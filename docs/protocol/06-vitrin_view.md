@@ -1,0 +1,158 @@
+# vitrin_view — observation facet (poll-model frame capture)
+
+**Interface version:** 1 · **Connection class:** principal · **Grant verb:** `observe` · **Messages:** 1 request + 1 event
+
+## Purpose
+
+`vitrin_view` is the observation capability onto a realm's composited framebuffer. In version 1 a realm has a single view, and that view is the realm's whole composited output; one `vitrin_view` object *is* that whole view. It carries no geometry protocol of its own — the agent learns the view's dimensions from the `frame_ready` event, never from a separate query.
+
+Capture is a **poll model**: one `capture_frame` request yields exactly one frame. There is no streaming, no subscription, and no server-initiated frame push. This keeps observation on the same request/reply spine as the rest of the principal connection and makes a threadless blocking SDK correct without extra machinery (see [conventions § delivery classification](00-conventions.md)).
+
+In the object graph, `vitrin_view` is one of the three authority *facets* co-minted by [`vitrin_realm.request_grant`](03-vitrin_realm.md) alongside the [`vitrin_grant`](04-vitrin_grant.md) handle and its consent observer. The facet is the observation-shaped surface of a single grant-table row; the grant is its authority. `vitrin_view` holds no authority of its own — every capture is checked at the grant's single enforcement chokepoint (grant alive, `observe` in the effective verb set, rate bucket not empty, realm has a surface), and every refusal is voiced not here but on [`vitrin_grant.refused`](04-vitrin_grant.md). The design idea is attenuation by construction: because the facet is minted only by the petition that also minted its grant, an agent can never name — and so never capture through — a view it was not granted.
+
+## Lifecycle
+
+A `vitrin_view` instance comes into existence only as the `view` `new_id` argument of [`vitrin_realm.request_grant`](03-vitrin_realm.md). It is never created by a request on this interface and has no constructor of its own. It is co-minted with its grant, its consent observer, and the pointer and text facets, all under the multi-`new_id` rule described in [conventions § object ids](00-conventions.md) (distinct, strictly increasing in argument order, above the connection's allocation watermark).
+
+The facet is **born inert**. Existence confers nothing: until the grant resolves `granted` with `observe` in its effective verb set, every `capture_frame` on this object is refused recoverably with [`vitrin_grant.refused`](04-vitrin_grant.md)`(observe, not_granted, …)`. This is deliberate — mint-freely, check-at-use — and it means a well-behaved agent may hold the facet through the whole pending phase and only discover the outcome on [`vitrin_grant.resolved`](04-vitrin_grant.md).
+
+Version 1 defines no destructors. A `vitrin_view` object lives for the connection. When its grant dies — expiry, revocation, or the realm's surface going away — the facet goes inert again rather than being destroyed: captures then refuse recoverably (`expired`, `revoked`, `no_surface`), never fatally. Because object ids are never reused, the server MAY still emit or reference this object after its grant has died, and clients MUST tolerate and discard anything stale (see [conventions § object ids](00-conventions.md)). All of a connection's facets die with the connection; version 1 has no grant persistence.
+
+## Requests
+
+### capture_frame
+
+```
+capture_frame()
+```
+
+This request takes no arguments.
+
+`capture_frame` requests exactly one frame of the realm view. It is **reply-bearing**: every `capture_frame` receives exactly one terminal event — `frame_ready` on success, or [`vitrin_grant.refused`](04-vitrin_grant.md)`(observe, …)` on failure — delivered in request order and **never coalesced**. This one-to-one, order-preserving pairing is what lets a client pipeline captures: send several `capture_frame` requests, then read terminals off the stream knowing the *n*-th terminal answers the *n*-th request.
+
+The pairing is forced by the type system rather than by convention. An `fd` argument has no null form, so a failed capture cannot be signalled as a `frame_ready` with an absent fd; failure must therefore be a distinct event, which is exactly [`vitrin_grant.refused`](04-vitrin_grant.md). A receiver that gets `frame_ready` knows it holds a real frame.
+
+Each capture passes the grant's single enforcement chokepoint. Captures are rate-limited by the grant's `max_event_rate` (events per second, chosen at petition time and reported on `resolved`); the token bucket governs observation just as it governs actuation.
+
+**Delivery class:** reply-bearing (exactly one terminal event per request, in request order, never coalesced — unlike fire-and-forget actuation refusals, capture refusals are never merged).
+
+**Failure modes.** `capture_frame` has no fatal failure of its own — a well-formed request on a live object never kills the connection. Every failure is a recoverable [`vitrin_grant.refused`](04-vitrin_grant.md)`(observe, code, retry_after_ms)`, where `code` is drawn from the grant's [`refusal`](04-vitrin_grant.md) enum:
+
+| code | when |
+| --- | --- |
+| `not_granted` | grant not (or not yet) active, or `observe` outside the effective verb set: capture while pending, after denial, or on a facet whose verb was not granted |
+| `expired` | the grant's expiry passed (checked on use and by a proactive timer) |
+| `revoked` | the grant was revoked by hold-Esc, panel, or policy; effective on the very next capture |
+| `rate_limited` | the capture token bucket is empty; `retry_after_ms` hints the refill |
+| `no_surface` | the realm has no surface (its shim crashed or exited) — a refusal, never a stale frame |
+| `internal` | server-side failure during this capture (renderer, memfd, delivery) |
+
+(Fatal errors — bad opcode, an unsolicited fd, a foreign object id — belong to the framing and object-graph layers documented in [conventions § error taxonomy](00-conventions.md), not to `capture_frame`'s semantics.)
+
+## Events
+
+### frame_ready
+
+```
+frame_ready(fd: fd, format: uint, width: uint, height: uint, stride: uint, flags: uint)
+```
+
+| arg | type | description |
+| --- | --- | --- |
+| `fd` | `fd` | fresh memfd holding the frame; ownership transfers to the receiver |
+| `format` | `uint` (enum [`format`](#format)) | pixel format as a DRM fourcc value; `xrgb8888` in version 1 |
+| `width` | `uint` | frame width in pixels |
+| `height` | `uint` | frame height in pixels |
+| `stride` | `uint` | row stride in bytes; equals `width * 4` exactly in version 1 |
+| `flags` | `uint` (bitfield [`frame_flags`](#frame_flags)) | frame flags; always `0` in version 1 |
+
+`frame_ready` is delivered exactly once per successful `capture_frame`, and it is that capture's terminal event.
+
+The `fd` is a **fresh memfd containing the frame — always a copy**. Agents never see live buffers. Ownership of the fd transfers to the receiver, which **MUST** close it after use; the server closes its own copy after sending. (At most one fd travels per frame; this is the framing invariant that lets a receiver drop any frame and still close its fd — see [conventions § framing](00-conventions.md).)
+
+Version 1 pixels are `xrgb8888`, row-major, origin top-left, little-endian, with `stride` equal to `width * 4` exactly. Pinning the stride makes the buffer layout unambiguous: it fixes the golden-frame tests and gives observation digests a single well-defined domain (the whole buffer). `flags` is always `0` in version 1; the reserved [`frame_flags`](#frame_flags) bits let a later zero-copy dmabuf handoff reuse this same message with a flag set, never a new signature.
+
+The agent learns the view's dimensions from `width` and `height` on this event. Version 1 has no separate geometry protocol.
+
+**Delivery class:** the success terminal of a reply-bearing request (paired one-to-one with `capture_frame`, in request order, never coalesced).
+
+## Enums
+
+### format
+
+Pixel formats, carried as DRM fourcc codes so the enum never diverges from the kernel's format namespace when dmabuf arrives. This enum is **defined on `vitrin_view`** and is **shared cross-interface**: [`vitrin_shim_surface.attach`](10-vitrin_shim_surface.md) references it as `vitrin_view.format` for the shim's buffer path.
+
+| entry | value | meaning |
+| --- | --- | --- |
+| `xrgb8888` | `0x34325258` | 32-bit xRGB, `DRM_FORMAT_XRGB8888` (the only format captured in version 1) |
+| `argb8888` | `0x34325241` | 32-bit ARGB, `DRM_FORMAT_ARGB8888` |
+
+### frame_flags
+
+Frame flags. Bitfield (entries are powers of two). Reserved in version 1: no bit is ever set, and their presence is the seam for a later zero-copy handoff without a signature change.
+
+| entry | value | meaning |
+| --- | --- | --- |
+| `y_invert` | `1` | rows are bottom-up (reserved; never set in version 1) |
+| `dmabuf` | `2` | the `fd` is a dmabuf rather than a memfd (reserved; never set in version 1) |
+
+## Flows
+
+Direction key: **A→C** agent→core, **C→A** core→agent. These are the version-1-shaped scenarios from the message-flow catalog that touch `vitrin_view`; steps not involving this interface are abbreviated. Note that observation facets are co-minted by `request_grant` (there is no separate bind step), and capture failures arrive on `vitrin_grant.refused` (not on any per-view error).
+
+### Flow A — walking skeleton: handshake → grant → single capture
+
+1. A→C `vitrin_handshake.hello(version=1, principal, identity, credential_type, credential)`
+2. C→A `vitrin_principal.bound(identity)`
+3. A→C `vitrin_principal.get_realm(realm, name="realm-0")`
+4. A→C `vitrin_realm.request_grant(grant, consent, view, pointer, text, resource=null, verbs=observe, …)` — co-mints the `view` facet, born inert
+5. C→A `vitrin_consent.state(closed)` — under auto-approve consent (loudly logged)
+6. C→A `vitrin_grant.resolved(granted, verbs=observe, persistence=while_running, expiry_ms)` — the facet is now live
+7. A→C `vitrin_view.capture_frame()`
+8. C→A `vitrin_view.frame_ready(fd=<memfd>, format=xrgb8888, width=1280, height=800, stride=5120, flags=0)`
+
+The SDK mmaps the memfd and closes it after use.
+
+### Flow B — demo: capture, actuate, sync, re-capture
+
+1–6. As Flow A steps 1–6, but `verbs=observe | actuate_pointer | actuate_text` and the consent prompt is shown to a human who approves (`vitrin_consent.state` → `shown` → `closed`, then `vitrin_grant.resolved(granted, …)`).
+7. A→C `vitrin_view.capture_frame()` → C→A `vitrin_view.frame_ready(…)` — SDK locates the target by pixels
+8. A→C pointer/text actuations on the sibling facets (see [`vitrin_actuator_pointer`](07-vitrin_actuator_pointer.md), [`vitrin_actuator_text`](08-vitrin_actuator_text.md))
+9. A→C `vitrin_handshake.sync(cookie)` → C→A `vitrin_handshake.done(cookie)` — flush any pending refusals before asserting
+10. A→C `vitrin_view.capture_frame()` → C→A `vitrin_view.frame_ready(…)` — SDK asserts the frame changed
+
+### Flow C — revocation mid-loop (recoverable refusal)
+
+1. Agent is in an observe/act loop under an active grant.
+2. A human holds Esc; the core revokes the grant. The `view` facet goes inert.
+3. A→C `vitrin_view.capture_frame()`
+4. C→A `vitrin_grant.refused(observe, revoked, 0)` — the SDK raises `Revoked`; the connection lives.
+
+### Flow D — expiry (recoverable refusal)
+
+1. The grant was issued with a bounded `expiry_ms`; the deadline passes.
+2. A→C `vitrin_view.capture_frame()`
+3. C→A `vitrin_grant.refused(observe, expired, 0)` — the SDK raises `GrantExpired`.
+
+### Flow E — rate-limit hit (never coalesced)
+
+1. A→C `vitrin_view.capture_frame()` ×5 within one second → C→A `vitrin_view.frame_ready(…)` ×5 (the token bucket admits five).
+2. A→C `vitrin_view.capture_frame()` (sixth) → C→A `vitrin_grant.refused(observe, rate_limited, retry_after_ms>0)` — one refusal per refused capture. Because `capture_frame` is reply-bearing, these refusals are **never coalesced** (unlike fire-and-forget actuation floods, which may coalesce one `refused(rate_limited)` per bucket-refill window).
+3. The bucket refills; the next second's first five captures succeed again.
+
+### Flow F — shim death mid-capture
+
+1. Agent capture loop is running against a live realm surface.
+2. The realm's shim is killed; the core reaps it, closes in-flight buffer fds, and drops the realm's surface.
+3. A→C `vitrin_view.capture_frame()`
+4. C→A `vitrin_grant.refused(observe, no_surface, 0)` — a refusal, never a stale frame; the SDK raises `NoSurface`.
+
+## Growth
+
+Every version-2+ addition below is purely additive: version-1 clients see no signature change, and the reserved fields and shared enum absorb the new capability without a new message on this interface.
+
+- **Zero-copy dmabuf handoff.** The `dmabuf` bit of [`frame_flags`](#frame_flags) and the DRM-fourcc [`format`](#format) enum let a later version deliver the frame as a dmabuf over the *same* `frame_ready` message — the `fd` becomes a dmabuf, the `dmabuf` flag is set, and the format code already names the kernel format. No new event, no changed signature.
+- **Wider formats.** Because [`format`](#format) mirrors the DRM fourcc namespace, new pixel formats append as new enum entries (values immutable) without touching the message.
+- **Geometry and multi-view realms.** Version 1's "one view is the whole realm" is a deliberate floor; multi-surface and multi-view realms add their enumeration and geometry surface to [`vitrin_realm`](03-vitrin_realm.md) and its addressing objects, not by re-plumbing `vitrin_view`.
+
+See [conventions § versioning](00-conventions.md) for the append-only growth rules and the additive-safety table naming every reserved seam.

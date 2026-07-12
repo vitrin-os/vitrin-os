@@ -1,0 +1,323 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  RELAX NG schema for the Vitrin protocol IDL dialect (vitrin-v0.xml).
+
+  The dialect is a stricter subset of the Wayland protocol XML shape, plus
+  exactly two extension attributes: protocol/@version (the single source of
+  truth for the hello version integer) and interface/@verb (declares that
+  every request on the interface exercises the named grant verb; the scanner
+  derives the enforcement chokepoint's opcode-to-verb table from it).
+
+  Structural rules this schema enforces beyond wayland.dtd:
+    - argument types are a closed set of seven (no array);
+    - new_id and object arguments MUST name their interface (no untyped
+      new_id; codegen stays a straight-line table);
+    - allow-null is legal only on string and object arguments;
+    - enum references are legal only on int and uint arguments;
+    - descriptions are required on the protocol, every interface, and every
+      request, event, and enum; every enum entry carries a summary;
+    - enum entry values are required (decimal or hex);
+    - B2: every vitrin_shim_seat event's final argument is the origin tag
+      (and the seat interface defines no requests).
+
+  Validate with: xmllint - -relaxng protocol/vitrin-v0.rng protocol/vitrin-v0.xml
+  (without the space between the dashes).
+-->
+<grammar xmlns="http://relaxng.org/ns/structure/1.0"
+         datatypeLibrary="http://www.w3.org/2001/XMLSchema-datatypes">
+
+  <start>
+    <ref name="protocol"/>
+  </start>
+
+  <define name="protocol">
+    <element name="protocol">
+      <attribute name="name">
+        <data type="NCName"/>
+      </attribute>
+      <attribute name="version">
+        <data type="positiveInteger"/>
+      </attribute>
+      <optional>
+        <element name="copyright">
+          <text/>
+        </element>
+      </optional>
+      <ref name="description"/>
+      <oneOrMore>
+        <ref name="interface"/>
+      </oneOrMore>
+    </element>
+  </define>
+
+  <define name="description">
+    <element name="description">
+      <attribute name="summary">
+        <text/>
+      </attribute>
+      <text/>
+    </element>
+  </define>
+
+  <define name="interface">
+    <choice>
+      <ref name="seat-interface"/>
+      <ref name="generic-interface"/>
+    </choice>
+  </define>
+
+  <!-- Every interface except vitrin_shim_seat. -->
+  <define name="generic-interface">
+    <element name="interface">
+      <attribute name="name">
+        <data type="NCName">
+          <except>
+            <value type="NCName">vitrin_shim_seat</value>
+          </except>
+        </data>
+      </attribute>
+      <ref name="interface-common-attrs"/>
+      <ref name="description"/>
+      <zeroOrMore>
+        <choice>
+          <ref name="request"/>
+          <ref name="event"/>
+          <ref name="enum"/>
+        </choice>
+      </zeroOrMore>
+    </element>
+  </define>
+
+  <!--
+    vitrin_shim_seat, specialized: events only, and every event's final
+    argument is the origin tag (backward requirement B2, enforced by the
+    schema rather than by convention).
+  -->
+  <define name="seat-interface">
+    <element name="interface">
+      <attribute name="name">
+        <value type="NCName">vitrin_shim_seat</value>
+      </attribute>
+      <ref name="interface-common-attrs"/>
+      <ref name="description"/>
+      <zeroOrMore>
+        <choice>
+          <ref name="seat-event"/>
+          <ref name="enum"/>
+        </choice>
+      </zeroOrMore>
+    </element>
+  </define>
+
+  <define name="interface-common-attrs">
+    <attribute name="version">
+      <data type="positiveInteger"/>
+    </attribute>
+    <optional>
+      <attribute name="verb">
+        <choice>
+          <value>observe</value>
+          <value>actuate_pointer</value>
+          <value>actuate_text</value>
+        </choice>
+      </attribute>
+    </optional>
+  </define>
+
+  <define name="message-common-attrs">
+    <attribute name="name">
+      <data type="NCName"/>
+    </attribute>
+    <optional>
+      <attribute name="type">
+        <value>destructor</value>
+      </attribute>
+    </optional>
+    <optional>
+      <attribute name="since">
+        <data type="positiveInteger"/>
+      </attribute>
+    </optional>
+    <optional>
+      <attribute name="deprecated-since">
+        <data type="positiveInteger"/>
+      </attribute>
+    </optional>
+  </define>
+
+  <define name="request">
+    <element name="request">
+      <ref name="message-common-attrs"/>
+      <ref name="description"/>
+      <zeroOrMore>
+        <ref name="arg"/>
+      </zeroOrMore>
+    </element>
+  </define>
+
+  <define name="event">
+    <element name="event">
+      <ref name="message-common-attrs"/>
+      <ref name="description"/>
+      <zeroOrMore>
+        <ref name="arg"/>
+      </zeroOrMore>
+    </element>
+  </define>
+
+  <define name="seat-event">
+    <element name="event">
+      <ref name="message-common-attrs"/>
+      <ref name="description"/>
+      <zeroOrMore>
+        <ref name="arg"/>
+      </zeroOrMore>
+      <ref name="origin-arg"/>
+    </element>
+  </define>
+
+  <define name="origin-arg">
+    <element name="arg">
+      <attribute name="name">
+        <value>origin</value>
+      </attribute>
+      <attribute name="type">
+        <value>uint</value>
+      </attribute>
+      <attribute name="enum">
+        <value>origin</value>
+      </attribute>
+      <optional>
+        <attribute name="summary">
+          <text/>
+        </attribute>
+      </optional>
+    </element>
+  </define>
+
+  <define name="arg">
+    <element name="arg">
+      <attribute name="name">
+        <data type="NCName"/>
+      </attribute>
+      <optional>
+        <attribute name="summary">
+          <text/>
+        </attribute>
+      </optional>
+      <choice>
+        <!-- new_id: must name its interface; never nullable -->
+        <group>
+          <attribute name="type">
+            <value>new_id</value>
+          </attribute>
+          <attribute name="interface">
+            <data type="NCName"/>
+          </attribute>
+        </group>
+        <!-- object: must name its interface; may be nullable -->
+        <group>
+          <attribute name="type">
+            <value>object</value>
+          </attribute>
+          <attribute name="interface">
+            <data type="NCName"/>
+          </attribute>
+          <optional>
+            <attribute name="allow-null">
+              <value>true</value>
+            </attribute>
+          </optional>
+        </group>
+        <!-- string: may be nullable; no interface -->
+        <group>
+          <attribute name="type">
+            <value>string</value>
+          </attribute>
+          <optional>
+            <attribute name="allow-null">
+              <value>true</value>
+            </attribute>
+          </optional>
+        </group>
+        <!-- scalar: may reference an enum -->
+        <group>
+          <attribute name="type">
+            <choice>
+              <value>int</value>
+              <value>uint</value>
+            </choice>
+          </attribute>
+          <optional>
+            <attribute name="enum">
+              <data type="string">
+                <param name="pattern">[a-z0-9_]+(\.[a-z0-9_]+)?</param>
+              </data>
+            </attribute>
+          </optional>
+        </group>
+        <!-- fixed and fd: bare -->
+        <group>
+          <attribute name="type">
+            <choice>
+              <value>fixed</value>
+              <value>fd</value>
+            </choice>
+          </attribute>
+        </group>
+      </choice>
+    </element>
+  </define>
+
+  <define name="enum">
+    <element name="enum">
+      <attribute name="name">
+        <data type="NCName"/>
+      </attribute>
+      <optional>
+        <attribute name="since">
+          <data type="positiveInteger"/>
+        </attribute>
+      </optional>
+      <optional>
+        <attribute name="bitfield">
+          <choice>
+            <value>true</value>
+            <value>false</value>
+          </choice>
+        </attribute>
+      </optional>
+      <ref name="description"/>
+      <oneOrMore>
+        <ref name="entry"/>
+      </oneOrMore>
+    </element>
+  </define>
+
+  <define name="entry">
+    <element name="entry">
+      <attribute name="name">
+        <data type="NCName"/>
+      </attribute>
+      <attribute name="value">
+        <data type="string">
+          <param name="pattern">(0x[0-9a-fA-F]+|[0-9]+)</param>
+        </data>
+      </attribute>
+      <attribute name="summary">
+        <text/>
+      </attribute>
+      <optional>
+        <attribute name="since">
+          <data type="positiveInteger"/>
+        </attribute>
+      </optional>
+      <optional>
+        <attribute name="deprecated-since">
+          <data type="positiveInteger"/>
+        </attribute>
+      </optional>
+    </element>
+  </define>
+
+</grammar>

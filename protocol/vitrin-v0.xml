@@ -1,0 +1,948 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="vitrin" version="1">
+
+  <copyright>
+    Copyright 2026 the Vitrin OS contributors
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+  </copyright>
+
+  <description summary="Vitrin OS wire protocol, version 0">
+    The single IDL source of truth for the Vitrin OS wire protocol: the
+    principal-facing interfaces spoken by agent clients over the core's
+    listening socket, and the shim-facing interfaces spoken by per-app shims
+    over a core-inherited socketpair. Both connection classes share one wire
+    format; they differ only in authentication and dispatch table.
+
+    CONNECTION CLASSES. The class of a connection is fixed at accept time by
+    the transport, never negotiated on the wire: connections on the listening
+    socket ($XDG_RUNTIME_DIR/vitrin-0/core.sock) are principal connections;
+    connections on a core-inherited socketpair are shim connections. Object 1
+    on a principal connection is vitrin_handshake; object 1 on a shim
+    connection is vitrin_shim_session. Neither class's interfaces are
+    reachable from the other: a message using the other class's opcodes dies
+    as a fatal protocol error with no special casing.
+
+    FRAMING. Little-endian on the wire. Each message is one frame with an
+    8-byte header: object_id (u32), size (u16, whole frame including header;
+    frames above 65535 bytes are fatal "oversized"), opcode (u8), fd_count
+    (u8, 0 or 1 - at most one file descriptor per message is a framing
+    invariant; because the count is in the header, a receiver can drop any
+    frame and still consume and close its fd without consulting the schema).
+    Argument types form a closed set of seven: int (s32), uint (u32), fixed
+    (signed 24.8), string, object (u32 id), new_id (u32 id), fd (SCM_RIGHTS,
+    matched positionally). Strings are a u32 byte length followed by UTF-8
+    (no NUL terminator on the wire, embedded NUL forbidden), padded to 4
+    bytes; each string argument documents a maximum byte length, and
+    violations are fatal "invalid_argument". There are no arrays and no
+    64-bit scalars in version 1.
+
+    OBJECT IDS. Object ids are per-connection u32 values. 0 is the null
+    object (legal only for arguments marked allow-null); 1 is the bootstrap
+    object, implicit at connect and never created by a message. Client-
+    allocated ids MUST be strictly increasing and are never reused, in the
+    range [2, 0xfeffffff]; the range [0xff000000, 0xffffffff] is reserved to
+    the server and unused in version 1 (no event carries a new_id, so the
+    server never allocates). When one request carries several new_id
+    arguments, they MUST be distinct, strictly increasing in argument order,
+    and all above the connection's allocation watermark; any violation is
+    fatal "invalid_object". Version 1 defines no destructors: objects live
+    for the connection, and objects derived from a grant become inert when
+    the grant dies (requests on them are refused recoverably, never fatally).
+    The server MAY emit events that reference an object whose grant has died;
+    clients MUST tolerate and discard such events - this is safe forever
+    because ids are never reused.
+
+    ORDERING. Each direction of a connection is a single ordered stream: the
+    server processes requests in order, the client receives events in order,
+    and ordering holds across objects within the connection. This guarantee
+    is load-bearing: it is what makes the sync barrier, the buffer_done
+    cookie protocol, pipelined capture pairing, and a threadless blocking
+    client SDK correct with no additional machinery.
+
+    ERROR TAXONOMY. A failure is FATAL (the connection dies) when the client
+    violated something it could have known: the grammar, the handshake order,
+    or its own connection's object graph. A failure is RECOVERABLE (an event
+    is delivered and the connection lives) when a well-formed request's
+    authority or target changed underneath it: consent outcome, expiry,
+    revocation, human preemption, a rate ceiling, or shim death. Corollary:
+    once a grant is revoked or expired its objects go inert - requests on
+    them yield recoverable refusals, never "invalid_object" death -
+    otherwise human revocation racing in-flight requests would kill
+    well-behaved agents. Fatal errors on principal connections are carried
+    by vitrin_handshake.error and then the connection closes; shim
+    connections carry no fatal-error message (a shim protocol violation is
+    log-and-close: the shim is a core-spawned disposable child, and the core
+    log is the debugging channel).
+
+    DELIVERY CLASSIFICATION. Requests are classified reply-bearing (hello,
+    sync, request_grant, capture_frame) or fire-and-forget (move, button,
+    scroll, type, attach, damage, commit). Every reply-bearing request
+    receives exactly one terminal event, in request order, and such
+    terminals are never coalesced. Refusals of fire-and-forget requests MAY
+    be coalesced: at most one refused(rate_limited) per grant per
+    bucket-refill window, and at most one refused per grant per (verb, code)
+    pair until a subsequent request on that grant succeeds. The sync barrier
+    bounds refusal discovery to one round trip.
+
+    VERSIONING. The protocol version is a single integer: the version
+    attribute of this document and the first argument of hello. Version 1
+    requires an exact match; a mismatch is fatal "version_unsupported"
+    (downgrade is refusal, not negotiation). Growth is Wayland-style: new
+    messages are appended with since attributes (opcodes are implicit
+    document order, requests and events numbered separately from 0), enum
+    entries are appended (values are immutable; deprecated-since marks,
+    never removes), and a message signature is immutable forever - extension
+    is a new message, never a changed one.
+
+    ENUM AND BITFIELD VALIDATION. An enum-referencing argument is strictly
+    validated. A plain enum argument is checked by whole-value membership:
+    a value that is not a defined entry is fatal "invalid_argument". A
+    bitfield="true" enum argument is checked as a bitmask: any bit set
+    outside the union of defined entry values is out-of-range and fatal
+    "invalid_argument", while any combination of defined bits is legal.
+    Thus request_grant's verbs accepts observe|actuate_pointer|actuate_text
+    (value 7) but a bit reserved for a future verb (for example value 8) is
+    fatal. This is distinct from a policy refusal: outcome "unsupported"
+    concerns a well-formed, in-range request the deployment declines to
+    serve, never an out-of-range wire value.
+
+    ENUM REFERENCES. An enum attribute names the enum a scalar argument
+    draws from. A bare name (for example "origin") refers to an enum
+    defined on the argument's own interface; a dotted name (for example
+    "vitrin_view.format") refers to an enum on the named interface. The
+    code generator resolves references by this rule to build membership and
+    mask tables.
+
+    STRING BOUNDS. Every string argument declares a maximum byte length in
+    its summary as a "(max N bytes)" token; a string exceeding its bound is
+    fatal "invalid_argument". The bound is machine-readable: the code
+    generator extracts it from the summary token, and CI lints that every
+    string argument carries exactly one such token. A null string (legal
+    only where allow-null is set) and an empty string are encoded
+    identically (length 0) and are treated as equivalent - resource relies
+    on this (null or empty both mean the whole realm).
+
+    PETITION EVENT ORDERING. resolved and vitrin_consent.state are
+    sequenced only within their own petition's lifecycle (zero or more
+    state events, then exactly one resolved) and do NOT participate in the
+    cross-request "in request order" rule, because a petition's resolution
+    waits on an unbounded human consent delay. A later sync's done reflects
+    that earlier requests were processed and that any petition among them
+    was registered and its consent initiated; it does NOT wait for that
+    petition to resolve. A blocking client therefore reads resolved on its
+    own schedule without deadlocking against an unrelated pending prompt.
+  </description>
+
+  <interface name="vitrin_handshake" version="1">
+    <description summary="principal connection bootstrap">
+      The connection-lifecycle object of a principal connection, implicit
+      object 1 at connect: the authentication gate, the fatal-error channel,
+      and the sync barrier. It lives for the whole connection.
+
+      Handshake state machine: in the initial state the only legal message
+      is hello. After hello the client MAY pipeline further requests; the
+      server queues them during credential verification and processes them
+      after vitrin_principal.bound is sent (if verification fails the
+      connection dies "auth_failed" and queued requests are never
+      processed). Any traffic before a first hello is fatal "pre_handshake",
+      delivered best-effort if the frame parsed; unparseable garbage may be
+      closed silently. Either way the reason is logged.
+
+      The human principal has no wire presence in version 1: host input in
+      nested mode is the implicit human, and only agents handshake.
+    </description>
+
+    <request name="hello">
+      <description summary="authenticate and bind a principal">
+        The only pre-authentication message. Presents a credential to the
+        core's pluggable verifier and pre-allocates the principal object
+        that a successful handshake will bind. Success is announced by
+        vitrin_principal.bound; failure is fatal "auth_failed" or
+        "version_unsupported".
+
+        The credential encoding is deliberately opaque to the wire:
+        credential_type names a scheme (for example "static-token",
+        "spiffe-jwt-svid", "oidc", "ssh-cert"; at most 32 bytes) and
+        credential carries scheme-defined bytes (at most 32768 bytes),
+        interpreted only by the verifier. identity is the SPIFFE-shaped
+        identity URI being claimed (at most 2048 bytes, the SPIFFE-ID
+        maximum: a 255-byte trust domain plus path). It is a routing hint;
+        the authoritative principal identity is the verifier-canonical
+        string later delivered in vitrin_principal.bound, never this
+        claimed value. The wire hard-wires
+        no scheme; this is the signature-agility hook for future credential
+        families, and credentials larger than one frame arrive via an
+        fd-borne sibling request in a future version. Sender-constraint is
+        the triple of this connection, the verified credential, and
+        SO_PEERCRED recorded at accept: a handle minted on one connection
+        presented on another is fatal "invalid_object".
+
+        This signature is frozen forever.
+      </description>
+      <arg name="version" type="uint" summary="protocol version; version 1 requires exact match"/>
+      <arg name="principal" type="new_id" interface="vitrin_principal" summary="principal object bound on success"/>
+      <arg name="identity" type="string" summary="claimed identity URI, e.g. vitrin://local/agent/demo (max 2048 bytes)"/>
+      <arg name="credential_type" type="string" summary="credential scheme discriminator (max 32 bytes)"/>
+      <arg name="credential" type="string" summary="opaque scheme-defined credential bytes (max 32768 bytes)"/>
+    </request>
+
+    <request name="sync">
+      <description summary="roundtrip barrier">
+        Requests a done event carrying the same cookie. The done event is
+        sent only after every request received before this one has been
+        processed and every event those requests caused has been queued
+        ahead of it. Because actuation requests are fire-and-forget and
+        enforcement failures are events, a threadless blocking client sends
+        its actuations, syncs, then reads until done, raising on any refused
+        event seen - bounding failure discovery to one round trip without
+        per-actuation acknowledgements. Valid only after bound; a cookie
+        echo, not a callback object, so it costs no id churn.
+      </description>
+      <arg name="cookie" type="uint" summary="client-chosen value echoed by done"/>
+    </request>
+
+    <event name="error">
+      <description summary="fatal protocol error; the connection closes">
+        The connection-fatal error channel. object_id is the id of the
+        object where the error occurred (which may be 1, this object);
+        code is namespaced by that object's interface error enum - in
+        version 1 the only error enum is on this interface, so all fatal
+        codes are connection-global. message is free-form debugging text
+        and is never machine-parsed. After sending this event the server
+        closes the connection. Delivery is best-effort: backpressure deaths
+        (a peer that stops reading) and unframeable streams are closed
+        without it.
+      </description>
+      <arg name="object_id" type="uint" summary="id of the object where the error occurred"/>
+      <arg name="code" type="uint" enum="error" summary="error code, namespaced by the cited object's interface"/>
+      <arg name="message" type="string" summary="free-form debug description, never parsed (max 1024 bytes)"/>
+    </event>
+
+    <event name="done">
+      <description summary="barrier reply">
+        Answers sync: all requests received before the corresponding sync
+        have been processed and their events queued ahead of this event.
+      </description>
+      <arg name="cookie" type="uint" summary="the cookie passed to sync"/>
+    </event>
+
+    <enum name="error">
+      <description summary="connection-global fatal error codes">
+        Every condition here is one a correct client can never trigger; the
+        fuzz target (hostile bytes, fd bombs, forged ids) maps every decode
+        failure onto exactly one of these codes with a clean connection
+        death, and error paths always close any received file descriptor.
+      </description>
+      <entry name="invalid_object" value="0" summary="unknown or foreign object id, id reuse at or below the watermark, reserved-range id, or multi-new_id rule violation"/>
+      <entry name="invalid_opcode" value="1" summary="opcode not defined for the interface at the negotiated version, including other-class opcodes"/>
+      <entry name="invalid_argument" value="2" summary="argument decode failure: bad UTF-8, embedded NUL, string over its bound, out-of-range enum value, forbidden control character, zero verbs, malformed padding"/>
+      <entry name="oversized" value="3" summary="frame size above 65535 bytes or truncated payload"/>
+      <entry name="fd_violation" value="4" summary="fd count in the header disagrees with the message signature, or unsolicited fds attached"/>
+      <entry name="pre_handshake" value="5" summary="traffic before a first hello on a principal connection"/>
+      <entry name="version_unsupported" value="6" summary="hello carried a protocol version the server does not implement; downgrade is refusal"/>
+      <entry name="auth_failed" value="7" summary="credential rejected: unknown identity, bad token, verifier failure, or SO_PEERCRED mismatch"/>
+      <entry name="internal" value="8" summary="server-side failure that poisoned the connection"/>
+    </enum>
+  </interface>
+
+  <interface name="vitrin_principal" version="1">
+    <description summary="the authenticated principal">
+      The bound identity: the root of the connection's authority chain,
+      holding exactly the authority to address realms and petition for
+      grants. Pre-allocated by hello and live upon bound. All of the
+      principal's grants die with the connection - version 1 has no grant
+      persistence (restore tokens are a future version's addition).
+    </description>
+
+    <event name="bound">
+      <description summary="handshake succeeded">
+        The terminal event of a successful handshake. identity is the
+        canonical identity as normalized and verified by the core's
+        verifier and recorded in the grant table - not an echo of the
+        client's claimed string. Everything the consent prompt and the
+        flight recorder later render about this principal derives from
+        this verifier-owned value, never from free client text.
+      </description>
+      <arg name="identity" type="string" summary="verifier-canonical principal identity (max 2048 bytes)"/>
+    </event>
+
+    <request name="get_realm">
+      <description summary="mint an address handle for a realm">
+        Creates a realm address object for a realm known by name ("realm-0"
+        is the single well-known realm of version 1). Naming is not
+        authority: this request always succeeds structurally, and holding a
+        realm handle only lets the principal petition. A name that is
+        unknown or vacant yields a handle whose petitions resolve
+        "unavailable" - realm absence is a race, not a protocol error,
+        because realms are dynamic in later phases.
+      </description>
+      <arg name="realm" type="new_id" interface="vitrin_realm" summary="the new realm address handle"/>
+      <arg name="name" type="string" summary="well-known realm name (max 64 bytes)"/>
+    </request>
+  </interface>
+
+  <interface name="vitrin_realm" version="1">
+    <description summary="realm address">
+      An addressing scope for petitions: grants attach to realms, and apps
+      launch into realms. Deliberately authority-free - the handle answers
+      "which realm are you asking about", nothing more. Realm ids are in
+      the protocol from day one so that later multi-realm phases add
+      enumeration and lifecycle events to this interface instead of
+      re-plumbing addressing.
+    </description>
+
+    <request name="request_grant">
+      <description summary="petition for authority over this realm">
+        Petitions for a grant and mints, in one request, the grant handle,
+        its consent observer, and the three authority facets (view, pointer
+        actuator, text actuator). All five new_id arguments follow the
+        multi-new_id rule (distinct, increasing, above the watermark). The
+        facets are born inert: they confer nothing until the grant resolves
+        granted, and each facet's requests are checked at use time against
+        the grant's effective verb set at the single enforcement chokepoint
+        - a facet whose verb was not granted refuses "not_granted"
+        recoverably. Creation order mirrors attenuation: nothing about this
+        petition is observable through any object the petitioner does not
+        hold.
+
+        resource selects what within the realm; null or empty means the
+        whole realm (the only granularity version 1 serves). The string
+        vocabulary is type-prefixed ("surface:...", "node:...") and grows
+        by version without a new request (max 256 bytes). verbs is the
+        requested verb set and MUST be non-zero (an empty petition is fatal
+        "invalid_argument"). expiry_ms of 0 means bounded only by the
+        persistence rung. max_event_rate is in events per second, governs
+        observation and actuation alike, and 0 selects the server's default
+        ceiling - never unlimited. persistence is the requested rung; the
+        durable rungs (until_revoked, always) exist in the enum from day
+        one but resolve "unsupported" in version 1, pending provenance
+        verification in a later phase. flags MUST be 0 in version 1: bit 0
+        is reserved for the one_shot constraint, and a set reserved bit
+        resolves "unsupported" - honest refusal rather than
+        accepted-and-unenforced. Future boolean constraints are flags bits;
+        future value-bearing constraints (such as focus conditions) arrive
+        as a since-gated builder request preceding this one.
+
+        Version 1 policy: pending-petition admission is capped per verified
+        identity, across all of that identity's connections (not merely per
+        connection - opening many connections under one credential must not
+        multiply concurrent prompts), and the deployment additionally
+        enforces a global ceiling on concurrent-plus-queued prompts. Excess
+        petitions resolve "busy" (the consent-fatigue valve). request_grant
+        is itself subject to a server-side petition-rate ceiling and a
+        per-connection live-object cap; because every petition permanently
+        allocates five object ids (version 1 has no destructors), a
+        connection that breaches either bound is closed fatally
+        ("invalid_object" on id exhaustion, "internal" on the rate cap),
+        confining the denial-of-service to the offending connection rather
+        than the whole core. A pending petition is withdrawn if the
+        connection closes: consent is in-context, so the prompt disappears
+        with the petitioner.
+      </description>
+      <arg name="grant" type="new_id" interface="vitrin_grant" summary="the grant handle, born pending"/>
+      <arg name="consent" type="new_id" interface="vitrin_consent" summary="prompt-visibility observer for this petition"/>
+      <arg name="view" type="new_id" interface="vitrin_view" summary="observation facet (inert until granted with observe)"/>
+      <arg name="pointer" type="new_id" interface="vitrin_actuator_pointer" summary="pointer facet (inert until granted with actuate_pointer)"/>
+      <arg name="text" type="new_id" interface="vitrin_actuator_text" summary="text facet (inert until granted with actuate_text)"/>
+      <arg name="resource" type="string" allow-null="true" summary="resource selector within the realm; null or empty = whole realm (max 256 bytes)"/>
+      <arg name="verbs" type="uint" enum="vitrin_grant.verb" summary="requested verb set; MUST be non-zero"/>
+      <arg name="expiry_ms" type="uint" summary="requested lifetime in milliseconds; 0 = bounded by the persistence rung"/>
+      <arg name="max_event_rate" type="uint" summary="requested ceiling in events per second for observation and actuation; 0 = server default, never unlimited"/>
+      <arg name="persistence" type="uint" enum="vitrin_grant.persistence" summary="requested persistence rung"/>
+      <arg name="flags" type="uint" summary="boolean constraint bits; MUST be 0 in version 1 (bit 0 reserved: one_shot)"/>
+    </request>
+  </interface>
+
+  <interface name="vitrin_grant" version="1">
+    <description summary="capability handle">
+      The wire projection of one grant-table row (principal x resource x
+      verbs x constraints) and the single voice of the enforcement
+      chokepoint: every capture and every actuation under this grant is
+      checked by one server-side function whose refusals are delivered
+      here. Born pending by request_grant, conferring nothing; exactly one
+      resolved event ever decides its fate. A grant that later expires or
+      is revoked goes dead and its facets go inert - their requests refuse
+      recoverably, never fatally.
+
+      Version 1 defines no requests on this interface. Documented growth
+      seams for later versions, each purely additive: a release destructor
+      (withdraw a pending petition or relinquish authority early, with the
+      tombstone rule that clients discard events to released ids), an
+      asynchronous revoked push event (resolved still fires exactly once,
+      ever; refused remains the enforcement-bearing signal), attenuation
+      (minting narrower child grants), restore tokens, and an
+      epoch-staleness refusal sibling carrying the current epoch for
+      compare-and-swap actuation.
+    </description>
+
+    <event name="resolved">
+      <description summary="the petition's terminal outcome">
+        Sent exactly once per grant, ever: the terminal event of the
+        pending phase, after the consent decision (or policy decision)
+        completes. On outcome granted, the remaining arguments carry the
+        EFFECTIVE authority - the verb set, persistence rung, and expiry
+        the human actually chose, which may be narrower than requested
+        (Allow-once versus Allow-while-running changes the lifetime). On
+        any other outcome the trailing arguments are zero. Denial and
+        timeout are clean distinct events, never a hang and never a
+        connection death.
+      </description>
+      <arg name="outcome" type="uint" enum="outcome" summary="how the petition resolved"/>
+      <arg name="verbs" type="uint" enum="verb" summary="effective verb set (0 unless granted)"/>
+      <arg name="persistence" type="uint" enum="persistence" summary="effective persistence rung (once unless granted)"/>
+      <arg name="expiry_ms" type="uint" summary="effective lifetime in milliseconds; 0 = bounded by the rung"/>
+    </event>
+
+    <event name="refused">
+      <description summary="the chokepoint refused one use of this grant">
+        The single recoverable-error event for grant use, covering capture
+        and actuation alike - one chokepoint, one refusal voice. verb names
+        the verb whose use was refused, which also identifies the facet.
+        For the reply-bearing capture_frame this event is that capture's
+        terminal (exactly one of frame_ready or refused per capture, in
+        request order, never coalesced). For fire-and-forget actuations
+        refusals may be coalesced per the delivery classification.
+        retry_after_ms is greater than zero only for rate_limited and
+        hints when the token bucket refills.
+      </description>
+      <arg name="verb" type="uint" enum="verb" summary="the verb whose use was refused"/>
+      <arg name="code" type="uint" enum="refusal" summary="why the use was refused"/>
+      <arg name="retry_after_ms" type="uint" summary="refill hint in milliseconds; nonzero only for rate_limited"/>
+    </event>
+
+    <enum name="verb" bitfield="true">
+      <description summary="grantable verbs">
+        The verb bitfield. Later phases append entries (key actuation,
+        credential presentation, subtree reads) without touching version-1
+        bits. The SDK-level dotted names (observe, actuate.pointer,
+        actuate.text) are these bits.
+      </description>
+      <entry name="observe" value="1" summary="capture frames of the granted resource"/>
+      <entry name="actuate_pointer" value="2" summary="inject pointer motion, buttons, and scroll"/>
+      <entry name="actuate_text" value="4" summary="inject Unicode text"/>
+    </enum>
+
+    <enum name="persistence">
+      <description summary="the consent persistence ladder">
+        The full ladder is defined from day one so the wire never changes
+        shape when durable rungs arrive; version 1 accepts only once and
+        while_running, and refuses the durable rungs "unsupported" because
+        they are valid only with verified provenance (a later phase).
+      </description>
+      <entry name="once" value="0" summary="single-use authority"/>
+      <entry name="while_running" value="1" summary="lives while the requesting principal's connection lives"/>
+      <entry name="until_revoked" value="2" summary="durable until explicitly revoked (requires verified provenance; refused in version 1)"/>
+      <entry name="always" value="3" summary="durable and auto-reissued (requires verified provenance; refused in version 1)"/>
+    </enum>
+
+    <enum name="outcome">
+      <description summary="petition outcomes">
+        Petition-time results, each mapping to a distinct typed SDK error
+        (or success). All are recoverable: a denial is an answer, not a
+        protocol violation.
+      </description>
+      <entry name="granted" value="0" summary="authority active; the event carries the effective verbs, rung, and expiry"/>
+      <entry name="denied" value="1" summary="the human said no"/>
+      <entry name="timed_out" value="2" summary="the consent prompt expired unanswered; petitioning again later is legal"/>
+      <entry name="unavailable" value="3" summary="the realm was unknown, vacant, or closed while the petition was pending"/>
+      <entry name="unsupported" value="4" summary="in-range but refused by policy: durable rung without provenance, reserved flag set, unserved resource prefix, or a defined verb this deployment or resource does not serve (an out-of-range verb bit is instead fatal invalid_argument)"/>
+      <entry name="busy" value="5" summary="the per-principal pending-petition cap was reached"/>
+    </enum>
+
+    <enum name="refusal">
+      <description summary="use-time refusal codes">
+        Emitted by the enforcement chokepoint on every refused capture or
+        actuation. Each code maps to a distinct typed SDK exception:
+        NotGranted, GrantExpired, Revoked, RateLimited, Preempted,
+        ConsentHeld, NoSurface, OperationFailed.
+      </description>
+      <entry name="not_granted" value="0" summary="the grant is not (or not yet) active, or the verb is outside its effective set: use while pending, through an ungranted facet, or after any non-granted resolution (denied, timed_out, unavailable, unsupported, busy)"/>
+      <entry name="expired" value="1" summary="the grant's expiry passed; checked on use and by a proactive timer"/>
+      <entry name="revoked" value="2" summary="revoked by hold-Esc, panel, or policy; effective on the very next request"/>
+      <entry name="rate_limited" value="3" summary="the token bucket is empty; retry_after_ms hints the refill"/>
+      <entry name="preempted" value="4" summary="physical human input owns the target right now"/>
+      <entry name="consent_held" value="5" summary="the principal's own pending petition has a prompt up; that principal's actuation is refused (never delivered to the app) until the prompt closes; other principals' grants are unaffected"/>
+      <entry name="no_surface" value="6" summary="the realm has no surface (its shim crashed or exited); never a stale frame"/>
+      <entry name="internal" value="7" summary="server-side failure during this use (renderer, memfd, delivery)"/>
+    </enum>
+  </interface>
+
+  <interface name="vitrin_consent" version="1">
+    <description summary="consent prompt visibility (events only)">
+      The prompt-visibility lifecycle of exactly one petition, visible to
+      exactly its petitioner. Scoping is structural: this object is minted
+      by request_grant itself, so an agent cannot name - and therefore
+      cannot observe - consent activity for any petition it did not make.
+      The interface deliberately carries no requests: nothing an agent
+      sends can put content in front of the human, and everything the
+      prompt renders is core-validated data (the verifier-canonical
+      identity, the parsed verbs, realm, and expiry). The authoritative
+      decision is never here: it arrives as vitrin_grant.resolved, so a
+      blocking client may ignore consent events entirely.
+
+      The consent overlay is composited into human-visible output only; it
+      never appears in captured frames - agents cannot watch prompts.
+      Consent decisions are not protocol-expressible by design: the
+      scripted-consent injector used by integration tests is a build-gated
+      core hook, not a wire message.
+    </description>
+
+    <event name="state">
+      <description summary="prompt lifecycle transition">
+        Zero or more transitions, all delivered before the grant's resolved
+        event: queued (the prompt waits behind another prompt or a policy
+        decision), shown (the prompt is visible, all physical input now
+        routes exclusively to it, and the agent knows to keep waiting),
+        closed (the prompt is gone; the decision follows on the grant).
+        Under an auto-approve consent policy (headless CI, explicitly
+        flagged and loudly logged) the server may emit only closed, or no
+        transitions at all.
+      </description>
+      <arg name="state" type="uint" enum="consent_state" summary="the new prompt state"/>
+    </event>
+
+    <enum name="consent_state">
+      <description summary="prompt visibility states"/>
+      <entry name="queued" value="0" summary="waiting behind another prompt or a policy decision"/>
+      <entry name="shown" value="1" summary="visible; physical input is grabbed by the prompt"/>
+      <entry name="closed" value="2" summary="gone; the decision arrives on the grant"/>
+    </enum>
+  </interface>
+
+  <interface name="vitrin_view" version="1" verb="observe">
+    <description summary="observation facet (poll-model capture)">
+      The observation capability onto a realm's composited framebuffer: in
+      version 1, one view is the realm's whole view. Capture is a poll
+      model: one request, one frame, no streaming. Minted inert by
+      request_grant; every capture passes the enforcement chokepoint
+      (grant alive, observe granted, rate bucket) and refuses recoverably
+      via vitrin_grant.refused when it fails. The agent learns the view's
+      dimensions from frame_ready; version 1 has no geometry protocol.
+    </description>
+
+    <request name="capture_frame">
+      <description summary="request one frame of the realm view">
+        Reply-bearing: exactly one terminal event per request - frame_ready
+        on success or vitrin_grant.refused(observe, ...) on failure - in
+        request order, never coalesced. Pipelining captures is legal;
+        replies pair in order. The pairing is forced by the type system:
+        fd arguments have no null form, so failure must be a distinct
+        event. Captures are rate-limited by the grant's max_event_rate.
+      </description>
+    </request>
+
+    <event name="frame_ready">
+      <description summary="one captured frame">
+        Exactly one per successful capture_frame. The fd is a fresh memfd
+        containing the frame - always a copy; agents never see live
+        buffers. Ownership of the fd transfers to the receiver, which MUST
+        close it after use (the server closes its own copy after sending).
+        Version 1 pixels are xrgb8888, row-major, origin top-left,
+        little-endian, and stride equals width * 4 exactly - this pins the
+        golden-frame tests and makes observation digests unambiguous (the
+        digest domain is the whole buffer). flags is always 0 in version 1;
+        the reserved bits make a later zero-copy dmabuf handoff this same
+        message with a flag, never a new signature.
+      </description>
+      <arg name="fd" type="fd" summary="fresh memfd holding the frame; ownership transfers to the receiver"/>
+      <arg name="format" type="uint" enum="format" summary="pixel format (DRM fourcc value)"/>
+      <arg name="width" type="uint" summary="frame width in pixels"/>
+      <arg name="height" type="uint" summary="frame height in pixels"/>
+      <arg name="stride" type="uint" summary="row stride in bytes; equals width * 4 in version 1"/>
+      <arg name="flags" type="uint" enum="frame_flags" summary="frame flags; always 0 in version 1"/>
+    </event>
+
+    <enum name="format">
+      <description summary="pixel formats (DRM fourcc values)">
+        Values are DRM fourcc codes so the enum never diverges from the
+        kernel's format namespace when dmabuf arrives. Shared by
+        vitrin_shim_surface.attach.
+      </description>
+      <entry name="xrgb8888" value="0x34325258" summary="32-bit xRGB, DRM_FORMAT_XRGB8888"/>
+      <entry name="argb8888" value="0x34325241" summary="32-bit ARGB, DRM_FORMAT_ARGB8888"/>
+    </enum>
+
+    <enum name="frame_flags" bitfield="true">
+      <description summary="frame flags (reserved in version 1)"/>
+      <entry name="y_invert" value="1" summary="rows are bottom-up (reserved; never set in version 1)"/>
+      <entry name="dmabuf" value="2" summary="fd is a dmabuf, not a memfd (reserved; never set in version 1)"/>
+    </enum>
+  </interface>
+
+  <interface name="vitrin_actuator_pointer" version="1" verb="actuate_pointer">
+    <description summary="pointer actuation facet">
+      The pointer-injection capability: move, button, and scroll, folded
+      into one pointer class for version 1. All coordinates are realm-view
+      pixels - what the agent observed in a captured frame is what it
+      addresses; coordinates outside the view are clamped (detecting that
+      the target moved underneath a stale observation is the epoch
+      mechanism of a later phase). Minted inert by request_grant. All
+      requests are fire-and-forget: failures arrive as
+      vitrin_grant.refused(actuate_pointer, ...), coalescible, bounded by
+      the sync barrier. A client-level click is move, button press, button
+      release, sync. Later versions add intent-level motion (drag with
+      duration and easing, interpolated server-side) as sibling requests;
+      these primitives stay valid forever.
+    </description>
+
+    <request name="move">
+      <description summary="move the pointer">
+        Moves this principal's virtual pointer to realm-view (x, y).
+      </description>
+      <arg name="x" type="int" summary="realm-view x in pixels"/>
+      <arg name="y" type="int" summary="realm-view y in pixels"/>
+    </request>
+
+    <request name="button">
+      <description summary="press or release a pointer button">
+        Presses or releases a button at the current pointer position.
+        Button codes are Linux evdev codes (BTN_LEFT is 0x110).
+      </description>
+      <arg name="button" type="uint" summary="Linux evdev button code"/>
+      <arg name="state" type="uint" enum="button_state" summary="pressed or released"/>
+    </request>
+
+    <request name="scroll">
+      <description summary="scroll">
+        High-resolution scroll on one axis; one wheel notch is a value120
+        of plus or minus 120.
+      </description>
+      <arg name="axis" type="uint" enum="axis" summary="scroll axis"/>
+      <arg name="value120" type="int" summary="scroll amount; one notch = +-120"/>
+    </request>
+
+    <enum name="button_state">
+      <description summary="button states"/>
+      <entry name="released" value="0" summary="button released"/>
+      <entry name="pressed" value="1" summary="button pressed"/>
+    </enum>
+
+    <enum name="axis">
+      <description summary="scroll axes"/>
+      <entry name="vertical" value="0" summary="vertical scroll"/>
+      <entry name="horizontal" value="1" summary="horizontal scroll"/>
+    </enum>
+  </interface>
+
+  <interface name="vitrin_actuator_text" version="1" verb="actuate_text">
+    <description summary="text actuation facet">
+      The text-injection capability. Semantics are "deliver this Unicode
+      string", never "press these keys": the payload bypasses keymaps and
+      input methods entirely, and the delivery path (the shim's dynamically
+      generated keymap) is an implementation detail the agent cannot
+      observe. Minted inert by request_grant; fire-and-forget, refusals via
+      vitrin_grant.refused(actuate_text, ...). Key chords are deliberately
+      not expressible by agents in version 1 - that is a distinct key
+      actuation verb reserved for a later phase.
+    </description>
+
+    <request name="type">
+      <description summary="deliver a Unicode string">
+        Delivers UTF-8 text of at most 4096 bytes to the granted target.
+        Normative control-character rule: a newline (U+000A) MUST be
+        rendered as a Return keypress and a tab (U+0009) as Tab by the
+        delivery path - this is how an agent submits a form or presses
+        Enter after a URL. All other C0 and C1 control characters are
+        fatal "invalid_argument": a correct client never emits them.
+      </description>
+      <arg name="text" type="string" summary="UTF-8 text to deliver (max 4096 bytes)"/>
+    </request>
+  </interface>
+
+  <interface name="vitrin_shim_session" version="1">
+    <description summary="shim connection bootstrap">
+      The connection-lifecycle object of a shim connection, implicit
+      object 1. Authentication is structural: the inherited socketpair is
+      the credential, and the realm identity was assigned at fork - this
+      protocol contains no request by which a shim sets, claims, or
+      changes its realm identity. The shim's protocol version is pinned at
+      spawn (the core and its shims are release-paired; there is no shim
+      hello).
+
+      Shim connections carry no fatal-error event: a shim that violates
+      the protocol is logged and its connection closed (named log-only
+      conditions: invalid_buffer for geometry or fd-size lies, bad_order
+      for damage or commit against a never-attached surface or an unknown
+      buffer_id, already_initialized for a second get_seat). Socketpair
+      EOF is shim death: the core survives, closes every in-flight buffer
+      fd, and drops the realm's surface - agents' next captures refuse
+      "no_surface". Version 1 has no restart policy.
+    </description>
+
+    <event name="configure">
+      <description summary="realm identity and view geometry">
+        The core's first message on a shim connection, guaranteed to
+        precede the processing of any shim request - the shim performs one
+        synchronous read at startup before serving its private Wayland
+        socket. Carries the realm identity (informational; the shim can
+        never assert it) and the realm-view size the shim advertises to
+        its app via its own output and window-configure machinery (the
+        single-maximized layout). May be re-sent when the view resizes; a
+        version-1 core may letterbox instead, but the message exists so
+        that resize is never a protocol change.
+      </description>
+      <arg name="realm" type="string" summary="realm identity assigned at fork (max 64 bytes)"/>
+      <arg name="width" type="uint" summary="realm-view width in pixels"/>
+      <arg name="height" type="uint" summary="realm-view height in pixels"/>
+    </event>
+
+    <request name="create_surface">
+      <description summary="create a surface for the app's content">
+        Creates a surface through which the shim forwards its app's
+        committed buffers. Version 1 composites realm surfaces with a
+        trivial single-maximized layout, but nothing in the protocol
+        hard-codes exactly one surface per shim.
+      </description>
+      <arg name="surface" type="new_id" interface="vitrin_shim_surface" summary="the new surface"/>
+    </request>
+
+    <request name="get_seat">
+      <description summary="mint the session's input-delivery object">
+        Creates the seat through which the core delivers input for this
+        realm. Exactly one seat per session: a second get_seat is the
+        log-and-close condition already_initialized. Because seat events
+        are addressed to this shim-allocated object, input the core routes
+        to the realm before the shim has created its seat has no
+        destination and is dropped; a well-behaved shim calls get_seat
+        during startup, immediately after receiving configure.
+      </description>
+      <arg name="seat" type="new_id" interface="vitrin_shim_seat" summary="the new seat"/>
+    </request>
+  </interface>
+
+  <interface name="vitrin_shim_surface" version="1">
+    <description summary="shim-to-core buffer path">
+      The buffer path from shim to core, with Wayland's proven
+      pending-state semantics: attach and damage mutate pending state
+      only; commit atomically latches it. Buffers are identified by
+      shim-chosen cookies (buffer_id) rather than buffer objects; the
+      buffer_done event echoes the cookie to return ownership. On
+      connection death the core closes every fd it holds.
+    </description>
+
+    <request name="attach">
+      <description summary="stage a buffer as pending">
+        Stages a buffer for the next commit. buffer_id is a shim-chosen
+        cookie naming this buffer in later buffer_done events. In
+        version-1 practice kind is shm: a memfd the core copies in at
+        commit. kind dmabuf is the same message - single-plane, linear
+        modifier implied (there is deliberately no modifier argument the
+        core could fail to honor); explicit modifiers and multi-planar
+        formats arrive as a since-gated parameter builder in a later
+        version, one fd per message, so the one-fd rule never becomes a
+        wall. Geometry inconsistent with the fd's actual size, a zero
+        dimension, or a stride overflow is the log-and-close condition
+        invalid_buffer; re-attaching a dmabuf buffer_id that has not yet
+        received buffer_done is bad_order.
+      </description>
+      <arg name="buffer_id" type="uint" summary="shim-chosen cookie identifying this buffer"/>
+      <arg name="fd" type="fd" summary="memfd (kind shm) or dmabuf (kind dmabuf)"/>
+      <arg name="kind" type="uint" enum="kind" summary="what the fd is"/>
+      <arg name="format" type="uint" enum="vitrin_view.format" summary="pixel format (DRM fourcc value)"/>
+      <arg name="width" type="uint" summary="buffer width in pixels"/>
+      <arg name="height" type="uint" summary="buffer height in pixels"/>
+      <arg name="stride" type="uint" summary="row stride in bytes"/>
+    </request>
+
+    <request name="damage">
+      <description summary="add a pending damage rectangle">
+        Adds a buffer-coordinate damage rectangle to pending state.
+        Repeatable; rectangles accumulate as a union until commit and
+        travel per-rectangle on the wire so damage-only updates are
+        verifiable in logs. Damage is a hint - the core may repaint more -
+        and out-of-bounds rectangles are clamped, not fatal.
+      </description>
+      <arg name="x" type="int" summary="rectangle x in buffer coordinates"/>
+      <arg name="y" type="int" summary="rectangle y in buffer coordinates"/>
+      <arg name="width" type="int" summary="rectangle width"/>
+      <arg name="height" type="int" summary="rectangle height"/>
+    </request>
+
+    <request name="commit">
+      <description summary="atomically apply pending state">
+        Latches pending attach and damage atomically into the surface's
+        current state. A commit with no new attach re-presents the current
+        buffer with the new damage (a repaint) - legal, not an error.
+        Damage or commit against a surface that has never been attached is
+        the log-and-close condition bad_order.
+      </description>
+    </request>
+
+    <event name="frame_done">
+      <description summary="frame pacing callback">
+        The frame-callback relay: sent after a commit's content has been
+        presented (or would have been, headless). At most one outstanding
+        frame_done per commit, FIFO-correlated; the shim fans it out to
+        its app's frame callbacks so the app throttles to the true output
+        cadence. frame_done is per commit and independent of buffer
+        disposition: a commit whose attached buffer failed (buffer_done
+        with a failure status) re-presents the previous content and still
+        receives its frame_done, so the app's pacing loop never stalls on a
+        rejected buffer.
+      </description>
+      <arg name="time_ms" type="uint" summary="presentation time in milliseconds, monotonic domain"/>
+    </event>
+
+    <event name="buffer_done">
+      <description summary="buffer ownership returns (exactly once per attach)">
+        Terminal disposition of one attach, exactly once per attach, in
+        attach order per surface - including an attach superseded by
+        another attach before commit, which is released promptly without
+        being used. Status released means the core (and GPU) are done with
+        the buffer: the shim, and its app, may reuse it - prompt after the
+        copy under version-1 shm copy-in, at GPU-done under dmabuf
+        passthrough (the same message; only the timing regime changes).
+        The failure statuses mean the buffer was not used (the previously
+        committed content remains on screen) and direct the shim to fall
+        back to shm; ownership returns in the same breath. Deliberately
+        not merged with frame_done: buffer reusability and frame pacing
+        are different facts that only coincide under copy-in.
+
+        File-descriptor ownership: the core takes ownership of the fd
+        received in attach and closes it before or as it emits this event
+        for that buffer_id (after copying the pixels out under shm, or
+        after importing under dmabuf, or immediately on a failure status).
+        The shim owns its buffer, never the passed fd, once buffer_done
+        arrives. On connection death the core closes every attach fd it
+        still holds.
+      </description>
+      <arg name="buffer_id" type="uint" summary="the cookie given in attach"/>
+      <arg name="status" type="uint" enum="buffer_status" summary="disposition of that attach"/>
+    </event>
+
+    <enum name="kind">
+      <description summary="attached fd kinds"/>
+      <entry name="shm" value="0" summary="memfd; the core copies pixels in at commit"/>
+      <entry name="dmabuf" value="1" summary="dmabuf; the core imports it zero-copy, single-plane, linear modifier implied"/>
+    </enum>
+
+    <enum name="buffer_status">
+      <description summary="attach dispositions"/>
+      <entry name="released" value="0" summary="the buffer was used (or superseded) and may be reused"/>
+      <entry name="import_failed" value="1" summary="dmabuf import failed; fall back to shm; buffer unused and released"/>
+      <entry name="format_unsupported" value="2" summary="format not usable by the renderer; fall back to shm; buffer unused and released"/>
+      <entry name="too_large" value="3" summary="buffer exceeds the renderer's limits; fall back to shm; buffer unused and released"/>
+    </enum>
+  </interface>
+
+  <interface name="vitrin_shim_seat" version="1">
+    <description summary="input delivery to the shim (events only, origin-tagged)">
+      Input delivery from core to shim. The shim replays these events to
+      its app through its own virtual seat; the core owns the mapping from
+      principals to shim seats. Every event carries origin as its final
+      argument - per-event tagging, never modal start/stop envelopes
+      (modal state desyncs and fuzzes badly) - preserving the
+      physical-versus-emulated distinction end to end from day one,
+      because physically-originated consent in a later phase is built on
+      it. This structural rule is enforced by the schema.
+
+      Pointer coordinates are realm-view pixels; the shim maps view to
+      surface-local coordinates. Focus in version 1 is synthesized
+      shim-side (a single-surface realm: pointer enter on first motion,
+      keyboard focus held on the app); an explicit tagged focus event is
+      the multi-surface addition of a later version.
+    </description>
+
+    <event name="motion">
+      <description summary="pointer moved">
+        Pointer motion to realm-view (x, y). Coordinates are fixed-point
+        so that later server-side motion synthesis can be sub-pixel
+        without a signature change (the agent-facing move request stays
+        integer because agents address captured pixels).
+      </description>
+      <arg name="x" type="fixed" summary="realm-view x"/>
+      <arg name="y" type="fixed" summary="realm-view y"/>
+      <arg name="origin" type="uint" enum="origin" summary="who caused this event"/>
+    </event>
+
+    <event name="button">
+      <description summary="pointer button">
+        Button press or release at the current pointer position; Linux
+        evdev button codes.
+      </description>
+      <arg name="button" type="uint" summary="Linux evdev button code"/>
+      <arg name="state" type="uint" enum="vitrin_actuator_pointer.button_state" summary="pressed or released"/>
+      <arg name="origin" type="uint" enum="origin" summary="who caused this event"/>
+    </event>
+
+    <event name="scroll">
+      <description summary="scroll">
+        High-resolution scroll; one wheel notch is plus or minus 120.
+      </description>
+      <arg name="axis" type="uint" enum="vitrin_actuator_pointer.axis" summary="scroll axis"/>
+      <arg name="value120" type="int" summary="scroll amount; one notch = +-120"/>
+      <arg name="origin" type="uint" enum="origin" summary="who caused this event"/>
+    </event>
+
+    <event name="key">
+      <description summary="key press or release (keysym)">
+        A key event for the human path: physical typing in nested mode
+        flows core to shim to app, and humans press chords, arrows, and
+        function keys that a text string cannot carry. Keys travel as
+        xkbcommon keysyms, not keycodes: layout-independent, requiring no
+        keymap-relay message and no keymap interpretation inside the core
+        (nested host input already arrives interpreted), and the shim maps
+        keysyms into the same dynamically generated keymap machinery that
+        text delivery already requires.
+
+        Normative modifier-suppression rule: keysyms arrive already
+        modifier-resolved. The shim MUST bind each non-modifier keysym at
+        an unmodified (plain) level of its dynamic keymap for replay, so
+        that modifiers already applied are never applied twice. Modifier
+        keysyms (Shift_L, Control_L, Alt_L, Super_L, and friends) are
+        forwarded as ordinary key events and convey chord state to the app
+        only; they MUST NOT change the level at which subsequent resolved
+        keysyms bind. Documented version-1 limitation: raw-scancode
+        fidelity for keymap-sensitive apps is a later version's keymap
+        relay plus keycode event.
+      </description>
+      <arg name="keysym" type="uint" summary="xkbcommon keysym, modifier-resolved"/>
+      <arg name="state" type="uint" enum="key_state" summary="pressed or released"/>
+      <arg name="origin" type="uint" enum="origin" summary="who caused this event"/>
+    </event>
+
+    <event name="text">
+      <description summary="deliver a Unicode string">
+        Text delivery - the agent actuation path in version 1, always
+        origin emulated. The shim renders the string via its dynamic
+        keymap; a newline MUST be rendered as Return and a tab as Tab,
+        mirroring the actuator contract. The origin tag on text is what
+        keeps a later phase's human input-method text (origin physical)
+        purely additive.
+      </description>
+      <arg name="text" type="string" summary="UTF-8 text to deliver (max 4096 bytes)"/>
+      <arg name="origin" type="uint" enum="origin" summary="who caused this event"/>
+    </event>
+
+    <enum name="key_state">
+      <description summary="key states"/>
+      <entry name="released" value="0" summary="key released"/>
+      <entry name="pressed" value="1" summary="key pressed"/>
+    </enum>
+
+    <enum name="origin">
+      <description summary="input origin (physical versus emulated)">
+        The libei/EIS distinction, preserved through the hop where libei
+        drops it: physical means a real human input device produced this
+        event; emulated means a principal's actuator (or, later, motion
+        synthesis) produced it. Present on every seat event as the final
+        argument, from day one, because later phases hang
+        physically-originated consent on it.
+      </description>
+      <entry name="physical" value="0" summary="produced by a physical human input device"/>
+      <entry name="emulated" value="1" summary="produced by a principal's actuator"/>
+    </enum>
+  </interface>
+
+</protocol>

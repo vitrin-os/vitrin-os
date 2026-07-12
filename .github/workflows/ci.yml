@@ -1,0 +1,45 @@
+name: CI
+
+# Minimal CI for P1.1.2 (vitrin-scanner codegen) only: build, test, the
+# codegen drift check, and a standalone C header compile check. Deliberately
+# does NOT include Meson, fuzzing, golden-frame, or wlcs jobs -- those belong
+# to the ci-docs track (a separate tracked issue) and would be scope creep
+# here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # Fail the build on any compiler warning, matching how this workspace is
+  # developed and verified locally.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build-test-codegen:
+    name: build, test, codegen --check, header compile check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # rustfmt is a real runtime dependency of the codegen (rust_gen.rs
+          # shells out to it so generated output is a pure function of the
+          # IDL regardless of the local machine's rustfmt availability).
+          components: rustfmt
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo xtask codegen --check
+        run: cargo xtask codegen --check
+
+      - name: C header compiles standalone (shim/include/vitrin-protocol.h)
+        run: cc -std=c11 -Wall -Werror -I shim/include -c shim/tests/test_header_compiles.c -o /dev/null

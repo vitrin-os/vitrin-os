@@ -1,0 +1,23 @@
+// GENERATED FILE -- DO NOT EDIT BY HAND.
+//
+// Source: protocol/vitrin-v0.xml
+// Regenerate with: cargo xtask codegen
+
+//! One module per protocol interface, in `protocol/vitrin-v0.xml` document order.
+
+/// The `vitrin` protocol's single wire version integer (`protocol/@version`);
+/// also the first argument of `vitrin_handshake::Hello`. An exact match is
+/// required -- downgrade is refusal, not negotiation.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+pub mod vitrin_handshake;
+pub mod vitrin_principal;
+pub mod vitrin_realm;
+pub mod vitrin_grant;
+pub mod vitrin_consent;
+pub mod vitrin_view;
+pub mod vitrin_actuator_pointer;
+pub mod vitrin_actuator_text;
+pub mod vitrin_shim_session;
+pub mod vitrin_shim_surface;
+pub mod vitrin_shim_seat;

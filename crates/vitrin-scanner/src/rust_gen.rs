@@ -1,0 +1,621 @@
+//! Rust codegen backend: IR -> `crates/vitrin-protocol/src/generated/*.rs`.
+//!
+//! Emits one file per interface plus a `mod.rs` that declares them all (in
+//! document order). Every generated file starts with [`BANNER`], names the
+//! source XML and the regeneration command, and contains nothing
+//! nondeterministic (no timestamps) -- required for idempotency.
+//!
+//! Generated code calls into hand-written runtime support in
+//! `vitrin_protocol::wire` / `::error` / `::fixed` rather than re-emitting
+//! byte-twiddling logic per message; see those modules' doc comments.
+
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+
+use anyhow::{bail, Context, Result};
+
+use crate::casing::{to_pascal_case, to_screaming_snake};
+use crate::gen_util::{doc_text, format_u32_literal, Buf};
+use crate::ir::{Arg, ArgType, EnumDef, EnumRef, Interface, Message, Protocol};
+
+/// Banner every generated file starts with. Deliberately free of timestamps
+/// or any other per-run-varying content: idempotency (running the generator
+/// twice produces byte-identical output) depends on it.
+const BANNER: &str = "\
+// GENERATED FILE -- DO NOT EDIT BY HAND.
+//
+// Source: protocol/vitrin-v0.xml
+// Regenerate with: cargo xtask codegen
+";
+
+/// Generate the whole `generated/` directory tree into `out_dir`
+/// (conventionally `crates/vitrin-protocol/src/generated`).
+pub fn generate(protocol: &Protocol, out_dir: &Path) -> Result<()> {
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("creating output directory {}", out_dir.display()))?;
+
+    for iface in &protocol.interfaces {
+        let contents = interface_file(protocol, iface);
+        let path = out_dir.join(format!("{}.rs", iface.name));
+        write_formatted(&path, &contents)?;
+    }
+
+    let mod_rs = mod_file(protocol);
+    write_formatted(&out_dir.join("mod.rs"), &mod_rs)?;
+
+    Ok(())
+}
+
+fn mod_file(protocol: &Protocol) -> String {
+    let mut buf = Buf::default();
+    buf.line(BANNER);
+    buf.line("//! One module per protocol interface, in `protocol/vitrin-v0.xml` document order.");
+    buf.blank();
+    buf.line(format!(
+        "/// The `{}` protocol's single wire version integer (`protocol/@version`);",
+        protocol.name
+    ));
+    buf.line("/// also the first argument of `vitrin_handshake::Hello`. An exact match is");
+    buf.line("/// required -- downgrade is refusal, not negotiation.");
+    buf.line(format!(
+        "pub const PROTOCOL_VERSION: u32 = {};",
+        protocol.version
+    ));
+    buf.blank();
+    for iface in &protocol.interfaces {
+        buf.line(format!("pub mod {};", iface.name));
+    }
+    buf.0
+}
+
+fn interface_file(protocol: &Protocol, iface: &Interface) -> String {
+    let mut buf = Buf::default();
+    buf.line(BANNER);
+    buf.line(format!(
+        "//! Interface `{}`, version {}.",
+        iface.name, iface.version
+    ));
+    if !iface.summary.is_empty() {
+        buf.line("//!");
+        buf.line(format!("//! {}", doc_text(&iface.summary)));
+    }
+    buf.blank();
+
+    buf.line(format!(
+        "pub const INTERFACE_NAME: &str = \"{}\";",
+        iface.name
+    ));
+    buf.line(format!(
+        "pub const INTERFACE_VERSION: u32 = {};",
+        iface.version
+    ));
+    if let Some(verb) = &iface.verb {
+        buf.blank();
+        buf.line(format!(
+            "/// Every request on this interface exercises the grant verb `{verb}`."
+        ));
+        buf.line(format!("pub const VERB: &str = \"{verb}\";"));
+    }
+
+    // Requests and events nest under their own submodules (rather than
+    // sitting flat in the interface module alongside enums) so that a
+    // message name can never collide with an enum name in the same
+    // interface -- e.g. `vitrin_handshake` defines both an `error` *event*
+    // and an `error` *enum*; `requests`/`events`/`<flat>` are three disjoint
+    // namespaces, so `events::Error` and `Error` (the enum) coexist without
+    // a special-cased rename heuristic.
+    if !iface.requests.is_empty() {
+        buf.blank();
+        buf.line("pub mod requests {");
+        for msg in &iface.requests {
+            buf.blank();
+            gen_message(&mut buf, protocol, iface, msg, MessageKind::Request);
+        }
+        buf.line("}");
+    }
+    if !iface.events.is_empty() {
+        buf.blank();
+        buf.line("pub mod events {");
+        for msg in &iface.events {
+            buf.blank();
+            gen_message(&mut buf, protocol, iface, msg, MessageKind::Event);
+        }
+        buf.line("}");
+    }
+    for enum_def in &iface.enums {
+        buf.blank();
+        gen_enum(&mut buf, iface, enum_def);
+    }
+
+    buf.0
+}
+
+#[derive(Clone, Copy)]
+enum MessageKind {
+    Request,
+    Event,
+}
+
+impl MessageKind {
+    fn label(self) -> &'static str {
+        match self {
+            MessageKind::Request => "Request",
+            MessageKind::Event => "Event",
+        }
+    }
+}
+
+fn gen_message(
+    buf: &mut Buf,
+    protocol: &Protocol,
+    iface: &Interface,
+    msg: &Message,
+    kind: MessageKind,
+) {
+    let struct_name = to_pascal_case(&msg.name);
+    let has_fd = msg.has_fd();
+
+    buf.line(format!(
+        "/// {} `{}` (opcode {}) on `{}`.",
+        kind.label(),
+        msg.name,
+        msg.opcode,
+        iface.name
+    ));
+    if !msg.summary.is_empty() {
+        buf.line("///");
+        buf.line(format!("/// {}", doc_text(&msg.summary)));
+    }
+    if has_fd {
+        // `OwnedFd` is not `Clone`/`PartialEq`, so a message with an fd
+        // argument can only derive `Debug`.
+        buf.line("#[derive(Debug)]");
+    } else {
+        buf.line("#[derive(Debug, Clone, PartialEq, Eq)]");
+    }
+    buf.line(format!("pub struct {struct_name} {{"));
+    for arg in &msg.args {
+        gen_field(buf, protocol, arg);
+    }
+    buf.line("}");
+    buf.blank();
+
+    buf.line(format!("impl {struct_name} {{"));
+    buf.line(format!("    pub const OPCODE: u8 = {};", msg.opcode));
+    buf.line(format!("    pub const HAS_FD: bool = {has_fd};"));
+    buf.blank();
+    gen_encode(buf, protocol, msg);
+    buf.blank();
+    gen_decode(buf, protocol, msg, &struct_name);
+    buf.line("}");
+}
+
+fn gen_field(buf: &mut Buf, protocol: &Protocol, arg: &Arg) {
+    let mut doc = doc_text(&arg.summary);
+    let ty = field_type(protocol, arg);
+    match &arg.ty {
+        ArgType::NewId { interface } => {
+            if doc.is_empty() {
+                doc = format!("(new_id: {interface})");
+            } else {
+                doc = format!("{doc} (new_id: {interface})");
+            }
+        }
+        ArgType::Object { interface } => {
+            if doc.is_empty() {
+                doc = format!("(object: {interface})");
+            } else {
+                doc = format!("{doc} (object: {interface})");
+            }
+        }
+        ArgType::Fd => {
+            let note = "not present in the byte buffer; carried out-of-band via SCM_RIGHTS";
+            doc = if doc.is_empty() {
+                note.to_string()
+            } else {
+                format!("{doc} ({note})")
+            };
+        }
+        _ => {}
+    }
+    if !doc.is_empty() {
+        buf.line(format!("    /// {doc}"));
+    }
+    buf.line(format!("    pub {}: {ty},", arg.name));
+}
+
+/// The Rust field type for one argument.
+fn field_type(protocol: &Protocol, arg: &Arg) -> String {
+    match &arg.ty {
+        ArgType::Int { enum_ref: None } => "i32".to_string(),
+        ArgType::Int { enum_ref: Some(r) } | ArgType::Uint { enum_ref: Some(r) } => {
+            enum_type_path(protocol, r)
+        }
+        ArgType::Uint { enum_ref: None } => "u32".to_string(),
+        ArgType::Fixed => "crate::fixed::Fixed".to_string(),
+        ArgType::String { .. } => "String".to_string(),
+        ArgType::Object { .. } => {
+            if arg.allow_null {
+                "Option<u32>".to_string()
+            } else {
+                "u32".to_string()
+            }
+        }
+        ArgType::NewId { .. } => "u32".to_string(),
+        ArgType::Fd => "std::os::fd::OwnedFd".to_string(),
+    }
+}
+
+fn enum_type_path(protocol: &Protocol, r: &EnumRef) -> String {
+    let iface = protocol.interface(&r.interface).unwrap_or_else(|| {
+        panic!(
+            "unresolved enum-ref interface '{}': should have been caught by validate_enum_refs",
+            r.interface
+        )
+    });
+    let def = iface.enum_def(&r.name).unwrap_or_else(|| {
+        panic!(
+            "unresolved enum-ref '{}.{}': should have been caught by validate_enum_refs",
+            r.interface, r.name
+        )
+    });
+    format!(
+        "crate::generated::{}::{}",
+        r.interface,
+        to_pascal_case(&def.name)
+    )
+}
+
+fn is_bitfield(protocol: &Protocol, r: &EnumRef) -> bool {
+    protocol
+        .interface(&r.interface)
+        .and_then(|i| i.enum_def(&r.name))
+        .map(|e| e.bitfield)
+        .unwrap_or(false)
+}
+
+fn gen_encode(buf: &mut Buf, protocol: &Protocol, msg: &Message) {
+    buf.line("    /// Encode into a complete frame (header + argument payload). The fd");
+    buf.line("    /// argument, if this message has one, is not written here -- send it");
+    buf.line("    /// out-of-band via `SCM_RIGHTS` alongside these bytes.");
+    buf.line("    pub fn encode(&self, object_id: u32) -> Vec<u8> {");
+    buf.line("        let mut out = Vec::new();");
+    buf.line("        crate::wire::FrameHeader {");
+    buf.line("            object_id,");
+    buf.line("            size: 0,");
+    buf.line("            opcode: Self::OPCODE,");
+    buf.line("            fd_count: Self::HAS_FD as u8,");
+    buf.line("        }.encode_with_placeholder_size(&mut out);");
+    for arg in &msg.args {
+        if let Some(line) = encode_arg_line(protocol, arg) {
+            buf.line(format!("        {line}"));
+        }
+    }
+    buf.line("        crate::wire::patch_size(&mut out);");
+    buf.line("        out");
+    buf.line("    }");
+}
+
+fn encode_arg_line(protocol: &Protocol, arg: &Arg) -> Option<String> {
+    let field = &arg.name;
+    Some(match &arg.ty {
+        ArgType::Int { enum_ref: None } => {
+            format!("crate::wire::write_int(&mut out, self.{field});")
+        }
+        ArgType::Int { enum_ref: Some(r) } => {
+            if is_bitfield(protocol, r) {
+                format!("crate::wire::write_int(&mut out, self.{field}.bits() as i32);")
+            } else {
+                format!("crate::wire::write_int(&mut out, self.{field}.to_wire() as i32);")
+            }
+        }
+        ArgType::Uint { enum_ref: None } => {
+            format!("crate::wire::write_uint(&mut out, self.{field});")
+        }
+        ArgType::Uint { enum_ref: Some(r) } => {
+            if is_bitfield(protocol, r) {
+                format!("crate::wire::write_uint(&mut out, self.{field}.bits());")
+            } else {
+                format!("crate::wire::write_uint(&mut out, self.{field}.to_wire());")
+            }
+        }
+        ArgType::Fixed => format!("crate::wire::write_int(&mut out, self.{field}.to_bits());"),
+        ArgType::String { max_bytes } => {
+            format!("crate::wire::write_string(&mut out, &self.{field}, {max_bytes});")
+        }
+        ArgType::Object { .. } => {
+            if arg.allow_null {
+                format!("crate::wire::write_uint(&mut out, self.{field}.unwrap_or(0));")
+            } else {
+                format!("crate::wire::write_uint(&mut out, self.{field});")
+            }
+        }
+        ArgType::NewId { .. } => format!("crate::wire::write_uint(&mut out, self.{field});"),
+        ArgType::Fd => return None, // never in the byte buffer
+    })
+}
+
+fn gen_decode(buf: &mut Buf, protocol: &Protocol, msg: &Message, struct_name: &str) {
+    buf.line("    /// Decode a complete frame (header + argument payload) plus, iff");
+    buf.line("    /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the");
+    buf.line("    /// frame's `object_id` (routing data the caller's dispatcher needs)");
+    buf.line("    /// alongside the decoded message.");
+    buf.line("    ///");
+    buf.line("    /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two");
+    buf.line("    /// independent disjuncts, both checked here: the header's own `fd_count`");
+    buf.line("    /// byte disagreeing with this message's signature, and the out-of-band");
+    buf.line("    /// `fd` parameter disagreeing with it. A hostile or buggy peer can make");
+    buf.line("    /// either one lie without the other, so neither check substitutes for");
+    buf.line("    /// the other.");
+    buf.line("    pub fn decode(");
+    buf.line("        bytes: &[u8],");
+    buf.line("        fd: Option<std::os::fd::OwnedFd>,");
+    buf.line("    ) -> Result<(u32, Self), crate::error::DecodeError> {");
+    buf.line("        if fd.is_some() != Self::HAS_FD {");
+    buf.line("            return Err(crate::error::DecodeError::FdCountMismatch {");
+    buf.line("                expected: Self::HAS_FD as u8,");
+    buf.line("                actual: fd.is_some() as u8,");
+    buf.line("            });");
+    buf.line("        }");
+    buf.line("        let header = crate::wire::FrameHeader::decode(bytes)?;");
+    buf.line("        if header.fd_count != Self::HAS_FD as u8 {");
+    buf.line("            return Err(crate::error::DecodeError::FdCountMismatch {");
+    buf.line("                expected: Self::HAS_FD as u8,");
+    buf.line("                actual: header.fd_count,");
+    buf.line("            });");
+    buf.line("        }");
+    buf.line("        #[allow(unused_mut)]");
+    buf.line("        let mut pos = crate::wire::HEADER_LEN;");
+    for arg in &msg.args {
+        buf.line(format!("        {}", decode_arg_line(protocol, arg)));
+    }
+    buf.line("        if pos != bytes.len() {");
+    buf.line("            return Err(crate::error::DecodeError::TrailingBytes {");
+    buf.line("                consumed: pos,");
+    buf.line("                total: bytes.len(),");
+    buf.line("            });");
+    buf.line("        }");
+    buf.line(format!("        Ok((header.object_id, {struct_name} {{"));
+    for arg in &msg.args {
+        buf.line(format!("            {},", arg.name));
+    }
+    buf.line("        }))");
+    buf.line("    }");
+}
+
+fn decode_arg_line(protocol: &Protocol, arg: &Arg) -> String {
+    let field = &arg.name;
+    match &arg.ty {
+        ArgType::Int { enum_ref: None } => {
+            format!("let {field} = crate::wire::read_int(bytes, &mut pos)?;")
+        }
+        ArgType::Int { enum_ref: Some(r) } => {
+            let path = enum_type_path(protocol, r);
+            if is_bitfield(protocol, r) {
+                format!("let {field} = {path}::from_bits(crate::wire::read_int(bytes, &mut pos)? as u32)?;")
+            } else {
+                format!("let {field} = {path}::from_wire(crate::wire::read_int(bytes, &mut pos)? as u32)?;")
+            }
+        }
+        ArgType::Uint { enum_ref: None } => {
+            format!("let {field} = crate::wire::read_uint(bytes, &mut pos)?;")
+        }
+        ArgType::Uint { enum_ref: Some(r) } => {
+            let path = enum_type_path(protocol, r);
+            if is_bitfield(protocol, r) {
+                format!(
+                    "let {field} = {path}::from_bits(crate::wire::read_uint(bytes, &mut pos)?)?;"
+                )
+            } else {
+                format!(
+                    "let {field} = {path}::from_wire(crate::wire::read_uint(bytes, &mut pos)?)?;"
+                )
+            }
+        }
+        ArgType::Fixed => {
+            format!("let {field} = crate::fixed::Fixed::from_bits(crate::wire::read_int(bytes, &mut pos)?);")
+        }
+        ArgType::String { max_bytes } => {
+            format!("let {field} = crate::wire::read_string(bytes, &mut pos, {max_bytes})?;")
+        }
+        ArgType::Object { .. } => {
+            if arg.allow_null {
+                format!(
+                    "let {field} = crate::wire::read_uint(bytes, &mut pos)?; let {field} = if {field} == 0 {{ None }} else {{ Some({field}) }};"
+                )
+            } else {
+                format!("let {field} = crate::wire::read_uint(bytes, &mut pos)?;")
+            }
+        }
+        ArgType::NewId { .. } => format!("let {field} = crate::wire::read_uint(bytes, &mut pos)?;"),
+        ArgType::Fd => format!("let {field} = fd.expect(\"fd presence already validated above\");"),
+    }
+}
+
+fn gen_enum(buf: &mut Buf, iface: &Interface, enum_def: &EnumDef) {
+    if enum_def.bitfield {
+        gen_bitfield_enum(buf, iface, enum_def);
+    } else {
+        gen_plain_enum(buf, iface, enum_def);
+    }
+}
+
+fn gen_plain_enum(buf: &mut Buf, iface: &Interface, enum_def: &EnumDef) {
+    let type_name = to_pascal_case(&enum_def.name);
+    buf.line(format!("/// Enum `{}` on `{}`.", enum_def.name, iface.name));
+    if !enum_def.summary.is_empty() {
+        buf.line("///");
+        buf.line(format!("/// {}", doc_text(&enum_def.summary)));
+    }
+    buf.line("///");
+    buf.line("/// Plain enum: a wire value MUST exactly equal one defined entry.");
+    buf.line("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]");
+    buf.line("#[repr(u32)]");
+    buf.line(format!("pub enum {type_name} {{"));
+    for entry in &enum_def.entries {
+        let variant = to_pascal_case(&entry.name);
+        if !entry.summary.is_empty() {
+            buf.line(format!("    /// {}", doc_text(&entry.summary)));
+        }
+        buf.line(format!(
+            "    {variant} = {},",
+            format_u32_literal(entry.value)
+        ));
+    }
+    buf.line("}");
+    buf.blank();
+    buf.line(format!("impl {type_name} {{"));
+    buf.line("    /// Every defined entry, in document order. Lets generic code (property");
+    buf.line("    /// tests, a future C backend) enumerate valid values without hardcoding");
+    buf.line("    /// them, so an appended entry can never be silently missed.");
+    buf.line(format!("    pub const ALL: &'static [{type_name}] = &["));
+    for entry in &enum_def.entries {
+        let variant = to_pascal_case(&entry.name);
+        buf.line(format!("        {type_name}::{variant},"));
+    }
+    buf.line("    ];");
+    buf.blank();
+    buf.line("    /// Decode a wire value, by whole-value membership in the defined entries.");
+    buf.line("    pub fn from_wire(value: u32) -> Result<Self, crate::error::DecodeError> {");
+    buf.line("        match value {");
+    for entry in &enum_def.entries {
+        let variant = to_pascal_case(&entry.name);
+        buf.line(format!(
+            "            {} => Ok({type_name}::{variant}),",
+            format_u32_literal(entry.value)
+        ));
+    }
+    buf.line("            _ => Err(crate::error::DecodeError::InvalidEnumValue {");
+    buf.line(format!("                interface: \"{}\",", iface.name));
+    buf.line(format!("                enum_name: \"{}\",", enum_def.name));
+    buf.line("                value,");
+    buf.line("            }),");
+    buf.line("        }");
+    buf.line("    }");
+    buf.blank();
+    buf.line("    /// The wire value for this entry.");
+    buf.line("    pub fn to_wire(self) -> u32 {");
+    buf.line("        self as u32");
+    buf.line("    }");
+    buf.line("}");
+}
+
+fn gen_bitfield_enum(buf: &mut Buf, iface: &Interface, enum_def: &EnumDef) {
+    let type_name = to_pascal_case(&enum_def.name);
+    buf.line(format!(
+        "/// Enum `{}` on `{}` (bitfield).",
+        enum_def.name, iface.name
+    ));
+    if !enum_def.summary.is_empty() {
+        buf.line("///");
+        buf.line(format!("/// {}", doc_text(&enum_def.summary)));
+    }
+    buf.line("///");
+    buf.line("/// Bitfield: any combination of the defined entries' bits is a legal wire");
+    buf.line("/// value; a bit outside their union is invalid.");
+    buf.line("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]");
+    buf.line(format!("pub struct {type_name}(u32);"));
+    buf.blank();
+    buf.line(format!("impl {type_name} {{"));
+    for entry in &enum_def.entries {
+        let const_name = to_screaming_snake(&entry.name);
+        if !entry.summary.is_empty() {
+            buf.line(format!("    /// {}", doc_text(&entry.summary)));
+        }
+        buf.line(format!(
+            "    pub const {const_name}: {type_name} = {type_name}({});",
+            format_u32_literal(entry.value)
+        ));
+    }
+    buf.blank();
+    let mask_expr = enum_def
+        .entries
+        .iter()
+        .map(|e| format_u32_literal(e.value))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    buf.line("    /// Union of every defined entry's bits; a wire value with any other");
+    buf.line("    /// bit set is invalid.");
+    buf.line(format!("    pub const VALID_MASK: u32 = {mask_expr};"));
+    buf.blank();
+    buf.line("    /// Decode a wire value, rejecting any bit outside `VALID_MASK`.");
+    buf.line("    pub fn from_bits(value: u32) -> Result<Self, crate::error::DecodeError> {");
+    buf.line("        if value & !Self::VALID_MASK != 0 {");
+    buf.line("            Err(crate::error::DecodeError::InvalidBitfieldValue {");
+    buf.line(format!("                interface: \"{}\",", iface.name));
+    buf.line(format!("                enum_name: \"{}\",", enum_def.name));
+    buf.line("                value,");
+    buf.line("            })");
+    buf.line("        } else {");
+    buf.line(format!("            Ok({type_name}(value))"));
+    buf.line("        }");
+    buf.line("    }");
+    buf.blank();
+    buf.line("    /// The raw wire bitmask.");
+    buf.line("    pub fn bits(self) -> u32 {");
+    buf.line("        self.0");
+    buf.line("    }");
+    buf.blank();
+    buf.line("    /// Whether every bit set in `other` is also set in `self`.");
+    buf.line(format!(
+        "    pub fn contains(self, other: {type_name}) -> bool {{"
+    ));
+    buf.line("        self.0 & other.0 == other.0");
+    buf.line("    }");
+    buf.line("}");
+    buf.blank();
+    buf.line(format!("impl std::ops::BitOr for {type_name} {{"));
+    buf.line(format!("    type Output = {type_name};"));
+    buf.blank();
+    buf.line(format!(
+        "    fn bitor(self, rhs: {type_name}) -> {type_name} {{"
+    ));
+    buf.line(format!("        {type_name}(self.0 | rhs.0)"));
+    buf.line("    }");
+    buf.line("}");
+}
+
+/// Write `contents` to `path`, then format it in place with `rustfmt`.
+///
+/// `rustfmt` is required, not best-effort: the exact byte-for-byte shape of
+/// generated files must be a pure function of the IDL input on any machine
+/// that has the pinned `stable` toolchain (which ships `rustfmt`), or the
+/// idempotency and CI diff-check properties this codegen is required to have
+/// would silently depend on whether the local machine happens to have
+/// `rustfmt` installed.
+///
+/// `reorder_modules = false` is passed as an explicit `--config` override,
+/// **not** left to the repo-root `rustfmt.toml` alone: rustfmt discovers that
+/// file by walking up from the *target file's* directory, so it is only ever
+/// found when generating in place under the repo tree. A CI diff-check (or
+/// anyone else) that points `--rust-out-dir` at a scratch directory outside
+/// the repo would otherwise silently get rustfmt's default alphabetical
+/// `pub mod` reordering instead of document order, and every run would
+/// falsely "drift" from the checked-in tree. The explicit `--config` makes
+/// this codegen's output a function of the IDL alone, independent of where
+/// its output directory happens to sit.
+fn write_formatted(path: &Path, contents: &str) -> Result<()> {
+    fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+
+    let status = Command::new("rustfmt")
+        .arg("--edition")
+        .arg("2021")
+        .arg("--config")
+        .arg("reorder_modules=false")
+        .arg(path)
+        .status()
+        .with_context(|| {
+            format!(
+                "running `rustfmt {}` -- is rustfmt installed? (rustup component add rustfmt)",
+                path.display()
+            )
+        })?;
+    if !status.success() {
+        bail!(
+            "rustfmt failed on {} (exit status: {status})",
+            path.display()
+        );
+    }
+    Ok(())
+}

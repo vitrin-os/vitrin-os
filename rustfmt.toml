@@ -1,0 +1,12 @@
+# `reorder_modules` (stable, default `true`) alphabetizes consecutive `mod`/
+# `pub mod` declarations. Generated `crates/vitrin-protocol/src/generated/mod.rs`
+# deliberately lists interface modules in `protocol/vitrin-v0.xml` document
+# order (opcode assignment IS document order -- see the codegen hard rules),
+# so this stays off repo-wide for anyone running `cargo fmt`/`rustfmt` by
+# hand. `vitrin-scanner` itself does not depend on this file being discovered
+# (rustfmt only finds it by walking up from the *target file's* directory,
+# which wouldn't happen for an out-of-tree `--rust-out-dir`): it passes
+# `--config reorder_modules=false` explicitly on every `rustfmt` invocation,
+# so its output is a function of the IDL alone, independent of output-path
+# location. This file is the human-facing counterpart of that same setting.
+reorder_modules = false

@@ -1,0 +1,17 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 456442e710c472058366f8f58424fc282ba7520d689e3ba3e75381a0ac94c085 # shrinks to object_id = 0, v = State { state: Queued }
+cc 4a241e42f5373348cde2a57e582fc820ec8aefc68786bc452cea2d110fe66991 # shrinks to object_id = 0, v = Sync { cookie: 0 }
+cc 59affea2e62cf40672520c5a7984530da7cd564d88b94b6921b8cfa8843fb21d # shrinks to object_id = 0, v = Scroll { axis: Vertical, value120: 0 }
+cc 71ca65bb8a9bb531e487af0d304632e7f5948aa96caf50cd171f642985014d13 # shrinks to object_id = 0, v = Resolved { outcome: Granted, verbs: Verb(0), persistence: Once, expiry_ms: 0 }
+cc 215eb3e298febc6b84a265d7805443443fa24e2e6c99d7a8ef16f1958fc29b7c # shrinks to object_id = 0, v = Button { button: 0, state: Released }
+cc e8e42914b13d1b2abd73acfca182b1d4896d29a184846c0ccf7bb8eb2b8876fd # shrinks to object_id = 0, v = Done { cookie: 0 }
+cc fb19a34e835032dfa7406d953e833d4e1c3631178876ad0fb399b98ba5c0efef # shrinks to object_id = 0, v = Refused { verb: Verb(0), code: NotGranted, retry_after_ms: 0 }
+cc 8f0ba0c7b0267471928d7b2bd6c9b683f7490b199644d772d10fe3e1daa56e78 # shrinks to object_id = 0, v = Type { text: "" }
+cc 1457e6211e13342551602a90ddd45aba2903ff4b32aff10e7c208a8734ce7ae9 # shrinks to object_id = 0, v = Error { object_id: 0, code: InvalidObject, message: "" }
+cc 01778cb737a8e2691fe1600e21b97d8df2f61e3c429d881dc038820607b40ae8 # shrinks to object_id = 0, v = RequestGrant { grant: 0, consent: 0, view: 0, pointer: 0, text: 0, resource: "", verbs: Verb(0), expiry_ms: 0, max_event_rate: 0, persistence: Once, flags: 0 }
+cc cde4de3aea7fb0e5d9dde608b5c77294c4f9791d0848b4409328af9e7aabeaa1 # shrinks to object_id = 0, v = Bound { identity: "" }

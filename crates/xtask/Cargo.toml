@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "cargo xtask codegen [--check] -- regenerate crates/vitrin-protocol/src/generated and shim/include/vitrin-protocol.h from protocol/vitrin-v0.xml"
+publish = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+vitrin-scanner = { path = "../vitrin-scanner" }

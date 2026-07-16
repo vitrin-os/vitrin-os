@@ -314,7 +314,17 @@ fn collect_files(root: &Path, dir: &Path, out: &mut BTreeMap<String, PathBuf>) -
             .with_context(|| format!("stat-ing {}", path.display()))?;
         if file_type.is_dir() {
             collect_files(root, &path, out)?;
-        } else if file_type.is_file() {
+        } else if !file_type.is_file() {
+            // A symlink (or fifo, socket, ...) in a generated-output tree is
+            // never something codegen produces; silently skipping it would
+            // make the drift check blind to whatever it points at (or
+            // shadows). Fail loudly instead.
+            bail!(
+                "unexpected non-regular-file entry {} while walking generated output \
+                 (symlinks are not produced by codegen and are not compared)",
+                path.display()
+            );
+        } else {
             let rel = path
                 .strip_prefix(root)
                 .expect("path was walked from under root, so root must be a prefix of it")

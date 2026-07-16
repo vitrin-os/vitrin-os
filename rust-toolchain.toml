@@ -1,2 +1,9 @@
 [toolchain]
-channel = "stable"
+# Pinned to an exact version, not "stable": `cargo xtask codegen --check`
+# compares generated output byte-for-byte, and that output is a function of
+# rustfmt's exact formatting decisions. A floating channel would make the
+# drift check fail on unrelated future PRs whenever a stable rustfmt release
+# changes a formatting decision, and would let local-vs-CI rustfmt skew
+# produce irreproducible "drift". Bumping this pin is a deliberate act that
+# regenerates the tree in the same commit (`cargo xtask codegen`).
+channel = "1.94.1"

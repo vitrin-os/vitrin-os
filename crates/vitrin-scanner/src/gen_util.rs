@@ -36,7 +36,12 @@ pub fn format_u32_literal(value: u32) -> String {
 }
 
 /// Escape a summary string for embedding in a single-line doc comment
-/// (`///` in Rust, `/* ... */` in C).
+/// (`///` in Rust, `/* ... */` in C). Beyond newline flattening, a literal
+/// `*/` must be defused: inside a generated C block comment it would
+/// terminate the comment early, turning the rest of the summary into
+/// (probably uncompilable, possibly semantically live) C code with no
+/// generation-time error. `*\/` renders near-identically and is inert in
+/// both comment syntaxes.
 pub fn doc_text(s: &str) -> String {
-    s.replace('\n', " ").replace('\r', "")
+    s.replace('\n', " ").replace('\r', "").replace("*/", "*\\/")
 }

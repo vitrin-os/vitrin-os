@@ -174,6 +174,10 @@ macro_rules! impl_message {
                 }
             }
         )*
+        /// How many message types the table above wires into the round-trip
+        /// harness -- asserted against the generated `MESSAGE_COUNT` below so
+        /// a message added to the IDL cannot ship silently untested.
+        const ROUNDTRIP_COVERED_MESSAGES: usize = [$(stringify!($ty)),*].len();
     };
 }
 
@@ -208,6 +212,22 @@ impl_message!(
     SeatKey,
     SeatText,
 );
+
+/// Exhaustiveness gate: the `impl_message!` table must cover every message
+/// the IDL defines (the generated `MESSAGE_COUNT` is emitted for exactly this
+/// assertion). This catches the "IDL grew, test table didn't" failure mode --
+/// a new message makes this test fail until it is added to the table (and,
+/// since the `impl Message` exists only to feed a strategy/test line, in
+/// practice to the `roundtrip_test!` table too).
+#[test]
+fn every_idl_message_is_in_the_roundtrip_table() {
+    assert_eq!(
+        ROUNDTRIP_COVERED_MESSAGES,
+        gen::MESSAGE_COUNT,
+        "a message defined in protocol/vitrin-v0.xml is missing from (or extra in) \
+         roundtrip.rs's impl_message! table"
+    );
+}
 
 /// The property itself: encode the generated value, decode those bytes back,
 /// re-encode the decoded value, and assert the two encoded buffers are
@@ -603,8 +623,9 @@ roundtrip_test!(roundtrip_vitrin_shim_seat_text, seat_text());
 // ---------------------------------------------------------------------------
 // The two fd-bearing messages in v0.xml (grep for an `fd`-typed arg):
 // `vitrin_view.frame_ready` and `vitrin_shim_surface.attach`. Each gets a
-// real, disposable fd pair from `std::io::pipe()` (stable since Rust 1.87,
-// present in this workspace's pinned 1.94 toolchain) rather than skipping fd
+// real, disposable fd pair from `std::io::pipe()` (stable since Rust 1.87;
+// this workspace pins its toolchain in `rust-toolchain.toml` and declares
+// `rust-version` in the workspace `Cargo.toml`) rather than skipping fd
 // coverage: one end is moved into the value that gets encoded, the other is
 // handed to `decode` as the out-of-band fd, exactly mirroring how a real
 // transport would deliver bytes and an SCM_RIGHTS fd side by side. `encode`

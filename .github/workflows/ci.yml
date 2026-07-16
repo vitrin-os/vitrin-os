@@ -1,10 +1,10 @@
 name: CI
 
-# Minimal CI for P1.1.2 (vitrin-scanner codegen) only: build, test, the
-# codegen drift check, and a standalone C header compile check. Deliberately
-# does NOT include Meson, fuzzing, golden-frame, or wlcs jobs -- those belong
-# to the ci-docs track (a separate tracked issue) and would be scope creep
-# here.
+# Minimal CI for P1.1.2 (vitrin-scanner codegen) only: schema validation,
+# test (debug AND release), the codegen drift check, and the C header
+# checks (standalone compile + golden-frame run). Deliberately does NOT
+# include Meson, fuzzing, or wlcs jobs -- those belong to the ci-docs track
+# (a separate tracked issue) and would be scope creep here.
 
 on:
   push:
@@ -18,28 +18,53 @@ env:
 
 jobs:
   build-test-codegen:
-    name: build, test, codegen --check, header compile check
+    name: test (debug+release), codegen --check, C header checks
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
+      - name: Install Rust
+        # rust-toolchain.toml pins the exact version (rustup auto-installs it
+        # on first cargo invocation); this step just guarantees rustup exists
+        # and pre-fetches. rustfmt is a real runtime dependency of the codegen
+        # (rust_gen.rs shells out to it so generated output is a pure function
+        # of the IDL regardless of the local machine's rustfmt availability);
+        # the pinned toolchain's default profile ships it.
         uses: dtolnay/rust-toolchain@stable
         with:
-          # rustfmt is a real runtime dependency of the codegen (rust_gen.rs
-          # shells out to it so generated output is a pure function of the
-          # IDL regardless of the local machine's rustfmt availability).
           components: rustfmt
 
-      - name: cargo build --workspace
-        run: cargo build --workspace
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate IDL against the RELAX NG schema
+        # The scanner parses with roxmltree and performs its own semantic
+        # checks, but structural/dialect validation is xmllint's job
+        # (CLAUDE.md names this as the protocol validation command); without
+        # it, a schema-invalid vitrin-v0.xml that roxmltree tolerates would
+        # land green.
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libxml2-utils
+          xmllint --noout --relaxng protocol/vitrin-v0.rng protocol/vitrin-v0.xml
 
       - name: cargo test --workspace
         run: cargo test --workspace
+
+      - name: cargo test --workspace --release
+        # Not redundant with the debug run: assertion-related bugs are
+        # release-only by nature (this crate's first shipped bug was a
+        # debug_assert! compiled out in release), so the suite must pass in
+        # exactly the mode where such a regression would hide.
+        run: cargo test --workspace --release
 
       - name: cargo xtask codegen --check
         run: cargo xtask codegen --check
 
       - name: C header compiles standalone (shim/include/vitrin-protocol.h)
         run: cc -std=c11 -Wall -Werror -I shim/include -c shim/tests/test_header_compiles.c -o /dev/null
+
+      - name: C golden-frame test (Rust and C pinned to the same bytes)
+        run: |
+          cc -std=c11 -Wall -Werror -I shim/include shim/tests/test_golden_frames.c -o "${RUNNER_TEMP}/golden"
+          "${RUNNER_TEMP}/golden"

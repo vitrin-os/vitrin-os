@@ -70,6 +70,13 @@ pub mod requests {
         /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
         /// either one lie without the other, so neither check substitutes for
         /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
         pub fn decode(
             bytes: &[u8],
             fd: Option<std::os::fd::OwnedFd>,
@@ -81,6 +88,18 @@ pub mod requests {
                 });
             }
             let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
             if header.fd_count != Self::HAS_FD as u8 {
                 return Err(crate::error::DecodeError::FdCountMismatch {
                     expected: Self::HAS_FD as u8,
@@ -171,6 +190,13 @@ pub mod requests {
         /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
         /// either one lie without the other, so neither check substitutes for
         /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
         pub fn decode(
             bytes: &[u8],
             fd: Option<std::os::fd::OwnedFd>,
@@ -182,6 +208,18 @@ pub mod requests {
                 });
             }
             let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
             if header.fd_count != Self::HAS_FD as u8 {
                 return Err(crate::error::DecodeError::FdCountMismatch {
                     expected: Self::HAS_FD as u8,
@@ -249,6 +287,13 @@ pub mod requests {
         /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
         /// either one lie without the other, so neither check substitutes for
         /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
         pub fn decode(
             bytes: &[u8],
             fd: Option<std::os::fd::OwnedFd>,
@@ -260,6 +305,18 @@ pub mod requests {
                 });
             }
             let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
             if header.fd_count != Self::HAS_FD as u8 {
                 return Err(crate::error::DecodeError::FdCountMismatch {
                     expected: Self::HAS_FD as u8,
@@ -322,6 +379,13 @@ pub mod events {
         /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
         /// either one lie without the other, so neither check substitutes for
         /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
         pub fn decode(
             bytes: &[u8],
             fd: Option<std::os::fd::OwnedFd>,
@@ -333,6 +397,18 @@ pub mod events {
                 });
             }
             let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
             if header.fd_count != Self::HAS_FD as u8 {
                 return Err(crate::error::DecodeError::FdCountMismatch {
                     expected: Self::HAS_FD as u8,
@@ -396,6 +472,13 @@ pub mod events {
         /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
         /// either one lie without the other, so neither check substitutes for
         /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
         pub fn decode(
             bytes: &[u8],
             fd: Option<std::os::fd::OwnedFd>,
@@ -407,6 +490,18 @@ pub mod events {
                 });
             }
             let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
             if header.fd_count != Self::HAS_FD as u8 {
                 return Err(crate::error::DecodeError::FdCountMismatch {
                     expected: Self::HAS_FD as u8,

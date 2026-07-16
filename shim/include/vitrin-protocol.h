@@ -63,10 +63,27 @@ static inline double vitrin_fixed_to_double(vitrin_fixed_t f) {
 
 /* Rounds half away from zero (matching the generated Rust side's
    Fixed::from_f64, which uses f64::round()) without pulling in <math.h>
-   -- this header has no dependency beyond the four includes above. */
+   -- this header has no dependency beyond the four includes above.
+
+   Out-of-range input clamps to INT32_MIN/INT32_MAX and NaN maps to 0,
+   matching the Rust side's saturating `as i32` cast exactly. The clamp is
+   not optional in C: casting an out-of-range double straight to int32_t
+   is undefined behavior (confirmed by -fsanitize=float-cast-overflow),
+   not saturation. 2147483648.0 and -2147483649.0 are both exactly
+   representable as doubles, so the comparisons below are exact. */
 static inline vitrin_fixed_t vitrin_fixed_from_double(double v) {
     double scaled = v * 256.0;
-    return (vitrin_fixed_t)(scaled >= 0.0 ? scaled + 0.5 : scaled - 0.5);
+    double rounded = scaled >= 0.0 ? scaled + 0.5 : scaled - 0.5;
+    if (rounded != rounded) { /* NaN (also caught v = NaN: NaN * 256 is NaN) */
+        return 0;
+    }
+    if (rounded >= 2147483648.0) {
+        return INT32_MAX;
+    }
+    if (rounded <= -2147483649.0) {
+        return INT32_MIN;
+    }
+    return (vitrin_fixed_t)rounded;
 }
 
 /* ---- borrowed string view -- see the rationale at the top of this file. */
@@ -89,8 +106,17 @@ typedef struct {
 
 /* Sentinel returned by a `*_encode` function when out_capacity is too
    small to hold the encoded frame, or the frame would exceed the wire
-   format's 65535-byte limit. Never returned for any other reason. */
+   format's 65535-byte limit. */
 #define VITRIN_ENCODE_ERR_OVERFLOW ((int32_t)-1)
+
+/* Sentinel returned by a `*_encode` function when a string argument's
+   `len` exceeds that argument's documented `(max N bytes)` bound. The
+   frame is never written: without this check the encoder could emit a
+   well-formed but spec-non-conformant frame that a conforming decoder
+   rejects, wasting a round trip -- mirroring the Rust side, which treats
+   an over-bound string on encode as a caller bug (there it panics; C has
+   no panic, so it is an error return). */
+#define VITRIN_ENCODE_ERR_STRING_TOO_LONG ((int32_t)-2)
 
 /* Returned by every `*_decode` function (and the raw helpers below).
    VITRIN_DECODE_OK (0) is success; every other value is a distinct
@@ -113,6 +139,17 @@ typedef enum {
     VITRIN_DECODE_ERR_INVALID_BITFIELD = -4,
     VITRIN_DECODE_ERR_FD_MISMATCH = -5,
     VITRIN_DECODE_ERR_TRAILING_BYTES = -6,
+    /* a string argument's zero padding contained a nonzero byte (fatal
+       invalid_argument per docs/protocol/00-conventions.md 2.2) */
+    VITRIN_DECODE_ERR_MALFORMED_PADDING = -7,
+    /* the header's size field disagrees with the delivered byte count */
+    VITRIN_DECODE_ERR_SIZE_MISMATCH = -8,
+    /* the header's opcode byte is not this message's opcode (dispatcher
+       mis-route; defense-in-depth, like the fd_count checks) */
+    VITRIN_DECODE_ERR_OPCODE_MISMATCH = -9,
+    /* object id 0 (null) for an argument not marked allow-null (no v0
+       message has a plain object argument; kept for spec completeness) */
+    VITRIN_DECODE_ERR_NULL_OBJECT = -10,
 } vitrin_decode_status_t;
 
 /* Human-readable name for a vitrin_decode_status_t, for logging. Returns
@@ -126,6 +163,10 @@ static inline const char *vitrin_decode_status_string(vitrin_decode_status_t s) 
         case VITRIN_DECODE_ERR_INVALID_BITFIELD: return "invalid_bitfield";
         case VITRIN_DECODE_ERR_FD_MISMATCH: return "fd_mismatch";
         case VITRIN_DECODE_ERR_TRAILING_BYTES: return "trailing_bytes";
+        case VITRIN_DECODE_ERR_MALFORMED_PADDING: return "malformed_padding";
+        case VITRIN_DECODE_ERR_SIZE_MISMATCH: return "size_mismatch";
+        case VITRIN_DECODE_ERR_OPCODE_MISMATCH: return "opcode_mismatch";
+        case VITRIN_DECODE_ERR_NULL_OBJECT: return "null_object";
         default: return "unknown";
     }
 }
@@ -166,8 +207,15 @@ static inline size_t vitrin_raw_pad_len(uint32_t len) {
     return (size_t)((4u - (len % 4u)) % 4u);
 }
 
-static inline size_t vitrin_raw_string_wire_len(uint32_t byte_len) {
-    return (size_t)4 + (size_t)byte_len + vitrin_raw_pad_len(byte_len);
+/* Wire size of one string argument: 4-byte length prefix + bytes + zero
+   padding to the next 4-byte boundary. Computed in uint64_t, NOT size_t:
+   on a 32-bit target a byte_len near UINT32_MAX would wrap 32-bit size_t
+   arithmetic to a tiny value, and every *_encode's total-frame-size guard
+   below would then pass a frame whose memcpy runs ~4 GiB past the output
+   buffer. 64-bit arithmetic cannot wrap here (max term is well under
+   2^33), so the guard stays sound on every target. */
+static inline uint64_t vitrin_raw_string_wire_len(uint32_t byte_len) {
+    return (uint64_t)4 + (uint64_t)byte_len + (uint64_t)vitrin_raw_pad_len(byte_len);
 }
 
 /* Writes a string argument: u32 byte length, the bytes themselves (no NUL
@@ -187,10 +235,12 @@ static inline size_t vitrin_raw_write_string(uint8_t *out, vitrin_string_t s) {
 }
 
 /* Reads a string argument, enforcing max_bytes (the arg's documented
-   `(max N bytes)` bound) and buffer bounds. *out borrows directly into
-   `in` (out->data = in + <offset>); it is valid only as long as `in` is.
-   Does not validate UTF-8 or reject embedded NUL bytes -- see the
-   rationale on vitrin_decode_status_t above. */
+   `(max N bytes)` bound), buffer bounds, and all-zero padding (malformed
+   padding is fatal invalid_argument per conventions 2.2; accepting
+   arbitrary padding bytes would also open a covert channel). *out borrows
+   directly into `in` (out->data = in + <offset>); it is valid only as
+   long as `in` is. Does not validate UTF-8 or reject embedded NUL bytes
+   -- see the rationale on vitrin_decode_status_t above. */
 static inline vitrin_decode_status_t vitrin_raw_read_string(
     const uint8_t *in, size_t in_len, size_t *pos, uint32_t max_bytes,
     vitrin_string_t *out) {
@@ -212,6 +262,11 @@ static inline vitrin_decode_status_t vitrin_raw_read_string(
     pad = vitrin_raw_pad_len(len);
     if (*pos + pad > in_len) {
         return VITRIN_DECODE_ERR_TRUNCATED;
+    }
+    for (size_t i = 0; i < pad; i++) {
+        if (in[*pos + i] != 0u) {
+            return VITRIN_DECODE_ERR_MALFORMED_PADDING;
+        }
     }
     *pos += pad;
     return VITRIN_DECODE_OK;
@@ -773,12 +828,24 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_handshake_req_hello_encode(const vitrin_handshake_req_hello_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + vitrin_raw_string_wire_len(msg->identity.len) + vitrin_raw_string_wire_len(msg->credential_type.len) + vitrin_raw_string_wire_len(msg->credential.len);
-    if (size > 0xffffu || size > out_capacity) {
+    if (msg->identity.len > 2048u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    if (msg->credential_type.len > 32u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    if (msg->credential.len > 32768u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + vitrin_raw_string_wire_len(msg->identity.len) + vitrin_raw_string_wire_len(msg->credential_type.len) + vitrin_raw_string_wire_len(msg->credential.len);
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -810,7 +877,14 @@ static inline int32_t vitrin_handshake_req_hello_encode(const vitrin_handshake_r
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_handshake_req_hello_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_handshake_req_hello_t *out) {
@@ -822,6 +896,12 @@ static inline vitrin_decode_status_t vitrin_handshake_req_hello_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_HANDSHAKE_REQ_HELLO_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_HANDSHAKE_REQ_HELLO_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -858,12 +938,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_handshake_req_sync_encode(const vitrin_handshake_req_sync_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -890,7 +973,14 @@ static inline int32_t vitrin_handshake_req_sync_encode(const vitrin_handshake_re
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_handshake_req_sync_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_handshake_req_sync_t *out) {
@@ -902,6 +992,12 @@ static inline vitrin_decode_status_t vitrin_handshake_req_sync_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_HANDSHAKE_REQ_SYNC_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_HANDSHAKE_REQ_SYNC_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -934,12 +1030,18 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_handshake_evt_error_encode(const vitrin_handshake_evt_error_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + vitrin_raw_string_wire_len(msg->message.len);
-    if (size > 0xffffu || size > out_capacity) {
+    if (msg->message.len > 1024u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + vitrin_raw_string_wire_len(msg->message.len);
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -969,7 +1071,14 @@ static inline int32_t vitrin_handshake_evt_error_encode(const vitrin_handshake_e
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_handshake_evt_error_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_handshake_evt_error_t *out) {
@@ -981,6 +1090,12 @@ static inline vitrin_decode_status_t vitrin_handshake_evt_error_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_HANDSHAKE_EVT_ERROR_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_HANDSHAKE_EVT_ERROR_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1016,12 +1131,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_handshake_evt_done_encode(const vitrin_handshake_evt_done_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -1048,7 +1166,14 @@ static inline int32_t vitrin_handshake_evt_done_encode(const vitrin_handshake_ev
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_handshake_evt_done_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_handshake_evt_done_t *out) {
@@ -1060,6 +1185,12 @@ static inline vitrin_decode_status_t vitrin_handshake_evt_done_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_HANDSHAKE_EVT_DONE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_HANDSHAKE_EVT_DONE_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1092,12 +1223,18 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_principal_req_get_realm_encode(const vitrin_principal_req_get_realm_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + vitrin_raw_string_wire_len(msg->name.len);
-    if (size > 0xffffu || size > out_capacity) {
+    if (msg->name.len > 64u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + vitrin_raw_string_wire_len(msg->name.len);
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -1125,7 +1262,14 @@ static inline int32_t vitrin_principal_req_get_realm_encode(const vitrin_princip
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_principal_req_get_realm_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_principal_req_get_realm_t *out) {
@@ -1137,6 +1281,12 @@ static inline vitrin_decode_status_t vitrin_principal_req_get_realm_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_PRINCIPAL_REQ_GET_REALM_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_PRINCIPAL_REQ_GET_REALM_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1167,12 +1317,18 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_principal_evt_bound_encode(const vitrin_principal_evt_bound_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->identity.len);
-    if (size > 0xffffu || size > out_capacity) {
+    if (msg->identity.len > 2048u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->identity.len);
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -1198,7 +1354,14 @@ static inline int32_t vitrin_principal_evt_bound_encode(const vitrin_principal_e
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_principal_evt_bound_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_principal_evt_bound_t *out) {
@@ -1210,6 +1373,12 @@ static inline vitrin_decode_status_t vitrin_principal_evt_bound_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_PRINCIPAL_EVT_BOUND_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_PRINCIPAL_EVT_BOUND_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1260,12 +1429,18 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_realm_req_request_grant_encode(const vitrin_realm_req_request_grant_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + 4 + 4 + 4 + vitrin_raw_string_wire_len(msg->resource.len) + 4 + 4 + 4 + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    if (msg->resource.len > 256u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4 + 4 + 4 + vitrin_raw_string_wire_len(msg->resource.len) + 4 + 4 + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -1311,7 +1486,14 @@ static inline int32_t vitrin_realm_req_request_grant_encode(const vitrin_realm_r
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_realm_req_request_grant_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_realm_req_request_grant_t *out) {
@@ -1323,6 +1505,12 @@ static inline vitrin_decode_status_t vitrin_realm_req_request_grant_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_REALM_REQ_REQUEST_GRANT_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_REALM_REQ_REQUEST_GRANT_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1385,12 +1573,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_grant_evt_resolved_encode(const vitrin_grant_evt_resolved_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -1423,7 +1614,14 @@ static inline int32_t vitrin_grant_evt_resolved_encode(const vitrin_grant_evt_re
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_grant_evt_resolved_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_grant_evt_resolved_t *out) {
@@ -1435,6 +1633,12 @@ static inline vitrin_decode_status_t vitrin_grant_evt_resolved_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_GRANT_EVT_RESOLVED_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_GRANT_EVT_RESOLVED_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1482,12 +1686,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_grant_evt_refused_encode(const vitrin_grant_evt_refused_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -1518,7 +1725,14 @@ static inline int32_t vitrin_grant_evt_refused_encode(const vitrin_grant_evt_ref
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_grant_evt_refused_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_grant_evt_refused_t *out) {
@@ -1530,6 +1744,12 @@ static inline vitrin_decode_status_t vitrin_grant_evt_refused_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_GRANT_EVT_REFUSED_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_GRANT_EVT_REFUSED_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1570,12 +1790,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_consent_evt_state_encode(const vitrin_consent_evt_state_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -1602,7 +1825,14 @@ static inline int32_t vitrin_consent_evt_state_encode(const vitrin_consent_evt_s
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_consent_evt_state_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_consent_evt_state_t *out) {
@@ -1614,6 +1844,12 @@ static inline vitrin_decode_status_t vitrin_consent_evt_state_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_CONSENT_EVT_STATE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_CONSENT_EVT_STATE_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1647,12 +1883,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_view_req_capture_frame_encode(const vitrin_view_req_capture_frame_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -1677,7 +1916,14 @@ static inline int32_t vitrin_view_req_capture_frame_encode(const vitrin_view_req
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_view_req_capture_frame_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_view_req_capture_frame_t *out) {
@@ -1689,6 +1935,12 @@ static inline vitrin_decode_status_t vitrin_view_req_capture_frame_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_VIEW_REQ_CAPTURE_FRAME_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_VIEW_REQ_CAPTURE_FRAME_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1726,12 +1978,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_view_evt_frame_ready_encode(const vitrin_view_evt_frame_ready_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + 4 + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -1767,7 +2022,14 @@ static inline int32_t vitrin_view_evt_frame_ready_encode(const vitrin_view_evt_f
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_view_evt_frame_ready_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_view_evt_frame_ready_t *out) {
@@ -1779,6 +2041,12 @@ static inline vitrin_decode_status_t vitrin_view_evt_frame_ready_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_VIEW_EVT_FRAME_READY_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_VIEW_EVT_FRAME_READY_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1826,12 +2094,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_actuator_pointer_req_move_encode(const vitrin_actuator_pointer_req_move_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -1860,7 +2131,14 @@ static inline int32_t vitrin_actuator_pointer_req_move_encode(const vitrin_actua
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_actuator_pointer_req_move_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_actuator_pointer_req_move_t *out) {
@@ -1872,6 +2150,12 @@ static inline vitrin_decode_status_t vitrin_actuator_pointer_req_move_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_ACTUATOR_POINTER_REQ_MOVE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_ACTUATOR_POINTER_REQ_MOVE_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1908,12 +2192,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_actuator_pointer_req_button_encode(const vitrin_actuator_pointer_req_button_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -1942,7 +2229,14 @@ static inline int32_t vitrin_actuator_pointer_req_button_encode(const vitrin_act
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_actuator_pointer_req_button_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_actuator_pointer_req_button_t *out) {
@@ -1954,6 +2248,12 @@ static inline vitrin_decode_status_t vitrin_actuator_pointer_req_button_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_ACTUATOR_POINTER_REQ_BUTTON_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_ACTUATOR_POINTER_REQ_BUTTON_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -1989,12 +2289,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_actuator_pointer_req_scroll_encode(const vitrin_actuator_pointer_req_scroll_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2023,7 +2326,14 @@ static inline int32_t vitrin_actuator_pointer_req_scroll_encode(const vitrin_act
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_actuator_pointer_req_scroll_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_actuator_pointer_req_scroll_t *out) {
@@ -2035,6 +2345,12 @@ static inline vitrin_decode_status_t vitrin_actuator_pointer_req_scroll_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_ACTUATOR_POINTER_REQ_SCROLL_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_ACTUATOR_POINTER_REQ_SCROLL_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2072,12 +2388,18 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_actuator_text_req_type_encode(const vitrin_actuator_text_req_type_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->text.len);
-    if (size > 0xffffu || size > out_capacity) {
+    if (msg->text.len > 4096u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->text.len);
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2103,7 +2425,14 @@ static inline int32_t vitrin_actuator_text_req_type_encode(const vitrin_actuator
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_actuator_text_req_type_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_actuator_text_req_type_t *out) {
@@ -2115,6 +2444,12 @@ static inline vitrin_decode_status_t vitrin_actuator_text_req_type_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_ACTUATOR_TEXT_REQ_TYPE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_ACTUATOR_TEXT_REQ_TYPE_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2145,12 +2480,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_session_req_create_surface_encode(const vitrin_shim_session_req_create_surface_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2177,7 +2515,14 @@ static inline int32_t vitrin_shim_session_req_create_surface_encode(const vitrin
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_session_req_create_surface_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_session_req_create_surface_t *out) {
@@ -2189,6 +2534,12 @@ static inline vitrin_decode_status_t vitrin_shim_session_req_create_surface_deco
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SESSION_REQ_CREATE_SURFACE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SESSION_REQ_CREATE_SURFACE_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2217,12 +2568,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_session_req_get_seat_encode(const vitrin_shim_session_req_get_seat_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2249,7 +2603,14 @@ static inline int32_t vitrin_shim_session_req_get_seat_encode(const vitrin_shim_
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_session_req_get_seat_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_session_req_get_seat_t *out) {
@@ -2261,6 +2622,12 @@ static inline vitrin_decode_status_t vitrin_shim_session_req_get_seat_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SESSION_REQ_GET_SEAT_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SESSION_REQ_GET_SEAT_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2293,12 +2660,18 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_session_evt_configure_encode(const vitrin_shim_session_evt_configure_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->realm.len) + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    if (msg->realm.len > 64u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->realm.len) + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2328,7 +2701,14 @@ static inline int32_t vitrin_shim_session_evt_configure_encode(const vitrin_shim
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_session_evt_configure_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_session_evt_configure_t *out) {
@@ -2340,6 +2720,12 @@ static inline vitrin_decode_status_t vitrin_shim_session_evt_configure_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SESSION_EVT_CONFIGURE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SESSION_EVT_CONFIGURE_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2386,12 +2772,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_surface_req_attach_encode(const vitrin_shim_surface_req_attach_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + 4 + 4 + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4 + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2429,7 +2818,14 @@ static inline int32_t vitrin_shim_surface_req_attach_encode(const vitrin_shim_su
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_surface_req_attach_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_surface_req_attach_t *out) {
@@ -2441,6 +2837,12 @@ static inline vitrin_decode_status_t vitrin_shim_surface_req_attach_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SURFACE_REQ_ATTACH_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SURFACE_REQ_ATTACH_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2492,12 +2894,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_surface_req_damage_encode(const vitrin_shim_surface_req_damage_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2530,7 +2935,14 @@ static inline int32_t vitrin_shim_surface_req_damage_encode(const vitrin_shim_su
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_surface_req_damage_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_surface_req_damage_t *out) {
@@ -2542,6 +2954,12 @@ static inline vitrin_decode_status_t vitrin_shim_surface_req_damage_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SURFACE_REQ_DAMAGE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SURFACE_REQ_DAMAGE_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2584,12 +3002,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_surface_req_commit_encode(const vitrin_shim_surface_req_commit_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2614,7 +3035,14 @@ static inline int32_t vitrin_shim_surface_req_commit_encode(const vitrin_shim_su
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_surface_req_commit_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_surface_req_commit_t *out) {
@@ -2626,6 +3054,12 @@ static inline vitrin_decode_status_t vitrin_shim_surface_req_commit_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SURFACE_REQ_COMMIT_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SURFACE_REQ_COMMIT_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2653,12 +3087,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_surface_evt_frame_done_encode(const vitrin_shim_surface_evt_frame_done_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2685,7 +3122,14 @@ static inline int32_t vitrin_shim_surface_evt_frame_done_encode(const vitrin_shi
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_surface_evt_frame_done_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_surface_evt_frame_done_t *out) {
@@ -2697,6 +3141,12 @@ static inline vitrin_decode_status_t vitrin_shim_surface_evt_frame_done_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SURFACE_EVT_FRAME_DONE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SURFACE_EVT_FRAME_DONE_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2727,12 +3177,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_surface_evt_buffer_done_encode(const vitrin_shim_surface_evt_buffer_done_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2761,7 +3214,14 @@ static inline int32_t vitrin_shim_surface_evt_buffer_done_encode(const vitrin_sh
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_surface_evt_buffer_done_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_surface_evt_buffer_done_t *out) {
@@ -2773,6 +3233,12 @@ static inline vitrin_decode_status_t vitrin_shim_surface_evt_buffer_done_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SURFACE_EVT_BUFFER_DONE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SURFACE_EVT_BUFFER_DONE_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2812,12 +3278,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_seat_evt_motion_encode(const vitrin_shim_seat_evt_motion_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2848,7 +3317,14 @@ static inline int32_t vitrin_shim_seat_evt_motion_encode(const vitrin_shim_seat_
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_seat_evt_motion_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_seat_evt_motion_t *out) {
@@ -2860,6 +3336,12 @@ static inline vitrin_decode_status_t vitrin_shim_seat_evt_motion_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SEAT_EVT_MOTION_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SEAT_EVT_MOTION_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2903,12 +3385,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_seat_evt_button_encode(const vitrin_shim_seat_evt_button_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -2939,7 +3424,14 @@ static inline int32_t vitrin_shim_seat_evt_button_encode(const vitrin_shim_seat_
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_seat_evt_button_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_seat_evt_button_t *out) {
@@ -2951,6 +3443,12 @@ static inline vitrin_decode_status_t vitrin_shim_seat_evt_button_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SEAT_EVT_BUTTON_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SEAT_EVT_BUTTON_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -2993,12 +3491,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_seat_evt_scroll_encode(const vitrin_shim_seat_evt_scroll_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -3029,7 +3530,14 @@ static inline int32_t vitrin_shim_seat_evt_scroll_encode(const vitrin_shim_seat_
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_seat_evt_scroll_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_seat_evt_scroll_t *out) {
@@ -3041,6 +3549,12 @@ static inline vitrin_decode_status_t vitrin_shim_seat_evt_scroll_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SEAT_EVT_SCROLL_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SEAT_EVT_SCROLL_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -3085,12 +3599,15 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_seat_evt_key_encode(const vitrin_shim_seat_evt_key_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + 4 + 4 + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -3121,7 +3638,14 @@ static inline int32_t vitrin_shim_seat_evt_key_encode(const vitrin_shim_seat_evt
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_seat_evt_key_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_seat_evt_key_t *out) {
@@ -3133,6 +3657,12 @@ static inline vitrin_decode_status_t vitrin_shim_seat_evt_key_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SEAT_EVT_KEY_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SEAT_EVT_KEY_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;
@@ -3173,12 +3703,18 @@ typedef struct {
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
-   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if
-   out_capacity is too small. Any fd argument is never written here -- send
-   it out-of-band via SCM_RIGHTS alongside these bytes. */
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
 static inline int32_t vitrin_shim_seat_evt_text_encode(const vitrin_shim_seat_evt_text_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
-    size_t size = VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->text.len) + 4;
-    if (size > 0xffffu || size > out_capacity) {
+    if (msg->text.len > 4096u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->text.len) + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
         return VITRIN_ENCODE_ERR_OVERFLOW;
     }
     vitrin_frame_header_t hdr;
@@ -3206,7 +3742,14 @@ static inline int32_t vitrin_shim_seat_evt_text_encode(const vitrin_shim_seat_ev
    independent disjuncts, both checked here: the header's own fd_count byte
    disagreeing with this message's signature, and the out-of-band fd
    parameter disagreeing with it. A hostile or buggy peer can make either
-   one lie without the other, so neither check substitutes for the other. */
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
 static inline vitrin_decode_status_t vitrin_shim_seat_evt_text_decode(
     const uint8_t *in, size_t in_len, int fd,
     uint32_t *out_object_id, vitrin_shim_seat_evt_text_t *out) {
@@ -3218,6 +3761,12 @@ static inline vitrin_decode_status_t vitrin_shim_seat_evt_text_decode(
     vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
     if (hdr_st != VITRIN_DECODE_OK) {
         return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SEAT_EVT_TEXT_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
     }
     if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SEAT_EVT_TEXT_HAS_FD) {
         return VITRIN_DECODE_ERR_FD_MISMATCH;

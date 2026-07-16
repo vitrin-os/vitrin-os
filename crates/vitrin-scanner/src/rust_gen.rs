@@ -63,6 +63,20 @@ fn mod_file(protocol: &Protocol) -> String {
         protocol.version
     ));
     buf.blank();
+    let message_count: usize = protocol
+        .interfaces
+        .iter()
+        .map(|i| i.requests.len() + i.events.len())
+        .sum();
+    buf.line("/// Total number of messages (requests + events) across every interface.");
+    buf.line("/// Exists so exhaustiveness can be *asserted* rather than assumed: a test");
+    buf.line("/// enumerating every message (e.g. the round-trip table) checks its own");
+    buf.line("/// length against this, so a message added to the IDL cannot ship silently");
+    buf.line("/// untested.");
+    buf.line(format!(
+        "pub const MESSAGE_COUNT: usize = {message_count};"
+    ));
+    buf.blank();
     for iface in &protocol.interfaces {
         buf.line(format!("pub mod {};", iface.name));
     }
@@ -348,6 +362,13 @@ fn gen_decode(buf: &mut Buf, protocol: &Protocol, msg: &Message, struct_name: &s
     buf.line("    /// `fd` parameter disagreeing with it. A hostile or buggy peer can make");
     buf.line("    /// either one lie without the other, so neither check substitutes for");
     buf.line("    /// the other.");
+    buf.line("    ///");
+    buf.line("    /// The header's `opcode` and `size` fields are validated in the same");
+    buf.line("    /// defense-in-depth spirit: the dispatcher already selected this message");
+    buf.line("    /// type by opcode and delimited the frame by size, but a dispatcher bug");
+    buf.line("    /// (or a header whose size field lies about the delivered byte count,");
+    buf.line("    /// fatal `oversized` per conventions 2.1) must surface as an error here,");
+    buf.line("    /// not as a silently mis-decoded message.");
     buf.line("    pub fn decode(");
     buf.line("        bytes: &[u8],");
     buf.line("        fd: Option<std::os::fd::OwnedFd>,");
@@ -359,6 +380,18 @@ fn gen_decode(buf: &mut Buf, protocol: &Protocol, msg: &Message, struct_name: &s
     buf.line("            });");
     buf.line("        }");
     buf.line("        let header = crate::wire::FrameHeader::decode(bytes)?;");
+    buf.line("        if header.opcode != Self::OPCODE {");
+    buf.line("            return Err(crate::error::DecodeError::OpcodeMismatch {");
+    buf.line("                expected: Self::OPCODE,");
+    buf.line("                actual: header.opcode,");
+    buf.line("            });");
+    buf.line("        }");
+    buf.line("        if header.size as usize != bytes.len() {");
+    buf.line("            return Err(crate::error::DecodeError::SizeMismatch {");
+    buf.line("                declared: header.size,");
+    buf.line("                actual: bytes.len(),");
+    buf.line("            });");
+    buf.line("        }");
     buf.line("        if header.fd_count != Self::HAS_FD as u8 {");
     buf.line("            return Err(crate::error::DecodeError::FdCountMismatch {");
     buf.line("                expected: Self::HAS_FD as u8,");
@@ -425,7 +458,12 @@ fn decode_arg_line(protocol: &Protocol, arg: &Arg) -> String {
                     "let {field} = crate::wire::read_uint(bytes, &mut pos)?; let {field} = if {field} == 0 {{ None }} else {{ Some({field}) }};"
                 )
             } else {
-                format!("let {field} = crate::wire::read_uint(bytes, &mut pos)?;")
+                // Object id 0 is the null object, legal only under allow-null
+                // (conventions section 3) -- reject it in the codec rather
+                // than leaving it for the dispatcher to remember.
+                format!(
+                    "let {field} = crate::wire::read_uint(bytes, &mut pos)?; if {field} == 0 {{ return Err(crate::error::DecodeError::NullObject); }}"
+                )
             }
         }
         ArgType::NewId { .. } => format!("let {field} = crate::wire::read_uint(bytes, &mut pos)?;"),

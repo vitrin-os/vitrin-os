@@ -151,11 +151,12 @@ Every `string` argument documents a maximum byte length. A violation is fatal
 
 | Interface.message | Argument | Max bytes |
 |---|---|---|
-| `vitrin_handshake.hello` | `identity` | 256 |
+| `vitrin_handshake.hello` | `identity` | 2048 |
 | `vitrin_handshake.hello` | `credential_type` | 32 |
 | `vitrin_handshake.hello` | `credential` | 32768 |
-| `vitrin_handshake.error` | `message` | frame-bounded (free-form debug text, never parsed) |
+| `vitrin_handshake.error` | `message` | 1024 (free-form debug text, never parsed) |
 | `vitrin_principal.get_realm` | `name` | 64 |
+| `vitrin_principal.bound` | `identity` | 2048 |
 | `vitrin_realm.request_grant` | `resource` | 256 (allow-null) |
 | `vitrin_actuator_text.type` | `text` | 4096 |
 | `vitrin_shim_session.configure` | `realm` | 64 |

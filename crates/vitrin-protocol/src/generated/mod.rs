@@ -10,6 +10,13 @@
 /// required -- downgrade is refusal, not negotiation.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Total number of messages (requests + events) across every interface.
+/// Exists so exhaustiveness can be *asserted* rather than assumed: a test
+/// enumerating every message (e.g. the round-trip table) checks its own
+/// length against this, so a message added to the IDL cannot ship silently
+/// untested.
+pub const MESSAGE_COUNT: usize = 29;
+
 pub mod vitrin_handshake;
 pub mod vitrin_principal;
 pub mod vitrin_realm;

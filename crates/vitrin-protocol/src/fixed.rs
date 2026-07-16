@@ -21,6 +21,15 @@ impl Fixed {
     }
 
     /// Convert from a floating-point value, rounding to the nearest 1/256.
+    ///
+    /// Out-of-range input saturates: values beyond the representable
+    /// `[i32::MIN, i32::MAX]` bit range clamp to the nearest bound, and NaN
+    /// maps to 0 -- the defined behavior of Rust's float-to-int `as` cast,
+    /// stated here so callers don't have to know that. The generated C
+    /// header's `vitrin_fixed_from_double` clamps identically (C's raw cast
+    /// would be UB there). This is an encode-side convenience fed only by
+    /// trusted-core code, never by wire bytes, so saturating beats panicking:
+    /// a coordinate clamp is recoverable, a crash in the compositor is not.
     pub fn from_f64(v: f64) -> Self {
         Fixed((v * 256.0).round() as i32)
     }
@@ -60,5 +69,16 @@ mod tests {
         assert_eq!(Fixed::from_f64(0.5).to_bits(), 128);
         assert_eq!(Fixed::from_f64(-1.0).to_bits(), -256);
         assert!((Fixed::from_bits(256).to_f64() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn f64_conversion_saturates_out_of_range_and_zeroes_nan() {
+        // Pins the documented saturation semantics (and keeps them in lockstep
+        // with the generated C header's clamping vitrin_fixed_from_double).
+        assert_eq!(Fixed::from_f64(1e18).to_bits(), i32::MAX);
+        assert_eq!(Fixed::from_f64(f64::INFINITY).to_bits(), i32::MAX);
+        assert_eq!(Fixed::from_f64(-1e18).to_bits(), i32::MIN);
+        assert_eq!(Fixed::from_f64(f64::NEG_INFINITY).to_bits(), i32::MIN);
+        assert_eq!(Fixed::from_f64(f64::NAN).to_bits(), 0);
     }
 }

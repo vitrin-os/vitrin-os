@@ -143,8 +143,18 @@ pub fn write_string(out: &mut Vec<u8>, s: &str, max_bytes: u32) {
 }
 
 /// Decode a string argument, enforcing `max_bytes` (the arg's documented
-/// `(max N bytes)` bound), UTF-8 validity, and the no-embedded-NUL rule.
-/// Padding bytes are consumed but their content is not itself validated.
+/// `(max N bytes)` bound), UTF-8 validity, the no-embedded-NUL rule, and
+/// all-zero padding. `docs/protocol/00-conventions.md` 2.2 makes malformed
+/// padding fatal `invalid_argument`, same as the other three -- and beyond
+/// spec conformance, accepting arbitrary padding bytes would both open a
+/// small covert channel and break the one-value-one-encoding property
+/// (`encode(decode(bytes)) == bytes`) the round-trip tests pin.
+///
+/// All cursor arithmetic is `checked_add`: `len` comes straight off the wire,
+/// so on a 32-bit target an attacker-supplied length near `u32::MAX` (legal
+/// only if some future argument documented a bound that large) could
+/// otherwise wrap `usize` and panic on a reversed slice range -- decode must
+/// return errors, never panic, on arbitrary bytes.
 pub fn read_string(bytes: &[u8], pos: &mut usize, max_bytes: u32) -> Result<String, DecodeError> {
     let len = read_uint(bytes, pos)?;
     if len > max_bytes {
@@ -154,7 +164,10 @@ pub fn read_string(bytes: &[u8], pos: &mut usize, max_bytes: u32) -> Result<Stri
         });
     }
     let len = len as usize;
-    let end = *pos + len;
+    let end = pos.checked_add(len).ok_or(DecodeError::Truncated {
+        needed: usize::MAX,
+        available: bytes.len(),
+    })?;
     if end > bytes.len() {
         return Err(DecodeError::Truncated {
             needed: end,
@@ -171,12 +184,18 @@ pub fn read_string(bytes: &[u8], pos: &mut usize, max_bytes: u32) -> Result<Stri
     *pos = end;
 
     let padding = pad_len(len);
-    let padded_end = *pos + padding;
+    let padded_end = pos.checked_add(padding).ok_or(DecodeError::Truncated {
+        needed: usize::MAX,
+        available: bytes.len(),
+    })?;
     if padded_end > bytes.len() {
         return Err(DecodeError::Truncated {
             needed: padded_end,
             available: bytes.len(),
         });
+    }
+    if bytes[*pos..padded_end].iter().any(|&b| b != 0) {
+        return Err(DecodeError::MalformedPadding);
     }
     *pos = padded_end;
 
@@ -230,6 +249,41 @@ mod tests {
         // never produce a frame with a wrong size field.
         let mut out = Vec::new();
         write_string(&mut out, "hello", 3);
+    }
+
+    #[test]
+    fn nonzero_padding_rejected() {
+        // "a" needs 3 padding bytes; any nonzero one is malformed padding
+        // (fatal invalid_argument per conventions 2.2), not silently skipped.
+        let mut out = Vec::new();
+        write_string(&mut out, "a", 1024);
+        for pad_idx in 5..8 {
+            let mut tampered = out.clone();
+            tampered[pad_idx] = 0xff;
+            let mut pos = 0;
+            assert_eq!(
+                read_string(&tampered, &mut pos, 1024),
+                Err(DecodeError::MalformedPadding),
+                "nonzero byte at padding offset {pad_idx} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_padding_rejected() {
+        // Cut the buffer between the end of the string bytes and the end of
+        // its padding: "a" is 4 (length) + 1 (byte) + 3 (padding) = 8 bytes;
+        // supply only 6.
+        let mut out = Vec::new();
+        write_string(&mut out, "a", 1024);
+        let mut pos = 0;
+        assert_eq!(
+            read_string(&out[..6], &mut pos, 1024),
+            Err(DecodeError::Truncated {
+                needed: 8,
+                available: 6,
+            })
+        );
     }
 
     #[test]

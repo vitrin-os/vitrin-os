@@ -223,10 +223,27 @@ fn gen_generic_support(buf: &mut Buf) {
     buf.blank();
     buf.line("/* Rounds half away from zero (matching the generated Rust side's");
     buf.line("   Fixed::from_f64, which uses f64::round()) without pulling in <math.h>");
-    buf.line("   -- this header has no dependency beyond the four includes above. */");
+    buf.line("   -- this header has no dependency beyond the four includes above.");
+    buf.line("");
+    buf.line("   Out-of-range input clamps to INT32_MIN/INT32_MAX and NaN maps to 0,");
+    buf.line("   matching the Rust side's saturating `as i32` cast exactly. The clamp is");
+    buf.line("   not optional in C: casting an out-of-range double straight to int32_t");
+    buf.line("   is undefined behavior (confirmed by -fsanitize=float-cast-overflow),");
+    buf.line("   not saturation. 2147483648.0 and -2147483649.0 are both exactly");
+    buf.line("   representable as doubles, so the comparisons below are exact. */");
     buf.line("static inline vitrin_fixed_t vitrin_fixed_from_double(double v) {");
     buf.line("    double scaled = v * 256.0;");
-    buf.line("    return (vitrin_fixed_t)(scaled >= 0.0 ? scaled + 0.5 : scaled - 0.5);");
+    buf.line("    double rounded = scaled >= 0.0 ? scaled + 0.5 : scaled - 0.5;");
+    buf.line("    if (rounded != rounded) { /* NaN (also caught v = NaN: NaN * 256 is NaN) */");
+    buf.line("        return 0;");
+    buf.line("    }");
+    buf.line("    if (rounded >= 2147483648.0) {");
+    buf.line("        return INT32_MAX;");
+    buf.line("    }");
+    buf.line("    if (rounded <= -2147483649.0) {");
+    buf.line("        return INT32_MIN;");
+    buf.line("    }");
+    buf.line("    return (vitrin_fixed_t)rounded;");
     buf.line("}");
     buf.blank();
 
@@ -252,8 +269,17 @@ fn gen_generic_support(buf: &mut Buf) {
 
     buf.line("/* Sentinel returned by a `*_encode` function when out_capacity is too");
     buf.line("   small to hold the encoded frame, or the frame would exceed the wire");
-    buf.line("   format's 65535-byte limit. Never returned for any other reason. */");
+    buf.line("   format's 65535-byte limit. */");
     buf.line("#define VITRIN_ENCODE_ERR_OVERFLOW ((int32_t)-1)");
+    buf.blank();
+    buf.line("/* Sentinel returned by a `*_encode` function when a string argument's");
+    buf.line("   `len` exceeds that argument's documented `(max N bytes)` bound. The");
+    buf.line("   frame is never written: without this check the encoder could emit a");
+    buf.line("   well-formed but spec-non-conformant frame that a conforming decoder");
+    buf.line("   rejects, wasting a round trip -- mirroring the Rust side, which treats");
+    buf.line("   an over-bound string on encode as a caller bug (there it panics; C has");
+    buf.line("   no panic, so it is an error return). */");
+    buf.line("#define VITRIN_ENCODE_ERR_STRING_TOO_LONG ((int32_t)-2)");
     buf.blank();
 
     buf.line("/* Returned by every `*_decode` function (and the raw helpers below).");
@@ -277,6 +303,17 @@ fn gen_generic_support(buf: &mut Buf) {
     buf.line("    VITRIN_DECODE_ERR_INVALID_BITFIELD = -4,");
     buf.line("    VITRIN_DECODE_ERR_FD_MISMATCH = -5,");
     buf.line("    VITRIN_DECODE_ERR_TRAILING_BYTES = -6,");
+    buf.line("    /* a string argument's zero padding contained a nonzero byte (fatal");
+    buf.line("       invalid_argument per docs/protocol/00-conventions.md 2.2) */");
+    buf.line("    VITRIN_DECODE_ERR_MALFORMED_PADDING = -7,");
+    buf.line("    /* the header's size field disagrees with the delivered byte count */");
+    buf.line("    VITRIN_DECODE_ERR_SIZE_MISMATCH = -8,");
+    buf.line("    /* the header's opcode byte is not this message's opcode (dispatcher");
+    buf.line("       mis-route; defense-in-depth, like the fd_count checks) */");
+    buf.line("    VITRIN_DECODE_ERR_OPCODE_MISMATCH = -9,");
+    buf.line("    /* object id 0 (null) for an argument not marked allow-null (no v0");
+    buf.line("       message has a plain object argument; kept for spec completeness) */");
+    buf.line("    VITRIN_DECODE_ERR_NULL_OBJECT = -10,");
     buf.line("} vitrin_decode_status_t;");
     buf.blank();
     buf.line("/* Human-readable name for a vitrin_decode_status_t, for logging. Returns");
@@ -290,6 +327,10 @@ fn gen_generic_support(buf: &mut Buf) {
     buf.line("        case VITRIN_DECODE_ERR_INVALID_BITFIELD: return \"invalid_bitfield\";");
     buf.line("        case VITRIN_DECODE_ERR_FD_MISMATCH: return \"fd_mismatch\";");
     buf.line("        case VITRIN_DECODE_ERR_TRAILING_BYTES: return \"trailing_bytes\";");
+    buf.line("        case VITRIN_DECODE_ERR_MALFORMED_PADDING: return \"malformed_padding\";");
+    buf.line("        case VITRIN_DECODE_ERR_SIZE_MISMATCH: return \"size_mismatch\";");
+    buf.line("        case VITRIN_DECODE_ERR_OPCODE_MISMATCH: return \"opcode_mismatch\";");
+    buf.line("        case VITRIN_DECODE_ERR_NULL_OBJECT: return \"null_object\";");
     buf.line("        default: return \"unknown\";");
     buf.line("    }");
     buf.line("}");
@@ -331,8 +372,15 @@ fn gen_generic_support(buf: &mut Buf) {
     buf.line("    return (size_t)((4u - (len % 4u)) % 4u);");
     buf.line("}");
     buf.blank();
-    buf.line("static inline size_t vitrin_raw_string_wire_len(uint32_t byte_len) {");
-    buf.line("    return (size_t)4 + (size_t)byte_len + vitrin_raw_pad_len(byte_len);");
+    buf.line("/* Wire size of one string argument: 4-byte length prefix + bytes + zero");
+    buf.line("   padding to the next 4-byte boundary. Computed in uint64_t, NOT size_t:");
+    buf.line("   on a 32-bit target a byte_len near UINT32_MAX would wrap 32-bit size_t");
+    buf.line("   arithmetic to a tiny value, and every *_encode's total-frame-size guard");
+    buf.line("   below would then pass a frame whose memcpy runs ~4 GiB past the output");
+    buf.line("   buffer. 64-bit arithmetic cannot wrap here (max term is well under");
+    buf.line("   2^33), so the guard stays sound on every target. */");
+    buf.line("static inline uint64_t vitrin_raw_string_wire_len(uint32_t byte_len) {");
+    buf.line("    return (uint64_t)4 + (uint64_t)byte_len + (uint64_t)vitrin_raw_pad_len(byte_len);");
     buf.line("}");
     buf.blank();
     buf.line("/* Writes a string argument: u32 byte length, the bytes themselves (no NUL");
@@ -352,10 +400,12 @@ fn gen_generic_support(buf: &mut Buf) {
     buf.line("}");
     buf.blank();
     buf.line("/* Reads a string argument, enforcing max_bytes (the arg's documented");
-    buf.line("   `(max N bytes)` bound) and buffer bounds. *out borrows directly into");
-    buf.line("   `in` (out->data = in + <offset>); it is valid only as long as `in` is.");
-    buf.line("   Does not validate UTF-8 or reject embedded NUL bytes -- see the");
-    buf.line("   rationale on vitrin_decode_status_t above. */");
+    buf.line("   `(max N bytes)` bound), buffer bounds, and all-zero padding (malformed");
+    buf.line("   padding is fatal invalid_argument per conventions 2.2; accepting");
+    buf.line("   arbitrary padding bytes would also open a covert channel). *out borrows");
+    buf.line("   directly into `in` (out->data = in + <offset>); it is valid only as");
+    buf.line("   long as `in` is. Does not validate UTF-8 or reject embedded NUL bytes");
+    buf.line("   -- see the rationale on vitrin_decode_status_t above. */");
     buf.line("static inline vitrin_decode_status_t vitrin_raw_read_string(");
     buf.line("    const uint8_t *in, size_t in_len, size_t *pos, uint32_t max_bytes,");
     buf.line("    vitrin_string_t *out) {");
@@ -377,6 +427,11 @@ fn gen_generic_support(buf: &mut Buf) {
     buf.line("    pad = vitrin_raw_pad_len(len);");
     buf.line("    if (*pos + pad > in_len) {");
     buf.line("        return VITRIN_DECODE_ERR_TRUNCATED;");
+    buf.line("    }");
+    buf.line("    for (size_t i = 0; i < pad; i++) {");
+    buf.line("        if (in[*pos + i] != 0u) {");
+    buf.line("            return VITRIN_DECODE_ERR_MALFORMED_PADDING;");
+    buf.line("        }");
     buf.line("    }");
     buf.line("    *pos += pad;");
     buf.line("    return VITRIN_DECODE_OK;");
@@ -770,22 +825,40 @@ fn gen_c_encode(
 ) {
     buf.line("/* Encodes into a complete frame (header + argument payload). Returns the");
     buf.line("   number of bytes written (fits in an int32_t: the wire format's own u16");
-    buf.line("   size field caps a frame at 65535 bytes), or VITRIN_ENCODE_ERR_OVERFLOW if");
-    buf.line("   out_capacity is too small. Any fd argument is never written here -- send");
-    buf.line("   it out-of-band via SCM_RIGHTS alongside these bytes. */");
+    buf.line("   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if");
+    buf.line("   out_capacity is too small or the frame would exceed 65535 bytes, or");
+    buf.line("   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own");
+    buf.line("   documented `(max N bytes)` bound. Nothing is written to `out` on either");
+    buf.line("   error. Any fd argument is never written here -- send it out-of-band via");
+    buf.line("   SCM_RIGHTS alongside these bytes. */");
     buf.line(format!(
         "static inline int32_t {base}_encode(const {type_name} *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {{"
     ));
 
-    let mut size_expr = String::from("VITRIN_HEADER_LEN");
+    // Per-argument bound checks come first, before any size arithmetic or
+    // writes: an over-bound string is a distinct caller error, not an
+    // out_capacity problem, and reporting it precisely mirrors the Rust
+    // side's per-argument assertion in wire::write_string.
+    for arg in &msg.args {
+        if let ArgType::String { max_bytes } = &arg.ty {
+            buf.line(format!("    if (msg->{}.len > {max_bytes}u) {{", arg.name));
+            buf.line("        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;");
+            buf.line("    }");
+        }
+    }
+
+    let mut size_expr = String::from("(uint64_t)VITRIN_HEADER_LEN");
     for arg in &msg.args {
         if let Some(term) = arg_size_term(arg) {
             size_expr.push_str(" + ");
             size_expr.push_str(&term);
         }
     }
-    buf.line(format!("    size_t size = {size_expr};"));
-    buf.line("    if (size > 0xffffu || size > out_capacity) {");
+    // uint64_t on purpose -- see vitrin_raw_string_wire_len's comment: 32-bit
+    // size_t arithmetic could wrap on a hostile string length and defeat this
+    // guard entirely.
+    buf.line(format!("    uint64_t size = {size_expr};"));
+    buf.line("    if (size > 0xffffu || size > (uint64_t)out_capacity) {");
     buf.line("        return VITRIN_ENCODE_ERR_OVERFLOW;");
     buf.line("    }");
     buf.line("    vitrin_frame_header_t hdr;");
@@ -880,7 +953,14 @@ fn gen_c_decode(
     buf.line("   independent disjuncts, both checked here: the header's own fd_count byte");
     buf.line("   disagreeing with this message's signature, and the out-of-band fd");
     buf.line("   parameter disagreeing with it. A hostile or buggy peer can make either");
-    buf.line("   one lie without the other, so neither check substitutes for the other. */");
+    buf.line("   one lie without the other, so neither check substitutes for the other.");
+    buf.line("");
+    buf.line("   The header's opcode and size fields are validated in the same");
+    buf.line("   defense-in-depth spirit: the dispatcher already selected this message by");
+    buf.line("   opcode and delimited the frame by size, but a dispatcher bug (or a");
+    buf.line("   header whose size field lies about the delivered byte count, fatal");
+    buf.line("   `oversized` per conventions 2.1) must surface as an error here, not as a");
+    buf.line("   silently mis-decoded message. */");
     buf.line(format!(
         "static inline vitrin_decode_status_t {base}_decode("
     ));
@@ -896,6 +976,14 @@ fn gen_c_decode(
     buf.line("    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);");
     buf.line("    if (hdr_st != VITRIN_DECODE_OK) {");
     buf.line("        return hdr_st;");
+    buf.line("    }");
+    buf.line(format!(
+        "    if (hdr.opcode != {macro_prefix}_OPCODE) {{"
+    ));
+    buf.line("        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;");
+    buf.line("    }");
+    buf.line("    if ((size_t)hdr.size != in_len) {");
+    buf.line("        return VITRIN_DECODE_ERR_SIZE_MISMATCH;");
     buf.line("    }");
     buf.line(format!(
         "    if (hdr.fd_count != (uint8_t){macro_prefix}_HAS_FD) {{"
@@ -931,13 +1019,28 @@ fn gen_decode_arg(buf: &mut Buf, protocol: &Protocol, arg: &Arg) {
             ));
             buf.line(format!("    out->{field} = (int32_t){field}_raw;"));
         }
-        ArgType::Uint { enum_ref: None } | ArgType::Object { .. } | ArgType::NewId { .. } => {
+        ArgType::Uint { enum_ref: None } | ArgType::NewId { .. } => {
             buf.line(format!(
                 "    vitrin_decode_status_t st_{field} = vitrin_raw_read_u32(in, in_len, &pos, &out->{field});"
             ));
             buf.line(format!(
                 "    if (st_{field} != VITRIN_DECODE_OK) {{ return st_{field}; }}"
             ));
+        }
+        ArgType::Object { .. } => {
+            buf.line(format!(
+                "    vitrin_decode_status_t st_{field} = vitrin_raw_read_u32(in, in_len, &pos, &out->{field});"
+            ));
+            buf.line(format!(
+                "    if (st_{field} != VITRIN_DECODE_OK) {{ return st_{field}; }}"
+            ));
+            if !arg.allow_null {
+                // Object id 0 is the null object, legal only under allow-null
+                // (conventions section 3).
+                buf.line(format!(
+                    "    if (out->{field} == 0u) {{ return VITRIN_DECODE_ERR_NULL_OBJECT; }}"
+                ));
+            }
         }
         ArgType::Int { enum_ref: Some(r) } | ArgType::Uint { enum_ref: Some(r) } => {
             let ty = enum_c_type_name(&r.interface, &r.name);

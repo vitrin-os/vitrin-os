@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+# Minimum supported Rust version. The hard floor is std::io::pipe() (stable
+# since 1.87, used by the fd-bearing round-trip tests); the workspace is
+# developed and CI-verified on the exact toolchain pinned in
+# rust-toolchain.toml.
+rust-version = "1.87"

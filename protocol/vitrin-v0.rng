@@ -15,7 +15,9 @@
     - allow-null is legal only on string and object arguments;
     - enum references are legal only on int and uint arguments;
     - descriptions are required on the protocol, every interface, and every
-      request, event, and enum; every enum entry carries a summary;
+      request, event, and enum; every enum entry and every argument carries
+      a summary; string-argument summaries carry the machine-readable
+      "(max N bytes)" bound token;
     - enum entry values are required (decimal or hex);
     - B2: every vitrin_shim_seat event's final argument is the origin tag
       (and the seat interface defines no requests).
@@ -187,12 +189,14 @@
       <attribute name="enum">
         <value>origin</value>
       </attribute>
-      <optional>
-        <attribute name="summary">
-          <text/>
-        </attribute>
-      </optional>
+      <ref name="arg-summary"/>
     </element>
+  </define>
+
+  <define name="arg-summary">
+    <attribute name="summary">
+      <text/>
+    </attribute>
   </define>
 
   <define name="arg">
@@ -200,11 +204,6 @@
       <attribute name="name">
         <data type="NCName"/>
       </attribute>
-      <optional>
-        <attribute name="summary">
-          <text/>
-        </attribute>
-      </optional>
       <choice>
         <!-- new_id: must name its interface; never nullable -->
         <group>
@@ -214,6 +213,7 @@
           <attribute name="interface">
             <data type="NCName"/>
           </attribute>
+          <ref name="arg-summary"/>
         </group>
         <!-- object: must name its interface; may be nullable -->
         <group>
@@ -228,8 +228,10 @@
               <value>true</value>
             </attribute>
           </optional>
+          <ref name="arg-summary"/>
         </group>
-        <!-- string: may be nullable; no interface -->
+        <!-- string: may be nullable; no interface; summary must carry the
+             machine-readable "(max N bytes)" bound token -->
         <group>
           <attribute name="type">
             <value>string</value>
@@ -239,6 +241,11 @@
               <value>true</value>
             </attribute>
           </optional>
+          <attribute name="summary">
+            <data type="string">
+              <param name="pattern">.*\(max [0-9]+ bytes\).*</param>
+            </data>
+          </attribute>
         </group>
         <!-- scalar: may reference an enum -->
         <group>
@@ -255,6 +262,7 @@
               </data>
             </attribute>
           </optional>
+          <ref name="arg-summary"/>
         </group>
         <!-- fixed and fd: bare -->
         <group>
@@ -264,6 +272,7 @@
               <value>fd</value>
             </choice>
           </attribute>
+          <ref name="arg-summary"/>
         </group>
       </choice>
     </element>

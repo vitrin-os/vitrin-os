@@ -60,6 +60,9 @@ A principal connection moves through exactly one authentication:
    for a version mismatch) and the queued requests are **never** processed. Any fatal protocol
    violation at any point produces an `error` event followed by close.
 
+`hello` is legal **exactly once** per connection: its opcode is defined only in the Initial state,
+so a second `hello` — in Verifying or Bound — is fatal `invalid_opcode`.
+
 ## Requests
 
 ### hello
@@ -72,7 +75,7 @@ hello(version: uint, principal: new_id<vitrin_principal>, identity: string, cred
 | --- | --- | --- |
 | `version` | uint | Protocol version being spoken. Version 1 requires an **exact** match; any other value is fatal `version_unsupported`. |
 | `principal` | new_id → [`vitrin_principal`](./02-vitrin_principal.md) | The principal object pre-allocated by this request and bound on success. |
-| `identity` | string | The claimed identity URI, SPIFFE-shaped (e.g. `vitrin://local/agent/demo`). Max 256 bytes. |
+| `identity` | string | The claimed identity URI, SPIFFE-shaped (e.g. `vitrin://local/agent/demo`). Max 2048 bytes — the SPIFFE-ID maximum (a 255-byte trust domain plus path). |
 | `credential_type` | string | Credential scheme discriminator naming how `credential` is interpreted (e.g. `static-token`, `spiffe-jwt-svid`, `oidc`, `ssh-cert`). Max 32 bytes. |
 | `credential` | string | Opaque, scheme-defined credential bytes, interpreted only by the verifier. Max 32768 bytes. |
 
@@ -87,6 +90,10 @@ The credential encoding is deliberately opaque to the wire. `credential_type` na
 signature-agility hook for future credential families. Because a `string` argument caps a single
 frame's payload, credentials larger than one frame arrive via an fd-borne sibling request in a
 future version (see [Growth](#growth)).
+
+The credential is **secret material**: the server MUST NOT write credential bytes into logs,
+`error.message` text, or the flight recorder — at most `credential_type` and the byte length may be
+recorded.
 
 **Sender-constraint.** Authentication binds a triple: this connection, the verified credential, and
 the `SO_PEERCRED` recorded by the transport at accept time. A handle minted on one connection and
@@ -107,6 +114,7 @@ close. There is no `hello`-specific event on `vitrin_handshake` itself.
   `SO_PEERCRED` mismatch).
 - `invalid_object` — the `new_id` for `principal` violated id allocation rules (at or below the
   watermark, reserved range, reused), or a cross-connection handle was presented.
+- `invalid_opcode` — a second `hello`; the opcode is defined only in the Initial state.
 - `pre_handshake` — a non-`hello` message arrived before any `hello`.
 
 There are **no recoverable refusals** of `hello`: a rejected credential is a client-known failure
@@ -125,7 +133,10 @@ sync(cookie: uint)
 `sync` requests a `done` event carrying the same `cookie`. `done` is sent only after **every request
 received before this `sync` has been processed and every event those requests caused has been queued
 ahead of it** — the guarantee rests on the connection's single-ordered-stream property
-(see [ordering](./00-conventions.md)).
+(see [ordering](./00-conventions.md)). One exemption: petition-lifecycle events
+([`vitrin_grant.resolved`](./04-vitrin_grant.md), [`vitrin_consent.state`](./05-vitrin_consent.md))
+wait on human consent and do not participate in the barrier — `done` confirms a preceding petition
+was registered and its consent initiated, never that it resolved.
 
 This is the mechanism that makes a threadless blocking client correct. Because actuation requests
 are fire-and-forget and their enforcement failures arrive as `vitrin_grant.refused` events, a client
@@ -196,14 +207,15 @@ connection.
 | entry | value | meaning |
 | --- | --- | --- |
 | `invalid_object` | 0 | Unknown or foreign object id, id reuse at or below the watermark, reserved-range id, or a multi-`new_id` rule violation. |
-| `invalid_opcode` | 1 | Opcode not defined for the interface at the negotiated version — including opcodes belonging to the other connection class. |
+| `invalid_opcode` | 1 | Opcode not defined for the interface at the negotiated version — including opcodes belonging to the other connection class, and a second `hello` (its opcode is defined only in the initial connection state). |
 | `invalid_argument` | 2 | Argument decode failure: bad UTF-8, embedded NUL, a string over its documented bound, an out-of-range enum value (a bit outside a bitfield's defined mask counts as out-of-range), a forbidden control character, zero verbs in a petition, or malformed padding. |
-| `oversized` | 3 | Frame size above 65535 bytes, or a truncated payload. |
+| `oversized` | 3 | Declared frame size below the 8-byte header minimum, or a payload shorter than the size declares. The 65535-byte ceiling binds senders — a u16 cannot express more. |
 | `fd_violation` | 4 | The header `fd_count` disagrees with the message signature, or unsolicited fds were attached. |
 | `pre_handshake` | 5 | Traffic before a first `hello` on a principal connection. |
 | `version_unsupported` | 6 | `hello` carried a protocol version the server does not implement; downgrade is refusal. |
 | `auth_failed` | 7 | Credential rejected: unknown identity, bad token, verifier failure, or `SO_PEERCRED` mismatch. |
 | `internal` | 8 | A server-side failure that poisoned the connection. |
+| `resource_exhausted` | 9 | A documented per-connection resource bound was breached: the petition-rate ceiling, the live-object cap, or object-id exhaustion. Denial-of-service confinement, not a semantic judgement. |
 
 This enum is not a bitfield: `code` carries exactly one value. Values are immutable across versions;
 later versions append entries and mark deprecations, never renumber (see

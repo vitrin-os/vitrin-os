@@ -92,7 +92,7 @@ layout, but nothing in the protocol hard-codes exactly one surface per shim —
 the request MAY be issued more than once, and multi-surface composition is a
 purely additive growth direction (see [Growth](#growth)).
 
-**Delivery class:** neither reply-bearing nor refusable. The request only mints
+**Delivery class:** a **structural mint** — neither reply-bearing nor refusable. The request only mints
 an object; there is no terminal event and no wire acknowledgement. A malformed
 `new_id` (reused, out of range, or below the watermark) is handled per the
 shim-connection rule as log-and-close, not as a recoverable refusal.
@@ -115,8 +115,8 @@ There is **exactly one seat per session.** A second `get_seat` on the same
 session is the log-and-close condition `already_initialized`: the core logs the
 reason and closes the connection.
 
-**Delivery class:** as with `create_surface`, object-minting only — no terminal
-event, no refusal. The single-seat violation is fatal to the connection
+**Delivery class:** a **structural mint**, as with `create_surface` — no
+terminal event, no refusal. The single-seat violation is fatal to the connection
 (log-and-close), consistent with the taxonomy rule that a client violating its
 own object graph dies rather than being refused.
 

@@ -92,8 +92,16 @@ values, not its request, as ground truth for what the grant confers.
 On any outcome other than `granted`, the trailing arguments are zero-filled
 (`verbs` = 0, `persistence` = `once`, `expiry_ms` = 0) and carry no meaning.
 
+The effective `max_event_rate` is deliberately **not** echoed here: an agent
+discovers throttling operationally, through
+[`refused(rate_limited)`](#refused) and its `retry_after_ms` hint.
+
 **Delivery class:** this is the terminal event of the reply-bearing
-`request_grant`. It is delivered in request order and is never coalesced. Every
+`request_grant` and is never coalesced — but unlike other reply-bearing
+terminals it is **exempt from the cross-request "in request order" rule**: it
+waits on an unbounded human consent delay, is sequenced only within its own
+petition's lifecycle (zero or more `vitrin_consent.state` events, then exactly
+one `resolved`), and a later `sync`'s `done` does **not** wait for it. Every
 outcome — including `denied`, `timed_out`, `unavailable`, `unsupported`, and
 `busy` — is a normal recoverable answer, not a protocol violation: a denial is
 an answer, not an error. The blocking SDK sends `request_grant`, then reads
@@ -191,7 +199,7 @@ All outcomes are recoverable: a denial is an answer, not a protocol violation.
 | `timed_out` | 2 | the consent prompt expired unanswered; petitioning again later is legal |
 | `unavailable` | 3 | the realm was unknown, vacant, or closed while the petition was pending |
 | `unsupported` | 4 | well-formed but refused by policy: durable rung without provenance, reserved flag set, unserved resource prefix or verb |
-| `busy` | 5 | the per-principal pending-petition cap was reached |
+| `busy` | 5 | the pending-petition admission cap for this verified identity (across all of its connections) was reached |
 
 This enum types `resolved.outcome`.
 
@@ -204,12 +212,12 @@ NoSurface, OperationFailed).
 
 | entry | value | meaning |
 |---|---|---|
-| `not_granted` | 0 | the grant is not (or not yet) active, or the verb is outside its effective set: use while pending, after denial, or through an ungranted facet |
+| `not_granted` | 0 | the grant is not (or not yet) active, or the verb is outside its effective set: use while pending, through an ungranted facet, or after any non-`granted` resolution (`denied`, `timed_out`, `unavailable`, `unsupported`, `busy`) |
 | `expired` | 1 | the grant's expiry passed; checked on use and by a proactive timer |
 | `revoked` | 2 | revoked by hold-Esc, panel, or policy; effective on the very next request |
 | `rate_limited` | 3 | the token bucket is empty; `retry_after_ms` hints the refill |
 | `preempted` | 4 | physical human input owns the target right now |
-| `consent_held` | 5 | a consent prompt is up; agent actuation is refused, never delivered to the app |
+| `consent_held` | 5 | the principal's **own** pending petition has a prompt up; that principal's actuation is refused (never delivered to the app) until the prompt closes — other principals' grants are unaffected |
 | `no_surface` | 6 | the realm has no surface (its shim crashed or exited); never a stale frame |
 | `internal` | 7 | server-side failure during this use (renderer, memfd, delivery) |
 

@@ -17,7 +17,7 @@
     limitations under the License.
   </copyright>
 
-  <description summary="Vitrin OS wire protocol, version 0">
+  <description summary="Vitrin OS wire protocol v0 (wire version integer 1)">
     The single IDL source of truth for the Vitrin OS wire protocol: the
     principal-facing interfaces spoken by agent clients over the core's
     listening socket, and the shim-facing interfaces spoken by per-app shims
@@ -35,7 +35,11 @@
 
     FRAMING. Little-endian on the wire. Each message is one frame with an
     8-byte header: object_id (u32), size (u16, whole frame including header;
-    frames above 65535 bytes are fatal "oversized"), opcode (u8), fd_count
+    a declared size below the 8-byte header minimum, or a payload shorter
+    than the size declares, is fatal "oversized" - and because the field is
+    u16 the 65535-byte ceiling binds senders, which MUST NOT construct a
+    larger frame, rather than receivers, which cannot observe one), opcode
+    (u8), fd_count
     (u8, 0 or 1 - at most one file descriptor per message is a framing
     invariant; because the count is in the header, a receiver can drop any
     frame and still consume and close its fd without consulting the schema).
@@ -71,11 +75,15 @@
     client SDK correct with no additional machinery.
 
     ERROR TAXONOMY. A failure is FATAL (the connection dies) when the client
-    violated something it could have known: the grammar, the handshake order,
-    or its own connection's object graph. A failure is RECOVERABLE (an event
-    is delivered and the connection lives) when a well-formed request's
+    violated something it could have known - the grammar, the handshake
+    order, or its own connection's object graph - or breached a documented
+    per-connection resource bound (the petition-rate ceiling, the live-object
+    cap, or id exhaustion: fatal "resource_exhausted", a denial-of-service
+    confinement, not a semantic judgement). A failure is RECOVERABLE (an
+    event is delivered and the connection lives) when a well-formed request's
     authority or target changed underneath it: consent outcome, expiry,
-    revocation, human preemption, a rate ceiling, or shim death. Corollary:
+    revocation, human preemption, a granted verb's rate ceiling, or shim
+    death. Corollary:
     once a grant is revoked or expired its objects go inert - requests on
     them yield recoverable refusals, never "invalid_object" death -
     otherwise human revocation racing in-flight requests would kill
@@ -86,9 +94,15 @@
     log is the debugging channel).
 
     DELIVERY CLASSIFICATION. Requests are classified reply-bearing (hello,
-    sync, request_grant, capture_frame) or fire-and-forget (move, button,
-    scroll, type, attach, damage, commit). Every reply-bearing request
-    receives exactly one terminal event, in request order, and such
+    sync, request_grant, capture_frame), fire-and-forget (move, button,
+    scroll, type, attach, damage, commit), or structural mints (get_realm,
+    create_surface, get_seat), which are neither reply-bearing nor
+    refusable: the request only mints an object, with no terminal event and
+    no wire acknowledgement - a malformed mint is a fatal object-graph
+    error, and a mint whose target is unknown or vacant surfaces that on
+    first use, never at mint time. Every reply-bearing request
+    receives exactly one terminal event, in request order (petition
+    resolution excepted - see PETITION EVENT ORDERING), and such
     terminals are never coalesced. Refusals of fire-and-forget requests MAY
     be coalesced: at most one refused(rate_limited) per grant per
     bucket-refill window, and at most one refused per grant per (verb, code)
@@ -96,7 +110,10 @@
     bounds refusal discovery to one round trip.
 
     VERSIONING. The protocol version is a single integer: the version
-    attribute of this document and the first argument of hello. Version 1
+    attribute of this document and the first argument of hello. The v0 in
+    the document family's name (vitrin-v0.xml) is the spec generation; the
+    wire integer it carries starts at 1 (the schema forbids 0). Prose that
+    says "version 1" means this wire integer. Version 1
     requires an exact match; a mismatch is fatal "version_unsupported"
     (downgrade is refusal, not negotiation). Growth is Wayland-style: new
     messages are appended with since attributes (opcodes are implicit
@@ -127,8 +144,9 @@
     STRING BOUNDS. Every string argument declares a maximum byte length in
     its summary as a "(max N bytes)" token; a string exceeding its bound is
     fatal "invalid_argument". The bound is machine-readable: the code
-    generator extracts it from the summary token, and CI lints that every
-    string argument carries exactly one such token. A null string (legal
+    generator extracts it from the summary token, the schema requires every
+    string argument's summary to carry the token, and CI lints that it
+    appears exactly once. A null string (legal
     only where allow-null is set) and an empty string are encoded
     identically (length 0) and are treated as equivalent - resource relies
     on this (null or empty both mean the whole realm).
@@ -188,6 +206,15 @@
         SO_PEERCRED recorded at accept: a handle minted on one connection
         presented on another is fatal "invalid_object".
 
+        The credential is secret material: the server MUST NOT write
+        credential bytes into logs, error.message text, or the flight
+        recorder - at most credential_type and the byte length may be
+        recorded.
+
+        hello is legal exactly once per connection: its opcode is defined
+        only in the initial state, so a second hello - during verification
+        or after bound - is fatal "invalid_opcode".
+
         This signature is frozen forever.
       </description>
       <arg name="version" type="uint" summary="protocol version; version 1 requires exact match"/>
@@ -202,7 +229,11 @@
         Requests a done event carrying the same cookie. The done event is
         sent only after every request received before this one has been
         processed and every event those requests caused has been queued
-        ahead of it. Because actuation requests are fire-and-forget and
+        ahead of it - with one exemption: petition-lifecycle events
+        (resolved, vitrin_consent.state) wait on human consent and do not
+        participate in the barrier; done confirms a petition was registered
+        and its consent initiated, never that it resolved (see PETITION
+        EVENT ORDERING). Because actuation requests are fire-and-forget and
         enforcement failures are events, a threadless blocking client sends
         its actuations, syncs, then reads until done, raising on any refused
         event seen - bounding failure discovery to one round trip without
@@ -245,14 +276,15 @@
         death, and error paths always close any received file descriptor.
       </description>
       <entry name="invalid_object" value="0" summary="unknown or foreign object id, id reuse at or below the watermark, reserved-range id, or multi-new_id rule violation"/>
-      <entry name="invalid_opcode" value="1" summary="opcode not defined for the interface at the negotiated version, including other-class opcodes"/>
+      <entry name="invalid_opcode" value="1" summary="opcode not defined for the interface at the negotiated version, including other-class opcodes and a second hello (hello's opcode is defined only in the initial connection state)"/>
       <entry name="invalid_argument" value="2" summary="argument decode failure: bad UTF-8, embedded NUL, string over its bound, out-of-range enum value, forbidden control character, zero verbs, malformed padding"/>
-      <entry name="oversized" value="3" summary="frame size above 65535 bytes or truncated payload"/>
+      <entry name="oversized" value="3" summary="declared frame size below the 8-byte header minimum, or a payload shorter than the size declares; the 65535-byte ceiling binds senders (a u16 cannot express more)"/>
       <entry name="fd_violation" value="4" summary="fd count in the header disagrees with the message signature, or unsolicited fds attached"/>
       <entry name="pre_handshake" value="5" summary="traffic before a first hello on a principal connection"/>
       <entry name="version_unsupported" value="6" summary="hello carried a protocol version the server does not implement; downgrade is refusal"/>
       <entry name="auth_failed" value="7" summary="credential rejected: unknown identity, bad token, verifier failure, or SO_PEERCRED mismatch"/>
       <entry name="internal" value="8" summary="server-side failure that poisoned the connection"/>
+      <entry name="resource_exhausted" value="9" summary="a documented per-connection resource bound was breached: the petition-rate ceiling, the live-object cap, or object-id exhaustion; denial-of-service confinement, not a semantic judgement"/>
     </enum>
   </interface>
 
@@ -327,10 +359,12 @@
         ceiling - never unlimited. persistence is the requested rung; the
         durable rungs (until_revoked, always) exist in the enum from day
         one but resolve "unsupported" in version 1, pending provenance
-        verification in a later phase. flags MUST be 0 in version 1: bit 0
-        is reserved for the one_shot constraint, and a set reserved bit
-        resolves "unsupported" - honest refusal rather than
-        accepted-and-unenforced. Future boolean constraints are flags bits;
+        verification in a later phase. Clients MUST send flags 0 in
+        version 1; bit 0 is reserved for the one_shot constraint. flags
+        references no enum and is deliberately not wire-validated, so a set
+        reserved bit is not a protocol error: it resolves "unsupported" -
+        honest refusal rather than accepted-and-unenforced. Future boolean
+        constraints are flags bits;
         future value-bearing constraints (such as focus conditions) arrive
         as a since-gated builder request preceding this one.
 
@@ -343,10 +377,10 @@
         is itself subject to a server-side petition-rate ceiling and a
         per-connection live-object cap; because every petition permanently
         allocates five object ids (version 1 has no destructors), a
-        connection that breaches either bound is closed fatally
-        ("invalid_object" on id exhaustion, "internal" on the rate cap),
-        confining the denial-of-service to the offending connection rather
-        than the whole core. A pending petition is withdrawn if the
+        connection that breaches either bound - or exhausts the id space
+        itself - is closed fatally "resource_exhausted", confining the
+        denial-of-service to the offending connection rather than the whole
+        core. A pending petition is withdrawn if the
         connection closes: consent is in-context, so the prompt disappears
         with the petitioner.
       </description>
@@ -394,9 +428,11 @@
         EFFECTIVE authority - the verb set, persistence rung, and expiry
         the human actually chose, which may be narrower than requested
         (Allow-once versus Allow-while-running changes the lifetime). On
-        any other outcome the trailing arguments are zero. Denial and
-        timeout are clean distinct events, never a hang and never a
-        connection death.
+        any other outcome the trailing arguments are zero. The effective
+        max_event_rate is deliberately not echoed here: an agent discovers
+        throttling operationally, through refused(rate_limited) and its
+        retry_after_ms hint. Denial and timeout are clean distinct events,
+        never a hang and never a connection death.
       </description>
       <arg name="outcome" type="uint" enum="outcome" summary="how the petition resolved"/>
       <arg name="verbs" type="uint" enum="verb" summary="effective verb set (0 unless granted)"/>
@@ -457,7 +493,7 @@
       <entry name="timed_out" value="2" summary="the consent prompt expired unanswered; petitioning again later is legal"/>
       <entry name="unavailable" value="3" summary="the realm was unknown, vacant, or closed while the petition was pending"/>
       <entry name="unsupported" value="4" summary="in-range but refused by policy: durable rung without provenance, reserved flag set, unserved resource prefix, or a defined verb this deployment or resource does not serve (an out-of-range verb bit is instead fatal invalid_argument)"/>
-      <entry name="busy" value="5" summary="the per-principal pending-petition cap was reached"/>
+      <entry name="busy" value="5" summary="the pending-petition admission cap for this verified identity (across all of its connections) was reached"/>
     </enum>
 
     <enum name="refusal">

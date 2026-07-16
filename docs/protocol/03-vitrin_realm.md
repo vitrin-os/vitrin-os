@@ -49,7 +49,8 @@ allocated ids, is never reused (see the [conventions page](./00-conventions.md)
 on object ids). A realm handle MAY be used to launch more than one petition
 over its lifetime — for example after an earlier petition resolved `denied` or
 `timed_out`, the same handle may petition again — subject to the version-1
-policy of at most one *pending* petition per principal at any instant.
+pending-petition admission cap, which is enforced per verified **identity**,
+across all of that identity's connections.
 
 ## Requests
 
@@ -72,7 +73,7 @@ grant handle, its consent observer, and the three authority facets.
 | `expiry_ms` | `uint` | requested lifetime in milliseconds; `0` = bounded only by the persistence rung |
 | `max_event_rate` | `uint` | requested ceiling in **events per second**, governing observation and actuation alike; `0` = server default ceiling, **never** unlimited |
 | `persistence` | `uint` — enum [`vitrin_grant.persistence`](./04-vitrin_grant.md#persistence) | requested persistence rung |
-| `flags` | `uint` | boolean constraint bits; **MUST be 0** in version 1 (bit 0 reserved: `one_shot`) |
+| `flags` | `uint` | boolean constraint bits; clients **MUST send 0** in version 1 (bit 0 reserved: `one_shot`) |
 
 **The five `new_id` arguments.** All five follow the multi-`new_id` rule from
 the [conventions page](./00-conventions.md): they MUST be distinct, strictly
@@ -115,23 +116,35 @@ death.
   `always`) exist in the [enum](./04-vitrin_grant.md#persistence) from day one
   but resolve `unsupported` in version 1, pending provenance verification in a
   later phase.
-- `flags` MUST be `0` in version 1. Bit 0 is reserved for the future
-  `one_shot` constraint. A set reserved bit does not kill the connection; it
-  resolves `unsupported` — honest refusal rather than accepted-and-unenforced.
+- Clients MUST send `flags` `0` in version 1. Bit 0 is reserved for the future
+  `one_shot` constraint. `flags` references no enum and is deliberately not
+  wire-validated, so a set reserved bit is not a protocol error and does not
+  kill the connection; it resolves `unsupported` — honest refusal rather than
+  accepted-and-unenforced.
 
 **Delivery class.** `request_grant` is **reply-bearing**: it receives exactly
-one terminal event, in request order, never coalesced. That terminal is
+one terminal event, never coalesced. That terminal is
 [`vitrin_grant.resolved`](./04-vitrin_grant.md#resolved), delivered on the
 co-minted grant handle — the reply lands on a *different* object than the one
-the request was sent to. See the [conventions page](./00-conventions.md) on
-delivery classification.
+the request was sent to. Unlike other reply-bearing terminals, `resolved` is
+**exempt from the cross-request "in request order" rule**: it waits on an
+unbounded human consent delay, and a later `sync`'s `done` does **not** wait
+for it (the `done` confirms the petition was registered and its consent
+initiated, never that it resolved). See the [conventions page](./00-conventions.md)
+on delivery classification and ordering.
 
 **Failure modes.**
 - *Fatal (connection dies).* `verbs == 0` is fatal `invalid_argument`: an empty
   petition is something a correct client can never intend. A `resource` string
   over 256 bytes, bad UTF-8, or an embedded NUL is likewise fatal
   `invalid_argument`. A malformed `new_id` set (non-distinct, non-increasing,
-  or at/below the watermark) is fatal `invalid_object`. These are carried by
+  or at/below the watermark) is fatal `invalid_object`. `request_grant` is
+  additionally subject to a server-side petition-rate ceiling and a
+  per-connection live-object cap (every petition permanently allocates five
+  object ids — version 1 has no destructors): a connection that breaches
+  either bound, or exhausts the id space itself, is closed fatal
+  `resource_exhausted`, confining the denial-of-service to the offending
+  connection. These are carried by
   [`vitrin_handshake.error`](./01-vitrin_handshake.md) and then the connection
   closes.
 - *Recoverable (an event is delivered, the connection lives).* Every
@@ -142,13 +155,17 @@ delivery classification.
   unknown, vacant, or closed while the petition was pending), `unsupported`
   (well-formed but refused by policy: a durable rung without provenance, a set
   reserved flag, an unserved resource prefix or verb), or `busy` (the
-  per-principal pending-petition cap was reached).
+  identity's pending-petition admission cap was reached).
 
-**Version 1 petition policy.** At most one pending petition per principal;
-excess petitions resolve `busy` — the consent-spam valve. A pending petition is
-withdrawn if the connection closes: consent is in-context, so the prompt
-disappears with the petitioner. There is no wire message to withdraw a pending
-petition in version 1 (see [Growth](#growth)).
+**Version 1 petition policy.** Pending-petition admission is capped **per
+verified identity, across all of that identity's connections** — not merely per
+connection, so opening many connections under one credential cannot multiply
+concurrent prompts — and the deployment additionally enforces a global ceiling
+on concurrent-plus-queued prompts. Excess petitions resolve `busy` — the
+consent-spam valve. A pending petition is withdrawn if the connection closes:
+consent is in-context, so the prompt disappears with the petitioner. There is
+no wire message to withdraw a pending petition in version 1 (see
+[Growth](#growth)).
 
 ## Enums
 
@@ -209,9 +226,9 @@ inert forever and the connection lives; the SDK raises a distinct typed error.
 
 ### Flow 4 — busy (excess petition)
 
-1. *(a petition is already pending for this principal)*
-2. A→C `vitrin_realm.request_grant(…)` — a second, concurrent petition
-3. C→A `vitrin_grant.resolved(outcome=busy, verbs=0, persistence=once, expiry_ms=0)` — the per-principal pending-petition cap
+1. *(this identity's pending-petition admission cap is already reached)*
+2. A→C `vitrin_realm.request_grant(…)` — an excess concurrent petition
+3. C→A `vitrin_grant.resolved(outcome=busy, verbs=0, persistence=once, expiry_ms=0)` — the identity's admission cap
 
 The busy petition's co-minted objects remain inert; the principal may retry
 after its outstanding petition resolves.

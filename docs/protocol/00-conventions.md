@@ -108,7 +108,7 @@ Each frame begins with an **8-byte header**:
 | Field | Type | Meaning |
 |---|---|---|
 | `object_id` | u32 | the target object of the message |
-| `size` | u16 | **whole frame including the 8-byte header**; a frame declaring more than 65535 bytes, or a truncated payload, is fatal `oversized` |
+| `size` | u16 | **whole frame including the 8-byte header**; a declared size below the 8-byte minimum, or a payload shorter than the size declares, is fatal `oversized`. The 65535-byte ceiling binds **senders** (a u16 cannot express more), which MUST NOT construct a larger frame |
 | `opcode` | u8 | the request/event opcode within the target object's interface at the negotiated version |
 | `fd_count` | u8 | `0` or `1` — see the one-fd-per-message invariant below |
 
@@ -151,10 +151,11 @@ Every `string` argument documents a maximum byte length. A violation is fatal
 
 | Interface.message | Argument | Max bytes |
 |---|---|---|
-| `vitrin_handshake.hello` | `identity` | 256 |
+| `vitrin_handshake.hello` | `identity` | 2048 (the SPIFFE-ID maximum: a 255-byte trust domain plus path) |
 | `vitrin_handshake.hello` | `credential_type` | 32 |
 | `vitrin_handshake.hello` | `credential` | 32768 |
-| `vitrin_handshake.error` | `message` | frame-bounded (free-form debug text, never parsed) |
+| `vitrin_handshake.error` | `message` | 1024 (free-form debug text, never parsed) |
+| `vitrin_principal.bound` | `identity` | 2048 |
 | `vitrin_principal.get_realm` | `name` | 64 |
 | `vitrin_realm.request_grant` | `resource` | 256 (allow-null) |
 | `vitrin_actuator_text.type` | `text` | 4096 |
@@ -222,9 +223,10 @@ Any violation is fatal `invalid_object`.
 ### 3.4 Id exhaustion
 
 A connection that allocates all client ids in `[2, 0xfeffffff]` (roughly
-4.28 billion) without any means to reuse them is a documented connection death
-(the practical
-population is far below this; exhaustion signals a client bug or attack).
+4.28 billion) without any means to reuse them dies fatal `resource_exhausted`
+(the practical population is far below this; exhaustion signals a client bug
+or attack — the same code covers the per-connection live-object cap and the
+petition-rate ceiling, §5.2).
 
 ---
 
@@ -248,7 +250,11 @@ no additional machinery (no serials, no per-message acks):
   event).
 
 Concretely: an event caused by request *N* is always delivered before the
-`done` of any `sync` issued after *N*.
+`done` of any `sync` issued after *N* — with one carve-out: **petition-lifecycle
+events** (`vitrin_grant.resolved`, `vitrin_consent.state`) wait on an unbounded
+human consent delay and do **not** participate in this rule. A `done` confirms
+that an earlier petition was registered and its consent initiated, never that
+it resolved (§6.4).
 
 ---
 
@@ -257,13 +263,15 @@ Concretely: an event caused by request *N* is always delivered before the
 ### 5.1 The razor
 
 > A failure is **FATAL** (the connection dies) when the client violated
-> something it could have known: the grammar, the handshake order, or its own
-> connection's object graph.
+> something it could have known — the grammar, the handshake order, or its own
+> connection's object graph — or breached a documented per-connection resource
+> bound (`resource_exhausted`: denial-of-service confinement, not a semantic
+> judgement).
 >
 > A failure is **RECOVERABLE** (an event is delivered and the connection lives)
 > when a well-formed request's authority or target changed underneath it:
-> consent outcome, expiry, revocation, human preemption, a rate ceiling, or
-> shim death.
+> consent outcome, expiry, revocation, human preemption, a granted verb's rate
+> ceiling, or shim death.
 
 Corollary: once a grant is revoked or expired its objects go inert — requests
 on them yield recoverable refusals, never `invalid_object` death — otherwise
@@ -283,20 +291,21 @@ unframeable streams are closed without it). On a **shim** connection there is
 shim is a core-spawned disposable child and the core log is the debugging
 channel.
 
-The nine fatal codes (the `vitrin_handshake.error` enum; in version 0 this is
+The ten fatal codes (the `vitrin_handshake.error` enum; in version 0 this is
 the only error enum, so all fatal codes are connection-global):
 
 | Code | Value | Condition |
 |---|---|---|
 | `invalid_object` | 0 | unknown or foreign object id, id reuse at or below the watermark, reserved-range id, or a multi-`new_id` rule violation |
-| `invalid_opcode` | 1 | opcode not defined for the interface at the negotiated version, **including other-class opcodes** |
+| `invalid_opcode` | 1 | opcode not defined for the interface at the negotiated version, **including other-class opcodes and a second `hello`** (`hello`'s opcode is defined only in the initial connection state) |
 | `invalid_argument` | 2 | argument decode failure: bad UTF-8, embedded NUL, string over its bound, out-of-range enum value, forbidden control character, zero verbs in a petition, malformed padding |
-| `oversized` | 3 | frame `size` above 65535 bytes, or a truncated payload |
+| `oversized` | 3 | declared frame `size` below the 8-byte minimum, or a payload shorter than the size declares (the 65535-byte ceiling binds senders — a u16 cannot express more) |
 | `fd_violation` | 4 | header `fd_count` disagrees with the signature, or unsolicited fds attached |
 | `pre_handshake` | 5 | traffic before a first `hello` on a principal connection |
 | `version_unsupported` | 6 | `hello` carried a protocol version the server does not implement; downgrade is refusal, not negotiation |
 | `auth_failed` | 7 | credential rejected: unknown identity, bad token, verifier failure, or `SO_PEERCRED` mismatch |
 | `internal` | 8 | server-side failure that poisoned the connection |
+| `resource_exhausted` | 9 | a documented per-connection resource bound was breached: the petition-rate ceiling, the live-object cap, or object-id exhaustion — denial-of-service confinement, not a semantic judgement |
 
 **Shim log-only conditions** (defined here, but delivered as log-and-close, not
 as a wire code):
@@ -362,9 +371,15 @@ best-effort; silent-close is legal where no addressable error can be delivered.
 
 ## 6. Delivery classification
 
-Every request is either **reply-bearing** or **fire-and-forget**. This
-classification, together with the ordering guarantee (§4), is what lets the SDK
-stay single-threaded and blocking.
+Every request is **reply-bearing**, **fire-and-forget**, or a **structural
+mint**. This classification, together with the ordering guarantee (§4), is what
+lets the SDK stay single-threaded and blocking.
+
+The structural mints are `get_realm`, `create_surface`, and `get_seat`: the
+request only mints an object, so it is neither reply-bearing nor refusable —
+no terminal event, no wire acknowledgement. A malformed mint is a fatal
+object-graph error; a mint whose target is unknown or vacant surfaces that on
+first *use* (e.g. petitions resolving `unavailable`), never at mint time.
 
 ### 6.1 Reply-bearing requests
 
@@ -372,11 +387,12 @@ stay single-threaded and blocking.
 |---|---|
 | `vitrin_handshake.hello` | `vitrin_principal.bound` (success) or fatal `auth_failed` / `version_unsupported` |
 | `vitrin_handshake.sync` | `vitrin_handshake.done` |
-| `vitrin_realm.request_grant` | `vitrin_grant.resolved` |
+| `vitrin_realm.request_grant` | `vitrin_grant.resolved` (delivered when the petition resolves — exempt from cross-request order, §4) |
 | `vitrin_view.capture_frame` | `vitrin_view.frame_ready` **or** `vitrin_grant.refused(observe, …)` |
 
 **Exactly-one-terminal rule.** Every reply-bearing request receives **exactly
-one** terminal event, in request order, and such terminals are **never
+one** terminal event, in request order (petition resolution excepted — §4), and
+such terminals are **never
 coalesced**. For `capture_frame` the one-of pairing is forced by the type
 system: `fd` arguments have no null form, so failure must be a distinct event.
 
@@ -423,6 +439,13 @@ The barrier costs no id churn: the cookie is an echoed value, not a callback
 object. `sync` is valid only after `bound`, and there is no `sync` on shim
 connections.
 
+One exemption: petition-lifecycle events (`resolved`, `vitrin_consent.state`)
+wait on human consent and do not participate in the barrier. A `done` confirms
+that a preceding `request_grant` was processed — the petition registered, its
+consent initiated — but does **not** wait for that petition to resolve, so a
+blocking client reads `resolved` on its own schedule without deadlocking
+against an unrelated pending prompt.
+
 ---
 
 ## 7. Handshake and versioning
@@ -454,6 +477,12 @@ connections.
   processed**.
 - `bound` carries the **verifier-canonical** identity, not an echo of the
   client's claimed string.
+- `hello` is legal **exactly once** per connection: its opcode is defined only
+  in the initial state, so a second `hello` — in VERIFYING or BOUND — is fatal
+  `invalid_opcode`.
+- The `credential` is secret material: the server MUST NOT write credential
+  bytes into logs, `error.message` text, or the flight recorder — at most
+  `credential_type` and the byte length may be recorded.
 
 ### 7.2 Shim "handshake"
 
@@ -503,12 +532,19 @@ RELAX NG schema (`protocol/vitrin-v0.rng`) and validated with
 - **`allow-null`** is legal only on `string` and `object` arguments.
 - **`enum` references** are legal only on `int` and `uint` arguments.
 - **Descriptions required** on the protocol, every interface, and every
-  request/event/enum; every enum `entry` carries a `summary`.
+  request/event/enum; every enum `entry` **and every argument** carries a
+  `summary`, and every `string` argument's summary carries the
+  machine-readable `(max N bytes)` bound token (schema-enforced; CI
+  additionally lints that the token appears exactly once).
 - **Enum entry values required** (decimal or `0x` hex).
 - **Structural rule B2**: `vitrin_shim_seat` is a specialized interface that
   defines **no requests**, and **every one of its events ends with the `origin`
   argument** (`type="uint" enum="origin"`). This makes the per-event
   origin-tagging invariant machine-checkable rather than conventional.
+
+The negative-mutation corpus `protocol/test-mutations.sh` regression-tests
+these rules: each case applies one illegal mutation to a copy of the IDL and
+asserts the schema rejects it.
 
 ### 8.2 The two extension attributes
 

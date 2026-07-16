@@ -428,11 +428,11 @@ pub mod events {
 pub enum Error {
     /// unknown or foreign object id, id reuse at or below the watermark, reserved-range id, or multi-new_id rule violation
     InvalidObject = 0,
-    /// opcode not defined for the interface at the negotiated version, including other-class opcodes
+    /// opcode not defined for the interface at the negotiated version, including other-class opcodes and a second hello (hello's opcode is defined only in the initial connection state)
     InvalidOpcode = 1,
     /// argument decode failure: bad UTF-8, embedded NUL, string over its bound, out-of-range enum value, forbidden control character, zero verbs, malformed padding
     InvalidArgument = 2,
-    /// frame size above 65535 bytes or truncated payload
+    /// declared frame size below the 8-byte header minimum, or a payload shorter than the size declares; the 65535-byte ceiling binds senders (a u16 cannot express more)
     Oversized = 3,
     /// fd count in the header disagrees with the message signature, or unsolicited fds attached
     FdViolation = 4,
@@ -444,6 +444,8 @@ pub enum Error {
     AuthFailed = 7,
     /// server-side failure that poisoned the connection
     Internal = 8,
+    /// a documented per-connection resource bound was breached: the petition-rate ceiling, the live-object cap, or object-id exhaustion; denial-of-service confinement, not a semantic judgement
+    ResourceExhausted = 9,
 }
 
 impl Error {
@@ -460,6 +462,7 @@ impl Error {
         Error::VersionUnsupported,
         Error::AuthFailed,
         Error::Internal,
+        Error::ResourceExhausted,
     ];
 
     /// Decode a wire value, by whole-value membership in the defined entries.
@@ -474,6 +477,7 @@ impl Error {
             6 => Ok(Error::VersionUnsupported),
             7 => Ok(Error::AuthFailed),
             8 => Ok(Error::Internal),
+            9 => Ok(Error::ResourceExhausted),
             _ => Err(crate::error::DecodeError::InvalidEnumValue {
                 interface: "vitrin_handshake",
                 enum_name: "error",

@@ -42,16 +42,17 @@ objects.
 ## The error razor
 
 > **FATAL** (connection dies): the client violated something it could have
-> known — grammar, handshake order, its own object graph.
+> known — grammar, handshake order, its own object graph — or breached a
+> documented per-connection resource bound (`resource_exhausted`).
 > **RECOVERABLE** (event delivered, connection lives): a well-formed
 > request's authority/target changed underneath it — consent, expiry,
-> revocation, preemption, rate limit.
+> revocation, preemption, a granted verb's rate limit.
 
-Nine fatal codes live on `vitrin_handshake.error`: `invalid_object`,
+Ten fatal codes live on `vitrin_handshake.error`: `invalid_object`,
 `invalid_opcode`, `invalid_argument`, `oversized`, `fd_violation`,
-`pre_handshake`, `version_unsupported`, `auth_failed`, `internal`. Shim
-connections have **no fatal-error message** — a violation is log-and-close
-(the shim is a disposable core-spawned child).
+`pre_handshake`, `version_unsupported`, `auth_failed`, `internal`,
+`resource_exhausted`. Shim connections have **no fatal-error message** — a
+violation is log-and-close (the shim is a disposable core-spawned child).
 
 Recoverable failures: `vitrin_grant.resolved` (exactly once per grant, ever)
 and `vitrin_grant.refused` (from the single enforcement chokepoint) — each
@@ -60,7 +61,11 @@ maps to exactly one typed SDK exception.
 ## Delivery classification
 
 Every request is **reply-bearing** (exactly one terminal event, never
-coalesced) or **fire-and-forget** (no reply; refusals MAY coalesce). Ordering
+coalesced), **fire-and-forget** (no reply; refusals MAY coalesce), or a
+**structural mint** (`get_realm`, `create_surface`, `get_seat` — mints an
+object, no terminal event, not refusable). Petition-lifecycle events
+(`resolved`, `consent.state`) are exempt from cross-request ordering and the
+sync barrier. Ordering
 is a single stream per direction, across objects — this is what makes the
 `sync`/`done` barrier idiom and a threadless blocking SDK possible with no
 extra machinery.
@@ -94,12 +99,14 @@ of its events ends with the `origin` argument
 (`type="uint" enum="origin"`) — schema-enforced, not just conventional.
 
 Descriptions are required everywhere (protocol, every interface, every
-request/event/enum; every enum entry needs a `summary`).
+request/event/enum; every enum entry **and every arg** needs a `summary`, and
+every string arg's summary needs its `(max N bytes)` token — schema-enforced).
 
 ## Validate every change
 
 ```bash
 xmllint --relaxng protocol/vitrin-v0.rng protocol/vitrin-v0.xml
+protocol/test-mutations.sh   # negative corpus: every illegal mutation must be rejected
 ```
 
 ## Paired-edit rule

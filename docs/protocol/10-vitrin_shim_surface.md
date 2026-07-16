@@ -6,17 +6,17 @@
 
 ## Purpose
 
-`vitrin_shim_surface` is the channel through which a per-app shim forwards its app's rendered buffers up to the core for composition into the realm view. It is a [shim-connection](./00-conventions.md#connection-classes) interface: it is spoken only over a core-inherited socketpair, never on the principal listening socket, and its opcodes are unreachable from a principal connection (an attempt is a fatal protocol error with no special casing).
+`vitrin_shim_surface` is the channel through which a per-app shim forwards its app's rendered buffers up to the core for composition into the realm view. It is a [shim-connection](./00-conventions.md#12-the-two-connection-classes-and-their-bootstrap-objects) interface: it is spoken only over a core-inherited socketpair, never on the principal listening socket, and its opcodes are unreachable from a principal connection (an attempt is a fatal protocol error with no special casing).
 
 The interface transplants Wayland's proven pending-state model. `attach` and `damage` mutate a *pending* state that has no visible effect; `commit` atomically latches that pending state into the surface's *current* state. This split is what makes a frame update a single indivisible fact on the wire — the core never composites a half-updated surface — and it lets the shim relay its app's own `wl_surface` semantics upward without translation.
 
-Buffers are named by shim-chosen integer cookies (`buffer_id`) rather than by protocol objects. This is deliberate: a buffer is a transient, high-churn thing, and minting a wire object per buffer would burn ids on every frame. The cookie is opaque to the core; the core only echoes it back in `buffer_done` to hand ownership of that buffer back to the shim. Because the whole path is one-fd-per-message ([a framing invariant](./00-conventions.md#framing)), a single `attach` carries exactly one buffer fd, and the core can always drain and close a dropped frame's fd without consulting the schema.
+Buffers are named by shim-chosen integer cookies (`buffer_id`) rather than by protocol objects. This is deliberate: a buffer is a transient, high-churn thing, and minting a wire object per buffer would burn ids on every frame. The cookie is opaque to the core; the core only echoes it back in `buffer_done` to hand ownership of that buffer back to the shim. Because the whole path is one-fd-per-message ([a framing invariant](./00-conventions.md#24-the-one-fd-per-message-invariant)), a single `attach` carries exactly one buffer fd, and the core can always drain and close a dropped frame's fd without consulting the schema.
 
 An instance is created by [`vitrin_shim_session.create_surface`](./09-vitrin_shim_session.md). Nothing in version 1 hard-codes exactly one surface per shim, though the version-1 core composites realm surfaces with a trivial single-maximized layout.
 
 ## Lifecycle
 
-A `vitrin_shim_surface` is minted by `vitrin_shim_session.create_surface`, which allocates its `new_id` on the shim connection. There is no destructor in version 1 — the surface lives for the connection ([version 1 defines no destructors](./00-conventions.md#object-ids)).
+A `vitrin_shim_surface` is minted by `vitrin_shim_session.create_surface`, which allocates its `new_id` on the shim connection. There is no destructor in version 1 — the surface lives for the connection ([version 1 defines no destructors](./00-conventions.md#33-no-destructors-inert-objects-tolerate-dead-events)).
 
 The surface is destroyed only when the shim connection dies. Socketpair EOF is shim death: the core survives, closes every buffer fd it still holds for the connection (no fd leaks), and drops the realm's surface from the scene. Agents observing that realm get [`vitrin_grant.refused(observe, no_surface)`](./04-vitrin_grant.md) on their next capture — never a stale frame. Version 1 has no shim restart policy.
 
@@ -24,7 +24,7 @@ Because this is a shim connection, there is no fatal-error event: a shim protoco
 
 ## Requests
 
-All three requests are **fire-and-forget** ([delivery classification](./00-conventions.md#delivery-classification)): none carries a reply, and none is individually acknowledged. Their effect becomes observable through the buffer-lifecycle events (`buffer_done`, `frame_done`) and, ultimately, through what the core composites. There is no sync barrier on shim connections.
+All three requests are **fire-and-forget** ([delivery classification](./00-conventions.md#6-delivery-classification)): none carries a reply, and none is individually acknowledged. Their effect becomes observable through the buffer-lifecycle events (`buffer_done`, `frame_done`) and, ultimately, through what the core composites. There is no sync barrier on shim connections.
 
 ### attach
 
@@ -192,7 +192,7 @@ If the shim is killed mid-loop, the socketpair reaches EOF. The core closes ever
 
 ## Growth
 
-Version 1 freezes the three request signatures and the two event signatures forever; growth is [additive](./00-conventions.md#versioning). The named version-2+ seams for this interface:
+Version 1 freezes the three request signatures and the two event signatures forever; growth is [additive](./00-conventions.md#74-growth-rules-wayland-style). The named version-2+ seams for this interface:
 
 - **Explicit dmabuf modifiers and multi-planar formats.** Version 1's `attach` is single-plane with a linear modifier implied — deliberately no modifier or plane-count argument. Richer buffers arrive as a since-gated *parameter builder* request (linux-dmabuf precedent): a small object accumulates one fd per message, so the one-fd-per-message framing invariant never becomes a wall. `attach` itself is untouched.
 - **The `kind`, `format`, and `buffer_status` enums are open.** New fd kinds, pixel formats, and failure dispositions are appended with immutable values; nothing shifts. `format` is shared with `vitrin_view`, so a format added there is available here automatically.

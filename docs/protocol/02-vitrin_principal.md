@@ -5,7 +5,7 @@
 ## Purpose
 
 `vitrin_principal` is the wire projection of a bound identity: the agent that
-successfully authenticated on a [principal connection](00-conventions.md#connection-classes).
+successfully authenticated on a [principal connection](00-conventions.md#12-the-two-connection-classes-and-their-bootstrap-objects).
 It is the root of the connection's authority chain. Everything an agent is
 allowed to do flows down from this object — but the principal itself holds only
 two narrow powers: it can mint an address handle for a realm
@@ -65,7 +65,7 @@ get_realm(realm: new_id<vitrin_realm>, name: string)
 
 | arg | type | description |
 |---|---|---|
-| `realm` | `new_id<vitrin_realm>` | the new realm address handle; MUST obey the [id-allocation rules](00-conventions.md#object-ids) (strictly increasing, above the watermark, never reused) |
+| `realm` | `new_id<vitrin_realm>` | the new realm address handle; MUST obey the [id-allocation rules](00-conventions.md#3-object-ids) (strictly increasing, above the watermark, never reused) |
 | `name` | `string` | well-known realm name (max 64 bytes). `"realm-0"` is the single well-known realm of version 1 |
 
 Creates a [`vitrin_realm`](03-vitrin_realm.md) address object for a realm known
@@ -81,14 +81,14 @@ phases: absence is a race against realm lifecycle, not a protocol error, and
 treating it as an outcome (not a refusal at address time) keeps the addressing
 layer stable when multi-realm enumeration arrives.
 
-**Delivery class:** neither reply-bearing nor an actuation. `get_realm` is a
-pure factory: it mints server state (the realm handle) synchronously and emits no
-terminal event. Its effect is observable only through the object it returns,
-never through a reply.
+**Delivery class:** a **structural mint** — neither reply-bearing nor refusable.
+`get_realm` is a pure factory: it mints server state (the realm handle)
+synchronously and emits no terminal event. Its effect is observable only through
+the object it returns, never through a reply.
 
 **Failure modes.** There are no recoverable refusals — an unknown name is not a
 failure of this request (see above). The only failures are
-[fatal](00-conventions.md#error-taxonomy), and each is something a correct client
+[fatal](00-conventions.md#5-error-taxonomy), and each is something a correct client
 can never trigger:
 
 - `invalid_object` — the `realm` new_id violates the id-allocation rules
@@ -107,7 +107,7 @@ bound(identity: string)
 
 | arg | type | description |
 |---|---|---|
-| `identity` | `string` | verifier-canonical principal identity |
+| `identity` | `string` | verifier-canonical principal identity (max 2048 bytes) |
 
 The terminal event of a successful handshake, sent exactly once when the
 principal is bound. `identity` is the canonical identity **as normalized and
@@ -174,7 +174,7 @@ The interface descriptions name one purely-additive seam for this object.
   in version 1 pending provenance verification). This arrives as new
   `since`-gated messages; it changes no existing signature and leaves the
   version-1 lifecycle — bind, address, petition, die-with-connection —
-  untouched. See the [additive-safety appendix](00-conventions.md#versioning).
+  untouched. See the [additive-safety appendix](00-conventions.md#appendix-a--additive-safety-table).
 
 Realm enumeration and lifecycle events are a related later-phase addition, but
 they attach to [`vitrin_realm`](03-vitrin_realm.md), not to the principal.

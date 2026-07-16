@@ -16,7 +16,7 @@ A `vitrin_view` instance comes into existence only as the `view` `new_id` argume
 
 The facet is **born inert**. Existence confers nothing: until the grant resolves `granted` with `observe` in its effective verb set, every `capture_frame` on this object is refused recoverably with [`vitrin_grant.refused`](04-vitrin_grant.md)`(observe, not_granted, …)`. This is deliberate — mint-freely, check-at-use — and it means a well-behaved agent may hold the facet through the whole pending phase and only discover the outcome on [`vitrin_grant.resolved`](04-vitrin_grant.md).
 
-Version 1 defines no destructors. A `vitrin_view` object lives for the connection. When its grant dies — expiry, revocation, or the realm's surface going away — the facet goes inert again rather than being destroyed: captures then refuse recoverably (`expired`, `revoked`, `no_surface`), never fatally. Because object ids are never reused, the server MAY still emit or reference this object after its grant has died, and clients MUST tolerate and discard anything stale (see [conventions § object ids](00-conventions.md)). All of a connection's facets die with the connection; version 1 has no grant persistence.
+Version 1 defines no destructors. A `vitrin_view` object lives for the connection. When its grant dies — expiry or revocation — the facet goes inert again rather than being destroyed: captures then refuse recoverably (`expired`, `revoked`), never fatally. The realm's surface going away does **not** kill the grant: `no_surface` is a use-time refusal on a *live* grant (the shim crashed or exited), and captures succeed again if the surface returns. Because object ids are never reused, the server MAY still emit or reference this object after its grant has died, and clients MUST tolerate and discard anything stale (see [conventions § object ids](00-conventions.md)). All of a connection's facets die with the connection; version 1 has no grant persistence.
 
 ## Requests
 
@@ -32,7 +32,7 @@ This request takes no arguments.
 
 The pairing is forced by the type system rather than by convention. An `fd` argument has no null form, so a failed capture cannot be signalled as a `frame_ready` with an absent fd; failure must therefore be a distinct event, which is exactly [`vitrin_grant.refused`](04-vitrin_grant.md). A receiver that gets `frame_ready` knows it holds a real frame.
 
-Each capture passes the grant's single enforcement chokepoint. Captures are rate-limited by the grant's `max_event_rate` (events per second, chosen at petition time and reported on `resolved`); the token bucket governs observation just as it governs actuation.
+Each capture passes the grant's single enforcement chokepoint. Captures are rate-limited by the grant's effective event-rate ceiling (requested as `max_event_rate` at petition time; the effective value is deliberately not echoed on `resolved` — an agent discovers throttling through `refused(rate_limited)` and its `retry_after_ms` hint); the token bucket governs observation just as it governs actuation.
 
 **Delivery class:** reply-bearing (exactly one terminal event per request, in request order, never coalesced — unlike fire-and-forget actuation refusals, capture refusals are never merged).
 

@@ -359,7 +359,7 @@ pub enum Outcome {
     Unavailable = 3,
     /// in-range but refused by policy: durable rung without provenance, reserved flag set, unserved resource prefix, or a defined verb this deployment or resource does not serve (an out-of-range verb bit is instead fatal invalid_argument)
     Unsupported = 4,
-    /// the per-principal pending-petition cap was reached
+    /// the pending-petition admission cap for this verified identity (across all of its connections) was reached
     Busy = 5,
 }
 

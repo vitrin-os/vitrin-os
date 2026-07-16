@@ -331,11 +331,11 @@ static inline vitrin_decode_status_t vitrin_frame_header_decode(
 typedef enum {
     /* unknown or foreign object id, id reuse at or below the watermark, reserved-range id, or multi-new_id rule violation */
     VITRIN_HANDSHAKE_ERROR_INVALID_OBJECT = 0,
-    /* opcode not defined for the interface at the negotiated version, including other-class opcodes */
+    /* opcode not defined for the interface at the negotiated version, including other-class opcodes and a second hello (hello's opcode is defined only in the initial connection state) */
     VITRIN_HANDSHAKE_ERROR_INVALID_OPCODE = 1,
     /* argument decode failure: bad UTF-8, embedded NUL, string over its bound, out-of-range enum value, forbidden control character, zero verbs, malformed padding */
     VITRIN_HANDSHAKE_ERROR_INVALID_ARGUMENT = 2,
-    /* frame size above 65535 bytes or truncated payload */
+    /* declared frame size below the 8-byte header minimum, or a payload shorter than the size declares; the 65535-byte ceiling binds senders (a u16 cannot express more) */
     VITRIN_HANDSHAKE_ERROR_OVERSIZED = 3,
     /* fd count in the header disagrees with the message signature, or unsolicited fds attached */
     VITRIN_HANDSHAKE_ERROR_FD_VIOLATION = 4,
@@ -347,6 +347,8 @@ typedef enum {
     VITRIN_HANDSHAKE_ERROR_AUTH_FAILED = 7,
     /* server-side failure that poisoned the connection */
     VITRIN_HANDSHAKE_ERROR_INTERNAL = 8,
+    /* a documented per-connection resource bound was breached: the petition-rate ceiling, the live-object cap, or object-id exhaustion; denial-of-service confinement, not a semantic judgement */
+    VITRIN_HANDSHAKE_ERROR_RESOURCE_EXHAUSTED = 9,
 } vitrin_handshake_error_t;
 
 /* Whole-value membership check for `vitrin_handshake_error_t` (decode a wire value by
@@ -362,6 +364,7 @@ static inline bool vitrin_handshake_error_is_valid(uint32_t v) {
         case VITRIN_HANDSHAKE_ERROR_VERSION_UNSUPPORTED:
         case VITRIN_HANDSHAKE_ERROR_AUTH_FAILED:
         case VITRIN_HANDSHAKE_ERROR_INTERNAL:
+        case VITRIN_HANDSHAKE_ERROR_RESOURCE_EXHAUSTED:
             return true;
         default:
             return false;
@@ -460,7 +463,7 @@ typedef enum {
     VITRIN_GRANT_OUTCOME_UNAVAILABLE = 3,
     /* in-range but refused by policy: durable rung without provenance, reserved flag set, unserved resource prefix, or a defined verb this deployment or resource does not serve (an out-of-range verb bit is instead fatal invalid_argument) */
     VITRIN_GRANT_OUTCOME_UNSUPPORTED = 4,
-    /* the per-principal pending-petition cap was reached */
+    /* the pending-petition admission cap for this verified identity (across all of its connections) was reached */
     VITRIN_GRANT_OUTCOME_BUSY = 5,
 } vitrin_grant_outcome_t;
 

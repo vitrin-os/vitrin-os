@@ -7,3 +7,8 @@
 # produce irreproducible "drift". Bumping this pin is a deliberate act that
 # regenerates the tree in the same commit (`cargo xtask codegen`).
 channel = "1.94.1"
+# rustfmt is a real runtime dependency of the codegen (rust_gen.rs shells out
+# to it), so it must be installed with the toolchain wherever rustup
+# auto-installs this pin -- a minimal-profile install (e.g. a CI runner)
+# would otherwise leave `cargo xtask codegen` broken.
+components = ["rustfmt"]

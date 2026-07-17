@@ -123,7 +123,10 @@ jobs:
         run: meson compile -C shim/build
 
       - name: meson test (generated header compiles)
-        run: meson test -C shim/build --print-errorlogs
+        # --suite vitrin-shim: run only this project's tests, not the vendored
+        # subprojects' suites (wlroots pulls in pixman/libliftoff, whose slow
+        # exhaustive tests otherwise run here and time out).
+        run: meson test -C shim/build --suite vitrin-shim --print-errorlogs
 
       - name: Headless acceptance (exact globals + weston-terminal blind)
         working-directory: shim

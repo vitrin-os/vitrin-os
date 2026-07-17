@@ -49,6 +49,13 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq libxml2-utils
           xmllint --noout --relaxng protocol/vitrin-v0.rng protocol/vitrin-v0.xml
 
+      - name: Install native build deps (libxkbcommon for the winit/Smithay backend)
+        # vitrin-core's nested winit backend links libxkbcommon; without the
+        # -dev package the runner's linker fails with "unable to find library
+        # -lxkbcommon". wayland/libinput are dlopen'd at runtime, so they need
+        # no -dev package to link the test binary here.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxkbcommon-dev
+
       - name: cargo test --workspace
         run: cargo test --workspace
 

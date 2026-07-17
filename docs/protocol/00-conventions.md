@@ -297,13 +297,13 @@ the only error enum, so all fatal codes are connection-global):
 | Code | Value | Condition |
 |---|---|---|
 | `invalid_object` | 0 | unknown or foreign object id, id reuse at or below the watermark, reserved-range id, or a multi-`new_id` rule violation |
-| `invalid_opcode` | 1 | opcode not defined for the interface at the negotiated version, **including other-class opcodes and a second `hello`** (`hello`'s opcode is defined only in the initial connection state) |
+| `invalid_opcode` | 1 | opcode not defined for the interface at the negotiated version, **including other-class opcodes and a second `hello`** (`hello`'s opcode is defined only in the CONNECTED state) |
 | `invalid_argument` | 2 | argument decode failure: bad UTF-8, embedded NUL, string over its bound, out-of-range enum value, forbidden control character, zero verbs in a petition, malformed padding |
 | `oversized` | 3 | declared frame `size` below the 8-byte minimum, or a payload shorter than the size declares (the 65535-byte ceiling binds senders — a u16 cannot express more) |
 | `fd_violation` | 4 | header `fd_count` disagrees with the signature, or unsolicited fds attached |
 | `pre_handshake` | 5 | traffic before a first `hello` on a principal connection |
 | `version_unsupported` | 6 | `hello` carried a protocol version the server does not implement; downgrade is refusal, not negotiation |
-| `auth_failed` | 7 | credential rejected: unknown identity, bad token, verifier failure, or `SO_PEERCRED` mismatch |
+| `auth_failed` | 7 | credential rejected: unknown identity, bad token, verifier failure, or `SO_PEERCRED` mismatch — never distinguished on the wire (uniform code, fixed message text, detail in the server log only, §7.1) |
 | `internal` | 8 | server-side failure that poisoned the connection |
 | `resource_exhausted` | 9 | a documented per-connection resource bound was breached: the petition-rate ceiling, the live-object cap, or object-id exhaustion — denial-of-service confinement, not a semantic judgement |
 
@@ -457,6 +457,8 @@ against an unrelated pending prompt.
                  ---> error(pre_handshake) --> close   [best-effort if framed]
                  (unparseable garbage)
                  ---> close silently (logged)
+                 (no complete hello within the unauthenticated deadline)
+                 ---> close administratively (logged; no error event)
 
    [CONNECTED] --hello--> [VERIFYING] --verify ok--> bound --> [BOUND]
                               |                                    |
@@ -478,8 +480,24 @@ against an unrelated pending prompt.
 - `bound` carries the **verifier-canonical** identity, not an echo of the
   client's claimed string.
 - `hello` is legal **exactly once** per connection: its opcode is defined only
-  in the initial state, so a second `hello` — in VERIFYING or BOUND — is fatal
+  in CONNECTED, so a second `hello` — in VERIFYING or BOUND — is fatal
   `invalid_opcode`.
+- **Checks run in a fixed order**: frame grammar, then the version integer,
+  then — only for a version-matched `hello` — credential verification.
+  `version_unsupported` therefore reveals nothing about the credential or the
+  claimed identity.
+- **A refused handshake is uniform on the wire** (identity-probing
+  resistance): every credential-rejection cause — unknown identity, bad
+  token, verifier failure, `SO_PEERCRED` mismatch — collapses to the single
+  code `auth_failed`, and its `error.message` MUST be a fixed phrase that
+  neither names the cause nor echoes the claimed identity. Cause and claimed
+  identity go to the server log only; verification SHOULD take uniform time
+  across rejection causes.
+- **The unauthenticated phase is time-bounded**: the server SHOULD impose a
+  deployment-configurable deadline on the arrival of a complete `hello`; a
+  connection still in CONNECTED at expiry is closed administratively — no
+  error event, reason logged. The deadline binds only CONNECTED (VERIFYING
+  latency is the server's own; a BOUND connection may idle indefinitely).
 - The `credential` is secret material: the server MUST NOT write credential
   bytes into logs, `error.message` text, or the flight recorder — at most
   `credential_type` and the byte length may be recorded.
@@ -591,6 +609,7 @@ documented seams so the wire never changes shape when they arrive.
 | focus event | new `since="2"` tagged event on `vitrin_shim_seat` | version 0 synthesizes focus shim-side (single-surface); the new event still ends with `origin`, satisfying B2 structurally |
 | keymap relay + keycode event | new `since="2"` `keymap(fd, size, origin)` + keycode event on `vitrin_shim_seat` | keysym `key` events stay valid; raw-scancode fidelity is added alongside, one fd per message (one-fd rule holds) |
 | `hello_fd` credential sibling | new `since="2"` fd-borne request on `vitrin_handshake` | `hello`'s signature is frozen forever; oversized credentials arrive via a sibling carrying one fd, so the 32768-byte in-frame bound is never a wall |
+| proof-of-possession credential exchange | new `since="2"` challenge event + response request on `vitrin_handshake` | version-0 schemes are bearer-shaped (presented whole in `hello`); a `credential_type` demanding proof of possession (e.g. X.509-SVID) adds a server-driven exchange inside VERIFYING as appended messages — `hello` and `bound` stay frozen, and bearer schemes never see the new messages |
 | dmabuf params builder | new `since="2"` builder on `vitrin_shim_surface`, one fd per add | `attach` stays single-plane linear (no modifier argument to fail to honor); explicit modifiers / multi-planar formats accumulate fds across messages, preserving the one-fd rule |
 | `frame_ready` `flags` bits | reserved bits in the existing `frame_flags` bitfield | a later zero-copy dmabuf handoff sets a flag on the *same* `frame_ready` message; `flags` is always 0 in version 0, so setting a bit is additive |
 | realm enumeration events | new `since="2"` events on `vitrin_realm` | `vitrin_realm` is authority-free and carries no version-0 events; multi-realm phases add enumeration/lifecycle here instead of re-plumbing addressing |

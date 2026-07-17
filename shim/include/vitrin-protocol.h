@@ -331,7 +331,7 @@ static inline vitrin_decode_status_t vitrin_frame_header_decode(
 typedef enum {
     /* unknown or foreign object id, id reuse at or below the watermark, reserved-range id, or multi-new_id rule violation */
     VITRIN_HANDSHAKE_ERROR_INVALID_OBJECT = 0,
-    /* opcode not defined for the interface at the negotiated version, including other-class opcodes and a second hello (hello's opcode is defined only in the initial connection state) */
+    /* opcode not defined for the interface at the negotiated version, including other-class opcodes and a second hello (hello's opcode is defined only in the CONNECTED state) */
     VITRIN_HANDSHAKE_ERROR_INVALID_OPCODE = 1,
     /* argument decode failure: bad UTF-8, embedded NUL, string over its bound, out-of-range enum value, forbidden control character, zero verbs, malformed padding */
     VITRIN_HANDSHAKE_ERROR_INVALID_ARGUMENT = 2,
@@ -343,7 +343,7 @@ typedef enum {
     VITRIN_HANDSHAKE_ERROR_PRE_HANDSHAKE = 5,
     /* hello carried a protocol version the server does not implement; downgrade is refusal */
     VITRIN_HANDSHAKE_ERROR_VERSION_UNSUPPORTED = 6,
-    /* credential rejected: unknown identity, bad token, verifier failure, or SO_PEERCRED mismatch */
+    /* credential rejected: unknown identity, bad token, verifier failure, or SO_PEERCRED mismatch; the cause is never distinguished on the wire - uniform code, fixed message text, detail in the server log only */
     VITRIN_HANDSHAKE_ERROR_AUTH_FAILED = 7,
     /* server-side failure that poisoned the connection */
     VITRIN_HANDSHAKE_ERROR_INTERNAL = 8,

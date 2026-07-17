@@ -168,14 +168,29 @@
       object 1 at connect: the authentication gate, the fatal-error channel,
       and the sync barrier. It lives for the whole connection.
 
-      Handshake state machine: in the initial state the only legal message
-      is hello. After hello the client MAY pipeline further requests; the
-      server queues them during credential verification and processes them
-      after vitrin_principal.bound is sent (if verification fails the
-      connection dies "auth_failed" and queued requests are never
-      processed). Any traffic before a first hello is fatal "pre_handshake",
-      delivered best-effort if the frame parsed; unparseable garbage may be
-      closed silently. Either way the reason is logged.
+      Handshake state machine: CONNECTED, VERIFYING, BOUND, DEAD. In
+      CONNECTED the only legal message is hello; a complete hello moves the
+      connection to VERIFYING. In VERIFYING the client MAY pipeline further
+      requests; the server queues them (bounded by ordinary transport
+      backpressure, never an unbounded server-side buffer) and processes
+      them only after vitrin_principal.bound is sent, which moves the
+      connection to BOUND, the steady state. Nothing a client sends is
+      processed before BOUND: pipelining buys latency, never early
+      execution, and if verification fails the connection dies
+      ("auth_failed" or "version_unsupported") with the queued requests
+      never processed. Any traffic before a first hello is fatal
+      "pre_handshake", delivered best-effort if the frame parsed;
+      unparseable garbage may be closed silently.
+
+      The unauthenticated phase is bounded in time: the server SHOULD
+      impose a deployment-configurable deadline on the arrival of a
+      complete hello, and a connection still in CONNECTED when it expires
+      (nothing sent, or a partial frame dribbled) is closed
+      administratively - no error event, because nothing was violated; the
+      close is indistinguishable from an ordinary disconnect. Every
+      pre-BOUND death - pre_handshake traffic, refused verification,
+      deadline expiry, unframeable garbage, backpressure - has its reason
+      logged server-side.
 
       The human principal has no wire presence in version 1: host input in
       nested mode is the implicit human, and only agents handshake.
@@ -183,11 +198,17 @@
 
     <request name="hello">
       <description summary="authenticate and bind a principal">
-        The only pre-authentication message. Presents a credential to the
-        core's pluggable verifier and pre-allocates the principal object
-        that a successful handshake will bind. Success is announced by
-        vitrin_principal.bound; failure is fatal "auth_failed" or
-        "version_unsupported".
+        The only pre-authentication message: credential presentation is
+        folded into hello rather than split across an exchange, so the
+        whole handshake is one client message and one server terminal.
+        Presents a credential to the core's pluggable verifier and
+        pre-allocates the principal object that a successful handshake
+        will bind. Success is announced by vitrin_principal.bound; failure
+        is fatal "auth_failed" or "version_unsupported". Checks run in a
+        fixed order: frame grammar first (fatal decode errors as usual),
+        then the version integer, then - only for a version-matched hello -
+        credential verification; "version_unsupported" therefore reveals
+        nothing about the credential or the claimed identity.
 
         The credential encoding is deliberately opaque to the wire:
         credential_type names a scheme (for example "static-token",
@@ -211,9 +232,21 @@
         recorder - at most credential_type and the byte length may be
         recorded.
 
+        A refused handshake is deliberately uniform on the wire
+        (identity-probing resistance): every credential-rejection cause -
+        unknown identity, bad token, verifier failure, SO_PEERCRED
+        mismatch - collapses to the single fatal code "auth_failed", and
+        the accompanying error.message MUST be a fixed phrase that neither
+        names the cause nor echoes the claimed identity. The cause and the
+        claimed identity are recorded in the server log only. Verification
+        SHOULD take uniform time across rejection causes (constant-time
+        credential comparison, identical verification work for unknown
+        identities) so that latency does not become the oracle the message
+        text refuses to be.
+
         hello is legal exactly once per connection: its opcode is defined
-        only in the initial state, so a second hello - during verification
-        or after bound - is fatal "invalid_opcode".
+        only in CONNECTED, so a second hello - in VERIFYING or BOUND - is
+        fatal "invalid_opcode".
 
         This signature is frozen forever.
       </description>
@@ -250,7 +283,9 @@
         code is namespaced by that object's interface error enum - in
         version 1 the only error enum is on this interface, so all fatal
         codes are connection-global. message is free-form debugging text
-        and is never machine-parsed. After sending this event the server
+        and is never machine-parsed; for "auth_failed" it is a fixed,
+        cause-free phrase (see hello: identity-probing resistance). After
+        sending this event the server
         closes the connection. Delivery is best-effort: backpressure deaths
         (a peer that stops reading) and unframeable streams are closed
         without it.
@@ -276,13 +311,13 @@
         death, and error paths always close any received file descriptor.
       </description>
       <entry name="invalid_object" value="0" summary="unknown or foreign object id, id reuse at or below the watermark, reserved-range id, or multi-new_id rule violation"/>
-      <entry name="invalid_opcode" value="1" summary="opcode not defined for the interface at the negotiated version, including other-class opcodes and a second hello (hello's opcode is defined only in the initial connection state)"/>
+      <entry name="invalid_opcode" value="1" summary="opcode not defined for the interface at the negotiated version, including other-class opcodes and a second hello (hello's opcode is defined only in the CONNECTED state)"/>
       <entry name="invalid_argument" value="2" summary="argument decode failure: bad UTF-8, embedded NUL, string over its bound, out-of-range enum value, forbidden control character, zero verbs, malformed padding"/>
       <entry name="oversized" value="3" summary="declared frame size below the 8-byte header minimum, or a payload shorter than the size declares; the 65535-byte ceiling binds senders (a u16 cannot express more)"/>
       <entry name="fd_violation" value="4" summary="fd count in the header disagrees with the message signature, or unsolicited fds attached"/>
       <entry name="pre_handshake" value="5" summary="traffic before a first hello on a principal connection"/>
       <entry name="version_unsupported" value="6" summary="hello carried a protocol version the server does not implement; downgrade is refusal"/>
-      <entry name="auth_failed" value="7" summary="credential rejected: unknown identity, bad token, verifier failure, or SO_PEERCRED mismatch"/>
+      <entry name="auth_failed" value="7" summary="credential rejected: unknown identity, bad token, verifier failure, or SO_PEERCRED mismatch; the cause is never distinguished on the wire - uniform code, fixed message text, detail in the server log only"/>
       <entry name="internal" value="8" summary="server-side failure that poisoned the connection"/>
       <entry name="resource_exhausted" value="9" summary="a documented per-connection resource bound was breached: the petition-rate ceiling, the live-object cap, or object-id exhaustion; denial-of-service confinement, not a semantic judgement"/>
     </enum>

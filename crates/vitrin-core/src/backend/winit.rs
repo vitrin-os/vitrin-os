@@ -9,9 +9,11 @@
 //! GL surface exists.
 
 use std::error::Error;
+use std::time::{Duration, Instant};
 
 use calloop::signals::{Signal, Signals};
-use calloop::{EventLoop, LoopSignal};
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{EventLoop, LoopHandle, LoopSignal};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::egl::context::GlAttributes;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
@@ -32,6 +34,16 @@ const INITIAL_SIZE: (f64, f64) = (1280.0, 800.0);
 /// Background behind the test pattern; only visible if the blit fails.
 const CLEAR_COLOR: Color32F = Color32F::new(0.06, 0.06, 0.08, 1.0);
 
+/// Fallback frame budget (~60 Hz). Vsync'd blocking swaps are the primary
+/// pacing mechanism, but Smithay's `vsync: true` only filters EGL config
+/// selection — it never calls `eglSwapInterval` — so on hosts whose EGL
+/// stack returns from swap immediately (Mesa software EGL under Xvfb,
+/// GPU-less VMs on llvmpipe, X servers without vblank) the redraw chain
+/// would otherwise spin unthrottled. Frames that complete faster than this
+/// budget defer the next redraw to a timer instead. A real frame clock
+/// replaces this in P1.3.3.
+const FRAME_BUDGET: Duration = Duration::from_micros(16_667);
+
 /// The test pattern uploaded as a GLES texture, remembered together with
 /// the window size it was generated for so resizes regenerate it.
 struct PatternTexture {
@@ -48,12 +60,17 @@ struct NestedState {
     backend: WinitGraphicsBackend<GlesRenderer>,
     pattern: Option<PatternTexture>,
     loop_signal: LoopSignal,
+    loop_handle: LoopHandle<'static, NestedState>,
+    /// Set when a render failure stops the loop, so [`run`] can propagate
+    /// it as an error (and `main` as a non-zero exit) instead of masking a
+    /// mid-run fatal as a clean shutdown.
+    fatal: Option<Box<dyn Error>>,
 }
 
 /// Run the nested compositor loop until the host window is closed or a
 /// SIGINT/SIGTERM arrives.
 pub fn run() -> Result<(), Box<dyn Error>> {
-    let mut event_loop: EventLoop<'_, NestedState> = EventLoop::try_new()?;
+    let mut event_loop: EventLoop<'static, NestedState> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
     // Signal source first (single-threaded process, so the mask is set
@@ -65,10 +82,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     })?;
 
     // vsync on (Smithay's default is off): each frame chains the next via
-    // `request_redraw`, and the blocking swap is what paces that chain to
-    // the host's refresh rate — without it the loop spins unthrottled on
-    // hosts that don't coalesce redraw requests (X11). A real frame clock
-    // replaces this once client surfaces need scheduling (P1.3.3).
+    // `request_redraw`, and the blocking swap paces that chain to the
+    // host's refresh rate. Because drivers are free to ignore the default
+    // swap interval, [`FRAME_BUDGET`] additionally caps the chain when the
+    // swap does not block (see its doc comment).
     let (backend, winit_source) = winit_backend::init_from_attributes_with_gl_attr::<GlesRenderer>(
         WinitWindow::default_attributes()
             .with_inner_size(LogicalSize::new(INITIAL_SIZE.0, INITIAL_SIZE.1))
@@ -105,29 +122,38 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         backend,
         pattern: None,
         loop_signal: event_loop.get_signal(),
+        loop_handle: event_loop.handle(),
+        fatal: None,
     };
 
     // Kick off the redraw cycle; each completed frame requests the next,
     // so presentation is paced by the host compositor (60 Hz on a 60 Hz
-    // host — winit redraws on Wayland are frame-callback driven).
+    // host — winit redraws on Wayland are frame-callback driven), with
+    // FRAME_BUDGET as the floor when the host doesn't throttle swaps.
     state.backend.window().request_redraw();
 
     event_loop.run(None, &mut state, |_| {})?;
+    if let Some(err) = state.fatal.take() {
+        return Err(err);
+    }
     info!("event loop stopped, shutting down");
     Ok(())
 }
 
 impl NestedState {
-    /// Draw one frame. Rendering failure is fatal to the skeleton: log it
-    /// and stop the loop rather than spinning on a broken GL context.
+    /// Draw one frame. Rendering failure is fatal to the skeleton: log it,
+    /// record it for [`run`] to propagate (non-zero exit), and stop the
+    /// loop rather than spinning on a broken GL context.
     fn redraw(&mut self) {
         if let Err(err) = self.try_redraw() {
             error!("render failed, shutting down: {err}");
+            self.fatal = Some(err);
             self.loop_signal.stop();
         }
     }
 
     fn try_redraw(&mut self) -> Result<(), Box<dyn Error>> {
+        let frame_start = Instant::now();
         let size = self.backend.window_size();
         if size.w <= 0 || size.h <= 0 {
             // Zero-sized (e.g. minimized) window: skip, resize will redraw.
@@ -175,7 +201,28 @@ impl NestedState {
         // client content (P1.3.3).
         self.backend.submit(None)?;
         trace!(?size, "frame submitted");
-        self.backend.window().request_redraw();
+        self.schedule_next_frame(frame_start)?;
+        Ok(())
+    }
+
+    /// Chain the next redraw. If the swap blocked for at least
+    /// [`FRAME_BUDGET`] (effective vsync), request it immediately;
+    /// otherwise arm a one-shot timer for the budget's remainder so the
+    /// render loop stays capped near 60 Hz instead of busy-spinning on
+    /// hosts without swap throttling.
+    fn schedule_next_frame(&mut self, frame_start: Instant) -> Result<(), Box<dyn Error>> {
+        let elapsed = frame_start.elapsed();
+        if elapsed >= FRAME_BUDGET {
+            self.backend.window().request_redraw();
+        } else {
+            let timer = Timer::from_duration(FRAME_BUDGET - elapsed);
+            self.loop_handle
+                .insert_source(timer, |_deadline, _, state| {
+                    state.backend.window().request_redraw();
+                    TimeoutAction::Drop
+                })
+                .map_err(|err| err.error)?;
+        }
         Ok(())
     }
 }

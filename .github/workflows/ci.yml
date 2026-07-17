@@ -71,6 +71,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install native link deps (libxkbcommon for the vitrind winit/Smithay backend)
+        # vitrin-core's nested winit/Smithay backend links libxkbcommon; the
+        # runner image lacks the -dev package, so cargo test/clippy would fail
+        # to link vitrind with "unable to find library -lxkbcommon". wayland
+        # and libinput are dlopen'd at runtime, so no -dev package is needed to
+        # link here.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxkbcommon-dev
+
       - name: cargo fmt --check
         run: cargo fmt --all --check
 

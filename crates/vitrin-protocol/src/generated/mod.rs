@@ -6,8 +6,10 @@
 //! One module per protocol interface, in `protocol/vitrin-v0.xml` document order.
 
 /// The `vitrin` protocol's single wire version integer (`protocol/@version`);
-/// also the first argument of `vitrin_handshake::Hello`. An exact match is
-/// required -- downgrade is refusal, not negotiation.
+/// also the first argument of `vitrin_handshake::Hello`, whose accepted value
+/// becomes the connection's negotiated version. A server implements every
+/// version up to its maximum and refuses anything above it with
+/// `version_unsupported` -- downgrade is refusal, not negotiation.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Total number of messages (requests + events) across every interface.

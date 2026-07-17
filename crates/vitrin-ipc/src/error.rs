@@ -61,7 +61,7 @@ pub enum LocalMisuse {
 /// Wire-error taxonomy mapping (`docs/protocol/00-conventions.md` section
 /// 5), for the layer that turns these into terminal protocol errors:
 /// [`UndersizedSizeField`](PeerViolation::UndersizedSizeField) is
-/// `oversized`; the three fd variants are `fd_violation`.
+/// `oversized`; the four fd variants are `fd_violation`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerViolation {
     /// A frame header declared a total size below the 8-byte header length
@@ -71,8 +71,16 @@ pub enum PeerViolation {
     /// one-fd-per-message invariant allows.
     FdCountExceeded { fd_count: u8 },
     /// A frame declared `fd_count = 1` but its bytes completed without an
-    /// accompanying `SCM_RIGHTS` fd.
+    /// accompanying `SCM_RIGHTS` fd attached to them.
     MissingFd,
+    /// An fd arrived attached to the bytes of a frame that does not declare
+    /// it: either a frame declaring `fd_count = 0` carried an fd, or a
+    /// one-fd frame carried more than one -- "fds attached to a message
+    /// that declares none" (conventions 2.4), fatal `fd_violation`.
+    /// Enforced here because no layer above the transport can observe an
+    /// undeclared fd, and an undetected one would shift positional
+    /// matching for every later fd-bearing frame.
+    UnsolicitedFd,
     /// More received fds are queued than [`crate::MAX_UNCLAIMED_FDS`];
     /// the peer is shipping fds no frame claims (fd-bomb).
     UnclaimedFdOverflow,
@@ -138,6 +146,10 @@ impl fmt::Display for PeerViolation {
             PeerViolation::MissingFd => {
                 write!(f, "frame declared one fd but its bytes arrived without one")
             }
+            PeerViolation::UnsolicitedFd => write!(
+                f,
+                "fd attached to the bytes of a frame that does not declare it"
+            ),
             PeerViolation::UnclaimedFdOverflow => write!(
                 f,
                 "peer shipped more unclaimed fds than the {} the transport tolerates",

@@ -9,12 +9,20 @@ publish = false
 
 [dependencies]
 vitrin-protocol = { path = "../vitrin-protocol" }
-# The one low-level unix crate of the workspace (already in the lockfile via
-# dev-dependencies). Chosen over `nix`/raw `libc` because it wraps every
-# syscall this crate needs (accept4, sendmsg/recvmsg with SCM_RIGHTS,
-# SO_PEERCRED, flock) behind I/O-safe `OwnedFd`/`BorrowedFd` types with no
-# unsafe in *our* code -- the TCB memory-safety posture of PRD Doc 2 section 2.
+# The primary low-level unix crate (already in the lockfile via
+# dev-dependencies). Chosen over raw `libc` because it wraps every syscall
+# this crate needs (accept4, sendmsg/recvmsg with SCM_RIGHTS, flock) behind
+# I/O-safe `OwnedFd`/`BorrowedFd` types with no unsafe in *our* code -- the
+# TCB memory-safety posture of PRD Doc 2 section 2.
 rustix = { version = "1", features = ["net", "fs"] }
+# Used for exactly one call: getsockopt(SO_PEERCRED). rustix's typed
+# `socket_peercred` reads the kernel `struct ucred` into a `Pid`-backed
+# (`NonZeroI32`) field, but the kernel legitimately reports `pid = 0` for a
+# peer whose pid is not mappable into this process's pid namespace
+# (unix(7)) -- undefined behavior in the TCB on any cross-pid-namespace
+# peer. nix's `UnixCredentials` keeps the raw `libc::ucred` (plain `pid_t`),
+# so pid 0 is representable and surfaced as `PeerCred::pid == None`.
+nix = { version = "0.31", default-features = false, features = ["socket"] }
 
 [dev-dependencies]
 # Tests additionally need getpid/getuid/getgid to assert SO_PEERCRED values.

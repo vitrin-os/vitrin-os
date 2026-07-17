@@ -53,10 +53,20 @@
 //! - fds are matched to frames **positionally**, in byte-stream order, per
 //!   conventions section 2.2: the ancillary payload rides with the frame's
 //!   bytes in one `sendmsg`, and the receiver claims queued fds as frames
-//!   complete. A frame whose header declares `fd_count = 1` but whose bytes
-//!   arrive without an fd is a [`error::PeerViolation::MissingFd`].
-//! - A peer that ships fds faster than frames claim them hits
-//!   [`MAX_UNCLAIMED_FDS`] and dies with
+//!   complete. Matching is *strict*: the receiver records the byte-stream
+//!   offset each fd arrived attached to (the kernel never coalesces a
+//!   `recvmsg` across an `SCM_RIGHTS` boundary, so that offset is exact)
+//!   and requires it to fall within the declaring frame's bytes. A frame
+//!   declaring `fd_count = 1` whose bytes carry no fd is
+//!   [`error::PeerViolation::MissingFd`]; an fd attached to the bytes of a
+//!   frame that does not declare it -- "fds attached to a message that
+//!   declares none", conventions 2.4 -- is
+//!   [`error::PeerViolation::UnsolicitedFd`]. Both are enforced here
+//!   because no layer above the transport can observe an undeclared fd,
+//!   and an undetected one would shift positional matching for every later
+//!   fd-bearing frame.
+//! - A peer that ships fds attached to bytes that never complete a frame
+//!   hits [`MAX_UNCLAIMED_FDS`] and dies with
 //!   [`error::PeerViolation::UnclaimedFdOverflow`]; more fds in a single
 //!   `sendmsg` than the receiver's ancillary buffer holds is
 //!   [`error::PeerViolation::AncillaryTruncated`] (`MSG_CTRUNC`). Both are
@@ -111,10 +121,15 @@ pub const MAX_MESSAGE_SIZE: usize = u16::MAX as usize;
 pub const MAX_FDS_PER_MESSAGE: usize = 1;
 
 /// Cap on received-but-not-yet-claimed fds queued on one [`Connection`],
-/// and the per-`recvmsg` ancillary capacity. A compliant peer sends each
-/// fd-bearing frame in its own `sendmsg`, so its unclaimed queue depth
-/// stays at 1 except for transient fragmentation; 8 is a generous margin
-/// that still stops fd-bombs at the transport before the P1.2.3 policy
-/// layer even sees them. Senders MUST NOT batch more than this many
-/// fd-bearing frames into a single `sendmsg`.
+/// and the per-`recvmsg` ancillary capacity. A compliant peer attaches
+/// each fd to its declaring frame's own bytes, so its unclaimed queue
+/// depth stays at 1 except for transient fragmentation; 8 is a generous
+/// margin that still stops fd-bombs at the transport before the P1.2.3
+/// policy layer even sees them.
+///
+/// This is a bound of *this implementation's* receive path, not a
+/// normative wire rule: the conventions specify positional matching but
+/// no ancillary batching ceiling. Whether one should become normative
+/// (so the C shim and Python SDK agree by spec rather than by margin) is
+/// flagged to the protocol track rather than legislated here.
 pub const MAX_UNCLAIMED_FDS: usize = 8;

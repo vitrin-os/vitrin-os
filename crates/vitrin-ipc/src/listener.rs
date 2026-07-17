@@ -20,7 +20,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{flock, FlockOperation};
+use rustix::fs::{flock, fstat, stat, FlockOperation};
 use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 
 use crate::connection::Connection;
@@ -29,6 +29,64 @@ use crate::connection::Connection;
 /// event loop, so this only needs to absorb a burst of simultaneous
 /// connects; 128 matches libwayland's choice.
 const LISTEN_BACKLOG: i32 = 128;
+
+/// How many times `lock_at` re-races a lock file whose inode changed
+/// underneath it before giving up. Each retry means one competing bind
+/// created (or a dropping listener unlinked) the lock file between our
+/// `open` and our post-`flock` verification -- transient by construction,
+/// so a small bound only guards against a pathological churn loop.
+const LOCK_RETRY_LIMIT: u32 = 16;
+
+/// Open `<socket>.lock`, take the exclusive `flock`, and verify the locked
+/// inode is still the one on disk at `lock_path`.
+///
+/// The verification closes an unlink TOCTOU: a dropping [`Listener`]
+/// unlinks its lock file and only then releases the `flock` (when the
+/// `File` closes), so a binder that opened the *old* path just before the
+/// unlink can win the flock on an orphaned inode -- holding a lock no
+/// later binder can see, which would let that later binder unlink a live
+/// socket out from under it. Re-checking `fstat(locked fd) == stat(path)`
+/// and retrying on mismatch guarantees the winner holds the lock on the
+/// inode every future binder will also open.
+fn lock_at(lock_path: &Path, socket_path: &Path) -> io::Result<fs::File> {
+    for _ in 0..LOCK_RETRY_LIMIT {
+        // std opens O_CLOEXEC like every fd in this crate.
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(lock_path)?;
+        flock(&lock_file, FlockOperation::NonBlockingLockExclusive).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "another process holds the lock for socket {}",
+                    socket_path.display()
+                ),
+            )
+        })?;
+        let locked = fstat(&lock_file)?;
+        match stat(lock_path) {
+            Ok(on_disk) if on_disk.st_dev == locked.st_dev && on_disk.st_ino == locked.st_ino => {
+                return Ok(lock_file);
+            }
+            // The file we locked is no longer the file at the path
+            // (unlinked or replaced mid-race): drop lock and fd, retry
+            // against whatever is there now.
+            Ok(_) | Err(rustix::io::Errno::NOENT) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "lock file for socket {} kept changing underneath us",
+            socket_path.display()
+        ),
+    ))
+}
 
 /// A bound, listening Unix socket that yields [`Connection`]s with their
 /// peer credentials already captured.
@@ -64,22 +122,7 @@ impl Listener {
             p.push(".lock");
             PathBuf::from(p)
         };
-        let lock_file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&lock_path)?;
-        flock(&lock_file, FlockOperation::NonBlockingLockExclusive).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!(
-                    "another process holds the lock for socket {}",
-                    socket_path.display()
-                ),
-            )
-        })?;
+        let lock_file = lock_at(&lock_path, &socket_path)?;
 
         // We hold the lock, so anything at the socket path is stale.
         match fs::remove_file(&socket_path) {

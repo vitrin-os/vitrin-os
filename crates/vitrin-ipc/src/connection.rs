@@ -36,8 +36,13 @@ use crate::{MAX_FDS_PER_MESSAGE, MAX_MESSAGE_SIZE, MAX_UNCLAIMED_FDS};
 /// conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerCred {
-    /// Peer process id at connect time.
-    pub pid: i32,
+    /// Peer process id at connect time, or `None` when the peer's pid is
+    /// not mappable into this process's pid namespace (the kernel reports
+    /// `0` then, per unix(7)) -- e.g. an SDK client in a container
+    /// connecting to a host core, or vice versa. `uid`/`gid` remain
+    /// meaningful in that case (subject to user-namespace overflow
+    /// mapping); a `None` pid must never be treated as identity evidence.
+    pub pid: Option<i32>,
     /// Peer effective user id at connect time.
     pub uid: u32,
     /// Peer effective group id at connect time.
@@ -70,8 +75,17 @@ pub struct Connection {
     /// per-connection memory stays visibly bounded.
     scratch: Box<[u8]>,
     /// Received fds not yet claimed by a completed frame, in arrival
-    /// order == frame order (positional matching, conventions 2.2).
-    pending_fds: VecDeque<OwnedFd>,
+    /// order == frame order (positional matching, conventions 2.2), each
+    /// tagged with the byte-stream offset it arrived attached to. The
+    /// kernel never coalesces a `recvmsg` across an `SCM_RIGHTS` boundary,
+    /// so that offset is exactly the offset of the first byte of the
+    /// `sendmsg` the peer attached the fds to -- which lets `recv_message`
+    /// enforce that an fd was attached to the bytes of the frame that
+    /// declares it, and to no other (conventions 2.4).
+    pending_fds: VecDeque<(u64, OwnedFd)>,
+    /// Total bytes already consumed from the stream as completed frames,
+    /// i.e. the stream offset of `recv_buf[0]`.
+    consumed: u64,
     /// Set on the first peer violation; replayed on every later receive so
     /// a caller can never read desynchronized frames past a violation.
     poisoned: Option<PeerViolation>,
@@ -92,17 +106,27 @@ impl Connection {
     /// exception is P1.5.2's to manage, not a hole in this crate's
     /// discipline.
     pub fn from_fd(fd: OwnedFd) -> io::Result<Self> {
-        let cred = net::sockopt::socket_peercred(&fd)?;
+        // Deliberately *not* rustix's `socket_peercred`: its `UCred` backs
+        // the pid with a `NonZeroI32`, but the kernel reports `pid = 0` for
+        // a peer whose pid has no mapping in our pid namespace (unix(7)),
+        // which would be undefined behavior. nix keeps the raw
+        // `struct ucred`, so pid 0 is representable and mapped to `None`.
+        let cred = nix::sys::socket::getsockopt(&fd, nix::sys::socket::sockopt::PeerCredentials)
+            .map_err(io::Error::from)?;
         Ok(Connection {
             fd,
             peer_cred: PeerCred {
-                pid: cred.pid.as_raw_nonzero().get(),
-                uid: cred.uid.as_raw(),
-                gid: cred.gid.as_raw(),
+                pid: match cred.pid() {
+                    0 => None,
+                    pid => Some(pid),
+                },
+                uid: cred.uid(),
+                gid: cred.gid(),
             },
             recv_buf: Vec::new(),
             scratch: vec![0u8; MAX_MESSAGE_SIZE].into_boxed_slice(),
             pending_fds: VecDeque::new(),
+            consumed: 0,
             poisoned: None,
         })
     }
@@ -235,17 +259,41 @@ impl Connection {
                 if self.recv_buf.len() >= size {
                     let bytes = self.recv_buf[..size].to_vec();
                     self.recv_buf.drain(..size);
+                    // This frame occupied [frame_start, frame_end) of the
+                    // byte stream. Every pending fd's arrival offset is
+                    // >= frame_start structurally: an offset below it would
+                    // have been checked (claimed or fataled) when the frame
+                    // covering it completed, and `fill` only ever tags fds
+                    // with the current end of the buffered stream.
+                    let frame_end = self.consumed + size as u64;
+                    self.consumed = frame_end;
                     let fd = if header.fd_count == 1 {
                         match self.pending_fds.pop_front() {
-                            Some(fd) => Some(fd),
+                            // The declared fd, attached to this frame's own
+                            // bytes (conventions 2.2/2.4).
+                            Some((offset, fd)) if offset < frame_end => Some(fd),
                             // The fd travels with the frame's own bytes, so
-                            // a completed frame with an empty queue means
-                            // the peer never attached one.
-                            None => return Err(self.poison(PeerViolation::MissingFd)),
+                            // a completed frame whose queue is empty -- or
+                            // whose front fd arrived attached to *later*
+                            // bytes -- means the peer never attached one to
+                            // this frame.
+                            _ => return Err(self.poison(PeerViolation::MissingFd)),
                         }
                     } else {
                         None
                     };
+                    // Any fd still queued that was attached to this frame's
+                    // bytes has no declaring frame: either fds on a frame
+                    // declaring none, or a second fd on a one-fd frame.
+                    // Both are fatal fd_violation (conventions 2.4) --
+                    // detected here, at the only layer that can see them,
+                    // so a smuggled fd can never shift positional matching
+                    // for a later frame.
+                    if let Some(&(offset, _)) = self.pending_fds.front() {
+                        if offset < frame_end {
+                            return Err(self.poison(PeerViolation::UnsolicitedFd));
+                        }
+                    }
                     return Ok(Some(Message { header, bytes, fd }));
                 }
             }
@@ -272,6 +320,11 @@ impl Connection {
             [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAX_UNCLAIMED_FDS))];
         let mut cmsg = RecvAncillaryBuffer::new(&mut space);
 
+        // Stream offset of the first byte this recvmsg will return. The
+        // kernel stops a recvmsg at an ancillary barrier, so fds harvested
+        // below were attached by the peer at exactly this offset.
+        let arrival_offset = self.consumed + self.recv_buf.len() as u64;
+
         let (bytes, flags) = {
             let mut iov = [IoSliceMut::new(&mut self.scratch)];
             // MSG_CMSG_CLOEXEC: every received fd is close-on-exec from the
@@ -296,7 +349,7 @@ impl Connection {
                         // here; queued fds close when the connection does.
                         return Err(self.poison(PeerViolation::UnclaimedFdOverflow));
                     }
-                    self.pending_fds.push_back(fd);
+                    self.pending_fds.push_back((arrival_offset, fd));
                 }
             }
         }

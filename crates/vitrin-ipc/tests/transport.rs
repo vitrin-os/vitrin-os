@@ -161,7 +161,7 @@ fn peer_cred_on_socketpair() {
     let (pid, uid, gid) = self_cred();
     for conn in [&a, &b] {
         let cred = conn.peer_cred();
-        assert_eq!(cred.pid, pid);
+        assert_eq!(cred.pid, Some(pid));
         assert_eq!(cred.uid, uid);
         assert_eq!(cred.gid, gid);
     }
@@ -185,7 +185,7 @@ fn peer_cred_recorded_at_accept() {
     let mut accepted = listener.accept().unwrap();
     let (pid, uid, gid) = self_cred();
     let cred = accepted.peer_cred();
-    assert_eq!((cred.pid, cred.uid, cred.gid), (pid, uid, gid));
+    assert_eq!((cred.pid, cred.uid, cred.gid), (Some(pid), uid, gid));
 
     // Credentials were captured at accept, but the connection also works.
     let msg = accepted.recv_message().unwrap().unwrap();
@@ -193,7 +193,7 @@ fn peer_cred_recorded_at_accept() {
 
     let client = client.join().unwrap();
     let cred = client.peer_cred();
-    assert_eq!((cred.pid, cred.uid, cred.gid), (pid, uid, gid));
+    assert_eq!((cred.pid, cred.uid, cred.gid), (Some(pid), uid, gid));
 
     drop(listener);
     fs::remove_dir_all(&dir).unwrap();
@@ -303,21 +303,98 @@ fn fd_bomb_in_one_sendmsg_is_a_violation() {
 }
 
 #[test]
-fn unclaimed_fd_buildup_is_a_violation() {
+fn fd_attached_to_a_frame_declaring_none_is_fatal_and_poisons() {
+    let (a, mut b) = Connection::pair().unwrap();
+    let (smuggled_r, _smuggled_w) = std::io::pipe().unwrap();
+    let (legit_r, _legit_w) = std::io::pipe().unwrap();
+
+    // Frame A smuggles an fd its header never claims (fd_count=0); frame B
+    // legitimately declares one. Without strict positional enforcement the
+    // smuggled fd would be delivered as frame B's -- misattribution the
+    // layers above could never detect (conventions 2.4 makes this fatal
+    // fd_violation at the transport).
+    raw_send_with_fds(&a, &frame(1, 0, 0, &[]), &[smuggled_r.as_fd()]);
+    raw_send_with_fds(&a, &frame(2, 0, 1, &[]), &[legit_r.as_fd()]);
+
+    for attempt in 0..2 {
+        match b.recv_message() {
+            Err(TransportError::PeerViolation(PeerViolation::UnsolicitedFd)) => {}
+            other => panic!("attempt {attempt}: expected UnsolicitedFd, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn second_fd_on_a_one_fd_frame_is_a_violation() {
+    let (a, mut b) = Connection::pair().unwrap();
+    let pipes: Vec<_> = (0..2).map(|_| std::io::pipe().unwrap()).collect();
+    let fds: Vec<BorrowedFd<'_>> = pipes.iter().map(|(r, _)| r.as_fd()).collect();
+
+    // One frame declaring one fd, two fds attached to its bytes: the
+    // second has no declaring frame.
+    raw_send_with_fds(&a, &frame(1, 0, 1, &[]), &fds);
+    match b.recv_message() {
+        Err(TransportError::PeerViolation(PeerViolation::UnsolicitedFd)) => {}
+        other => panic!("expected UnsolicitedFd, got {other:?}"),
+    }
+}
+
+#[test]
+fn fd_frame_coalesced_with_trailing_plain_frame_still_matches() {
+    let (a, mut b) = Connection::pair().unwrap();
+    let (mut reader, writer) = std::io::pipe().unwrap();
+
+    // One sendmsg carrying [fd-bearing frame | plain frame], the fd
+    // attached to the leading bytes -- a legal coalescing pattern: the fd
+    // falls within its declaring frame's bytes.
+    let mut bytes = frame(1, 0, 1, &[0x11; 4]);
+    bytes.extend_from_slice(&frame(2, 0, 0, &[0x22; 4]));
+    raw_send_with_fds(&a, &bytes, &[writer.as_fd()]);
+    drop(writer);
+
+    let first = b.recv_message().unwrap().unwrap();
+    assert_eq!(first.header.object_id, 1);
+    let mut through: fs::File = first.fd.expect("declared fd delivered").into();
+    through.write_all(b"ok").unwrap();
+    drop(through);
+    let mut got = String::new();
+    reader.read_to_string(&mut got).unwrap();
+    assert_eq!(got, "ok");
+
+    let second = b.recv_message().unwrap().unwrap();
+    assert_eq!(second.header.object_id, 2);
+    assert!(second.fd.is_none());
+}
+
+#[test]
+fn fd_attached_mid_frame_is_claimed_by_that_frame() {
+    let (a, mut b) = Connection::pair().unwrap();
+    let (_reader, writer) = std::io::pipe().unwrap();
+
+    // The declaring frame's bytes split across two sendmsgs with the fd on
+    // the second: still attached to the frame's own bytes, still claimed.
+    let f = frame(5, 0, 1, &[0x33; 8]);
+    raw_send(&a, &f[..6]);
+    raw_send_with_fds(&a, &f[6..], &[writer.as_fd()]);
+
+    let msg = b.recv_message().unwrap().unwrap();
+    assert_eq!(msg.header.object_id, 5);
+    assert!(msg.fd.is_some());
+}
+
+#[test]
+fn unclaimed_fd_buildup_on_an_incomplete_frame_is_a_violation() {
     let (a, mut b) = Connection::pair().unwrap();
     let pipes: Vec<_> = (0..MAX_UNCLAIMED_FDS + 1)
         .map(|_| std::io::pipe().unwrap())
         .collect();
 
-    // Each message smuggles one fd its header never claims (fd_count=0).
-    // The transport tolerates a queue of MAX_UNCLAIMED_FDS, then kills.
+    // Drip-feed one byte of a never-completed frame per sendmsg, each
+    // smuggling one fd: no frame ever completes to claim or condemn them,
+    // so the queue-depth backstop must kill the connection instead.
+    let f = frame(1, 0, 1, &[0x44; 64]);
     for (i, (r, _)) in pipes.iter().enumerate() {
-        raw_send_with_fds(&a, &frame(i as u32, 0, 0, &[]), &[r.as_fd()]);
-    }
-    for i in 0..MAX_UNCLAIMED_FDS {
-        let msg = b.recv_message().unwrap().unwrap();
-        assert_eq!(msg.header.object_id, i as u32);
-        assert!(msg.fd.is_none());
+        raw_send_with_fds(&a, &f[i..=i], &[r.as_fd()]);
     }
     match b.recv_message() {
         Err(TransportError::PeerViolation(PeerViolation::UnclaimedFdOverflow)) => {}

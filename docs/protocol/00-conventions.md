@@ -593,6 +593,7 @@ documented seams so the wire never changes shape when they arrive.
 | `hello_fd` credential sibling | new `since="2"` fd-borne request on `vitrin_handshake` | `hello`'s signature is frozen forever; oversized credentials arrive via a sibling carrying one fd, so the 32768-byte in-frame bound is never a wall |
 | dmabuf params builder | new `since="2"` builder on `vitrin_shim_surface`, one fd per add | `attach` stays single-plane linear (no modifier argument to fail to honor); explicit modifiers / multi-planar formats accumulate fds across messages, preserving the one-fd rule |
 | `frame_ready` `flags` bits | reserved bits in the existing `frame_flags` bitfield | a later zero-copy dmabuf handoff sets a flag on the *same* `frame_ready` message; `flags` is always 0 in version 0, so setting a bit is additive |
+| capture streaming | new `since="2"` sibling messages on `vitrin_view` (a subscription request and its frame-push event, appended after the poll pair) | `capture_frame`/`frame_ready` stay valid forever; refusals still voice through `vitrin_grant.refused`, and each pushed frame carries one fd, so the one-fd rule holds |
 | realm enumeration events | new `since="2"` events on `vitrin_realm` | `vitrin_realm` is authority-free and carries no version-0 events; multi-realm phases add enumeration/lifecycle here instead of re-plumbing addressing |
 | drag intents | new `since="2"` sibling requests on `vitrin_actuator_pointer` | intent-level motion (drag with duration/easing, interpolated server-side) is added beside `move`/`button`/`scroll`, which stay valid forever |
 | `actuate_key` verb | new appended entry in the `verb` bitfield + a later key-actuation facet | version-0 verb bits are untouched; a new power-of-two bit and its facet are additive |
@@ -607,6 +608,9 @@ named here so their absence is understood as a decision, not an omission:
 
 - **Semantic trees** — no accessibility/DOM-like node graph; observation is
   pixels only (`node:` resource prefixes are reserved but unserved).
+- **Streaming capture** — observation is poll-only: one `capture_frame`, one
+  frame. A push/subscription model is a later version's sibling messages on
+  `vitrin_view` (see Appendix A), never a change to the poll pair.
 - **Epochs** — no compare-and-swap staleness detection; out-of-view coordinates
   are clamped, and stale-observation detection is a later phase's epoch
   mechanism.

@@ -565,6 +565,16 @@
       (grant alive, observe granted, rate bucket) and refuses recoverably
       via vitrin_grant.refused when it fails. The agent learns the view's
       dimensions from frame_ready; version 1 has no geometry protocol.
+
+      Observation is concurrent by design: capture never contends with
+      physical human input or with a pending consent prompt, so the
+      refusal codes preempted and consent_held are actuation-only and
+      never refuse a capture - and the consent overlay is composited into
+      human-visible output only, so a frame captured while a prompt is up
+      simply does not contain it. Streaming capture is a deliberate
+      deferral, not an omission: if a later version adds it, it arrives
+      as since-gated sibling messages beside this poll pair, which stays
+      valid forever.
     </description>
 
     <request name="capture_frame">
@@ -575,6 +585,21 @@
         replies pair in order. The pairing is forced by the type system:
         fd arguments have no null form, so failure must be a distinct
         event. Captures are rate-limited by the grant's max_event_rate.
+
+        The frame carries the realm view's most recently composited
+        content as of when the server processes this request; version 1
+        makes no freshness promise beyond that, and an agent observes
+        change by capturing again. "Never a stale frame" is the
+        no_surface rule: a realm whose surface is gone (shim crashed or
+        exited) refuses rather than re-serving its last content, so a
+        delivered frame always describes a live realm view.
+
+        The request deliberately carries no arguments: a capture is
+        always the whole realm view, and the pixel format is
+        server-chosen, announced per-frame by frame_ready. Region
+        selection, format negotiation, or a streaming subscription would
+        arrive as sibling messages in a later version, never as changes
+        to this one.
       </description>
     </request>
 
@@ -587,9 +612,42 @@
         Version 1 pixels are xrgb8888, row-major, origin top-left,
         little-endian, and stride equals width * 4 exactly - this pins the
         golden-frame tests and makes observation digests unambiguous (the
-        digest domain is the whole buffer). flags is always 0 in version 1;
-        the reserved bits make a later zero-copy dmabuf handoff this same
-        message with a flag, never a new signature.
+        digest domain is the whole buffer). The padding byte of every
+        pixel (byte 3 of each little-endian xrgb8888 pixel, the X channel)
+        is 0xFF exactly, so identical content yields identical buffer
+        bytes and digests stay deterministic. width and height are always
+        nonzero: a realm view that does not exist refuses no_surface
+        rather than delivering an empty frame.
+
+        Memfd contract (binding whenever the dmabuf flag is unset - in
+        version 1, always): the memfd's size is exactly stride * height
+        bytes, and the server MUST seal it with F_SEAL_SHRINK,
+        F_SEAL_GROW, F_SEAL_WRITE, and F_SEAL_SEAL before sending. The
+        write seal is the mechanical form of the always-a-copy rule: a
+        buffer still being rendered into cannot be write-sealed, so a
+        sealed fd is provably not a live buffer, the mapping cannot be
+        truncated or mutated under the reader, and the frame's bytes -
+        and digest - are immutable for the fd's lifetime. The receiver
+        SHOULD verify the size with fstat and MAY verify the seals before
+        mapping; row r of the image begins at byte offset r * stride, and
+        pixels are addressed only through this event's arguments, never
+        inferred from the fd.
+
+        A frame that violates this contract - a memfd whose size is not
+        stride * height, a missing seal, a zero dimension, a stride other
+        than width * 4, or nonzero flags in version 1 - is a server
+        protocol violation, not a refusal: the client MUST discard the
+        frame and close the fd, MAY close the connection, and MUST NOT
+        attribute the failure to the grant. There is no wire message for
+        it - version 1 has no client-to-server error channel by design,
+        so a client's only sanction is disconnecting.
+
+        flags is always 0 in version 1; the reserved bits make a later
+        zero-copy dmabuf handoff this same message with a flag, never a
+        new signature. Flag bits are version-gated and there is no
+        ignore-unknown-bits rule on this event: the server sets a bit
+        only when the negotiated version defines its semantics, so under
+        version 1 any nonzero flags is the contract violation above.
       </description>
       <arg name="fd" type="fd" summary="fresh memfd holding the frame; ownership transfers to the receiver"/>
       <arg name="format" type="uint" enum="format" summary="pixel format (DRM fourcc value)"/>
@@ -603,14 +661,34 @@
       <description summary="pixel formats (DRM fourcc values)">
         Values are DRM fourcc codes so the enum never diverges from the
         kernel's format namespace when dmabuf arrives. Shared by
-        vitrin_shim_surface.attach.
+        vitrin_shim_surface.attach. Version-1 capture always announces
+        xrgb8888; argb8888 exists for the shim attach path, whose apps
+        commit ARGB buffers. New formats append as new entries with
+        immutable values, so widening either path is never a signature
+        change.
       </description>
       <entry name="xrgb8888" value="0x34325258" summary="32-bit xRGB, DRM_FORMAT_XRGB8888"/>
       <entry name="argb8888" value="0x34325241" summary="32-bit ARGB, DRM_FORMAT_ARGB8888"/>
     </enum>
 
     <enum name="frame_flags" bitfield="true">
-      <description summary="frame flags (reserved in version 1)"/>
+      <description summary="frame flags (reserved in version 1)">
+        Delivery variations of frame_ready, defined in version 1 but
+        never set by it: the reserved bits are the seam that keeps later
+        capture modes on this same message. When y_invert is set, rows
+        are bottom-up - row r of the image begins at byte offset
+        (height - 1 - r) * stride; GPU readback is naturally bottom-up,
+        and the bit lets a later version hand a frame over without a
+        flip pass instead of mandating one forever. When dmabuf is set,
+        the fd is a single-plane dmabuf with the linear modifier implied
+        - mirroring vitrin_shim_surface.attach, there is deliberately no
+        modifier argument to fail to honor - and the memfd
+        size-and-seal contract does not apply (seals are memfd-specific);
+        the frame is still a capture copy, never the live composite:
+        always-a-copy is the capture model, not the transport. The bits
+        compose, and future bits append as new entries with immutable
+        values.
+      </description>
       <entry name="y_invert" value="1" summary="rows are bottom-up (reserved; never set in version 1)"/>
       <entry name="dmabuf" value="2" summary="fd is a dmabuf, not a memfd (reserved; never set in version 1)"/>
     </enum>

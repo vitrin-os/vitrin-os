@@ -6,7 +6,9 @@
 
 `vitrin_view` is the observation capability onto a realm's composited framebuffer. In version 1 a realm has a single view, and that view is the realm's whole composited output; one `vitrin_view` object *is* that whole view. It carries no geometry protocol of its own — the agent learns the view's dimensions from the `frame_ready` event, never from a separate query.
 
-Capture is a **poll model**: one `capture_frame` request yields exactly one frame. There is no streaming, no subscription, and no server-initiated frame push. This keeps observation on the same request/reply spine as the rest of the principal connection and makes a threadless blocking SDK correct without extra machinery (see [conventions § delivery classification](00-conventions.md)).
+Capture is a **poll model**: one `capture_frame` request yields exactly one frame. There is no streaming, no subscription, and no server-initiated frame push. This keeps observation on the same request/reply spine as the rest of the principal connection and makes a threadless blocking SDK correct without extra machinery (see [conventions § delivery classification](00-conventions.md)). Streaming capture is a deliberate deferral, not an omission (decision D6): if a later version adds it, it arrives as `since`-gated sibling messages beside this poll pair, which stays valid forever.
+
+Observation is **concurrent by design**: capture never contends with physical human input or with a pending consent prompt, so the refusal codes `preempted` and `consent_held` are actuation-only and never refuse a capture. The consent overlay is composited into human-visible output only, so a frame captured while a prompt is up simply does not contain it (see [`vitrin_consent`](05-vitrin_consent.md)) — captures keep flowing while a prompt is pending.
 
 In the object graph, `vitrin_view` is one of the three authority *facets* co-minted by [`vitrin_realm.request_grant`](03-vitrin_realm.md) alongside the [`vitrin_grant`](04-vitrin_grant.md) handle and its consent observer. The facet is the observation-shaped surface of a single grant-table row; the grant is its authority. `vitrin_view` holds no authority of its own — every capture is checked at the grant's single enforcement chokepoint (grant alive, `observe` in the effective verb set, rate bucket not empty, realm has a surface), and every refusal is voiced not here but on [`vitrin_grant.refused`](04-vitrin_grant.md). The design idea is attenuation by construction: because the facet is minted only by the petition that also minted its grant, an agent can never name — and so never capture through — a view it was not granted.
 
@@ -26,13 +28,15 @@ Version 1 defines no destructors. A `vitrin_view` object lives for the connectio
 capture_frame()
 ```
 
-This request takes no arguments.
+This request takes no arguments — deliberately. A capture is always the whole realm view, and the pixel format is server-chosen, announced per-frame by `frame_ready`. Region selection, format negotiation, or a streaming subscription would arrive as sibling messages in a later version, never as changes to this one (a message signature is immutable forever — [conventions § versioning](00-conventions.md)).
 
 `capture_frame` requests exactly one frame of the realm view. It is **reply-bearing**: every `capture_frame` receives exactly one terminal event — `frame_ready` on success, or [`vitrin_grant.refused`](04-vitrin_grant.md)`(observe, …)` on failure — delivered in request order and **never coalesced**. This one-to-one, order-preserving pairing is what lets a client pipeline captures: send several `capture_frame` requests, then read terminals off the stream knowing the *n*-th terminal answers the *n*-th request.
 
 The pairing is forced by the type system rather than by convention. An `fd` argument has no null form, so a failed capture cannot be signalled as a `frame_ready` with an absent fd; failure must therefore be a distinct event, which is exactly [`vitrin_grant.refused`](04-vitrin_grant.md). A receiver that gets `frame_ready` knows it holds a real frame.
 
 Each capture passes the grant's single enforcement chokepoint. Captures are rate-limited by the grant's effective event-rate ceiling (requested as `max_event_rate` at petition time; the effective value is deliberately not echoed on `resolved` — an agent discovers throttling through `refused(rate_limited)` and its `retry_after_ms` hint); the token bucket governs observation just as it governs actuation.
+
+**Freshness.** The frame carries the realm view's most recently composited content as of when the server processes the request; version 1 makes no freshness promise beyond that, and an agent observes change by capturing again. "Never a stale frame" is the `no_surface` rule: a realm whose surface is gone (its shim crashed or exited) refuses rather than re-serving its last content, so a delivered frame always describes a live realm view.
 
 **Delivery class:** reply-bearing (exactly one terminal event per request, in request order, never coalesced — unlike fire-and-forget actuation refusals, capture refusals are never merged).
 
@@ -46,6 +50,8 @@ Each capture passes the grant's single enforcement chokepoint. Captures are rate
 | `rate_limited` | the capture token bucket is empty; `retry_after_ms` hints the refill |
 | `no_surface` | the realm has no surface (its shim crashed or exited) — a refusal, never a stale frame |
 | `internal` | server-side failure during this capture (renderer, memfd, delivery) |
+
+Two refusal codes are deliberately absent from this table: `preempted` and `consent_held` are **actuation-only** and never refuse a capture. Observation is concurrent with physical input by design (concurrent observers are a documented non-error — [conventions § delivery classification](00-conventions.md)), and the consent overlay is never part of the realm view, so there is nothing a pending prompt would need to hide from capture.
 
 (Fatal errors — bad opcode, an unsolicited fd, a foreign object id — belong to the framing and object-graph layers documented in [conventions § error taxonomy](00-conventions.md), not to `capture_frame`'s semantics.)
 
@@ -70,9 +76,23 @@ frame_ready(fd: fd, format: uint, width: uint, height: uint, stride: uint, flags
 
 The `fd` is a **fresh memfd containing the frame — always a copy**. Agents never see live buffers. Ownership of the fd transfers to the receiver, which **MUST** close it after use; the server closes its own copy after sending. (At most one fd travels per frame; this is the framing invariant that lets a receiver drop any frame and still close its fd — see [conventions § framing](00-conventions.md).)
 
-Version 1 pixels are `xrgb8888`, row-major, origin top-left, little-endian, with `stride` equal to `width * 4` exactly. Pinning the stride makes the buffer layout unambiguous: it fixes the golden-frame tests and gives observation digests a single well-defined domain (the whole buffer). `flags` is always `0` in version 1; the reserved [`frame_flags`](#frame_flags) bits let a later zero-copy dmabuf handoff reuse this same message with a flag set, never a new signature.
+Version 1 pixels are `xrgb8888`, row-major, origin top-left, little-endian, with `stride` equal to `width * 4` exactly. Pinning the stride makes the buffer layout unambiguous: it fixes the golden-frame tests and gives observation digests a single well-defined domain (the whole buffer). The padding byte of every pixel — byte 3 of each little-endian `xrgb8888` pixel, the X channel — is `0xFF` exactly, so identical content yields identical buffer bytes and digests stay deterministic (an unpinned don't-care channel would make the whole-buffer digest domain nondeterministic).
 
-The agent learns the view's dimensions from `width` and `height` on this event. Version 1 has no separate geometry protocol.
+The agent learns the view's dimensions from `width` and `height` on this event; both are always nonzero — a realm view that does not exist refuses `no_surface` rather than delivering an empty frame. Version 1 has no separate geometry protocol.
+
+#### The memfd contract
+
+Binding whenever the `dmabuf` flag is unset — in version 1, always:
+
+- **Size.** The memfd's size (`st_size`) is **exactly `stride * height` bytes**. The whole file is the frame; the whole file is the digest domain.
+- **Seals.** The server **MUST** seal the memfd with `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL` before sending. The write seal is the mechanical form of the always-a-copy rule: a buffer still being rendered into cannot be write-sealed, so a sealed fd is *provably* not a live buffer, the mapping cannot be truncated or mutated under the reader, and the frame's bytes — and digest — are immutable for the fd's lifetime.
+- **Addressing.** Row *r* of the image begins at byte offset `r * stride`. Pixels are addressed only through this event's arguments (`width`, `height`, `stride`, `format`), never inferred from the fd. The receiver **SHOULD** verify the size with `fstat` and **MAY** verify the seals (`F_GET_SEALS`) before mapping.
+
+**Contract violations.** A frame that violates this contract — a memfd whose size is not `stride * height`, a missing seal, a zero dimension, a stride other than `width * 4`, or nonzero `flags` in version 1 — is a **server protocol violation, not a refusal**: the client MUST discard the frame and close the fd, MAY close the connection, and MUST NOT attribute the failure to the grant (an SDK surfaces it as a client-side protocol error, never as a typed refusal exception). There is no wire message for it — version 1 has no client-to-server error channel by design, so a client's only sanction is disconnecting. A correct server never produces such a frame.
+
+#### Flags
+
+`flags` is always `0` in version 1; the reserved [`frame_flags`](#frame_flags) bits let a later zero-copy dmabuf handoff reuse this same message with a flag set, never a new signature. Flag bits are **version-gated** and there is **no ignore-unknown-bits rule** on this event: the server sets a bit only when the negotiated version defines its semantics — silently ignoring a bit like `y_invert` would mean silently misreading the frame — so under version 1 any nonzero `flags` is a contract violation, handled as above.
 
 **Delivery class:** the success terminal of a reply-bearing request (paired one-to-one with `capture_frame`, in request order, never coalesced).
 
@@ -80,7 +100,7 @@ The agent learns the view's dimensions from `width` and `height` on this event. 
 
 ### format
 
-Pixel formats, carried as DRM fourcc codes so the enum never diverges from the kernel's format namespace when dmabuf arrives. This enum is **defined on `vitrin_view`** and is **shared cross-interface**: [`vitrin_shim_surface.attach`](10-vitrin_shim_surface.md) references it as `vitrin_view.format` for the shim's buffer path.
+Pixel formats, carried as DRM fourcc codes so the enum never diverges from the kernel's format namespace when dmabuf arrives. This enum is **defined on `vitrin_view`** and is **shared cross-interface**: [`vitrin_shim_surface.attach`](10-vitrin_shim_surface.md) references it as `vitrin_view.format` for the shim's buffer path. Version-1 capture always announces `xrgb8888`; `argb8888` exists for the shim attach path, whose apps commit ARGB buffers. New formats append as new entries with immutable values, so widening either path is never a signature change.
 
 | entry | value | meaning |
 | --- | --- | --- |
@@ -89,12 +109,41 @@ Pixel formats, carried as DRM fourcc codes so the enum never diverges from the k
 
 ### frame_flags
 
-Frame flags. Bitfield (entries are powers of two). Reserved in version 1: no bit is ever set, and their presence is the seam for a later zero-copy handoff without a signature change.
+Delivery variations of `frame_ready`. Bitfield (entries are powers of two), defined in version 1 but never set by it: the reserved bits are the seam that keeps later capture modes on this same message.
 
 | entry | value | meaning |
 | --- | --- | --- |
 | `y_invert` | `1` | rows are bottom-up (reserved; never set in version 1) |
 | `dmabuf` | `2` | the `fd` is a dmabuf rather than a memfd (reserved; never set in version 1) |
+
+Exact semantics, pinned now so the later handoff needs no re-litigation:
+
+- **`y_invert`** — when set, rows are bottom-up: row *r* of the image begins at byte offset `(height - 1 - r) * stride`. GPU readback is naturally bottom-up; the bit lets a later version hand a frame over without a flip pass instead of mandating one forever.
+- **`dmabuf`** — when set, the `fd` is a **single-plane dmabuf with the linear modifier implied** — mirroring [`vitrin_shim_surface.attach`](10-vitrin_shim_surface.md), there is deliberately no modifier argument to fail to honor — and the memfd size-and-seal contract does not apply (seals are memfd-specific). The frame is still a capture **copy**, never the live composite: always-a-copy is the capture model, not the transport.
+
+The bits compose (a later version may deliver a y-inverted dmabuf). Future bits append as new entries with immutable values.
+
+## Threadless client shape
+
+The message design is sized so a pure-Python, blocking, single-threaded SDK expresses the whole flow — this is a design constraint, not an afterthought. Three properties carry it: `capture_frame` is reply-bearing with **exactly one** terminal event; terminals arrive **in request order** on the connection's **single ordered event stream** (so the *n*-th terminal answers the *n*-th outstanding capture); and the fd rides the terminal itself, matched positionally (no side channel to poll). A blocking capture is therefore one send followed by one read loop:
+
+```
+def capture(view):                       # blocking, no threads
+    send(view.capture_frame())
+    while True:
+        ev = read_event()                # single ordered stream (conventions section 4)
+        if ev is frame_ready on view:    # the paired terminal
+            size = ev.stride * ev.height # == fstat(ev.fd).st_size, verified
+            buf = mmap(ev.fd, size, PROT_READ)   # sealed: cannot change underneath
+            frame = Frame(buf, ev.width, ev.height, ev.stride, ev.format)
+            close(ev.fd)                 # ownership is the receiver's
+            return frame
+        if ev is refused(observe) on the grant:  # the failure terminal
+            raise typed_exception(ev.code)       # conventions section 5.3 mapping
+        dispatch(ev)                     # resolved, consent.state, done, ... and continue
+```
+
+Non-terminal events read mid-loop (a `resolved` for another petition, a `done` for an earlier sync) are dispatched or queued, never lost — the exactly-one-terminal rule guarantees the loop exits on this capture's own terminal and nothing else. Pipelined captures generalize the same loop: send *k* requests, then read *k* terminals off the stream in order.
 
 ## Flows
 
@@ -149,10 +198,11 @@ The SDK mmaps the memfd and closes it after use.
 
 ## Growth
 
-Every version-2+ addition below is purely additive: version-1 clients see no signature change, and the reserved fields and shared enum absorb the new capability without a new message on this interface.
+Every version-2+ addition below is purely additive: version-1 clients see no signature change. The reserved fields and the shared enum absorb new delivery capabilities on the *existing* messages; anything genuinely new (a streaming subscription) arrives as appended sibling messages, never as a changed one.
 
-- **Zero-copy dmabuf handoff.** The `dmabuf` bit of [`frame_flags`](#frame_flags) and the DRM-fourcc [`format`](#format) enum let a later version deliver the frame as a dmabuf over the *same* `frame_ready` message — the `fd` becomes a dmabuf, the `dmabuf` flag is set, and the format code already names the kernel format. No new event, no changed signature.
+- **Zero-copy dmabuf handoff.** The `dmabuf` bit of [`frame_flags`](#frame_flags) and the DRM-fourcc [`format`](#format) enum let a later version deliver the frame as a dmabuf over the *same* `frame_ready` message — the `fd` becomes a dmabuf (single-plane, linear modifier implied, mirroring the shim attach posture), the `dmabuf` flag is set, and the format code already names the kernel format. No new event, no changed signature.
 - **Wider formats.** Because [`format`](#format) mirrors the DRM fourcc namespace, new pixel formats append as new enum entries (values immutable) without touching the message.
+- **Streaming capture.** Deliberately deferred (decision D6). If a later version adds it, it arrives as `since`-gated sibling messages (a subscription request and its frame-push event appended after the poll pair); `capture_frame`/`frame_ready` stay valid forever, refusals still voice through [`vitrin_grant.refused`](04-vitrin_grant.md), and each pushed frame would still carry one fd (the one-fd rule holds).
 - **Geometry and multi-view realms.** Version 1's "one view is the whole realm" is a deliberate floor; multi-surface and multi-view realms add their enumeration and geometry surface to [`vitrin_realm`](03-vitrin_realm.md) and its addressing objects, not by re-plumbing `vitrin_view`.
 
 See [conventions § versioning](00-conventions.md) for the append-only growth rules and the additive-safety table naming every reserved seam.

@@ -1,15 +1,39 @@
 name: CI
 
-# Minimal CI for P1.1.2 (vitrin-scanner codegen) only: schema validation,
-# test (debug AND release), the codegen drift check, and the C header
-# checks (standalone compile + golden-frame run). Deliberately does NOT
-# include Meson, fuzzing, or wlcs jobs -- those belong to the ci-docs track
-# (a separate tracked issue) and would be scope creep here.
+# Phase-1 pipeline (P1.9.1). Four jobs mirror the four components the issue
+# names, so each acceptance criterion is a visible check on every PR:
+#
+#   rust          fmt + clippy + workspace tests (debug AND release)
+#   codegen-diff  IDL schema validation + regeneration honesty (the P1.1.2
+#                 contract: checked-in generated code matches vitrin-v0.xml)
+#   shim          the C side, in a container with NO Rust toolchain -- the
+#                 checked-in generated header must suffice on its own. The
+#                 Meson build activates automatically once shim/meson.build
+#                 lands (P1.6.1).
+#   integration   vitrind --headless + scripted Python SDK tests, hard-capped
+#                 at 10 minutes. Dormant until tests/integration/run.sh lands
+#                 (needs P1.3.x headless + P1.8.x SDK); later hosts the M1.5
+#                 gates: demo job (P1.8.4), goldens (P1.9.2), hostile-client
+#                 tests (P1.9.3).
+#
+# Everything runs on GPU-less Linux runners: pixman rendering + shm buffers
+# are mandatory in CI (plan 01-phase-1-mvp.md §6 D3), and nested mode is
+# never a CI dependency (§7 R1). Jobs grow with each landing epic -- extend
+# this file in the PR that lands the surface a job tests.
 
 on:
   push:
     branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded pushes to a PR cancel the in-flight run; pushes to main never
+  # cancel each other, so every main commit keeps a complete verdict.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Fail the build on any compiler warning, matching how this workspace is
@@ -17,8 +41,8 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  build-test-codegen:
-    name: test (debug+release), codegen --check, C header checks
+  rust:
+    name: rust (fmt, clippy, tests debug+release)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,28 +50,26 @@ jobs:
 
       - name: Install Rust (pinned toolchain + components from rust-toolchain.toml)
         # rust-toolchain.toml is the single source of truth for the version
-        # AND the rustfmt component (a real runtime dependency of the
-        # codegen). Installing from the file -- rather than a toolchain
-        # action with its own version/components inputs -- means bumping the
-        # pin never needs a matching ci.yml edit, and CI cannot silently run
-        # a different toolchain than contributors do. (An action-installed
-        # "stable" would also leave the *pinned* toolchain, which rustup
-        # auto-installs minimal-profile on first cargo run, without rustfmt
-        # -- exactly the failure this replaces.)
+        # AND the component set (rustfmt is a runtime dependency of the
+        # codegen; clippy is the lint gate below). Installing from the file
+        # -- rather than a toolchain action with its own version/components
+        # inputs -- means bumping the pin never needs a matching ci.yml
+        # edit, and CI cannot silently run a different toolchain (or a
+        # different clippy lint set) than contributors do.
         run: rustup toolchain install && rustup show active-toolchain
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Validate IDL against the RELAX NG schema
-        # The scanner parses with roxmltree and performs its own semantic
-        # checks, but structural/dialect validation is xmllint's job
-        # (CLAUDE.md names this as the protocol validation command); without
-        # it, a schema-invalid vitrin-v0.xml that roxmltree tolerates would
-        # land green.
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq libxml2-utils
-          xmllint --noout --relaxng protocol/vitrin-v0.rng protocol/vitrin-v0.xml
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (all targets)
+        # --all-targets type-checks every lib/bin/test/bench target, so this
+        # step doubles as the "workspace builds" gate; the explicit
+        # -D warnings keeps the clippy gate intact even if the global
+        # RUSTFLAGS env ever changes.
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test --workspace
         run: cargo test --workspace
@@ -59,13 +81,140 @@ jobs:
         # exactly the mode where such a regression would hide.
         run: cargo test --workspace --release
 
+  codegen-diff:
+    name: codegen-diff (IDL schema + regeneration honesty)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate IDL against the RELAX NG schema
+        # The scanner parses with roxmltree and performs its own semantic
+        # checks, but structural/dialect validation is xmllint's job
+        # (CLAUDE.md names this as the protocol validation command); without
+        # it, a schema-invalid vitrin-v0.xml that roxmltree tolerates would
+        # land green.
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libxml2-utils
+          xmllint --noout --relaxng protocol/vitrin-v0.rng protocol/vitrin-v0.xml
+
+      - name: Install Rust (pinned toolchain + components from rust-toolchain.toml)
+        # Installed from rust-toolchain.toml for the reasons documented on
+        # the rust job's install step (single source of truth for version
+        # and components; the codegen shells out to the pinned rustfmt).
+        run: rustup toolchain install && rustup show active-toolchain
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
       - name: cargo xtask codegen --check
+        # Regenerates into a scratch dir and diffs against the checked-in
+        # crates/vitrin-protocol/src/generated + shim/include/vitrin-protocol.h.
+        # Fails when generated code drifts from protocol/vitrin-v0.xml.
         run: cargo xtask codegen --check
 
+  shim:
+    name: shim (C header, golden frames, Meson; no Rust)
+    runs-on: ubuntu-latest
+    # A plain distro container, not the runner image: hosted runners ship a
+    # Rust toolchain, so only a clean container can prove the acceptance
+    # criterion that the shim side builds WITHOUT Rust -- i.e. the
+    # checked-in generated header is sufficient on its own (the P1.1.2
+    # contract). The container tag also pins the C dependency set at the
+    # distro level. Once the shim exists and pins its wlroots API target,
+    # this becomes a GHCR-hosted image with that exact wlroots prebuilt
+    # (Dockerfile in-repo, rebuilt when it changes) -- decision recorded in
+    # P1.9.1, deferred until P1.6.1 fixes the version.
+    container: ubuntu:24.04
+    steps:
+      - name: Install C toolchain and git
+        # git first, so the checkout step clones instead of falling back to
+        # a tarball download.
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcc git ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assert no Rust toolchain is present
+        # Machine-checks the "shim job has no Rust toolchain installed"
+        # acceptance criterion instead of trusting the container to stay
+        # Rust-free by accident.
+        run: |
+          if command -v cargo >/dev/null 2>&1 || command -v rustc >/dev/null 2>&1; then
+            echo "::error::a Rust toolchain is on PATH; the shim job must build from the checked-in header alone"
+            exit 1
+          fi
+          echo "OK: no cargo/rustc on PATH"
+
       - name: C header compiles standalone (shim/include/vitrin-protocol.h)
-        run: cc -std=c11 -Wall -Werror -I shim/include -c shim/tests/test_header_compiles.c -o /dev/null
+        run: gcc -std=c11 -Wall -Werror -I shim/include -c shim/tests/test_header_compiles.c -o /dev/null
 
       - name: C golden-frame test (Rust and C pinned to the same bytes)
         run: |
-          cc -std=c11 -Wall -Werror -I shim/include shim/tests/test_golden_frames.c -o "${RUNNER_TEMP}/golden"
+          gcc -std=c11 -Wall -Werror -I shim/include shim/tests/test_golden_frames.c -o "${RUNNER_TEMP}/golden"
           "${RUNNER_TEMP}/golden"
+
+      # ---- Meson build: activates the moment shim/meson.build lands ------
+      # (P1.6.1 is in flight on a sibling branch; step-level hashFiles
+      # guards keep main green both before and after it merges. The landing
+      # PR runs these steps for real and adjusts the dependency list if its
+      # skeleton needs more.)
+
+      - name: Install Meson + wlroots build dependencies
+        if: hashFiles('shim/meson.build') != ''
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            meson ninja-build pkg-config \
+            libwayland-dev wayland-protocols libwlroots-dev \
+            libpixman-1-dev libxkbcommon-dev
+
+      - name: Meson build + tests
+        if: hashFiles('shim/meson.build') != ''
+        run: |
+          meson setup "${RUNNER_TEMP}/shim-build" shim
+          meson compile -C "${RUNNER_TEMP}/shim-build"
+          meson test -C "${RUNNER_TEMP}/shim-build" --print-errorlogs
+
+      - name: Meson build dormant
+        if: hashFiles('shim/meson.build') == ''
+        run: echo "shim/meson.build not landed yet (P1.6.1) -- Meson steps skipped."
+
+  integration:
+    name: integration (vitrind --headless + SDK tests)
+    runs-on: ubuntu-latest
+    # Acceptance criterion from P1.9.1, enforced structurally from day one:
+    # the integration job completes in < 10 minutes or fails.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Headless integration suite: activates the moment
+      # tests/integration/run.sh lands. ---------------------------------
+      # Entry-point contract: tests/integration/run.sh (bash, exit 0 =
+      # pass) builds what it needs via cargo, spawns `vitrind --headless`,
+      # and drives it with the scripted Python SDK tests (runner python3 is
+      # 3.12, satisfying the SDK's >=3.11 floor, D8). The guard is the test
+      # entry point itself -- NOT crates/vitrin-core -- because the vitrind
+      # skeleton (P1.2.x, in flight on a sibling branch) predates --headless
+      # and the SDK, and must not activate this job. The PR that lands the
+      # first integration test owns updating this contract if its shape
+      # differs.
+
+      - name: Install Rust (pinned toolchain + components from rust-toolchain.toml)
+        if: hashFiles('tests/integration/run.sh') != ''
+        run: rustup toolchain install && rustup show active-toolchain
+
+      - name: Cache cargo
+        if: hashFiles('tests/integration/run.sh') != ''
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run headless integration suite
+        if: hashFiles('tests/integration/run.sh') != ''
+        run: bash tests/integration/run.sh
+
+      - name: Integration suite dormant
+        if: hashFiles('tests/integration/run.sh') == ''
+        run: echo "tests/integration/run.sh not landed yet (needs P1.3.x headless + P1.8.x SDK) -- integration steps skipped."

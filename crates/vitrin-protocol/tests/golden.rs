@@ -26,8 +26,7 @@ fn golden_sync_uint() {
     let frame = gen::vitrin_handshake::requests::Sync { cookie: 42 }.encode(1);
     assert_eq!(frame, [1, 0, 0, 0, 12, 0, 1, 0, 42, 0, 0, 0]);
 
-    let (object_id, decoded) =
-        gen::vitrin_handshake::requests::Sync::decode(&frame, None).unwrap();
+    let (object_id, decoded) = gen::vitrin_handshake::requests::Sync::decode(&frame, None).unwrap();
     assert_eq!(object_id, 1);
     assert_eq!(decoded.cookie, 42);
 }
@@ -83,8 +82,7 @@ fn golden_seat_motion_fixed_point() {
         [9, 0, 0, 0, 20, 0, 0, 0, 0x80, 1, 0, 0, 0, 0xff, 0xff, 0xff, 0, 0, 0, 0]
     );
 
-    let (object_id, decoded) =
-        gen::vitrin_shim_seat::events::Motion::decode(&frame, None).unwrap();
+    let (object_id, decoded) = gen::vitrin_shim_seat::events::Motion::decode(&frame, None).unwrap();
     assert_eq!(object_id, 9);
     assert_eq!(decoded.x.to_bits(), 384);
     assert_eq!(decoded.y.to_bits(), -256);
@@ -121,9 +119,6 @@ fn golden_frame_ready_fd_header_and_fourcc_enum() {
         gen::vitrin_view::events::FrameReady::decode(&frame, Some(writer.into())).unwrap();
     assert_eq!(object_id, 5);
     assert_eq!(decoded.format, gen::vitrin_view::Format::Xrgb8888);
-    assert_eq!(
-        (decoded.width, decoded.height, decoded.stride),
-        (1, 2, 4)
-    );
+    assert_eq!((decoded.width, decoded.height, decoded.stride), (1, 2, 4));
     assert_eq!(decoded.flags, gen::vitrin_view::FrameFlags::default());
 }

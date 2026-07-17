@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Dependency install for the CI shim job (.github/workflows/ci.yml).
+#
+# OWNERSHIP: the c-shim track. The PR that lands shim/meson.build (P1.6.1)
+# activates the Meson CI steps and runs this script for real for the first
+# time -- it MUST adjust this list to the exact build-dependency set of its
+# vendored wlroots subproject. CI deliberately delegates the list to this
+# file so the workflow and the shim's dependency reality cannot drift apart.
+#
+# D11 (docs/plan/01-phase-1-mvp.md §6): wlroots is pinned + vendored as a
+# Meson subproject. This list therefore contains wlroots's *build*
+# dependencies -- NOT libwlroots-dev: Ubuntu 24.04 ships wlroots 0.17.1,
+# which would pin the shim to an API the project did not choose and shadow
+# the vendored subproject.
+#
+# Invariant checked by CI after this script runs: nothing here may pull
+# rustc/cargo onto PATH (the shim job's no-Rust acceptance criterion).
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq \
+  meson ninja-build pkg-config \
+  libwayland-dev wayland-protocols \
+  libpixman-1-dev libxkbcommon-dev \
+  libdrm-dev libgbm-dev libinput-dev libudev-dev libseat-dev \
+  libdisplay-info-dev libliftoff-dev hwdata

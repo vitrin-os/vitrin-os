@@ -174,7 +174,7 @@ fn reject_unsupported_growth_attrs(node: Node, what: &str) -> Result<()> {
 fn arg_worst_case_wire_size(arg: &Arg) -> u64 {
     match &arg.ty {
         ArgType::Fd => 0,
-        ArgType::String { max_bytes } => 4 + (u64::from(*max_bytes) + 3) / 4 * 4,
+        ArgType::String { max_bytes } => 4 + u64::from(*max_bytes).div_ceil(4) * 4,
         _ => 4,
     }
 }
@@ -329,8 +329,8 @@ const RESERVED_KEYWORDS: &[&str] = &[
     "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
     // C11 (those not already listed above)
     "auto", "case", "char", "default", "double", "float", "goto", "inline", "int", "long",
-    "register", "restrict", "short", "signed", "sizeof", "switch", "typedef", "union",
-    "unsigned", "void", "volatile",
+    "register", "restrict", "short", "signed", "sizeof", "switch", "typedef", "union", "unsigned",
+    "void", "volatile",
 ];
 
 /// Local variable names the Rust decode template binds before/while decoding
@@ -408,7 +408,10 @@ fn parse_enum(node: Node) -> Result<EnumDef> {
         // Rust backend emits as the variant name -- `foo_bar` and `foo__bar`
         // are distinct XML names that collide in generated code.
         let pascal = to_pascal_case(&e.name);
-        if let Some(prev) = entries[..i].iter().find(|p| to_pascal_case(&p.name) == pascal) {
+        if let Some(prev) = entries[..i]
+            .iter()
+            .find(|p| to_pascal_case(&p.name) == pascal)
+        {
             bail!(
                 "enum '{name}': entries '{}' and '{}' both become '{pascal}' in \
                  generated Rust",

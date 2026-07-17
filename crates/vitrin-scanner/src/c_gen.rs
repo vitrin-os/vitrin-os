@@ -250,7 +250,9 @@ fn gen_generic_support(buf: &mut Buf) {
     buf.line("/* ---- borrowed string view -- see the rationale at the top of this file. */");
     buf.line("typedef struct {");
     buf.line("    uint32_t len;        /* byte length; excludes wire padding */");
-    buf.line("    const uint8_t *data; /* borrowed; valid only as long as the buffer it points into */");
+    buf.line(
+        "    const uint8_t *data; /* borrowed; valid only as long as the buffer it points into */",
+    );
     buf.line("} vitrin_string_t;");
     buf.blank();
 
@@ -380,7 +382,9 @@ fn gen_generic_support(buf: &mut Buf) {
     buf.line("   buffer. 64-bit arithmetic cannot wrap here (max term is well under");
     buf.line("   2^33), so the guard stays sound on every target. */");
     buf.line("static inline uint64_t vitrin_raw_string_wire_len(uint32_t byte_len) {");
-    buf.line("    return (uint64_t)4 + (uint64_t)byte_len + (uint64_t)vitrin_raw_pad_len(byte_len);");
+    buf.line(
+        "    return (uint64_t)4 + (uint64_t)byte_len + (uint64_t)vitrin_raw_pad_len(byte_len);",
+    );
     buf.line("}");
     buf.blank();
     buf.line("/* Writes a string argument: u32 byte length, the bytes themselves (no NUL");
@@ -534,10 +538,7 @@ fn gen_phase1_interface(buf: &mut Buf, iface: &Interface) -> Result<()> {
 
 fn gen_interface_consts(buf: &mut Buf, iface: &Interface) {
     let upper = to_screaming_snake(&iface.name);
-    buf.line(format!(
-        "#define {upper}_INTERFACE_NAME \"{}\"",
-        iface.name
-    ));
+    buf.line(format!("#define {upper}_INTERFACE_NAME \"{}\"", iface.name));
     buf.line(format!(
         "#define {upper}_INTERFACE_VERSION {}u",
         iface.version
@@ -573,7 +574,11 @@ fn gen_plain_enum(buf: &mut Buf, iface: &Interface, enum_def: &EnumDef) -> Resul
                  `int` and therefore cannot be a plain C enum constant (ISO C requires \
                  enumeration constants to be representable as `int`); the C backend does not \
                  support this -- a bitfield-style value would need `bitfield=\"true\"` instead",
-                iface.name, enum_def.name, entry.name, entry.value, entry.value
+                iface.name,
+                enum_def.name,
+                entry.name,
+                entry.value,
+                entry.value
             );
         }
     }
@@ -729,7 +734,10 @@ fn gen_c_message(
     buf.line(format!("}} {type_name};"));
     buf.blank();
 
-    buf.line(format!("#define {macro_prefix}_OPCODE ((uint8_t){})", msg.opcode));
+    buf.line(format!(
+        "#define {macro_prefix}_OPCODE ((uint8_t){})",
+        msg.opcode
+    ));
     buf.line(format!(
         "#define {macro_prefix}_HAS_FD {}",
         i32::from(has_fd)
@@ -807,10 +815,9 @@ fn c_field_type(arg: &Arg) -> String {
 fn arg_size_term(arg: &Arg) -> Option<String> {
     match &arg.ty {
         ArgType::Fd => None,
-        ArgType::String { .. } => Some(format!(
-            "vitrin_raw_string_wire_len(msg->{}.len)",
-            arg.name
-        )),
+        ArgType::String { .. } => {
+            Some(format!("vitrin_raw_string_wire_len(msg->{}.len)", arg.name))
+        }
         _ => Some("4".to_string()),
     }
 }
@@ -965,9 +972,7 @@ fn gen_c_decode(
         "static inline vitrin_decode_status_t {base}_decode("
     ));
     buf.line("    const uint8_t *in, size_t in_len, int fd,");
-    buf.line(format!(
-        "    uint32_t *out_object_id, {type_name} *out) {{"
-    ));
+    buf.line(format!("    uint32_t *out_object_id, {type_name} *out) {{"));
     buf.line("    int fd_present = (fd >= 0) ? 1 : 0;");
     buf.line(format!("    if (fd_present != {macro_prefix}_HAS_FD) {{"));
     buf.line("        return VITRIN_DECODE_ERR_FD_MISMATCH;");
@@ -977,9 +982,7 @@ fn gen_c_decode(
     buf.line("    if (hdr_st != VITRIN_DECODE_OK) {");
     buf.line("        return hdr_st;");
     buf.line("    }");
-    buf.line(format!(
-        "    if (hdr.opcode != {macro_prefix}_OPCODE) {{"
-    ));
+    buf.line(format!("    if (hdr.opcode != {macro_prefix}_OPCODE) {{"));
     buf.line("        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;");
     buf.line("    }");
     buf.line("    if ((size_t)hdr.size != in_len) {");
@@ -1070,9 +1073,7 @@ fn gen_decode_arg(buf: &mut Buf, protocol: &Protocol, arg: &Arg) {
             buf.line(format!(
                 "    if (st_{field} != VITRIN_DECODE_OK) {{ return st_{field}; }}"
             ));
-            buf.line(format!(
-                "    out->{field} = (vitrin_fixed_t){field}_raw;"
-            ));
+            buf.line(format!("    out->{field} = (vitrin_fixed_t){field}_raw;"));
         }
         ArgType::String { max_bytes } => {
             buf.line(format!(

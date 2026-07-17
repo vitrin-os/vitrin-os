@@ -1,0 +1,21 @@
+[package]
+name = "vitrin-ipc"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Vitrin OS Unix-socket transport: framing over the vitrin-protocol wire format, SCM_RIGHTS fd passing (at most one fd per message), SO_PEERCRED captured at accept. No protocol semantics."
+publish = false
+
+[dependencies]
+vitrin-protocol = { path = "../vitrin-protocol" }
+# The one low-level unix crate of the workspace (already in the lockfile via
+# dev-dependencies). Chosen over `nix`/raw `libc` because it wraps every
+# syscall this crate needs (accept4, sendmsg/recvmsg with SCM_RIGHTS,
+# SO_PEERCRED, flock) behind I/O-safe `OwnedFd`/`BorrowedFd` types with no
+# unsafe in *our* code -- the TCB memory-safety posture of PRD Doc 2 section 2.
+rustix = { version = "1", features = ["net", "fs"] }
+
+[dev-dependencies]
+# Tests additionally need getpid/getuid/getgid to assert SO_PEERCRED values.
+rustix = { version = "1", features = ["net", "fs", "process"] }

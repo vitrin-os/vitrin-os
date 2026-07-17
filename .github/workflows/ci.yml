@@ -1,10 +1,14 @@
 name: CI
 
-# Minimal CI for P1.1.2 (vitrin-scanner codegen) only: schema validation,
-# test (debug AND release), the codegen drift check, and the C header
-# checks (standalone compile + golden-frame run). Deliberately does NOT
-# include Meson, fuzzing, or wlcs jobs -- those belong to the ci-docs track
-# (a separate tracked issue) and would be scope creep here.
+# CI covers two tracks today:
+#   * build-test-codegen (protocol track, P1.1.2): schema validation, tests
+#     (debug AND release), the codegen drift check, and the C header checks
+#     (standalone compile + golden-frame run).
+#   * shim (c-shim track, P1.6.1): Meson build of the wlroots shim from the
+#     checked-in generated header + the headless acceptance harness.
+# The broader ci-docs work (containerized deps, fuzzing, wlcs conformance,
+# the vitrind integration job -- P1.9.*) still belongs to that track and is
+# deliberately out of scope here.
 
 on:
   push:
@@ -69,3 +73,58 @@ jobs:
         run: |
           cc -std=c11 -Wall -Werror -I shim/include shim/tests/test_golden_frames.c -o "${RUNNER_TEMP}/golden"
           "${RUNNER_TEMP}/golden"
+
+  shim:
+    name: shim build (Meson, wlroots 0.19 wrap) + headless acceptance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build + runtime deps
+        # No Rust toolchain here -- the shim builds purely from the checked-in
+        # generated header (acceptance criterion). Ubuntu ships no wlroots-0.19,
+        # so the pinned subprojects/wlroots.wrap builds it from source using
+        # these system deps (wlroots' own nested wraps cover anything missing).
+        # No mesa/libinput/vulkan installed on purpose: wlroots' 'auto'
+        # renderers/backends then compile down to headless + pixman, which is
+        # all this GPU-free runner needs. weston + wayland-utils drive the
+        # acceptance harness.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            meson ninja-build pkg-config \
+            libwayland-dev libwayland-bin wayland-protocols \
+            libdrm-dev libxkbcommon-dev libpixman-1-dev \
+            hwdata libdisplay-info-dev libudev-dev \
+            weston wayland-utils fonts-dejavu-core
+
+      - name: Cache vendored wlroots + wayland-protocols checkouts
+        # Both wraps are wrap-git, which meson clones straight into these dirs
+        # and never stores in subprojects/packagecache -- so caching the clone
+        # dirs (not packagecache) is what actually avoids re-fetching from
+        # freedesktop.org each run. Keyed on the wrap files, so a pin bump
+        # (new revision) busts the cache. depth=1 pinned checkouts restore
+        # cleanly; meson re-validates the revision on setup.
+        uses: actions/cache@v4
+        with:
+          path: |
+            shim/subprojects/wlroots
+            shim/subprojects/wayland-protocols
+          key: shim-subprojects-${{ hashFiles('shim/subprojects/*.wrap') }}
+
+      - name: meson setup (wlroots from the pinned wrap)
+        # Ubuntu has no wlroots-0.19, so the wrap fallback triggers on its own;
+        # --force-fallback-for makes that explicit and fails loudly if a system
+        # wlroots ever appears with a mismatched version.
+        run: meson setup shim/build shim --force-fallback-for=wlroots-0.19,wlroots
+
+      - name: meson compile
+        run: meson compile -C shim/build
+
+      - name: meson test (generated header compiles)
+        run: meson test -C shim/build --print-errorlogs
+
+      - name: Headless acceptance (exact globals + weston-terminal blind)
+        working-directory: shim
+        run: bash tests/acceptance/shim_globals_and_client.sh

@@ -341,7 +341,7 @@ typedef enum {
     VITRIN_HANDSHAKE_ERROR_FD_VIOLATION = 4,
     /* traffic before a first hello on a principal connection */
     VITRIN_HANDSHAKE_ERROR_PRE_HANDSHAKE = 5,
-    /* hello carried a protocol version the server does not implement; downgrade is refusal */
+    /* hello offered a protocol version the server does not implement - i.e. above its maximum, since additive growth means a server implements every version up to its maximum; downgrade is refusal, not negotiation */
     VITRIN_HANDSHAKE_ERROR_VERSION_UNSUPPORTED = 6,
     /* credential rejected: unknown identity, bad token, verifier failure, or SO_PEERCRED mismatch; the cause is never distinguished on the wire - uniform code, fixed message text, detail in the server log only */
     VITRIN_HANDSHAKE_ERROR_AUTH_FAILED = 7,
@@ -814,7 +814,7 @@ static inline bool vitrin_shim_seat_origin_is_valid(uint32_t v) {
  * authenticate and bind a principal
  */
 typedef struct {
-    /* protocol version; version 1 requires exact match */
+    /* protocol version the connection will speak (the negotiated version); a version the server does not implement (above its maximum) is fatal version_unsupported */
     uint32_t version;
     /* principal object bound on success (new_id: vitrin_principal) */
     uint32_t principal;

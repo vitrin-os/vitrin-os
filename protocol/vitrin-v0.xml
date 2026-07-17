@@ -113,9 +113,23 @@
     attribute of this document and the first argument of hello. The v0 in
     the document family's name (vitrin-v0.xml) is the spec generation; the
     wire integer it carries starts at 1 (the schema forbids 0). Prose that
-    says "version 1" means this wire integer. Version 1
-    requires an exact match; a mismatch is fatal "version_unsupported"
-    (downgrade is refusal, not negotiation). Growth is Wayland-style: new
+    says "version 1" means this wire integer. The version named in hello
+    is the negotiated version: the connection speaks exactly that version
+    for its whole life, and messages introduced by a later "since" are not
+    defined on it (using one is fatal "invalid_opcode"). A server accepts
+    any offered version it implements and refuses the rest with fatal
+    "version_unsupported"; because growth is strictly additive, a server
+    whose maximum version is N implements every version from 1 to N -
+    serving an older version means never emitting later-since events and
+    rejecting later-since opcodes - so refusal means exactly that the
+    client offered a version above the server's maximum. Downgrade is
+    refusal, not negotiation: the server never counters with a different
+    version and the refusal carries no supported-version hint
+    (error.message is never machine-parsed); a newer client willing to
+    speak an older version reconnects offering a lower integer -
+    convergence by descending reoffer, bounded by the client's own
+    maximum. In version 1 exactly one version exists, so acceptance
+    degenerates to an exact match. Growth is Wayland-style: new
     messages are appended with since attributes (opcodes are implicit
     document order, requests and events numbered separately from 0), enum
     entries are appended (values are immutable; deprecated-since marks,
@@ -174,18 +188,27 @@
       requests; the server queues them (bounded by ordinary transport
       backpressure, never an unbounded server-side buffer) and processes
       them only after vitrin_principal.bound is sent, which moves the
-      connection to BOUND, the steady state. Nothing a client sends is
-      processed before BOUND: pipelining buys latency, never early
-      execution, and if verification fails the connection dies
-      ("auth_failed" or "version_unsupported") with the queued requests
-      never processed. Any traffic before a first hello is fatal
+      connection to BOUND, the steady state. No request outside the
+      handshake exchange itself is processed before BOUND - in version 1
+      the exchange is hello alone; a later version's proof-of-possession
+      response request is part of the exchange and is processed inside
+      VERIFYING (see the growth seams). Pipelining buys latency, never
+      early execution: requests pipelined behind a hello that succeeds are
+      queued and served only after bound, and if verification fails the
+      connection dies ("auth_failed" or "version_unsupported") with the
+      queued requests never processed. Any traffic before a first hello is fatal
       "pre_handshake", delivered best-effort if the frame parsed;
       unparseable garbage may be closed silently.
 
       The unauthenticated phase is bounded in time: the server SHOULD
-      impose a deployment-configurable deadline on the arrival of a
-      complete hello, and a connection still in CONNECTED when it expires
-      (nothing sent, or a partial frame dribbled) is closed
+      impose a deployment-configurable deadline on every unauthenticated
+      interval spent waiting on the client. In version 1 that interval is
+      exactly CONNECTED - once a complete hello has arrived, remaining
+      VERIFYING time is the server's own verifier latency - and a later
+      version's proof-of-possession exchange keeps the deadline armed
+      inside VERIFYING while the server awaits the client's response. A
+      connection that exhausts the deadline (nothing sent, or a partial
+      frame dribbled) is closed
       administratively - no error event, because nothing was violated; the
       close is indistinguishable from an ordinary disconnect. Every
       pre-BOUND death - pre_handshake traffic, refused verification,
@@ -204,9 +227,11 @@
         Presents a credential to the core's pluggable verifier and
         pre-allocates the principal object that a successful handshake
         will bind. Success is announced by vitrin_principal.bound; failure
-        is fatal "auth_failed" or "version_unsupported". Checks run in a
+        is fatal "auth_failed" or "version_unsupported". The version
+        accepted here becomes the connection's negotiated version for its
+        whole life (see VERSIONING). Checks run in a
         fixed order: frame grammar first (fatal decode errors as usual),
-        then the version integer, then - only for a version-matched hello -
+        then the version integer, then - only for a version-accepted hello -
         credential verification; "version_unsupported" therefore reveals
         nothing about the credential or the claimed identity.
 
@@ -250,7 +275,7 @@
 
         This signature is frozen forever.
       </description>
-      <arg name="version" type="uint" summary="protocol version; version 1 requires exact match"/>
+      <arg name="version" type="uint" summary="protocol version the connection will speak (the negotiated version); a version the server does not implement (above its maximum) is fatal version_unsupported"/>
       <arg name="principal" type="new_id" interface="vitrin_principal" summary="principal object bound on success"/>
       <arg name="identity" type="string" summary="claimed identity URI, e.g. vitrin://local/agent/demo (max 2048 bytes)"/>
       <arg name="credential_type" type="string" summary="credential scheme discriminator (max 32 bytes)"/>
@@ -316,7 +341,7 @@
       <entry name="oversized" value="3" summary="declared frame size below the 8-byte header minimum, or a payload shorter than the size declares; the 65535-byte ceiling binds senders (a u16 cannot express more)"/>
       <entry name="fd_violation" value="4" summary="fd count in the header disagrees with the message signature, or unsolicited fds attached"/>
       <entry name="pre_handshake" value="5" summary="traffic before a first hello on a principal connection"/>
-      <entry name="version_unsupported" value="6" summary="hello carried a protocol version the server does not implement; downgrade is refusal"/>
+      <entry name="version_unsupported" value="6" summary="hello offered a protocol version the server does not implement - i.e. above its maximum, since additive growth means a server implements every version up to its maximum; downgrade is refusal, not negotiation"/>
       <entry name="auth_failed" value="7" summary="credential rejected: unknown identity, bad token, verifier failure, or SO_PEERCRED mismatch; the cause is never distinguished on the wire - uniform code, fixed message text, detail in the server log only"/>
       <entry name="internal" value="8" summary="server-side failure that poisoned the connection"/>
       <entry name="resource_exhausted" value="9" summary="a documented per-connection resource bound was breached: the petition-rate ceiling, the live-object cap, or object-id exhaustion; denial-of-service confinement, not a semantic judgement"/>

@@ -68,16 +68,26 @@ Two properties of the machine are load-bearing for security:
 
 - **Nothing is processed before BOUND.** The server acts on zero client requests until
   verification succeeds; pipelining buys latency, never early execution. Combined with the
-  logged-reason rule below, this is the "any traffic before a successful handshake is dropped
-  with a logged reason" guarantee: pre-`hello` traffic dies `pre_handshake`, and requests
-  pipelined behind a `hello` that fails are discarded unprocessed when the connection dies.
+  logged-reason rule below, this realizes the acceptance criterion "any traffic before a
+  successful handshake is dropped with a logged reason" — with one deliberate, **sanctioned
+  exception** to its literal wording: pre-`hello` traffic dies `pre_handshake`, and requests
+  pipelined behind a `hello` that fails are discarded unprocessed when the connection dies, but
+  requests pipelined behind a `hello` that **succeeds** are queued and then served after `bound`.
+  They were *sent* before the handshake completed yet are deliberately not dropped, because the
+  security property the criterion protects is zero pre-BOUND **execution**, not zero pre-BOUND
+  bytes. The queue rule scopes to requests outside the handshake exchange itself: in version 1
+  the exchange is `hello` alone; a later version's proof-of-possession response request is part
+  of the exchange and is processed inside VERIFYING (see [Growth](#growth)).
 - **The unauthenticated phase is bounded in time.** The server SHOULD impose a
-  deployment-configurable deadline on the arrival of a complete `hello`. A connection still in
-  CONNECTED when the deadline expires — nothing sent, or a partial frame dribbled — is closed
-  **administratively**: no `error` event, because nothing was violated; the close is
-  indistinguishable from an ordinary disconnect. The deadline binds only CONNECTED: once a
-  complete `hello` has arrived, remaining VERIFYING time is the server's own verifier latency,
-  and a BOUND connection may idle indefinitely (e.g. awaiting a pending consent resolution).
+  deployment-configurable deadline on every unauthenticated interval spent waiting on the
+  client. A connection that exhausts the deadline — nothing sent, or a partial frame dribbled —
+  is closed **administratively**: no `error` event, because nothing was violated; the close is
+  indistinguishable from an ordinary disconnect. In version 1 the client-attributable interval
+  is exactly CONNECTED: once a complete `hello` has arrived, remaining VERIFYING time is the
+  server's own verifier latency. A later version's proof-of-possession exchange keeps the
+  deadline armed inside VERIFYING while the server awaits the client's response (see
+  [Growth](#growth)); a BOUND connection may idle indefinitely (e.g. awaiting a pending consent
+  resolution).
 
 Every pre-BOUND death has its reason logged server-side: `pre_handshake` traffic, refused
 verification, deadline expiry, unframeable garbage, and backpressure alike.
@@ -95,7 +105,7 @@ hello(version: uint, principal: new_id<vitrin_principal>, identity: string, cred
 
 | arg | type | description |
 | --- | --- | --- |
-| `version` | uint | Protocol version being spoken. Version 1 requires an **exact** match; any other value is fatal `version_unsupported`. |
+| `version` | uint | The protocol version this connection will speak — the **negotiated version**. A version the server does not implement (above its maximum) is fatal `version_unsupported`. |
 | `principal` | new_id → [`vitrin_principal`](./02-vitrin_principal.md) | The principal object pre-allocated by this request and bound on success. |
 | `identity` | string | The claimed identity URI, SPIFFE-shaped (e.g. `vitrin://local/agent/demo`). Max 2048 bytes — the SPIFFE-ID maximum (a 255-byte trust domain plus path). |
 | `credential_type` | string | Credential scheme discriminator naming how `credential` is interpreted (e.g. `static-token`, `spiffe-jwt-svid`, `oidc`, `ssh-cert`). Max 32 bytes. |
@@ -112,8 +122,12 @@ pre-allocates the `vitrin_principal` object that a successful handshake binds. S
 announced by [`vitrin_principal.bound`](./02-vitrin_principal.md); the identity that `bound`
 carries is the verifier-canonical value, **not** an echo of the `identity` string presented here.
 
+The version accepted here becomes the connection's **negotiated version** for its whole life:
+messages introduced by a later `since` are not defined on the connection, and using one is fatal
+`invalid_opcode` (see [version semantics](./00-conventions.md#73-version-semantics)).
+
 Checks run in a **fixed order**: frame grammar first (fatal decode errors as usual), then the
-`version` integer, then — only for a version-matched `hello` — credential verification.
+`version` integer, then — only for a version-accepted `hello` — credential verification.
 `version_unsupported` therefore reveals nothing about the credential or the claimed identity.
 
 The credential encoding is deliberately opaque to the wire. `credential_type` names a scheme and
@@ -139,8 +153,14 @@ close. There is no `hello`-specific event on `vitrin_handshake` itself.
 
 **Failure modes (all fatal — the connection dies):**
 
-- `version_unsupported` — `version` was not the server's exact version; downgrade is refusal, not
-  negotiation.
+- `version_unsupported` — the server does not implement the offered `version`. Because growth is
+  strictly additive, a server implements every version up to its maximum, so this means the
+  client offered a version **above the server's maximum** (in version 1 exactly one version
+  exists, so acceptance degenerates to an exact match). Downgrade is refusal, not negotiation:
+  the server never counters with a different version and the error carries no supported-version
+  hint (`error.message` is never machine-parsed); a newer client willing to speak an older
+  version reconnects offering a lower integer — convergence by descending reoffer, bounded by
+  the client's own maximum.
 - `auth_failed` — the credential was rejected (unknown identity, bad token, verifier failure, or
   `SO_PEERCRED` mismatch — never distinguished on the wire; see below).
 - `invalid_object` — the `new_id` for `principal` violated id allocation rules (at or below the
@@ -327,9 +347,10 @@ Pre-handshake traffic:
   A→C  <any non-hello message before hello>
   C→A  vitrin_handshake.error(object_id=1, code=pre_handshake, message="…")   → close
 
-Version mismatch:
+Version mismatch (this version-1 server's maximum is 1):
   A→C  vitrin_handshake.hello(version=2, …)
   C→A  vitrin_handshake.error(object_id=1, code=version_unsupported, message="…")   → close
+        — a client willing to speak version 1 reconnects and offers the lower integer
 
 Bad credential (any cause — unknown identity, bad token, verifier failure, peercred mismatch):
   A→C  vitrin_handshake.hello(version=1, …, credential=<rejected>)
@@ -363,8 +384,11 @@ message signatures never change (see [versioning](./00-conventions.md)).
   which is what lets the whole handshake be a single `hello`. A scheme whose `credential_type`
   demands proof of possession (e.g. X.509-SVID with a private-key challenge) arrives as an
   appended server-driven exchange inside VERIFYING — a new challenge event plus a new response
-  request on this interface. `hello` and `bound` stay frozen; bearer schemes never see the new
-  messages.
+  request on this interface. The exchange is part of the handshake itself: the response request
+  is exempt from the queued-until-BOUND rule (which scopes to requests outside the handshake
+  exchange), and the unauthenticated deadline stays armed while the server awaits the client's
+  response. `hello` and `bound` stay frozen; version-1 connections and bearer schemes never see
+  the new messages.
 - **Interface-namespaced error codes.** In version 1 this interface owns the only `error` enum, so
   all fatal codes are connection-global. When a later version gives another interface its own `error`
   enum, `error.object_id` already routes the namespacing: `code` is read against the cited object's

@@ -17,7 +17,7 @@ pub mod requests {
     /// authenticate and bind a principal
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Hello {
-        /// protocol version; version 1 requires exact match
+        /// protocol version the connection will speak (the negotiated version); a version the server does not implement (above its maximum) is fatal version_unsupported
         pub version: u32,
         /// principal object bound on success (new_id: vitrin_principal)
         pub principal: u32,
@@ -438,7 +438,7 @@ pub enum Error {
     FdViolation = 4,
     /// traffic before a first hello on a principal connection
     PreHandshake = 5,
-    /// hello carried a protocol version the server does not implement; downgrade is refusal
+    /// hello offered a protocol version the server does not implement - i.e. above its maximum, since additive growth means a server implements every version up to its maximum; downgrade is refusal, not negotiation
     VersionUnsupported = 6,
     /// credential rejected: unknown identity, bad token, verifier failure, or SO_PEERCRED mismatch; the cause is never distinguished on the wire - uniform code, fixed message text, detail in the server log only
     AuthFailed = 7,

@@ -1,0 +1,8 @@
+[wrap-git]
+directory = wayland-protocols
+url = https://gitlab.freedesktop.org/wayland/wayland-protocols.git
+revision = 1.49
+depth = 1
+
+[provide]
+wayland-protocols = wayland_protocols

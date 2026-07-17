@@ -116,8 +116,8 @@ fn codegen(check: bool) -> Result<()> {
     let rust_out_dir = root.join(RUST_OUT_DIR);
     let c_header_path = root.join(C_HEADER_PATH);
 
-    let xml = fs::read_to_string(&xml_path)
-        .with_context(|| format!("reading {}", xml_path.display()))?;
+    let xml =
+        fs::read_to_string(&xml_path).with_context(|| format!("reading {}", xml_path.display()))?;
     let protocol = vitrin_scanner::parse::parse(&xml)
         .with_context(|| format!("parsing {}", xml_path.display()))?;
 

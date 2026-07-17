@@ -1,2 +1,11 @@
 /target
 **/target
+
+# Meson build output for the C+wlroots shim (shim/, outside the Cargo workspace).
+/shim/build*/
+# Everything under subprojects/ is generated -- downloaded checkouts, the
+# packagecache, .wraplock, and the nested wraps Meson promotes from wlroots --
+# except the two wrap files we author and pin (D11).
+/shim/subprojects/*
+!/shim/subprojects/wlroots.wrap
+!/shim/subprojects/wayland-protocols.wrap

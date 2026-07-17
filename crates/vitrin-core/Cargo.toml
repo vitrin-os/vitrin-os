@@ -1,0 +1,29 @@
+[package]
+name = "vitrin-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Vitrin OS trusted core. Binary `vitrind`: compositor, capability kernel, grant store -- the entire TCB."
+publish = false
+
+[[bin]]
+name = "vitrind"
+path = "src/main.rs"
+
+[dependencies]
+# The compositor toolkit for the trusted core (PRD SS17: Rust + Smithay).
+# Pinned exactly -- the issue-#17 decision -- because renderer output feeds
+# pixel-golden tests later (P1.3.2/P1.3.6) and a silent minor bump must not
+# move pixels. `default-features = false` keeps the TCB dependency surface
+# minimal (plan risk R7): `backend_winit` transitively enables exactly the
+# EGL/GLES pieces the nested backend needs, nothing else.
+smithay = { version = "=0.7.0", default-features = false, features = ["backend_winit"] }
+# The same calloop Smithay links against (it pins 0.14); this direct
+# dependency exists to (a) import event-loop types under their own name and
+# (b) switch on the `signals` feature -- the signalfd event source used for
+# clean SIGINT/SIGTERM shutdown inside the compositor loop.
+calloop = { version = "0.14", features = ["signals"] }
+# Smithay's logging facade; the core emits its own diagnostics through it too.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

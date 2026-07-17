@@ -56,8 +56,10 @@ fn mod_file(protocol: &Protocol) -> String {
         "/// The `{}` protocol's single wire version integer (`protocol/@version`);",
         protocol.name
     ));
-    buf.line("/// also the first argument of `vitrin_handshake::Hello`. An exact match is");
-    buf.line("/// required -- downgrade is refusal, not negotiation.");
+    buf.line("/// also the first argument of `vitrin_handshake::Hello`, whose accepted value");
+    buf.line("/// becomes the connection's negotiated version. A server implements every");
+    buf.line("/// version up to its maximum and refuses anything above it with");
+    buf.line("/// `version_unsupported` -- downgrade is refusal, not negotiation.");
     buf.line(format!(
         "pub const PROTOCOL_VERSION: u32 = {};",
         protocol.version
@@ -73,9 +75,7 @@ fn mod_file(protocol: &Protocol) -> String {
     buf.line("/// enumerating every message (e.g. the round-trip table) checks its own");
     buf.line("/// length against this, so a message added to the IDL cannot ship silently");
     buf.line("/// untested.");
-    buf.line(format!(
-        "pub const MESSAGE_COUNT: usize = {message_count};"
-    ));
+    buf.line(format!("pub const MESSAGE_COUNT: usize = {message_count};"));
     buf.blank();
     for iface in &protocol.interfaces {
         buf.line(format!("pub mod {};", iface.name));

@@ -113,9 +113,23 @@
     attribute of this document and the first argument of hello. The v0 in
     the document family's name (vitrin-v0.xml) is the spec generation; the
     wire integer it carries starts at 1 (the schema forbids 0). Prose that
-    says "version 1" means this wire integer. Version 1
-    requires an exact match; a mismatch is fatal "version_unsupported"
-    (downgrade is refusal, not negotiation). Growth is Wayland-style: new
+    says "version 1" means this wire integer. The version named in hello
+    is the negotiated version: the connection speaks exactly that version
+    for its whole life, and messages introduced by a later "since" are not
+    defined on it (using one is fatal "invalid_opcode"). A server accepts
+    any offered version it implements and refuses the rest with fatal
+    "version_unsupported"; because growth is strictly additive, a server
+    whose maximum version is N implements every version from 1 to N -
+    serving an older version means never emitting later-since events and
+    rejecting later-since opcodes - so refusal means exactly that the
+    client offered a version above the server's maximum. Downgrade is
+    refusal, not negotiation: the server never counters with a different
+    version and the refusal carries no supported-version hint
+    (error.message is never machine-parsed); a newer client willing to
+    speak an older version reconnects offering a lower integer -
+    convergence by descending reoffer, bounded by the client's own
+    maximum. In version 1 exactly one version exists, so acceptance
+    degenerates to an exact match. Growth is Wayland-style: new
     messages are appended with since attributes (opcodes are implicit
     document order, requests and events numbered separately from 0), enum
     entries are appended (values are immutable; deprecated-since marks,
@@ -168,14 +182,38 @@
       object 1 at connect: the authentication gate, the fatal-error channel,
       and the sync barrier. It lives for the whole connection.
 
-      Handshake state machine: in the initial state the only legal message
-      is hello. After hello the client MAY pipeline further requests; the
-      server queues them during credential verification and processes them
-      after vitrin_principal.bound is sent (if verification fails the
-      connection dies "auth_failed" and queued requests are never
-      processed). Any traffic before a first hello is fatal "pre_handshake",
-      delivered best-effort if the frame parsed; unparseable garbage may be
-      closed silently. Either way the reason is logged.
+      Handshake state machine: CONNECTED, VERIFYING, BOUND, DEAD. In
+      CONNECTED the only legal message is hello; a complete hello moves the
+      connection to VERIFYING. In VERIFYING the client MAY pipeline further
+      requests; the server queues them (bounded by ordinary transport
+      backpressure, never an unbounded server-side buffer) and processes
+      them only after vitrin_principal.bound is sent, which moves the
+      connection to BOUND, the steady state. No request outside the
+      handshake exchange itself is processed before BOUND - in version 1
+      the exchange is hello alone; a later version's proof-of-possession
+      response request is part of the exchange and is processed inside
+      VERIFYING (see the growth seams). Pipelining buys latency, never
+      early execution: requests pipelined behind a hello that succeeds are
+      queued and served only after bound, and if verification fails the
+      connection dies ("auth_failed" or "version_unsupported") with the
+      queued requests never processed. Any traffic before a first hello is fatal
+      "pre_handshake", delivered best-effort if the frame parsed;
+      unparseable garbage may be closed silently.
+
+      The unauthenticated phase is bounded in time: the server SHOULD
+      impose a deployment-configurable deadline on every unauthenticated
+      interval spent waiting on the client. In version 1 that interval is
+      exactly CONNECTED - once a complete hello has arrived, remaining
+      VERIFYING time is the server's own verifier latency - and a later
+      version's proof-of-possession exchange keeps the deadline armed
+      inside VERIFYING while the server awaits the client's response. A
+      connection that exhausts the deadline (nothing sent, or a partial
+      frame dribbled) is closed
+      administratively - no error event, because nothing was violated; the
+      close is indistinguishable from an ordinary disconnect. Every
+      pre-BOUND death - pre_handshake traffic, refused verification,
+      deadline expiry, unframeable garbage, backpressure - has its reason
+      logged server-side.
 
       The human principal has no wire presence in version 1: host input in
       nested mode is the implicit human, and only agents handshake.
@@ -183,11 +221,19 @@
 
     <request name="hello">
       <description summary="authenticate and bind a principal">
-        The only pre-authentication message. Presents a credential to the
-        core's pluggable verifier and pre-allocates the principal object
-        that a successful handshake will bind. Success is announced by
-        vitrin_principal.bound; failure is fatal "auth_failed" or
-        "version_unsupported".
+        The only pre-authentication message: credential presentation is
+        folded into hello rather than split across an exchange, so the
+        whole handshake is one client message and one server terminal.
+        Presents a credential to the core's pluggable verifier and
+        pre-allocates the principal object that a successful handshake
+        will bind. Success is announced by vitrin_principal.bound; failure
+        is fatal "auth_failed" or "version_unsupported". The version
+        accepted here becomes the connection's negotiated version for its
+        whole life (see VERSIONING). Checks run in a
+        fixed order: frame grammar first (fatal decode errors as usual),
+        then the version integer, then - only for a version-accepted hello -
+        credential verification; "version_unsupported" therefore reveals
+        nothing about the credential or the claimed identity.
 
         The credential encoding is deliberately opaque to the wire:
         credential_type names a scheme (for example "static-token",
@@ -211,13 +257,25 @@
         recorder - at most credential_type and the byte length may be
         recorded.
 
+        A refused handshake is deliberately uniform on the wire
+        (identity-probing resistance): every credential-rejection cause -
+        unknown identity, bad token, verifier failure, SO_PEERCRED
+        mismatch - collapses to the single fatal code "auth_failed", and
+        the accompanying error.message MUST be a fixed phrase that neither
+        names the cause nor echoes the claimed identity. The cause and the
+        claimed identity are recorded in the server log only. Verification
+        SHOULD take uniform time across rejection causes (constant-time
+        credential comparison, identical verification work for unknown
+        identities) so that latency does not become the oracle the message
+        text refuses to be.
+
         hello is legal exactly once per connection: its opcode is defined
-        only in the initial state, so a second hello - during verification
-        or after bound - is fatal "invalid_opcode".
+        only in CONNECTED, so a second hello - in VERIFYING or BOUND - is
+        fatal "invalid_opcode".
 
         This signature is frozen forever.
       </description>
-      <arg name="version" type="uint" summary="protocol version; version 1 requires exact match"/>
+      <arg name="version" type="uint" summary="protocol version the connection will speak (the negotiated version); a version the server does not implement (above its maximum) is fatal version_unsupported"/>
       <arg name="principal" type="new_id" interface="vitrin_principal" summary="principal object bound on success"/>
       <arg name="identity" type="string" summary="claimed identity URI, e.g. vitrin://local/agent/demo (max 2048 bytes)"/>
       <arg name="credential_type" type="string" summary="credential scheme discriminator (max 32 bytes)"/>
@@ -250,7 +308,9 @@
         code is namespaced by that object's interface error enum - in
         version 1 the only error enum is on this interface, so all fatal
         codes are connection-global. message is free-form debugging text
-        and is never machine-parsed. After sending this event the server
+        and is never machine-parsed; for "auth_failed" it is a fixed,
+        cause-free phrase (see hello: identity-probing resistance). After
+        sending this event the server
         closes the connection. Delivery is best-effort: backpressure deaths
         (a peer that stops reading) and unframeable streams are closed
         without it.
@@ -276,13 +336,13 @@
         death, and error paths always close any received file descriptor.
       </description>
       <entry name="invalid_object" value="0" summary="unknown or foreign object id, id reuse at or below the watermark, reserved-range id, or multi-new_id rule violation"/>
-      <entry name="invalid_opcode" value="1" summary="opcode not defined for the interface at the negotiated version, including other-class opcodes and a second hello (hello's opcode is defined only in the initial connection state)"/>
+      <entry name="invalid_opcode" value="1" summary="opcode not defined for the interface at the negotiated version, including other-class opcodes and a second hello (hello's opcode is defined only in the CONNECTED state)"/>
       <entry name="invalid_argument" value="2" summary="argument decode failure: bad UTF-8, embedded NUL, string over its bound, out-of-range enum value, forbidden control character, zero verbs, malformed padding"/>
       <entry name="oversized" value="3" summary="declared frame size below the 8-byte header minimum, or a payload shorter than the size declares; the 65535-byte ceiling binds senders (a u16 cannot express more)"/>
       <entry name="fd_violation" value="4" summary="fd count in the header disagrees with the message signature, or unsolicited fds attached"/>
       <entry name="pre_handshake" value="5" summary="traffic before a first hello on a principal connection"/>
-      <entry name="version_unsupported" value="6" summary="hello carried a protocol version the server does not implement; downgrade is refusal"/>
-      <entry name="auth_failed" value="7" summary="credential rejected: unknown identity, bad token, verifier failure, or SO_PEERCRED mismatch"/>
+      <entry name="version_unsupported" value="6" summary="hello offered a protocol version the server does not implement - i.e. above its maximum, since additive growth means a server implements every version up to its maximum; downgrade is refusal, not negotiation"/>
+      <entry name="auth_failed" value="7" summary="credential rejected: unknown identity, bad token, verifier failure, or SO_PEERCRED mismatch; the cause is never distinguished on the wire - uniform code, fixed message text, detail in the server log only"/>
       <entry name="internal" value="8" summary="server-side failure that poisoned the connection"/>
       <entry name="resource_exhausted" value="9" summary="a documented per-connection resource bound was breached: the petition-rate ceiling, the live-object cap, or object-id exhaustion; denial-of-service confinement, not a semantic judgement"/>
     </enum>
@@ -565,6 +625,16 @@
       (grant alive, observe granted, rate bucket) and refuses recoverably
       via vitrin_grant.refused when it fails. The agent learns the view's
       dimensions from frame_ready; version 1 has no geometry protocol.
+
+      Observation is concurrent by design: capture never contends with
+      physical human input or with a pending consent prompt, so the
+      refusal codes preempted and consent_held are actuation-only and
+      never refuse a capture - and the consent overlay is composited into
+      human-visible output only, so a frame captured while a prompt is up
+      simply does not contain it. Streaming capture is a deliberate
+      deferral, not an omission: if a later version adds it, it arrives
+      as since-gated sibling messages beside this poll pair, which stays
+      valid forever.
     </description>
 
     <request name="capture_frame">
@@ -575,6 +645,21 @@
         replies pair in order. The pairing is forced by the type system:
         fd arguments have no null form, so failure must be a distinct
         event. Captures are rate-limited by the grant's max_event_rate.
+
+        The frame carries the realm view's most recently composited
+        content as of when the server processes this request; version 1
+        makes no freshness promise beyond that, and an agent observes
+        change by capturing again. "Never a stale frame" is the
+        no_surface rule: a realm whose surface is gone (shim crashed or
+        exited) refuses rather than re-serving its last content, so a
+        delivered frame always describes a live realm view.
+
+        The request deliberately carries no arguments: a capture is
+        always the whole realm view, and the pixel format is
+        server-chosen, announced per-frame by frame_ready. Region
+        selection, format negotiation, or a streaming subscription would
+        arrive as sibling messages in a later version, never as changes
+        to this one.
       </description>
     </request>
 
@@ -587,9 +672,52 @@
         Version 1 pixels are xrgb8888, row-major, origin top-left,
         little-endian, and stride equals width * 4 exactly - this pins the
         golden-frame tests and makes observation digests unambiguous (the
-        digest domain is the whole buffer). flags is always 0 in version 1;
-        the reserved bits make a later zero-copy dmabuf handoff this same
-        message with a flag, never a new signature.
+        digest domain is the whole buffer). The padding byte of every
+        pixel (byte 3 of each little-endian xrgb8888 pixel, the X channel)
+        is 0xFF exactly, so identical content yields identical buffer
+        bytes and digests stay deterministic. width and height are always
+        nonzero: a realm view that does not exist refuses no_surface
+        rather than delivering an empty frame.
+
+        Memfd contract (binding whenever the dmabuf flag is unset - in
+        version 1, always): the memfd's size is exactly stride * height
+        bytes, and the server MUST seal it with F_SEAL_SHRINK,
+        F_SEAL_GROW, F_SEAL_WRITE, and F_SEAL_SEAL before sending. The
+        write seal is the mechanical form of the always-a-copy rule: a
+        buffer still being rendered into cannot be write-sealed, so a
+        sealed fd is provably not a live buffer, the mapping cannot be
+        truncated or mutated under the reader, and the frame's bytes -
+        and digest - are immutable for the fd's lifetime. The receiver
+        SHOULD verify the size with fstat and SHOULD verify the seals
+        with F_GET_SEALS before mapping - the immutability above is
+        client-provable rather than taken on trust only when the seals
+        are actually checked. Pixels are addressed only through this
+        event's arguments, never inferred from the fd; row order follows
+        the y_invert flag (row r begins at byte offset r * stride while
+        it is unset - in version 1, always), and stride equals width
+        times the announced format's bytes per pixel (width * 4 for
+        xrgb8888, the only format captured in version 1). All contract
+        arithmetic is exact: the equalities hold in unbounded integers,
+        and a receiver MUST evaluate them without 32-bit wraparound
+        (widening to at least 64 bits) - a frame that satisfies them
+        only modulo 2^32 violates the contract.
+
+        A frame that violates this contract - a memfd whose size is not
+        stride * height, a missing seal, a zero dimension, a stride
+        inconsistent with the announced format's bytes per pixel (other
+        than width * 4 in version 1), or nonzero flags in version 1 - is
+        a server protocol violation, not a refusal: the client MUST
+        discard the frame and close the fd, MAY close the connection,
+        and MUST NOT attribute the failure to the grant. There is no
+        wire message for it - version 1 has no client-to-server error
+        channel by design, so a client's only sanction is disconnecting.
+
+        flags is always 0 in version 1; the reserved bits make a later
+        zero-copy dmabuf handoff this same message with a flag, never a
+        new signature. Flag bits are version-gated and there is no
+        ignore-unknown-bits rule on this event: the server sets a bit
+        only when the negotiated version defines its semantics, so under
+        version 1 any nonzero flags is the contract violation above.
       </description>
       <arg name="fd" type="fd" summary="fresh memfd holding the frame; ownership transfers to the receiver"/>
       <arg name="format" type="uint" enum="format" summary="pixel format (DRM fourcc value)"/>
@@ -603,14 +731,43 @@
       <description summary="pixel formats (DRM fourcc values)">
         Values are DRM fourcc codes so the enum never diverges from the
         kernel's format namespace when dmabuf arrives. Shared by
-        vitrin_shim_surface.attach.
+        vitrin_shim_surface.attach. Version-1 capture always announces
+        xrgb8888; argb8888 exists for the shim attach path, whose apps
+        commit ARGB buffers. New formats append as new entries with
+        immutable values, so widening either path is never a signature
+        change.
       </description>
       <entry name="xrgb8888" value="0x34325258" summary="32-bit xRGB, DRM_FORMAT_XRGB8888"/>
       <entry name="argb8888" value="0x34325241" summary="32-bit ARGB, DRM_FORMAT_ARGB8888"/>
     </enum>
 
     <enum name="frame_flags" bitfield="true">
-      <description summary="frame flags (reserved in version 1)"/>
+      <description summary="frame flags (reserved in version 1)">
+        Delivery variations of frame_ready, defined in version 1 but
+        never set by it: the reserved bits are the seam that keeps later
+        capture modes on this same message. When y_invert is set, rows
+        are bottom-up - row r of the image begins at byte offset
+        (height - 1 - r) * stride; GPU readback is naturally bottom-up,
+        and the bit lets a later version hand a frame over without a
+        flip pass instead of mandating one forever. When dmabuf is set,
+        the fd is a single-plane dmabuf with the linear modifier implied
+        - mirroring vitrin_shim_surface.attach, there is deliberately no
+        modifier argument to fail to honor. The memfd seal contract does
+        not apply (dmabufs cannot be sealed); in its place, the dmabuf's
+        size - as reported by lseek(fd, 0, SEEK_END) - MUST be at least
+        stride * height bytes (allocators round up, so exactness cannot
+        hold), the receiver SHOULD verify that bound before mapping or
+        importing, and a shorter dmabuf is a contract violation handled
+        exactly like a memfd one. The frame is still a capture copy,
+        never the live composite - always-a-copy is the capture model,
+        not the transport - but on this path immutability is a server
+        obligation rather than a client-provable property: the server
+        MUST complete all writes to the buffer before sending and MUST
+        NOT write to it afterwards; a client that needs provably
+        immutable bytes (deterministic digests) uses the sealed-memfd
+        path. The bits compose, and future bits append as new entries
+        with immutable values.
+      </description>
       <entry name="y_invert" value="1" summary="rows are bottom-up (reserved; never set in version 1)"/>
       <entry name="dmabuf" value="2" summary="fd is a dmabuf, not a memfd (reserved; never set in version 1)"/>
     </enum>

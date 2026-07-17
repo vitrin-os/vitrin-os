@@ -11,4 +11,9 @@ channel = "1.94.1"
 # to it), so it must be installed with the toolchain wherever rustup
 # auto-installs this pin -- a minimal-profile install (e.g. a CI runner)
 # would otherwise leave `cargo xtask codegen` broken.
-components = ["rustfmt"]
+#
+# clippy is pinned for the same reproducibility reason: CI gates on
+# `cargo clippy -- -D warnings` (P1.9.1), and clippy's lint set grows with
+# every release, so a floating clippy would fail PRs on lints the pinned
+# toolchain has never seen (and vice versa between contributors and CI).
+components = ["rustfmt", "clippy"]

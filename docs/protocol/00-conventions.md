@@ -297,13 +297,13 @@ the only error enum, so all fatal codes are connection-global):
 | Code | Value | Condition |
 |---|---|---|
 | `invalid_object` | 0 | unknown or foreign object id, id reuse at or below the watermark, reserved-range id, or a multi-`new_id` rule violation |
-| `invalid_opcode` | 1 | opcode not defined for the interface at the negotiated version, **including other-class opcodes and a second `hello`** (`hello`'s opcode is defined only in the initial connection state) |
+| `invalid_opcode` | 1 | opcode not defined for the interface at the negotiated version, **including other-class opcodes and a second `hello`** (`hello`'s opcode is defined only in the CONNECTED state) |
 | `invalid_argument` | 2 | argument decode failure: bad UTF-8, embedded NUL, string over its bound, out-of-range enum value, forbidden control character, zero verbs in a petition, malformed padding |
 | `oversized` | 3 | declared frame `size` below the 8-byte minimum, or a payload shorter than the size declares (the 65535-byte ceiling binds senders — a u16 cannot express more) |
 | `fd_violation` | 4 | header `fd_count` disagrees with the signature, or unsolicited fds attached |
 | `pre_handshake` | 5 | traffic before a first `hello` on a principal connection |
-| `version_unsupported` | 6 | `hello` carried a protocol version the server does not implement; downgrade is refusal, not negotiation |
-| `auth_failed` | 7 | credential rejected: unknown identity, bad token, verifier failure, or `SO_PEERCRED` mismatch |
+| `version_unsupported` | 6 | `hello` offered a protocol version the server does not implement — i.e. above its maximum, since additive growth means a server implements every version up to its maximum; downgrade is refusal, not negotiation |
+| `auth_failed` | 7 | credential rejected: unknown identity, bad token, verifier failure, or `SO_PEERCRED` mismatch — never distinguished on the wire (uniform code, fixed message text, detail in the server log only, §7.1) |
 | `internal` | 8 | server-side failure that poisoned the connection |
 | `resource_exhausted` | 9 | a documented per-connection resource bound was breached: the petition-rate ceiling, the live-object cap, or object-id exhaustion — denial-of-service confinement, not a semantic judgement |
 
@@ -457,6 +457,8 @@ against an unrelated pending prompt.
                  ---> error(pre_handshake) --> close   [best-effort if framed]
                  (unparseable garbage)
                  ---> close silently (logged)
+                 (no complete hello within the unauthenticated deadline)
+                 ---> close administratively (logged; no error event)
 
    [CONNECTED] --hello--> [VERIFYING] --verify ok--> bound --> [BOUND]
                               |                                    |
@@ -472,14 +474,37 @@ against an unrelated pending prompt.
   logged.
 - After `hello` the client **MAY pipeline** further requests; the server
   **queues them during credential verification** and processes them only after
-  `vitrin_principal.bound` is sent. If verification fails, the connection dies
-  (`auth_failed` or `version_unsupported`) and the **queued requests are never
-  processed**.
+  `vitrin_principal.bound` is sent — queued and then served, never dropped,
+  when verification succeeds. The queue rule scopes to requests **outside the
+  handshake exchange itself**: in version 1 the exchange is `hello` alone, and
+  a later version's proof-of-possession response request (Appendix A) is part
+  of the exchange, processed inside VERIFYING. If verification fails, the
+  connection dies (`auth_failed` or `version_unsupported`) and the **queued
+  requests are never processed**.
 - `bound` carries the **verifier-canonical** identity, not an echo of the
   client's claimed string.
 - `hello` is legal **exactly once** per connection: its opcode is defined only
-  in the initial state, so a second `hello` — in VERIFYING or BOUND — is fatal
+  in CONNECTED, so a second `hello` — in VERIFYING or BOUND — is fatal
   `invalid_opcode`.
+- **Checks run in a fixed order**: frame grammar, then the version integer,
+  then — only for a version-accepted `hello` — credential verification.
+  `version_unsupported` therefore reveals nothing about the credential or the
+  claimed identity.
+- **A refused handshake is uniform on the wire** (identity-probing
+  resistance): every credential-rejection cause — unknown identity, bad
+  token, verifier failure, `SO_PEERCRED` mismatch — collapses to the single
+  code `auth_failed`, and its `error.message` MUST be a fixed phrase that
+  neither names the cause nor echoes the claimed identity. Cause and claimed
+  identity go to the server log only; verification SHOULD take uniform time
+  across rejection causes.
+- **The unauthenticated phase is time-bounded**: the server SHOULD impose a
+  deployment-configurable deadline on every unauthenticated interval spent
+  waiting on the client; a connection that exhausts it is closed
+  administratively — no error event, reason logged. In version 1 that interval
+  is exactly CONNECTED (after a complete `hello`, remaining VERIFYING latency
+  is the server's own); a later version's proof-of-possession exchange keeps
+  the deadline armed inside VERIFYING while the server awaits the client's
+  response (Appendix A). A BOUND connection may idle indefinitely.
 - The `credential` is secret material: the server MUST NOT write credential
   bytes into logs, `error.message` text, or the flight recorder — at most
   `credential_type` and the byte length may be recorded.
@@ -496,9 +521,23 @@ shims are release-paired, so there is no shim version negotiation.
 ### 7.3 Version semantics
 
 The protocol version is a **single integer**: the `version` attribute of the
-protocol document *and* the first argument of `hello`. Version 0 (integer `1`)
-requires an **exact match**; a mismatch is fatal `version_unsupported`
-(downgrade is refusal, not negotiation).
+protocol document *and* the first argument of `hello`. The version named in
+`hello` is the **negotiated version**: the connection speaks exactly that
+version for its whole life, and messages introduced by a later `since` are not
+defined on it (using one is fatal `invalid_opcode`).
+
+A server accepts any offered version it **implements** and refuses the rest
+with fatal `version_unsupported`. Because growth is strictly additive, a
+server whose maximum version is N implements every version from 1 to N —
+serving an older version means never emitting later-`since` events and
+rejecting later-`since` opcodes — so refusal means exactly that the client
+offered a version **above the server's maximum**. Downgrade is refusal, not
+negotiation: the server never counters with a different version and the
+refusal carries no supported-version hint (`error.message` is never
+machine-parsed); a newer client willing to speak an older version reconnects
+offering a lower integer — convergence by descending reoffer, bounded by the
+client's own maximum. In version 0 (wire integer `1`) exactly one version
+exists, so acceptance degenerates to an exact match.
 
 ### 7.4 Growth rules (Wayland-style)
 
@@ -591,8 +630,10 @@ documented seams so the wire never changes shape when they arrive.
 | focus event | new `since="2"` tagged event on `vitrin_shim_seat` | version 0 synthesizes focus shim-side (single-surface); the new event still ends with `origin`, satisfying B2 structurally |
 | keymap relay + keycode event | new `since="2"` `keymap(fd, size, origin)` + keycode event on `vitrin_shim_seat` | keysym `key` events stay valid; raw-scancode fidelity is added alongside, one fd per message (one-fd rule holds) |
 | `hello_fd` credential sibling | new `since="2"` fd-borne request on `vitrin_handshake` | `hello`'s signature is frozen forever; oversized credentials arrive via a sibling carrying one fd, so the 32768-byte in-frame bound is never a wall |
+| proof-of-possession credential exchange | new `since="2"` challenge event + response request on `vitrin_handshake` | version-0 schemes are bearer-shaped (presented whole in `hello`); a `credential_type` demanding proof of possession (e.g. X.509-SVID) adds a server-driven exchange inside VERIFYING as appended messages — the exchange is part of the handshake itself, so the response request is exempt from the queued-until-BOUND rule (which scopes to non-handshake requests, §7.1) and the unauthenticated deadline stays armed while the server awaits the response; `hello` and `bound` stay frozen, and version-1 connections and bearer schemes never see the new messages |
 | dmabuf params builder | new `since="2"` builder on `vitrin_shim_surface`, one fd per add | `attach` stays single-plane linear (no modifier argument to fail to honor); explicit modifiers / multi-planar formats accumulate fds across messages, preserving the one-fd rule |
 | `frame_ready` `flags` bits | reserved bits in the existing `frame_flags` bitfield | a later zero-copy dmabuf handoff sets a flag on the *same* `frame_ready` message; `flags` is always 0 in version 0, so setting a bit is additive |
+| capture streaming | new `since="2"` sibling messages on `vitrin_view` (a subscription request and its frame-push event, appended after the poll pair) | `capture_frame`/`frame_ready` stay valid forever; refusals still voice through `vitrin_grant.refused`, and each pushed frame carries one fd, so the one-fd rule holds |
 | realm enumeration events | new `since="2"` events on `vitrin_realm` | `vitrin_realm` is authority-free and carries no version-0 events; multi-realm phases add enumeration/lifecycle here instead of re-plumbing addressing |
 | drag intents | new `since="2"` sibling requests on `vitrin_actuator_pointer` | intent-level motion (drag with duration/easing, interpolated server-side) is added beside `move`/`button`/`scroll`, which stay valid forever |
 | `actuate_key` verb | new appended entry in the `verb` bitfield + a later key-actuation facet | version-0 verb bits are untouched; a new power-of-two bit and its facet are additive |
@@ -607,6 +648,9 @@ named here so their absence is understood as a decision, not an omission:
 
 - **Semantic trees** — no accessibility/DOM-like node graph; observation is
   pixels only (`node:` resource prefixes are reserved but unserved).
+- **Streaming capture** — observation is poll-only: one `capture_frame`, one
+  frame. A push/subscription model is a later version's sibling messages on
+  `vitrin_view` (see Appendix A), never a change to the poll pair.
 - **Epochs** — no compare-and-swap staleness detection; out-of-view coordinates
   are clamped, and stale-observation detection is a later phase's epoch
   mechanism.

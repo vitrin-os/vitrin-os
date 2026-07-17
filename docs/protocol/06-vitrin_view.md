@@ -85,10 +85,11 @@ The agent learns the view's dimensions from `width` and `height` on this event; 
 Binding whenever the `dmabuf` flag is unset — in version 1, always:
 
 - **Size.** The memfd's size (`st_size`) is **exactly `stride * height` bytes**. The whole file is the frame; the whole file is the digest domain.
-- **Seals.** The server **MUST** seal the memfd with `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL` before sending. The write seal is the mechanical form of the always-a-copy rule: a buffer still being rendered into cannot be write-sealed, so a sealed fd is *provably* not a live buffer, the mapping cannot be truncated or mutated under the reader, and the frame's bytes — and digest — are immutable for the fd's lifetime.
-- **Addressing.** Row *r* of the image begins at byte offset `r * stride`. Pixels are addressed only through this event's arguments (`width`, `height`, `stride`, `format`), never inferred from the fd. The receiver **SHOULD** verify the size with `fstat` and **MAY** verify the seals (`F_GET_SEALS`) before mapping.
+- **Seals.** The server **MUST** seal the memfd with `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL` before sending. The write seal is the mechanical form of the always-a-copy rule: a buffer still being rendered into cannot be write-sealed, so a sealed fd is *provably* not a live buffer, the mapping cannot be truncated or mutated under the reader, and the frame's bytes — and digest — are immutable for the fd's lifetime. The receiver **SHOULD** verify the size with `fstat` and **SHOULD** verify the seals (`F_GET_SEALS`) before mapping — the immutability above is client-provable rather than taken on trust only when the seals are actually checked.
+- **Addressing.** Pixels are addressed only through this event's arguments (`width`, `height`, `stride`, `format`), never inferred from the fd. Row order follows the [`y_invert`](#frame_flags) flag: row *r* of the image begins at byte offset `r * stride` while it is unset — in version 1, always. `stride` equals `width` times the announced format's bytes per pixel — `width * 4` for `xrgb8888`, the only format captured in version 1.
+- **Arithmetic.** All contract arithmetic is exact: the equalities hold in unbounded integers, and a receiver **MUST** evaluate them without 32-bit wraparound (widening to at least 64 bits). A frame that satisfies them only modulo 2³² violates the contract.
 
-**Contract violations.** A frame that violates this contract — a memfd whose size is not `stride * height`, a missing seal, a zero dimension, a stride other than `width * 4`, or nonzero `flags` in version 1 — is a **server protocol violation, not a refusal**: the client MUST discard the frame and close the fd, MAY close the connection, and MUST NOT attribute the failure to the grant (an SDK surfaces it as a client-side protocol error, never as a typed refusal exception). There is no wire message for it — version 1 has no client-to-server error channel by design, so a client's only sanction is disconnecting. A correct server never produces such a frame.
+**Contract violations.** A frame that violates this contract — a memfd whose size is not `stride * height`, a missing seal, a zero dimension, a stride inconsistent with the announced format's bytes per pixel (other than `width * 4` in version 1), or nonzero `flags` in version 1 — is a **server protocol violation, not a refusal**: the client MUST discard the frame and close the fd, MAY close the connection, and MUST NOT attribute the failure to the grant (an SDK surfaces it as a client-side protocol error, never as a typed refusal exception). There is no wire message for it — version 1 has no client-to-server error channel by design, so a client's only sanction is disconnecting. A correct server never produces such a frame.
 
 #### Flags
 
@@ -119,7 +120,7 @@ Delivery variations of `frame_ready`. Bitfield (entries are powers of two), defi
 Exact semantics, pinned now so the later handoff needs no re-litigation:
 
 - **`y_invert`** — when set, rows are bottom-up: row *r* of the image begins at byte offset `(height - 1 - r) * stride`. GPU readback is naturally bottom-up; the bit lets a later version hand a frame over without a flip pass instead of mandating one forever.
-- **`dmabuf`** — when set, the `fd` is a **single-plane dmabuf with the linear modifier implied** — mirroring [`vitrin_shim_surface.attach`](10-vitrin_shim_surface.md), there is deliberately no modifier argument to fail to honor — and the memfd size-and-seal contract does not apply (seals are memfd-specific). The frame is still a capture **copy**, never the live composite: always-a-copy is the capture model, not the transport.
+- **`dmabuf`** — when set, the `fd` is a **single-plane dmabuf with the linear modifier implied** — mirroring [`vitrin_shim_surface.attach`](10-vitrin_shim_surface.md), there is deliberately no modifier argument to fail to honor. The memfd seal contract does not apply (dmabufs cannot be sealed); in its place, the dmabuf's size — as reported by `lseek(fd, 0, SEEK_END)` — **MUST** be at least `stride * height` bytes (allocators round up, so exactness cannot hold), the receiver **SHOULD** verify that bound before mapping or importing, and a shorter dmabuf is a contract violation handled exactly like a memfd one. The frame is still a capture **copy**, never the live composite — always-a-copy is the capture model, not the transport — but on this path immutability is a **server obligation** rather than a client-provable property: the server MUST complete all writes to the buffer before sending and MUST NOT write to it afterwards; a client that needs provably immutable bytes (deterministic digests) uses the sealed-memfd path.
 
 The bits compose (a later version may deliver a y-inverted dmabuf). Future bits append as new entries with immutable values.
 
@@ -133,7 +134,8 @@ def capture(view):                       # blocking, no threads
     while True:
         ev = read_event()                # single ordered stream (conventions section 4)
         if ev is frame_ready on view:    # the paired terminal
-            size = ev.stride * ev.height # == fstat(ev.fd).st_size, verified
+            size = ev.stride * ev.height # exact (64-bit) arithmetic; == fstat(ev.fd).st_size, verified
+            check_seals(ev.fd)           # F_GET_SEALS has all four -> provably immutable
             buf = mmap(ev.fd, size, PROT_READ)   # sealed: cannot change underneath
             frame = Frame(buf, ev.width, ev.height, ev.stride, ev.format)
             close(ev.fd)                 # ownership is the receiver's

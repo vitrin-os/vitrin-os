@@ -13,6 +13,11 @@
 # which would pin the shim to an API the project did not choose and shadow
 # the vendored subproject.
 #
+# The last line adds the shim's headless-acceptance tooling (not wlroots build
+# deps): wayland-info (wayland-utils) checks the advertised globals and
+# weston-terminal (weston) is the blind client; fonts-dejavu-core lets
+# weston-terminal render glyphs in the bare container.
+#
 # Invariant checked by CI after this script runs: nothing here may pull
 # rustc/cargo onto PATH (the shim job's no-Rust acceptance criterion).
 set -euo pipefail
@@ -24,4 +29,5 @@ apt-get install -y -qq \
   libwayland-dev wayland-protocols \
   libpixman-1-dev libxkbcommon-dev \
   libdrm-dev libgbm-dev libinput-dev libudev-dev libseat-dev \
-  libdisplay-info-dev libliftoff-dev hwdata
+  libdisplay-info-dev libliftoff-dev hwdata \
+  weston wayland-utils fonts-dejavu-core

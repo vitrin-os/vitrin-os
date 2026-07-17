@@ -98,22 +98,30 @@ fn invalid_bitfield_value_is_rejected() {
 #[test]
 fn invalid_utf8_is_rejected_through_a_generated_message() {
     // get_realm's `name`: a 2-byte string that is not valid UTF-8.
-    let bytes = craft_frame(gen::vitrin_principal::requests::GetRealm::OPCODE, 0, |out| {
-        vitrin_protocol::wire::write_uint(out, 2); // realm new_id
-        vitrin_protocol::wire::write_uint(out, 2); // string length
-        out.extend_from_slice(&[0xff, 0xfe, 0, 0]); // bad UTF-8 + padding
-    });
+    let bytes = craft_frame(
+        gen::vitrin_principal::requests::GetRealm::OPCODE,
+        0,
+        |out| {
+            vitrin_protocol::wire::write_uint(out, 2); // realm new_id
+            vitrin_protocol::wire::write_uint(out, 2); // string length
+            out.extend_from_slice(&[0xff, 0xfe, 0, 0]); // bad UTF-8 + padding
+        },
+    );
     let err = gen::vitrin_principal::requests::GetRealm::decode(&bytes, None).unwrap_err();
     assert_eq!(err, DecodeError::InvalidUtf8);
 }
 
 #[test]
 fn embedded_nul_is_rejected_through_a_generated_message() {
-    let bytes = craft_frame(gen::vitrin_principal::requests::GetRealm::OPCODE, 0, |out| {
-        vitrin_protocol::wire::write_uint(out, 2); // realm new_id
-        vitrin_protocol::wire::write_uint(out, 3); // string length
-        out.extend_from_slice(b"a\0b\0"); // embedded NUL + 1 padding byte
-    });
+    let bytes = craft_frame(
+        gen::vitrin_principal::requests::GetRealm::OPCODE,
+        0,
+        |out| {
+            vitrin_protocol::wire::write_uint(out, 2); // realm new_id
+            vitrin_protocol::wire::write_uint(out, 3); // string length
+            out.extend_from_slice(b"a\0b\0"); // embedded NUL + 1 padding byte
+        },
+    );
     let err = gen::vitrin_principal::requests::GetRealm::decode(&bytes, None).unwrap_err();
     assert_eq!(err, DecodeError::EmbeddedNul);
 }
@@ -123,11 +131,15 @@ fn malformed_padding_is_rejected_through_a_generated_message() {
     // A 1-byte string needs 3 padding bytes; conventions 2.2 makes a nonzero
     // one fatal invalid_argument, and accepting it would break the canonical
     // one-value-one-encoding property.
-    let bytes = craft_frame(gen::vitrin_principal::requests::GetRealm::OPCODE, 0, |out| {
-        vitrin_protocol::wire::write_uint(out, 2); // realm new_id
-        vitrin_protocol::wire::write_uint(out, 1); // string length
-        out.extend_from_slice(&[b'a', 0xff, 0, 0]); // nonzero padding byte
-    });
+    let bytes = craft_frame(
+        gen::vitrin_principal::requests::GetRealm::OPCODE,
+        0,
+        |out| {
+            vitrin_protocol::wire::write_uint(out, 2); // realm new_id
+            vitrin_protocol::wire::write_uint(out, 1); // string length
+            out.extend_from_slice(&[b'a', 0xff, 0, 0]); // nonzero padding byte
+        },
+    );
     let err = gen::vitrin_principal::requests::GetRealm::decode(&bytes, None).unwrap_err();
     assert_eq!(err, DecodeError::MalformedPadding);
 }
@@ -393,5 +405,8 @@ fn decode_error_bridges_to_the_wire_error_enum() {
         .to_wire_error(),
         WireError::InvalidOpcode
     );
-    assert_eq!(DecodeError::NullObject.to_wire_error(), WireError::InvalidObject);
+    assert_eq!(
+        DecodeError::NullObject.to_wire_error(),
+        WireError::InvalidObject
+    );
 }

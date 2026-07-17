@@ -73,9 +73,7 @@ fn mod_file(protocol: &Protocol) -> String {
     buf.line("/// enumerating every message (e.g. the round-trip table) checks its own");
     buf.line("/// length against this, so a message added to the IDL cannot ship silently");
     buf.line("/// untested.");
-    buf.line(format!(
-        "pub const MESSAGE_COUNT: usize = {message_count};"
-    ));
+    buf.line(format!("pub const MESSAGE_COUNT: usize = {message_count};"));
     buf.blank();
     for iface in &protocol.interfaces {
         buf.line(format!("pub mod {};", iface.name));

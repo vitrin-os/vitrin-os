@@ -13,6 +13,12 @@
 # which would pin the shim to an API the project did not choose and shadow
 # the vendored subproject.
 #
+# libexpat1-dev + libxml2-dev are for wlroots's NESTED wayland subproject:
+# Ubuntu 24.04 ships wayland 1.22, below wlroots 0.19's >=1.23.1 floor, so the
+# vendored build compiles wayland from source, and its wayland-scanner needs
+# expat + libxml2 (DTD-validated protocol parsing). Drop them if the base image
+# ever ships wayland >= 1.23.1.
+#
 # The last line adds the shim's headless-acceptance tooling (not wlroots build
 # deps): wayland-info (wayland-utils) checks the advertised globals and
 # weston-terminal (weston) is the blind client; fonts-dejavu-core lets
@@ -30,4 +36,5 @@ apt-get install -y -qq \
   libpixman-1-dev libxkbcommon-dev \
   libdrm-dev libgbm-dev libinput-dev libudev-dev libseat-dev \
   libdisplay-info-dev libliftoff-dev hwdata \
+  libexpat1-dev libxml2-dev \
   weston wayland-utils fonts-dejavu-core

@@ -10,8 +10,9 @@ name: CI
 #                 checked-in generated header must suffice on its own. The
 #                 Meson build activates automatically once shim/meson.build
 #                 lands (P1.6.1).
-#   integration   vitrind --headless + scripted Python SDK tests, hard-capped
-#                 at 10 minutes. Dormant until tests/integration/run.sh lands
+#   integration   vitrind --headless + scripted Python SDK tests, suite
+#                 hard-capped at 10 minutes. Dormant until
+#                 tests/integration/run.sh lands
 #                 (needs P1.3.x headless + P1.8.x SDK); later hosts the M1.5
 #                 gates: demo job (P1.8.4), goldens (P1.9.2), hostile-client
 #                 tests (P1.9.3).
@@ -30,9 +31,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  # Superseded pushes to a PR cancel the in-flight run; pushes to main never
-  # cancel each other, so every main commit keeps a complete verdict.
+  # Superseded pushes to a PR cancel the in-flight run. Pushes to main are
+  # keyed per-sha instead of per-ref: GitHub keeps at most ONE pending run
+  # per concurrency group and cancels an older pending run when a newer one
+  # queues -- even with cancel-in-progress false -- so a ref-keyed group
+  # would silently drop the CI verdict for intermediate main commits. A
+  # per-sha group gives every main commit its own group and therefore a
+  # complete verdict.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -44,6 +50,10 @@ jobs:
   rust:
     name: rust (fmt, clippy, tests debug+release)
     runs-on: ubuntu-latest
+    # Explicit budget (the GitHub default is 360 minutes): a looping proptest
+    # regression or a wedged linker should fail in minutes, not hold the
+    # job -- and, on main, the concurrency queue -- for hours.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -84,6 +94,7 @@ jobs:
   codegen-diff:
     name: codegen-diff (IDL schema + regeneration honesty)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -126,6 +137,7 @@ jobs:
     # (Dockerfile in-repo, rebuilt when it changes) -- decision recorded in
     # P1.9.1, deferred until P1.6.1 fixes the version.
     container: ubuntu:24.04
+    timeout-minutes: 15
     steps:
       - name: Install C toolchain and git
         # git first, so the checkout step clones instead of falling back to
@@ -158,17 +170,38 @@ jobs:
 
       # ---- Meson build: activates the moment shim/meson.build lands ------
       # (P1.6.1 is in flight on a sibling branch; step-level hashFiles
-      # guards keep main green both before and after it merges. The landing
-      # PR runs these steps for real and adjusts the dependency list if its
-      # skeleton needs more.)
+      # guards keep main green both before and after it merges. The
+      # dependency list lives in shim/ci/install-deps.sh -- a file the
+      # landing PR owns and must adjust to its vendored wlroots subproject's
+      # exact build deps, per D11. See the header of that script.)
 
-      - name: Install Meson + wlroots build dependencies
+      - name: Guard against shim gate drift
+        # If shim sources land without shim/meson.build, the Meson steps
+        # below would skip silently and this job would stay green while
+        # never building the shim. Fail loudly instead.
+        run: |
+          if [ -d shim/src ] && [ ! -f shim/meson.build ]; then
+            echo "::error::shim/src exists but shim/meson.build does not -- the Meson CI steps are gated on shim/meson.build and would silently skip. Land meson.build with the sources (P1.6.1)."
+            exit 1
+          fi
+
+      - name: Install Meson + wlroots subproject build dependencies
+        if: hashFiles('shim/meson.build') != ''
+        run: bash shim/ci/install-deps.sh
+
+      - name: Re-assert no Rust toolchain after dependency install
+        # The first assert proves the header/golden steps ran Rust-free on
+        # the clean container; this one re-checks AFTER apt has installed
+        # the Meson dependency set, so a future package whose dependency
+        # chain drags in rustc/cargo cannot silently void the acceptance
+        # criterion for the steps that actually build the shim.
         if: hashFiles('shim/meson.build') != ''
         run: |
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            meson ninja-build pkg-config \
-            libwayland-dev wayland-protocols libwlroots-dev \
-            libpixman-1-dev libxkbcommon-dev
+          if command -v cargo >/dev/null 2>&1 || command -v rustc >/dev/null 2>&1; then
+            echo "::error::the Meson dependency install pulled a Rust toolchain onto PATH; the shim job must build from the checked-in header alone (fix shim/ci/install-deps.sh)"
+            exit 1
+          fi
+          echo "OK: still no cargo/rustc on PATH after dependency install"
 
       - name: Meson build + tests
         if: hashFiles('shim/meson.build') != ''
@@ -177,31 +210,62 @@ jobs:
           meson compile -C "${RUNNER_TEMP}/shim-build"
           meson test -C "${RUNNER_TEMP}/shim-build" --print-errorlogs
 
-      - name: Meson build dormant
+      - name: Meson build DORMANT
         if: hashFiles('shim/meson.build') == ''
-        run: echo "shim/meson.build not landed yet (P1.6.1) -- Meson steps skipped."
+        run: |
+          echo "::notice title=shim Meson steps dormant::shim/meson.build has not landed yet (P1.6.1) -- the Meson install/build/test steps were skipped, not passed."
+          {
+            echo "## shim job: Meson steps DORMANT"
+            echo ""
+            echo "\`shim/meson.build\` has not landed yet (P1.6.1). Only the header-compile,"
+            echo "golden-frame, and no-Rust checks ran. The Meson build/test steps activate"
+            echo "automatically when \`shim/meson.build\` lands; the landing PR owns"
+            echo "\`shim/ci/install-deps.sh\` (see its header, decision D11)."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   integration:
     name: integration (vitrind --headless + SDK tests)
     runs-on: ubuntu-latest
-    # Acceptance criterion from P1.9.1, enforced structurally from day one:
-    # the integration job completes in < 10 minutes or fails.
-    timeout-minutes: 10
+    # The P1.9.1 "< 10 minutes" acceptance criterion is enforced on the
+    # suite step below (timeout-minutes: 10). The job-level cap is wider
+    # for one reason only: the first activated run builds the workspace
+    # cold (Swatinem/rust-cache has nothing saved while the steps are
+    # dormant, and by default it only saves on job success), so a 10-minute
+    # job cap would time out the cold build, skip the cache save, and leave
+    # every retry equally cold -- the activating PR could never go green.
+    # The warm-build step plus cache-on-failure below give that first run a
+    # warm-up path; steady-state (warm cache) the job lands well under 10.
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # ---- Headless integration suite: activates the moment
       # tests/integration/run.sh lands. ---------------------------------
-      # Entry-point contract: tests/integration/run.sh (bash, exit 0 =
-      # pass) builds what it needs via cargo, spawns `vitrind --headless`,
-      # and drives it with the scripted Python SDK tests (runner python3 is
-      # 3.12, satisfying the SDK's >=3.11 floor, D8). The guard is the test
-      # entry point itself -- NOT crates/vitrin-core -- because the vitrind
-      # skeleton (P1.2.x, in flight on a sibling branch) predates --headless
-      # and the SDK, and must not activate this job. The PR that lands the
-      # first integration test owns updating this contract if its shape
-      # differs.
+      # Entry-point contract (normative copy: tests/integration/README.md,
+      # which the landing PR edits in-place and therefore cannot miss):
+      # tests/integration/run.sh (bash, exit 0 = pass) spawns
+      # `vitrind --headless` and drives it with the scripted Python SDK
+      # tests (runner python3 is 3.12, satisfying the SDK's >=3.11 floor,
+      # D8). The guard is the test entry point itself -- NOT
+      # crates/vitrin-core -- because the vitrind skeleton (P1.2.x, in
+      # flight on a sibling branch) predates --headless and the SDK, and
+      # must not activate this job.
+
+      - name: Guard against integration gate drift
+        # If integration tests land under any entry point other than
+        # tests/integration/run.sh (e.g. bare pytest), every later step
+        # would skip silently and this job would stay green while running
+        # nothing. Fail loudly instead.
+        run: |
+          if [ -d tests/integration ] && [ ! -f tests/integration/run.sh ]; then
+            extra=$(find tests/integration -type f ! -name 'README.md' | head -5)
+            if [ -n "$extra" ]; then
+              echo "::error::tests/integration/ contains files but no run.sh -- this job's steps are gated on tests/integration/run.sh and would silently skip. See tests/integration/README.md for the entry-point contract."
+              echo "$extra"
+              exit 1
+            fi
+          fi
 
       - name: Install Rust (pinned toolchain + components from rust-toolchain.toml)
         if: hashFiles('tests/integration/run.sh') != ''
@@ -210,11 +274,37 @@ jobs:
       - name: Cache cargo
         if: hashFiles('tests/integration/run.sh') != ''
         uses: Swatinem/rust-cache@v2
+        with:
+          # The default saves only on job success: a first activated run
+          # whose suite step fails (or overruns its 10-minute cap) would
+          # save nothing and stay cold forever. cache-on-failure banks the
+          # warm build below even across a red first run.
+          cache-on-failure: true
+
+      - name: Warm build (workspace)
+        # Separates compile time from the suite's 10-minute budget: vitrind
+        # is a workspace crate (crates/vitrin-core per the plan layout), so
+        # this builds -- and, via the cache step above, banks -- the heavy
+        # dependency tree before the timed suite step runs.
+        if: hashFiles('tests/integration/run.sh') != ''
+        run: cargo build --workspace
 
       - name: Run headless integration suite
         if: hashFiles('tests/integration/run.sh') != ''
+        # The P1.9.1 acceptance criterion, machine-enforced: the suite
+        # completes in < 10 minutes or this step fails.
+        timeout-minutes: 10
         run: bash tests/integration/run.sh
 
-      - name: Integration suite dormant
+      - name: Integration suite DORMANT
         if: hashFiles('tests/integration/run.sh') == ''
-        run: echo "tests/integration/run.sh not landed yet (needs P1.3.x headless + P1.8.x SDK) -- integration steps skipped."
+        run: |
+          echo "::notice title=integration job dormant::tests/integration/run.sh has not landed yet (needs P1.3.x headless + P1.8.x SDK) -- the integration steps were skipped, not passed. This green check is vacuous until then."
+          {
+            echo "## integration job: DORMANT"
+            echo ""
+            echo "\`tests/integration/run.sh\` has not landed yet (needs P1.3.x headless +"
+            echo "P1.8.x SDK), so no integration test ran -- this job's green check is"
+            echo "vacuous for now. Do not add it to branch protection until it activates."
+            echo "Entry-point contract: \`tests/integration/README.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"

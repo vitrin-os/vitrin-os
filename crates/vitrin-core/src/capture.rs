@@ -185,13 +185,33 @@ impl<G: CaptureGate> CaptureService<G> {
         // Today this arm is the degenerate-view backstop; when the realm's
         // surface can genuinely vanish (shim crash, P1.5+) that condition
         // lands here too.
-        let expected_len = view.width as usize * view.height as usize * BYTES_PER_PIXEL;
-        if view.width == 0 || view.height == 0 || view.rgba.len() != expected_len {
+        if view.width == 0 || view.height == 0 {
             return refuse(
                 conn,
                 ids.grant_id,
                 CaptureRefusal {
                     code: Refusal::NoSurface,
+                    retry_after_ms: 0,
+                },
+            );
+        }
+
+        // A nonzero-dimension view whose readback buffer is mis-sized is a
+        // server-side invariant break (a corrupted readback, not a dead
+        // realm): the IDL's `internal` refusal, never `no_surface` — an
+        // agent must not conclude the shim crashed from a readback bug.
+        let expected_len = view.width as usize * view.height as usize * BYTES_PER_PIXEL;
+        if view.rgba.len() != expected_len {
+            tracing::warn!(
+                got = view.rgba.len(),
+                expected = expected_len,
+                "capture readback length mismatch, refusing internal"
+            );
+            return refuse(
+                conn,
+                ids.grant_id,
+                CaptureRefusal {
+                    code: Refusal::Internal,
                     retry_after_ms: 0,
                 },
             );
@@ -239,19 +259,34 @@ impl<G: CaptureGate> CaptureService<G> {
 /// Voice a refusal as the capture's terminal:
 /// `vitrin_grant.refused(observe, code, retry_after_ms)` on the grant
 /// handle.
+///
+/// This is the single site where every capture refusal is encoded, so it
+/// enforces the IDL invariant "retry_after_ms is nonzero only for
+/// rate_limited" unconditionally: a faulty [`CaptureGate`] cannot put an
+/// IDL-violating refusal on the wire — the field is zeroed (with a
+/// warning) for every other code, in release builds too.
 fn refuse(
     conn: &mut Connection,
     grant_id: u32,
     refusal: CaptureRefusal,
 ) -> Result<CaptureOutcome, TransportError> {
-    debug_assert!(
-        refusal.code == Refusal::RateLimited || refusal.retry_after_ms == 0,
-        "retry_after_ms is nonzero only for rate_limited (IDL vitrin_grant.refused)"
-    );
+    let retry_after_ms = if refusal.code == Refusal::RateLimited {
+        refusal.retry_after_ms
+    } else {
+        if refusal.retry_after_ms != 0 {
+            tracing::warn!(
+                code = ?refusal.code,
+                retry_after_ms = refusal.retry_after_ms,
+                "gate emitted nonzero retry_after_ms on a non-rate_limited \
+                 refusal; zeroing it (IDL vitrin_grant.refused invariant)"
+            );
+        }
+        0
+    };
     let event = vitrin_grant::events::Refused {
         verb: Verb::OBSERVE,
         code: refusal.code,
-        retry_after_ms: refusal.retry_after_ms,
+        retry_after_ms,
     };
     conn.send_or_queue(&event.encode(grant_id), None)?;
     Ok(CaptureOutcome::Refused(refusal.code))
@@ -588,6 +623,75 @@ pub(crate) mod tests {
             vitrin_grant::events::Refused::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, GRANT_ID);
         assert_eq!(refused.code, Refusal::NoSurface);
+        assert_eq!(refused.retry_after_ms, 0);
+    }
+
+    /// The wire invariant "retry_after_ms nonzero only for rate_limited"
+    /// holds even against a faulty gate: `refuse()` — the single site
+    /// encoding every capture refusal — zeroes the field for any other
+    /// code instead of trusting the gate's output.
+    #[test]
+    fn faulty_gate_retry_hint_is_zeroed_on_non_rate_limited() {
+        let _fd = fd_lock();
+        let (mut server, mut client) = Connection::pair().unwrap();
+        let rgba = test_pattern::render(16, 16);
+
+        let mut service = CaptureService::new(RefuseAll(CaptureRefusal {
+            code: Refusal::Preempted,
+            retry_after_ms: 999,
+        }));
+        let outcome = service
+            .serve(
+                RealmViewFrame {
+                    rgba: &rgba,
+                    width: 16,
+                    height: 16,
+                },
+                IDS,
+                &mut server,
+            )
+            .unwrap();
+        assert_eq!(outcome, CaptureOutcome::Refused(Refusal::Preempted));
+
+        let msg = client.recv_message().unwrap().unwrap();
+        let (object_id, refused) =
+            vitrin_grant::events::Refused::decode(&msg.bytes, msg.fd).unwrap();
+        assert_eq!(object_id, GRANT_ID);
+        assert_eq!(refused.code, Refusal::Preempted);
+        assert_eq!(
+            refused.retry_after_ms, 0,
+            "retry_after_ms must be zeroed on the wire for non-rate_limited"
+        );
+    }
+
+    /// A nonzero-dimension view with a mis-sized readback buffer is a
+    /// server-side invariant break: it refuses `internal`, never
+    /// `no_surface` — a readback bug must not masquerade as a dead realm.
+    #[test]
+    fn mis_sized_readback_refuses_internal_not_no_surface() {
+        let _fd = fd_lock();
+        let (mut server, mut client) = Connection::pair().unwrap();
+        let rgba = test_pattern::render(16, 16);
+        let mut service = CaptureService::new(AutoApprove);
+        let outcome = service
+            .serve(
+                RealmViewFrame {
+                    rgba: &rgba,
+                    width: 32, // claims more pixels than the buffer holds
+                    height: 32,
+                },
+                IDS,
+                &mut server,
+            )
+            .unwrap();
+        assert_eq!(outcome, CaptureOutcome::Refused(Refusal::Internal));
+
+        let msg = client.recv_message().unwrap().unwrap();
+        assert!(msg.fd.is_none(), "a refusal carries no fd");
+        let (object_id, refused) =
+            vitrin_grant::events::Refused::decode(&msg.bytes, msg.fd).unwrap();
+        assert_eq!(object_id, GRANT_ID);
+        assert_eq!(refused.code, Refusal::Internal);
         assert_eq!(refused.retry_after_ms, 0);
     }
 

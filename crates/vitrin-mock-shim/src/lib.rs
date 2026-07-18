@@ -34,9 +34,13 @@ use std::os::fd::{AsFd, OwnedFd};
 use rustix::fs::MemfdFlags;
 use vitrin_ipc::{Connection, TransportError};
 use vitrin_protocol::error::DecodeError;
+use vitrin_protocol::generated::vitrin_actuator_pointer::{Axis, ButtonState};
+use vitrin_protocol::generated::vitrin_shim_seat as shim_seat;
+use vitrin_protocol::generated::vitrin_shim_seat::{KeyState, Origin};
 use vitrin_protocol::generated::vitrin_shim_session as session;
 use vitrin_protocol::generated::vitrin_shim_surface as shim_surface;
 use vitrin_protocol::generated::vitrin_view::Format;
+use vitrin_protocol::Fixed;
 
 /// The shim-session bootstrap object: implicit object 1 on a shim connection
 /// (conventions section 3).
@@ -106,6 +110,37 @@ pub enum SurfaceEvent {
         buffer_id: u32,
         status: shim_surface::BufferStatus,
     },
+}
+
+/// One decoded core-to-shim event on the seat object (`vitrin_shim_seat`).
+/// Every variant carries the wire's `origin` tag — per-event, final
+/// argument, per backward requirement B2 — so core-side tests assert tag
+/// preservation on real wire bytes, exactly what the C shim (P1.6.3) will
+/// decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeatEvent {
+    /// `motion` — pointer moved, realm-view coordinates (24.8 fixed).
+    Motion { x: Fixed, y: Fixed, origin: Origin },
+    /// `button` — pointer button, Linux evdev code.
+    Button {
+        button: u32,
+        state: ButtonState,
+        origin: Origin,
+    },
+    /// `scroll` — high-resolution scroll, one notch = ±120.
+    Scroll {
+        axis: Axis,
+        value120: i32,
+        origin: Origin,
+    },
+    /// `key` — xkbcommon keysym, modifier-resolved.
+    Key {
+        keysym: u32,
+        state: KeyState,
+        origin: Origin,
+    },
+    /// `text` — UTF-8 string delivery.
+    Text { text: String, origin: Origin },
 }
 
 /// What one paced animation run observed, for the harness to assert on.
@@ -190,6 +225,8 @@ pub struct MockShim {
     /// The surface object id this shim minted (above the bootstrap id,
     /// per the watermark rule).
     pub surface_id: u32,
+    /// The seat object id, once minted via [`get_seat`](Self::get_seat).
+    pub seat_id: Option<u32>,
     next_buffer_id: u32,
 }
 
@@ -220,8 +257,82 @@ impl MockShim {
             width: configure.width,
             height: configure.height,
             surface_id,
+            seat_id: None,
             next_buffer_id: 1,
         })
+    }
+
+    /// Mint the session's input-delivery object (`get_seat`) — the seat
+    /// the core addresses origin-tagged `vitrin_shim_seat` events to
+    /// (P1.3.7). A well-behaved shim does this during startup; the fixture
+    /// keeps it a separate step after [`start`](Self::start) so
+    /// pre-existing surface-path tests keep their exact message counts.
+    /// Returns the seat object id (minted above the surface id, per the
+    /// watermark rule).
+    pub fn get_seat(&mut self) -> Result<u32, MockShimError> {
+        let seat_id = self.surface_id + 1;
+        let get_seat = session::requests::GetSeat { seat: seat_id };
+        self.conn
+            .send_message(&get_seat.encode(SHIM_SESSION_ID), None)?;
+        self.seat_id = Some(seat_id);
+        Ok(seat_id)
+    }
+
+    /// Block for the next core-to-shim event on the seat object. Fails
+    /// with [`MockShimError::UnexpectedEvent`] if the seat was never
+    /// minted or the next event targets another object.
+    pub fn next_seat_event(&mut self) -> Result<SeatEvent, MockShimError> {
+        let msg = self
+            .conn
+            .recv_message()?
+            .ok_or(MockShimError::Disconnected)?;
+        let object_id = msg.header.object_id;
+        let opcode = msg.header.opcode;
+        if self.seat_id != Some(object_id) {
+            return Err(MockShimError::UnexpectedEvent { object_id, opcode });
+        }
+        match opcode {
+            shim_seat::events::Motion::OPCODE => {
+                let (_, ev) = shim_seat::events::Motion::decode(&msg.bytes, msg.fd)?;
+                Ok(SeatEvent::Motion {
+                    x: ev.x,
+                    y: ev.y,
+                    origin: ev.origin,
+                })
+            }
+            shim_seat::events::Button::OPCODE => {
+                let (_, ev) = shim_seat::events::Button::decode(&msg.bytes, msg.fd)?;
+                Ok(SeatEvent::Button {
+                    button: ev.button,
+                    state: ev.state,
+                    origin: ev.origin,
+                })
+            }
+            shim_seat::events::Scroll::OPCODE => {
+                let (_, ev) = shim_seat::events::Scroll::decode(&msg.bytes, msg.fd)?;
+                Ok(SeatEvent::Scroll {
+                    axis: ev.axis,
+                    value120: ev.value120,
+                    origin: ev.origin,
+                })
+            }
+            shim_seat::events::Key::OPCODE => {
+                let (_, ev) = shim_seat::events::Key::decode(&msg.bytes, msg.fd)?;
+                Ok(SeatEvent::Key {
+                    keysym: ev.keysym,
+                    state: ev.state,
+                    origin: ev.origin,
+                })
+            }
+            shim_seat::events::Text::OPCODE => {
+                let (_, ev) = shim_seat::events::Text::decode(&msg.bytes, msg.fd)?;
+                Ok(SeatEvent::Text {
+                    text: ev.text,
+                    origin: ev.origin,
+                })
+            }
+            _ => Err(MockShimError::UnexpectedEvent { object_id, opcode }),
+        }
     }
 
     /// Attach frame `n` as a fresh shm memfd at the configured view size

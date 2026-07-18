@@ -394,9 +394,10 @@ pub(crate) struct ShimServer {
     /// Surface object id → protocol state. `BTreeMap` so iteration (and
     /// hence log output) is deterministic.
     surfaces: BTreeMap<u32, SurfaceState>,
-    /// The single seat object, once minted (`get_seat`); events toward it
-    /// are P1.6.3's, but the mint and its `already_initialized` rule are
-    /// session protocol served here.
+    /// The single seat object, once minted (`get_seat`): the address
+    /// [`deliver_seat_event`](Self::deliver_seat_event) encodes routed
+    /// input toward (P1.3.7). The mint and its `already_initialized` rule
+    /// are session protocol served here; the shim-side replay is P1.6.3.
     seat_id: Option<u32>,
     /// Surface ids of commits whose `frame_done` is still owed, in commit
     /// order (FIFO-correlated per the IDL). Drained by [`presented`].
@@ -559,21 +560,56 @@ impl ShimServer {
         Ok(())
     }
 
+    /// Deliver one routed, origin-tagged seat event to the shim (P1.3.7):
+    /// the delivery half of the input path, encoding the
+    /// [`SeatDelivery`](crate::input::SeatDelivery) toward the session's
+    /// seat object. Returns whether it went out: input the core routes to
+    /// the realm before the shim has minted its seat "has no destination
+    /// and is dropped" (IDL `vitrin_shim_session.get_seat`) — a trace, not
+    /// an error. The origin tag rides the wire on every event; this method
+    /// only addresses, it never constructs or re-tags (B2).
+    pub fn deliver_seat_event<F>(
+        &self,
+        event: &crate::input::SeatDelivery,
+        send: &mut F,
+    ) -> Result<bool, TransportError>
+    where
+        F: FnMut(&[u8]) -> Result<(), TransportError>,
+    {
+        let Some(seat_id) = self.seat_id else {
+            tracing::trace!("seat event dropped: shim has not minted its seat yet");
+            return Ok(false);
+        };
+        send(&event.encode(seat_id))?;
+        Ok(true)
+    }
+
     /// The shim connection is gone (EOF, transport fault, or protocol
     /// violation): drop the realm's surface from the scene so no capture
     /// can ever serve a stale frame, retire any retained zero-copy content
-    /// (the importer's texture — and with it the dmabuf fd — is dropped;
-    /// no `released` event exists to send on a dead connection, per the
-    /// IDL's "on connection death the core closes every attach fd it still
-    /// holds"), and release every staged buffer fd (they close as `self`
-    /// drops — no fd leak). The embedder calls this exactly once, with the
-    /// connection's importer, then forgets server, importer state, and
-    /// connection.
-    pub fn connection_closed(self, scene: &mut Scene, importer: Option<&mut dyn DmabufImporter>) {
+    /// (the importer's texture — and with it the dmabuf-backed buffer — is
+    /// dropped; no `released` event exists to send on a dead connection, per
+    /// the IDL's "on connection death the core closes every attach fd it
+    /// still holds"), reset the realm's input router so no implicit-grab or
+    /// pointer state leaks into the next shim generation (a stale grab
+    /// would route off-surface input to an app that never saw the press —
+    /// a phantom grab), and release every staged buffer fd (they close as
+    /// `self` drops — no fd leak). The embedder calls this exactly once,
+    /// with the connection's importer and the realm's router, then forgets
+    /// server, importer state, and connection. Taking the router here keeps
+    /// realm teardown a single funnel: an embedder (P1.5.2) cannot reset
+    /// the scene but forget the seat state.
+    pub fn connection_closed<H: crate::input::PreemptionHook>(
+        self,
+        scene: &mut Scene,
+        importer: Option<&mut dyn DmabufImporter>,
+        router: &mut crate::input::InputRouter<H>,
+    ) {
         scene.clear_surface();
         if let Some(importer) = importer {
             importer.clear();
         }
+        router.reset();
         // `self` drops here: every `PendingBuffer.fd` closes with it.
     }
 
@@ -2170,7 +2206,8 @@ mod tests {
         process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
         assert!(importer.holds_content);
 
-        server.connection_closed(&mut scene, Some(&mut importer));
+        let mut router = crate::input::InputRouter::new(crate::input::NoopHook);
+        server.connection_closed(&mut scene, Some(&mut importer), &mut router);
         assert_eq!(importer.clears, 1);
         assert!(
             !importer.holds_content,
@@ -2429,8 +2466,45 @@ mod tests {
         process_n(&mut server, &mut scene, &mut core, 2).unwrap();
         assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(0, VIEW_W, VIEW_H));
 
-        // Shim death: the embedder tears the server down.
-        server.connection_closed(&mut scene, None);
+        // Stage an implicit grab in the realm's router (emulated is the
+        // origin a test outside `crate::input` can mint; grab mechanics
+        // are origin-blind) so the teardown funnel's reset is observable.
+        use crate::input::{InputRouter, NoopHook, SeatInput, SeatInputKind};
+        use vitrin_protocol::generated::vitrin_actuator_pointer::ButtonState;
+        let mut router = InputRouter::new(NoopHook);
+        let view = (VIEW_W, VIEW_H);
+        let surface = Some((VIEW_W, VIEW_H));
+        let button = |state| SeatInputKind::Button {
+            button: 0x110,
+            state,
+        };
+        assert!(router
+            .route(
+                SeatInput::emulated(SeatInputKind::Motion { x: 1.0, y: 1.0 }),
+                view,
+                surface,
+            )
+            .is_some());
+        assert!(router
+            .route(
+                SeatInput::emulated(button(ButtonState::Pressed)),
+                view,
+                surface
+            )
+            .is_some());
+
+        // Shim death: the embedder tears the server down — one funnel for
+        // all realm state (scene, buffer fds, and seat/router state).
+        server.connection_closed(&mut scene, None, &mut router);
+        // No grab survived the generation: the stale release is unpaired
+        // at the next shim's seat and dropped.
+        assert!(router
+            .route(
+                SeatInput::emulated(button(ButtonState::Released)),
+                view,
+                surface
+            )
+            .is_none());
         drop(mock);
         drop(core);
         // Never a stale frame: the scene falls back to the background.

@@ -545,7 +545,15 @@ pub(crate) fn render_content(
         &content.texture,
         Rectangle::from_size(content.texture.size().to_f64()),
         dst,
-        &[full], // clip to the view; a larger-than-view surface center-crops
+        // Damage is DST-LOCAL in this call (Smithay 0.7 constrains each
+        // rect into `dst.size`, then translates by `dst.loc` — its own
+        // damage tracker likewise subtracts the element location before
+        // drawing): full-dst damage draws the whole placed rectangle and
+        // the rasterizer clips it to the view, so a larger-than-view
+        // surface center-crops. The view rectangle would be wrong here —
+        // under a negative placement it shifts left/up and leaves
+        // right/bottom strips of matte where client pixels belong.
+        &[Rectangle::from_size(dst.size)],
         &[],
         Transform::Normal,
         1.0,
@@ -717,18 +725,20 @@ mod gpu_tests {
         None
     }
 
-    /// Allocate a linear XRGB8888 GBM buffer, fill it with frame `n`'s
-    /// deterministic pixels, and export (fd, stride). The test-side
-    /// app/shim role: this is exactly what P1.6.2's v1 forwarding passes
-    /// through untouched.
-    fn gbm_frame(
+    /// Allocate a linear XRGB8888 GBM buffer of the given size, fill it
+    /// with frame `n`'s deterministic pixels, and export (fd, stride). The
+    /// test-side app/shim role: this is exactly what P1.6.2's v1 forwarding
+    /// passes through untouched.
+    fn gbm_frame_sized(
         gbm: &gbm::Device<File>,
         n: u32,
+        width: u32,
+        height: u32,
     ) -> Result<(std::os::fd::OwnedFd, u32), Box<dyn std::error::Error>> {
         use gbm::BufferObjectFlags;
         let mut bo = gbm.create_buffer_object::<()>(
-            W,
-            H,
+            width,
+            height,
             gbm::Format::Xrgb8888,
             BufferObjectFlags::RENDERING | BufferObjectFlags::LINEAR,
         )?;
@@ -736,9 +746,9 @@ mod gpu_tests {
         // implements the latter only for BOs allocated with USE_WRITE
         // (cursor-style dumb buffers), while mapping works for any linear
         // BO. Rows land at the *map* stride the driver reports.
-        let tight = frame_xrgb8888(n, W, H);
-        let row = (W * 4) as usize;
-        bo.map_mut(0, 0, W, H, |map| {
+        let tight = frame_xrgb8888(n, width, height);
+        let row = width as usize * BYTES_PER_PIXEL;
+        bo.map_mut(0, 0, width, height, |map| {
             let stride = map.stride() as usize;
             let buffer = map.buffer_mut();
             for (i, src) in tight.chunks_exact(row).enumerate() {
@@ -748,6 +758,15 @@ mod gpu_tests {
         let stride = bo.stride();
         let fd = bo.fd()?;
         Ok((fd, stride))
+    }
+
+    /// [`gbm_frame_sized`] at the harness view size — the steady-state
+    /// single-maximized shape the end-to-end tests drive.
+    fn gbm_frame(
+        gbm: &gbm::Device<File>,
+        n: u32,
+    ) -> Result<(std::os::fd::OwnedFd, u32), Box<dyn std::error::Error>> {
+        gbm_frame_sized(gbm, n, W, H)
     }
 
     /// Drive `n` core-side dispatches, with the GLES importer plugged in.
@@ -1032,6 +1051,71 @@ mod gpu_tests {
         assert!(
             fault.to_string().contains("invalid_buffer"),
             "expected invalid_buffer, got: {fault}"
+        );
+    }
+
+    /// The center-crop acceptance for [`render_content`]: content larger
+    /// than the view (legal mid-resize; [`layout::place`] goes negative)
+    /// must fill the **whole** view with the client's central pixels, 1:1 —
+    /// exactly what `Scene::compose` does on the CPU path. Pins the
+    /// dst-local damage contract of `Frame::render_texture_from_to`:
+    /// passing view-space damage instead shifts the drawn region by the
+    /// negative placement and leaves right/bottom strips of letterbox
+    /// matte where client pixels belong.
+    #[test]
+    #[ignore = "requires a real GPU (EGL + DRM render node); VITRIN_GPU_TESTS=1 cargo test -p vitrin-core --features gpu-tests -- --ignored dmabuf"]
+    fn real_gpu_oversized_dmabuf_center_crops_the_full_view() {
+        let Some(()) = env_gate() else { return };
+        let _fd = crate::capture::tests::fd_lock();
+        let Some((mut renderer, gbm, node)) = gpu_harness() else {
+            panic!("VITRIN_GPU_TESTS=1 but no EGL device with a working GBM pipeline was found");
+        };
+        eprintln!("running on {}", node.display());
+
+        // Larger than the view on both axes, asymmetrically, so both
+        // center-crop offsets are negative and different: placement is
+        // ((W - SW) / 2, (H - SH) / 2) = (-32, -18) for the 96x64 view.
+        const SW: u32 = W + 64;
+        const SH: u32 = H + 36;
+        const N: u32 = 5;
+
+        let mut content: Option<GpuContent> = None;
+        let mut importer = GlesDmabufImporter {
+            renderer: &mut renderer,
+            content: &mut content,
+        };
+        if !importer.supports(Format::Xrgb8888) {
+            eprintln!("skipping: renderer does not import XRGB8888+LINEAR dmabufs");
+            return;
+        }
+        let (fd, stride) = gbm_frame_sized(&gbm, N, SW, SH).expect("gbm buffer");
+        importer
+            .import(
+                &DmabufSpec {
+                    format: Format::Xrgb8888,
+                    width: SW,
+                    height: SH,
+                    stride,
+                },
+                fd,
+            )
+            .expect("an oversized linear buffer must import");
+
+        let composed =
+            composite_and_readback(&mut renderer, content.as_ref().expect("content retained"));
+        // Expected: the buffer's central W x H window, row-extracted from
+        // the same deterministic generator the buffer was filled from.
+        let full = frame_rgba(N, SW, SH);
+        let (cx, cy) = (((SW - W) / 2) as usize, ((SH - H) / 2) as usize);
+        let row = W as usize * BYTES_PER_PIXEL;
+        let mut expected = Vec::with_capacity(row * H as usize);
+        for y in 0..H as usize {
+            let off = ((cy + y) * SW as usize + cx) * BYTES_PER_PIXEL;
+            expected.extend_from_slice(&full[off..off + row]);
+        }
+        assert_eq!(
+            composed, expected,
+            "the view must be the client's central {W}x{H} window, 1:1 — no matte strips"
         );
     }
 }

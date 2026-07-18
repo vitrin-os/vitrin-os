@@ -257,6 +257,50 @@ impl MockShim {
         Ok(buffer_id)
     }
 
+    /// Attach an externally allocated buffer as `kind=dmabuf` (P1.3.5),
+    /// followed by a full-surface `damage` — the compliant zero-copy attach
+    /// of `docs/protocol/10-vitrin_shim_surface.md` flow g′, exactly what
+    /// the real shim's v1 forwarding (P1.6.2) passes through untouched. The
+    /// fixture does not allocate GPU buffers itself: the caller (a
+    /// real-GPU test harness, or a hostile-path test passing a deliberate
+    /// non-dmabuf) supplies the fd and its geometry. Returns the buffer
+    /// cookie used, for correlation with `buffer_done`.
+    pub fn attach_dmabuf(
+        &mut self,
+        fd: OwnedFd,
+        format: Format,
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) -> Result<u32, MockShimError> {
+        let buffer_id = self.next_buffer_id;
+        self.next_buffer_id += 1;
+        let attach = shim_surface::requests::Attach {
+            buffer_id,
+            fd,
+            kind: shim_surface::Kind::Dmabuf,
+            format,
+            width,
+            height,
+            stride,
+        };
+        self.conn
+            .send_message(&attach.encode(self.surface_id), Some(attach.fd.as_fd()))?;
+        // `attach` drops here: the shim's duplicate of the dmabuf fd
+        // closes; the core's SCM_RIGHTS duplicate is the one that matters
+        // (and, zero-copy, the one the GPU keeps sampling until release).
+
+        let damage = shim_surface::requests::Damage {
+            x: 0,
+            y: 0,
+            width: width as i32,
+            height: height as i32,
+        };
+        self.conn
+            .send_message(&damage.encode(self.surface_id), None)?;
+        Ok(buffer_id)
+    }
+
     /// Send `commit`, atomically latching the pending attach + damage.
     pub fn commit(&mut self) -> Result<(), MockShimError> {
         let commit = shim_surface::requests::Commit {};

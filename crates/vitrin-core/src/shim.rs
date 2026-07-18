@@ -7,10 +7,17 @@
 //! and the attach → damage → commit → `buffer_done`/`frame_done` frame loop.
 //! Buffer path v0 is **shm/memfd copy-in** (plan decision D3): at commit the
 //! core copies the attached buffer's pixels out of the shim's fd into
-//! [`Scene::commit`] (the P1.3.3 seam) and owns its bytes from then on;
-//! dmabuf import is the M1.5 optimization (P1.3.5) and, until it lands, a
-//! `kind=dmabuf` commit takes the protocol's designed fallback path
-//! (`buffer_done(import_failed)` — the shim re-attaches as shm).
+//! [`Scene::commit`] (the P1.3.3 seam) and owns its bytes from then on.
+//! The dmabuf zero-copy path (P1.3.5) is layered on top through the
+//! [`DmabufImporter`] seam: an embedder with a GPU passes an importer and a
+//! `kind=dmabuf` commit is really imported (see [`crate::dmabuf`] for the
+//! mechanics — allowlist, hostile-fd probe, failure detection, deferred
+//! release); an embedder without one (headless, CI) passes `None` and every
+//! dmabuf commit takes the protocol's designed fallback path
+//! (`buffer_done(import_failed)` — the shim re-attaches as shm). This server
+//! stays the one policy site either way: it maps the importer's typed
+//! outcomes onto the wire's dispositions at the same single commit site
+//! that resolves shm.
 //!
 //! # Atomicity (Wayland's double-buffered state model)
 //!
@@ -81,8 +88,35 @@
 //! defense against sparse-memfd allocation bombs) takes the *recoverable*
 //! `buffer_done(too_large)` path the IDL defines, not a kill. Both
 //! version-1 formats (xrgb8888/argb8888) are supported by the copy-in
-//! converter, so `format_unsupported` is unreachable here until a format
-//! appends.
+//! converter, so `format_unsupported` is unreachable on the shm arm until a
+//! format appends.
+//!
+//! An attached **dmabuf** fd is validated by the path that will actually
+//! touch it, and only there: at attach the core stages the fd untouched (no
+//! syscall — even `fstat` can block on a hostile fd), and at commit the
+//! importer, if one is present, runs the non-blocking fdinfo authenticity +
+//! size probe before its first driver call (the `F_GET_SEALS` analogue —
+//! [`crate::dmabuf`]'s module docs carry the full argument). A core without
+//! an importer never touches the fd at all and answers the designed
+//! `import_failed` fallback. An fd lie the probe catches is the same
+//! `invalid_buffer` log-and-close as the shm arm's; a genuine import
+//! failure (either failure time — EGL rejection or first-render, collapsed
+//! by the importer's probe composite) is the recoverable
+//! `buffer_done(import_failed)` fallback event, never a silent black frame.
+//!
+//! # Zero-copy release semantics (P1.3.5)
+//!
+//! A successfully imported dmabuf is **retained**: the GPU samples the
+//! client's buffer at every composite, so its `buffer_done(released)` is
+//! deferred until the next successful commit replaces it (or the connection
+//! dies, where no event exists) — the IDL's "at GPU-done under dmabuf
+//! passthrough", proven by the importer's synchronous replacement/retire
+//! sync. Re-attaching the retained cookie is `bad_order` (its ownership has
+//! not returned). Failure dispositions stay prompt even while an earlier
+//! buffer is retained — the deadlock-free reading of the IDL's two timing
+//! regimes; see [`crate::dmabuf`]. The per-server [`CopyMeter`] instruments
+//! the whole claim: the shm arm records exactly one client-pixel copy per
+//! commit, the dmabuf arm records none.
 //!
 //! # Frame pacing (`frame_done`)
 //!
@@ -136,6 +170,7 @@ use vitrin_protocol::generated::vitrin_shim_session as session;
 use vitrin_protocol::generated::vitrin_shim_surface as shim_surface;
 use vitrin_protocol::generated::vitrin_view::Format;
 
+use crate::dmabuf::{CopyMeter, DmabufImporter, DmabufSpec, ImportDenied};
 use crate::scene::{Scene, SurfaceContent, BYTES_PER_PIXEL};
 
 /// The shim-session bootstrap object: implicit object 1 on a shim
@@ -337,6 +372,16 @@ struct SurfaceState {
     pending_damage: Vec<DamageRect>,
 }
 
+/// The zero-copy buffer the core is currently holding (P1.3.5): a
+/// successfully imported dmabuf whose `buffer_done(released)` is deferred
+/// until content replaces it (the module docs' release semantics). One per
+/// server, mirroring the scene's single content slot — but tagged with its
+/// surface so the deferred event reaches the right object.
+struct RetainedDmabuf {
+    surface_id: u32,
+    buffer_id: u32,
+}
+
 /// The per-connection shim protocol server. One instance per shim
 /// connection; single-threaded, driven by decoded [`Message`]s from the
 /// connection's event source and by the embedder's presentation cadence.
@@ -358,6 +403,13 @@ pub(crate) struct ShimServer {
     ///
     /// [`presented`]: Self::presented
     owed_frame_dones: VecDeque<u32>,
+    /// The retained zero-copy buffer, if any (P1.3.5): its
+    /// `buffer_done(released)` is owed at replacement. The importer holds
+    /// the matching GPU texture; this is the protocol-side half.
+    retained_dmabuf: Option<RetainedDmabuf>,
+    /// Zero-copy instrumentation: every core-side CPU copy of client
+    /// pixels (the shm copy-in — the only such site) is recorded here.
+    copy_meter: CopyMeter,
 }
 
 impl ShimServer {
@@ -368,7 +420,16 @@ impl ShimServer {
             surfaces: BTreeMap::new(),
             seat_id: None,
             owed_frame_dones: VecDeque::new(),
+            retained_dmabuf: None,
+            copy_meter: CopyMeter::default(),
         }
+    }
+
+    /// The client-pixel copy instrumentation (P1.3.5): tests assert the shm
+    /// path copies exactly once per commit and the dmabuf path never; the
+    /// M1.5 perf report reads the same numbers.
+    pub fn copy_meter(&self) -> &CopyMeter {
+        &self.copy_meter
     }
 
     /// Send `vitrin_shim_session.configure` — the core's first message on a
@@ -389,6 +450,12 @@ impl ShimServer {
 
     /// Dispatch one decoded frame from the shim connection.
     ///
+    /// `importer` is the embedder's dmabuf import capability (P1.3.5):
+    /// `Some` on a GPU-backed embedder, `None` on headless/CI paths, and
+    /// **the same importer for the connection's whole lifetime** — it holds
+    /// the retained zero-copy buffer between commits, so swapping or
+    /// dropping it mid-connection would orphan that buffer's release.
+    ///
     /// Returns `Ok(true)` iff a `commit` was latched — the embedder should
     /// recomposite (redraw) and, once that content has been presented, call
     /// [`presented`](Self::presented) so the owed `frame_done` goes out.
@@ -398,6 +465,7 @@ impl ShimServer {
         &mut self,
         msg: Message,
         scene: &mut Scene,
+        importer: Option<&mut dyn DmabufImporter>,
         send: &mut F,
     ) -> Result<bool, ShimFault>
     where
@@ -452,7 +520,7 @@ impl ShimServer {
                 shim_surface::requests::Commit::OPCODE => {
                     shim_surface::requests::Commit::decode(&msg.bytes, msg.fd)
                         .map_err(ShimViolation::from)?;
-                    self.handle_commit(object_id, scene, send)?;
+                    self.handle_commit(object_id, scene, importer, send)?;
                     Ok(true)
                 }
                 _ => Err(ShimViolation::UnknownOpcode { object_id, opcode }.into()),
@@ -493,11 +561,19 @@ impl ShimServer {
 
     /// The shim connection is gone (EOF, transport fault, or protocol
     /// violation): drop the realm's surface from the scene so no capture
-    /// can ever serve a stale frame, and release every buffer fd still
-    /// held (they close as `self` drops — no fd leak). The embedder calls
-    /// this exactly once, then forgets both server and connection.
-    pub fn connection_closed(self, scene: &mut Scene) {
+    /// can ever serve a stale frame, retire any retained zero-copy content
+    /// (the importer's texture — and with it the dmabuf fd — is dropped;
+    /// no `released` event exists to send on a dead connection, per the
+    /// IDL's "on connection death the core closes every attach fd it still
+    /// holds"), and release every staged buffer fd (they close as `self`
+    /// drops — no fd leak). The embedder calls this exactly once, with the
+    /// connection's importer, then forgets server, importer state, and
+    /// connection.
+    pub fn connection_closed(self, scene: &mut Scene, importer: Option<&mut dyn DmabufImporter>) {
         scene.clear_surface();
+        if let Some(importer) = importer {
+            importer.clear();
+        }
         // `self` drops here: every `PendingBuffer.fd` closes with it.
     }
 
@@ -586,8 +662,12 @@ impl ShimServer {
             .expect("dispatch routed on a known surface id");
 
         // Re-attaching a dmabuf cookie whose buffer_done has not returned
-        // is `bad_order` (IDL). Under copy-in the only attach ever awaiting
-        // its buffer_done is the pending one, so the check is exactly this.
+        // is `bad_order` (IDL). Two places can be awaiting one: the pending
+        // slot (staged, uncommitted) and — under zero-copy (P1.3.5) — the
+        // retained slot, whose buffer the GPU is still sampling; the check
+        // covers both, regardless of the *new* attach's kind (the cookie
+        // names a buffer whose ownership has not returned, which is the
+        // whole razor).
         if let Some(pending) = &state.pending_buffer {
             if pending.kind == shim_surface::Kind::Dmabuf && pending.buffer_id == req.buffer_id {
                 return Err(ShimViolation::BadOrder(
@@ -595,6 +675,16 @@ impl ShimServer {
                 )
                 .into());
             }
+        }
+        if self
+            .retained_dmabuf
+            .as_ref()
+            .is_some_and(|r| r.surface_id == surface_id && r.buffer_id == req.buffer_id)
+        {
+            return Err(ShimViolation::BadOrder(
+                "re-attach of a retained dmabuf buffer_id still awaiting buffer_done",
+            )
+            .into());
         }
 
         // Supersede: the replaced pending attach is released promptly,
@@ -661,11 +751,13 @@ impl ShimServer {
     /// `commit`: atomically latch pending state. The one call site of
     /// [`Scene::commit`] on the shim path — copy-in happens entirely here,
     /// before the scene changes, so composition never observes a partially
-    /// applied frame.
+    /// applied frame — and the one call site of [`DmabufImporter::import`],
+    /// so zero-copy content latches at exactly the same seam.
     fn handle_commit<F>(
         &mut self,
         surface_id: u32,
         scene: &mut Scene,
+        importer: Option<&mut dyn DmabufImporter>,
         send: &mut F,
     ) -> Result<(), ShimFault>
     where
@@ -695,9 +787,16 @@ impl ShimServer {
             None => {}
             Some(pending) => {
                 let buffer_id = pending.buffer_id;
-                let status = self.apply_buffer(pending, scene)?;
-                let event = shim_surface::events::BufferDone { buffer_id, status };
-                send(&event.encode(surface_id))?;
+                // `None` = disposition deferred: a successful zero-copy
+                // import is retained and answers at replacement (the
+                // module docs' release semantics); any deferred release it
+                // triggered has already been sent, in attach order.
+                if let Some(status) =
+                    self.apply_buffer(surface_id, pending, scene, importer, send)?
+                {
+                    let event = shim_surface::events::BufferDone { buffer_id, status };
+                    send(&event.encode(surface_id))?;
+                }
             }
         }
 
@@ -709,24 +808,28 @@ impl ShimServer {
     }
 
     /// Consume one pending buffer at commit: copy a valid shm buffer into
-    /// the scene, or resolve the recoverable failure dispositions. Returns
-    /// the `buffer_done` status; the buffer's fd closes on return in every
-    /// arm ("the core takes ownership of the fd received in attach and
-    /// closes it before or as it emits this event").
-    fn apply_buffer(
+    /// the scene, import a valid dmabuf zero-copy, or resolve the
+    /// recoverable failure dispositions. Returns the `buffer_done` status —
+    /// or `None` when the disposition is deferred (a retained zero-copy
+    /// import; see the module docs). The buffer's fd closes on return in
+    /// **every** arm — a retaining import consumes it too ("the core takes
+    /// ownership of the fd received in attach and closes it before or as
+    /// it emits this event"): what a retained import holds is the kernel
+    /// buffer via its EGLImage, never an open fd (see
+    /// [`crate::dmabuf::GpuContent`]).
+    fn apply_buffer<F>(
         &mut self,
+        surface_id: u32,
         pending: PendingBuffer,
         scene: &mut Scene,
-    ) -> Result<shim_surface::BufferStatus, ShimFault> {
-        // No dmabuf import in this core yet (P1.3.5): the designed
-        // recoverable fallback — the shim re-attaches the same content as
-        // shm. Previously committed content stays on screen.
+        importer: Option<&mut dyn DmabufImporter>,
+        send: &mut F,
+    ) -> Result<Option<shim_surface::BufferStatus>, ShimFault>
+    where
+        F: FnMut(&[u8]) -> Result<(), TransportError>,
+    {
         if pending.kind == shim_surface::Kind::Dmabuf {
-            tracing::debug!(
-                buffer_id = pending.buffer_id,
-                "dmabuf attach before P1.3.5: directing shim to shm fallback"
-            );
-            return Ok(shim_surface::BufferStatus::ImportFailed);
+            return self.apply_dmabuf(surface_id, pending, importer, send);
         }
 
         // Renderer limits: recoverable too_large, never a kill (and the
@@ -742,7 +845,7 @@ impl ShimServer {
                 height = pending.height,
                 "buffer exceeds renderer limits: too_large"
             );
-            return Ok(shim_surface::BufferStatus::TooLarge);
+            return Ok(Some(shim_surface::BufferStatus::TooLarge));
         }
 
         // The D3 copy-in: pread rows bounded by the validated geometry —
@@ -758,6 +861,7 @@ impl ShimServer {
             pending.format,
         )
         .map_err(|e| ShimViolation::InvalidBuffer(format!("copy-in failed: {e}")))?;
+        self.copy_meter.record(rgba.len());
 
         // Structurally exact by construction; mapped anyway so a future
         // copy-in bug surfaces as the protocol's own condition, never as a
@@ -765,7 +869,117 @@ impl ShimServer {
         let content = SurfaceContent::from_rgba(rgba, pending.width, pending.height)
             .map_err(|e| ShimViolation::InvalidBuffer(e.to_string()))?;
         scene.commit(content);
-        Ok(shim_surface::BufferStatus::Released)
+
+        // CPU content replaced any retained zero-copy buffer: retire the
+        // GPU side (synced — GPU-done is proven, not assumed) and send the
+        // deferred release *first*, preserving attach order along the
+        // release chain (that buffer was attached before this one).
+        if let Some(prev) = self.retained_dmabuf.take() {
+            debug_assert!(
+                importer.is_some(),
+                "a retained dmabuf implies the embedder has an importer (its contract)"
+            );
+            if let Some(importer) = importer {
+                importer.clear();
+            }
+            let event = shim_surface::events::BufferDone {
+                buffer_id: prev.buffer_id,
+                status: shim_surface::BufferStatus::Released,
+            };
+            send(&event.encode(prev.surface_id))?;
+        }
+        Ok(Some(shim_surface::BufferStatus::Released))
+    }
+
+    /// The `kind=dmabuf` arm of [`apply_buffer`](Self::apply_buffer): the
+    /// P1.3.5 zero-copy attempt, resolved in the settled order — renderer
+    /// dimension limit, import capability, the D3 allowlist (all pure, no
+    /// syscall on the fd) — then the importer's own fd probe + import +
+    /// probe render, mapping its typed outcome onto the wire dispositions.
+    /// This is policy mapping only; every mechanic lives in
+    /// [`crate::dmabuf`].
+    fn apply_dmabuf<F>(
+        &mut self,
+        surface_id: u32,
+        pending: PendingBuffer,
+        importer: Option<&mut dyn DmabufImporter>,
+        send: &mut F,
+    ) -> Result<Option<shim_surface::BufferStatus>, ShimFault>
+    where
+        F: FnMut(&[u8]) -> Result<(), TransportError>,
+    {
+        // GPU max-texture dimension limit: the same recoverable too_large
+        // as shm. MAX_SURFACE_BYTES is deliberately *not* applied — it caps
+        // the copy-in allocation, and zero-copy allocates nothing
+        // core-side.
+        if pending.width > MAX_SURFACE_DIM || pending.height > MAX_SURFACE_DIM {
+            tracing::debug!(
+                width = pending.width,
+                height = pending.height,
+                "dmabuf exceeds renderer dimension limits: too_large"
+            );
+            return Ok(Some(shim_surface::BufferStatus::TooLarge));
+        }
+        // No import capability in this embedder (headless/pixman, CI): the
+        // designed fallback — the shim re-attaches the same content as shm.
+        // The fd is never touched. Previously committed content stays on
+        // screen.
+        let Some(importer) = importer else {
+            tracing::debug!(
+                buffer_id = pending.buffer_id,
+                "no dmabuf import capability: directing shim to shm fallback"
+            );
+            return Ok(Some(shim_surface::BufferStatus::ImportFailed));
+        };
+        // The D3 allowlist, before any driver call and before any syscall
+        // on the fd: xrgb8888/argb8888 with the implied linear modifier,
+        // intersected with the renderer's cached import-format table.
+        if !importer.supports(pending.format) {
+            tracing::debug!(
+                buffer_id = pending.buffer_id,
+                format = ?pending.format,
+                "dmabuf format/modifier outside the renderer's allowlist"
+            );
+            return Ok(Some(shim_surface::BufferStatus::FormatUnsupported));
+        }
+
+        let spec = DmabufSpec {
+            format: pending.format,
+            width: pending.width,
+            height: pending.height,
+            stride: pending.stride,
+        };
+        match importer.import(&spec, pending.fd) {
+            // The fd lied (not a dmabuf / size below the geometry): the
+            // same invalid_buffer log-and-close razor as the shm arm.
+            Err(ImportDenied::FdLie(detail)) => Err(ShimViolation::InvalidBuffer(detail).into()),
+            // A genuine import failure — either failure time, collapsed by
+            // the importer's probe composite: the recoverable fallback
+            // event. Previously committed content stays on screen.
+            Err(ImportDenied::Refusal(err)) => {
+                tracing::debug!(buffer_id = pending.buffer_id, %err, "directing shim to shm fallback");
+                Ok(Some(shim_surface::BufferStatus::ImportFailed))
+            }
+            Ok(()) => {
+                // Zero-copy content latched. The import's synchronous probe
+                // drained the GL queue, so the previously retained buffer
+                // is provably GPU-done: send its deferred release now
+                // (attach order along the release chain), then retain this
+                // one — its own buffer_done is deferred to replacement.
+                if let Some(prev) = self.retained_dmabuf.take() {
+                    let event = shim_surface::events::BufferDone {
+                        buffer_id: prev.buffer_id,
+                        status: shim_surface::BufferStatus::Released,
+                    };
+                    send(&event.encode(prev.surface_id))?;
+                }
+                self.retained_dmabuf = Some(RetainedDmabuf {
+                    surface_id,
+                    buffer_id: pending.buffer_id,
+                });
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -831,12 +1045,25 @@ mod tests {
         (server, Scene::new(), core, shim)
     }
 
-    /// Receive and dispatch exactly `n` shim messages on the core side.
+    /// Receive and dispatch exactly `n` shim messages on the core side,
+    /// with no dmabuf import capability (the headless/CI embedder shape).
     /// Returns whether any of them latched a commit.
     fn process_n(
         server: &mut ShimServer,
         scene: &mut Scene,
         core: &mut Connection,
+        n: usize,
+    ) -> Result<bool, ShimFault> {
+        process_n_with(server, scene, core, None, n)
+    }
+
+    /// [`process_n`] with an explicit importer — the GPU-embedder shape,
+    /// driven in CI through mock importers.
+    fn process_n_with(
+        server: &mut ShimServer,
+        scene: &mut Scene,
+        core: &mut Connection,
+        mut importer: Option<&mut dyn DmabufImporter>,
         n: usize,
     ) -> Result<bool, ShimFault> {
         let mut committed = false;
@@ -845,8 +1072,15 @@ mod tests {
                 .recv_message()
                 .expect("core receive")
                 .expect("a message must be waiting");
-            committed |=
-                server.handle_message(msg, scene, &mut |frame| core.send_message(frame, None))?;
+            // Fresh reborrow per iteration, via `match` — a closure-based
+            // `as_deref_mut`/`map` would pin the borrow to the outer
+            // lifetime.
+            let imp: Option<&mut dyn DmabufImporter> = match &mut importer {
+                Some(i) => Some(&mut **i),
+                None => None,
+            };
+            committed |= server
+                .handle_message(msg, scene, imp, &mut |frame| core.send_message(frame, None))?;
         }
         Ok(committed)
     }
@@ -1467,8 +1701,9 @@ mod tests {
 
     #[test]
     fn dmabuf_commit_directs_shm_fallback_and_still_paces() {
-        // No dmabuf import until P1.3.5: the commit resolves as the IDL's
-        // recoverable fallback (buffer_done(import_failed)), previous
+        // The no-importer embedder (headless/pixman — the CI path): a
+        // dmabuf commit resolves as the IDL's recoverable fallback
+        // (buffer_done(import_failed)) with the fd never touched, previous
         // content survives, and the commit still earns its frame_done —
         // flow g-prime of the prose page.
         let _fd = crate::capture::tests::fd_lock();
@@ -1561,6 +1796,389 @@ mod tests {
         assert_violation(
             process_n(&mut server, &mut scene, &mut core, 3),
             "bad_order",
+        );
+    }
+
+    /// A scriptable [`DmabufImporter`] — the CI stand-in for the GLES
+    /// importer, letting every policy mapping in `apply_dmabuf` be driven
+    /// without a GPU. It also counts calls, so tests can prove ordering
+    /// claims ("the allowlist is checked *before* any import").
+    struct MockImporter {
+        supported: Vec<Format>,
+        /// Scripted outcomes for successive `import` calls.
+        outcomes: std::collections::VecDeque<Result<(), ImportDenied>>,
+        import_calls: usize,
+        /// Mirrors the renderer-side retained-content slot.
+        holds_content: bool,
+        clears: usize,
+    }
+
+    impl MockImporter {
+        fn new(
+            supported: &[Format],
+            outcomes: impl IntoIterator<Item = Result<(), ImportDenied>>,
+        ) -> Self {
+            Self {
+                supported: supported.to_vec(),
+                outcomes: outcomes.into_iter().collect(),
+                import_calls: 0,
+                holds_content: false,
+                clears: 0,
+            }
+        }
+    }
+
+    impl DmabufImporter for MockImporter {
+        fn supports(&self, format: Format) -> bool {
+            self.supported.contains(&format)
+        }
+
+        fn import(
+            &mut self,
+            _spec: &DmabufSpec,
+            _fd: std::os::fd::OwnedFd,
+        ) -> Result<(), ImportDenied> {
+            self.import_calls += 1;
+            let outcome = self
+                .outcomes
+                .pop_front()
+                .expect("import called more often than the test scripted");
+            if outcome.is_ok() {
+                self.holds_content = true;
+            }
+            outcome
+        }
+
+        fn clear(&mut self) {
+            self.clears += 1;
+            self.holds_content = false;
+        }
+    }
+
+    fn refusal() -> ImportDenied {
+        ImportDenied::Refusal(crate::dmabuf::ImportError {
+            stage: crate::dmabuf::ImportStage::FirstRender,
+            detail: "scripted failure".into(),
+        })
+    }
+
+    #[test]
+    fn dmabuf_allowlist_miss_is_format_unsupported_before_any_import() {
+        // The D3 allowlist is enforced before any driver call: a format the
+        // renderer's table does not carry resolves as the recoverable
+        // format_unsupported event with the importer's import path — and
+        // therefore the fd — never touched. The connection survives and
+        // the shm path keeps working.
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut server, mut scene, mut core, shim) = setup();
+        let mut mock = MockShim::start(shim).expect("bring-up");
+        let mut importer = MockImporter::new(&[Format::Xrgb8888], []);
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 1).unwrap();
+
+        mock.attach_dmabuf(
+            memfd(&[0u8; 4]),
+            Format::Argb8888,
+            VIEW_W,
+            VIEW_H,
+            VIEW_W * 4,
+        )
+        .unwrap();
+        mock.commit().unwrap();
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
+
+        assert_eq!(
+            mock.next_surface_event().unwrap(),
+            SurfaceEvent::BufferDone {
+                buffer_id: 1,
+                status: BufferStatus::FormatUnsupported,
+            }
+        );
+        assert_eq!(
+            importer.import_calls, 0,
+            "an allowlist miss must never reach the import path"
+        );
+        server
+            .presented(1, &mut |frame| core.send_message(frame, None))
+            .unwrap();
+        mock.next_surface_event().unwrap(); // frame_done
+
+        // The directed shm fallback lands normally afterwards.
+        mock.attach_frame(0).unwrap();
+        mock.commit().unwrap();
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
+        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(0, VIEW_W, VIEW_H));
+    }
+
+    #[test]
+    fn dmabuf_import_refusal_falls_back_to_shm_end_to_end() {
+        // The R3 acceptance in CI: an import failure (here scripted at the
+        // first-render stage — the same mapping covers EGL-time rejection)
+        // produces the explicit fallback event, previously committed
+        // content stays on screen, pacing continues, and the surface then
+        // keeps updating via shm.
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut server, mut scene, mut core, shim) = setup();
+        let mut mock = MockShim::start(shim).expect("bring-up");
+        let mut importer =
+            MockImporter::new(&[Format::Xrgb8888, Format::Argb8888], [Err(refusal())]);
+
+        // Frame 0 over shm first, so "previous content" is real content.
+        mock.attach_frame(0).unwrap();
+        mock.commit().unwrap();
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 4).unwrap();
+        mock.next_surface_event().unwrap(); // buffer_done frame 0
+        server
+            .presented(1, &mut |frame| core.send_message(frame, None))
+            .unwrap();
+        mock.next_surface_event().unwrap(); // frame_done
+
+        // The failing dmabuf commit: explicit fallback event, no kill.
+        mock.attach_dmabuf(
+            memfd(&[0u8; 4]),
+            Format::Xrgb8888,
+            VIEW_W,
+            VIEW_H,
+            VIEW_W * 4,
+        )
+        .unwrap();
+        mock.commit().unwrap();
+        let committed =
+            process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
+        assert!(committed, "a failed-buffer commit still presents");
+        assert_eq!(importer.import_calls, 1);
+        assert_eq!(
+            mock.next_surface_event().unwrap(),
+            SurfaceEvent::BufferDone {
+                buffer_id: 2,
+                status: BufferStatus::ImportFailed,
+            }
+        );
+        assert_eq!(
+            scene.compose(VIEW_W, VIEW_H),
+            frame_rgba(0, VIEW_W, VIEW_H),
+            "previously committed content remains on screen"
+        );
+        server
+            .presented(2, &mut |frame| core.send_message(frame, None))
+            .unwrap();
+        assert_eq!(
+            mock.next_surface_event().unwrap(),
+            SurfaceEvent::FrameDone { time_ms: 2 },
+            "a rejected buffer must not stall the pacing loop"
+        );
+
+        // The surface keeps updating via shm afterwards (the acceptance's
+        // second half), and the copy meter shows the copy-in regime.
+        mock.attach_frame(1).unwrap();
+        mock.commit().unwrap();
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
+        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(1, VIEW_W, VIEW_H));
+        assert_eq!(
+            server.copy_meter().copies(),
+            2,
+            "exactly the two shm commits copied pixels; the dmabuf commit copied none"
+        );
+    }
+
+    #[test]
+    fn dmabuf_fd_lie_reported_by_the_importer_is_invalid_buffer() {
+        // The importer's fd probe found a lie (not a dmabuf / size below
+        // the geometry): the same invalid_buffer log-and-close razor as the
+        // shm arm — connection-fatal, no fallback event.
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut server, mut scene, mut core, shim) = setup();
+        let mut mock = MockShim::start(shim).expect("bring-up");
+        let mut importer = MockImporter::new(
+            &[Format::Xrgb8888],
+            [Err(ImportDenied::FdLie("scripted fd lie".into()))],
+        );
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 1).unwrap();
+        mock.attach_dmabuf(
+            memfd(&[0u8; 4]),
+            Format::Xrgb8888,
+            VIEW_W,
+            VIEW_H,
+            VIEW_W * 4,
+        )
+        .unwrap();
+        mock.commit().unwrap();
+        assert_violation(
+            process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3),
+            "invalid_buffer",
+        );
+    }
+
+    #[test]
+    fn successful_dmabuf_import_defers_release_until_replacement() {
+        // The zero-copy release semantics (module docs), end to end over
+        // the wire: a successfully imported buffer earns no buffer_done at
+        // its own commit — the GPU keeps sampling it — and is released
+        // exactly when the next successful commit replaces it; a shm
+        // commit retires the retained buffer (importer.clear, synced)
+        // before its own prompt release, preserving attach order along the
+        // release chain. The CPU scene is never touched by zero-copy
+        // content.
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut server, mut scene, mut core, shim) = setup();
+        let mut mock = MockShim::start(shim).expect("bring-up");
+        let mut importer = MockImporter::new(&[Format::Xrgb8888], [Ok(()), Ok(())]);
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 1).unwrap();
+        set_nonblocking(mock_conn(&mut mock));
+
+        // Commit A (cookie 1): imported, retained, unanswered.
+        mock.attach_dmabuf(
+            memfd(&[0u8; 4]),
+            Format::Xrgb8888,
+            VIEW_W,
+            VIEW_H,
+            VIEW_W * 4,
+        )
+        .unwrap();
+        mock.commit().unwrap();
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
+        assert!(importer.holds_content);
+        assert_wire_silent(mock_conn(&mut mock)); // no buffer_done: deferred
+        server
+            .presented(1, &mut |frame| core.send_message(frame, None))
+            .unwrap();
+        assert_eq!(
+            mock.next_surface_event().unwrap(),
+            SurfaceEvent::FrameDone { time_ms: 1 },
+            "pacing is independent of the deferred buffer disposition"
+        );
+        assert_eq!(
+            scene.compose(VIEW_W, VIEW_H),
+            test_pattern::render(VIEW_W, VIEW_H),
+            "zero-copy content never enters the CPU scene"
+        );
+
+        // Commit B (cookie 2): replaces A — A's released arrives now.
+        mock.attach_dmabuf(
+            memfd(&[0u8; 4]),
+            Format::Xrgb8888,
+            VIEW_W,
+            VIEW_H,
+            VIEW_W * 4,
+        )
+        .unwrap();
+        mock.commit().unwrap();
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
+        assert_eq!(
+            mock.next_surface_event().unwrap(),
+            SurfaceEvent::BufferDone {
+                buffer_id: 1,
+                status: BufferStatus::Released,
+            },
+            "the replaced buffer is released exactly at replacement"
+        );
+        assert_wire_silent(mock_conn(&mut mock)); // B itself: deferred
+        server
+            .presented(2, &mut |frame| core.send_message(frame, None))
+            .unwrap();
+        mock.next_surface_event().unwrap(); // frame_done
+
+        // Commit C over shm (cookie 3): retires B (clear + sync) and
+        // releases it BEFORE C's own prompt release — attach order.
+        mock.attach_frame(5).unwrap();
+        mock.commit().unwrap();
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
+        assert_eq!(importer.clears, 1, "shm content must retire the GPU side");
+        assert!(!importer.holds_content);
+        assert_eq!(
+            mock.next_surface_event().unwrap(),
+            SurfaceEvent::BufferDone {
+                buffer_id: 2,
+                status: BufferStatus::Released,
+            },
+            "the retained buffer's release precedes the shm buffer's (attach order)"
+        );
+        assert_eq!(
+            mock.next_surface_event().unwrap(),
+            SurfaceEvent::BufferDone {
+                buffer_id: 3,
+                status: BufferStatus::Released,
+            }
+        );
+        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(5, VIEW_W, VIEW_H));
+        assert_eq!(
+            server.copy_meter().copies(),
+            1,
+            "only the shm commit copied client pixels"
+        );
+    }
+
+    #[test]
+    fn reattach_of_retained_dmabuf_cookie_is_bad_order() {
+        // The deferred-release consequence the IDL already legislates: the
+        // retained cookie's ownership has not returned, so re-attaching it
+        // — with either kind — is the bad_order log-and-close.
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut server, mut scene, mut core, shim) = setup();
+        let mut mock = MockShim::start(shim).expect("bring-up");
+        let mut importer = MockImporter::new(&[Format::Xrgb8888], [Ok(())]);
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 1).unwrap();
+
+        mock.attach_dmabuf(
+            memfd(&[0u8; 4]),
+            Format::Xrgb8888,
+            VIEW_W,
+            VIEW_H,
+            VIEW_W * 4,
+        )
+        .unwrap();
+        mock.commit().unwrap();
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
+
+        // Cookie 1 is retained; a hostile re-attach names it again.
+        send_attach(
+            mock_conn(&mut mock),
+            SURFACE_ID,
+            1,
+            memfd(&[0u8; 4]),
+            Kind::Dmabuf,
+            Format::Xrgb8888,
+            VIEW_W,
+            VIEW_H,
+            VIEW_W * 4,
+        );
+        assert_violation(
+            process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 1),
+            "bad_order",
+        );
+    }
+
+    #[test]
+    fn teardown_with_retained_dmabuf_clears_the_importer() {
+        // Shim death while a zero-copy buffer is retained: no released
+        // event exists to send (the wire is gone), but the importer must
+        // drop its texture — and with it the dmabuf fd — on the same
+        // teardown path that clears the scene.
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut server, mut scene, mut core, shim) = setup();
+        let mut mock = MockShim::start(shim).expect("bring-up");
+        let mut importer = MockImporter::new(&[Format::Xrgb8888], [Ok(())]);
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 1).unwrap();
+        mock.attach_dmabuf(
+            memfd(&[0u8; 4]),
+            Format::Xrgb8888,
+            VIEW_W,
+            VIEW_H,
+            VIEW_W * 4,
+        )
+        .unwrap();
+        mock.commit().unwrap();
+        process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
+        assert!(importer.holds_content);
+
+        server.connection_closed(&mut scene, Some(&mut importer));
+        assert_eq!(importer.clears, 1);
+        assert!(
+            !importer.holds_content,
+            "teardown must drop the GPU content"
+        );
+        assert_eq!(
+            scene.compose(VIEW_W, VIEW_H),
+            test_pattern::render(VIEW_W, VIEW_H)
         );
     }
 
@@ -1812,7 +2430,7 @@ mod tests {
         assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(0, VIEW_W, VIEW_H));
 
         // Shim death: the embedder tears the server down.
-        server.connection_closed(&mut scene);
+        server.connection_closed(&mut scene, None);
         drop(mock);
         drop(core);
         // Never a stale frame: the scene falls back to the background.

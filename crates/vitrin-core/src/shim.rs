@@ -812,10 +812,11 @@ impl ShimServer {
     /// recoverable failure dispositions. Returns the `buffer_done` status —
     /// or `None` when the disposition is deferred (a retained zero-copy
     /// import; see the module docs). The buffer's fd closes on return in
-    /// every non-retaining arm ("the core takes ownership of the fd
-    /// received in attach and closes it before or as it emits this
-    /// event"); a retained import's fd closes with the import, as its
-    /// deferred event is emitted.
+    /// **every** arm — a retaining import consumes it too ("the core takes
+    /// ownership of the fd received in attach and closes it before or as
+    /// it emits this event"): what a retained import holds is the kernel
+    /// buffer via its EGLImage, never an open fd (see
+    /// [`crate::dmabuf::GpuContent`]).
     fn apply_buffer<F>(
         &mut self,
         surface_id: u32,

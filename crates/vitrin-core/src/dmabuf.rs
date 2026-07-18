@@ -95,9 +95,15 @@
 //! probe composite of the *replacing* import, or [`DmabufImporter::clear`]'s
 //! explicit sync when CPU (shm) content takes over — so by the time the
 //! deferred `released` is sent, every command that could still have sampled
-//! the old buffer has provably completed. The dmabuf *fd* itself lives
-//! inside the retained import and closes when that import is dropped — "as
-//! it emits this event", within the IDL's fd-ownership contract.
+//! the old buffer has provably completed. The dmabuf *fd* itself is
+//! consumed and closed by the successful import (EGL dups/references what
+//! it needs at `eglCreateImageKHR`, per `EGL_EXT_image_dma_buf_import`) —
+//! "before ... this event", within the IDL's fd-ownership contract. What a
+//! retained import keeps alive is the *kernel buffer*, via the texture's
+//! EGLImage: no fd of a retained buffer stays in the core's fd table, so
+//! retained imports never count against fd-exhaustion budgets (the
+//! issue-#21 EMFILE accounting) — only *staged* attaches (fd received,
+//! commit pending) hold fds, and those are capped in [`crate::shim`].
 //!
 //! One ordering consequence is deliberate: `buffer_done` events stay in
 //! attach order along the release chain (buffer N's `released` always
@@ -324,8 +330,10 @@ fn wire_fourcc(format: Format) -> Option<Fourcc> {
 
 /// A successfully imported, currently retained zero-copy surface: the GLES
 /// texture sampling the client's dmabuf, plus its pixel size for placement.
-/// Owning this keeps the underlying `Dmabuf` (and its fd) alive via the
-/// texture's EGLImage.
+/// Owning this keeps the *kernel buffer* alive via the texture's EGLImage;
+/// the dmabuf fd itself was already closed when [`GlesDmabufImporter::import`]
+/// returned success (EGL holds its own reference on the buffer — no fd
+/// lives here, and none stays open in the core's fd table).
 #[cfg_attr(not(all(test, feature = "gpu-tests")), allow(dead_code))]
 pub(crate) struct GpuContent {
     texture: GlesTexture,

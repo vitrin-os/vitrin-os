@@ -32,7 +32,9 @@
 //! --size WxH`) drives a fixed-size virtual output composited entirely in
 //! software (pixman) and retained in memory for capture, with no display or
 //! GPU (P1.3.2) — the path CI runs on. The shim-facing protocol server that
-//! feeds the scene real client buffers is P1.3.4.
+//! feeds the scene real client buffers exists (`shim`, P1.3.4, exercised
+//! end-to-end by the `vitrin-mock-shim` fixture) and goes live when the
+//! realm spawn manager provides the inherited socketpair (P1.5.2).
 
 mod backend;
 /// The `vitrin_view.capture_frame` service (P1.3.6). Dead-code-allowed
@@ -43,6 +45,14 @@ mod backend;
 #[cfg_attr(not(test), allow(dead_code))]
 mod capture;
 mod scene;
+/// The shim-facing protocol server (P1.3.4): `vitrin_shim_session` +
+/// `vitrin_shim_surface`, feeding `Scene::commit`. Dead-code-allowed outside
+/// tests for the same reason as `capture`: fully exercised by its tests (and
+/// the mock shim, `vitrin-mock-shim`) today, wired to a live shim connection
+/// when the realm spawn manager inherits the socketpair at fork (P1.5.2) —
+/// nothing at runtime creates a shim connection before then.
+#[cfg_attr(not(test), allow(dead_code))]
+mod shim;
 mod test_pattern;
 
 use std::process::ExitCode;

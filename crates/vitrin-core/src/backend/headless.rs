@@ -472,4 +472,157 @@ mod tests {
             .collect();
         assert_eq!(served, expected, "capture must serve the composed view");
     }
+
+    /// The P1.3.4 acceptance criteria, end to end over the real calloop
+    /// wiring: a mock shim (its own thread of control, speaking the real
+    /// wire protocol over a socketpair — P1.5.2 later forks real processes)
+    /// drives an animated surface through a [`vitrin_ipc::ConnectionSource`]
+    /// into the retained framebuffer.
+    ///
+    /// - **Animated end-to-end**: every presented frame reaches the
+    ///   retained framebuffer (capture's pixel source) byte-exactly.
+    /// - **No tearing**: each readback equals the deterministic generator
+    ///   output for exactly one frame index — every pixel of frame N
+    ///   differs from frame N+1, so a torn mix would equal neither.
+    /// - **Pacing**: the shim renders frame N+1 only after frame N's
+    ///   `frame_done` (which the wiring sends when the composite completes —
+    ///   the headless output cadence), so frames rendered == presentations,
+    ///   with monotonic presentation times.
+    ///
+    /// Shim death (EOF at the end of the animation) drops the surface from
+    /// the scene — never a stale frame — through the same wiring.
+    #[test]
+    fn mock_shim_animates_the_retained_framebuffer_over_the_event_loop() {
+        use std::time::Instant;
+
+        use vitrin_ipc::{Connection, ConnectionEvent, ConnectionSource};
+        use vitrin_mock_shim::frame_rgba;
+        use vitrin_protocol::generated::vitrin_shim_surface::BufferStatus;
+
+        use crate::shim::{ShimConfig, ShimServer};
+
+        let _fd = crate::capture::tests::fd_lock();
+        const W: u32 = 96;
+        const H: u32 = 64;
+        const FRAMES: u32 = 5;
+
+        let (mut core_conn, shim_conn) = Connection::pair().expect("socketpair");
+
+        // The mock shim: blocking client transport, paced by frame_done.
+        let shim_thread = std::thread::spawn(move || {
+            let mut shim = vitrin_mock_shim::MockShim::start(shim_conn)?;
+            shim.run_paced_animation(FRAMES)
+        });
+
+        struct LoopState {
+            headless: HeadlessState,
+            server: Option<ShimServer>,
+            start: Instant,
+            /// Readback of the retained framebuffer after each presentation.
+            presented: Vec<Vec<u8>>,
+        }
+
+        let size: Size<i32, Physical> = (W as i32, H as i32).into();
+        let mut event_loop: EventLoop<LoopState> = EventLoop::try_new().expect("event loop");
+        let mut state = LoopState {
+            headless: HeadlessState::new(size, event_loop.get_signal())
+                .expect("headless state under pixman"),
+            server: Some(ShimServer::new(ShimConfig {
+                realm: "realm-0".into(),
+                width: W,
+                height: H,
+            })),
+            start: Instant::now(),
+            presented: Vec::new(),
+        };
+
+        // `configure` precedes the processing of any shim request (sent on
+        // the still-blocking fd; ConnectionSource::new flips it after).
+        state
+            .server
+            .as_ref()
+            .expect("server present")
+            .send_configure(&mut |frame| core_conn.send_message(frame, None))
+            .expect("send configure");
+
+        let source = ConnectionSource::new(core_conn).expect("connection source");
+        event_loop
+            .handle()
+            .insert_source(source, |event, conn, state: &mut LoopState| match event {
+                ConnectionEvent::Message(msg) => {
+                    let Some(server) = state.server.as_mut() else {
+                        return;
+                    };
+                    let mut send = |frame: &[u8]| vitrin_ipc::reply(conn, frame, None);
+                    match server.handle_message(msg, &mut state.headless.scene, &mut send) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            // Presentation, headless: the composite
+                            // completing IS the output cadence ("or,
+                            // headless, after it would have been").
+                            state.headless.redraw().expect("redraw on commit");
+                            let time_ms = state.start.elapsed().as_millis() as u32;
+                            server.presented(time_ms, &mut send).expect("frame_done");
+                            state
+                                .presented
+                                .push(state.headless.latest_frame_rgba().expect("readback"));
+                        }
+                        // A compliant shim never faults; a violation here
+                        // is a test failure. (The hostile paths are pinned
+                        // by the unit tests in `crate::shim`.)
+                        Err(fault) => panic!("compliant mock shim faulted: {fault}"),
+                    }
+                }
+                ConnectionEvent::Disconnected => {
+                    // Shim death: drop the surface — never a stale frame —
+                    // and stop the loop.
+                    if let Some(server) = state.server.take() {
+                        server.connection_closed(&mut state.headless.scene);
+                    }
+                    state.headless.loop_signal.stop();
+                }
+                ConnectionEvent::Fault(reason) => panic!("transport fault: {reason}"),
+            })
+            .expect("insert connection source");
+
+        event_loop
+            .run(None, &mut state, |_| {})
+            .expect("event loop");
+
+        let stats = shim_thread
+            .join()
+            .expect("shim thread")
+            .expect("mock shim animation");
+        // Pacing: one frame per presentation, presentation times monotonic,
+        // every buffer returned (released) in attach order.
+        assert_eq!(stats.frames_rendered, FRAMES);
+        assert_eq!(stats.frame_done_times.len(), FRAMES as usize);
+        assert!(
+            stats.frame_done_times.windows(2).all(|w| w[0] <= w[1]),
+            "presentation times must be monotonic"
+        );
+        assert_eq!(
+            stats.buffer_dones,
+            (1..=FRAMES)
+                .map(|id| (id, BufferStatus::Released))
+                .collect::<Vec<_>>()
+        );
+        // Animated end-to-end, tear-free: each presented readback of the
+        // retained framebuffer is byte-exact frame k.
+        assert_eq!(state.presented.len(), FRAMES as usize);
+        for (k, frame) in state.presented.iter().enumerate() {
+            assert_eq!(
+                frame,
+                &frame_rgba(k as u32, W, H),
+                "presented frame {k} must be the exact generator output"
+            );
+        }
+        // After shim death the scene composes the deterministic background.
+        assert!(state.server.is_none(), "server forgotten on disconnect");
+        assert_eq!(
+            state.headless.scene.compose(W, H),
+            test_pattern::render(W, H),
+            "shim death must drop the surface from the scene"
+        );
+    }
 }

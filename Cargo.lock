@@ -1716,6 +1716,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vitrin-ipc",
+ "vitrin-mock-shim",
  "vitrin-protocol",
 ]
 
@@ -1727,6 +1728,15 @@ dependencies = [
  "nix",
  "rustix 1.1.4",
  "tracing",
+ "vitrin-protocol",
+]
+
+[[package]]
+name = "vitrin-mock-shim"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.4",
+ "vitrin-ipc",
  "vitrin-protocol",
 ]
 

@@ -23,7 +23,7 @@ use rustix::net::{
 use vitrin_protocol::wire::{FrameHeader, HEADER_LEN};
 
 use crate::error::{LocalMisuse, PeerViolation, TransportError};
-use crate::{MAX_FDS_PER_MESSAGE, MAX_MESSAGE_SIZE, MAX_UNCLAIMED_FDS};
+use crate::{MAX_FDS_PER_MESSAGE, MAX_MESSAGE_SIZE, MAX_SEND_QUEUE_BYTES, MAX_UNCLAIMED_FDS};
 
 /// Kernel-reported peer credentials (`SO_PEERCRED`), captured once when the
 /// [`Connection`] is created -- at `accept(2)` time for accepted
@@ -65,6 +65,23 @@ pub struct Message {
     pub fd: Option<OwnedFd>,
 }
 
+/// One outgoing frame parked by the non-blocking send path
+/// ([`Connection::send_or_queue`]) because the kernel would not take its
+/// bytes yet.
+struct QueuedFrame {
+    /// The unsent tail of the frame (a fully-unsent frame parks whole).
+    bytes: Vec<u8>,
+    /// Bytes of `bytes` already written to the socket by a partial flush.
+    offset: usize,
+    /// The fd that must ride the frame's first `sendmsg` (positional
+    /// matching, conventions 2.2). A duplicate owned by the queue -- the
+    /// caller's `BorrowedFd` cannot outlive the call -- and `None` once
+    /// delivered (any successful `sendmsg` carries the whole ancillary
+    /// payload) or when the head of the frame already went out before the
+    /// frame was parked.
+    fd: Option<OwnedFd>,
+}
+
 /// A connected transport endpoint over a Unix stream socket.
 pub struct Connection {
     fd: OwnedFd,
@@ -89,6 +106,17 @@ pub struct Connection {
     /// Set on the first peer violation; replayed on every later receive so
     /// a caller can never read desynchronized frames past a violation.
     poisoned: Option<PeerViolation>,
+    /// Outgoing frames the non-blocking send path has parked, oldest first
+    /// (FIFO preserves wire order). Empty on the blocking client path.
+    send_queue: VecDeque<QueuedFrame>,
+    /// Total unsent bytes across `send_queue` -- the number
+    /// [`MAX_SEND_QUEUE_BYTES`] caps. Maintained incrementally so the
+    /// event-loop's per-dispatch checks are O(1).
+    queued_send_bytes: usize,
+    /// Set when a send would have pushed `queued_send_bytes` past the cap;
+    /// sticky (like `poisoned`) so every later send fails identically and
+    /// the event loop reliably observes the overflow after any dispatch.
+    send_overflowed: bool,
 }
 
 impl std::fmt::Debug for Connection {
@@ -102,6 +130,8 @@ impl std::fmt::Debug for Connection {
             .field("buffered", &self.recv_buf.len())
             .field("pending_fds", &self.pending_fds.len())
             .field("poisoned", &self.poisoned)
+            .field("queued_send_bytes", &self.queued_send_bytes)
+            .field("send_overflowed", &self.send_overflowed)
             .finish_non_exhaustive()
     }
 }
@@ -143,6 +173,9 @@ impl Connection {
             pending_fds: VecDeque::new(),
             consumed: 0,
             poisoned: None,
+            send_queue: VecDeque::new(),
+            queued_send_bytes: 0,
+            send_overflowed: false,
         })
     }
 
@@ -193,28 +226,7 @@ impl Connection {
         frame: &[u8],
         fd: Option<BorrowedFd<'_>>,
     ) -> Result<(), TransportError> {
-        if frame.len() < HEADER_LEN {
-            return Err(LocalMisuse::FrameTooShort { len: frame.len() }.into());
-        }
-        let header =
-            FrameHeader::decode(frame).expect("frame length checked against HEADER_LEN above");
-        if header.size as usize != frame.len() {
-            // Also enforces MAX_MESSAGE_SIZE: a u16 size field cannot
-            // declare more, so an oversized buffer always mismatches.
-            return Err(LocalMisuse::SizeFieldMismatch {
-                declared: header.size,
-                actual: frame.len(),
-            }
-            .into());
-        }
-        if header.fd_count as usize > MAX_FDS_PER_MESSAGE || (header.fd_count == 1) != fd.is_some()
-        {
-            return Err(LocalMisuse::FdCountMismatch {
-                declared: header.fd_count,
-                attached: fd.is_some(),
-            }
-            .into());
-        }
+        validate_outgoing(frame, fd)?;
 
         let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut cmsg = SendAncillaryBuffer::new(&mut space);
@@ -242,6 +254,175 @@ impl Connection {
             }
             sent += n;
         }
+        Ok(())
+    }
+
+    /// Send one frame on a **non-blocking** socket, parking whatever the
+    /// kernel will not take in the connection's bounded send queue -- the
+    /// event-loop side of sending (the core's fd is non-blocking; the
+    /// blocking SDK path stays on [`send_message`](Self::send_message)).
+    ///
+    /// Semantics:
+    ///
+    /// - Same argument validation as `send_message`; contradictions are
+    ///   [`TransportError::LocalMisuse`] before any byte moves.
+    /// - Attempts an immediate write (after opportunistically flushing any
+    ///   already-parked frames, preserving wire order). On `EAGAIN` the
+    ///   remainder is queued and `Ok(())` returned -- the caller's event
+    ///   loop flushes it on write-readiness via
+    ///   [`flush_send_queue`](Self::flush_send_queue).
+    /// - A queued fd is duplicated (`F_DUPFD_CLOEXEC` via
+    ///   `try_clone_to_owned`), so the caller's fd can be closed as soon as
+    ///   this returns, exactly as with the blocking path.
+    /// - If parking the frame would push the queue past
+    ///   [`MAX_SEND_QUEUE_BYTES`], **nothing is queued** and the sticky
+    ///   [`TransportError::SendQueueFull`] is returned: the peer has stopped
+    ///   reading, and the P1.2.3 policy is to disconnect it -- the event
+    ///   loop observes [`send_queue_overflowed`](Self::send_queue_overflowed)
+    ///   after each dispatch and removes the connection.
+    pub fn send_or_queue(
+        &mut self,
+        frame: &[u8],
+        fd: Option<BorrowedFd<'_>>,
+    ) -> Result<(), TransportError> {
+        validate_outgoing(frame, fd)?;
+        if self.send_overflowed {
+            return Err(TransportError::SendQueueFull {
+                queued: self.queued_send_bytes,
+            });
+        }
+        if !self.send_queue.is_empty() {
+            self.flush_send_queue()?;
+        }
+        if self.send_queue.is_empty() {
+            let sent = self.try_send_now(frame, fd)?;
+            if sent == frame.len() {
+                return Ok(());
+            }
+            // Any successful sendmsg carried the whole ancillary payload, so
+            // the fd is still owed only if *zero* bytes went out.
+            let parked_fd = if sent == 0 {
+                fd.map(|fd| fd.try_clone_to_owned()).transpose()?
+            } else {
+                None
+            };
+            self.park(frame[sent..].to_vec(), parked_fd)
+        } else {
+            // Earlier frames are still parked; this one must queue whole
+            // behind them to preserve wire order (fd included).
+            let parked_fd = fd.map(|fd| fd.try_clone_to_owned()).transpose()?;
+            self.park(frame.to_vec(), parked_fd)
+        }
+    }
+
+    /// Write as much of the parked send queue as the kernel will take.
+    /// `EAGAIN` is success ("wait for the next write-readiness"), so `Ok`
+    /// does **not** mean empty -- check
+    /// [`queued_send_bytes`](Self::queued_send_bytes). Real I/O errors (e.g.
+    /// `EPIPE` after the peer closed) are returned and the connection should
+    /// be dropped.
+    pub fn flush_send_queue(&mut self) -> Result<(), TransportError> {
+        while let Some(front) = self.send_queue.front_mut() {
+            let result = if let Some(fd) = front.fd.as_ref() {
+                debug_assert_eq!(front.offset, 0, "an fd rides its frame's first byte");
+                let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+                let mut cmsg = SendAncillaryBuffer::new(&mut space);
+                let fds = [fd.as_fd()];
+                let pushed = cmsg.push(SendAncillaryMessage::ScmRights(&fds));
+                assert!(pushed, "ancillary buffer sized for exactly one fd");
+                let iov = [IoSlice::new(&front.bytes)];
+                retry_eintr(|| net::sendmsg(&self.fd, &iov, &mut cmsg, SendFlags::NOSIGNAL))
+            } else {
+                retry_eintr(|| {
+                    net::send(&self.fd, &front.bytes[front.offset..], SendFlags::NOSIGNAL)
+                })
+            };
+            match result {
+                Ok(0) => return Err(TransportError::Io(io::ErrorKind::WriteZero.into())),
+                Ok(n) => {
+                    // Delivered with the first successful sendmsg; drop our
+                    // duplicate.
+                    front.fd = None;
+                    front.offset += n;
+                    self.queued_send_bytes -= n;
+                    if front.offset == front.bytes.len() {
+                        self.send_queue.pop_front();
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Unsent bytes currently parked by [`send_or_queue`](Self::send_or_queue)
+    /// (the quantity [`MAX_SEND_QUEUE_BYTES`] caps). Non-zero means the
+    /// event loop should watch for write-readiness and
+    /// [`flush_send_queue`](Self::flush_send_queue).
+    pub fn queued_send_bytes(&self) -> usize {
+        self.queued_send_bytes
+    }
+
+    /// Whether a send has hit the [`MAX_SEND_QUEUE_BYTES`] cap: the peer is
+    /// a slow reader and the P1.2.3 policy is to disconnect it. Sticky.
+    pub fn send_queue_overflowed(&self) -> bool {
+        self.send_overflowed
+    }
+
+    /// One immediate non-blocking write attempt of a fresh frame (empty
+    /// queue): the ancillary fd rides the first `sendmsg`, then plain sends
+    /// continue until done or `EAGAIN`. Returns the bytes written (`0` means
+    /// the fd was *not* delivered); `EAGAIN` is never an error here.
+    fn try_send_now(
+        &mut self,
+        frame: &[u8],
+        fd: Option<BorrowedFd<'_>>,
+    ) -> Result<usize, TransportError> {
+        let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut cmsg = SendAncillaryBuffer::new(&mut space);
+        let fds;
+        if let Some(fd) = fd {
+            fds = [fd];
+            let pushed = cmsg.push(SendAncillaryMessage::ScmRights(&fds));
+            assert!(pushed, "ancillary buffer sized for exactly one fd");
+        }
+        let iov = [IoSlice::new(frame)];
+        let mut sent =
+            match retry_eintr(|| net::sendmsg(&self.fd, &iov, &mut cmsg, SendFlags::NOSIGNAL)) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(0),
+                Err(e) => return Err(e.into()),
+            };
+        while sent < frame.len() {
+            match retry_eintr(|| net::send(&self.fd, &frame[sent..], SendFlags::NOSIGNAL)) {
+                Ok(0) => return Err(TransportError::Io(io::ErrorKind::WriteZero.into())),
+                Ok(n) => sent += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(sent)
+    }
+
+    /// Park an unsent (tail of a) frame, enforcing the queue cap. On
+    /// overflow nothing is queued, the sticky overflow flag is set, and the
+    /// dropped duplicate fd (if any) closes here -- the connection is about
+    /// to die anyway.
+    fn park(&mut self, bytes: Vec<u8>, fd: Option<OwnedFd>) -> Result<(), TransportError> {
+        debug_assert!(!bytes.is_empty());
+        if self.queued_send_bytes + bytes.len() > MAX_SEND_QUEUE_BYTES {
+            self.send_overflowed = true;
+            return Err(TransportError::SendQueueFull {
+                queued: self.queued_send_bytes,
+            });
+        }
+        self.queued_send_bytes += bytes.len();
+        self.send_queue.push_back(QueuedFrame {
+            bytes,
+            offset: 0,
+            fd,
+        });
         Ok(())
     }
 
@@ -383,6 +564,34 @@ impl AsFd for Connection {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
+}
+
+/// The shared outgoing-frame validation of [`Connection::send_message`] and
+/// [`Connection::send_or_queue`]: `frame` must be exactly one well-formed
+/// frame and `fd` must match its header's `fd_count`. Contradictions are
+/// [`LocalMisuse`], caught before any byte hits the wire.
+fn validate_outgoing(frame: &[u8], fd: Option<BorrowedFd<'_>>) -> Result<(), TransportError> {
+    if frame.len() < HEADER_LEN {
+        return Err(LocalMisuse::FrameTooShort { len: frame.len() }.into());
+    }
+    let header = FrameHeader::decode(frame).expect("frame length checked against HEADER_LEN above");
+    if header.size as usize != frame.len() {
+        // Also enforces MAX_MESSAGE_SIZE: a u16 size field cannot declare
+        // more, so an oversized buffer always mismatches.
+        return Err(LocalMisuse::SizeFieldMismatch {
+            declared: header.size,
+            actual: frame.len(),
+        }
+        .into());
+    }
+    if header.fd_count as usize > MAX_FDS_PER_MESSAGE || (header.fd_count == 1) != fd.is_some() {
+        return Err(LocalMisuse::FdCountMismatch {
+            declared: header.fd_count,
+            attached: fd.is_some(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Retry a syscall on `EINTR` (harmless here: for these blocking calls the

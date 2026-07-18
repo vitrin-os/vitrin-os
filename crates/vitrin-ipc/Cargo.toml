@@ -7,6 +7,27 @@ rust-version.workspace = true
 description = "Vitrin OS Unix-socket transport: framing over the vitrin-protocol wire format, SCM_RIGHTS fd passing (at most one fd per message), SO_PEERCRED captured at accept. No protocol semantics."
 publish = false
 
+[features]
+# `default = ["server"]` -- not `client` -- because the only in-workspace
+# consumer of this crate is the trusted core (`vitrin-core`), which needs the
+# calloop glue. A default that built the light slice would leave the server
+# code out of `cargo test --workspace` / `clippy --all-targets` (neither
+# passes `--features`), so it would rot silently. The dependency-light slice
+# stays honest instead through an explicit client-only CI step (see ci.yml).
+default = ["server"]
+# The base blocking transport -- `Listener`, `Connection`, framing, fd
+# passing, peer credentials -- and nothing else. This is what the Rust
+# `vitrin-sdk` reference client selects (`default-features = false,
+# features = ["client"]`): it pulls no calloop and no Smithay, so an SDK
+# consumer never links the compositor's event loop.
+client = []
+# Adds the core-side calloop event-source glue ([`event_loop`]:
+# `ListenerSource` / `ConnectionSource`) so `vitrind` services N connections
+# inside its single-threaded compositor loop -- no dedicated IPC thread, no
+# async runtime (plan risk R7). Implies `client`: the glue wraps those base
+# types.
+server = ["client", "dep:calloop"]
+
 [dependencies]
 vitrin-protocol = { path = "../vitrin-protocol" }
 # The primary low-level unix crate (already in the lockfile via
@@ -23,6 +44,12 @@ rustix = { version = "1", features = ["net", "fs"] }
 # peer. nix's `UnixCredentials` keeps the raw `libc::ucred` (plain `pid_t`),
 # so pid 0 is representable and surfaced as `PeerCred::pid == None`.
 nix = { version = "0.31", default-features = false, features = ["socket"] }
+# Core-side event-loop integration only (the `server` feature). The exact
+# 0.14 line Smithay pins, so `vitrind` -- which depends on both -- links a
+# single calloop. `optional` keeps it out of the `client` slice entirely, so
+# the SDK never pulls it. No feature of calloop is enabled here: the glue
+# uses only the base `Generic` event source and the `EventSource` trait.
+calloop = { version = "0.14", optional = true }
 
 [dev-dependencies]
 # Tests additionally need getpid/getuid/getgid to assert SO_PEERCRED values.

@@ -94,18 +94,47 @@
 //! which is what makes their realm identity assigned, never claimed
 //! (conventions section 1.2).
 
+//! # Cargo features
+//!
+//! - **`client`** (base) -- the blocking transport: [`Listener`],
+//!   [`Connection`], framing, `SCM_RIGHTS` fd passing, and `SO_PEERCRED`.
+//!   Pulls no calloop; this is the slice the Rust `vitrin-sdk` reference
+//!   client links.
+//! - **`server`** (default, implies `client`) -- adds the [`event_loop`]
+//!   glue that plugs the transport into the trusted core's calloop loop, so
+//!   `vitrind` services N connections as just another event source with no
+//!   dedicated IPC thread and no async runtime (P1.2.2).
+//!
+//! The default is `server` so the workspace's own `cargo test`/`clippy`
+//! (which pass no `--features`) exercise the core-side glue; a consumer that
+//! wants only the light client selects `default-features = false,
+//! features = ["client"]`.
+
+#[cfg(feature = "client")]
 pub mod connection;
+#[cfg(feature = "client")]
 pub mod error;
+#[cfg(feature = "server")]
+pub mod event_loop;
+#[cfg(feature = "client")]
 pub mod listener;
+#[cfg(feature = "client")]
 pub mod paths;
 
+#[cfg(feature = "client")]
 pub use connection::{Connection, Message, PeerCred};
+#[cfg(feature = "client")]
 pub use error::{LocalMisuse, PeerViolation, TransportError};
+#[cfg(feature = "server")]
+pub use event_loop::{reply, ConnectionEvent, ConnectionSource, ListenerEvent, ListenerSource};
+#[cfg(feature = "client")]
 pub use listener::Listener;
+#[cfg(feature = "client")]
 pub use paths::PathError;
 
 // Re-exported so transport consumers can name the frame-header type that
 // [`Message`] exposes without also depending on `vitrin-protocol` directly.
+#[cfg(feature = "client")]
 pub use vitrin_protocol::wire::{FrameHeader, HEADER_LEN};
 
 /// Hard ceiling on a single frame's size in bytes, including its 8-byte
@@ -113,11 +142,13 @@ pub use vitrin_protocol::wire::{FrameHeader, HEADER_LEN};
 /// express. See the crate docs for the full rationale. A frame *declaring*
 /// less than [`HEADER_LEN`] is the inverse violation
 /// ([`error::PeerViolation::UndersizedSizeField`]).
+#[cfg(feature = "client")]
 pub const MAX_MESSAGE_SIZE: usize = u16::MAX as usize;
 
 /// Protocol v0 allows at most one file descriptor per message (`fd_count`
 /// is `0` or `1` -- the P1.1.2 codegen constraint). A received header
 /// declaring more is [`error::PeerViolation::FdCountExceeded`].
+#[cfg(feature = "client")]
 pub const MAX_FDS_PER_MESSAGE: usize = 1;
 
 /// Cap on received-but-not-yet-claimed fds queued on one [`Connection`],
@@ -132,4 +163,5 @@ pub const MAX_FDS_PER_MESSAGE: usize = 1;
 /// no ancillary batching ceiling. Whether one should become normative
 /// (so the C shim and Python SDK agree by spec rather than by margin) is
 /// flagged to the protocol track rather than legislated here.
+#[cfg(feature = "client")]
 pub const MAX_UNCLAIMED_FDS: usize = 8;

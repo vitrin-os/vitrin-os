@@ -1695,6 +1695,7 @@ dependencies = [
 name = "vitrin-ipc"
 version = "0.1.0"
 dependencies = [
+ "calloop 0.14.4",
  "nix",
  "rustix 1.1.4",
  "vitrin-protocol",

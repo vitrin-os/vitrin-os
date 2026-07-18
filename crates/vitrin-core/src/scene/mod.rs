@@ -183,6 +183,15 @@ impl Scene {
         self.generation
     }
 
+    /// Size of the committed client surface, if any — the geometry the
+    /// input router (P1.3.7, [`crate::input`]) maps pointer coordinates
+    /// through. Router and composition use the same deterministic
+    /// [`layout::place`], so they can never disagree about where the
+    /// surface sits in the view.
+    pub fn surface_size(&self) -> Option<(u32, u32)> {
+        self.surface.as_ref().map(|s| (s.width, s.height))
+    }
+
     /// Compose the realm view at `width x height`: tightly packed RGBA8888,
     /// rows top-down, every pixel opaque. Pure and deterministic — same
     /// scene + same size = same bytes. Zero-sized views yield an empty

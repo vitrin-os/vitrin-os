@@ -394,9 +394,10 @@ pub(crate) struct ShimServer {
     /// Surface object id → protocol state. `BTreeMap` so iteration (and
     /// hence log output) is deterministic.
     surfaces: BTreeMap<u32, SurfaceState>,
-    /// The single seat object, once minted (`get_seat`); events toward it
-    /// are P1.6.3's, but the mint and its `already_initialized` rule are
-    /// session protocol served here.
+    /// The single seat object, once minted (`get_seat`): the address
+    /// [`deliver_seat_event`](Self::deliver_seat_event) encodes routed
+    /// input toward (P1.3.7). The mint and its `already_initialized` rule
+    /// are session protocol served here; the shim-side replay is P1.6.3.
     seat_id: Option<u32>,
     /// Surface ids of commits whose `frame_done` is still owed, in commit
     /// order (FIFO-correlated per the IDL). Drained by [`presented`].
@@ -557,6 +558,30 @@ impl ShimServer {
             send(&event.encode(surface_id))?;
         }
         Ok(())
+    }
+
+    /// Deliver one routed, origin-tagged seat event to the shim (P1.3.7):
+    /// the delivery half of the input path, encoding the
+    /// [`SeatDelivery`](crate::input::SeatDelivery) toward the session's
+    /// seat object. Returns whether it went out: input the core routes to
+    /// the realm before the shim has minted its seat "has no destination
+    /// and is dropped" (IDL `vitrin_shim_session.get_seat`) — a trace, not
+    /// an error. The origin tag rides the wire on every event; this method
+    /// only addresses, it never constructs or re-tags (B2).
+    pub fn deliver_seat_event<F>(
+        &self,
+        event: &crate::input::SeatDelivery,
+        send: &mut F,
+    ) -> Result<bool, TransportError>
+    where
+        F: FnMut(&[u8]) -> Result<(), TransportError>,
+    {
+        let Some(seat_id) = self.seat_id else {
+            tracing::trace!("seat event dropped: shim has not minted its seat yet");
+            return Ok(false);
+        };
+        send(&event.encode(seat_id))?;
+        Ok(true)
     }
 
     /// The shim connection is gone (EOF, transport fault, or protocol

@@ -20,12 +20,15 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::egl::context::GlAttributes;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{Color32F, Frame, ImportMem, Renderer};
-use smithay::backend::winit::{self as winit_backend, WinitEvent, WinitGraphicsBackend};
+use smithay::backend::winit::{
+    self as winit_backend, WinitEvent, WinitGraphicsBackend, WinitInput,
+};
 use smithay::reexports::winit::dpi::LogicalSize;
 use smithay::reexports::winit::window::Window as WinitWindow;
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use tracing::{debug, error, info, trace};
 
+use crate::input;
 use crate::scene::Scene;
 
 /// Initial logical window size; matches the planned headless default
@@ -66,6 +69,11 @@ struct NestedState {
     /// output 1:1 in the host window. The shim-facing protocol server
     /// (P1.3.4) commits into it and requests a redraw.
     scene: Scene,
+    /// The input router (P1.3.7): host input tagged `physical` at intake
+    /// flows through it toward the realm's shim seat. Carries the MVP
+    /// no-op preemption hook, where the P1.7.2 consent grab and P1.7.3
+    /// revocation watcher later attach.
+    router: input::InputRouter<input::NoopHook>,
     view: Option<SceneTexture>,
     loop_signal: LoopSignal,
     loop_handle: LoopHandle<'static, NestedState>,
@@ -120,15 +128,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             info!("host window close requested");
             state.loop_signal.stop();
         }
-        // Input intake is P1.3.7: nested-mode host events become the human
-        // principal's input, origin-tagged at this point of entry.
-        WinitEvent::Input(_) => {}
+        // P1.3.7 input intake: nested-mode host events ARE the human
+        // principal's input, origin-tagged `physical` at this single point
+        // of entry (B2) — see `crate::input`.
+        WinitEvent::Input(event) => state.handle_input(&event),
         WinitEvent::Focus(_) => {}
     })?;
 
     let mut state = NestedState {
         backend,
         scene: Scene::new(),
+        router: input::InputRouter::new(input::NoopHook),
         view: None,
         loop_signal: event_loop.get_signal(),
         loop_handle: event_loop.handle(),
@@ -150,6 +160,34 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 }
 
 impl NestedState {
+    /// P1.3.7 input intake, nested mode. The host compositor delivered
+    /// this event to the core's window, so it is the human principal's
+    /// input (implicit principal, no identity ceremony — trusted as human,
+    /// the documented MVP limitation; real physical-origin verification is
+    /// Phase 3). [`input::intake_physical`] binds `origin=physical` at
+    /// this single point of entry (B2) and the router maps it through the
+    /// scene's current layout.
+    ///
+    /// No shim connection exists at runtime until the realm spawn manager
+    /// (P1.5.2) inherits the socketpair at fork, so routed deliveries are
+    /// trace-dropped here for now; the full route → encode →
+    /// `ShimServer::deliver_seat_event` → wire path is exercised
+    /// end-to-end by `crate::input`'s tests against the mock shim.
+    fn handle_input(&mut self, event: &smithay::backend::input::InputEvent<WinitInput>) {
+        let size = self.backend.window_size();
+        let view = (size.w.max(0) as u32, size.h.max(0) as u32);
+        for tagged in input::intake_physical(event, (size.w, size.h)) {
+            if let Some(delivery) = self.router.route(tagged, view, self.scene.surface_size()) {
+                // P1.5.2 hands this to ShimServer::deliver_seat_event on
+                // the realm's live connection.
+                trace!(
+                    origin = ?delivery.origin(),
+                    "routed input dropped: no shim connection yet (P1.5.2)"
+                );
+            }
+        }
+    }
+
     /// Draw one frame. Rendering failure is fatal to the skeleton: log it,
     /// record it for [`run`] to propagate (non-zero exit), and stop the
     /// loop rather than spinning on a broken GL context.

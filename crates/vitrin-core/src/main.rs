@@ -52,6 +52,11 @@ mod capture;
 /// `GlesRenderer` when the realm/backend wiring lands (P1.5.2).
 #[cfg_attr(not(test), allow(dead_code))]
 mod dmabuf;
+/// Input intake & routing (P1.3.7): origin tagging at intake (backward
+/// requirement B2), view→surface coordinate mapping, and the preemption
+/// hook point. The nested backend feeds it host input at runtime; seat
+/// delivery to a live shim connection arrives with P1.5.2.
+mod input;
 mod scene;
 /// The shim-facing protocol server (P1.3.4): `vitrin_shim_session` +
 /// `vitrin_shim_surface`, feeding `Scene::commit`. Dead-code-allowed outside

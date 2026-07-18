@@ -12,7 +12,9 @@
 #![cfg(feature = "server")]
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::os::fd::{AsFd, BorrowedFd};
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -23,7 +25,7 @@ use calloop::{EventLoop, LoopHandle};
 use vitrin_ipc::{
     Connection, ConnectionEvent, ConnectionSource, DisconnectReason, FrameHeader, Listener,
     ListenerEvent, ListenerSource, TransportError, HEADER_LEN, MAX_MESSAGE_SIZE,
-    MAX_SEND_QUEUE_BYTES,
+    MAX_SEND_QUEUE_BYTES, MAX_SEND_QUEUE_FDS,
 };
 use vitrin_protocol::wire::patch_size;
 
@@ -36,6 +38,17 @@ const BURST_ID: u32 = 0xB0B;
 /// exceed the cap (4 x 65 535 = 262 140 <= 262 144).
 const PARK_ID: u32 = 0xAB;
 const PARKED_FRAMES: usize = 4;
+/// Object id answered with one max-size fd-less frame (to stuff the shrunken
+/// kernel buffer so everything after it must park) followed by
+/// [`FD_PARKED_REPLIES`] small fd-bearing replies, each carrying a memfd
+/// whose first byte is the reply's opcode -- so the client can prove each fd
+/// arrived attached to its own declaring frame (conventions 2.2).
+const FD_PARK_ID: u32 = 0xFD;
+const FD_PARKED_REPLIES: usize = 3;
+/// Object id answered with an unbounded burst of *small* fd-bearing replies:
+/// bytes alone would fit thousands inside [`MAX_SEND_QUEUE_BYTES`], so only
+/// the [`MAX_SEND_QUEUE_FDS`] cap can stop the flood.
+const FD_FLOOD_ID: u32 = 0xFDF;
 
 /// A unique scratch directory, short enough for `sun_path`.
 fn scratch_dir(tag: &str) -> PathBuf {
@@ -57,6 +70,30 @@ fn frame(object_id: u32, opcode: u8, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(payload);
     patch_size(&mut out);
     out
+}
+
+/// One syntactically complete frame declaring `fd_count = 1`.
+fn fd_frame(object_id: u32, opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    FrameHeader {
+        object_id,
+        size: 0,
+        opcode,
+        fd_count: 1,
+    }
+    .encode_with_placeholder_size(&mut out);
+    out.extend_from_slice(payload);
+    patch_size(&mut out);
+    out
+}
+
+/// A memfd whose first byte is `tag` -- the identity-checkable fd payload
+/// the fd-parking tests attach to replies.
+fn tagged_memfd(tag: u8) -> std::fs::File {
+    let memfd = rustix::fs::memfd_create("bp-tag", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+    let mut file = std::fs::File::from(memfd);
+    file.write_all(&[tag]).unwrap();
+    file
 }
 
 /// A frame of exactly [`MAX_MESSAGE_SIZE`] bytes.
@@ -160,6 +197,57 @@ fn start_server(path: &Path) -> (EventLoop<'static, Server>, Server) {
                                                 .unwrap();
                                         }
                                     }
+                                    FD_PARK_ID => {
+                                        // Stuff the ~4 KiB kernel buffer with
+                                        // one max-size fd-less frame so the
+                                        // fd-bearing replies below must park
+                                        // (each dup'd fd then travels the
+                                        // flush-on-write-readiness path).
+                                        vitrin_ipc::reply(conn, &max_frame(0), None).unwrap();
+                                        for i in 0..FD_PARKED_REPLIES {
+                                            let file = tagged_memfd(i as u8);
+                                            vitrin_ipc::reply(
+                                                conn,
+                                                &fd_frame(FD_PARK_ID, i as u8, b"take this fd"),
+                                                Some(file.as_fd()),
+                                            )
+                                            .unwrap();
+                                            // `file` closes here: the queue
+                                            // must own its own duplicate.
+                                        }
+                                    }
+                                    FD_FLOOD_ID => {
+                                        // Small fd-bearing replies: the byte
+                                        // cap alone would admit thousands, so
+                                        // the fd cap must trip. Bounded so a
+                                        // broken cap fails, not hangs.
+                                        for i in 0..1024u32 {
+                                            let file = tagged_memfd(0);
+                                            let r = vitrin_ipc::reply(
+                                                conn,
+                                                &fd_frame(FD_FLOOD_ID, 0, &i.to_le_bytes()),
+                                                Some(file.as_fd()),
+                                            );
+                                            match r {
+                                                Ok(()) => {}
+                                                Err(TransportError::SendQueueFull { queued }) => {
+                                                    assert!(
+                                                        queued < MAX_SEND_QUEUE_BYTES / 4,
+                                                        "the fd cap, not the byte cap, must have \
+                                                         tripped; {queued} bytes were parked"
+                                                    );
+                                                    state.burst_overflowed = true;
+                                                    break;
+                                                }
+                                                Err(e) => panic!("unexpected reply error: {e}"),
+                                            }
+                                        }
+                                        assert!(
+                                            state.burst_overflowed,
+                                            "1024 fd-bearing replies must overflow the \
+                                             {MAX_SEND_QUEUE_FDS}-fd cap"
+                                        );
+                                    }
                                     _ => {
                                         let payload = &msg.bytes[HEADER_LEN..];
                                         let reply = frame(
@@ -167,7 +255,16 @@ fn start_server(path: &Path) -> (EventLoop<'static, Server>, Server) {
                                             msg.header.opcode + 1,
                                             payload,
                                         );
-                                        vitrin_ipc::reply(conn, &reply, None).unwrap();
+                                        match vitrin_ipc::reply(conn, &reply, None) {
+                                            Ok(()) => {}
+                                            // A dead-peer send error: the
+                                            // source observes the sticky send
+                                            // poison after this callback and
+                                            // removes the connection; the
+                                            // handler just stops replying.
+                                            Err(TransportError::Io(_)) => {}
+                                            Err(e) => panic!("unexpected reply error: {e}"),
+                                        }
                                     }
                                 }
                             }
@@ -413,6 +510,144 @@ fn parked_replies_flush_when_reader_resumes() {
     assert_eq!(state.disconnects, 1, "client must end with a clean close");
 }
 
+// --- Good-path backpressure: parked fd-bearing replies keep their fds ------
+
+#[test]
+fn parked_fd_replies_flush_with_fds_attached() {
+    let path = scratch_dir("bp-fdpark").join("core.sock");
+    let (mut event_loop, mut state) = start_server(&path);
+
+    // A momentarily-slow but compliant client: the server's first reply
+    // (max-size, fd-less) overfills the ~4-8 KiB kernel buffer, so the
+    // fd-bearing replies behind it must park -- exercising the fd
+    // duplication at park time and the flush path that must put the
+    // duplicate on its frame's first sendmsg (positional matching,
+    // conventions 2.2).
+    let (tx, rx) = mpsc::channel();
+    let client = {
+        let path = path.clone();
+        thread::spawn(move || {
+            let mut c = Connection::connect(&path).unwrap();
+            c.send_message(&frame(FD_PARK_ID, 0, b"stall then read fds"), None)
+                .unwrap();
+            thread::sleep(Duration::from_millis(200));
+            let first = c.recv_message().unwrap().expect("the buffer-filling frame");
+            assert_eq!(first.header.size as usize, MAX_MESSAGE_SIZE);
+            assert!(first.fd.is_none(), "first frame declares no fd");
+            for i in 0..FD_PARKED_REPLIES {
+                let msg = c.recv_message().unwrap().expect("a parked fd reply");
+                assert_eq!(msg.header.opcode, i as u8, "replies flush in wire order");
+                let fd = msg.fd.expect("fd must ride its declaring frame");
+                let file = std::fs::File::from(fd);
+                let mut tag = [0u8; 1];
+                file.read_at(&mut tag, 0).unwrap();
+                assert_eq!(tag[0], i as u8, "fd delivered attached to the wrong frame");
+            }
+            tx.send(()).unwrap();
+            // Dropping `c` closes cleanly.
+        })
+    };
+
+    pump(&mut event_loop, &mut state, |s| s.disconnects >= 1);
+    rx.recv_timeout(Duration::from_secs(2))
+        .expect("client did not receive all parked fd replies");
+    client.join().unwrap();
+
+    assert!(
+        state.faults.is_empty(),
+        "no fault expected: {:?}",
+        state.faults
+    );
+    assert_eq!(state.disconnects, 1, "client must end with a clean close");
+}
+
+// --- Acceptance 1b: fd flood hits the send-queue *fd* cap -> disconnected --
+
+#[test]
+fn fd_flood_disconnected_at_send_queue_fd_cap() {
+    let path = scratch_dir("bp-fdflood").join("core.sock");
+    let (mut event_loop, mut state) = start_server(&path);
+
+    // The hostile client: request a stream of small fd-bearing replies and
+    // never read. Each reply is ~12 bytes, so the 256 KiB byte cap alone
+    // would let thousands of duplicated fds park; the fd cap must kill the
+    // connection long before that.
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let client = {
+        let path = path.clone();
+        thread::spawn(move || {
+            let mut c = Connection::connect(&path).unwrap();
+            c.send_message(&frame(FD_FLOOD_ID, 0, b"fd flood"), None)
+                .unwrap();
+            release_rx.recv().unwrap();
+        })
+    };
+
+    let lines = capture_logs(|| {
+        pump(&mut event_loop, &mut state, |s| !s.faults.is_empty());
+    });
+    release_tx.send(()).unwrap();
+    client.join().unwrap();
+
+    assert!(state.burst_overflowed, "reply() must report SendQueueFull");
+    assert!(
+        matches!(
+            state.faults.as_slice(),
+            [DisconnectReason::SlowReader { queued }] if *queued > 0 && *queued < MAX_SEND_QUEUE_BYTES / 4
+        ),
+        "expected one SlowReader fault from the fd cap (small byte count), got {:?}",
+        state.faults
+    );
+    assert_eq!(state.disconnects, 0, "policy kill, not a clean disconnect");
+    assert_logged(&lines, "slow reader");
+}
+
+// --- Send-side death: a peer that stops reading its socket half kills it ---
+
+#[test]
+fn dead_peer_send_error_terminates_connection() {
+    let path = scratch_dir("bp-halfshut").join("core.sock");
+    let (mut event_loop, mut state) = start_server(&path);
+
+    // The hostile shape: shutdown(SHUT_RD) on the client end, then keep
+    // writing requests. Every server reply now fails with EPIPE while the
+    // socket stays open -- without the sticky send poison the connection
+    // would live forever as an undying zombie with no Fault and no removal.
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let client = {
+        let path = path.clone();
+        thread::spawn(move || {
+            let mut c = Connection::connect(&path).unwrap();
+            // One clean round-trip first, so the EPIPE below can only come
+            // from the shutdown, not a connect race.
+            c.send_message(&frame(7, 0, b"ping"), None).unwrap();
+            let reply = c.recv_message().unwrap().expect("echo reply");
+            assert_eq!(reply.header.opcode, 1);
+            rustix::net::shutdown(c.as_fd(), rustix::net::Shutdown::Read).unwrap();
+            c.send_message(&frame(7, 2, b"reply to this"), None)
+                .unwrap();
+            release_rx.recv().unwrap();
+        })
+    };
+
+    let lines = capture_logs(|| {
+        pump(&mut event_loop, &mut state, |s| !s.faults.is_empty());
+    });
+    release_tx.send(()).unwrap();
+    client.join().unwrap();
+
+    assert!(
+        matches!(
+            state.faults.as_slice(),
+            [DisconnectReason::PeerAborted(TransportError::Io(_))]
+        ),
+        "expected exactly one PeerAborted fault, got {:?}",
+        state.faults
+    );
+    assert_eq!(state.disconnects, 0, "send poison, not a clean disconnect");
+    assert_logged(&lines, "peer aborted");
+}
+
 // --- Acceptance 2: the loop is not blocked while misbehavior is handled ----
 
 #[test]
@@ -420,8 +655,9 @@ fn loop_stays_responsive_while_misbehaving_client_handled() {
     let path = scratch_dir("bp-timing").join("core.sock");
     let (mut event_loop, mut state) = start_server(&path);
 
-    // Hostile client: triggers the flood, never reads, stays connected for
-    // the whole test so its kernel buffers remain full.
+    // Hostile client: triggers the flood, never reads, and holds its socket
+    // open past the end of the test so the server-side disconnect can only
+    // come from the slow-reader policy.
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let hostile = {
         let path = path.clone();
@@ -433,29 +669,9 @@ fn loop_stays_responsive_while_misbehaving_client_handled() {
         })
     };
 
-    // Handle the misbehavior (bounded): the whole burst + overflow + kill
-    // must complete well inside the pump deadline -- a loop wedged in a
-    // blocking send to the hostile client would time out here.
-    let handled_in = {
-        let start = Instant::now();
-        pump(&mut event_loop, &mut state, |s| !s.faults.is_empty());
-        start.elapsed()
-    };
-    assert!(
-        matches!(
-            state.faults.as_slice(),
-            [DisconnectReason::SlowReader { .. }]
-        ),
-        "hostile client must die as a slow reader, got {:?}",
-        state.faults
-    );
-    assert!(
-        handled_in < Duration::from_secs(4),
-        "misbehavior handling stalled the loop for {handled_in:?}"
-    );
-
-    // While the hostile client is still connected (buffers full, never
-    // read), a well-behaved client's round-trips must complete promptly.
+    // Polite client, started *before* the loop runs so both connections are
+    // serviced in the same pump window: its round-trips interleave with the
+    // dispatches that flood, overflow, and kill the hostile connection.
     let (tx, rx) = mpsc::channel();
     let polite = {
         let path = path.clone();
@@ -471,16 +687,39 @@ fn loop_stays_responsive_while_misbehaving_client_handled() {
         })
     };
 
+    // One pump drives both concurrently: it ends only when the hostile
+    // client has been killed *and* every polite round-trip completed. A loop
+    // wedged in a blocking send to the hostile client would fail both exit
+    // conditions and time out here.
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(5);
     let mut latencies = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while latencies.len() < 3 && Instant::now() < deadline {
+    let mut fault_at = None;
+    while (latencies.len() < 3 || state.faults.is_empty()) && Instant::now() < deadline {
         event_loop
             .dispatch(Some(Duration::from_millis(50)), &mut state)
             .unwrap();
+        if fault_at.is_none() && !state.faults.is_empty() {
+            fault_at = Some(start.elapsed());
+        }
         while let Ok(latency) = rx.try_recv() {
             latencies.push(latency);
         }
     }
+
+    assert!(
+        matches!(
+            state.faults.as_slice(),
+            [DisconnectReason::SlowReader { .. }]
+        ),
+        "hostile client must die as a slow reader, got {:?}",
+        state.faults
+    );
+    let handled_in = fault_at.expect("hostile client was never killed");
+    assert!(
+        handled_in < Duration::from_secs(4),
+        "misbehavior handling stalled the loop for {handled_in:?}"
+    );
     assert_eq!(
         latencies.len(),
         3,
@@ -493,7 +732,7 @@ fn loop_stays_responsive_while_misbehaving_client_handled() {
     for latency in latencies {
         assert!(
             latency < Duration::from_secs(2),
-            "round-trip took {latency:?} with a misbehaving client present"
+            "round-trip took {latency:?} while a misbehaving client was being handled"
         );
     }
 }

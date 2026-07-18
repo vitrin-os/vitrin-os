@@ -57,6 +57,23 @@ mod dmabuf;
 /// hook point. The nested backend feeds it host input at runtime; seat
 /// delivery to a live shim connection arrives with P1.5.2.
 mod input;
+/// The identity layer of the capability kernel (P1.4.1): the pluggable
+/// `Verifier` trait, the `principals.toml`-backed `StaticVerifier`, and the
+/// principal-identity model every grant and enforcement decision keys on.
+/// Dead-code-allowed outside tests for the same reason as `capture`: fully
+/// exercised by its tests (and `principal`'s) today, consulted at runtime
+/// when the principal listener wiring lands (M1.1 integration).
+#[cfg_attr(not(test), allow(dead_code))]
+mod identity;
+/// The principal-connection protocol server (P1.4.1): the server side of the
+/// P1.1.3 handshake state machine (`vitrin_handshake` + `vitrin_principal`),
+/// where `identity` binds and where the per-connection object table enforces
+/// sender-constrained handles. Dead-code-allowed outside tests for the same
+/// reason as `shim`: exercised end-to-end by its tests over socketpairs
+/// today, wired to the live listener (`ListenerSource`) at M1.1 integration
+/// -- nothing at runtime accepts principal connections before then.
+#[cfg_attr(not(test), allow(dead_code))]
+mod principal;
 mod scene;
 /// The shim-facing protocol server (P1.3.4): `vitrin_shim_session` +
 /// `vitrin_shim_surface`, feeding `Scene::commit`. Dead-code-allowed outside

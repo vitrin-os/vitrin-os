@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import struct
 
 import pytest
 
@@ -86,6 +87,36 @@ def test_wrong_memfd_size_is_a_server_contract_violation(server) -> None:
     with pytest.raises(ServerContractViolation, match="size"):
         grant.observe()
     assert conn.closed
+
+
+def test_unsolicited_fd_is_a_server_contract_violation(server) -> None:
+    """An fd attached to a frame declaring fd_count == 0 is the client-side
+    equivalent of the fd_violation condition (conventions section 2.4): it
+    must never sit queued to mispair with a later fd-declaring frame."""
+    fd = os.open(os.devnull, os.O_RDONLY)
+    server.run(
+        [
+            ("expect", flows.hello_frame()),
+            ("send_fd", flows.bound_frame(), fd),  # bound declares no fd
+        ]
+    )
+    with pytest.raises(ServerContractViolation, match="unsolicited"):
+        _connect(server)
+
+
+def test_fd_flood_is_bounded(server) -> None:
+    """Unclaimed fds cannot accumulate without bound (fd-bomb confinement)."""
+    # A header declaring a 4096-byte frame that never completes, dribbled
+    # one fd-bearing byte at a time: fds queue up, none is ever claimed.
+    steps: list[tuple] = [
+        ("expect", flows.hello_frame()),
+        ("send", struct.pack("<IHBB", flows.PRINCIPAL_ID, 4096, 0, 0)),
+    ]
+    for _ in range(17):
+        steps.append(("send_fd", b"x", os.open(os.devnull, os.O_RDONLY)))
+    server.run(steps)
+    with pytest.raises(ServerContractViolation, match="unclaimed"):
+        _connect(server)
 
 
 def test_refused_capture_is_typed_not_a_frame(server) -> None:

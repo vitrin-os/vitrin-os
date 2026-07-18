@@ -102,3 +102,26 @@ def test_eof_during_handshake_raises_connection_closed(server) -> None:
     server.run([("expect", flows.hello_frame()), ("close",)])
     with pytest.raises(ConnectionClosed):
         _connect(server)
+
+
+def test_connect_timeout_governs_handshake_only(server) -> None:
+    """The connect timeout is cleared once bound: steady-state blocking
+    calls (await_consent waits on an unbounded human delay) never trip it."""
+    server.run(flows.handshake_steps())
+    conn = _connect(server)  # timeout=5.0 during connect + handshake
+    assert conn._transport._sock.gettimeout() is None
+    conn.close()
+
+
+def test_handshake_timeout_is_typed_not_raw(server) -> None:
+    """A server stalling mid-handshake surfaces a typed VitrinError, never
+    a raw TimeoutError outside the hierarchy."""
+    server.run([("expect", flows.hello_frame()), ("linger",)])
+    with pytest.raises(ConnectionClosed, match="timed out"):
+        connect(
+            server.path,
+            identity=flows.IDENTITY,
+            credential_type=flows.CREDENTIAL_TYPE,
+            credential=flows.CREDENTIAL,
+            timeout=0.2,
+        )

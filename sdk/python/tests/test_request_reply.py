@@ -12,6 +12,7 @@ from vitrin_os import (
     Persistence,
     RateLimited,
     Revoked,
+    ServerContractViolation,
     Verb,
     connect,
 )
@@ -151,6 +152,129 @@ def test_events_to_unknown_objects_are_tolerated(server) -> None:
     )
     conn = _connect(server)
     conn.sync()  # the stray event is discarded, the barrier completes
+    conn.close()
+
+
+def test_undefined_consent_state_is_contract_violation(server) -> None:
+    """An enum value outside the negotiated version's set is a server
+    contract violation (typed, connection closed), never a raw ValueError."""
+    server.run(
+        [
+            *flows.handshake_steps(),
+            ("expect", flows.get_realm_frame()),
+            ("expect", flows.request_grant_frame()),
+            ("send", flows.consent_state_frame(9)),
+        ]
+    )
+    conn = _connect(server)
+    grant = conn.request_grant()
+    with pytest.raises(ServerContractViolation, match="consent state"):
+        grant.await_consent()
+    assert conn.closed
+
+
+def test_undefined_resolved_persistence_is_contract_violation(server) -> None:
+    server.run(
+        [
+            *flows.handshake_steps(),
+            ("expect", flows.get_realm_frame()),
+            ("expect", flows.request_grant_frame()),
+            ("send", flows.resolved_frame(outcome=0, verbs=flows.ALL_VERBS, persistence=9)),
+        ]
+    )
+    conn = _connect(server)
+    grant = conn.request_grant()
+    with pytest.raises(ServerContractViolation, match="undefined enum"):
+        grant.await_consent()
+    assert conn.closed
+
+
+def test_undefined_refusal_code_is_contract_violation(server) -> None:
+    server.run(
+        [
+            *flows.granted_steps(),
+            ("expect", encode_move(flows.POINTER_ID, x=1, y=2)),
+            ("expect", encode_sync(1)),
+            ("send", flows.refused_frame(verb=2, code=9)),
+        ]
+    )
+    conn = _connect(server)
+    grant = conn.request_grant().await_consent()
+    with pytest.raises(ServerContractViolation, match="refusal code"):
+        grant.pointer.move(1, 2)
+    assert conn.closed
+
+
+def test_refused_barrier_consumes_done_no_cookie_leak(server) -> None:
+    """A refused barrier still reads its done: no cookie state leaks, and
+    the next barrier round-trips cleanly."""
+    server.run(
+        [
+            *flows.granted_steps(),
+            ("expect", encode_move(flows.POINTER_ID, x=1, y=2)),
+            ("expect", encode_sync(1)),
+            ("send", flows.refused_frame(verb=2, code=2)),
+            ("send", flows.done_frame(1)),
+            ("expect", encode_type(flows.TEXT_ID, text="ok")),
+            ("expect", encode_sync(2)),
+            ("send", flows.done_frame(2)),
+        ]
+    )
+    conn = _connect(server)
+    grant = conn.request_grant().await_consent()
+    with pytest.raises(Revoked):
+        grant.pointer.move(1, 2)
+    grant.text.type("ok")  # the next barrier completes against fresh state
+    assert conn._done_cookies == set()
+    conn.close()
+
+
+def test_flush_false_batch_surfaces_refusals_via_sync(server) -> None:
+    """flush=False actuations + sync(grant): the barrier drains the whole
+    refusal window — the oldest raises, the rest attach as notes."""
+    server.run(
+        [
+            *flows.granted_steps(),
+            ("expect", encode_move(flows.POINTER_ID, x=1, y=2)),
+            ("expect", encode_type(flows.TEXT_ID, text="hi")),
+            ("expect", encode_sync(1)),
+            ("send", flows.refused_frame(verb=2, code=2)),
+            ("send", flows.refused_frame(verb=4, code=2)),  # coalescing: one per (verb, code)
+            ("send", flows.done_frame(1)),
+        ]
+    )
+    conn = _connect(server)
+    grant = conn.request_grant().await_consent()
+    grant.pointer.move(1, 2, flush=False)
+    grant.text.type("hi", flush=False)
+    with pytest.raises(Revoked) as excinfo:
+        conn.sync(grant)
+    assert excinfo.value.verb == 2
+    assert any("verb 4" in note for note in excinfo.value.__notes__)
+    assert not grant._refusals  # the window is fully drained
+    assert not conn.closed
+    conn.close()
+
+
+def test_encode_failure_burns_no_ids_and_registers_no_proxies(server) -> None:
+    """A client-side encode ValueError must not advance the never-reusable
+    watermark or leave dead proxies: the next petition still uses ids 4..8
+    (asserted byte-exactly by the mock script)."""
+    server.run(
+        [
+            *flows.handshake_steps(),
+            ("expect", flows.get_realm_frame()),
+            ("expect", flows.request_grant_frame()),
+            ("send", flows.resolved_frame(outcome=0, verbs=flows.ALL_VERBS)),
+        ]
+    )
+    conn = _connect(server)
+    realm = conn.get_realm()
+    objects_before = dict(conn._objects)
+    with pytest.raises(ValueError, match="bound"):
+        realm.request_grant(resource="x" * 257)  # over the 256-byte bound
+    assert conn._objects == objects_before  # no dead proxies registered
+    conn.request_grant().await_consent()
     conn.close()
 
 

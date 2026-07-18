@@ -23,7 +23,7 @@ from __future__ import annotations
 import fcntl
 import os
 from collections import deque
-from typing import Callable, Iterable
+from typing import Callable, Iterable, NoReturn
 
 from . import messages, protocol
 from .errors import (
@@ -52,6 +52,7 @@ from .protocol import (
     Format,
     Outcome,
     Persistence,
+    Refusal,
     Verb,
 )
 from .transport import Transport
@@ -128,7 +129,16 @@ class _ConsentProxy(_Proxy):
 
     def _handle_event(self, event: Event) -> None:
         if isinstance(event, ConsentStateEvent):
-            self._grant._consent_states.append(ConsentState(event.state))
+            try:
+                state = ConsentState(event.state)
+            except ValueError:
+                # A version-1 server never emits an undefined enum entry:
+                # this is a server contract violation, never a ValueError
+                # surfaced to the caller with the connection left open.
+                self._conn._die_contract(
+                    f"server sent undefined consent state {event.state}"
+                )
+            self._grant._consent_states.append(state)
 
 
 class _ViewProxy(_Proxy):
@@ -261,8 +271,24 @@ class Grant(_Proxy):
             if self._resolved is not None:
                 # resolved is sent exactly once per grant, ever.
                 self._conn._die_contract("server sent resolved twice on one grant")
+            try:
+                # Undefined enum entries from a version-1 server are a
+                # contract violation (validated here, at dispatch, so the
+                # effective_* properties can convert without surprises).
+                Outcome(event.outcome)
+                Persistence(event.persistence)
+            except ValueError as exc:
+                self._conn._die_contract(
+                    f"server sent resolved with an undefined enum value: {exc}"
+                )
             self._resolved = event
         elif isinstance(event, RefusedEvent):
+            try:
+                Refusal(event.code)
+            except ValueError:
+                self._conn._die_contract(
+                    f"server sent undefined refusal code {event.code}"
+                )
             self._refusals.append(event)
 
     # -- petition lifecycle -------------------------------------------------
@@ -367,7 +393,26 @@ class Realm(_Proxy):
         """
         conn = self._conn
         verb_bits = _parse_verbs(verbs)
-        grant_id, consent_id, view_id, pointer_id, text_id = conn._allocate_ids(5)
+        # Peek at the ids and encode *before* committing anything: an
+        # encode-time ValueError (over-bound resource, out-of-u32-range
+        # expiry/rate/flags) is a pure client-side bug and must not burn
+        # never-reusable watermark ids nor leave dead proxies registered.
+        grant_id, consent_id, view_id, pointer_id, text_id = conn._peek_ids(5)
+        request = messages.encode_request_grant(
+            self.id,
+            grant_id=grant_id,
+            consent_id=consent_id,
+            view_id=view_id,
+            pointer_id=pointer_id,
+            text_id=text_id,
+            resource=resource,
+            verbs=verb_bits,
+            expiry_ms=expiry_ms,
+            max_event_rate=max_event_rate,
+            persistence=int(persistence),
+            flags=flags,
+        )
+        conn._commit_ids(5)
         grant = Grant(conn, grant_id)
         grant.consent = _ConsentProxy(conn, consent_id, grant)
         grant._view = _ViewProxy(conn, view_id, grant)
@@ -375,22 +420,7 @@ class Realm(_Proxy):
         grant.text = TextActuator(conn, text_id, grant)
         for proxy in (grant, grant.consent, grant._view, grant.pointer, grant.text):
             conn._register(proxy)
-        conn._send(
-            messages.encode_request_grant(
-                self.id,
-                grant_id=grant_id,
-                consent_id=consent_id,
-                view_id=view_id,
-                pointer_id=pointer_id,
-                text_id=text_id,
-                resource=resource,
-                verbs=verb_bits,
-                expiry_ms=expiry_ms,
-                max_event_rate=max_event_rate,
-                persistence=int(persistence),
-                flags=flags,
-            )
-        )
+        conn._send(request)
         return grant
 
 
@@ -410,6 +440,24 @@ class Connection:
 
     # -- id allocation (watermark rule, conventions section 3.1) -----------
 
+    def _peek_ids(self, count: int) -> list[int]:
+        """The next ``count`` ids *without* advancing the watermark.
+
+        Callers that can still fail client-side after seeing the ids (e.g.
+        encode-time validation) peek first and commit only once the frame
+        that names the ids is actually going onto the wire, so a pure
+        client-side error never burns never-reusable ids.
+        """
+        if self._next_id + count - 1 > protocol.CLIENT_ID_MAX:
+            raise ObjectIdsExhausted(
+                "client object ids exhausted (watermark reached 0xfeffffff)"
+            )
+        return list(range(self._next_id, self._next_id + count))
+
+    def _commit_ids(self, count: int) -> None:
+        """Advance the watermark over ids previously peeked."""
+        self._next_id += count
+
     def _allocate_ids(self, count: int) -> list[int]:
         """Allocate ``count`` strictly-increasing ids; never reused.
 
@@ -417,12 +465,8 @@ class Connection:
         server to catch bugs: ids only ever move forward, and running past
         0xfeffffff raises :class:`ObjectIdsExhausted` locally.
         """
-        if self._next_id + count - 1 > protocol.CLIENT_ID_MAX:
-            raise ObjectIdsExhausted(
-                "client object ids exhausted (watermark reached 0xfeffffff)"
-            )
-        ids = list(range(self._next_id, self._next_id + count))
-        self._next_id += count
+        ids = self._peek_ids(count)
+        self._commit_ids(count)
         return ids
 
     def _allocate_id(self) -> int:
@@ -436,7 +480,7 @@ class Connection:
     def _send(self, frame: bytes) -> None:
         self._transport.send_frame(frame)
 
-    def _die_contract(self, reason: str) -> None:
+    def _die_contract(self, reason: str) -> NoReturn:
         self._transport.close()
         raise ServerContractViolation(reason)
 
@@ -474,24 +518,32 @@ class Connection:
     def _barrier(self, grant: Grant | None = None) -> None:
         """The sync/done barrier idiom (conventions section 6.4).
 
-        Sends ``sync`` and reads the ordered stream until its ``done``.
-        When ``grant`` is given, any refusal on that grant seen before the
-        ``done`` raises the typed exception immediately (the refusal was
-        necessarily caused by a request sent before the sync).
+        Sends ``sync`` and reads the ordered stream until its ``done`` —
+        always consuming the ``done``, so a refused barrier leaks no cookie
+        state. When ``grant`` is given, every refusal queued on that grant
+        by the time the ``done`` arrives raises the typed exception: each
+        one was necessarily caused by a request sent before the sync
+        (possibly an earlier ``flush=False`` actuation or a refusal
+        coalesced into this window, not only the immediately preceding
+        call). The oldest refusal becomes the exception; the rest of the
+        drained window is attached via ``add_note`` — still one round trip,
+        since the ``done`` was already in flight behind the refusals.
         """
         cookie = self._next_cookie
         self._next_cookie = self._next_cookie + 1 & 0xFFFFFFFF
         self._send(messages.encode_sync(cookie))
-        self._run_until(
-            lambda: cookie in self._done_cookies
-            or (grant is not None and bool(grant._refusals))
-        )
-        if grant is not None and grant._refusals:
-            refusal = grant._refusals.popleft()
-            raise refusal_error_by_code(
-                refusal.verb, refusal.code, refusal.retry_after_ms
-            )
+        self._run_until(lambda: cookie in self._done_cookies)
         self._done_cookies.discard(cookie)
+        if grant is not None and grant._refusals:
+            first = grant._refusals.popleft()
+            exc = refusal_error_by_code(first.verb, first.code, first.retry_after_ms)
+            while grant._refusals:
+                extra = grant._refusals.popleft()
+                exc.add_note(
+                    f"also refused in the same barrier window: verb {extra.verb}, "
+                    f"code {extra.code}, retry_after_ms {extra.retry_after_ms}"
+                )
+            raise exc
 
     # -- handshake (P1.1.3 state machine, client side) ----------------------
 
@@ -588,12 +640,17 @@ class Connection:
             flags=flags,
         )
 
-    def sync(self) -> None:
-        """A bare barrier round trip: returns once all prior requests are
+    def sync(self, grant: Grant | None = None) -> None:
+        """A barrier round trip: returns once all prior requests are
         processed and their events delivered (petition resolution excepted).
+
+        Pass ``grant`` to surface that grant's refusals as typed exceptions
+        — the pattern for a batch of ``flush=False`` actuations bounded by
+        one barrier. Without it, refusals stay queued on their grant and
+        surface at that grant's next barrier.
         """
         self._require_bound()
-        self._barrier(None)
+        self._barrier(grant)
 
     # -- frame contract (vitrin_view.frame_ready memfd contract) ------------
 
@@ -686,4 +743,9 @@ def connect(
     except BaseException:
         transport.close()
         raise
+    # The timeout governs connect + handshake only. Steady-state blocking
+    # calls must never trip it: await_consent waits on an unbounded human
+    # consent delay, and a timeout escaping mid-sendall would leave the
+    # framed stream indeterminate.
+    transport.settimeout(None)
     return conn

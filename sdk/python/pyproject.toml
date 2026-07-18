@@ -20,5 +20,10 @@ dev = ["pytest>=8"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# PEP 561: the package is fully annotated; ship the marker so type
+# checkers accept the installed distribution as typed.
+vitrin_os = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

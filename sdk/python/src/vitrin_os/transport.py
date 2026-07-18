@@ -27,6 +27,10 @@ _RECV_SIZE = 65536
 # Room for a generous burst of fds per recvmsg; version 1 sends at most one
 # fd per message, but a pipelined capture burst can deliver several.
 _ANC_SIZE = socket.CMSG_SPACE(16 * array.array("i").itemsize)
+# Ceiling on received-but-unclaimed fds. A conformant server attaches an fd
+# only to the frame that declares it, so the queue stays shallow (bounded by
+# frames still in the receive buffer); growth past this is an fd flood.
+_MAX_UNCLAIMED_FDS = 16
 
 
 class Transport:
@@ -60,7 +64,14 @@ class Transport:
             raise ConnectionClosed("send on a closed connection")
         try:
             self._sock.sendall(frame)
+        except TimeoutError as exc:
+            # A timeout mid-sendall leaves the amount actually written
+            # unknowable (per the socket docs): the framed stream is
+            # indeterminate, so the transport must die, not be reused.
+            self.close()
+            raise ConnectionClosed(f"send timed out mid-frame: {exc}") from exc
         except (BrokenPipeError, ConnectionResetError) as exc:
+            self.close()
             raise ConnectionClosed(f"connection lost while sending: {exc}") from exc
 
     # -- receiving ----------------------------------------------------------
@@ -71,13 +82,22 @@ class Transport:
             data, ancdata, msg_flags, _ = self._sock.recvmsg(
                 _RECV_SIZE, _ANC_SIZE, socket.MSG_CMSG_CLOEXEC
             )
+        except TimeoutError as exc:
+            self.close()
+            raise ConnectionClosed(f"read timed out: {exc}") from exc
         except (ConnectionResetError, BrokenPipeError) as exc:
+            self.close()
             raise ConnectionClosed(f"connection lost while reading: {exc}") from exc
         for level, ctype, cdata in ancdata:
             if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS:
                 fds = array.array("i")
                 fds.frombytes(cdata[: len(cdata) - (len(cdata) % fds.itemsize)])
                 self._fds.extend(fds)
+        if len(self._fds) > _MAX_UNCLAIMED_FDS:
+            self.close()
+            raise ServerContractViolation(
+                f"more than {_MAX_UNCLAIMED_FDS} unclaimed fds queued (fd flood)"
+            )
         if msg_flags & socket.MSG_CTRUNC:
             # An fd bomb overflowed the ancillary buffer; some fds may have
             # been dropped by the kernel. The positional fd/frame matching
@@ -127,6 +147,21 @@ class Transport:
             self.close()
             raise ServerContractViolation(
                 f"fd_count {fd_count} violates the one-fd-per-message invariant"
+            )
+        if self._fds and not self._buf:
+            # Ancillary data is delivered no later than the first byte of
+            # the segment it was sent with, so with the receive buffer
+            # fully drained every queued fd was attached to bytes already
+            # consumed — bytes whose frames declared no fd (or already
+            # claimed theirs). That is the "unsolicited fds attached"
+            # fd_violation condition (conventions section 2.4), and left
+            # unchecked the orphan would silently mispair with the next
+            # fd-declaring frame.
+            if fd is not None:
+                os.close(fd)
+            self.close()
+            raise ServerContractViolation(
+                "unsolicited fd(s) attached to frames that declare none"
             )
         return object_id, opcode, payload, fd
 

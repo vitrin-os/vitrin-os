@@ -9,6 +9,8 @@ steps against one accepted connection:
     ("send_fd", frame_bytes, fd)   sendmsg bytes with one SCM_RIGHTS fd;
                                    the server closes its copy after sending
     ("close",)                     close the connection immediately
+    ("linger",)                    hold the connection open, discarding any
+                                   inbound bytes, until the client closes
 
 Assertion failures inside the thread are re-raised in the test thread by
 ``join()`` (the conftest fixture always joins).
@@ -69,6 +71,10 @@ class MockServer:
                     )
                     os.close(fd)  # sender closes its own copy after sending
                 case ("close",):
+                    return
+                case ("linger",):
+                    while conn.recv(4096):
+                        pass
                     return
                 case _:
                     raise AssertionError(f"unknown script step {step!r}")

@@ -16,8 +16,35 @@
 //! the trusted core (`vitrin-core`, P1.3+) stacks identity, grants, and
 //! dispatch on top. Event-loop integration (calloop on the core side) is
 //! P1.2.2 and builds on [`Connection`]'s `AsFd` implementation; the
-//! backpressure and misbehavior *policy* is P1.2.3 and consumes the
-//! [`error::PeerViolation`] values surfaced here.
+//! backpressure and misbehavior *policy* (P1.2.3) lives in [`event_loop`]
+//! and consumes the [`error::PeerViolation`] / [`error::TransportError`]
+//! values surfaced here.
+//!
+//! # Backpressure & misbehavior posture (P1.2.3)
+//!
+//! Wayland's posture, adopted wholesale: **a misbehaving client dies; the
+//! compositor loop never blocks and never buffers unboundedly on a client's
+//! behalf.** Concretely:
+//!
+//! - **Slow readers.** The non-blocking send path
+//!   ([`Connection::send_or_queue`]) parks bytes the kernel will not take in
+//!   a per-connection queue capped at [`MAX_SEND_QUEUE_BYTES`]; a send that
+//!   would exceed the cap fails with [`error::TransportError::SendQueueFull`]
+//!   and the event-loop glue disconnects the client
+//!   (`DisconnectReason::SlowReader`). The queue is *drained* on
+//!   write-readiness -- a stalled peer costs the loop nothing.
+//! - **Oversized messages / fd-bombs / framing violations.** Already fatal
+//!   at the receive path (see below); the event-loop glue classifies each
+//!   into a [`event_loop::DisconnectReason`], logs it via `tracing`, and
+//!   removes the connection from the loop.
+//! - **No goodbye message.** A connection killed for misbehavior is closed
+//!   without a best-effort terminal protocol error on the wire. Deliberate:
+//!   protocol v0 defines no transport-level "you are being disconnected"
+//!   event, and inventing one here would be an unpaired wire-format change
+//!   (the IDL + prose pages are `track:protocol`'s to evolve). A peer that
+//!   just violated framing cannot be assumed to parse a farewell anyway --
+//!   the same conclusion libwayland reached. If a terminal error event is
+//!   ever wanted, it lands in `protocol/vitrin-v0.xml` first.
 //!
 //! # Maximum message size
 //!
@@ -53,10 +80,14 @@
 //! - fds are matched to frames **positionally**, in byte-stream order, per
 //!   conventions section 2.2: the ancillary payload rides with the frame's
 //!   bytes in one `sendmsg`, and the receiver claims queued fds as frames
-//!   complete. Matching is *strict*: the receiver records the byte-stream
-//!   offset each fd arrived attached to (the kernel never coalesces a
-//!   `recvmsg` across an `SCM_RIGHTS` boundary, so that offset is exact)
-//!   and requires it to fall within the declaring frame's bytes. A frame
+//!   complete. Matching is as strict as the kernel's delivery semantics
+//!   allow: the receiver records the byte-stream *span* of the `recvmsg`
+//!   each fd batch arrived with (the kernel delivers a batch with the
+//!   `recvmsg` that first consumes bytes of the `sendmsg` that carried it
+//!   and never merges two batches, but it may glue preceding fd-less bytes
+//!   onto the head of that `recvmsg`) and requires the span to be
+//!   consistent with the fd being attached to the declaring frame's bytes.
+//!   A frame
 //!   declaring `fd_count = 1` whose bytes carry no fd is
 //!   [`error::PeerViolation::MissingFd`]; an fd attached to the bytes of a
 //!   frame that does not declare it -- "fds attached to a message that
@@ -126,7 +157,9 @@ pub use connection::{Connection, Message, PeerCred};
 #[cfg(feature = "client")]
 pub use error::{LocalMisuse, PeerViolation, TransportError};
 #[cfg(feature = "server")]
-pub use event_loop::{reply, ConnectionEvent, ConnectionSource, ListenerEvent, ListenerSource};
+pub use event_loop::{
+    reply, ConnectionEvent, ConnectionSource, DisconnectReason, ListenerEvent, ListenerSource,
+};
 #[cfg(feature = "client")]
 pub use listener::Listener;
 #[cfg(feature = "client")]
@@ -165,3 +198,53 @@ pub const MAX_FDS_PER_MESSAGE: usize = 1;
 /// flagged to the protocol track rather than legislated here.
 #[cfg(feature = "client")]
 pub const MAX_UNCLAIMED_FDS: usize = 8;
+
+/// Cap on the bytes a [`Connection`]'s non-blocking send path will park for
+/// a peer that is not reading ([`Connection::send_or_queue`]): **256 KiB**,
+/// room for exactly four max-size frames (4 x 65 535 = 262 140 <= 262 144).
+///
+/// Sizing rationale (the reference posture is libwayland's: a client whose
+/// outgoing buffer cannot drain is disconnected -- the compositor never
+/// blocks on it and never buffers without bound):
+///
+/// - **On the order of what the kernel already buffers.** A default AF_UNIX
+///   socket gives a peer roughly `net.core.wmem_default` (~208 KiB) of
+///   in-flight slack; this queue about doubles it. A compliant client that
+///   falls more than ~half a MiB behind on a local socket is not "slow", it
+///   has stopped reading.
+/// - **Real replies are small.** Per-argument bounds keep every schema-legal
+///   v0 message under 35 KiB (see [`MAX_MESSAGE_SIZE`]); four *maximum*
+///   frames of headroom already assumes a pathological burst.
+/// - **Bounded hostile cost.** Worst case a hostile connection pins
+///   `MAX_SEND_QUEUE_BYTES` + one receive scratch + one reassembly buffer,
+///   so even hundreds of hostile connections cost the core tens of MiB, not
+///   gigabytes. (Bytes only: the resources a parked *fd* pins are bounded
+///   separately by [`MAX_SEND_QUEUE_FDS`].)
+/// - **Never less than one frame.** The cap exceeds [`MAX_MESSAGE_SIZE`],
+///   so a single frame can always be parked into an empty queue: exceeding
+///   the cap is always the peer's accumulated slowness, never one legal
+///   message's size.
+#[cfg(feature = "client")]
+pub const MAX_SEND_QUEUE_BYTES: usize = 256 * 1024;
+
+/// Cap on the *file descriptors* parked in one [`Connection`]'s send queue:
+/// **16**, enforced by [`Connection::send_or_queue`] alongside
+/// [`MAX_SEND_QUEUE_BYTES`] -- tripping either sets the same sticky
+/// [`error::TransportError::SendQueueFull`] slow-reader state.
+///
+/// The byte cap alone does not bound fds. Protocol v0 defines *small*
+/// fd-bearing server-to-client events (`vitrin_capture_stream.frame`
+/// transfers a fresh memfd per delivered frame), so 256 KiB of ~50-byte
+/// frame events could otherwise park thousands of duplicated fds for one
+/// non-reading peer. That is a compositor-wide hazard, not a per-connection
+/// one: fd-table exhaustion (`RLIMIT_NOFILE`, commonly a 1024 soft limit)
+/// makes `accept(2)` and fd duplication fail with `EMFILE` for *every*
+/// connection, and each parked memfd duplicate also pins its whole backing
+/// frame allocation -- far past the byte cap's "tens of MiB" hostile-cost
+/// rationale. Sixteen parked fds bound both costs: at most 16 fd-table
+/// entries and 16 pinned frames per hostile connection. A compliant reader
+/// never accumulates that many -- the kernel socket buffer already holds
+/// multiple in-flight fd-bearing frames before the first one parks (compare
+/// libwayland's `MAX_FDS_OUT` of 28 for a whole batched flush).
+#[cfg(feature = "client")]
+pub const MAX_SEND_QUEUE_FDS: usize = 16;

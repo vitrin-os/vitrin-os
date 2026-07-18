@@ -1723,6 +1723,7 @@ dependencies = [
  "calloop 0.14.4",
  "nix",
  "rustix 1.1.4",
+ "tracing",
  "vitrin-protocol",
 ]
 

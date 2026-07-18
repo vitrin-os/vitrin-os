@@ -26,7 +26,7 @@ client = []
 # inside its single-threaded compositor loop -- no dedicated IPC thread, no
 # async runtime (plan risk R7). Implies `client`: the glue wraps those base
 # types.
-server = ["client", "dep:calloop"]
+server = ["client", "dep:calloop", "dep:tracing"]
 
 [dependencies]
 vitrin-protocol = { path = "../vitrin-protocol" }
@@ -50,7 +50,17 @@ nix = { version = "0.31", default-features = false, features = ["socket"] }
 # the SDK never pulls it. No feature of calloop is enabled here: the glue
 # uses only the base `Generic` event source and the `EventSource` trait.
 calloop = { version = "0.14", optional = true }
+# Misbehavior logging (P1.2.3): the event-loop glue logs every connection
+# it terminates (slow reader / oversized / fd bomb / protocol error) so
+# `vitrind` operators can see hostile peers without the core wiring its own
+# hook. Core-side only (`server` feature); the client slice pulls nothing.
+# `default-features = false` drops the `attributes` proc-macro (unused);
+# `std` is needed for the event macros' runtime.
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 # Tests additionally need getpid/getuid/getgid to assert SO_PEERCRED values.
 rustix = { version = "1", features = ["net", "fs", "process"] }
+# The backpressure tests install a capturing subscriber to assert that a
+# terminated connection was actually *logged*, not just surfaced as an event.
+tracing = { version = "0.1", default-features = false, features = ["std"] }

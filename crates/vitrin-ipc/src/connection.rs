@@ -23,7 +23,10 @@ use rustix::net::{
 use vitrin_protocol::wire::{FrameHeader, HEADER_LEN};
 
 use crate::error::{LocalMisuse, PeerViolation, TransportError};
-use crate::{MAX_FDS_PER_MESSAGE, MAX_MESSAGE_SIZE, MAX_UNCLAIMED_FDS};
+use crate::{
+    MAX_FDS_PER_MESSAGE, MAX_MESSAGE_SIZE, MAX_SEND_QUEUE_BYTES, MAX_SEND_QUEUE_FDS,
+    MAX_UNCLAIMED_FDS,
+};
 
 /// Kernel-reported peer credentials (`SO_PEERCRED`), captured once when the
 /// [`Connection`] is created -- at `accept(2)` time for accepted
@@ -65,6 +68,44 @@ pub struct Message {
     pub fd: Option<OwnedFd>,
 }
 
+/// One received `SCM_RIGHTS` fd batch awaiting the frame that declares it.
+///
+/// The kernel delivers an fd batch with the `recvmsg` that first consumes
+/// bytes of the `sendmsg` that carried it, and never delivers two batches
+/// in one `recvmsg` -- but it *does* glue preceding fd-less bytes from the
+/// same sender onto the head of that `recvmsg` (`unix_stream_read_generic`
+/// merges consecutive skbs whose credentials match; the fd array is not
+/// part of that comparison). So the receiver knows the byte-stream *span*
+/// of the delivering `recvmsg`, not the exact offset the sender attached
+/// the fds at; positional matching is enforced against that span.
+struct PendingFd {
+    /// Stream offset of the first byte of the `recvmsg` that delivered
+    /// this fd. The true attach offset is `>= span_start`.
+    span_start: u64,
+    /// Stream offset one past the last byte of that `recvmsg`. Because a
+    /// `recvmsg` ends at (or inside) the fd-bearing segment, the true
+    /// attach offset is `< span_end`.
+    span_end: u64,
+    fd: OwnedFd,
+}
+
+/// One outgoing frame parked by the non-blocking send path
+/// ([`Connection::send_or_queue`]) because the kernel would not take its
+/// bytes yet.
+struct QueuedFrame {
+    /// The unsent tail of the frame (a fully-unsent frame parks whole).
+    bytes: Vec<u8>,
+    /// Bytes of `bytes` already written to the socket by a partial flush.
+    offset: usize,
+    /// The fd that must ride the frame's first `sendmsg` (positional
+    /// matching, conventions 2.2). A duplicate owned by the queue -- the
+    /// caller's `BorrowedFd` cannot outlive the call -- and `None` once
+    /// delivered (any successful `sendmsg` carries the whole ancillary
+    /// payload) or when the head of the frame already went out before the
+    /// frame was parked.
+    fd: Option<OwnedFd>,
+}
+
 /// A connected transport endpoint over a Unix stream socket.
 pub struct Connection {
     fd: OwnedFd,
@@ -76,19 +117,43 @@ pub struct Connection {
     scratch: Box<[u8]>,
     /// Received fds not yet claimed by a completed frame, in arrival
     /// order == frame order (positional matching, conventions 2.2), each
-    /// tagged with the byte-stream offset it arrived attached to. The
-    /// kernel never coalesces a `recvmsg` across an `SCM_RIGHTS` boundary,
-    /// so that offset is exactly the offset of the first byte of the
-    /// `sendmsg` the peer attached the fds to -- which lets `recv_message`
-    /// enforce that an fd was attached to the bytes of the frame that
-    /// declares it, and to no other (conventions 2.4).
-    pending_fds: VecDeque<(u64, OwnedFd)>,
+    /// tagged with the byte-stream span of the `recvmsg` that delivered it
+    /// (see [`PendingFd`]) -- which lets `recv_message` enforce, as tightly
+    /// as the kernel's delivery semantics allow, that an fd was attached to
+    /// the bytes of the frame that declares it, and to no other
+    /// (conventions 2.4).
+    pending_fds: VecDeque<PendingFd>,
     /// Total bytes already consumed from the stream as completed frames,
     /// i.e. the stream offset of `recv_buf[0]`.
     consumed: u64,
     /// Set on the first peer violation; replayed on every later receive so
     /// a caller can never read desynchronized frames past a violation.
     poisoned: Option<PeerViolation>,
+    /// Outgoing frames the non-blocking send path has parked, oldest first
+    /// (FIFO preserves wire order). Empty on the blocking client path.
+    send_queue: VecDeque<QueuedFrame>,
+    /// Total unsent bytes across `send_queue` -- the number
+    /// [`MAX_SEND_QUEUE_BYTES`] caps. Maintained incrementally so the
+    /// event-loop's per-dispatch checks are O(1).
+    queued_send_bytes: usize,
+    /// Undelivered duplicate fds across `send_queue` -- the number
+    /// [`MAX_SEND_QUEUE_FDS`] caps. Counted separately from bytes because
+    /// small fd-bearing frames would otherwise let the byte cap admit
+    /// thousands of parked fds (see the constant's docs).
+    queued_send_fds: usize,
+    /// Set when a send would have pushed the queue past either
+    /// [`MAX_SEND_QUEUE_BYTES`] or [`MAX_SEND_QUEUE_FDS`]; sticky (like
+    /// `poisoned`) so every later send fails identically and the event loop
+    /// reliably observes the overflow after any dispatch.
+    send_overflowed: bool,
+    /// Set on the first fatal (non-`WouldBlock`) I/O error on the
+    /// non-blocking send path; sticky. A partial `try_send_now` write that
+    /// then errors leaves a torn frame prefix in the kernel buffer, so no
+    /// later send may ever touch the stream again -- and the event loop
+    /// checks this after each dispatch to remove the connection (a send
+    /// error with an empty queue would otherwise never surface as a
+    /// terminal condition).
+    send_poisoned: Option<io::ErrorKind>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -102,6 +167,10 @@ impl std::fmt::Debug for Connection {
             .field("buffered", &self.recv_buf.len())
             .field("pending_fds", &self.pending_fds.len())
             .field("poisoned", &self.poisoned)
+            .field("queued_send_bytes", &self.queued_send_bytes)
+            .field("queued_send_fds", &self.queued_send_fds)
+            .field("send_overflowed", &self.send_overflowed)
+            .field("send_poisoned", &self.send_poisoned)
             .finish_non_exhaustive()
     }
 }
@@ -143,6 +212,11 @@ impl Connection {
             pending_fds: VecDeque::new(),
             consumed: 0,
             poisoned: None,
+            send_queue: VecDeque::new(),
+            queued_send_bytes: 0,
+            queued_send_fds: 0,
+            send_overflowed: false,
+            send_poisoned: None,
         })
     }
 
@@ -193,28 +267,7 @@ impl Connection {
         frame: &[u8],
         fd: Option<BorrowedFd<'_>>,
     ) -> Result<(), TransportError> {
-        if frame.len() < HEADER_LEN {
-            return Err(LocalMisuse::FrameTooShort { len: frame.len() }.into());
-        }
-        let header =
-            FrameHeader::decode(frame).expect("frame length checked against HEADER_LEN above");
-        if header.size as usize != frame.len() {
-            // Also enforces MAX_MESSAGE_SIZE: a u16 size field cannot
-            // declare more, so an oversized buffer always mismatches.
-            return Err(LocalMisuse::SizeFieldMismatch {
-                declared: header.size,
-                actual: frame.len(),
-            }
-            .into());
-        }
-        if header.fd_count as usize > MAX_FDS_PER_MESSAGE || (header.fd_count == 1) != fd.is_some()
-        {
-            return Err(LocalMisuse::FdCountMismatch {
-                declared: header.fd_count,
-                attached: fd.is_some(),
-            }
-            .into());
-        }
+        validate_outgoing(frame, fd)?;
 
         let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut cmsg = SendAncillaryBuffer::new(&mut space);
@@ -242,6 +295,223 @@ impl Connection {
             }
             sent += n;
         }
+        Ok(())
+    }
+
+    /// Send one frame on a **non-blocking** socket, parking whatever the
+    /// kernel will not take in the connection's bounded send queue -- the
+    /// event-loop side of sending (the core's fd is non-blocking; the
+    /// blocking SDK path stays on [`send_message`](Self::send_message)).
+    ///
+    /// Semantics:
+    ///
+    /// - Same argument validation as `send_message`; contradictions are
+    ///   [`TransportError::LocalMisuse`] before any byte moves.
+    /// - Attempts an immediate write (after opportunistically flushing any
+    ///   already-parked frames, preserving wire order). On `EAGAIN` the
+    ///   remainder is queued and `Ok(())` returned -- the caller's event
+    ///   loop flushes it on write-readiness via
+    ///   [`flush_send_queue`](Self::flush_send_queue).
+    /// - A queued fd is duplicated (`F_DUPFD_CLOEXEC` via
+    ///   `try_clone_to_owned`), so the caller's fd can be closed as soon as
+    ///   this returns, exactly as with the blocking path.
+    /// - If parking the frame would push the queue past
+    ///   [`MAX_SEND_QUEUE_BYTES`] bytes or [`MAX_SEND_QUEUE_FDS`] parked
+    ///   fds, **nothing is queued** and the sticky
+    ///   [`TransportError::SendQueueFull`] is returned: the peer has stopped
+    ///   reading, and the P1.2.3 policy is to disconnect it -- the event
+    ///   loop observes [`send_queue_overflowed`](Self::send_queue_overflowed)
+    ///   after each dispatch and removes the connection.
+    /// - A fatal (non-`WouldBlock`) I/O error poisons the send side
+    ///   ([`send_poisoned`](Self::send_poisoned)), also sticky: a partial
+    ///   write followed by an error leaves a torn frame prefix in the kernel
+    ///   buffer, so appending anything afterwards would desynchronize the
+    ///   whole outgoing stream. Every later call replays the error without
+    ///   touching the wire; the event loop observes the poison after each
+    ///   dispatch and removes the connection.
+    pub fn send_or_queue(
+        &mut self,
+        frame: &[u8],
+        fd: Option<BorrowedFd<'_>>,
+    ) -> Result<(), TransportError> {
+        validate_outgoing(frame, fd)?;
+        if self.send_overflowed {
+            return Err(TransportError::SendQueueFull {
+                queued: self.queued_send_bytes,
+            });
+        }
+        if let Some(kind) = self.send_poisoned {
+            return Err(TransportError::Io(kind.into()));
+        }
+        if !self.send_queue.is_empty() {
+            self.flush_send_queue()?;
+        }
+        if self.send_queue.is_empty() {
+            let sent = self.try_send_now(frame, fd)?;
+            if sent == frame.len() {
+                return Ok(());
+            }
+            // Any successful sendmsg carried the whole ancillary payload, so
+            // the fd is still owed only if *zero* bytes went out.
+            let parked_fd = if sent == 0 {
+                fd.map(|fd| fd.try_clone_to_owned()).transpose()?
+            } else {
+                None
+            };
+            self.park(frame[sent..].to_vec(), parked_fd)
+        } else {
+            // Earlier frames are still parked; this one must queue whole
+            // behind them to preserve wire order (fd included).
+            let parked_fd = fd.map(|fd| fd.try_clone_to_owned()).transpose()?;
+            self.park(frame.to_vec(), parked_fd)
+        }
+    }
+
+    /// Write as much of the parked send queue as the kernel will take.
+    /// `EAGAIN` is success ("wait for the next write-readiness"), so `Ok`
+    /// does **not** mean empty -- check
+    /// [`queued_send_bytes`](Self::queued_send_bytes). Real I/O errors (e.g.
+    /// `EPIPE` after the peer closed) poison the send side
+    /// ([`send_poisoned`](Self::send_poisoned)) and are returned; the
+    /// connection should be dropped.
+    pub fn flush_send_queue(&mut self) -> Result<(), TransportError> {
+        while let Some(front) = self.send_queue.front_mut() {
+            let result = if let Some(fd) = front.fd.as_ref() {
+                debug_assert_eq!(front.offset, 0, "an fd rides its frame's first byte");
+                let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+                let mut cmsg = SendAncillaryBuffer::new(&mut space);
+                let fds = [fd.as_fd()];
+                let pushed = cmsg.push(SendAncillaryMessage::ScmRights(&fds));
+                assert!(pushed, "ancillary buffer sized for exactly one fd");
+                let iov = [IoSlice::new(&front.bytes)];
+                retry_eintr(|| net::sendmsg(&self.fd, &iov, &mut cmsg, SendFlags::NOSIGNAL))
+            } else {
+                retry_eintr(|| {
+                    net::send(&self.fd, &front.bytes[front.offset..], SendFlags::NOSIGNAL)
+                })
+            };
+            match result {
+                Ok(0) => return Err(self.poison_send(io::ErrorKind::WriteZero.into())),
+                Ok(n) => {
+                    // Delivered with the first successful sendmsg; drop our
+                    // duplicate.
+                    if front.fd.take().is_some() {
+                        self.queued_send_fds -= 1;
+                    }
+                    front.offset += n;
+                    self.queued_send_bytes -= n;
+                    if front.offset == front.bytes.len() {
+                        self.send_queue.pop_front();
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(self.poison_send(e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Unsent bytes currently parked by [`send_or_queue`](Self::send_or_queue)
+    /// (the quantity [`MAX_SEND_QUEUE_BYTES`] caps). Non-zero means the
+    /// event loop should watch for write-readiness and
+    /// [`flush_send_queue`](Self::flush_send_queue).
+    pub fn queued_send_bytes(&self) -> usize {
+        self.queued_send_bytes
+    }
+
+    /// Undelivered duplicate fds currently parked in the send queue (the
+    /// quantity [`MAX_SEND_QUEUE_FDS`] caps).
+    pub fn queued_send_fds(&self) -> usize {
+        self.queued_send_fds
+    }
+
+    /// Whether a send has hit the [`MAX_SEND_QUEUE_BYTES`] or
+    /// [`MAX_SEND_QUEUE_FDS`] cap: the peer is a slow reader and the P1.2.3
+    /// policy is to disconnect it. Sticky.
+    pub fn send_queue_overflowed(&self) -> bool {
+        self.send_overflowed
+    }
+
+    /// The sticky fatal send-side I/O error, if one has occurred
+    /// (e.g. `EPIPE` from a peer that shut down its read side, or an error
+    /// after a partial write that left a torn frame on the wire). The event
+    /// loop checks this after each dispatch -- a send failure with an empty
+    /// queue has no other observation point -- and removes the connection.
+    pub fn send_poisoned(&self) -> Option<io::ErrorKind> {
+        self.send_poisoned
+    }
+
+    /// One immediate non-blocking write attempt of a fresh frame (empty
+    /// queue): the ancillary fd rides the first `sendmsg`, then plain sends
+    /// continue until done or `EAGAIN`. Returns the bytes written (`0` means
+    /// the fd was *not* delivered); `EAGAIN` is never an error here.
+    fn try_send_now(
+        &mut self,
+        frame: &[u8],
+        fd: Option<BorrowedFd<'_>>,
+    ) -> Result<usize, TransportError> {
+        let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut cmsg = SendAncillaryBuffer::new(&mut space);
+        let fds;
+        if let Some(fd) = fd {
+            fds = [fd];
+            let pushed = cmsg.push(SendAncillaryMessage::ScmRights(&fds));
+            assert!(pushed, "ancillary buffer sized for exactly one fd");
+        }
+        let iov = [IoSlice::new(frame)];
+        let mut sent =
+            match retry_eintr(|| net::sendmsg(&self.fd, &iov, &mut cmsg, SendFlags::NOSIGNAL)) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(0),
+                Err(e) => return Err(self.poison_send(e)),
+            };
+        while sent < frame.len() {
+            match retry_eintr(|| net::send(&self.fd, &frame[sent..], SendFlags::NOSIGNAL)) {
+                Ok(0) => return Err(self.poison_send(io::ErrorKind::WriteZero.into())),
+                Ok(n) => sent += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                // An error *after* a partial write leaves a torn frame
+                // prefix in the kernel buffer; the poison guarantees no
+                // later send can append past it.
+                Err(e) => return Err(self.poison_send(e)),
+            }
+        }
+        Ok(sent)
+    }
+
+    /// Record a fatal send-side I/O error (sticky) and convert it. Every
+    /// non-`WouldBlock` error on the non-blocking send path funnels through
+    /// here so the event loop can observe the failure after the dispatch
+    /// even when nothing is parked in the queue.
+    fn poison_send(&mut self, e: io::Error) -> TransportError {
+        self.send_poisoned = Some(e.kind());
+        TransportError::Io(e)
+    }
+
+    /// Park an unsent (tail of a) frame, enforcing both queue caps: bytes
+    /// ([`MAX_SEND_QUEUE_BYTES`]) and parked duplicate fds
+    /// ([`MAX_SEND_QUEUE_FDS`] -- without it, small fd-bearing frames would
+    /// let a non-reading peer pin thousands of fds inside the byte cap). On
+    /// overflow nothing is queued, the sticky overflow flag is set, and the
+    /// dropped duplicate fd (if any) closes here -- the connection is about
+    /// to die anyway.
+    fn park(&mut self, bytes: Vec<u8>, fd: Option<OwnedFd>) -> Result<(), TransportError> {
+        debug_assert!(!bytes.is_empty());
+        if self.queued_send_bytes + bytes.len() > MAX_SEND_QUEUE_BYTES
+            || self.queued_send_fds + usize::from(fd.is_some()) > MAX_SEND_QUEUE_FDS
+        {
+            self.send_overflowed = true;
+            return Err(TransportError::SendQueueFull {
+                queued: self.queued_send_bytes,
+            });
+        }
+        self.queued_send_bytes += bytes.len();
+        self.queued_send_fds += usize::from(fd.is_some());
+        self.send_queue.push_back(QueuedFrame {
+            bytes,
+            offset: 0,
+            fd,
+        });
         Ok(())
     }
 
@@ -275,37 +545,51 @@ impl Connection {
                     let bytes = self.recv_buf[..size].to_vec();
                     self.recv_buf.drain(..size);
                     // This frame occupied [frame_start, frame_end) of the
-                    // byte stream. Every pending fd's arrival offset is
-                    // >= frame_start structurally: an offset below it would
-                    // have been checked (claimed or fataled) when the frame
-                    // covering it completed, and `fill` only ever tags fds
-                    // with the current end of the buffered stream.
-                    let frame_end = self.consumed + size as u64;
+                    // byte stream. Matching is against each pending fd's
+                    // recvmsg *span* (see [`PendingFd`]): the kernel can
+                    // glue fd-less bytes onto the head of the recvmsg that
+                    // delivers an fd batch, so the exact attach offset is
+                    // only known to lie inside the span.
+                    let frame_start = self.consumed;
+                    let frame_end = frame_start + size as u64;
                     self.consumed = frame_end;
                     let fd = if header.fd_count == 1 {
-                        match self.pending_fds.pop_front() {
-                            // The declared fd, attached to this frame's own
-                            // bytes (conventions 2.2/2.4).
-                            Some((offset, fd)) if offset < frame_end => Some(fd),
-                            // The fd travels with the frame's own bytes, so
-                            // a completed frame whose queue is empty -- or
-                            // whose front fd arrived attached to *later*
-                            // bytes -- means the peer never attached one to
-                            // this frame.
+                        match self.pending_fds.front() {
+                            // The declared fd. A compliant peer attaches it
+                            // to the frame's first byte, and the recvmsg
+                            // that consumed that byte -- delivering the fd
+                            // -- necessarily started at or before it, so
+                            // `span_start <= frame_start` holds for the
+                            // frame's own fd (conventions 2.2/2.4).
+                            Some(entry) if entry.span_start <= frame_start => {
+                                let entry = self.pending_fds.pop_front().expect("front exists");
+                                Some(entry.fd)
+                            }
+                            // An empty queue -- or a front fd whose whole
+                            // delivering recvmsg lies after the frame began
+                            // -- means the frame's own bytes carried no fd.
+                            // (A front fd from strictly *earlier* bytes is
+                            // structurally impossible: it would have been
+                            // claimed or fataled when the frame covering
+                            // those bytes completed.)
                             _ => return Err(self.poison(PeerViolation::MissingFd)),
                         }
                     } else {
                         None
                     };
-                    // Any fd still queued that was attached to this frame's
-                    // bytes has no declaring frame: either fds on a frame
+                    // Any fd still queued whose delivering recvmsg ended
+                    // within this frame's bytes was attached at an offset
+                    // below `frame_end`, i.e. to this frame or earlier --
+                    // and no frame declared it: either fds on a frame
                     // declaring none, or a second fd on a one-fd frame.
                     // Both are fatal fd_violation (conventions 2.4) --
                     // detected here, at the only layer that can see them,
                     // so a smuggled fd can never shift positional matching
-                    // for a later frame.
-                    if let Some(&(offset, _)) = self.pending_fds.front() {
-                        if offset < frame_end {
+                    // for a later frame. (A span reaching past `frame_end`
+                    // may belong to the *next* frame's first byte; it stays
+                    // pending and is judged when that frame completes.)
+                    if let Some(front) = self.pending_fds.front() {
+                        if front.span_end <= frame_end {
                             return Err(self.poison(PeerViolation::UnsolicitedFd));
                         }
                     }
@@ -335,10 +619,13 @@ impl Connection {
             [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAX_UNCLAIMED_FDS))];
         let mut cmsg = RecvAncillaryBuffer::new(&mut space);
 
-        // Stream offset of the first byte this recvmsg will return. The
-        // kernel stops a recvmsg at an ancillary barrier, so fds harvested
-        // below were attached by the peer at exactly this offset.
-        let arrival_offset = self.consumed + self.recv_buf.len() as u64;
+        // Stream offset of the first byte this recvmsg will return: the
+        // start of the span the harvested fds are tagged with. The kernel
+        // stops a recvmsg after delivering one fd batch (so at most one
+        // batch arrives here), but it may glue preceding fd-less bytes onto
+        // the head, so the batch's true attach offset is only known to lie
+        // within [span_start, span_end) -- see [`PendingFd`].
+        let span_start = self.consumed + self.recv_buf.len() as u64;
 
         let (bytes, flags) = {
             let mut iov = [IoSliceMut::new(&mut self.scratch)];
@@ -356,6 +643,7 @@ impl Connection {
             // delivered remainder, and the connection dies.
             return Err(self.poison(PeerViolation::AncillaryTruncated));
         }
+        let span_end = span_start + bytes as u64;
         for cm in cmsg.drain() {
             if let RecvAncillaryMessage::ScmRights(fds) = cm {
                 for fd in fds {
@@ -364,7 +652,11 @@ impl Connection {
                         // here; queued fds close when the connection does.
                         return Err(self.poison(PeerViolation::UnclaimedFdOverflow));
                     }
-                    self.pending_fds.push_back((arrival_offset, fd));
+                    self.pending_fds.push_back(PendingFd {
+                        span_start,
+                        span_end,
+                        fd,
+                    });
                 }
             }
         }
@@ -383,6 +675,34 @@ impl AsFd for Connection {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
+}
+
+/// The shared outgoing-frame validation of [`Connection::send_message`] and
+/// [`Connection::send_or_queue`]: `frame` must be exactly one well-formed
+/// frame and `fd` must match its header's `fd_count`. Contradictions are
+/// [`LocalMisuse`], caught before any byte hits the wire.
+fn validate_outgoing(frame: &[u8], fd: Option<BorrowedFd<'_>>) -> Result<(), TransportError> {
+    if frame.len() < HEADER_LEN {
+        return Err(LocalMisuse::FrameTooShort { len: frame.len() }.into());
+    }
+    let header = FrameHeader::decode(frame).expect("frame length checked against HEADER_LEN above");
+    if header.size as usize != frame.len() {
+        // Also enforces MAX_MESSAGE_SIZE: a u16 size field cannot declare
+        // more, so an oversized buffer always mismatches.
+        return Err(LocalMisuse::SizeFieldMismatch {
+            declared: header.size,
+            actual: frame.len(),
+        }
+        .into());
+    }
+    if header.fd_count as usize > MAX_FDS_PER_MESSAGE || (header.fd_count == 1) != fd.is_some() {
+        return Err(LocalMisuse::FdCountMismatch {
+            declared: header.fd_count,
+            attached: fd.is_some(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Retry a syscall on `EINTR` (harmless here: for these blocking calls the

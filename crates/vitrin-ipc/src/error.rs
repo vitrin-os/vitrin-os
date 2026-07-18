@@ -20,6 +20,14 @@
 //!   P1.2.3's job and consumes these values. After a violation the
 //!   connection is poisoned: further `recv_message` calls return the same
 //!   violation rather than desynchronized garbage.
+//! - [`TransportError::SendQueueFull`] -- the peer stopped *reading*: the
+//!   non-blocking send path's per-connection queue hit
+//!   [`crate::MAX_SEND_QUEUE_BYTES`] or [`crate::MAX_SEND_QUEUE_FDS`].
+//!   Not a wire violation (nothing the peer
+//!   sent was malformed) but the same disposition: the connection dies
+//!   (`DisconnectReason::SlowReader` in the event-loop policy), because the
+//!   only alternatives are unbounded buffering or blocking the compositor
+//!   loop. Sticky like a poison: later sends keep returning it.
 
 use std::fmt;
 use std::io;
@@ -41,6 +49,15 @@ pub enum TransportError {
     /// The peer violated a framing or fd-passing invariant; the connection
     /// is dead. See [`PeerViolation`].
     PeerViolation(PeerViolation),
+    /// A non-blocking send could not be parked because the connection's
+    /// send queue already holds `queued` bytes and accepting the frame
+    /// would push it past [`crate::MAX_SEND_QUEUE_BYTES`] bytes or
+    /// [`crate::MAX_SEND_QUEUE_FDS`] parked fds: the peer has
+    /// stopped reading (slow reader). Sticky like a receive-side poison --
+    /// every later [`Connection::send_or_queue`](crate::Connection::send_or_queue)
+    /// returns it again; the P1.2.3 policy is to drop the connection, never
+    /// to stall the loop waiting for the peer to drain.
+    SendQueueFull { queued: usize },
 }
 
 /// A self-contradictory `send_message` call, caught before any byte hits
@@ -100,6 +117,12 @@ impl fmt::Display for TransportError {
             ),
             TransportError::LocalMisuse(m) => write!(f, "local send_message misuse: {m}"),
             TransportError::PeerViolation(v) => write!(f, "peer violation: {v}"),
+            TransportError::SendQueueFull { queued } => write!(
+                f,
+                "send queue full: {queued} bytes already parked for a peer that is not reading (caps: {} bytes, {} fds)",
+                crate::MAX_SEND_QUEUE_BYTES,
+                crate::MAX_SEND_QUEUE_FDS
+            ),
         }
     }
 }

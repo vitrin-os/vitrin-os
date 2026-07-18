@@ -16,14 +16,20 @@
 //! - **One enforcement chokepoint.** When capture (P1.3.6) and actuation
 //!   (P1.3.7) land, every request is checked at a single site against the
 //!   grant table. No second authority-checking code path.
-//! - **Budgeted dependencies** (plan risk R7): the skeleton links Smithay's
-//!   winit backend, calloop, and a tracing subscriber — nothing else.
+//! - **Budgeted dependencies** (plan risk R7): the core links Smithay (its
+//!   winit and pixman-software-renderer backends), calloop, and a tracing
+//!   subscriber — nothing else, at runtime or in tests. The headless capture
+//!   golden asserts against the deterministic test pattern in-process, so it
+//!   needs no image codec; PNG serialization is the SDK's job (P1.8.2), never
+//!   the core.
 //!
-//! P1.3.1 scope: nested mode only (`vitrind --nested`) — the core runs as a
-//! client of the host compositor, presents exactly one host window, and
-//! renders a deterministic test pattern at the host's frame cadence.
-//! Headless mode (`--headless`) is P1.3.2; the shim-facing protocol server
-//! is P1.3.4.
+//! Scope so far: two presentation backends, both rendering the same
+//! deterministic test pattern. Nested mode (`vitrind --nested`) runs the core
+//! as a client of the host compositor, presenting one host window at the
+//! host's frame cadence (P1.3.1). Headless mode (`vitrind --headless --size
+//! WxH`) drives a fixed-size virtual output composited entirely in software
+//! (pixman) and retained in memory for capture, with no display or GPU
+//! (P1.3.2) — the path CI runs on. The shim-facing protocol server is P1.3.4.
 
 mod backend;
 mod test_pattern;
@@ -34,36 +40,122 @@ const USAGE: &str = "\
 vitrind — Vitrin OS trusted core
 
 USAGE:
-    vitrind --nested     Run nested inside the host compositor (one window,
-                         test pattern). Headless mode arrives with P1.3.2.
-    vitrind --help       Show this help.
-    vitrind --version    Show the version.
+    vitrind --nested            Run nested inside the host compositor (one
+                                window, test pattern).
+    vitrind --headless [--size WxH]
+                                Run headless: a fixed-size virtual output
+                                (default 1280x800) composited in software
+                                (pixman) and retained in memory for capture.
+    vitrind --help              Show this help.
+    vitrind --version           Show the version.
 ";
+
+/// The default virtual-output size for `--headless` when `--size` is omitted;
+/// matches the nested backend's initial window size so the two backends agree
+/// on the same content by default.
+const DEFAULT_HEADLESS_SIZE: (u32, u32) = (1280, 800);
 
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     RunNested,
+    RunHeadless { size: (u32, u32) },
     Help,
     Version,
 }
 
-/// Hand-rolled argument parsing: the surface is three flags, which does not
-/// justify pulling an argument-parsing crate into the TCB (plan risk R7).
+/// The presentation mode selected on the command line, before it is paired
+/// with any `--size` into an [`Action`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Mode {
+    Nested,
+    Headless,
+}
+
+/// Hand-rolled argument parsing: the surface is a handful of flags, which does
+/// not justify pulling an argument-parsing crate into the TCB (plan risk R7).
+/// `--size` consumes the following argument (`--size 1280x800`) and is only
+/// meaningful with `--headless`.
 fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, String> {
-    let mut action = None;
-    for arg in args {
+    let mut mode: Option<Mode> = None;
+    let mut size: Option<(u32, u32)> = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         match arg {
-            "--nested" => match action {
-                None => action = Some(Action::RunNested),
-                Some(_) => return Err("`--nested` given more than once".into()),
-            },
+            "--nested" => set_mode(&mut mode, Mode::Nested)?,
+            "--headless" => set_mode(&mut mode, Mode::Headless)?,
+            "--size" => {
+                if size.is_some() {
+                    return Err("`--size` given more than once".into());
+                }
+                let value = args
+                    .next()
+                    .ok_or("`--size` requires a `WxH` value (e.g. `--size 1280x800`)")?;
+                size = Some(parse_size(value)?);
+            }
             "--help" | "-h" => return Ok(Action::Help),
             "--version" | "-V" => return Ok(Action::Version),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
-    action.ok_or_else(|| "no mode given (expected `--nested`)".into())
+
+    // `--help`/`--version` already returned above, so only the run modes
+    // remain to resolve; `--size` is meaningless without `--headless`.
+    match (mode, size) {
+        (Some(Mode::Nested), None) => Ok(Action::RunNested),
+        (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
+        (Some(Mode::Headless), size) => Ok(Action::RunHeadless {
+            size: size.unwrap_or(DEFAULT_HEADLESS_SIZE),
+        }),
+        (None, Some(_)) => Err("`--size` requires `--headless`".into()),
+        (None, None) => Err("no mode given (expected `--nested` or `--headless`)".into()),
+    }
+}
+
+/// Record the selected [`Mode`], rejecting a second (or conflicting) mode flag.
+fn set_mode(slot: &mut Option<Mode>, mode: Mode) -> Result<(), String> {
+    match slot {
+        None => {
+            *slot = Some(mode);
+            Ok(())
+        }
+        Some(_) => {
+            Err("more than one mode given (expected one of `--nested`, `--headless`)".into())
+        }
+    }
+}
+
+/// Parse a `WxH` size such as `1280x800` into a `(width, height)` that fits
+/// the `i32` physical-pixel domain the backend uses. A missing `x`, a
+/// non-numeric field, a zero dimension, or a dimension past `i32::MAX` is an
+/// error: a virtual output with no area — or one large enough to wrap negative
+/// on the backend's `i32` cast — is never what the caller meant.
+fn parse_size(value: &str) -> Result<(u32, u32), String> {
+    let (w, h) = value
+        .split_once('x')
+        .ok_or_else(|| format!("malformed `--size` `{value}` (expected `WxH`, e.g. `1280x800`)"))?;
+    let width: u32 = w
+        .parse()
+        .map_err(|_| format!("malformed `--size` width in `{value}`"))?;
+    let height: u32 = h
+        .parse()
+        .map_err(|_| format!("malformed `--size` height in `{value}`"))?;
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "`--size` `{value}` must have positive width and height"
+        ));
+    }
+    // The backend carries the size as `i32` physical pixels; a dimension past
+    // `i32::MAX` would wrap negative on that cast and silently degenerate the
+    // output. Reject it with a clear message instead of accepting a size that
+    // can never be honored.
+    if width > i32::MAX as u32 || height > i32::MAX as u32 {
+        return Err(format!(
+            "`--size` `{value}` exceeds the maximum virtual-output dimension ({})",
+            i32::MAX
+        ));
+    }
+    Ok((width, height))
 }
 
 fn main() -> ExitCode {
@@ -88,6 +180,16 @@ fn main() -> ExitCode {
         Action::RunNested => {
             init_tracing();
             match backend::winit::run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    tracing::error!("fatal: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Action::RunHeadless { size } => {
+            init_tracing();
+            match backend::headless::run(size) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     tracing::error!("fatal: {err}");
@@ -120,8 +222,64 @@ mod tests {
     }
 
     #[test]
+    fn headless_flag_defaults_to_1280x800() {
+        assert_eq!(
+            parse_args(["--headless"]),
+            Ok(Action::RunHeadless { size: (1280, 800) })
+        );
+    }
+
+    #[test]
+    fn headless_size_is_parsed() {
+        assert_eq!(
+            parse_args(["--headless", "--size", "1280x800"]),
+            Ok(Action::RunHeadless { size: (1280, 800) })
+        );
+        assert_eq!(
+            parse_args(["--headless", "--size", "640x480"]),
+            Ok(Action::RunHeadless { size: (640, 480) })
+        );
+    }
+
+    #[test]
+    fn malformed_size_is_an_error() {
+        // Missing separator, empty field, extra field, non-numeric, and zero
+        // dimensions are all rejected.
+        assert!(parse_args(["--headless", "--size", "1280"]).is_err());
+        assert!(parse_args(["--headless", "--size", "1280x"]).is_err());
+        assert!(parse_args(["--headless", "--size", "1280x800x1"]).is_err());
+        assert!(parse_args(["--headless", "--size", "widexhigh"]).is_err());
+        assert!(parse_args(["--headless", "--size", "0x800"]).is_err());
+        assert!(parse_args(["--headless", "--size", "1280x0"]).is_err());
+        // `--size` as the final argument has no value to consume.
+        assert!(parse_args(["--headless", "--size"]).is_err());
+    }
+
+    #[test]
+    fn oversized_size_is_an_error() {
+        // A dimension past i32::MAX would wrap negative on the backend's i32
+        // cast; reject it rather than silently degenerating the output.
+        assert!(parse_args(["--headless", "--size", "3000000000x800"]).is_err());
+        assert!(parse_args(["--headless", "--size", "1280x4294967295"]).is_err());
+        // The boundary value i32::MAX itself is in-domain and accepted.
+        assert_eq!(
+            parse_args(["--headless", "--size", "2147483647x1"]),
+            Ok(Action::RunHeadless {
+                size: (2147483647, 1)
+            })
+        );
+    }
+
+    #[test]
+    fn size_without_headless_is_an_error() {
+        assert!(parse_args(["--size", "1280x800"]).is_err());
+        assert!(parse_args(["--nested", "--size", "1280x800"]).is_err());
+    }
+
+    #[test]
     fn help_and_version_win_over_mode() {
         assert_eq!(parse_args(["--nested", "--help"]), Ok(Action::Help));
+        assert_eq!(parse_args(["--headless", "--help"]), Ok(Action::Help));
         assert_eq!(parse_args(["--version"]), Ok(Action::Version));
     }
 
@@ -132,12 +290,14 @@ mod tests {
 
     #[test]
     fn unknown_argument_is_an_error() {
-        assert!(parse_args(["--headless"]).is_err());
+        assert!(parse_args(["--frobnicate"]).is_err());
         assert!(parse_args(["--nested", "extra"]).is_err());
     }
 
     #[test]
-    fn duplicate_mode_is_an_error() {
+    fn duplicate_or_conflicting_mode_is_an_error() {
         assert!(parse_args(["--nested", "--nested"]).is_err());
+        assert!(parse_args(["--headless", "--headless"]).is_err());
+        assert!(parse_args(["--nested", "--headless"]).is_err());
     }
 }

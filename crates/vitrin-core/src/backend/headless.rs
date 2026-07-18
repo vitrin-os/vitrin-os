@@ -34,14 +34,15 @@ use smithay::reexports::pixman::Image;
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use tracing::info;
 
+use crate::scene::Scene;
 use crate::test_pattern;
 
-/// Composite the virtual output once and read it back as tightly packed
-/// RGBA8888 (rows top-down) — the same byte layout [`test_pattern::render`]
-/// produces. This is the compositing seam the golden test drives directly,
-/// with no event loop: create a software renderer, allocate an offscreen
-/// memory framebuffer, blit the test pattern into it 1:1, then export the
-/// composited pixels.
+/// Composite an **empty scene** (the deterministic test-pattern background)
+/// once and read it back as tightly packed RGBA8888 (rows top-down) — the
+/// same byte layout [`test_pattern::render`] produces. This is the
+/// compositing seam the golden test drives directly, with no event loop:
+/// create a software renderer, allocate an offscreen memory framebuffer,
+/// blit the composed view into it 1:1, then export the composited pixels.
 ///
 /// A zero or negative size has no pixels; it yields an empty buffer rather
 /// than driving pixman with a degenerate image.
@@ -59,7 +60,7 @@ pub(crate) fn render_once(size: Size<i32, Physical>) -> Result<Vec<u8>, Box<dyn 
     let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
     let mut framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
 
-    composite(&mut renderer, &mut framebuffer, size)?;
+    composite(&mut renderer, &mut framebuffer, size, &Scene::new())?;
     readback(&mut renderer, &mut framebuffer, size)
 }
 
@@ -95,16 +96,17 @@ fn readback(
 /// Run the headless compositor: composite the virtual output once, then idle
 /// until SIGINT/SIGTERM.
 ///
-/// **Refresh-driving decision (the one this task settles): render once, then
-/// idle.** P1.3.2 has no client surfaces and therefore no damage source, so
-/// the composited pattern is static. A periodic timer (the nested backend's
-/// [`FRAME_BUDGET`](super::winit) posture) would re-render byte-identical
-/// pixels forever and burn CI CPU for nothing; a damage-driven loop
-/// degenerates to exactly this single initial frame, because nothing ever
-/// reports damage. So we composite once into the retained framebuffer and let
-/// the event loop block on signals. [`HeadlessState::redraw`] is factored as a
-/// re-entrant entry point so P1.3.3 can call it again when real client damage
-/// arrives, without reworking this control flow.
+/// **Refresh-driving decision (settled in P1.3.2): render once, then idle.**
+/// Until the shim-facing protocol server (P1.3.4) feeds the scene real
+/// client commits there is no damage source, so the composed view is static.
+/// A periodic timer (the nested backend's [`FRAME_BUDGET`](super::winit)
+/// posture) would re-render byte-identical pixels forever and burn CI CPU
+/// for nothing; a damage-driven loop degenerates to exactly this single
+/// initial frame, because nothing ever reports damage. So we composite once
+/// into the retained framebuffer and let the event loop block on signals.
+/// [`HeadlessState::redraw`] is the re-entrant entry point P1.3.4 calls
+/// again on client damage (a scene commit), without reworking this control
+/// flow.
 pub fn run(size: (u32, u32)) -> Result<(), Box<dyn Error>> {
     let (width, height) = size;
     let mut event_loop: EventLoop<'static, HeadlessState> = EventLoop::try_new()?;
@@ -137,14 +139,16 @@ pub fn run(size: (u32, u32)) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Per-run state of the headless backend: the software renderer and the
-/// virtual output's framebuffer image, retained so it can be captured.
-///
-/// Scene composition of real client surfaces (P1.3.3) hangs off this struct
-/// exactly as it does off the nested backend's state; [`redraw`](Self::redraw)
-/// is where a real frame will be assembled from client surfaces.
+/// Per-run state of the headless backend: the software renderer, the realm's
+/// [`Scene`], and the virtual output's framebuffer image, retained so it can
+/// be captured.
 struct HeadlessState {
     renderer: PixmanRenderer,
+    /// The realm's scene (P1.3.3): the single-maximized client surface, or
+    /// the deterministic background when none is committed. The shim-facing
+    /// protocol server (P1.3.4) commits into it and calls
+    /// [`redraw`](Self::redraw); the realm object (P1.5.1) hangs off it.
+    scene: Scene,
     /// The virtual output's framebuffer. Retained across the process lifetime
     /// (PRD Doc 2 §9) so an internal capture reads composited pixels, not a
     /// freshly cleared buffer.
@@ -163,17 +167,23 @@ impl HeadlessState {
         let framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
         Ok(Self {
             renderer,
+            scene: Scene::new(),
             framebuffer,
             size,
             loop_signal,
         })
     }
 
-    /// (Re)composite the virtual output into the retained framebuffer. The
+    /// (Re)composite the realm view into the retained framebuffer. The
     /// single redraw entry point: called once from [`run`] today, and again
-    /// from client damage in P1.3.3.
+    /// on client damage (a scene commit) once P1.3.4 feeds the scene.
     fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
-        composite(&mut self.renderer, &mut self.framebuffer, self.size)
+        composite(
+            &mut self.renderer,
+            &mut self.framebuffer,
+            self.size,
+            &self.scene,
+        )
     }
 
     /// The capture service's pixel source (P1.3.6): the **latest completed
@@ -194,34 +204,41 @@ impl HeadlessState {
     }
 }
 
-/// Blit the test pattern into `framebuffer` at `size`, 1:1 and upright.
+/// Blit the composed realm view ([`Scene::compose`]) into `framebuffer` at
+/// `size`, 1:1 and upright.
 ///
 /// Shared by [`render_once`] (which then reads the framebuffer back) and
 /// [`HeadlessState::redraw`] (which fills the retained framebuffer in place),
-/// so the compositing step has one definition and one behavior.
+/// so the compositing step has one definition and one behavior. Composition
+/// itself — layout, letterbox, background — happens in [`Scene::compose`],
+/// the single implementation both backends present (P1.3.3); this function
+/// only moves the composed bytes into the retained framebuffer.
 fn composite(
     renderer: &mut PixmanRenderer,
     framebuffer: &mut Image<'static, 'static>,
     size: Size<i32, Physical>,
+    scene: &Scene,
 ) -> Result<(), Box<dyn Error>> {
     if size.w <= 0 || size.h <= 0 {
         return Ok(());
     }
     let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
 
-    // Upload the pattern exactly as the nested backend does: tightly packed
-    // RGBA8888 imported as DRM `ABGR8888` (bytes R,G,B,A on little-endian).
-    let pixels = test_pattern::render(size.w as u32, size.h as u32);
+    // Upload the composed view exactly as the nested backend does: tightly
+    // packed RGBA8888 imported as DRM `ABGR8888` (bytes R,G,B,A on
+    // little-endian).
+    let pixels = scene.compose(size.w as u32, size.h as u32);
     let texture = renderer.import_memory(&pixels, Fourcc::Abgr8888, buffer_size, false)?;
 
     let full = Rectangle::from_size(size);
     let mut target = renderer.bind(framebuffer)?;
     // `Transform::Normal`, NOT `Flipped180`: a pixman image is a top-down CPU
-    // buffer, so there is no GL bottom-up convention to undo. The pattern is
-    // fully opaque and covers the whole output, so blitting it 1:1 (full
-    // texture -> full framebuffer, no scaling) leaves the framebuffer a
-    // byte-exact identity of the pattern — no separate clear is needed, and
-    // the P1.3.2 golden asserts exactly that.
+    // buffer, so there is no GL bottom-up convention to undo. The composed
+    // view is fully opaque (Scene::compose forces alpha) and covers the whole
+    // output, so blitting it 1:1 (full texture -> full framebuffer, no
+    // scaling) leaves the framebuffer a byte-exact identity of the composed
+    // view — no separate clear is needed, and the P1.3.2/P1.3.3 goldens
+    // assert exactly that.
     let mut frame = renderer.render(&mut target, size, Transform::Normal)?;
     frame.render_texture_from_to(
         &texture,
@@ -337,5 +354,122 @@ mod tests {
             golden,
             "capture is a pure read: no recomposite, identical bytes"
         );
+    }
+
+    /// The P1.3.3 acceptance chain, end to end on the shared path: a test
+    /// client's shm buffer (real memfd bytes) is committed to the scene,
+    /// composed into the retained framebuffer, and served by the capture
+    /// service — and the retained bytes equal [`Scene::compose`]'s output
+    /// exactly. That last equality is the sharing proof: presentation is a
+    /// byte-exact identity of the one shared composition implementation,
+    /// and the nested backend uploads the same `Scene::compose` output as
+    /// its window texture (same seam, same bytes; GL presentation itself
+    /// needs a display, so CI proves the shared-seam half).
+    #[test]
+    fn committed_shm_buffer_reaches_retained_framebuffer_and_capture() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+
+        use rustix::fs::MemfdFlags;
+        use vitrin_ipc::Connection;
+        use vitrin_protocol::generated::vitrin_view::{events::FrameReady, Format};
+
+        use crate::capture::{
+            AutoApprove, CaptureIds, CaptureOutcome, CaptureService, RealmViewFrame,
+        };
+        use crate::scene::{tests::client_pixels, SurfaceContent, LETTERBOX_RGBA};
+
+        let _fd = crate::capture::tests::fd_lock();
+        const VW: u32 = 320; // view (virtual output)
+        const VH: u32 = 200;
+        const SW: u32 = 160; // committed client buffer (smaller: letterboxed)
+        const SH: u32 = 120;
+
+        // The client buffer travels through a real shm-style memfd: written
+        // by the "client", read back by the "server" — the byte path the
+        // P1.3.4 shm copy-in will take.
+        let pixels = client_pixels(SW, SH);
+        let memfd = rustix::fs::memfd_create("vitrin-test-client-buffer", MemfdFlags::CLOEXEC)
+            .expect("memfd_create");
+        let mut file = File::from(memfd);
+        file.write_all(&pixels).expect("write client buffer");
+        let mut from_fd = vec![0u8; pixels.len()];
+        file.read_exact_at(&mut from_fd, 0)
+            .expect("read client buffer");
+        drop(file);
+
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessState> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state =
+            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+        state
+            .scene
+            .commit(SurfaceContent::from_rgba(from_fd, SW, SH).expect("well-formed content"));
+        state.redraw().expect("composite the committed surface");
+
+        // Sharing proof: the retained framebuffer (capture's pixel source)
+        // is byte-for-byte the shared composition's output.
+        let retained = state.latest_frame_rgba().expect("readback");
+        assert_eq!(
+            retained,
+            state.scene.compose(VW, VH),
+            "retained framebuffer must be the shared Scene::compose output"
+        );
+
+        // The client's shm bytes appear in the view, centered 1:1, matte
+        // around them (the letterbox decision).
+        let (ox, oy) = (((VW - SW) / 2) as usize, ((VH - SH) / 2) as usize);
+        for row in 0..SH as usize {
+            let dst = ((oy + row) * VW as usize + ox) * test_pattern::BYTES_PER_PIXEL;
+            let src = row * SW as usize * test_pattern::BYTES_PER_PIXEL;
+            assert_eq!(
+                &retained[dst..dst + SW as usize * test_pattern::BYTES_PER_PIXEL],
+                &pixels[src..src + SW as usize * test_pattern::BYTES_PER_PIXEL],
+                "client row {row} must appear unscaled in the view"
+            );
+        }
+        assert_eq!(retained[..4], LETTERBOX_RGBA, "matte at the view corner");
+
+        // The same buffer appears in a served capture: the capture service
+        // reads the same retained frame and delivers its xrgb8888 form.
+        let (mut server, mut client) = Connection::pair().expect("socketpair");
+        let mut service = CaptureService::new(AutoApprove);
+        let outcome = service
+            .serve(
+                RealmViewFrame {
+                    rgba: &retained,
+                    width: VW,
+                    height: VH,
+                },
+                CaptureIds {
+                    view_id: 7,
+                    grant_id: 5,
+                },
+                &mut server,
+            )
+            .expect("serve capture");
+        assert_eq!(outcome, CaptureOutcome::Delivered);
+        let msg = client
+            .recv_message()
+            .expect("client receive")
+            .expect("a frame must be waiting");
+        let (_, frame) = FrameReady::decode(&msg.bytes, msg.fd).expect("frame_ready decodes");
+        assert_eq!(frame.format, Format::Xrgb8888);
+        assert_eq!((frame.width, frame.height), (VW, VH));
+        let served_file = File::from(frame.fd);
+        let mut served = vec![0u8; (frame.stride * frame.height) as usize];
+        served_file
+            .read_exact_at(&mut served, 0)
+            .expect("read served frame");
+        // Independent re-implementation of the wire swizzle (RGBA ->
+        // little-endian xrgb8888, X pinned 0xFF): the served bytes are the
+        // composed view, converted.
+        let expected: Vec<u8> = retained
+            .chunks_exact(4)
+            .flat_map(|px| [px[2], px[1], px[0], 0xff])
+            .collect();
+        assert_eq!(served, expected, "capture must serve the composed view");
     }
 }

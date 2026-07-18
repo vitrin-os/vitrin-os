@@ -10,9 +10,9 @@
 //!
 //! - **No policy in the core.** Window management, decoration, and theming
 //!   run in unprivileged components outside this binary (PRD Doc 2 §2 — the
-//!   Nitpicker/Qubes lesson). The skeleton renders only its own test
-//!   pattern; when client surfaces arrive (P1.3.3) their layout stays
-//!   trivial and isolated.
+//!   Nitpicker/Qubes lesson). Client-surface layout (P1.3.3) is trivial —
+//!   single maximized, no decorations — and quarantined in `scene::layout`,
+//!   which is doc-marked as not the core's job long-term.
 //! - **One enforcement chokepoint.** When capture (P1.3.6) and actuation
 //!   (P1.3.7) land, every request is checked at a single site against the
 //!   grant table. No second authority-checking code path.
@@ -23,13 +23,16 @@
 //!   needs no image codec; PNG serialization is the SDK's job (P1.8.2), never
 //!   the core.
 //!
-//! Scope so far: two presentation backends, both rendering the same
-//! deterministic test pattern. Nested mode (`vitrind --nested`) runs the core
-//! as a client of the host compositor, presenting one host window at the
-//! host's frame cadence (P1.3.1). Headless mode (`vitrind --headless --size
-//! WxH`) drives a fixed-size virtual output composited entirely in software
-//! (pixman) and retained in memory for capture, with no display or GPU
-//! (P1.3.2) — the path CI runs on. The shim-facing protocol server is P1.3.4.
+//! Scope so far: two presentation backends presenting the same composed
+//! realm view (`scene`, P1.3.3 — single maximized surface, layout policy
+//! quarantined in `scene::layout`; with no client surface committed the view
+//! is the deterministic test pattern). Nested mode (`vitrind --nested`) runs
+//! the core as a client of the host compositor, presenting one host window at
+//! the host's frame cadence (P1.3.1). Headless mode (`vitrind --headless
+//! --size WxH`) drives a fixed-size virtual output composited entirely in
+//! software (pixman) and retained in memory for capture, with no display or
+//! GPU (P1.3.2) — the path CI runs on. The shim-facing protocol server that
+//! feeds the scene real client buffers is P1.3.4.
 
 mod backend;
 /// The `vitrin_view.capture_frame` service (P1.3.6). Dead-code-allowed
@@ -39,6 +42,7 @@ mod backend;
 /// integration) — nothing at runtime calls it before then.
 #[cfg_attr(not(test), allow(dead_code))]
 mod capture;
+mod scene;
 mod test_pattern;
 
 use std::process::ExitCode;

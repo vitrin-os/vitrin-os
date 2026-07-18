@@ -45,3 +45,12 @@ vitrin-ipc = { path = "../vitrin-ipc" }
 # (already in the tree, so no new dependency for the R7 budget): I/O-safe
 # OwnedFd APIs, no unsafe in our code.
 rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+# The permanent mock-shim fixture (issue #21): a compliant peer speaking the
+# real shim wire protocol over a socketpair, used to exercise the shim-facing
+# server (`shim`, P1.3.4) end-to-end until — and alongside — the real C shim
+# (P1.6.2). Test-only: it must never enter the vitrind runtime dependency
+# tree. Its deterministic frame generator keeps pixel assertions in-process
+# (plan risk R7: no image codec in the core, in any dependency class).
+vitrin-mock-shim = { path = "../vitrin-mock-shim" }

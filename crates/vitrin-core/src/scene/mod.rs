@@ -17,15 +17,16 @@
 //! That keeps the pixel goldens exact (integer math only, no filtering, no
 //! renderer state) and keeps this module trivially testable.
 //!
-//! # The surface-content seam (fed by P1.3.4, #21)
+//! # The surface-content seam (fed by the shim server, P1.3.4 / #21)
 //!
 //! [`Scene::commit`] / [`Scene::clear_surface`] are the seam the shim-facing
-//! protocol server will drive: on a shim's `commit`, it copies the attached
-//! shm/memfd buffer out of the client's fd (buffer path v0 = copy-in, plan
-//! D3) and commits the bytes here, then triggers a backend redraw; on
-//! surface loss (shim crash, P1.5.3) it clears. Until that server lands,
-//! only tests drive the seam — deliberately the smallest honest interface:
-//! plain bytes in, no protocol, no fds, no Wayland objects.
+//! protocol server ([`crate::shim`]) drives: on a shim's `commit`, it copies
+//! the attached shm/memfd buffer out of the client's fd (buffer path v0 =
+//! copy-in, plan D3) and commits the bytes here, then the embedder triggers
+//! a backend redraw; on surface loss (shim death) it clears. Deliberately
+//! the smallest honest interface: plain bytes in, no protocol, no fds, no
+//! Wayland objects. At runtime the seam goes live when the realm spawn
+//! manager provides the shim connection (P1.5.2).
 //!
 //! # No surface committed → the deterministic test pattern
 //!
@@ -86,10 +87,10 @@ pub(crate) struct SurfaceContent {
 }
 
 /// A rejected [`SurfaceContent`]: zero dimensions or a byte length that is
-/// not exactly `width * height * 4`. The shim-facing server (P1.3.4) maps
-/// this to a protocol error at the commit site; composition itself never
-/// sees an inconsistent buffer. Constructed only through [`from_rgba`]
-/// (test-driven until P1.3.4 lands, like the rest of the seam).
+/// not exactly `width * height * 4`. The shim-facing server
+/// ([`crate::shim`], P1.3.4) maps this to the `invalid_buffer` log-and-close
+/// condition at its commit site; composition itself never sees an
+/// inconsistent buffer. Constructed only through [`from_rgba`].
 ///
 /// [`from_rgba`]: SurfaceContent::from_rgba
 #[derive(Debug, PartialEq, Eq)]
@@ -118,8 +119,8 @@ impl SurfaceContent {
     /// are rejected (a surface with no pixels is [`Scene::clear_surface`],
     /// not a commit), as is any length mismatch (128-bit math, so even
     /// `u32::MAX * u32::MAX * 4` cannot wrap the check — these dimensions
-    /// are wire-derived and attacker-controlled once P1.3.4 lands).
-    /// Test-driven until P1.3.4 lands, like the rest of the seam.
+    /// are wire-derived and attacker-controlled: the shim server
+    /// ([`crate::shim`]) feeds them off the wire).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_rgba(rgba: Vec<u8>, width: u32, height: u32) -> Result<Self, ContentSizeMismatch> {
         let expected = u128::from(width) * u128::from(height) * BYTES_PER_PIXEL as u128;
@@ -158,18 +159,18 @@ impl Scene {
         }
     }
 
-    /// Commit new surface content — the seam P1.3.4's shim protocol server
-    /// feeds after its shm copy-in. The caller is responsible for
-    /// triggering a redraw. Test-driven until that server lands.
+    /// Commit new surface content — the seam the shim protocol server
+    /// ([`crate::shim`], P1.3.4) feeds after its shm copy-in. The caller is
+    /// responsible for triggering a redraw.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn commit(&mut self, content: SurfaceContent) {
         self.surface = Some(content);
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Drop the committed surface (shim crash / surface destroyed, P1.5.3):
-    /// the view falls back to the deterministic background. Test-driven
-    /// until the shim server lands.
+    /// Drop the committed surface (shim death — the shim server's
+    /// connection-teardown path, P1.3.4/P1.5.3): the view falls back to
+    /// the deterministic background, never a stale frame.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear_surface(&mut self) {
         self.surface = None;

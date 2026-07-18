@@ -1,0 +1,19 @@
+[package]
+name = "vitrin-mock-shim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Mock per-app shim: a permanent Rust test fixture speaking the real shim wire protocol (vitrin_shim_session / vitrin_shim_surface) over a socketpair. Stands in for the C shim (P1.6) in core-side tests."
+publish = false
+
+[dependencies]
+# The blocking client slice only: a shim is a plain synchronous client of the
+# core, exactly like the SDK -- no calloop, no event loop.
+vitrin-ipc = { path = "../vitrin-ipc", default-features = false, features = ["client"] }
+# Generated message types; the mock shim encodes/decodes through them, never
+# by hand.
+vitrin-protocol = { path = "../vitrin-protocol" }
+# memfd_create for the shm buffers the mock shim attaches (D3: buffer path v0
+# is shm/memfd copy-in). Same crate and posture as vitrin-ipc/vitrin-core.
+rustix = { version = "1", features = ["fs"] }

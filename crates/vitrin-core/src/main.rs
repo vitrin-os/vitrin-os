@@ -57,6 +57,15 @@ mod dmabuf;
 /// hook point. The nested backend feeds it host input at runtime; seat
 /// delivery to a live shim connection arrives with P1.5.2.
 mod input;
+/// The grant table v0 (P1.4.2): the in-memory PRD Doc 2 §5.2 grant store of
+/// the capability kernel — rows keyed by `identity`'s verifier-canonical
+/// principal, answering the enforcement chokepoint's single
+/// (principal, resource, verb, now) query. Dead-code-allowed outside tests
+/// for the same reason as `capture`: fully exercised by its tests today,
+/// consumed when the petition flow inserts rows (P1.4.3) and the
+/// enforcement chokepoint queries them (P1.4.4).
+#[cfg_attr(not(test), allow(dead_code))]
+mod grants;
 /// The identity layer of the capability kernel (P1.4.1): the pluggable
 /// `Verifier` trait, the `principals.toml`-backed `StaticVerifier`, and the
 /// principal-identity model every grant and enforcement decision keys on.

@@ -53,7 +53,9 @@
 //! - Protocol-level violations — the IDL's named log-and-close conditions
 //!   (`invalid_buffer`, `bad_order`, `already_initialized`) plus the generic
 //!   object-graph violations every class shares (unknown ids, watermark
-//!   breaches, unknown opcodes, malformed payloads) — surface as
+//!   breaches, unknown opcodes, malformed payloads), plus the documented
+//!   per-connection resource bounds (the conventions' live-object cap:
+//!   [`MAX_LIVE_SURFACES`], fatal `resource_exhausted`) — surface as
 //!   [`ShimViolation`]. Shim connections carry **no fatal-error event** (the
 //!   IDL: "a shim that violates the protocol is logged and its connection
 //!   closed"), so the embedder logs the violation and closes the connection,
@@ -61,14 +63,20 @@
 //!   reached for its own violations.
 //!
 //! Defensive validation of an attached memfd (all before any byte is
-//! trusted): nonzero dimensions, `stride >= width * 4`, and fd size at
-//! least `stride * height` — all in 128-bit math, so wire-derived `u32`
-//! geometry can never wrap a check (the [`scene`](crate::scene) overflow
-//! precedent). The copy itself uses `pread` bounded by the validated
-//! geometry — never `mmap` — so a shim that shrinks its (deliberately
-//! unsealed: version 1 demands no seals on shim buffers) memfd after attach
-//! produces a clean short-read error at commit (`invalid_buffer`,
-//! log-and-close), not a `SIGBUS` in the TCB. A buffer too large for the
+//! trusted): the fd must actually be shmem-backed (`F_GET_SEALS` succeeds —
+//! the kernel implements it only for memfd/tmpfs/hugetlb files, so a
+//! hostile shim cannot substitute a regular file on a FUSE mount or slow
+//! storage whose reads would block the single-threaded core loop; the
+//! probe is purely in-kernel, so it is safe *before* `fstat`, which on a
+//! hostile FUSE fd could itself block), nonzero dimensions, `stride >=
+//! width * 4`, and fd size at least `stride * height` — all in 128-bit
+//! math, so wire-derived `u32` geometry can never wrap a check (the
+//! [`scene`](crate::scene) overflow precedent). Shim buffers remain
+//! deliberately unsealed — version 1 demands no seals, the probe only
+//! requires the fd to be seal-*capable* — so the copy itself uses `pread`
+//! bounded by the validated geometry — never `mmap` — and a shim that
+//! shrinks its memfd after attach produces a clean short-read error at
+//! commit (`invalid_buffer`, log-and-close), not a `SIGBUS` in the TCB. A buffer too large for the
 //! renderer's limits ([`MAX_SURFACE_DIM`]/[`MAX_SURFACE_BYTES`] — also the
 //! defense against sparse-memfd allocation bombs) takes the *recoverable*
 //! `buffer_done(too_large)` path the IDL defines, not a kill. Both
@@ -100,6 +108,21 @@
 //! redraws on commit, then calls [`ShimServer::presented`] — with a real
 //! mock shim (`vitrin-mock-shim`, the permanent fixture) on the other end
 //! of the socketpair.
+//!
+//! One deliberate simplification in that harness must **not** be copied
+//! into the runtime loop: it composites synchronously inside the
+//! per-message dispatch (one redraw per commit), which is exactly what the
+//! pacing test needs but hands a hostile shim CPU amplification — after
+//! one legal attach, a repaint `commit` is a 12-byte message, so redrawing
+//! per commit buys a full-output composite per 12 wire bytes. The runtime
+//! wiring (P1.5.2) must instead *coalesce*: mark the scene dirty when a
+//! commit latches and schedule at most one redraw + [`presented`] per loop
+//! iteration (or per output-cadence tick). `ShimServer` is built for that
+//! shape — [`wants_presentation`] is the embedder's cue, and one
+//! [`presented`] call drains every owed `frame_done` at once.
+//!
+//! [`presented`]: ShimServer::presented
+//! [`wants_presentation`]: ShimServer::wants_presentation
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -137,6 +160,18 @@ pub(crate) const MAX_SURFACE_DIM: u32 = 16384;
 /// recoverable `too_large` disposition, never a kill.
 pub(crate) const MAX_SURFACE_BYTES: u128 = 128 * 1024 * 1024;
 
+/// Cap on live surfaces per shim connection — the conventions' documented
+/// per-connection live-object cap (fatal `resource_exhausted`), applied to
+/// the one object class a shim can mint without bound. Version 1 defines no
+/// destructors, so every `create_surface` is a permanent per-connection
+/// allocation: a `SurfaceState` (heap) plus, via a staged attach, up to one
+/// retained buffer fd. Without a cap a hostile shim streaming 12-byte
+/// `create_surface` frames grows core memory O(messages) and can drive the
+/// whole process to EMFILE by staging one fd per surface — so the cap
+/// bounds both at O(1). Version 1 composites a single-maximized layout;
+/// 16 is generous headroom for any legitimate multi-surface shim.
+pub(crate) const MAX_LIVE_SURFACES: usize = 16;
+
 /// Cap on pending damage rectangles retained verbatim between commits.
 /// Damage is a hint the core may over-approximate, so rectangles past the
 /// cap are folded into a running bounding box instead of growing the Vec —
@@ -162,6 +197,11 @@ pub(crate) enum ShimViolation {
     BadOrder(&'static str),
     /// `already_initialized`: a second `get_seat` on the session.
     AlreadyInitialized,
+    /// `resource_exhausted`: a documented per-connection resource bound was
+    /// breached — the live-object cap ([`MAX_LIVE_SURFACES`]). A
+    /// denial-of-service confinement, not a semantic judgement
+    /// (conventions error taxonomy).
+    ResourceExhausted(&'static str),
     /// `invalid_object`: unknown/foreign object id, or a `new_id` at or
     /// below the watermark / outside the client range.
     InvalidObject {
@@ -183,6 +223,9 @@ impl fmt::Display for ShimViolation {
             ShimViolation::BadOrder(detail) => write!(f, "bad_order: {detail}"),
             ShimViolation::AlreadyInitialized => {
                 write!(f, "already_initialized: second get_seat on the session")
+            }
+            ShimViolation::ResourceExhausted(detail) => {
+                write!(f, "resource_exhausted: {detail}")
             }
             ShimViolation::InvalidObject { object_id, detail } => {
                 write!(f, "invalid_object: id {object_id}: {detail}")
@@ -367,6 +410,17 @@ impl ShimServer {
                 session::requests::CreateSurface::OPCODE => {
                     let (_, req) = session::requests::CreateSurface::decode(&msg.bytes, msg.fd)
                         .map_err(ShimViolation::from)?;
+                    // The live-object cap precedes the mint: version 1 has
+                    // no destructors, so every surface is a permanent
+                    // allocation of core memory (and, via a staged attach,
+                    // up to one retained fd) — unbounded minting is the
+                    // conventions' fatal resource_exhausted, not a legal
+                    // stream.
+                    if self.surfaces.len() >= MAX_LIVE_SURFACES {
+                        return Err(
+                            ShimViolation::ResourceExhausted("live-surface cap exceeded").into(),
+                        );
+                    }
                     self.allocate_id(req.surface)?;
                     self.surfaces.insert(req.surface, SurfaceState::default());
                     Ok(false)
@@ -493,10 +547,27 @@ impl ShimServer {
             ))
             .into());
         }
-        // The fd's actual size must cover the declared geometry. Checked
-        // for shm only: a dmabuf's size is the import path's to validate
-        // (P1.3.5), and this core never maps a dmabuf.
+        // fd validation, shm only: a dmabuf's fd is the import path's to
+        // validate (P1.3.5), and this core never touches a dmabuf fd.
         if req.kind == shim_surface::Kind::Shm {
+            // The fd must actually be shmem-backed before *any* other fd
+            // syscall trusts it: `F_GET_SEALS` is implemented by the kernel
+            // only for memfd/tmpfs/hugetlb files, entirely in-kernel — a
+            // FUSE server cannot fake it, and unlike `fstat` it can never
+            // block on hostile filesystem I/O. Without this probe a hostile
+            // shim could pass a regular file on a mount it controls whose
+            // reads stall, wedging the single-threaded core loop at commit
+            // (a hang never reaches the DisconnectReason funnel). Shmem
+            // reads cannot block on attacker-controlled I/O. No seals are
+            // *required* (shim buffers stay unsealed); the fd merely has to
+            // be seal-capable.
+            if rustix::fs::fcntl_get_seals(&req.fd).is_err() {
+                return Err(ShimViolation::InvalidBuffer(
+                    "kind=shm fd is not memfd/shmem-backed (F_GET_SEALS failed)".into(),
+                )
+                .into());
+            }
+            // The fd's actual size must cover the declared geometry.
             let required = u128::from(req.stride) * u128::from(req.height);
             let actual = rustix::fs::fstat(&req.fd)
                 .map(|st| st.st_size.max(0) as u128)
@@ -1542,6 +1613,73 @@ mod tests {
         assert_violation(
             process_n(&mut server, &mut scene, &mut core, 2),
             "invalid_object",
+        );
+    }
+
+    #[test]
+    fn surface_flood_is_resource_exhausted() {
+        // The conventions' per-connection live-object cap: version 1 has no
+        // destructors, so a shim streaming create_surface pins core memory
+        // (and potentially one staged fd) per surface forever. The mint
+        // past the cap is the fatal resource_exhausted confinement — the
+        // core's state stays O(1), not O(messages).
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut server, mut scene, mut core, mut shim) = setup();
+        shim.recv_message().unwrap().unwrap(); // configure
+        for i in 0..=MAX_LIVE_SURFACES as u32 {
+            shim.send_message(
+                &session::requests::CreateSurface { surface: 2 + i }.encode(SHIM_SESSION_ID),
+                None,
+            )
+            .unwrap();
+        }
+        // The first MAX_LIVE_SURFACES mints are legal...
+        process_n(&mut server, &mut scene, &mut core, MAX_LIVE_SURFACES).unwrap();
+        assert_eq!(server.surfaces.len(), MAX_LIVE_SURFACES);
+        // ...the one past the cap kills the connection.
+        assert_violation(
+            process_n(&mut server, &mut scene, &mut core, 1),
+            "resource_exhausted",
+        );
+    }
+
+    #[test]
+    fn non_shmem_shm_fd_is_rejected_at_attach() {
+        // A kind=shm fd that is not memfd/shmem-backed must die at attach,
+        // before any other syscall trusts it: reads (or even fstat) on a
+        // hostile fd — e.g. a file on a shim-controlled FUSE mount — can
+        // block, wedging the single-threaded core loop with no funnel able
+        // to fire. /dev/null stands in as a deterministic non-shmem fd
+        // (F_GET_SEALS fails on it as it does on any non-shmem file).
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut server, mut scene, mut core, mut shim) = setup();
+        shim.recv_message().unwrap().unwrap(); // configure
+        shim.send_message(
+            &session::requests::CreateSurface {
+                surface: SURFACE_ID,
+            }
+            .encode(SHIM_SESSION_ID),
+            None,
+        )
+        .unwrap();
+        let hostile = OwnedFd::from(File::open("/dev/null").unwrap());
+        send_attach(
+            &mut shim,
+            SURFACE_ID,
+            1,
+            hostile,
+            Kind::Shm,
+            Format::Xrgb8888,
+            1,
+            1,
+            4,
+        );
+        // The distinctive probe message, not the fd-size check: the seals
+        // probe must be what rejects the fd (it runs first, because fstat
+        // itself is unsafe on a hostile fd).
+        assert_violation(
+            process_n(&mut server, &mut scene, &mut core, 2),
+            "not memfd/shmem-backed",
         );
     }
 

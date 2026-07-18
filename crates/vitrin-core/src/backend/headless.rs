@@ -560,6 +560,20 @@ mod tests {
                             // Presentation, headless: the composite
                             // completing IS the output cadence ("or,
                             // headless, after it would have been").
+                            //
+                            // TEST-ONLY SHAPE — do not copy into the
+                            // runtime loop (P1.5.2). Compositing
+                            // synchronously per commit is what this pacing
+                            // test needs (one readback per presented
+                            // frame), but at runtime it would let a
+                            // hostile shim buy a full-output composite per
+                            // 12-byte repaint commit. The runtime wiring
+                            // must coalesce: mark the scene dirty here and
+                            // schedule at most one redraw + `presented`
+                            // per loop iteration or output-cadence tick
+                            // (see the "Wiring" section of `crate::shim`'s
+                            // module docs; `wants_presentation`/`presented`
+                            // already batch all owed frame_dones).
                             state.headless.redraw().expect("redraw on commit");
                             let time_ms = state.start.elapsed().as_millis() as u32;
                             server.presented(time_ms, &mut send).expect("frame_done");

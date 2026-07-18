@@ -160,8 +160,12 @@ pub(crate) enum PrincipalViolation {
         detail: &'static str,
     },
     /// The frame did not decode as the selected message; maps onto the
-    /// conventions' fatal code via [`DecodeError::to_wire_error`].
-    Malformed(DecodeError),
+    /// conventions' fatal code via [`DecodeError::to_wire_error`]. Carries
+    /// the id the frame targeted so the goodbye cites the object where the
+    /// error occurred (the IDL's `error.object_id` "may be 1" -- it is not
+    /// always 1: a malformed `get_realm` cites the principal, not the
+    /// handshake object).
+    Malformed { object_id: u32, source: DecodeError },
     /// `resource_exhausted`: a documented per-connection bound was
     /// breached ([`MAX_LIVE_REALMS`], object-id exhaustion).
     ResourceExhausted(&'static str),
@@ -185,7 +189,7 @@ impl PrincipalViolation {
                 WireError::InvalidOpcode
             }
             PrincipalViolation::InvalidObject { .. } => WireError::InvalidObject,
-            PrincipalViolation::Malformed(e) => e.to_wire_error(),
+            PrincipalViolation::Malformed { source, .. } => source.to_wire_error(),
             PrincipalViolation::ResourceExhausted(_) => WireError::ResourceExhausted,
             PrincipalViolation::Unimplemented { .. } | PrincipalViolation::ConnectionDead => {
                 WireError::Internal
@@ -200,6 +204,7 @@ impl PrincipalViolation {
             PrincipalViolation::PreHandshake { object_id, .. }
             | PrincipalViolation::UnknownOpcode { object_id, .. }
             | PrincipalViolation::InvalidObject { object_id, .. }
+            | PrincipalViolation::Malformed { object_id, .. }
             | PrincipalViolation::Unimplemented { object_id, .. } => *object_id,
             _ => HANDSHAKE_ID,
         }
@@ -222,7 +227,7 @@ impl PrincipalViolation {
                 format!("opcode {opcode} is not defined for this object")
             }
             PrincipalViolation::InvalidObject { detail, .. } => (*detail).into(),
-            PrincipalViolation::Malformed(e) => e.to_string(),
+            PrincipalViolation::Malformed { source, .. } => source.to_string(),
             PrincipalViolation::ResourceExhausted(detail) => (*detail).into(),
             PrincipalViolation::Unimplemented { what, .. } => {
                 format!("{what} is not implemented in this build")
@@ -270,7 +275,9 @@ impl fmt::Display for PrincipalViolation {
             PrincipalViolation::InvalidObject { object_id, detail } => {
                 write!(f, "invalid_object: id {object_id}: {detail}")
             }
-            PrincipalViolation::Malformed(e) => write!(f, "malformed message: {e}"),
+            PrincipalViolation::Malformed { object_id, source } => {
+                write!(f, "malformed message on object {object_id}: {source}")
+            }
             PrincipalViolation::ResourceExhausted(detail) => {
                 write!(f, "resource_exhausted: {detail}")
             }
@@ -463,8 +470,10 @@ impl PrincipalServer {
                             Err(PrincipalViolation::SecondHello.into())
                         }
                         handshake::requests::Sync::OPCODE => {
-                            let (_, sync) = handshake::requests::Sync::decode(&msg.bytes, msg.fd)
-                                .map_err(PrincipalViolation::Malformed)?;
+                            let (_, sync) =
+                                handshake::requests::Sync::decode(&msg.bytes, msg.fd).map_err(
+                                    |source| PrincipalViolation::Malformed { object_id, source },
+                                )?;
                             // Single-threaded in-order dispatch: everything
                             // received before this sync has been processed
                             // and its events queued, so done goes out now.
@@ -525,8 +534,9 @@ impl PrincipalServer {
     where
         F: FnMut(&[u8]) -> Result<(), TransportError>,
     {
+        let object_id = msg.header.object_id;
         let (_, hello) = handshake::requests::Hello::decode(&msg.bytes, msg.fd)
-            .map_err(PrincipalViolation::Malformed)?;
+            .map_err(|source| PrincipalViolation::Malformed { object_id, source })?;
         if hello.version != PROTOCOL_VERSION {
             // Additive growth: this server implements exactly wire version
             // 1, so any other offer (a later version, or the never-issued
@@ -575,8 +585,9 @@ impl PrincipalServer {
     /// petitions resolve `unavailable` later (IDL). Subject to the
     /// live-object cap and the watermark rule.
     fn handle_get_realm(&mut self, msg: Message) -> Result<(), PrincipalFault> {
+        let object_id = msg.header.object_id;
         let (_, req) = principal::requests::GetRealm::decode(&msg.bytes, msg.fd)
-            .map_err(PrincipalViolation::Malformed)?;
+            .map_err(|source| PrincipalViolation::Malformed { object_id, source })?;
         // The cap precedes the mint (the shim server's precedent): version
         // 1 has no destructors, so every realm handle is a permanent
         // allocation, and unbounded minting is the conventions' fatal
@@ -796,13 +807,16 @@ mod tests {
                 VerifyOutcome::Unavailable("SPIRE agent unreachable (simulated)".into())
             }
         }
+        // The global anchor requires a uid the peer does not have (per-row
+        // pins cannot express this: a pin differing from the anchor is
+        // refused at load as unsatisfiable).
         let uid_mismatch = StaticVerifier::from_rows(
             vec![StaticPrincipal {
                 identity: PrincipalIdentity::parse(DEMO_IDENTITY).unwrap(),
                 token: TOKEN.as_bytes().to_vec(),
-                uid: Some(my_uid().wrapping_add(1)),
+                uid: None,
             }],
-            my_uid(),
+            my_uid().wrapping_add(1),
         )
         .unwrap();
         let registry = demo_verifier();
@@ -931,7 +945,46 @@ mod tests {
             process_n(&mut server, &mut core, &Panicking, 1),
             "malformed",
         );
-        expect_error(&mut client, WireError::InvalidArgument);
+        let err = expect_error(&mut client, WireError::InvalidArgument);
+        assert_eq!(
+            err.object_id, HANDSHAKE_ID,
+            "a malformed hello cites object 1"
+        );
+    }
+
+    #[test]
+    fn malformed_frames_cite_the_object_they_targeted() {
+        // The IDL defines error.object_id as the id of the object where the
+        // error occurred, "which may be 1" -- not always 1. A malformed
+        // get_realm on the bound principal (object 2) must cite object 2,
+        // so client-side debugging is not misdirected to the handshake
+        // object. Here the name argument is invalid UTF-8.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client) = setup();
+        bind(&mut server, &mut core, &mut client, &verifier);
+        let mut frame = Vec::new();
+        vitrin_protocol::wire::FrameHeader {
+            object_id: 2,
+            size: 0,
+            opcode: principal::requests::GetRealm::OPCODE,
+            fd_count: 0,
+        }
+        .encode_with_placeholder_size(&mut frame);
+        vitrin_protocol::wire::write_uint(&mut frame, 3); // realm new_id
+        vitrin_protocol::wire::write_uint(&mut frame, 2); // name length...
+        frame.extend_from_slice(&[0xff, 0xfe, 0, 0]); // ...invalid UTF-8 + pad
+        vitrin_protocol::wire::patch_size(&mut frame);
+
+        client.send_message(&frame, None).unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, 1),
+            "malformed message on object 2",
+        );
+        let err = expect_error(&mut client, WireError::InvalidArgument);
+        assert_eq!(
+            err.object_id, 2,
+            "the citation names the object the frame targeted"
+        );
     }
 
     #[test]

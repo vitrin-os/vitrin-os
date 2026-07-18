@@ -63,7 +63,7 @@
 //! |---|---|---|---|
 //! | `identity` | string | yes | SPIFFE-shaped canonical identity URI, e.g. `vitrin://local/agent/demo` -- unique across the file, at most 2048 bytes (the wire bound), shape-validated by [`PrincipalIdentity`] |
 //! | `token` | string | yes | the pre-shared random bearer token, compared byte-wise constant-time against `hello`'s `credential`; at least 16 bytes (64 random hex chars recommended: `openssl rand -hex 32`) |
-//! | `uid` | integer | no | additionally require the connecting peer's `SO_PEERCRED` uid to equal this value |
+//! | `uid` | integer | no | additionally require the connecting peer's `SO_PEERCRED` uid to equal this value; must equal the uid the core itself runs as, or the registry is refused at load (see the `SO_PEERCRED` policy section) |
 //!
 //! The file is parsed by a **hand-rolled strict TOML subset** rather than a
 //! TOML crate: plan risk R7 names config parsing as the classic TCB
@@ -105,7 +105,13 @@
 //! Concretely, [`StaticVerifier`] requires the peer uid to equal the core's
 //! own effective uid (the socket directory is `0700`, so this is defense in
 //! depth against a mis-permissioned runtime dir), plus the per-row `uid`
-//! pin when present. The peer **pid is never policy**: it is `None` when
+//! pin when present. Because the pin is conjoined with that euid rule, a
+//! pin naming any other uid could never be satisfied, so
+//! [`StaticVerifier::from_rows`] refuses such a row at load time (a hard
+//! error, like every registry problem) rather than carrying a row that
+//! silently never binds. The pin is thereby a deployment assertion: a
+//! registry pinning uid `N` loads only where the core itself runs as uid
+//! `N`. The peer **pid is never policy**: it is `None` when
 //! not mappable into the core's pid namespace and is racy by nature
 //! (documented on [`PeerCred`]); uid is the authority anchor. Future
 //! verifiers choose their own peercred policy -- the trait hands them the
@@ -436,6 +442,23 @@ impl StaticVerifier {
                     ),
                 });
             }
+            // The verify-time uid policy is a conjunction of the global
+            // anchor and the pin, so a pin differing from the anchor is
+            // unsatisfiable -- a row that could never bind. Refuse it here
+            // (module docs: the pin is a deployment assertion) instead of
+            // letting it rot into mysterious per-connection refusals.
+            if let Some(pin) = row.uid {
+                if pin != required_uid {
+                    return Err(RegistryError::Invalid {
+                        detail: format!(
+                            "principal {} pins peer uid {pin}, but every peer must \
+                             present uid {required_uid} (the core's own); the pin is \
+                             unsatisfiable -- run the core as uid {pin} or drop the pin",
+                            row.identity
+                        ),
+                    });
+                }
+            }
             if rows[..i].iter().any(|r| r.identity == row.identity) {
                 return Err(RegistryError::Invalid {
                     detail: format!("duplicate identity {}", row.identity),
@@ -465,7 +488,18 @@ impl Verifier for StaticVerifier {
         let expected: &[u8] = matched.map_or(&DECOY_TOKEN[..], |r| &r.token);
         let token_ok = constant_time_eq(presented.credential, expected) && matched.is_some();
         let row_uid = matched.and_then(|r| r.uid);
-        let uid_required = row_uid.unwrap_or(self.required_uid);
+        // The uid to cite on refusal: the leg of the conjunction below that
+        // actually failed -- the global anchor whenever the peer misses it,
+        // the per-row pin only when the anchor passed. (Citing the pin
+        // unconditionally once rendered a self-contradictory "peer uid N,
+        // required N" when the pin matched but the anchor did not.)
+        // `from_rows` refuses pins differing from the anchor, so today the
+        // two branches agree; the selection stays locally correct either way.
+        let uid_required = if presented.peer.uid == self.required_uid {
+            row_uid.unwrap_or(self.required_uid)
+        } else {
+            self.required_uid
+        };
         let uid_ok = presented.peer.uid == self.required_uid
             && row_uid.is_none_or(|u| presented.peer.uid == u);
 
@@ -743,7 +777,11 @@ fn parse_basic_string(value: &str, line: usize) -> Result<String, RegistryError>
 }
 
 /// Parse a bare non-negative decimal integer fitting `u32` (the uid
-/// domain); the remainder may hold only whitespace or a comment.
+/// domain); the remainder may hold only whitespace or a comment. Leading
+/// zeros are rejected: TOML 1.0 forbids them, and the subset's invariant
+/// is that every accepted file is valid TOML (module docs) -- `007` must
+/// not load today only to break under external tooling or a future parser
+/// swap. A bare `0` stays legal.
 fn parse_integer(value: &str, line: usize) -> Result<u32, RegistryError> {
     let err = |detail: &str| RegistryError::Parse {
         line,
@@ -755,6 +793,9 @@ fn parse_integer(value: &str, line: usize) -> Result<u32, RegistryError> {
     let (digits, rest) = value.split_at(end);
     if digits.is_empty() {
         return Err(err("expected a non-negative integer value"));
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return Err(err("leading zeros are not valid TOML integers"));
     }
     if !matches!(rest.trim_start().chars().next(), None | Some('#')) {
         return Err(err("trailing content after integer value"));
@@ -875,7 +916,7 @@ token = "{TOKEN}"
 [[principal]]
 identity = "vitrin://local/agent/ci-probe"
 token = "abcdefabcdefabcdefabcdef"
-uid = 4242  # pin to the CI runner uid
+uid = 4242  # deployment assertion: only loads where the core runs as 4242
 "##
         );
         let rows = parse_registry(&text).unwrap();
@@ -918,10 +959,21 @@ token = "with#hash-and-\\-and-\"-inside"
             ("[[principal]]\ntoken = \"unterminated\n", "unterminated"),
             ("[[principal]]\nuid = -1\n", "negative integer"),
             ("[[principal]]\nuid = 99999999999\n", "integer overflow"),
+            ("[[principal]]\nuid = 007\n", "leading zero"),
+            ("[[principal]]\nuid = 00\n", "leading zero on zero"),
             ("[[principal]]\ntoken = \"a\" junk\n", "trailing junk"),
         ] {
             assert!(parse_registry(text).is_err(), "must reject: {why}");
         }
+    }
+
+    #[test]
+    fn bare_zero_is_a_legal_integer() {
+        // The leading-zero rejection must not take the one-digit `0` with
+        // it: TOML allows a bare zero, and uid 0 (root) is expressible.
+        let text =
+            format!("[[principal]]\nidentity = \"vitrin://l/a\"\ntoken = \"{TOKEN}\"\nuid = 0\n");
+        assert_eq!(parse_registry(&text).unwrap()[0].uid, Some(0));
     }
 
     #[test]
@@ -1100,14 +1152,16 @@ token = "with#hash-and-\\-and-\"-inside"
             }
         );
 
-        // Per-row pin narrows an otherwise-passing global policy.
+        // With a (satisfiable) pin present, a refusal cites the anchor the
+        // peer actually failed -- the log can never render the
+        // self-contradictory "peer uid N, required N".
         let v = StaticVerifier::from_rows(
             vec![StaticPrincipal {
                 identity: demo_identity(),
                 token: TOKEN.as_bytes().to_vec(),
                 uid: Some(other_uid),
             }],
-            my_uid(),
+            other_uid,
         )
         .unwrap();
         assert_eq!(
@@ -1117,6 +1171,44 @@ token = "with#hash-and-\\-and-\"-inside"
                 peer_uid: my_uid(),
             }
         );
+    }
+
+    #[test]
+    fn a_pin_matching_the_anchor_loads_and_binds() {
+        let v = StaticVerifier::from_rows(
+            vec![StaticPrincipal {
+                identity: demo_identity(),
+                token: TOKEN.as_bytes().to_vec(),
+                uid: Some(my_uid()),
+            }],
+            my_uid(),
+        )
+        .unwrap();
+        assert!(matches!(
+            v.verify(&present("vitrin://local/agent/demo", TOKEN)),
+            VerifyOutcome::Bound(_)
+        ));
+    }
+
+    #[test]
+    fn an_unsatisfiable_uid_pin_is_refused_at_load() {
+        // A pin differing from the required uid can never be satisfied
+        // (the verify-time policy is a conjunction): loading must fail
+        // loudly instead of carrying a row that silently never binds.
+        let rows = vec![StaticPrincipal {
+            identity: demo_identity(),
+            token: TOKEN.as_bytes().to_vec(),
+            uid: Some(my_uid().wrapping_add(1)),
+        }];
+        match StaticVerifier::from_rows(rows, my_uid()) {
+            Err(RegistryError::Invalid { detail }) => {
+                assert!(
+                    detail.contains("unsatisfiable"),
+                    "unexpected detail: {detail}"
+                )
+            }
+            other => panic!("an unsatisfiable pin must be refused, got {other:?}"),
+        }
     }
 
     #[test]

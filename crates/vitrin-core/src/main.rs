@@ -59,8 +59,9 @@ mod dmabuf;
 mod input;
 /// The grant table v0 (P1.4.2): the in-memory PRD Doc 2 §5.2 grant store of
 /// the capability kernel — rows keyed by `identity`'s verifier-canonical
-/// principal, answering the enforcement chokepoint's single
-/// (principal, resource, verb, now) query. Dead-code-allowed outside tests
+/// principal, answering the enforcement chokepoint's grant-scoped use query
+/// (the P1.4.4 chain: connection → principal → grant → verbs →
+/// constraints). Dead-code-allowed outside tests
 /// for the same reason as `capture`: fully exercised by its tests today,
 /// consumed when the petition flow inserts rows (P1.4.3) and the
 /// enforcement chokepoint queries them (P1.4.4).

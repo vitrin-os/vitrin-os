@@ -116,13 +116,14 @@ impl Error for ContentSizeMismatch {}
 impl SurfaceContent {
     /// Wrap client bytes as committable surface content. Zero dimensions
     /// are rejected (a surface with no pixels is [`Scene::clear_surface`],
-    /// not a commit), as is any length mismatch (64-bit math, so a huge
-    /// `width * height` cannot wrap the check). Test-driven until P1.3.4
-    /// lands, like the rest of the seam.
+    /// not a commit), as is any length mismatch (128-bit math, so even
+    /// `u32::MAX * u32::MAX * 4` cannot wrap the check — these dimensions
+    /// are wire-derived and attacker-controlled once P1.3.4 lands).
+    /// Test-driven until P1.3.4 lands, like the rest of the seam.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_rgba(rgba: Vec<u8>, width: u32, height: u32) -> Result<Self, ContentSizeMismatch> {
-        let expected = u64::from(width) * u64::from(height) * BYTES_PER_PIXEL as u64;
-        if width == 0 || height == 0 || rgba.len() as u64 != expected {
+        let expected = u128::from(width) * u128::from(height) * BYTES_PER_PIXEL as u128;
+        if width == 0 || height == 0 || rgba.len() as u128 != expected {
             return Err(ContentSizeMismatch {
                 width,
                 height,
@@ -312,6 +313,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn wider_but_shorter_surface_letterboxes_x_and_crops_y() {
+        // The mixed case: surface taller than the view but narrower than it
+        // is wide relative to the surface — here view 100x20, surface 40x50,
+        // so the destination x-offset (30) and the source y-offset (15) are
+        // simultaneously nonzero on different axes. Pins the clip math in
+        // compose against regression.
+        let (vw, vh) = (100, 20);
+        let (sw, sh) = (40, 50);
+        let pixels = client_pixels(sw, sh);
+        let mut scene = Scene::new();
+        scene.commit(SurfaceContent::from_rgba(pixels.clone(), sw, sh).unwrap());
+        let out = scene.compose(vw, vh);
+
+        // Horizontally centered at 1:1; vertically the surface's central
+        // vh-tall band fills the whole view height.
+        let ox = (vw - sw) / 2; // 30
+        let cy = (sh - vh) / 2; // 15
+        for y in 0..vh {
+            for x in 0..sw {
+                assert_eq!(px(&out, vw, ox + x, y), px(&pixels, sw, x, cy + y));
+            }
+        }
+        // Matte in the side bars, immediately outside the placed rectangle
+        // and in all four view corners.
+        for y in [0, vh - 1] {
+            for x in [0, ox - 1, ox + sw, vw - 1] {
+                assert_eq!(px(&out, vw, x, y), LETTERBOX_RGBA);
+            }
+        }
+    }
+
+    #[test]
     fn larger_surface_is_center_cropped_unscaled() {
         let (vw, vh) = (40, 30);
         let (sw, sh) = (60, 50);
@@ -365,6 +398,11 @@ pub(crate) mod tests {
         // Zero dimensions are a clear_surface, not a commit.
         assert!(SurfaceContent::from_rgba(Vec::new(), 0, 4).is_err());
         assert!(SurfaceContent::from_rgba(Vec::new(), 4, 0).is_err());
+        // Huge dimensions whose byte count would wrap 64-bit math
+        // (2^31 * 2^31 * 4 = 2^64) must be rejected, not wrap to an
+        // expected length of 0 — these are wire-derived once P1.3.4 lands.
+        assert!(SurfaceContent::from_rgba(Vec::new(), 0x8000_0000, 0x8000_0000).is_err());
+        assert!(SurfaceContent::from_rgba(Vec::new(), u32::MAX, u32::MAX).is_err());
         // The well-formed case constructs.
         assert!(SurfaceContent::from_rgba(vec![0; 4 * 4], 2, 2).is_ok());
     }

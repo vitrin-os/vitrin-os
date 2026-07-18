@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vitrin-os"
+version = "0.1.0a0"
+description = "Pure-Python agent SDK for the Vitrin OS wire protocol (spec v0, wire version 1)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+# Deliberately zero runtime dependencies (decision D8: pure Python, stdlib
+# only, no C extension). The wire client is a second, independent
+# implementation of the protocol that keeps the Rust side honest.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# PEP 561: the package is fully annotated; ship the marker so type
+# checkers accept the installed distribution as typed.
+vitrin_os = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

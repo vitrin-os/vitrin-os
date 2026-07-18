@@ -60,12 +60,25 @@ pub(crate) fn render_once(size: Size<i32, Physical>) -> Result<Vec<u8>, Box<dyn 
     let mut framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
 
     composite(&mut renderer, &mut framebuffer, size)?;
+    readback(&mut renderer, &mut framebuffer, size)
+}
 
-    // Read the composited framebuffer back out of pixman: `copy_framebuffer`
-    // copies (SRC) the bound image into a fresh mapping, which `map_texture`
-    // then exposes as bytes. For a 32-bpp format the stride is `width * 4`, so
-    // the slice is tightly packed and needs no de-striding.
-    let target = renderer.bind(&mut framebuffer)?;
+/// Read a composited framebuffer back as tightly packed RGBA8888, rows
+/// top-down: `copy_framebuffer` copies (SRC) the bound image into a fresh
+/// mapping, which `map_texture` then exposes as bytes. For a 32-bpp format
+/// the stride is `width * 4`, so the slice is tightly packed and needs no
+/// de-striding.
+///
+/// Shared by [`render_once`] and [`HeadlessState::latest_frame_rgba`] (the
+/// capture service's pixel source, P1.3.6), so readback has one definition
+/// and one byte layout.
+fn readback(
+    renderer: &mut PixmanRenderer,
+    framebuffer: &mut Image<'static, 'static>,
+    size: Size<i32, Physical>,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
+    let target = renderer.bind(framebuffer)?;
     let mapping =
         renderer.copy_framebuffer(&target, Rectangle::from_size(buffer_size), Fourcc::Abgr8888)?;
     let pixels = renderer.map_texture(&mapping)?;
@@ -162,6 +175,23 @@ impl HeadlessState {
     fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
         composite(&mut self.renderer, &mut self.framebuffer, self.size)
     }
+
+    /// The capture service's pixel source (P1.3.6): the **latest completed
+    /// frame**, read back from the retained framebuffer as tightly packed
+    /// RGBA8888 — a pure read that never triggers a composite. This is the
+    /// capture-timing decision (see [`crate::capture`]'s module docs):
+    /// capture observes what the compositor last finished, exactly the
+    /// IDL's "most recently composited content as of when the server
+    /// processes this request", keeping goldens deterministic and keeping
+    /// render cost off the agent-request path.
+    ///
+    /// Compiled in every build so the path stays type-checked; called from
+    /// the golden test today and wired to protocol dispatch when the
+    /// enforcement chokepoint lands (P1.4.4, M1.1 integration).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn latest_frame_rgba(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
+        readback(&mut self.renderer, &mut self.framebuffer, self.size)
+    }
 }
 
 /// Blit the test pattern into `framebuffer` at `size`, 1:1 and upright.
@@ -210,8 +240,9 @@ fn composite(
 
 #[cfg(test)]
 mod tests {
-    use super::render_once;
+    use super::{render_once, HeadlessState};
     use crate::test_pattern;
+    use calloop::EventLoop;
     use smithay::utils::{Physical, Size};
 
     const WIDTH: u32 = 1280;
@@ -269,6 +300,42 @@ mod tests {
             pixel(&cap, WIDTH - 1, HEIGHT - 1),
             test_pattern::MARKER_BOTTOM_RIGHT,
             "bottom-right"
+        );
+    }
+
+    /// The capture service's actual pixel source: after `redraw`, the
+    /// *retained* framebuffer reads back as the exact synthetic pattern —
+    /// the latest-completed-frame seam the P1.3.6 capture path consumes,
+    /// exercised on real [`HeadlessState`], not just the `render_once`
+    /// shortcut. Reading again without recompositing yields the same
+    /// bytes: capture is a pure read of completed output.
+    ///
+    /// Takes the fd-quiescence lock: the calloop `EventLoop` (needed only
+    /// to mint a `LoopSignal`) opens fds, which must not race the capture
+    /// module's `/proc/self/fd` baseline assertions.
+    #[test]
+    fn retained_framebuffer_is_the_capture_source() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (w, h) = (640, 400);
+        let size: Size<i32, Physical> = (w as i32, h as i32).into();
+        let event_loop: EventLoop<'static, HeadlessState> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state =
+            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+        state
+            .redraw()
+            .expect("composite into the retained framebuffer");
+
+        let golden = test_pattern::render(w, h);
+        assert_eq!(
+            state.latest_frame_rgba().expect("readback"),
+            golden,
+            "retained framebuffer must hold the composited pattern"
+        );
+        assert_eq!(
+            state.latest_frame_rgba().expect("second readback"),
+            golden,
+            "capture is a pure read: no recomposite, identical bytes"
         );
     }
 }

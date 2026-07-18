@@ -29,3 +29,19 @@ calloop = { version = "0.14", features = ["signals"] }
 # Smithay's logging facade; the core emits its own diagnostics through it too.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The wire codec (P1.1.5 codegen): the capture service (P1.3.6) encodes
+# `vitrin_view.frame_ready` and `vitrin_grant.refused` through the generated
+# message types, never by hand. Pure data, no I/O -- zero new transitive
+# dependencies.
+vitrin-protocol = { path = "../vitrin-protocol" }
+# The transport (P1.2): `Connection::send_or_queue` is how a capture's fresh
+# memfd rides SCM_RIGHTS to the requesting agent connection. Default features
+# = the `server` slice (calloop event-source glue), which is exactly the side
+# the trusted core is.
+vitrin-ipc = { path = "../vitrin-ipc" }
+# memfd_create + F_ADD_SEALS for the capture path (P1.3.6): every capture is
+# a fresh memfd sealed SHRINK|GROW|WRITE|SEAL before sending (the wire
+# contract's always-a-copy proof). Same crate and posture as vitrin-ipc
+# (already in the tree, so no new dependency for the R7 budget): I/O-safe
+# OwnedFd APIs, no unsafe in our code.
+rustix = { version = "1", features = ["fs"] }

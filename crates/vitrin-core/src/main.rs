@@ -32,6 +32,13 @@
 //! (P1.3.2) — the path CI runs on. The shim-facing protocol server is P1.3.4.
 
 mod backend;
+/// The `vitrin_view.capture_frame` service (P1.3.6). Dead-code-allowed
+/// outside tests for the same reason as `headless::render_once`: the module
+/// is fully exercised by its tests today and gets wired to live protocol
+/// dispatch when the enforcement chokepoint lands (P1.4.4, M1.1
+/// integration) — nothing at runtime calls it before then.
+#[cfg_attr(not(test), allow(dead_code))]
+mod capture;
 mod test_pattern;
 
 use std::process::ExitCode;

@@ -43,8 +43,11 @@ vitrin-ipc = { path = "../vitrin-ipc" }
 # a fresh memfd sealed SHRINK|GROW|WRITE|SEAL before sending (the wire
 # contract's always-a-copy proof). Same crate and posture as vitrin-ipc
 # (already in the tree, so no new dependency for the R7 budget): I/O-safe
-# OwnedFd APIs, no unsafe in our code.
-rustix = { version = "1", features = ["fs"] }
+# OwnedFd APIs, no unsafe in our code. The `process` feature (P1.4.1) adds
+# only `geteuid`, which anchors the identity layer's registry-ownership
+# check and its SO_PEERCRED same-user policy -- a feature bump on an
+# existing dependency, not a new one.
+rustix = { version = "1", features = ["fs", "process"] }
 
 # GBM buffer allocation for the env-gated real-GPU dmabuf tests (P1.3.5,
 # M1.5) — the test-side allocator that mints *genuine* dmabufs from a render

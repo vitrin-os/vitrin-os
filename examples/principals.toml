@@ -1,0 +1,41 @@
+# Vitrin OS principal registry -- the StaticVerifier's input (P1.4.1).
+#
+# One [[principal]] table per agent identity the core will accept at
+# handshake time (`vitrin_handshake.hello` with credential_type
+# "static-token"). This file is parsed by a deliberately strict TOML
+# subset (see `crates/vitrin-core/src/identity.rs` for the schema and the
+# rationale): comments, blank lines, [[principal]] headers, and
+# `key = "string"` / `key = integer` pairs -- nothing else. Every file this
+# subset accepts is valid TOML.
+#
+# SECURITY -- this file holds bearer tokens and is refused unless it is:
+#   - a regular file,
+#   - owned by the uid running vitrind, and
+#   - inaccessible to group and other:  chmod 600 principals.toml
+#
+# Conventional location: $XDG_CONFIG_HOME/vitrin/principals.toml
+# (~/.config/vitrin/principals.toml).
+
+[[principal]]
+# The canonical, SPIFFE-shaped identity this row binds. This exact string
+# is what `vitrin_principal.bound` announces, what the consent prompt
+# names, and what grant-table rows are keyed by. Unique per file; at most
+# 2048 bytes; shape `scheme://trust-domain/path` over [A-Za-z0-9._/-].
+identity = "vitrin://local/agent/demo"
+
+# The pre-shared random token the agent presents as its `hello` credential,
+# compared constant-time. At least 16 bytes; generate 64 random hex chars:
+#
+#   openssl rand -hex 32
+#
+# (Replace this placeholder before use -- the core refuses short tokens,
+# and a guessable token defeats the whole registry.)
+token = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# Optional: additionally pin the connecting peer's kernel-attested
+# SO_PEERCRED uid. Even without this pin, the core always requires the
+# peer uid to equal its own effective uid (hard refusal on mismatch), so
+# the only satisfiable pin is that same uid -- a registry pinning any
+# other value is refused at load. Use it as a deployment assertion: this
+# file then only loads where vitrind itself runs as the pinned uid.
+#uid = 1000

@@ -80,10 +80,14 @@
 //! - fds are matched to frames **positionally**, in byte-stream order, per
 //!   conventions section 2.2: the ancillary payload rides with the frame's
 //!   bytes in one `sendmsg`, and the receiver claims queued fds as frames
-//!   complete. Matching is *strict*: the receiver records the byte-stream
-//!   offset each fd arrived attached to (the kernel never coalesces a
-//!   `recvmsg` across an `SCM_RIGHTS` boundary, so that offset is exact)
-//!   and requires it to fall within the declaring frame's bytes. A frame
+//!   complete. Matching is as strict as the kernel's delivery semantics
+//!   allow: the receiver records the byte-stream *span* of the `recvmsg`
+//!   each fd batch arrived with (the kernel delivers a batch with the
+//!   `recvmsg` that first consumes bytes of the `sendmsg` that carried it
+//!   and never merges two batches, but it may glue preceding fd-less bytes
+//!   onto the head of that `recvmsg`) and requires the span to be
+//!   consistent with the fd being attached to the declaring frame's bytes.
+//!   A frame
 //!   declaring `fd_count = 1` whose bytes carry no fd is
 //!   [`error::PeerViolation::MissingFd`]; an fd attached to the bytes of a
 //!   frame that does not declare it -- "fds attached to a message that
@@ -214,10 +218,33 @@ pub const MAX_UNCLAIMED_FDS: usize = 8;
 /// - **Bounded hostile cost.** Worst case a hostile connection pins
 ///   `MAX_SEND_QUEUE_BYTES` + one receive scratch + one reassembly buffer,
 ///   so even hundreds of hostile connections cost the core tens of MiB, not
-///   gigabytes.
+///   gigabytes. (Bytes only: the resources a parked *fd* pins are bounded
+///   separately by [`MAX_SEND_QUEUE_FDS`].)
 /// - **Never less than one frame.** The cap exceeds [`MAX_MESSAGE_SIZE`],
 ///   so a single frame can always be parked into an empty queue: exceeding
 ///   the cap is always the peer's accumulated slowness, never one legal
 ///   message's size.
 #[cfg(feature = "client")]
 pub const MAX_SEND_QUEUE_BYTES: usize = 256 * 1024;
+
+/// Cap on the *file descriptors* parked in one [`Connection`]'s send queue:
+/// **16**, enforced by [`Connection::send_or_queue`] alongside
+/// [`MAX_SEND_QUEUE_BYTES`] -- tripping either sets the same sticky
+/// [`error::TransportError::SendQueueFull`] slow-reader state.
+///
+/// The byte cap alone does not bound fds. Protocol v0 defines *small*
+/// fd-bearing server-to-client events (`vitrin_capture_stream.frame`
+/// transfers a fresh memfd per delivered frame), so 256 KiB of ~50-byte
+/// frame events could otherwise park thousands of duplicated fds for one
+/// non-reading peer. That is a compositor-wide hazard, not a per-connection
+/// one: fd-table exhaustion (`RLIMIT_NOFILE`, commonly a 1024 soft limit)
+/// makes `accept(2)` and fd duplication fail with `EMFILE` for *every*
+/// connection, and each parked memfd duplicate also pins its whole backing
+/// frame allocation -- far past the byte cap's "tens of MiB" hostile-cost
+/// rationale. Sixteen parked fds bound both costs: at most 16 fd-table
+/// entries and 16 pinned frames per hostile connection. A compliant reader
+/// never accumulates that many -- the kernel socket buffer already holds
+/// multiple in-flight fd-bearing frames before the first one parks (compare
+/// libwayland's `MAX_FDS_OUT` of 28 for a whole batched flush).
+#[cfg(feature = "client")]
+pub const MAX_SEND_QUEUE_FDS: usize = 16;

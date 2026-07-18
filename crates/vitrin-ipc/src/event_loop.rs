@@ -45,9 +45,16 @@
 //!   connection's bounded send queue
 //!   ([`Connection::send_or_queue`]); the source adds write-interest while
 //!   anything is parked and flushes on write-readiness. A queue pushed past
-//!   [`crate::MAX_SEND_QUEUE_BYTES`] means the peer stopped reading: the
-//!   connection is removed with [`DisconnectReason::SlowReader`] -- it is
-//!   never allowed to stall the loop or grow the queue without bound.
+//!   [`crate::MAX_SEND_QUEUE_BYTES`] bytes or [`crate::MAX_SEND_QUEUE_FDS`]
+//!   parked fds means the peer stopped reading: the connection is removed
+//!   with [`DisconnectReason::SlowReader`] -- it is never allowed to stall
+//!   the loop, grow the queue without bound, or pin unbounded fds.
+//! - **Dead and half-dead peers.** A fatal send I/O error (e.g. `EPIPE`
+//!   from a peer that shut down its read side but keeps writing) poisons
+//!   the connection's send path; the source observes the sticky poison
+//!   after the dispatch and removes the connection with
+//!   [`DisconnectReason::PeerAborted`] -- send failures are just as
+//!   terminal as receive failures, even when nothing is parked.
 //! - **Oversized messages and fd-bombs.** The transport's receive path
 //!   already makes these connection-fatal
 //!   ([`TransportError::PeerViolation`]); here each is classified into a
@@ -80,19 +87,22 @@ use crate::{Connection, Listener, Message, PeerCred, TransportError};
 /// connection-fatal; the connection is already dead (and its source removed)
 /// when the callback sees this inside [`ConnectionEvent::Fault`].
 ///
-/// The taxonomy follows the P1.2.3 misbehavior classes; the wire-error
-/// mapping (conventions section 5) is noted per variant.
+/// The taxonomy follows the P1.2.3 misbehavior classes **as seen by the
+/// operator/policy layer** (graduated handling: rate-limiting, per-uid
+/// banning): [`PeerAborted`](Self::PeerAborted) is the one non-misbehavior
+/// variant, so crash-shaped disconnects never pollute misbehavior counters.
+/// The wire-error mapping (conventions section 5) is noted per variant.
 #[derive(Debug)]
 pub enum DisconnectReason {
     /// The peer stopped reading: its send queue hit
-    /// [`crate::MAX_SEND_QUEUE_BYTES`] with `queued` bytes already parked.
+    /// [`crate::MAX_SEND_QUEUE_BYTES`] (with `queued` bytes already parked)
+    /// or [`crate::MAX_SEND_QUEUE_FDS`] parked fds.
     SlowReader { queued: usize },
-    /// A size violation: the frame's declared size and the bytes the stream
-    /// can or did deliver disagree. Both expressible forms map to the fatal
-    /// `oversized` wire condition: a size field below the 8-byte header
-    /// minimum ([`PeerViolation::UndersizedSizeField`]; a size *above*
-    /// [`crate::MAX_MESSAGE_SIZE`] is inexpressible in the u16 field), and a
-    /// stream that ended inside a declared frame ([`TransportError::Eof`]).
+    /// A size violation: a frame header declared a size below the 8-byte
+    /// header minimum ([`PeerViolation::UndersizedSizeField`]) -- the one
+    /// size violation the u16 `size` field can express (a size *above*
+    /// [`crate::MAX_MESSAGE_SIZE`] is inexpressible). Maps to the fatal
+    /// `oversized` wire condition.
     Oversized(TransportError),
     /// An fd-passing violation -- more fds than the message schema allows
     /// (fatal `fd_violation`): a header declaring >1 fd, an fd attached to a
@@ -100,10 +110,17 @@ pub enum DisconnectReason {
     /// [`crate::MAX_UNCLAIMED_FDS`], or an ancillary payload the kernel had
     /// to truncate.
     FdBomb(PeerViolation),
-    /// Any other terminal transport condition: a frame that declared an fd
-    /// but carried none ([`PeerViolation::MissingFd`]), or an OS-level I/O
-    /// failure on the connection (e.g. `ECONNRESET`) -- not necessarily
-    /// hostile, but equally fatal to the connection.
+    /// The peer went away out from under the connection rather than
+    /// violating anything: the stream ended inside a declared frame
+    /// ([`TransportError::Eof`] -- e.g. the peer was killed between the
+    /// partial writes of a frame) or an OS-level I/O failure on the socket
+    /// ([`TransportError::Io`], e.g. `EPIPE`/`ECONNRESET`, including a
+    /// sticky send-side poison observed after a dispatch). Equally fatal to
+    /// the connection, but *not* misbehavior -- policy consumers must not
+    /// count it toward graduated sanctions.
+    PeerAborted(TransportError),
+    /// Any other terminal transport condition, e.g. a frame that declared an
+    /// fd but carried none ([`PeerViolation::MissingFd`]).
     ProtocolError(TransportError),
 }
 
@@ -112,8 +129,8 @@ impl From<TransportError> for DisconnectReason {
     fn from(e: TransportError) -> Self {
         match e {
             TransportError::SendQueueFull { queued } => DisconnectReason::SlowReader { queued },
-            TransportError::Eof { .. }
-            | TransportError::PeerViolation(PeerViolation::UndersizedSizeField { .. }) => {
+            TransportError::Eof { .. } | TransportError::Io(_) => DisconnectReason::PeerAborted(e),
+            TransportError::PeerViolation(PeerViolation::UndersizedSizeField { .. }) => {
                 DisconnectReason::Oversized(e)
             }
             TransportError::PeerViolation(
@@ -137,22 +154,34 @@ impl fmt::Display for DisconnectReason {
             ),
             DisconnectReason::Oversized(e) => write!(f, "oversized: {e}"),
             DisconnectReason::FdBomb(v) => write!(f, "fd bomb: {v}"),
+            DisconnectReason::PeerAborted(e) => write!(f, "peer aborted: {e}"),
             DisconnectReason::ProtocolError(e) => write!(f, "protocol error: {e}"),
         }
     }
 }
 
 /// The one place a terminated connection gets its reason logged: every
-/// disconnect path (receive violation, flush failure, slow-reader overflow)
-/// funnels through here before the [`ConnectionEvent::Fault`] callback.
+/// disconnect path (receive violation, flush/send failure, slow-reader
+/// overflow) funnels through here before the [`ConnectionEvent::Fault`]
+/// callback. Misbehavior classes log at WARN; a peer that merely went away
+/// ([`DisconnectReason::PeerAborted`] -- crash-shaped, not hostile) logs at
+/// INFO so it never reads as actionable misbehavior noise.
 fn log_disconnect(conn: &Connection, reason: &DisconnectReason) {
     let cred = conn.peer_cred();
-    tracing::warn!(
-        peer_uid = cred.uid,
-        peer_pid = ?cred.pid,
-        %reason,
-        "terminating connection for misbehavior"
-    );
+    match reason {
+        DisconnectReason::PeerAborted(_) => tracing::info!(
+            peer_uid = cred.uid,
+            peer_pid = ?cred.pid,
+            %reason,
+            "terminating connection: peer went away"
+        ),
+        _ => tracing::warn!(
+            peer_uid = cred.uid,
+            peer_pid = ?cred.pid,
+            %reason,
+            "terminating connection for misbehavior"
+        ),
+    }
 }
 
 /// Put `fd` into non-blocking mode, preserving its other open-file flags.
@@ -296,17 +325,31 @@ impl EventSource for ConnectionSource {
                     }
                 }
                 // Replies issued by the callback above may have hit the
-                // send-queue cap. This check is what makes the slow-reader
-                // policy *prompt*: the overflow flag is sticky, so it cannot
-                // be missed, and the connection dies in the same dispatch
-                // that overflowed it -- the loop never parks past-cap data.
-                if matches!(action, PostAction::Continue) && conn_nodrop.send_queue_overflowed() {
-                    let reason = DisconnectReason::SlowReader {
-                        queued: conn_nodrop.queued_send_bytes(),
-                    };
-                    log_disconnect(conn_nodrop, &reason);
-                    callback(ConnectionEvent::Fault(reason), conn_nodrop);
-                    action = PostAction::Remove;
+                // send-queue cap or a fatal send I/O error. Both are sticky
+                // on the Connection, so neither can be missed here, and the
+                // connection dies in the same dispatch that hit it. The
+                // overflow check makes the slow-reader policy *prompt* (the
+                // loop never parks past-cap data); the poison check is the
+                // *only* observation point for a send error with an empty
+                // queue (e.g. EPIPE from a peer that shut down its read side
+                // but keeps writing) -- without it such a connection would
+                // live forever with every reply silently failing, and a
+                // partial write followed by an error would leave a torn
+                // frame on a still-registered connection.
+                if matches!(action, PostAction::Continue) {
+                    if conn_nodrop.send_queue_overflowed() {
+                        let reason = DisconnectReason::SlowReader {
+                            queued: conn_nodrop.queued_send_bytes(),
+                        };
+                        log_disconnect(conn_nodrop, &reason);
+                        callback(ConnectionEvent::Fault(reason), conn_nodrop);
+                        action = PostAction::Remove;
+                    } else if let Some(kind) = conn_nodrop.send_poisoned() {
+                        let reason = DisconnectReason::from(TransportError::Io(kind.into()));
+                        log_disconnect(conn_nodrop, &reason);
+                        callback(ConnectionEvent::Fault(reason), conn_nodrop);
+                        action = PostAction::Remove;
+                    }
                 }
                 Ok(action)
             })?;
@@ -358,13 +401,17 @@ impl EventSource for ConnectionSource {
 ///
 /// **Never blocks, never fails on a full socket** (P1.2.3): what the kernel
 /// will not take is parked in the connection's bounded send queue and flushed
-/// by the source on write-readiness. The one backpressure failure is
-/// [`TransportError::SendQueueFull`] -- the peer has stopped reading and its
-/// parked bytes hit [`crate::MAX_SEND_QUEUE_BYTES`]. The caller should stop
-/// replying and simply return: the source notices the overflow when the
-/// dispatch callback returns, emits
-/// [`ConnectionEvent::Fault`]`(`[`DisconnectReason::SlowReader`]`)`, and
-/// removes the connection.
+/// by the source on write-readiness. Two failures matter, and for both the
+/// caller should stop replying and simply return -- the source observes the
+/// sticky state when the dispatch callback returns, emits the matching
+/// [`ConnectionEvent::Fault`], and removes the connection:
+///
+/// - [`TransportError::SendQueueFull`] -- the peer has stopped reading and
+///   its parked bytes/fds hit [`crate::MAX_SEND_QUEUE_BYTES`] /
+///   [`crate::MAX_SEND_QUEUE_FDS`] ([`DisconnectReason::SlowReader`]).
+/// - [`TransportError::Io`] -- a fatal send error (e.g. `EPIPE` because the
+///   peer went away); the connection's send side is poisoned
+///   ([`DisconnectReason::PeerAborted`]).
 pub fn reply(
     conn: &mut NoIoDrop<Connection>,
     frame: &[u8],

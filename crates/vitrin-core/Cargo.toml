@@ -14,11 +14,13 @@ path = "src/main.rs"
 [dependencies]
 # The compositor toolkit for the trusted core (PRD SS17: Rust + Smithay).
 # Pinned exactly -- the issue-#17 decision -- because renderer output feeds
-# pixel-golden tests later (P1.3.2/P1.3.6) and a silent minor bump must not
-# move pixels. `default-features = false` keeps the TCB dependency surface
-# minimal (plan risk R7): `backend_winit` transitively enables exactly the
-# EGL/GLES pieces the nested backend needs, nothing else.
-smithay = { version = "=0.7.0", default-features = false, features = ["backend_winit"] }
+# pixel-golden tests (P1.3.2/P1.3.6) and a silent minor bump must not move
+# pixels. `default-features = false` keeps the TCB dependency surface minimal
+# (plan risk R7): `backend_winit` pulls exactly the EGL/GLES pieces the nested
+# backend needs, and `renderer_pixman` adds the CPU software renderer the
+# headless backend composites with (P1.3.2) -- the GPU-less path CI runs on,
+# and where the P1.3.2/P1.3.6 goldens are read back. Nothing else.
+smithay = { version = "=0.7.0", default-features = false, features = ["backend_winit", "renderer_pixman"] }
 # The same calloop Smithay links against (it pins 0.14); this direct
 # dependency exists to (a) import event-loop types under their own name and
 # (b) switch on the `signals` feature -- the signalfd event source used for

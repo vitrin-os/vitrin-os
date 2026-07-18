@@ -71,13 +71,16 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install native link deps (libxkbcommon for the vitrind winit/Smithay backend)
-        # vitrin-core's nested winit/Smithay backend links libxkbcommon; the
-        # runner image lacks the -dev package, so cargo test/clippy would fail
-        # to link vitrind with "unable to find library -lxkbcommon". wayland
-        # and libinput are dlopen'd at runtime, so no -dev package is needed to
+      - name: Install native link deps (libxkbcommon + libpixman for the vitrind Smithay backends)
+        # vitrin-core's Smithay backends link two system libraries the runner
+        # image lacks the -dev packages for: the nested winit backend links
+        # libxkbcommon, and the headless backend's pixman software renderer
+        # links libpixman-1 (P1.3.2, the GPU-less compositing path). Without
+        # either -dev package cargo test/clippy would fail to link vitrind
+        # ("unable to find library -lxkbcommon" / "-lpixman-1"). wayland and
+        # libinput are dlopen'd at runtime, so no -dev package is needed to
         # link here.
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxkbcommon-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxkbcommon-dev libpixman-1-dev
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -314,6 +317,14 @@ jobs:
         # is a workspace crate (crates/vitrin-core per the plan layout), so
         # this builds -- and, via the cache step above, banks -- the heavy
         # dependency tree before the timed suite step runs.
+        #
+        # TODO(P1.8.x activation): this job installs no native -dev packages,
+        # but vitrind links libxkbcommon (winit backend) and libpixman-1
+        # (headless backend, P1.3.2). The activating PR that lands
+        # tests/integration/run.sh must add an apt step installing
+        # `libxkbcommon-dev libpixman-1-dev` (mirroring the rust job) or this
+        # `cargo build --workspace` will fail to link. Left to that PR per this
+        # repo's "the activating PR owns its deps" convention.
         if: hashFiles('tests/integration/run.sh') != ''
         run: cargo build --workspace
 

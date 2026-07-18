@@ -114,6 +114,18 @@ jobs:
         # unnoticed. Kept scoped to the one crate that has the feature split.
         run: cargo test -p vitrin-ipc --no-default-features --features client
 
+      - name: vitrin-core gpu-tests slice (compile-check only)
+        # The real-GPU dmabuf tests (P1.3.5, the M1.5 zero-copy acceptance)
+        # hide behind the `gpu-tests` feature and can never RUN on these
+        # GPU-less runners — they stay env-gated on developer machines
+        # (VITRIN_GPU_TESTS=1, see crates/vitrin-core/Cargo.toml). But
+        # nothing else compiles that cfg combination, so without this step a
+        # refactor of dmabuf/shim/mock-shim internals could land green and
+        # rot the acceptance harness unnoticed. clippy type-checks without
+        # linking, so the runner needs no libgbm/EGL (gbm-sys links only at
+        # final-binary link time, which check/clippy skip).
+        run: cargo clippy -p vitrin-core --all-targets --features gpu-tests -- -D warnings
+
   codegen-diff:
     name: codegen-diff (IDL schema + regeneration honesty)
     runs-on: ubuntu-latest

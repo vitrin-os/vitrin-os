@@ -1,7 +1,7 @@
 name: CI
 
-# Phase-1 pipeline (P1.9.1). Four jobs mirror the four components the issue
-# names, so each acceptance criterion is a visible check on every PR:
+# Phase-1 pipeline (P1.9.1). Jobs mirror the components the issue names, so
+# each acceptance criterion is a visible check on every PR:
 #
 #   rust          fmt + clippy + workspace tests (debug AND release)
 #   codegen-diff  IDL schema validation + regeneration honesty (the P1.1.2
@@ -10,6 +10,9 @@ name: CI
 #                 checked-in generated header must suffice on its own. The
 #                 Meson build activates automatically once shim/meson.build
 #                 lands (P1.6.1).
+#   sdk           the pure-Python wire client's unit tests (P1.8.1) against
+#                 its scripted mock server -- no vitrind involved; the live
+#                 pairing is the integration job's business.
 #   integration   vitrind --headless + scripted Python SDK tests, suite
 #                 hard-capped at 10 minutes. Dormant until
 #                 tests/integration/run.sh lands
@@ -253,6 +256,33 @@ jobs:
             echo "automatically when \`shim/meson.build\` lands; the landing PR owns"
             echo "\`shim/ci/install-deps.sh\` (see its header, decision D11)."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  sdk:
+    name: sdk (Python ${{ matrix.python }} wire-client unit tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor (D8: pure Python >= 3.11) and the current latest, so a
+        # 3.11-incompatible construct and a deprecation-removal both fail
+        # visibly. The suite is mock-server unit tests only -- pure stdlib,
+        # no vitrind, no native deps -- so it stays fast and GPU-less.
+        python: ["3.11", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install vitrin-os (zero runtime deps) + pytest
+        run: python -m pip install './sdk/python[dev]'
+
+      - name: pytest
+        run: python -m pytest sdk/python/tests -q
 
   integration:
     name: integration (vitrind --headless + SDK tests)

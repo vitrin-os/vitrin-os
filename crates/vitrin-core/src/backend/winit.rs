@@ -1,7 +1,9 @@
 //! Nested backend: the core runs as a client of the host compositor
 //! (GNOME, Hyprland, …), presenting exactly one host window — the gamescope
 //! nested-session pattern (PRD Doc 2 §4/§17). Rendering stays deliberately
-//! trivial per plan risk R1: one window, one full-window texture blit.
+//! trivial per plan risk R1: one window, one full-window texture blit of the
+//! composed realm view ([`Scene::compose`] — the same bytes the headless
+//! backend retains for capture, P1.3.3).
 //!
 //! The winit backend is EGL/GLES-bound by construction, so this path always
 //! renders with [`GlesRenderer`]. The pixman software path (mandatory for
@@ -24,14 +26,16 @@ use smithay::reexports::winit::window::Window as WinitWindow;
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use tracing::{debug, error, info, trace};
 
-use crate::test_pattern;
+use crate::scene::Scene;
 
 /// Initial logical window size; matches the planned headless default
 /// (`--headless --size 1280x800`, P1.3.2) so nested and headless views of
 /// the same content agree by default.
 const INITIAL_SIZE: (f64, f64) = (1280.0, 800.0);
 
-/// Background behind the test pattern; only visible if the blit fails.
+/// Background behind the composed view; only visible if the blit fails.
+/// Deliberately near [`crate::scene::LETTERBOX_RGBA`] so nothing here reads
+/// as client content.
 const CLEAR_COLOR: Color32F = Color32F::new(0.06, 0.06, 0.08, 1.0);
 
 /// Fallback frame budget (~60 Hz). Vsync'd blocking swaps are the primary
@@ -41,24 +45,28 @@ const CLEAR_COLOR: Color32F = Color32F::new(0.06, 0.06, 0.08, 1.0);
 /// GPU-less VMs on llvmpipe, X servers without vblank) the redraw chain
 /// would otherwise spin unthrottled. Frames that complete faster than this
 /// budget defer the next redraw to a timer instead. A real frame clock
-/// replaces this in P1.3.3.
+/// (client damage + frame callbacks) replaces this in P1.3.4.
 const FRAME_BUDGET: Duration = Duration::from_micros(16_667);
 
-/// The test pattern uploaded as a GLES texture, remembered together with
-/// the window size it was generated for so resizes regenerate it.
-struct PatternTexture {
+/// The composed realm view ([`Scene::compose`]) uploaded as a GLES texture,
+/// remembered together with the window size and scene generation it was
+/// composed for, so resizes and scene commits re-upload it.
+struct SceneTexture {
     texture: GlesTexture,
     size: Size<i32, Physical>,
+    generation: u64,
 }
 
 /// Per-run state of the nested backend: the winit window + GLES renderer
-/// pair and the current test-pattern texture.
-///
-/// Scene composition of real client surfaces replaces the test-pattern blit
-/// in P1.3.3; this struct is where the realm view state will hang.
+/// pair, the realm's [`Scene`], and the currently uploaded view texture.
 struct NestedState {
     backend: WinitGraphicsBackend<GlesRenderer>,
-    pattern: Option<PatternTexture>,
+    /// The realm's scene (P1.3.3) — the same composition implementation the
+    /// headless backend retains for capture; this backend presents its
+    /// output 1:1 in the host window. The shim-facing protocol server
+    /// (P1.3.4) commits into it and requests a redraw.
+    scene: Scene,
+    view: Option<SceneTexture>,
     loop_signal: LoopSignal,
     loop_handle: LoopHandle<'static, NestedState>,
     /// Set when a render failure stops the loop, so [`run`] can propagate
@@ -103,9 +111,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         WinitEvent::Redraw => state.redraw(),
         WinitEvent::Resized { size, .. } => {
             debug!(?size, "host window resized");
-            // Drop the pattern; the next redraw regenerates it 1:1 at the
-            // new size (kept pixel-exact for the P1.3.2/P1.3.6 goldens).
-            state.pattern = None;
+            // Drop the uploaded view; the next redraw recomposes it 1:1 at
+            // the new size (kept pixel-exact for the P1.3.2/P1.3.6 goldens).
+            state.view = None;
             state.backend.window().request_redraw();
         }
         WinitEvent::CloseRequested => {
@@ -120,7 +128,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let mut state = NestedState {
         backend,
-        pattern: None,
+        scene: Scene::new(),
+        view: None,
         loop_signal: event_loop.get_signal(),
         loop_handle: event_loop.handle(),
         fatal: None,
@@ -160,8 +169,13 @@ impl NestedState {
             return Ok(());
         }
 
-        if self.pattern.as_ref().map(|p| p.size) != Some(size) {
-            let pixels = test_pattern::render(size.w as u32, size.h as u32);
+        // Re-upload the view when the window size or the scene content
+        // changed: the same `Scene::compose` bytes the headless backend
+        // retains for capture, presented here as a full-window texture (the
+        // single shared composition implementation, P1.3.3).
+        let generation = self.scene.generation();
+        if self.view.as_ref().map(|v| (v.size, v.generation)) != Some((size, generation)) {
+            let pixels = self.scene.compose(size.w as u32, size.h as u32);
             let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
             let texture = self.backend.renderer().import_memory(
                 &pixels,
@@ -169,14 +183,18 @@ impl NestedState {
                 buffer_size,
                 false,
             )?;
-            self.pattern = Some(PatternTexture { texture, size });
+            self.view = Some(SceneTexture {
+                texture,
+                size,
+                generation,
+            });
         }
 
         let full_window = Rectangle::from_size(size);
         {
             // Field-level borrows: `bind` holds `self.backend` mutably while
-            // the pattern texture is read from `self.pattern`.
-            let pattern = self.pattern.as_ref().expect("pattern generated above");
+            // the view texture is read from `self.view`.
+            let view = self.view.as_ref().expect("view composed above");
             let (renderer, mut framebuffer) = self.backend.bind()?;
             let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
             frame.clear(CLEAR_COLOR, &[full_window])?;
@@ -185,7 +203,7 @@ impl NestedState {
             // renderer-agnostic trait method.
             Frame::render_texture_from_to(
                 &mut frame,
-                &pattern.texture,
+                &view.texture,
                 Rectangle::from_size(Size::<f64, Buffer>::from((size.w as f64, size.h as f64))),
                 full_window,
                 &[full_window],
@@ -197,8 +215,8 @@ impl NestedState {
             // here (same posture as Smithay's own winit example).
             let _sync_point = frame.finish()?;
         }
-        // Full-frame submit; damage tracking becomes worthwhile with real
-        // client content (P1.3.3).
+        // Full-frame submit; damage tracking becomes worthwhile once client
+        // damage arrives over the shim protocol (P1.3.4).
         self.backend.submit(None)?;
         trace!(?size, "frame submitted");
         self.schedule_next_frame(frame_start)?;

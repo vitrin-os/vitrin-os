@@ -482,6 +482,50 @@ pub(crate) mod tests {
         assert!(pixels.iter().skip(3).step_by(4).all(|&x| x == 0xff));
     }
 
+    /// Cross-language golden pin (P1.8.2, issue #41): the committed
+    /// raw-bytes file `sdk/python/tests/golden/test_pattern_64x40.xrgb`
+    /// IS `rgba_to_xrgb8888(test_pattern::render(64, 40))` — the exact
+    /// wire bytes a capture of the 64x40 pattern delivers. Rust CI pins
+    /// the file with this test; the Python SDK suite consumes it (its
+    /// mock core serves these bytes as the frame memfd, and `.to_png()`
+    /// must decode back to them), so the two implementations can only
+    /// drift loudly — and no image codec ever enters the core (plan risk
+    /// R7): the shared golden stays raw bytes, PNG encoding lives in the
+    /// SDK alone.
+    ///
+    /// Regeneration — only when the pattern or the swizzle deliberately
+    /// changes:
+    ///
+    /// ```sh
+    /// VITRIN_REGEN_GOLDEN=1 cargo test -p vitrin-core sdk_capture_golden
+    /// ```
+    ///
+    /// then commit the rewritten file together with the change that
+    /// motivated it (the Python capture tests keep consuming it).
+    #[test]
+    fn sdk_capture_golden_file_pins_the_wire_bytes() {
+        let _fd = fd_lock();
+        const W: u32 = 64;
+        const H: u32 = 40;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sdk/python/tests/golden/test_pattern_64x40.xrgb"
+        );
+        let expected = rgba_to_xrgb8888(&test_pattern::render(W, H));
+        if std::env::var_os("VITRIN_REGEN_GOLDEN").is_some() {
+            std::fs::write(path, &expected).expect("golden regeneration must be writable");
+        }
+        let committed = std::fs::read(path)
+            .expect("committed SDK golden exists (regenerate: VITRIN_REGEN_GOLDEN=1)");
+        assert_eq!(
+            committed, expected,
+            "sdk/python/tests/golden/test_pattern_64x40.xrgb no longer matches \
+             rgba_to_xrgb8888(test_pattern::render(64, 40)); if the pattern or \
+             swizzle changed deliberately, regenerate with VITRIN_REGEN_GOLDEN=1 \
+             and update the Python capture tests"
+        );
+    }
+
     /// Every capture yields a *fresh* memfd: two frames held concurrently
     /// are distinct open files (different inodes), and the sealed bytes of
     /// the first cannot be disturbed by anything that happens after it was

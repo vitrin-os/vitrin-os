@@ -10,7 +10,7 @@ name: CI
 #                 checked-in generated header must suffice on its own. The
 #                 Meson build activates automatically once shim/meson.build
 #                 lands (P1.6.1).
-#   sdk           the pure-Python wire client's unit tests (P1.8.1) against
+#   sdk           the pure-Python wire client's unit tests (P1.8.x) against
 #                 its scripted mock server -- no vitrind involved; the live
 #                 pairing is the integration job's business.
 #   integration   vitrind --headless + scripted Python SDK tests, suite
@@ -292,6 +292,15 @@ jobs:
 
       - name: Install vitrin-os (zero runtime deps) + pytest
         run: python -m pip install './sdk/python[dev]'
+
+      - name: Install Pillow (independent PNG decode verification)
+        # Test-only: the SDK never imports Pillow (Frame.to_png is pure
+        # stdlib). One matrix leg gets the real decoder so the
+        # test_to_png_decodes_with_pillow round-trip runs; the other leg
+        # stays Pillow-less and proves the dependency-free path end to end
+        # (that one test skips itself there).
+        if: matrix.python == '3.13'
+        run: python -m pip install pillow
 
       - name: pytest
         run: python -m pytest sdk/python/tests -q

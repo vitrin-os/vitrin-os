@@ -12,6 +12,7 @@ import flows
 from vitrin_os import NoSurface, ServerContractViolation, connect
 from vitrin_os.messages import encode_capture_frame
 from vitrin_os.protocol import REQUIRED_FRAME_SEALS
+from vitrin_os.transport import Transport
 
 WIDTH, HEIGHT = 2, 2
 STRIDE = WIDTH * 4
@@ -51,22 +52,45 @@ def _observe_script(fd: int) -> list[tuple]:
     ]
 
 
-def test_observe_receives_usable_sealed_memfd_with_cloexec(server) -> None:
+def test_observe_materializes_and_closes_the_sealed_memfd(server) -> None:
+    """observe() verifies the memfd contract (size, seals), copies the
+    bytes out, and closes the fd before returning (P1.8.2 close-after-copy):
+    the returned Frame is a value object owning no descriptor, and its raw
+    buffer is the memfd content verbatim."""
     server.run(_observe_script(_make_memfd(PIXELS)))
     conn = _connect(server)
     grant = conn.request_grant().await_consent()
-    with grant.observe() as frame:
-        assert (frame.width, frame.height, frame.stride) == (WIDTH, HEIGHT, STRIDE)
-        assert frame.size == STRIDE * HEIGHT
-        # The memfd is usable: the bytes the server wrote come back.
-        assert frame.read_bytes() == PIXELS
-        # CLOEXEC is set atomically at receipt (MSG_CMSG_CLOEXEC).
-        assert fcntl.fcntl(frame.fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
-        # The seals are really there (client-provable immutability).
-        seals = fcntl.fcntl(frame.fd, fcntl.F_GET_SEALS)
-        assert seals & REQUIRED_FRAME_SEALS == REQUIRED_FRAME_SEALS
-    assert frame.closed
+    frame = grant.observe()
+    assert (frame.width, frame.height, frame.stride) == (WIDTH, HEIGHT, STRIDE)
+    assert frame.size == STRIDE * HEIGHT
+    assert frame.raw == PIXELS
     conn.close()
+
+
+def test_received_fd_is_cloexec_at_the_transport(server) -> None:
+    """MSG_CMSG_CLOEXEC sets close-on-exec atomically at receipt, and the
+    server's seals ride along on the received fd. Pinned at the transport
+    layer since P1.8.2's close-after-copy Frame no longer exposes the fd
+    for observe()-level inspection."""
+    fd_in = _make_memfd(PIXELS)
+    server.run(
+        [
+            (
+                "send_fd",
+                flows.frame_ready_frame(width=WIDTH, height=HEIGHT, stride=STRIDE),
+                fd_in,
+            )
+        ]
+    )
+    transport = Transport.connect_unix(server.path, timeout=5.0)
+    object_id, _opcode, _payload, fd = transport.recv_frame()
+    assert object_id == flows.VIEW_ID
+    assert fd is not None
+    assert fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+    seals = fcntl.fcntl(fd, fcntl.F_GET_SEALS)
+    assert seals & REQUIRED_FRAME_SEALS == REQUIRED_FRAME_SEALS
+    os.close(fd)
+    transport.close()
 
 
 def test_unsealed_memfd_is_a_server_contract_violation(server) -> None:

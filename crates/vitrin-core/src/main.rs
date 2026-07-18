@@ -44,6 +44,14 @@ mod backend;
 /// integration) — nothing at runtime calls it before then.
 #[cfg_attr(not(test), allow(dead_code))]
 mod capture;
+/// The dmabuf import path (P1.3.5): the zero-copy mechanics behind the shim
+/// server's `kind=dmabuf` commits — importer seam, hostile-fd probe, GLES
+/// import + probe render, copy instrumentation. Dead-code-allowed outside
+/// tests for the same reason as `shim`: exercised by its tests (CI-side
+/// mocks plus the env-gated real-GPU tests) today, handed a live
+/// `GlesRenderer` when the realm/backend wiring lands (P1.5.2).
+#[cfg_attr(not(test), allow(dead_code))]
+mod dmabuf;
 mod scene;
 /// The shim-facing protocol server (P1.3.4): `vitrin_shim_session` +
 /// `vitrin_shim_surface`, feeding `Scene::commit`. Dead-code-allowed outside

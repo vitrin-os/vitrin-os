@@ -554,7 +554,10 @@ mod tests {
                         return;
                     };
                     let mut send = |frame: &[u8]| vitrin_ipc::reply(conn, frame, None);
-                    match server.handle_message(msg, &mut state.headless.scene, &mut send) {
+                    // No dmabuf importer on the headless path (P1.3.5):
+                    // pixman has no GPU import, so every dmabuf commit
+                    // resolves as the designed shm-fallback event.
+                    match server.handle_message(msg, &mut state.headless.scene, None, &mut send) {
                         Ok(false) => {}
                         Ok(true) => {
                             // Presentation, headless: the composite
@@ -591,7 +594,7 @@ mod tests {
                     // Shim death: drop the surface — never a stale frame —
                     // and stop the loop.
                     if let Some(server) = state.server.take() {
-                        server.connection_closed(&mut state.headless.scene);
+                        server.connection_closed(&mut state.headless.scene, None);
                     }
                     state.headless.loop_signal.stop();
                 }

@@ -25,7 +25,7 @@ import os
 from collections import deque
 from typing import Callable, Iterable, NoReturn
 
-from . import messages, protocol
+from . import messages, png, protocol
 from .errors import (
     ConnectionClosed,
     ObjectIdsExhausted,
@@ -212,42 +212,110 @@ class TextActuator(_Proxy):
 
 
 class Frame:
-    """One captured frame, backed by a sealed memfd the client now owns."""
+    """One captured frame: a plain immutable value object, fd-free.
 
-    def __init__(self, fd: int, format: Format, width: int, height: int, stride: int) -> None:
-        self.fd = fd
+    Memfd lifecycle (the P1.8.2 decision): **close-after-copy**.
+    ``observe()`` verifies the frame_ready memfd contract, copies the whole
+    buffer out, and closes the fd before this object exists — a ``Frame``
+    never owns a file descriptor, so there is nothing to close, no
+    context-manager obligation, and the no-fd-leak acceptance ("fd count
+    flat over a capture loop") holds unconditionally rather than only for
+    callers who remember to release frames. The alternative (an
+    mmap-backed lazy view) would defer nothing under the poll model (D6):
+    every consumer — ``raw``, ``to_png``, a digest — reads the whole
+    fresh-per-capture buffer exactly once either way, while the mapping
+    would add a lifetime to manage.
+
+    ``raw`` is the wire buffer verbatim (``stride * height`` bytes of
+    little-endian xrgb8888) — the IDL's observation-digest domain — so a
+    digest over ``raw`` equals a digest over the memfd. Pixel addressing
+    is stride-generic per the IDL ("pixels are addressed only through this
+    event's arguments"): row ``r`` begins at byte offset ``r * stride``
+    and carries ``width * 4`` payload bytes. Version 1 additionally pins
+    ``stride == width * 4`` on the wire (enforced at receipt in
+    :meth:`Connection._verify_frame`); the generic form here is the
+    later-version seam. XRGB→RGB conversion deliberately never touches
+    ``raw``: it happens only at the presentation boundary, inside
+    :meth:`to_png` (see :mod:`vitrin_os.png`).
+    """
+
+    __slots__ = ("_raw", "format", "width", "height", "stride")
+
+    def __init__(
+        self, raw: bytes, *, format: Format, width: int, height: int, stride: int
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("frame dimensions must be positive")
+        if stride < width * 4:
+            raise ValueError(f"stride {stride} cannot hold {width} 4-byte pixels per row")
+        if len(raw) != stride * height:
+            raise ValueError(
+                f"buffer holds {len(raw)} bytes, expected stride * height = {stride * height}"
+            )
+        self._raw = bytes(raw)
         self.format = format
         self.width = width
         self.height = height
         self.stride = stride
-        self.size = stride * height
-        self._closed = False
 
-    def read_bytes(self) -> bytes:
-        """Read the whole frame (row r begins at byte offset r * stride)."""
-        if self._closed:
-            raise ValueError("frame is closed")
-        return os.pread(self.fd, self.size, 0)
+    @classmethod
+    def _from_fd(
+        cls, fd: int, *, format: Format, width: int, height: int, stride: int
+    ) -> "Frame":
+        """Materialize close-after-copy: read the whole buffer, close the fd.
+
+        The fd is closed on every path — ownership transferred to us with
+        ``frame_ready``, and nothing retains it past this call.
+        """
+        size = stride * height
+        chunks: list[bytes] = []
+        try:
+            offset = 0
+            while offset < size:
+                chunk = os.pread(fd, size - offset, offset)
+                if not chunk:
+                    # Unreachable for a contract-verified memfd (exact fstat
+                    # size, SHRINK seal); guards the direct-construction door.
+                    raise OSError(f"frame buffer ended at byte {offset}, expected {size}")
+                chunks.append(chunk)
+                offset += len(chunk)
+        finally:
+            os.close(fd)
+        return cls(b"".join(chunks), format=format, width=width, height=height, stride=stride)
 
     @property
-    def closed(self) -> bool:
-        return self._closed
+    def raw(self) -> bytes:
+        """The frame buffer exactly as the wire delivered it."""
+        return self._raw
 
-    def close(self) -> None:
-        """Close the memfd (fd ownership transferred to us; we must close)."""
-        if not self._closed:
-            self._closed = True
-            os.close(self.fd)
+    @property
+    def size(self) -> int:
+        """Buffer size in bytes (``== stride * height == len(raw)``)."""
+        return len(self._raw)
 
-    def __enter__(self) -> "Frame":
-        return self
+    def to_png(self, path: str | os.PathLike[str]) -> None:
+        """Write the frame to ``path`` as a PNG.
 
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
+        Pure stdlib and always available — the SDK never imports Pillow
+        (see :mod:`vitrin_os.png` for the rationale and the determinism
+        guarantees).
+        """
+        if self.format != Format.XRGB8888:
+            raise ValueError(
+                f"to_png supports xrgb8888 only, not {self.format!r} "
+                "(the only format version-1 capture announces)"
+            )
+        data = png.encode_png(
+            self._raw, width=self.width, height=self.height, stride=self.stride
+        )
+        with open(path, "wb") as out:
+            out.write(data)
 
-    def __del__(self) -> None:  # last-resort leak guard
-        if not getattr(self, "_closed", True):
-            self.close()
+    def __repr__(self) -> str:
+        return (
+            f"<Frame {self.width}x{self.height} {self.format.name.lower()} "
+            f"stride={self.stride}>"
+        )
 
 
 class Grant(_Proxy):
@@ -336,7 +404,10 @@ class Grant(_Proxy):
 
         Sends ``capture_frame`` and blocks until its terminal event:
         ``frame_ready`` (returned as a verified :class:`Frame`) or
-        ``refused(observe, ...)`` (raised as the typed exception).
+        ``refused(observe, ...)`` (raised as the typed exception). The
+        returned frame is a value object — the memfd was verified, copied,
+        and closed before this returns, so callers hold no descriptor and
+        owe no cleanup (poll model, D6: one fresh frame per call).
         """
         view = self._view
         self._conn._send(messages.encode_capture_frame(view.id))
@@ -655,14 +726,16 @@ class Connection:
     # -- frame contract (vitrin_view.frame_ready memfd contract) ------------
 
     def _verify_frame(self, event: FrameReadyEvent) -> Frame:
-        """Verify the frame_ready memfd contract before exposing the frame.
+        """Verify the frame_ready memfd contract, then materialize the frame.
 
         The receiver SHOULD verify size and seals so immutability is
         client-provable; a violating frame is a *server* protocol violation
         (never attributed to the grant): discard, close the fd, and close
         the connection (the IDL permits closing; this SDK always does).
         All arithmetic is exact — Python integers are unbounded, so the
-        no-32-bit-wraparound requirement holds trivially.
+        no-32-bit-wraparound requirement holds trivially. A verified frame
+        is materialized close-after-copy (:meth:`Frame._from_fd`): the fd
+        is read once and closed before ``observe()`` returns.
         """
         fd = event.fd
         try:
@@ -698,7 +771,13 @@ class Connection:
             os.close(fd)
             self._transport.close()
             raise
-        return Frame(fd, Format(event.format), event.width, event.height, event.stride)
+        return Frame._from_fd(
+            fd,
+            format=Format(event.format),
+            width=event.width,
+            height=event.height,
+            stride=event.stride,
+        )
 
     # -- lifecycle ----------------------------------------------------------
 

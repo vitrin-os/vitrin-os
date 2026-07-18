@@ -8,6 +8,12 @@ steps against one accepted connection:
     ("send", frame_bytes)          write bytes
     ("send_fd", frame_bytes, fd)   sendmsg bytes with one SCM_RIGHTS fd;
                                    the server closes its copy after sending
+    ("send_memfd", frame_bytes, content)
+                                   like send_fd, but the fd is a fresh
+                                   sealed memfd holding ``content``,
+                                   created at *execution* time — building
+                                   a script therefore pre-opens no fds,
+                                   which the fd-count-flatness tests need
     ("close",)                     close the connection immediately
     ("linger",)                    hold the connection open, discarding any
                                    inbound bytes, until the client closes
@@ -18,10 +24,24 @@ Assertion failures inside the thread are re-raised in the test thread by
 
 from __future__ import annotations
 
+import fcntl
 import os
 import socket
 import struct
 import threading
+
+# What a conformant core seals every frame memfd with before sending
+# (restated from linux/fcntl.h, independent of the SDK's own constants).
+_FRAME_SEALS = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+
+
+def make_sealed_memfd(content: bytes) -> int:
+    """A fresh memfd holding exactly ``content``, sealed like a conformant
+    core seals a frame (SHRINK|GROW|WRITE|SEAL). The caller owns the fd."""
+    fd = os.memfd_create("vitrin-mock-frame", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    os.write(fd, content)
+    fcntl.fcntl(fd, fcntl.F_ADD_SEALS, _FRAME_SEALS)
+    return fd
 
 
 class MockServer:
@@ -65,6 +85,13 @@ class MockServer:
                 case ("send", payload):
                     conn.sendall(payload)
                 case ("send_fd", payload, fd):
+                    conn.sendmsg(
+                        [payload],
+                        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))],
+                    )
+                    os.close(fd)  # sender closes its own copy after sending
+                case ("send_memfd", payload, content):
+                    fd = make_sealed_memfd(content)
                     conn.sendmsg(
                         [payload],
                         [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))],

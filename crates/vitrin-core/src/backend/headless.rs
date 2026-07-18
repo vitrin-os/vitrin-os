@@ -517,6 +517,11 @@ mod tests {
         struct LoopState {
             headless: HeadlessState,
             server: Option<ShimServer>,
+            /// The realm's input router: no intake feeds it headless (no
+            /// physical source exists, structurally), but the teardown
+            /// funnel (`connection_closed`) resets it alongside the scene
+            /// — the embedder shape P1.5.2 inherits.
+            router: crate::input::InputRouter<crate::input::NoopHook>,
             start: Instant,
             /// Readback of the retained framebuffer after each presentation.
             presented: Vec<Vec<u8>>,
@@ -532,6 +537,7 @@ mod tests {
                 width: W,
                 height: H,
             })),
+            router: crate::input::InputRouter::new(crate::input::NoopHook),
             start: Instant::now(),
             presented: Vec::new(),
         };
@@ -592,9 +598,13 @@ mod tests {
                 }
                 ConnectionEvent::Disconnected => {
                     // Shim death: drop the surface — never a stale frame —
-                    // and stop the loop.
+                    // reset the realm's seat state, and stop the loop.
                     if let Some(server) = state.server.take() {
-                        server.connection_closed(&mut state.headless.scene, None);
+                        server.connection_closed(
+                            &mut state.headless.scene,
+                            None,
+                            &mut state.router,
+                        );
                     }
                     state.headless.loop_signal.stop();
                 }

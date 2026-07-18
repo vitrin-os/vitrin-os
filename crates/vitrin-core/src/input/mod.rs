@@ -8,11 +8,13 @@
 //! ceremony (plan P1.3.7; `docs/protocol/11-vitrin_shim_seat.md` flow (i)).
 //! Trusting nested host input as human is a documented limitation; real
 //! physical-origin verification is Phase 3. Headless mode has **no human
-//! device at all**, and that absence is structural, not a runtime check:
-//! the only producer of `Origin::Physical` events is [`intake_physical`],
-//! whose only caller is the nested backend's winit event handler — the
-//! headless backend contains no call site, so no phantom physical-input
-//! path can exist there.
+//! device at all**, and that absence is compiler-enforced, not a runtime
+//! check: [`SeatInput::physical`] is private to this module, so the only
+//! producer of `Origin::Physical` events in the crate is
+//! [`intake_physical`], whose only caller is the nested backend's winit
+//! event handler — a call site anywhere else (the headless backend, a
+//! P1.4.x actuation path, a replay helper) is a compile error, so no
+//! phantom physical-input path can exist there.
 //!
 //! # B2: the origin tag is bound at intake, structurally
 //!
@@ -25,8 +27,12 @@
 //! - [`SeatInput`] (an event at intake) and [`SeatDelivery`] (an event
 //!   ready for the wire) keep `origin` **private**, with no setter and no
 //!   `Default`. The only ways to obtain a `SeatInput` are the two
-//!   constructors [`SeatInput::physical`] and [`SeatInput::emulated`] —
-//!   an untagged event is unrepresentable.
+//!   constructors [`SeatInput::physical`] (private to this module — only
+//!   [`intake_physical`] can mint the physical tag) and
+//!   [`SeatInput::emulated`] (crate-visible for the P1.4.x actuation
+//!   intake) — an untagged event is unrepresentable, and a
+//!   physical-origin masquerade outside nested intake is a compile
+//!   error.
 //! - A [`SeatDelivery`] is constructed **only** by [`InputRouter::route`],
 //!   which *moves* the origin from the `SeatInput` it consumed. The tag is
 //!   never re-derived downstream, so it provably cannot drift between
@@ -69,7 +75,12 @@
 //! stray off the surface never strand a stuck button in the app, mirroring
 //! Wayland's implicit-grab semantics. A press that lands on the matte is
 //! dropped and starts no grab; its release is likewise dropped (the razor:
-//! a release is delivered iff its press was).
+//! a release is delivered iff its own press was). Pairing is tracked
+//! **per button code**, Wayland-style, not as a bare count: a
+//! matte-dropped `BTN_LEFT` press can never borrow the grab a delivered
+//! `BTN_RIGHT` press holds, so the wire never sees a release for a button
+//! the app never saw pressed, and no delivered press is ever left
+//! stranded by someone else's release.
 //!
 //! # The preemption hook (defined now, consumed by P1.7.x)
 //!
@@ -97,8 +108,11 @@
 //!    consuming all delivery*.
 //! 2. [`PreemptionHook::gate`] — the consuming gate. P1.7.2's consent
 //!    input grab attaches here: returning [`Gate::Consume`] stops the
-//!    event before mapping and before the wire. Consumed events update no
-//!    grab state (a consumed press starts no implicit grab).
+//!    event before mapping and before the wire. A consumed press starts
+//!    no implicit grab; a consumed **release** of a delivered press still
+//!    clears that press's grab bookkeeping — reconciled without delivery
+//!    — so a consuming gate can never wedge the router's grab (see
+//!    [`Gate::Consume`] and the pairing contract on [`PreemptionHook`]).
 //!
 //! The MVP implementation is [`NoopHook`] (observe nothing, deliver
 //! everything) — the shape, placement, and ordering are the deliverable;
@@ -175,10 +189,13 @@ pub(crate) struct SeatInput {
 }
 
 impl SeatInput {
-    /// Tag input from a physical human device. The only call sites are the
-    /// nested backend's intake ([`intake_physical`]) — headless mode has
-    /// no physical source, structurally.
-    pub fn physical(kind: SeatInputKind) -> Self {
+    /// Tag input from a physical human device. Private to this module by
+    /// design: the only producer of physical-tagged events in the crate
+    /// is [`intake_physical`] (nested mode's single point of entry), so a
+    /// physical-origin masquerade anywhere else — the headless backend, a
+    /// P1.4.x actuation path, a replay helper — is a compile error, not a
+    /// convention. Headless mode has no physical source, structurally.
+    fn physical(kind: SeatInputKind) -> Self {
         Self {
             origin: Origin::Physical,
             kind,
@@ -290,8 +307,16 @@ impl SeatDelivery {
 pub(crate) enum Gate {
     /// Route and deliver normally.
     Deliver,
-    /// Consume: the event stops here — no mapping, no wire, no grab-state
-    /// change.
+    /// Consume: the event stops here — no mapping, no wire. A consumed
+    /// press starts no implicit grab. A consumed **release** whose press
+    /// the router delivered still clears that press's grab bookkeeping
+    /// (delivered-state reconciliation, nothing on the wire): the
+    /// router's grab can never wedge on a consuming gate, but the app is
+    /// left holding the press — the gate implementor's debt. A grab that
+    /// wants clean app-side pairing simply never consumes releases: the
+    /// router's per-button-code pairing already drops unpaired ones, so
+    /// answering [`Gate::Deliver`] for a release can never leak input
+    /// the app should not see.
     Consume,
 }
 
@@ -299,6 +324,17 @@ pub(crate) enum Gate {
 /// out the placement rationale). For every event, [`observe`] is called
 /// first and unconditionally (P1.7.3's revocation watcher — cannot
 /// consume), then [`gate`] may consume it (P1.7.2's consent grab).
+///
+/// **Pairing contract for gate implementors.** A gate that begins
+/// consuming while router-delivered presses are outstanding (a consent
+/// grab seizing input mid-drag) should keep answering [`Gate::Deliver`]
+/// for button *releases* — hold-until-release. That is always safe: the
+/// router's per-button-code pairing drops any release whose press was
+/// not delivered, so a blanket-delivered release can never leak input
+/// the app should not see, and the app's press/release accounting stays
+/// intact. A gate that consumes such a release instead does not wedge
+/// the router (the grab bookkeeping is reconciled; see [`Gate::Consume`])
+/// but strands the press app-side — its debt to settle.
 ///
 /// [`observe`]: PreemptionHook::observe
 /// [`gate`]: PreemptionHook::gate
@@ -334,9 +370,12 @@ pub(crate) struct InputRouter<H: PreemptionHook> {
     /// Updated at intake (a physical fact), even for events the gate
     /// consumes, so a released grab never hit-tests a stale position.
     pointer: Option<(f64, f64)>,
-    /// Number of delivered-and-unreleased button presses: nonzero means an
-    /// implicit grab holds the pointer on the surface.
-    pressed_buttons: u32,
+    /// Button codes of delivered-and-unreleased presses, in press order
+    /// (a multiset: a pathological double-press pairs with a double-
+    /// release). Nonempty means an implicit grab holds the pointer on
+    /// the surface; a release is delivered iff its code is present here —
+    /// per-button pairing, Wayland-style, never a bare count.
+    pressed: Vec<u32>,
 }
 
 impl<H: PreemptionHook> InputRouter<H> {
@@ -344,8 +383,23 @@ impl<H: PreemptionHook> InputRouter<H> {
         Self {
             hook,
             pointer: None,
-            pressed_buttons: 0,
+            pressed: Vec::new(),
         }
+    }
+
+    /// Forget all per-shim-generation seat state: the implicit-grab
+    /// bookkeeping and the last known pointer position. Invoked by the
+    /// realm teardown funnel
+    /// ([`ShimServer::connection_closed`](crate::shim::ShimServer::connection_closed)),
+    /// so no state can survive into the next shim generation: a stale
+    /// grab would route off-surface input to an app that never saw the
+    /// press, a stale release would arrive unpaired at the fresh seat,
+    /// and a stale pointer position would let a press hit-test geometry
+    /// the new shim never produced. First motion re-establishes the
+    /// pointer.
+    pub fn reset(&mut self) {
+        self.pressed.clear();
+        self.pointer = None;
     }
 
     /// Route one tagged event against the current geometry: `view` is the
@@ -372,6 +426,19 @@ impl<H: PreemptionHook> InputRouter<H> {
         // THE preemption hook point: observe unconditionally, then gate.
         self.hook.observe(&input);
         if self.hook.gate(&input) == Gate::Consume {
+            // Delivered-state reconciliation: a consumed release still
+            // physically ended a hold the app saw begin. Clear the
+            // press's grab bookkeeping — nothing is delivered — so a
+            // consuming gate can never wedge the implicit grab; the
+            // app-side pairing debt belongs to the gate implementor
+            // (`Gate::Consume` docs).
+            if let SeatInputKind::Button {
+                button,
+                state: ButtonState::Released,
+            } = &input.kind
+            {
+                self.release_pressed(*button);
+            }
             return None;
         }
 
@@ -388,7 +455,7 @@ impl<H: PreemptionHook> InputRouter<H> {
                 // placement to map through) — not deliverable.
                 let surface = surface?;
                 let (sx, sy) = surface_local((x, y), view, surface);
-                if self.pressed_buttons == 0 && !inside(sx, sy, surface) {
+                if self.pressed.is_empty() && !inside(sx, sy, surface) {
                     return None; // the matte is not the app
                 }
                 SeatDeliveryKind::Motion {
@@ -399,32 +466,48 @@ impl<H: PreemptionHook> InputRouter<H> {
 
             SeatInputKind::Button { button, state } => match state {
                 ButtonState::Pressed => {
-                    if self.pressed_buttons == 0 && !self.pointer_over_surface(view, surface) {
+                    if self.pressed.is_empty() && !self.pointer_over_surface(view, surface) {
                         return None; // press on the matte starts nothing
                     }
-                    self.pressed_buttons = self.pressed_buttons.saturating_add(1);
+                    self.pressed.push(button);
                     SeatDeliveryKind::Button { button, state }
                 }
                 ButtonState::Released => {
-                    // A release is delivered iff its press was — the
-                    // implicit grab guarantees the app never holds a stuck
-                    // button, wherever the pointer wandered meanwhile.
-                    if self.pressed_buttons == 0 {
+                    // A release is delivered iff its own press was — per
+                    // button code, so a matte-dropped press can never
+                    // borrow another button's grab, the wire never sees
+                    // a release for a button the app never saw pressed,
+                    // and the implicit grab guarantees the app never
+                    // holds a stuck button, wherever the pointer
+                    // wandered meanwhile.
+                    if !self.release_pressed(button) {
                         return None;
                     }
-                    self.pressed_buttons -= 1;
                     SeatDeliveryKind::Button { button, state }
                 }
             },
 
             SeatInputKind::Scroll { axis, value120 } => {
-                if self.pressed_buttons == 0 && !self.pointer_over_surface(view, surface) {
+                if self.pressed.is_empty() && !self.pointer_over_surface(view, surface) {
                     return None;
                 }
                 SeatDeliveryKind::Scroll { axis, value120 }
             }
         };
         Some(SeatDelivery { origin, kind })
+    }
+
+    /// Remove one delivered-press entry for `button`, if any; returns
+    /// whether one existed (i.e. whether a release of this code pairs
+    /// with a delivered press).
+    fn release_pressed(&mut self, button: u32) -> bool {
+        match self.pressed.iter().position(|&b| b == button) {
+            Some(i) => {
+                self.pressed.remove(i);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether the last known pointer position lies over the placed
@@ -1054,6 +1137,15 @@ mod tests {
     fn sub_pixel_motion_survives_in_fixed_point() {
         // Host positions are f64 (HiDPI hosts report fractions); the wire
         // is 24.8 fixed-point exactly so sub-pixel survives.
+        //
+        // Design note (issue #24 review): the prose page
+        // docs/protocol/11-vitrin_shim_seat.md still says v0 motion is
+        // whole-pixel — written for the actuator path before nested
+        // physical intake existed. The IDL <description>, which wins,
+        // only motivates fixed-point via later synthesis and does not
+        // forbid fractional v0 values; the prose sentence is flagged for
+        // a protocol-track amendment rather than rounding away real host
+        // precision here.
         let mut router = router();
         let out = router
             .route(phys(motion(0.5, 0.25)), (10, 10), Some((10, 10)))
@@ -1122,6 +1214,51 @@ mod tests {
             .route(phys(motion(0.0, 0.0)), view, surface)
             .is_none());
         assert!(router.route(phys(scroll()), view, surface).is_none());
+    }
+
+    #[test]
+    fn releases_pair_per_button_code_not_by_count() {
+        // Issue #24 review: pairing is per button code, never a bare
+        // count. A BTN_LEFT press dropped on the matte must not pair with
+        // a later delivered BTN_RIGHT press — the wire must never see a
+        // release for a button the app never saw pressed, and the app
+        // must never be left holding a stranded button.
+        let mut router = router();
+        let view = (100, 80);
+        let surface = Some((40, 20)); // placed at (30, 30)
+        let button = |code, state| SeatInputKind::Button {
+            button: code,
+            state,
+        };
+
+        // BTN_LEFT pressed on the matte: dropped, no grab.
+        assert!(router
+            .route(phys(motion(5.0, 5.0)), view, surface)
+            .is_none());
+        assert!(router
+            .route(phys(button(0x110, ButtonState::Pressed)), view, surface)
+            .is_none());
+        // Drag onto the surface (the host keeps reporting motion while
+        // the button stays physically held) and press BTN_RIGHT there.
+        assert!(router
+            .route(phys(motion(35.0, 35.0)), view, surface)
+            .is_some());
+        assert!(router
+            .route(phys(button(0x111, ButtonState::Pressed)), view, surface)
+            .is_some());
+        // BTN_LEFT's release: its press was never delivered — dropped,
+        // it must not consume BTN_RIGHT's grab.
+        assert!(router
+            .route(phys(button(0x110, ButtonState::Released)), view, surface)
+            .is_none());
+        // BTN_RIGHT's release still pairs: no stuck button in the app.
+        assert!(router
+            .route(phys(button(0x111, ButtonState::Released)), view, surface)
+            .is_some());
+        // The grab is fully over: off-surface motion is matte again.
+        assert!(router
+            .route(phys(motion(0.0, 0.0)), view, surface)
+            .is_none());
     }
 
     #[test]
@@ -1249,6 +1386,92 @@ mod tests {
         assert!(router.route(phys(release()), view, surface).is_none());
     }
 
+    #[test]
+    fn consumed_release_reconciles_the_grab_without_delivering() {
+        // Issue #24 review: a gate that consumes the release of a
+        // delivered press (the P1.7.2 consent grab seizing input
+        // mid-drag) must not wedge the implicit grab forever. The router
+        // reconciles its own bookkeeping — nothing is delivered; the
+        // app-side stranded press is the gate implementor's documented
+        // debt (see `Gate::Consume`).
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let consume = Rc::new(Cell::new(false));
+        let mut router = InputRouter::new(RecordingHook {
+            log,
+            consume: Rc::clone(&consume),
+        });
+        let view = (100, 80);
+        let surface = Some((40, 20)); // placed at (30, 30)
+
+        // Press delivered on the surface: implicit grab begins.
+        assert!(router
+            .route(phys(motion(35.0, 35.0)), view, surface)
+            .is_some());
+        assert!(router.route(phys(press()), view, surface).is_some());
+
+        // The grab consumes the user's release: not delivered ...
+        consume.set(true);
+        assert!(router.route(phys(release()), view, surface).is_none());
+
+        // ... but the router did not wedge. With the gate open again,
+        // matte hit-testing works (no phantom grab force-delivers
+        // off-surface events to the app), an unpaired release stays
+        // dropped, and a fresh press/release pair over the surface
+        // behaves normally.
+        consume.set(false);
+        assert!(router
+            .route(phys(motion(5.0, 5.0)), view, surface)
+            .is_none());
+        assert!(router.route(phys(press()), view, surface).is_none());
+        assert!(router.route(phys(scroll()), view, surface).is_none());
+        assert!(router.route(phys(release()), view, surface).is_none());
+        assert!(router
+            .route(phys(motion(35.0, 35.0)), view, surface)
+            .is_some());
+        assert!(router.route(phys(press()), view, surface).is_some());
+        assert!(router.route(phys(release()), view, surface).is_some());
+        assert!(router
+            .route(phys(motion(5.0, 5.0)), view, surface)
+            .is_none());
+    }
+
+    #[test]
+    fn reset_forgets_grab_and_pointer_across_shim_generations() {
+        // Issue #24 review: a grab held at shim death must not become a
+        // phantom grab against the next shim generation. `reset` is what
+        // the realm teardown funnel (`ShimServer::connection_closed`)
+        // invokes alongside `Scene::clear_surface`.
+        let mut router = router();
+        let view = (100, 80);
+        let surface = Some((40, 20)); // placed at (30, 30)
+
+        assert!(router
+            .route(phys(motion(35.0, 35.0)), view, surface)
+            .is_some());
+        assert!(router.route(phys(press()), view, surface).is_some());
+
+        router.reset();
+
+        // The stale release from the dead generation is unpaired at the
+        // fresh seat: dropped.
+        assert!(router.route(phys(release()), view, surface).is_none());
+        // The pointer position was forgotten too: a press cannot
+        // hit-test against a pre-teardown position (which sat over the
+        // surface) — first motion must re-establish it.
+        assert!(router.route(phys(press()), view, surface).is_none());
+        // No phantom grab: off-surface events are matte again.
+        assert!(router
+            .route(phys(motion(0.0, 0.0)), view, surface)
+            .is_none());
+        assert!(router.route(phys(scroll()), view, surface).is_none());
+        // The fresh generation then works normally.
+        assert!(router
+            .route(phys(motion(35.0, 35.0)), view, surface)
+            .is_some());
+        assert!(router.route(phys(press()), view, surface).is_some());
+        assert!(router.route(phys(release()), view, surface).is_some());
+    }
+
     // ------------------------------------------------------------------
     // B2 on the wire: every delivery kind encodes its origin
     // ------------------------------------------------------------------
@@ -1350,7 +1573,9 @@ mod tests {
                 .expect("core receive")
                 .expect("a message must be waiting");
             server
-                .handle_message(msg, scene, &mut |frame| core.send_message(frame, None))
+                .handle_message(msg, scene, None, &mut |frame| {
+                    core.send_message(frame, None)
+                })
                 .expect("compliant traffic");
         }
     }

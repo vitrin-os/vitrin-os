@@ -91,6 +91,21 @@ pub struct Connection {
     poisoned: Option<PeerViolation>,
 }
 
+impl std::fmt::Debug for Connection {
+    /// Concise on purpose: a derived impl would dump the multi-kilobyte
+    /// `scratch`/`recv_buf` byte buffers on every log line. The fields worth
+    /// seeing are the peer identity and how much is mid-reassembly.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("fd", &self.fd)
+            .field("peer_cred", &self.peer_cred)
+            .field("buffered", &self.recv_buf.len())
+            .field("pending_fds", &self.pending_fds.len())
+            .field("poisoned", &self.poisoned)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Connection {
     /// Wrap an already-connected Unix stream socket, capturing
     /// `SO_PEERCRED` immediately. This is the accepted-socket path

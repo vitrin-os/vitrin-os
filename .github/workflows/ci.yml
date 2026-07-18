@@ -99,6 +99,15 @@ jobs:
         # exactly the mode where such a regression would hide.
         run: cargo test --workspace --release
 
+      - name: vitrin-ipc dependency-light client slice
+        # The workspace default feature for vitrin-ipc is `server` (the
+        # calloop event-loop glue), so every step above exercises it. This
+        # step guards the *other* slice: the `client`-only transport the Rust
+        # SDK links must keep building and passing with no calloop pulled in,
+        # or the "SDK links no compositor deps" guarantee (P1.2.2) rots
+        # unnoticed. Kept scoped to the one crate that has the feature split.
+        run: cargo test -p vitrin-ipc --no-default-features --features client
+
   codegen-diff:
     name: codegen-diff (IDL schema + regeneration honesty)
     runs-on: ubuntu-latest

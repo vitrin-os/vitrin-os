@@ -44,6 +44,16 @@ mod backend;
 /// integration) — nothing at runtime calls it before then.
 #[cfg_attr(not(test), allow(dead_code))]
 mod capture;
+/// The consent-decision seam and petition-admission policy (P1.4.3): the
+/// `ConsentDecider` trait the consent surface (P1.7.x) implements, the
+/// walking skeleton's loudly-logged auto-approve decider, and the shared
+/// `GrantKernel` (grant table + cross-connection pending-petition admission
+/// + live realms) behind `principal`'s petition flow. Dead-code-allowed
+/// outside tests for the same reason as `principal`: exercised end-to-end
+/// by the socketpair suites today, wired to the live listener at M1.1
+/// integration.
+#[cfg_attr(not(test), allow(dead_code))]
+mod consent;
 /// The dmabuf import path (P1.3.5): the zero-copy mechanics behind the shim
 /// server's `kind=dmabuf` commits — importer seam, hostile-fd probe, GLES
 /// import + probe render, copy instrumentation. Dead-code-allowed outside
@@ -75,13 +85,16 @@ mod grants;
 /// when the principal listener wiring lands (M1.1 integration).
 #[cfg_attr(not(test), allow(dead_code))]
 mod identity;
-/// The principal-connection protocol server (P1.4.1): the server side of the
-/// P1.1.3 handshake state machine (`vitrin_handshake` + `vitrin_principal`),
-/// where `identity` binds and where the per-connection object table enforces
-/// sender-constrained handles. Dead-code-allowed outside tests for the same
-/// reason as `shim`: exercised end-to-end by its tests over socketpairs
-/// today, wired to the live listener (`ListenerSource`) at M1.1 integration
-/// -- nothing at runtime accepts principal connections before then.
+/// The principal-connection protocol server (P1.4.1, P1.4.3): the server
+/// side of the P1.1.3 handshake state machine (`vitrin_handshake` +
+/// `vitrin_principal`), where `identity` binds, where the per-connection
+/// object table enforces sender-constrained handles, and where the grant
+/// petition flow (`vitrin_realm.request_grant` -> pending -> consent ->
+/// active handle) runs against `consent`'s decider seam and kernel.
+/// Dead-code-allowed outside tests for the same reason as `shim`: exercised
+/// end-to-end by its tests over socketpairs today, wired to the live
+/// listener (`ListenerSource`) at M1.1 integration -- nothing at runtime
+/// accepts principal connections before then.
 #[cfg_attr(not(test), allow(dead_code))]
 mod principal;
 mod scene;

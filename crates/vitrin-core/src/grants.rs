@@ -269,6 +269,18 @@ impl TryFrom<WirePersistence> for PersistenceRung {
     }
 }
 
+impl From<PersistenceRung> for WirePersistence {
+    /// The wire projection, for the effective rung `vitrin_grant.resolved`
+    /// carries (the petition flow's terminal event, P1.4.3). Total: every
+    /// table rung exists on the wire; only the reverse direction can fail.
+    fn from(rung: PersistenceRung) -> WirePersistence {
+        match rung {
+            PersistenceRung::Once => WirePersistence::Once,
+            PersistenceRung::WhileRunning => WirePersistence::WhileRunning,
+        }
+    }
+}
+
 /// `constraints.focus_condition` (PRD Doc 2 section 5.2): a value-bearing
 /// use condition ("only while the surface is focused"). **Present-but-null
 /// until Phase 2**: value-bearing constraints arrive on the wire as a

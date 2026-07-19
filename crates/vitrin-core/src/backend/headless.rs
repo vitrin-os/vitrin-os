@@ -22,6 +22,30 @@
 //!   `width * 4`, so the mapped framebuffer slice is already exactly
 //!   `width * height * 4` bytes — the tightly packed RGBA the capture wants,
 //!   with no per-row padding to strip.
+//!
+//! # Two retained images, because two audiences see different pixels (P1.7.1)
+//!
+//! [`HeadlessState`] retains **both** sides of the output-stage fork
+//! ([`super::compose_human_visible`]):
+//!
+//! - [`view_framebuffer`] — the composed **realm view**. This is the capture
+//!   service's pixel source ([`HeadlessState::latest_frame_rgba`]) and it is
+//!   overlay-free *structurally*: nothing composites a consent prompt into
+//!   it, here or anywhere.
+//! - [`output_framebuffer`] — the virtual display's **human-visible output**:
+//!   the same realm view plus the consent overlay. Headless has no display,
+//!   so this image is what stands in for one, and it is what the P1.7.1
+//!   golden reads back.
+//!
+//! One `Scene::compose` call fills both every redraw, so they can differ only
+//! by the overlay — never by drifting composition. A single shared image
+//! would be the obvious simplification and is exactly wrong: the capture path
+//! reads the retained image directly, so folding the two together would put
+//! the consent prompt into `vitrin_view.frame_ready` and hand agents the
+//! prompt-watching ability `docs/protocol/05-vitrin_consent.md` forbids.
+//!
+//! [`view_framebuffer`]: HeadlessState::view_framebuffer
+//! [`output_framebuffer`]: HeadlessState::output_framebuffer
 
 use std::error::Error;
 
@@ -34,6 +58,7 @@ use smithay::reexports::pixman::Image;
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use tracing::info;
 
+use crate::consent::ConsentSurface;
 use crate::scene::Scene;
 use crate::test_pattern;
 
@@ -60,7 +85,8 @@ pub(crate) fn render_once(size: Size<i32, Physical>) -> Result<Vec<u8>, Box<dyn 
     let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
     let mut framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
 
-    composite(&mut renderer, &mut framebuffer, size, &Scene::new())?;
+    let pixels = Scene::new().compose(size.w as u32, size.h as u32);
+    composite(&mut renderer, &mut framebuffer, size, &pixels)?;
     readback(&mut renderer, &mut framebuffer, size)
 }
 
@@ -129,10 +155,13 @@ pub fn run(size: (u32, u32)) -> Result<(), Box<dyn Error>> {
     );
 
     let mut state = HeadlessState::new(physical_size, event_loop.get_signal())?;
-    // Composite once so the framebuffer is capture-ready before we start
-    // idling (see this function's doc comment for why exactly once).
+    // Composite once so the retained images are ready before we start idling
+    // (see this function's doc comment for why exactly once).
     state.redraw()?;
-    info!("virtual-output framebuffer composited and retained in memory (capture-ready)");
+    info!(
+        "virtual-output framebuffers composited and retained in memory: realm view \
+         (capture-ready) + human-visible output (consent overlay)"
+    );
 
     event_loop.run(None, &mut state, |_| {})?;
     info!("event loop stopped, shutting down");
@@ -140,8 +169,8 @@ pub fn run(size: (u32, u32)) -> Result<(), Box<dyn Error>> {
 }
 
 /// Per-run state of the headless backend: the software renderer, the realm's
-/// [`Scene`], and the virtual output's framebuffer image, retained so it can
-/// be captured.
+/// [`Scene`], the consent surface, and the two retained images the module
+/// docs describe.
 struct HeadlessState {
     renderer: PixmanRenderer,
     /// The realm's scene (P1.3.3): the single-maximized client surface, or
@@ -149,10 +178,18 @@ struct HeadlessState {
     /// protocol server (P1.3.4) commits into it and calls
     /// [`redraw`](Self::redraw); the realm object (P1.5.1) hangs off it.
     scene: Scene,
-    /// The virtual output's framebuffer. Retained across the process lifetime
+    /// The consent surface (P1.7.1): the prompt composited above the realm
+    /// view on the human-visible side of the output stage only. Always
+    /// present, empty until P1.7.2 puts a petition up.
+    consent: ConsentSurface,
+    /// The composed **realm view**, retained across the process lifetime
     /// (PRD Doc 2 §9) so an internal capture reads composited pixels, not a
-    /// freshly cleared buffer.
-    framebuffer: Image<'static, 'static>,
+    /// freshly cleared buffer. Overlay-free by construction — this is what
+    /// [`Self::latest_frame_rgba`] serves to agents.
+    view_framebuffer: Image<'static, 'static>,
+    /// The virtual display's **human-visible output**: the realm view with
+    /// the consent overlay on top. Never read by the capture path.
+    output_framebuffer: Image<'static, 'static>,
     size: Size<i32, Physical>,
     loop_signal: LoopSignal,
 }
@@ -164,43 +201,83 @@ impl HeadlessState {
         // (the CLI parser rejects zero/negative), but a degenerate size must
         // never wrap to a huge allocation on the `i32 -> usize` cast.
         let buffer_size: Size<i32, Buffer> = (size.w.max(0), size.h.max(0)).into();
-        let framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
+        let view_framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
+        let output_framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
         Ok(Self {
             renderer,
             scene: Scene::new(),
-            framebuffer,
+            consent: ConsentSurface::new(),
+            view_framebuffer,
+            output_framebuffer,
             size,
             loop_signal,
         })
     }
 
-    /// (Re)composite the realm view into the retained framebuffer. The
-    /// single redraw entry point: called once from [`run`] today, and again
-    /// on client damage (a scene commit) once P1.3.4 feeds the scene.
+    /// (Re)composite both retained images. The single redraw entry point:
+    /// called once from [`run`] today, and again on client damage (a scene
+    /// commit) once P1.3.4 feeds the scene — or on a consent-surface change
+    /// (P1.7.2), which is why [`ConsentSurface::generation`] exists.
+    ///
+    /// One [`Scene::compose`] call feeds both images, so the realm view an
+    /// agent may capture and the output a human sees are the same
+    /// composition, differing only by the overlay (module docs).
     fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
+        let (w, h) = (self.size.w.max(0) as u32, self.size.h.max(0) as u32);
+        let view = self.scene.compose(w, h);
         composite(
             &mut self.renderer,
-            &mut self.framebuffer,
+            &mut self.view_framebuffer,
             self.size,
-            &self.scene,
+            &view,
+        )?;
+        // The human-visible half: the same bytes, plus the prompt. Cloning
+        // the view rather than recomposing is what makes "differ only by the
+        // overlay" a property of the code and not a comment.
+        let mut output = view;
+        self.consent.composite_over(&mut output, w, h);
+        composite(
+            &mut self.renderer,
+            &mut self.output_framebuffer,
+            self.size,
+            &output,
         )
     }
 
     /// The capture service's pixel source (P1.3.6): the **latest completed
-    /// frame**, read back from the retained framebuffer as tightly packed
-    /// RGBA8888 — a pure read that never triggers a composite. This is the
-    /// capture-timing decision (see [`crate::capture`]'s module docs):
-    /// capture observes what the compositor last finished, exactly the
-    /// IDL's "most recently composited content as of when the server
-    /// processes this request", keeping goldens deterministic and keeping
-    /// render cost off the agent-request path.
+    /// frame** of the *realm view*, read back from
+    /// [`Self::view_framebuffer`] as tightly packed RGBA8888 — a pure read
+    /// that never triggers a composite. This is the capture-timing decision
+    /// (see [`crate::capture`]'s module docs): capture observes what the
+    /// compositor last finished, exactly the IDL's "most recently composited
+    /// content as of when the server processes this request", keeping
+    /// goldens deterministic and keeping render cost off the agent-request
+    /// path.
+    ///
+    /// Reads the realm view, **not** the human-visible output, so a consent
+    /// prompt that is on screen is absent from every capture
+    /// (`docs/protocol/05-vitrin_consent.md`;
+    /// `a_capture_taken_while_a_prompt_is_up_contains_no_overlay` pins it).
     ///
     /// Compiled in every build so the path stays type-checked; called from
     /// the golden test today and wired to protocol dispatch when the
     /// enforcement chokepoint lands (P1.4.4, M1.1 integration).
     #[cfg_attr(not(test), allow(dead_code))]
     fn latest_frame_rgba(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
-        readback(&mut self.renderer, &mut self.framebuffer, self.size)
+        readback(&mut self.renderer, &mut self.view_framebuffer, self.size)
+    }
+
+    /// The virtual display's latest human-visible output — realm view plus
+    /// consent overlay — read back from [`Self::output_framebuffer`].
+    ///
+    /// Headless mode has no display, so this is the only thing that can
+    /// stand in for "what a human would see", which is what makes the P1.7.1
+    /// prompt golden-testable on a GPU-less CI runner at all. It has no wire
+    /// path and never will: no protocol message delivers human-visible
+    /// output.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn latest_output_rgba(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
+        readback(&mut self.renderer, &mut self.output_framebuffer, self.size)
     }
 }
 
@@ -221,30 +298,48 @@ impl crate::lifecycle::RetainedOutput for HeadlessState {
     /// happens on the death path, never on the capture path, so capture
     /// still observes "what the compositor last finished" and the goldens
     /// stay deterministic.
+    ///
+    /// **Both** retained images are scrubbed. The human-visible one matters
+    /// less (no agent reads it) but leaving a dead realm's last frame on a
+    /// virtual display would be the same staleness bug with a different
+    /// audience, and a scrub that covered only one image would be a trap for
+    /// whoever next reaches for the other.
     fn scrub_retained_frame(&mut self) -> Result<(), Box<dyn Error>> {
+        let (w, h) = (self.size.w.max(0) as u32, self.size.h.max(0) as u32);
+        let empty = Scene::new().compose(w, h);
         composite(
             &mut self.renderer,
-            &mut self.framebuffer,
+            &mut self.view_framebuffer,
             self.size,
-            &Scene::new(),
+            &empty,
+        )?;
+        composite(
+            &mut self.renderer,
+            &mut self.output_framebuffer,
+            self.size,
+            &empty,
         )
     }
 }
 
-/// Blit the composed realm view ([`Scene::compose`]) into `framebuffer` at
-/// `size`, 1:1 and upright.
+/// Blit already-composed `pixels` into `framebuffer` at `size`, 1:1 and
+/// upright.
 ///
-/// Shared by [`render_once`] (which then reads the framebuffer back) and
-/// [`HeadlessState::redraw`] (which fills the retained framebuffer in place),
-/// so the compositing step has one definition and one behavior. Composition
-/// itself — layout, letterbox, background — happens in [`Scene::compose`],
-/// the single implementation both backends present (P1.3.3); this function
-/// only moves the composed bytes into the retained framebuffer.
+/// Takes bytes rather than a [`Scene`] because it has two callers with two
+/// different sources: [`HeadlessState::redraw`] fills the realm-view image
+/// from [`Scene::compose`] and the output image from that same buffer with
+/// the consent overlay applied. Passing a scene instead would mean composing
+/// twice, and two composes are two chances for the capture path and the
+/// human's display to disagree about the realm view.
+///
+/// Composition itself — layout, letterbox, background — happens in
+/// [`Scene::compose`], the single implementation both backends present
+/// (P1.3.3); this function only moves composed bytes into a retained image.
 fn composite(
     renderer: &mut PixmanRenderer,
     framebuffer: &mut Image<'static, 'static>,
     size: Size<i32, Physical>,
-    scene: &Scene,
+    pixels: &[u8],
 ) -> Result<(), Box<dyn Error>> {
     if size.w <= 0 || size.h <= 0 {
         return Ok(());
@@ -254,18 +349,17 @@ fn composite(
     // Upload the composed view exactly as the nested backend does: tightly
     // packed RGBA8888 imported as DRM `ABGR8888` (bytes R,G,B,A on
     // little-endian).
-    let pixels = scene.compose(size.w as u32, size.h as u32);
-    let texture = renderer.import_memory(&pixels, Fourcc::Abgr8888, buffer_size, false)?;
+    let texture = renderer.import_memory(pixels, Fourcc::Abgr8888, buffer_size, false)?;
 
     let full = Rectangle::from_size(size);
     let mut target = renderer.bind(framebuffer)?;
     // `Transform::Normal`, NOT `Flipped180`: a pixman image is a top-down CPU
     // buffer, so there is no GL bottom-up convention to undo. The composed
-    // view is fully opaque (Scene::compose forces alpha) and covers the whole
-    // output, so blitting it 1:1 (full texture -> full framebuffer, no
-    // scaling) leaves the framebuffer a byte-exact identity of the composed
-    // view — no separate clear is needed, and the P1.3.2/P1.3.3 goldens
-    // assert exactly that.
+    // pixels are fully opaque (`Scene::compose` forces alpha, and the consent
+    // overlay preserves it) and cover the whole output, so blitting them 1:1
+    // (full texture -> full framebuffer, no scaling) leaves the framebuffer a
+    // byte-exact identity of what was composed — no separate clear is needed,
+    // and the P1.3.2/P1.3.3/P1.7.1 goldens assert exactly that.
     let mut frame = renderer.render(&mut target, size, Transform::Normal)?;
     frame.render_texture_from_to(
         &texture,
@@ -566,6 +660,187 @@ mod tests {
             .flat_map(|px| [px[2], px[1], px[0], 0xff])
             .collect();
         assert_eq!(served, expected, "capture must serve the composed view");
+    }
+
+    /// The P1.7.1 acceptance criteria, both halves, on real backend pixels.
+    ///
+    /// The overlay must appear in the human-visible output **and** must be
+    /// absent from what an agent captures. Those are not two views of one
+    /// fact: they are two retained images, and this test reads both after a
+    /// single redraw with a prompt up.
+    ///
+    /// The agent-side assertion goes all the way through
+    /// [`crate::capture::render_frame`] rather than stopping at the readback,
+    /// because that is the buffer that would actually be sealed into a memfd
+    /// and handed over `SCM_RIGHTS`. Anything weaker would prove the retained
+    /// image is clean while leaving the delivered artifact untested.
+    #[test]
+    fn a_prompt_reaches_human_visible_output_but_never_a_capture() {
+        use crate::capture::{render_frame, RealmViewFrame};
+        use crate::consent::tests::prompt_fixture;
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+
+        let _fd = crate::capture::tests::fd_lock();
+        // Wide enough that the 560px card fits with realm view around it, so
+        // "the overlay changed the output" is not an artifact of cropping.
+        const VW: u32 = 800;
+        const VH: u32 = 600;
+        const SW: u32 = 400;
+        const SH: u32 = 300;
+
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessState> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state =
+            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+
+        // A realm that has painted, so the test distinguishes "the overlay is
+        // absent" from "nothing was ever drawn".
+        state.scene.commit(
+            SurfaceContent::from_rgba(client_pixels(SW, SH), SW, SH).expect("well-formed content"),
+        );
+        state.redraw().expect("composite the committed surface");
+        let clean_view = state.latest_frame_rgba().expect("readback");
+        let clean_output = state.latest_output_rgba().expect("readback");
+        assert_eq!(
+            clean_view, clean_output,
+            "with no prompt up the two retained images must be identical"
+        );
+
+        // The prompt goes up. This is the moment P1.7.2 will pair with
+        // `mark_prompt_shown` + `vitrin_consent.state(shown)`.
+        state.consent.show(prompt_fixture());
+        state.redraw().expect("recomposite with the prompt up");
+
+        // --- Human-visible side: the prompt is really on the display. ---
+        let output = state.latest_output_rgba().expect("readback");
+        assert_ne!(output, clean_output, "the prompt must change the output");
+        let card = crate::consent::render::rasterize(&prompt_fixture());
+        let (cx, cy) = state
+            .consent
+            .card_origin(VW, VH)
+            .expect("a prompt is up, so the card has an origin");
+        assert!(cx >= 0 && cy >= 0, "the card fits in an {VW}x{VH} view");
+        for row in 0..card.height {
+            let d = ((cy as u32 + row) as usize * VW as usize + cx as usize)
+                * test_pattern::BYTES_PER_PIXEL;
+            let s = row as usize * card.width as usize * test_pattern::BYTES_PER_PIXEL;
+            let run = card.width as usize * test_pattern::BYTES_PER_PIXEL;
+            assert_eq!(
+                &output[d..d + run],
+                &card.rgba[s..s + run],
+                "card row {row} must appear verbatim in the human-visible output"
+            );
+        }
+        // ...and the realm view around it is darkened, not erased.
+        assert_ne!(output[..4], clean_output[..4], "the scrim must apply");
+        assert!(output[0] > 0 || output[1] > 0 || output[2] > 0);
+
+        // --- Agent side: the capture is the realm view, unchanged. ---
+        let view = state.latest_frame_rgba().expect("readback");
+        assert_eq!(
+            view, clean_view,
+            "a prompt being up must not move a single pixel of the realm view"
+        );
+        assert_eq!(
+            view,
+            state.scene.compose(VW, VH),
+            "the capture source must be exactly Scene::compose -- the overlay \
+             composites at the output stage, above this"
+        );
+        assert_ne!(view, output, "...and the two really do differ now");
+
+        // The delivered artifact, not just the retained image: what a
+        // `capture_frame` would seal into a memfd carries no overlay pixel.
+        let (frame, _digest) = render_frame(&RealmViewFrame {
+            rgba: &view,
+            width: VW,
+            height: VH,
+        })
+        .expect("render the retained view");
+        let served = {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::File::from(frame.fd);
+            let mut buf = vec![0u8; (frame.stride * frame.height) as usize];
+            file.read_exact_at(&mut buf, 0).expect("read served frame");
+            buf
+        };
+        let swizzle = |rgba: &[u8]| -> Vec<u8> {
+            rgba.chunks_exact(4)
+                .flat_map(|px| [px[2], px[1], px[0], 0xff])
+                .collect()
+        };
+        assert_eq!(
+            served,
+            swizzle(&clean_view),
+            "the served capture must be the overlay-free realm view"
+        );
+        assert_ne!(
+            served,
+            swizzle(&output),
+            "the served capture must NOT be the human-visible output"
+        );
+        // Pixel-level: no run of the card's bytes survives anywhere in the
+        // delivered frame. Catches a partial leak an equality check on the
+        // whole buffer could not (a wrongly-offset blit, say).
+        let card_row = &card.rgba[..card.width as usize * test_pattern::BYTES_PER_PIXEL];
+        let card_row_wire = swizzle(card_row);
+        assert!(
+            !served
+                .windows(card_row_wire.len())
+                .any(|w| w == card_row_wire),
+            "a row of consent-prompt pixels reached a capture"
+        );
+
+        // Taking the prompt down restores the human-visible output exactly.
+        state.consent.dismiss();
+        state.redraw().expect("recomposite with the prompt down");
+        assert_eq!(
+            state.latest_output_rgba().expect("readback"),
+            clean_output,
+            "a dismissed prompt must leave no pixels behind"
+        );
+    }
+
+    /// The sharing proof for the output stage: the retained human-visible
+    /// image is byte-for-byte [`super::compose_human_visible`]'s output, which
+    /// is the same function the nested backend uploads as its window texture.
+    /// GL presentation itself needs a display, so — exactly as P1.3.3 does for
+    /// the realm view — CI proves the shared-seam half, and nested mode
+    /// cannot drift from headless in what a human sees.
+    #[test]
+    fn human_visible_output_is_the_shared_compose_for_both_backends() {
+        use crate::consent::tests::prompt_fixture;
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+
+        let _fd = crate::capture::tests::fd_lock();
+        const VW: u32 = 700;
+        const VH: u32 = 560;
+
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessState> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state =
+            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+        state
+            .scene
+            .commit(SurfaceContent::from_rgba(client_pixels(200, 150), 200, 150).expect("content"));
+
+        for prompt_up in [false, true] {
+            if prompt_up {
+                state.consent.show(prompt_fixture());
+            }
+            state.redraw().expect("redraw");
+            let mut expected = crate::consent::ConsentSurface::new();
+            if prompt_up {
+                expected.show(prompt_fixture());
+            }
+            assert_eq!(
+                state.latest_output_rgba().expect("readback"),
+                super::super::compose_human_visible(&state.scene, &mut expected, VW, VH),
+                "retained output must be the shared compose (prompt_up = {prompt_up})"
+            );
+        }
     }
 
     /// The P1.3.4 acceptance criteria, end to end over the real calloop

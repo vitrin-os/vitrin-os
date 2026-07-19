@@ -2,8 +2,16 @@
 //! (GNOME, Hyprland, …), presenting exactly one host window — the gamescope
 //! nested-session pattern (PRD Doc 2 §4/§17). Rendering stays deliberately
 //! trivial per plan risk R1: one window, one full-window texture blit of the
-//! composed realm view ([`Scene::compose`] — the same bytes the headless
-//! backend retains for capture, P1.3.3).
+//! composed human-visible output ([`super::compose_human_visible`] — the
+//! realm view of [`Scene::compose`], the same bytes the headless backend
+//! retains for capture, P1.3.3, with the consent overlay on top, P1.7.1).
+//!
+//! The host window IS the human's display here, so it presents the
+//! human-visible side of the output stage and there is no second window,
+//! no second surface, and no compositing anywhere else (decision D4). The
+//! consent overlay reaching this texture is therefore exactly as far as it
+//! goes: no capture path reads a GL texture (see [`super`] and
+//! [`crate::consent`] for the fork).
 //!
 //! The winit backend is EGL/GLES-bound by construction, so this path always
 //! renders with [`GlesRenderer`]. The pixman software path (mandatory for
@@ -28,6 +36,7 @@ use smithay::reexports::winit::window::Window as WinitWindow;
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use tracing::{debug, error, info, trace};
 
+use crate::consent::ConsentSurface;
 use crate::input;
 use crate::scene::Scene;
 
@@ -51,13 +60,19 @@ const CLEAR_COLOR: Color32F = Color32F::new(0.06, 0.06, 0.08, 1.0);
 /// (client damage + frame callbacks) replaces this in P1.3.4.
 const FRAME_BUDGET: Duration = Duration::from_micros(16_667);
 
-/// The composed realm view ([`Scene::compose`]) uploaded as a GLES texture,
-/// remembered together with the window size and scene generation it was
-/// composed for, so resizes and scene commits re-upload it.
+/// The composed human-visible output ([`super::compose_human_visible`])
+/// uploaded as a GLES texture, remembered together with the window size and
+/// the generations it was composed for, so resizes, scene commits, and
+/// consent-prompt transitions all re-upload it.
 struct SceneTexture {
     texture: GlesTexture,
     size: Size<i32, Physical>,
-    generation: u64,
+    /// [`Scene::generation`] at upload time.
+    scene_generation: u64,
+    /// [`ConsentSurface::generation`] at upload time. A separate counter
+    /// rather than a merged one because the two changes have different
+    /// consumers — see [`crate::consent`]'s redraw section.
+    consent_generation: u64,
 }
 
 /// Per-run state of the nested backend: the winit window + GLES renderer
@@ -69,6 +84,10 @@ struct NestedState {
     /// output 1:1 in the host window. The shim-facing protocol server
     /// (P1.3.4) commits into it and requests a redraw.
     scene: Scene,
+    /// The consent surface (P1.7.1): the prompt composited above the realm
+    /// view in the host window. Always present, empty until P1.7.2 puts a
+    /// petition up.
+    consent: ConsentSurface,
     /// The input router (P1.3.7): host input tagged `physical` at intake
     /// flows through it toward the realm's shim seat. Carries the MVP
     /// no-op preemption hook, where the P1.7.2 consent grab and P1.7.3
@@ -138,6 +157,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let mut state = NestedState {
         backend,
         scene: Scene::new(),
+        consent: ConsentSurface::new(),
         router: input::InputRouter::new(input::NoopHook),
         view: None,
         loop_signal: event_loop.get_signal(),
@@ -207,13 +227,27 @@ impl NestedState {
             return Ok(());
         }
 
-        // Re-upload the view when the window size or the scene content
-        // changed: the same `Scene::compose` bytes the headless backend
-        // retains for capture, presented here as a full-window texture (the
-        // single shared composition implementation, P1.3.3).
-        let generation = self.scene.generation();
-        if self.view.as_ref().map(|v| (v.size, v.generation)) != Some((size, generation)) {
-            let pixels = self.scene.compose(size.w as u32, size.h as u32);
+        // Re-upload when the window size, the scene content, or the consent
+        // surface changed: the same shared composition both backends present
+        // (P1.3.3), plus the prompt (P1.7.1), uploaded here as a full-window
+        // texture. Keying on both generations is what makes a prompt appear
+        // and disappear at the host's very next frame instead of whenever the
+        // scene happens to change next.
+        let scene_generation = self.scene.generation();
+        let consent_generation = self.consent.generation();
+        let key = (size, scene_generation, consent_generation);
+        if self
+            .view
+            .as_ref()
+            .map(|v| (v.size, v.scene_generation, v.consent_generation))
+            != Some(key)
+        {
+            let pixels = super::compose_human_visible(
+                &self.scene,
+                &mut self.consent,
+                size.w as u32,
+                size.h as u32,
+            );
             let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
             let texture = self.backend.renderer().import_memory(
                 &pixels,
@@ -224,7 +258,8 @@ impl NestedState {
             self.view = Some(SceneTexture {
                 texture,
                 size,
-                generation,
+                scene_generation,
+                consent_generation,
             });
         }
 

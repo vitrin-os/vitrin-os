@@ -91,6 +91,60 @@ gbm = { version = "0.18", default-features = false, optional = true }
 # The algorithm is tagged in every recorder entry (`frame.digest_alg`), so
 # swapping it is a schema-visible, non-breaking change.
 blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
+# Glyph rasterization for the consent prompt (P1.7.1, `crate::consent`). The
+# core owns the screen, so there is no privileged system layer to delegate the
+# prompt to -- the TCB draws it itself -- and turning a TrueType outline into
+# an anti-aliased coverage bitmap is the one part of that it should not
+# hand-roll, for the same reason the recorder does not hand-roll a hash
+# (blake3, above): quadratic-bezier flattening plus scanline coverage
+# accumulation is subtle, well-solved code whose bugs are silent.
+#
+# Scoped to exactly that: fontdue rasterizes ONE glyph at a time into an
+# 8-bit coverage bitmap. Every shape the prompt draws -- scrim, card, border,
+# button boxes -- and every composite of those bitmaps is integer byte
+# assembly in `crate::consent::render`, the same posture `crate::scene`
+# already takes ("integer math only, no filtering, no renderer state"). No
+# vector rasterizer, no toolkit, no second host window (decision D4).
+#
+# Justified against plan risk R7 on four counts:
+#
+# 1. **Transitive surface: exactly one crate.** `default-features = false`
+#    yields `fontdue -> ttf-parser` and nothing else -- ttf-parser being the
+#    same `#![forbid(unsafe_code)]` font parser the wider Rust graphics
+#    ecosystem standardized on. For comparison, the rejected alternatives are
+#    an order of magnitude wider: tiny-skia (for the shapes fontdue does not
+#    draw) adds 7 crates, and cosmic-text -- the usual "just do text properly"
+#    answer -- pulls a full shaping/bidi/system-font stack (rustybuzz,
+#    unicode-bidi, swash, fontdb, ...). The prompt renders core-validated
+#    ASCII from `principals.toml`-registered identities, verb names, and a
+#    fixed label set: it needs no shaping engine, and buying one would put
+#    tens of thousands of lines of text-layout code inside the TCB to draw
+#    the string "Deny".
+# 2. **`default-features = false` is a determinism requirement, not tidiness.**
+#    fontdue's default `simd` feature swaps in x86-only SSE implementations of
+#    its coverage accumulator, and that accumulator computes a prefix sum:
+#    the scalar path sums strictly left to right, the SSE path sums pairwise.
+#    Floating-point addition is not associative, so the two paths can disagree
+#    in the low bits of a coverage byte -- i.e. the golden would be
+#    architecture-dependent by construction. (The same feature also swaps an
+#    exact `_mm_sqrt_ss` in for a hand-rolled bit-twiddling approximation.)
+#    Disabling it puts every machine on one scalar IEEE-754 path, which Rust
+#    does not license itself to reassociate or contract, so the golden is
+#    byte-stable across x86-64 and aarch64. `hashbrown` (the other default) is
+#    dropped for the ordinary R7 reason: the core is a std binary and
+#    `std::collections` already serves.
+# 3. **No I/O and no font discovery.** fontdue parses bytes handed to it. The
+#    one font it is ever handed is vendored in `assets/fonts/` and embedded
+#    with `include_bytes!` (see that directory's README for provenance and the
+#    OFL-1.1 terms), so the prompt never touches fontconfig, never reads a
+#    user-writable font path, and cannot fail to draw because the system's
+#    font setup is broken or hostile.
+# 4. **Parsing attacker-controlled data? No.** The font bytes are a
+#    compile-time constant of this binary; the strings are core-validated
+#    (`crate::consent::PromptContent` holds typed core values, never client
+#    text). So the usual "font parsers are a CVE farm" objection does not
+#    apply here: nothing an agent or app sends reaches this parser.
+fontdue = { version = "0.9.3", default-features = false }
 
 [features]
 # Compile the real-GPU dmabuf tests (P1.3.5). Requires a machine with a DRM

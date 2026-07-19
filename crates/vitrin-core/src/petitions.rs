@@ -189,6 +189,7 @@ use std::time::{Duration, Instant};
 
 use vitrin_protocol::generated::vitrin_grant::{Outcome, Persistence as WirePersistence, Verb};
 
+use crate::consent::PromptContent;
 use crate::grants::{
     GrantId, GrantSpec, GrantTable, InsertError, Issuer, PersistenceRung, RealmId, ResourceRef,
 };
@@ -729,6 +730,36 @@ impl PetitionRegistry {
         }
     }
 
+    /// What the consent prompt for `petition` may say (P1.7.1, E7).
+    ///
+    /// **The only non-test constructor of [`PromptContent`]**, which is what
+    /// makes "the prompt renders core-validated data, never free client text"
+    /// (the IDL's `vitrin_consent` page) structural rather than a rule
+    /// someone has to keep applying: the renderer has no way to obtain
+    /// content that did not come out of a pending petition, and the type it
+    /// receives has no free-text field to smuggle anything through (see
+    /// [`crate::consent`]).
+    ///
+    /// Note which realm value travels: `self.realm` is the **registry's**
+    /// [`RealmId`], resolved at admission from `realm.toml`, not the name the
+    /// client minted its realm handle with. The requested name is never
+    /// stored, so it can never reach a screen.
+    ///
+    /// `None` when the petition is not pending -- resolved, timed out, or
+    /// withdrawn. A prompt for a petition that no longer exists must not be
+    /// renderable at all, which is the same exactly-once property removal
+    /// from this table already gives every other consumer.
+    pub fn prompt_content(&self, petition: PetitionId) -> Option<PromptContent> {
+        let pending = self.pending.get(&petition)?;
+        Some(PromptContent {
+            principal: pending.identity.clone(),
+            realm: pending.realm.clone(),
+            verbs: pending.requested.verbs,
+            persistence: pending.requested.persistence,
+            expiry_ms: pending.requested.expiry_ms,
+        })
+    }
+
     /// Whether this verified identity currently has a consent prompt **on
     /// screen** for any of its pending petitions, across all of its
     /// connections -- the `consent_held` judgement the enforcement
@@ -798,9 +829,11 @@ impl PetitionRegistry {
                         "effective verbs outside the petitioned set",
                     ));
                 }
-                if requested.persistence == PersistenceRung::Once
-                    && persistence == PersistenceRung::WhileRunning
-                {
+                // The shared narrowing rule (`PersistenceRung::narrows`), not
+                // a local comparison: the consent prompt decides which
+                // allow-buttons to draw with the same predicate, so it can
+                // never offer a rung this refuses.
+                if !persistence.narrows(requested.persistence) {
                     return Err(ScriptedError::InvalidDecision(
                         "persistence rung longer-lived than petitioned",
                     ));
@@ -1065,6 +1098,77 @@ mod tests {
         assert_eq!(reg.withdraw_connection(conn_b), 1);
         assert!(!reg.prompt_up_for(&identity(DEMO)));
         assert!(!reg.mark_prompt_shown(petition));
+    }
+
+    #[test]
+    fn prompt_content_comes_from_the_pending_petition_and_dies_with_it() {
+        // P1.7.1: the consent renderer's only source of content. Three
+        // things are pinned here because the prompt's integrity rests on
+        // them.
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::Interactive);
+        let conn = reg.register_connection();
+        let realms = crate::realm::tests::registry_with(&["kiosk"]);
+
+        let mut req = request(DEMO, conn, 10);
+        // The client names the realm "kiosk"; what the prompt shows must be
+        // the REGISTRY's id, resolved from realm.toml -- the requested name
+        // is never stored, so no client string can reach a screen.
+        req.realm_name = "kiosk".into();
+        req.verbs = Verb::OBSERVE;
+        req.expiry_ms = 30_000;
+        req.persistence = WirePersistence::Once;
+        let Admission::Pending { petition } = reg.admit(req, t0, &realms) else {
+            panic!("interactive petition must pend");
+        };
+
+        // 1. Every field is the petition's own, verbatim.
+        let prompt = reg
+            .prompt_content(petition)
+            .expect("the petition is pending");
+        assert_eq!(prompt.principal, identity(DEMO));
+        assert_eq!(prompt.realm, RealmId::new("kiosk"));
+        assert_eq!(prompt.verbs, Verb::OBSERVE);
+        assert_eq!(prompt.persistence, PersistenceRung::Once);
+        assert_eq!(prompt.expiry_ms, 30_000);
+
+        // 2. The choices offered are the ones this petition can legally
+        //    resolve to -- the registry's own narrowing rule decides, so the
+        //    prompt cannot offer a button `resolve_scripted` would refuse.
+        for choice in prompt.choices() {
+            let crate::consent::Choice::Allow(rung) = choice else {
+                continue;
+            };
+            assert!(
+                reg.resolve_scripted(
+                    petition,
+                    ScriptedDecision::Approve {
+                        verbs: prompt.verbs,
+                        persistence: rung,
+                        expiry_ms: prompt.expiry_ms,
+                    },
+                )
+                .is_ok(),
+                "the prompt offered {rung:?}, which this petition refuses"
+            );
+            // Re-admit for the next iteration: resolving consumed it.
+            let mut again = request(DEMO, conn, 10);
+            again.realm_name = "kiosk".into();
+            again.persistence = WirePersistence::Once;
+            let Admission::Pending { .. } = reg.admit(again, t0, &realms) else {
+                panic!("re-admission must pend");
+            };
+        }
+
+        // 3. A petition that is no longer pending has no prompt at all --
+        //    the same exactly-once property removal gives every other
+        //    consumer, so a decided petition cannot be re-rendered.
+        let pending = reg.pending_ids();
+        for id in &pending {
+            reg.resolve_scripted(*id, ScriptedDecision::Deny).unwrap();
+            assert!(reg.prompt_content(*id).is_none());
+        }
+        assert!(reg.prompt_content(PetitionId(u64::MAX)).is_none());
     }
 
     #[test]

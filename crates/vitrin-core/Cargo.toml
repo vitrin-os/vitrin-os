@@ -66,6 +66,13 @@ gbm = { version = "0.18", default-features = false, optional = true }
 #   VITRIN_GPU_TESTS=1 cargo test -p vitrin-core --features gpu-tests -- --ignored dmabuf
 # CI never enables this feature, so headless builds stay GPU-free and lean.
 gpu-tests = ["dep:gbm"]
+# Compile the scripted-consent injector (P1.4.3): the build-gated core hook
+# through which integration harnesses approve/deny/narrow specific pending
+# petitions programmatically. Consent decisions are deliberately not
+# protocol-expressible (IDL, vitrin_consent), so this hook is the only test
+# seam -- always compiled under cfg(test); this feature additionally exposes
+# it to out-of-crate harnesses (P1.9). Never enabled in deployment builds.
+scripted-consent = []
 
 [dev-dependencies]
 # The permanent mock-shim fixture (issue #21): a compliant peer speaking the

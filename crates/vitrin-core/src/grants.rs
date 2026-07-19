@@ -269,6 +269,18 @@ impl TryFrom<WirePersistence> for PersistenceRung {
     }
 }
 
+impl From<PersistenceRung> for WirePersistence {
+    /// The wire projection, for the petition flow's
+    /// `vitrin_grant.resolved.persistence` (total: every table rung is a
+    /// wire rung; only the reverse conversion can fail).
+    fn from(rung: PersistenceRung) -> WirePersistence {
+        match rung {
+            PersistenceRung::Once => WirePersistence::Once,
+            PersistenceRung::WhileRunning => WirePersistence::WhileRunning,
+        }
+    }
+}
+
 /// `constraints.focus_condition` (PRD Doc 2 section 5.2): a value-bearing
 /// use condition ("only while the surface is focused"). **Present-but-null
 /// until Phase 2**: value-bearing constraints arrive on the wire as a
@@ -290,8 +302,9 @@ pub(crate) enum FocusCondition {}
 pub(crate) enum ProvenanceRef {}
 
 /// `issuer` (PRD Doc 2 section 5.2): which authority created the row.
-/// Version 1 has exactly the two consent paths of Phase 1; both name a
-/// *core-side* decision -- agents never issue grants.
+/// Version 1 has exactly the two consent paths of Phase 1 -- plus, in test
+/// builds only, the scripted stand-in below; all name a *core-side*
+/// decision -- agents never issue grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Issuer {
     /// The human approved the core-rendered consent prompt (P1.7.1).
@@ -299,6 +312,13 @@ pub(crate) enum Issuer {
     /// The loudly-logged `--consent=auto-approve` policy for headless CI
     /// and demos (P1.7.2, plan risk R6).
     AutoApprovePolicy,
+    /// The build-gated scripted-consent injector approved the petition
+    /// (P1.4.3): the integration-test stand-in for the consent surface,
+    /// recorded honestly rather than masquerading as `HumanConsent`.
+    /// Compiled only under `cfg(test)` or the `scripted-consent` feature,
+    /// so a deployment build cannot even represent this issuer.
+    #[cfg(any(test, feature = "scripted-consent"))]
+    ScriptedConsent,
 }
 
 /// `constraints{...}` (PRD Doc 2 section 5.2), stored exactly as the row

@@ -82,10 +82,12 @@
 //! increasing, above the watermark -- enforced by allocating them in
 //! argument order through the same [`allocate_id`] every mint uses), the
 //! per-connection object table, and event emission. [`petitions`] owns
-//! everything policy-scoped (realm existence, reserved flags, durable
-//! rungs, resource granularity, admission caps, the consent decision) --
-//! so the petition-policy razor has one home and the object-graph razor
-//! has another.
+//! everything policy-scoped (reserved flags, durable rungs, resource
+//! granularity, admission caps, the consent decision) -- so the
+//! petition-policy razor has one home and the object-graph razor has
+//! another. Realm *existence* is a third module's, [`realm`]'s: this
+//! module carries the name a `get_realm` handle was minted with, and
+//! admission resolves it against the realm registry.
 //!
 //! **One emission path, exactly-once `resolved`.** Every resolution --
 //! immediate (admission refusals, auto-approve) or deferred (scripted
@@ -189,6 +191,7 @@
 //! [`UseOutcome`]: crate::enforcement::UseOutcome
 //! [`identity`]: crate::identity
 //! [`petitions`]: crate::petitions
+//! [`realm`]: crate::realm
 //! [`enforcement`]: crate::enforcement
 //! [`Verifier`]: crate::identity::Verifier
 //! [`Verifier::verify`]: crate::identity::Verifier::verify
@@ -227,6 +230,7 @@ use crate::input::{PhysicalPresence, SeatInput, SeatInputKind};
 use crate::petitions::{
     Admission, ConnectionId, PetitionRegistry, PetitionRequest, Resolution, Verdict,
 };
+use crate::realm::RealmRegistry;
 use crate::recorder::{
     self, auth_cause_class, ActuationDetail, Event, Recorder, RequestedAuthority,
     VERIFIER_UNAVAILABLE_CLASS,
@@ -654,6 +658,12 @@ pub(crate) struct ServerCtx<'a> {
     /// The core-global pending-petition registry (also the chokepoint's
     /// `consent_held` source).
     pub petitions: &'a mut PetitionRegistry,
+    /// The core-global realm registry (P1.5.1): the single source of realm
+    /// existence, consulted by petition admission for its `unavailable`
+    /// judgement. Shared and immutable per dispatch turn -- realm state
+    /// changes belong to the spawn manager (P1.5.2/P1.5.3), never to a
+    /// petitioner's connection.
+    pub realms: &'a RealmRegistry,
     /// The core-global grant table.
     pub grants: &'a mut GrantTable,
     /// The dispatch turn's injected instant: the server never reads a
@@ -1322,7 +1332,7 @@ impl PrincipalServer {
                 flags: petition.flags,
             },
         });
-        let admission = ctx.petitions.admit(petition, now);
+        let admission = ctx.petitions.admit(petition, now, ctx.realms);
         match admission {
             Admission::Pending { petition } => {
                 // The prompt lifecycle began: it is waiting on the consent
@@ -1754,9 +1764,17 @@ mod tests {
     /// actuations.
     struct Shared {
         petitions: PetitionRegistry,
+        /// The rig's realm registry (P1.5.1): one configured realm under
+        /// the well-known default id, which is what `bind_with_realm`
+        /// addresses. Tests that need another shape replace it.
+        realms: RealmRegistry,
         grants: GrantTable,
         now: Instant,
-        /// `(rgba, width, height)`; `None` models a vacant realm.
+        /// `(rgba, width, height)`; `None` models a realm with no live
+        /// surface -- the chokepoint's use-time `no_surface` judgement,
+        /// which is deliberately NOT the same thing as a realm being
+        /// vacant at petition time (that is [`Shared::realms`], and see
+        /// [`crate::realm`]'s vacancy decision).
         view: Option<(Vec<u8>, u32, u32)>,
         presence: PhysicalPresence,
         actuations: Vec<SeatInput>,
@@ -1774,6 +1792,7 @@ mod tests {
             let (recorder, log_path) = crate::recorder::tests::scratch_recorder("principal");
             Self {
                 petitions: PetitionRegistry::new(policy, PetitionConfig::default()),
+                realms: crate::realm::tests::registry_with(&[crate::realm::WELL_KNOWN_REALM_ID]),
                 grants: GrantTable::new(),
                 now: Instant::now(),
                 view: Some((crate::test_pattern::render(VIEW_W, VIEW_H), VIEW_W, VIEW_H)),
@@ -1830,6 +1849,7 @@ mod tests {
     ) -> Result<(), PrincipalFault> {
         let Shared {
             petitions,
+            realms,
             grants,
             now,
             view,
@@ -1847,6 +1867,7 @@ mod tests {
             let mut ctx = ServerCtx {
                 verifier,
                 petitions,
+                realms,
                 grants,
                 now: *now,
                 realm_view: view.as_ref().map(|(rgba, width, height)| RealmViewFrame {
@@ -3122,6 +3143,104 @@ mod tests {
             &verifier,
             &mut shared,
             6,
+        );
+    }
+
+    #[test]
+    fn realm_zero_petitions_resolve_through_the_realm_registry() {
+        // P1.5.1 acceptance criteria 1 and 2, end to end on the wire: the
+        // realm is addressable by its stable id, and a petition naming it
+        // resolves through the *registry*. The proof that this is not a
+        // hardcode is the inversion: with a registry that serves "kiosk"
+        // and not "realm-0", the same "realm-0" petition that succeeds
+        // above now resolves unavailable, and a "kiosk" petition pends.
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let mut shared = Shared::new(ConsentPolicy::Interactive);
+        let (mut server, mut core, mut client) = connect(&mut shared);
+
+        // Against the default registry (realm-0 configured), the petition
+        // is admitted: it pends for consent rather than resolving.
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+        assert_eq!(shared.petitions.pending_total(), 1);
+
+        // The row the grant will state names that same registry id.
+        assert_eq!(
+            shared
+                .realms
+                .resolve_for_petition("realm-0")
+                .map(crate::grants::RealmId::as_str),
+            Some("realm-0")
+        );
+
+        // Now the inversion, on a fresh rig whose registry holds a
+        // differently named realm. Version-0 *config* cannot produce that
+        // registry -- `realm.toml` pins the id to the IDL's well-known name
+        // -- but the addressing path underneath is name-agnostic, and that
+        // is what this asserts: nothing between the wire and the registry
+        // privileges "realm-0".
+        let mut shared = Shared::new(ConsentPolicy::Interactive);
+        shared.realms = crate::realm::tests::registry_with(&["kiosk"]);
+        let (mut server, mut core, mut client) = connect(&mut shared);
+        bind(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        send_get_realm(&mut client, 2, 3, "realm-0");
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 2).unwrap();
+        assert_eq!(
+            expect_resolved(&mut client, 4).outcome,
+            Outcome::Unavailable,
+            "the well-known name is not privileged: existence comes from the registry"
+        );
+
+        // ... and the configured name is what this session serves.
+        send_get_realm(&mut client, 2, 10, "kiosk");
+        client
+            .send_message(&petition_at(11).encode(10), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 2).unwrap();
+        expect_consent_state(&mut client, 12, ConsentState::Queued);
+        assert_eq!(shared.petitions.pending_total(), 1);
+    }
+
+    #[test]
+    fn a_vacant_realm_petitions_resolve_unavailable() {
+        // The IDL folds "unknown" and "vacant" into one client-visible
+        // answer. Version 0's registry answers vacancy by presence, so an
+        // empty registry -- the shape P1.5.3 will also produce when a realm
+        // goes vacant -- resolves every petition unavailable, without any
+        // change at this layer.
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let mut shared = Shared::new(ConsentPolicy::Interactive);
+        shared.realms = crate::realm::tests::registry_with(&[]);
+        let (mut server, mut core, mut client) = connect(&mut shared);
+
+        // get_realm still succeeds structurally: naming is not authority.
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        let resolved = expect_resolved(&mut client, 4);
+        assert_eq!(resolved.outcome, Outcome::Unavailable);
+        assert_eq!(resolved.verbs, Verb::default(), "declined carries no verbs");
+        // No consent lifecycle ever began, and no authority was minted.
+        assert_eq!(shared.petitions.pending_total(), 0);
+        assert_eq!(shared.grants.rows(shared.now).count(), 0);
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            9,
         );
     }
 

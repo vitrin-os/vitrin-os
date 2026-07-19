@@ -110,6 +110,17 @@ mod petitions;
 /// -- nothing at runtime accepts principal connections before then.
 #[cfg_attr(not(test), allow(dead_code))]
 mod principal;
+/// The realm object and realm registry (P1.5.1): exactly one realm,
+/// `realm-0`, built at startup from `realm.toml` -- the stable wire-visible
+/// id `get_realm` addresses, the whole-realm grant scope grants attach to,
+/// and the owner of the app's spawn configuration (which P1.5.2 executes;
+/// nothing here forks). Also the single source of realm existence, which
+/// petition admission consults for its `unavailable` judgement. Loaded at
+/// startup below; dead-code-allowed outside tests for the same reason as
+/// its siblings -- the registry becomes a `ServerCtx` field at the M1.1
+/// listener wiring.
+#[cfg_attr(not(test), allow(dead_code))]
+mod realm;
 /// The flight-recorder log v0 (P1.4.5): the journal seed — a JSON-lines
 /// event log of handshakes, grant lifecycle transitions, consent decisions,
 /// and every enforcement decision, carrying an observation digest on every
@@ -132,11 +143,18 @@ mod scene;
 #[cfg_attr(not(test), allow(dead_code))]
 mod shim;
 mod test_pattern;
+/// The strict TOML subset every core configuration file is written in
+/// (P1.4.1's `principals.toml`, P1.5.1's `realm.toml`): one hand-rolled
+/// lexer for hostile config bytes, not one per schema. Plan risk R7 keeps a
+/// TOML crate out of the TCB; having a single lexer is what keeps that
+/// choice from multiplying parsers.
+mod toml_subset;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::petitions::ConsentPolicy;
+use crate::realm::RealmRegistry;
 use crate::recorder::{Event, Recorder};
 
 const USAGE: &str = "\
@@ -158,6 +176,10 @@ USAGE:
                                 lines, appended). Default:
                                 $XDG_RUNTIME_DIR/vitrin-0/flight-recorder-<pid>.jsonl
                                 Startup FAILS if the log cannot be opened.
+    vitrind [--realm PATH]      Realm configuration for this session (one
+                                [[realm]] table: command, args, env_allow).
+                                Default: $XDG_CONFIG_HOME/vitrin/realm.toml
+                                Startup FAILS if it is missing or malformed.
     vitrind --help              Show this help.
     vitrind --version           Show the version.
 ";
@@ -178,11 +200,13 @@ enum Action {
     RunNested {
         consent: ConsentPolicy,
         recorder: Option<PathBuf>,
+        realm: Option<PathBuf>,
     },
     RunHeadless {
         size: (u32, u32),
         consent: ConsentPolicy,
         recorder: Option<PathBuf>,
+        realm: Option<PathBuf>,
     },
     Help,
     Version,
@@ -210,6 +234,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut size: Option<(u32, u32)> = None;
     let mut consent: Option<ConsentPolicy> = None;
     let mut recorder: Option<PathBuf> = None;
+    let mut realm: Option<PathBuf> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg {
@@ -234,7 +259,13 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 let value = args
                     .next()
                     .ok_or("`--recorder` requires a log path (e.g. `--recorder /tmp/run.jsonl`)")?;
-                set_recorder(&mut recorder, value)?;
+                set_path(&mut recorder, "--recorder", "log path", value)?;
+            }
+            "--realm" => {
+                let value = args.next().ok_or(
+                    "`--realm` requires a config path (e.g. `--realm ~/.config/vitrin/realm.toml`)",
+                )?;
+                set_path(&mut realm, "--realm", "config path", value)?;
             }
             "--help" | "-h" => return Ok(Action::Help),
             "--version" | "-V" => return Ok(Action::Version),
@@ -242,7 +273,9 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 if let Some(value) = other.strip_prefix("--consent=") {
                     set_consent(&mut consent, parse_consent(value)?)?;
                 } else if let Some(value) = other.strip_prefix("--recorder=") {
-                    set_recorder(&mut recorder, value)?;
+                    set_path(&mut recorder, "--recorder", "log path", value)?;
+                } else if let Some(value) = other.strip_prefix("--realm=") {
+                    set_path(&mut realm, "--realm", "config path", value)?;
                 } else {
                     return Err(format!("unknown argument `{other}`"));
                 }
@@ -257,27 +290,32 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     // `--help`/`--version` already returned above, so only the run modes
     // remain to resolve; `--size` is meaningless without `--headless`.
     match (mode, size) {
-        (Some(Mode::Nested), None) => Ok(Action::RunNested { consent, recorder }),
+        (Some(Mode::Nested), None) => Ok(Action::RunNested {
+            consent,
+            recorder,
+            realm,
+        }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
         (Some(Mode::Headless), size) => Ok(Action::RunHeadless {
             size: size.unwrap_or(DEFAULT_HEADLESS_SIZE),
             consent,
             recorder,
+            realm,
         }),
         (None, Some(_)) => Err("`--size` requires `--headless`".into()),
         (None, None) => Err("no mode given (expected `--nested` or `--headless`)".into()),
     }
 }
 
-/// Record the flight-recorder log path, rejecting a repeat flag and an
-/// empty value (an empty path can never open, and failing here names the
-/// flag rather than surfacing a bare ENOENT at startup).
-fn set_recorder(slot: &mut Option<PathBuf>, value: &str) -> Result<(), String> {
+/// Record a path-valued flag (`--recorder`, `--realm`), rejecting a repeat
+/// flag and an empty value (an empty path can never open, and failing here
+/// names the flag rather than surfacing a bare ENOENT at startup).
+fn set_path(slot: &mut Option<PathBuf>, flag: &str, what: &str, value: &str) -> Result<(), String> {
     if slot.is_some() {
-        return Err("`--recorder` given more than once".into());
+        return Err(format!("`{flag}` given more than once"));
     }
     if value.is_empty() {
-        return Err("`--recorder` requires a non-empty log path".into());
+        return Err(format!("`{flag}` requires a non-empty {what}"));
     }
     *slot = Some(PathBuf::from(value));
     Ok(())
@@ -370,25 +408,37 @@ fn main() -> ExitCode {
             println!("vitrind {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Action::RunNested { consent, recorder } => {
+        Action::RunNested {
+            consent,
+            recorder,
+            realm,
+        } => {
             init_tracing();
             announce_consent_policy(consent);
-            run_session(consent, recorder, backend::winit::run)
+            run_session(consent, recorder, realm, backend::winit::run)
         }
         Action::RunHeadless {
             size,
             consent,
             recorder,
+            realm,
         } => {
             init_tracing();
             announce_consent_policy(consent);
-            run_session(consent, recorder, || backend::headless::run(size))
+            run_session(consent, recorder, realm, || backend::headless::run(size))
         }
     }
 }
 
-/// Open the run's flight recorder, run the backend inside it, and close the
-/// log. The recorder brackets the whole session: creation failure is fatal
+/// Load the session's realm, open the run's flight recorder, run the
+/// backend inside it, and close the log.
+///
+/// The realm goes first (P1.5.1): it is the only startup input whose
+/// absence means the session has nothing to serve at all, so failing on it
+/// before anything is created leaves no log file and no window behind from
+/// a run that could never have worked.
+///
+/// The recorder brackets the whole session: creation failure is fatal
 /// *before* the backend starts (P1.4.5 — an operator who asked for a flight
 /// recorder and cannot have one must learn it before the session, not after
 /// it is unreconstructable), and the closing entry reports how many entries
@@ -399,13 +449,31 @@ fn main() -> ExitCode {
 /// recovered ends with no file-only evidence at all (which the operator
 /// message below says outright rather than implying otherwise).
 ///
-/// The handle stays here for now: nothing at runtime accepts principal
-/// connections yet (the listener wiring is M1.1 integration), and that
-/// wiring hands this same single handle to each connection's `ServerCtx`.
-fn run_session<R>(consent: ConsentPolicy, recorder_path: Option<PathBuf>, backend: R) -> ExitCode
+/// Both the recorder handle and the realm registry stay here for now:
+/// nothing at runtime accepts principal connections yet (the listener
+/// wiring is M1.1 integration), and that wiring hands this same single
+/// recorder handle and this same registry to each connection's
+/// `ServerCtx`. The registry is also what P1.5.2 will spawn from — it is
+/// already the only place the realm's command lives.
+fn run_session<R>(
+    consent: ConsentPolicy,
+    recorder_path: Option<PathBuf>,
+    realm_path: Option<PathBuf>,
+    backend: R,
+) -> ExitCode
 where
     R: FnOnce() -> Result<(), Box<dyn std::error::Error>>,
 {
+    // The realm is resolved before anything else this run creates: a
+    // session whose realm configuration is missing or malformed has
+    // nothing to serve, and aborting here means no log file, no socket,
+    // and no window are left behind by a run that could never work.
+    let realms = match load_realms(realm_path.as_deref()) {
+        Ok(realms) => realms,
+        Err(()) => return ExitCode::FAILURE,
+    };
+    announce_realms(&realms);
+
     let path = match recorder_path {
         Some(path) => path,
         None => match default_recorder_path() {
@@ -485,6 +553,48 @@ fn default_recorder_path() -> Result<PathBuf, vitrin_ipc::PathError> {
     )))
 }
 
+/// Resolve and load the session's realm configuration (P1.5.1), failing
+/// **loudly and fatally** on any problem: the message names the file and
+/// the specific fault, because a core that silently defaulted to some
+/// realm the operator did not describe would be spawning an app nobody
+/// asked for. `Err(())` means the caller returns a failure exit code --
+/// the diagnostics have already been emitted.
+fn load_realms(realm_path: Option<&Path>) -> Result<RealmRegistry, ()> {
+    let path = match realm_path {
+        Some(path) => path.to_path_buf(),
+        None => match realm::default_config_path() {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!(
+                    "fatal: cannot locate the realm configuration: {err}; \
+                     pass an explicit `--realm PATH`"
+                );
+                return Err(());
+            }
+        },
+    };
+    RealmRegistry::load(&path).map_err(|err| {
+        tracing::error!("fatal: {err}");
+    })
+}
+
+/// Announce what this session will run. The command a trusted core is
+/// configured to execute is a security-relevant fact an operator should
+/// see in the log, not discover from `ps`; the environment allowlist is
+/// named for the same reason (its default is empty -- the app inherits
+/// nothing the file does not name).
+fn announce_realms(realms: &RealmRegistry) {
+    for realm in realms.iter() {
+        tracing::info!(
+            realm = %realm.id(),
+            command = %realm.spawn().command().display(),
+            args = realm.spawn().args().len(),
+            env_allow = ?realm.spawn().env_allow(),
+            "realm configured (not started: spawning lands with P1.5.2)"
+        );
+    }
+}
+
 /// The loud startup announcement the consent policy owes (plan risk R6):
 /// auto-approve must never run silently. The parsed policy is consumed by
 /// the M1.1 listener wiring (which constructs the `PetitionRegistry` from
@@ -525,7 +635,8 @@ mod tests {
             parse_args(["--nested"]),
             Ok(Action::RunNested {
                 consent: ConsentPolicy::Interactive,
-                recorder: None
+                recorder: None,
+                realm: None
             })
         );
     }
@@ -537,7 +648,8 @@ mod tests {
             Ok(Action::RunHeadless {
                 size: (1280, 800),
                 consent: ConsentPolicy::Interactive,
-                recorder: None
+                recorder: None,
+                realm: None
             })
         );
     }
@@ -549,7 +661,8 @@ mod tests {
             Ok(Action::RunHeadless {
                 size: (1280, 800),
                 consent: ConsentPolicy::Interactive,
-                recorder: None
+                recorder: None,
+                realm: None
             })
         );
         assert_eq!(
@@ -557,7 +670,8 @@ mod tests {
             Ok(Action::RunHeadless {
                 size: (640, 480),
                 consent: ConsentPolicy::Interactive,
-                recorder: None
+                recorder: None,
+                realm: None
             })
         );
     }
@@ -575,7 +689,8 @@ mod tests {
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
                     consent: ConsentPolicy::AutoApprove,
-                    recorder: None
+                    recorder: None,
+                    realm: None
                 })
             );
         }
@@ -583,7 +698,8 @@ mod tests {
             parse_args(["--nested", "--consent=interactive"]),
             Ok(Action::RunNested {
                 consent: ConsentPolicy::Interactive,
-                recorder: None
+                recorder: None,
+                realm: None
             })
         );
     }
@@ -598,7 +714,8 @@ mod tests {
             Ok(Action::RunHeadless {
                 size: (1280, 800),
                 consent: ConsentPolicy::Interactive,
-                recorder: None
+                recorder: None,
+                realm: None
             })
         );
         for args in [
@@ -610,7 +727,8 @@ mod tests {
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
                     consent: ConsentPolicy::Interactive,
-                    recorder: Some(PathBuf::from("/tmp/run.jsonl"))
+                    recorder: Some(PathBuf::from("/tmp/run.jsonl")),
+                    realm: None
                 })
             );
         }
@@ -623,9 +741,76 @@ mod tests {
             ]),
             Ok(Action::RunNested {
                 consent: ConsentPolicy::AutoApprove,
-                recorder: Some(PathBuf::from("/tmp/n.jsonl"))
+                recorder: Some(PathBuf::from("/tmp/n.jsonl")),
+                realm: None
             })
         );
+    }
+
+    #[test]
+    fn realm_config_path_parses_both_spellings_and_defaults_to_none() {
+        // `None` is "not given", never "no realm": omitted, startup
+        // resolves the documented default path and still fails if nothing
+        // is there.
+        for args in [
+            vec!["--headless", "--realm", "/etc/vitrin/realm.toml"],
+            vec!["--headless", "--realm=/etc/vitrin/realm.toml"],
+        ] {
+            assert_eq!(
+                parse_args(args),
+                Ok(Action::RunHeadless {
+                    size: (1280, 800),
+                    consent: ConsentPolicy::Interactive,
+                    recorder: None,
+                    realm: Some(PathBuf::from("/etc/vitrin/realm.toml"))
+                })
+            );
+        }
+        // Valid with the nested mode and alongside the sibling flags.
+        assert_eq!(
+            parse_args([
+                "--nested",
+                "--consent=auto-approve",
+                "--recorder=/tmp/n.jsonl",
+                "--realm=/tmp/realm.toml"
+            ]),
+            Ok(Action::RunNested {
+                consent: ConsentPolicy::AutoApprove,
+                recorder: Some(PathBuf::from("/tmp/n.jsonl")),
+                realm: Some(PathBuf::from("/tmp/realm.toml"))
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_or_repeated_realm_is_an_error() {
+        // The `--recorder` precedent, flag for flag: no value to consume,
+        // an empty path, and a repeat.
+        assert!(parse_args(["--headless", "--realm"]).is_err());
+        assert!(parse_args(["--headless", "--realm="]).is_err());
+        assert!(parse_args(["--headless", "--realm", ""]).is_err());
+        assert!(parse_args(["--headless", "--realm=/a.toml", "--realm=/b.toml"]).is_err());
+        // The error names the flag the operator typed.
+        assert!(
+            parse_args(["--headless", "--realm=/a.toml", "--realm=/b.toml"])
+                .unwrap_err()
+                .contains("--realm")
+        );
+    }
+
+    #[test]
+    fn a_bad_realm_config_aborts_startup_with_an_actionable_message() {
+        // Acceptance criterion 3 at the startup seam: `load_realms` is the
+        // one path a session's realm comes from, and every failure is
+        // fatal, not defaulted. (The message content itself is asserted in
+        // `realm`'s tests, on `RealmConfigError`'s Display -- which is
+        // verbatim what the `tracing::error!` above emits.)
+        let _fd = crate::capture::tests::fd_lock();
+        let absent = std::env::temp_dir().join(format!(
+            "vitrin-main-absent-{}/realm.toml",
+            std::process::id()
+        ));
+        assert!(load_realms(Some(&absent)).is_err());
     }
 
     #[test]
@@ -699,7 +884,8 @@ mod tests {
             Ok(Action::RunHeadless {
                 size: (2147483647, 1),
                 consent: ConsentPolicy::Interactive,
-                recorder: None
+                recorder: None,
+                realm: None
             })
         );
     }

@@ -33,6 +33,14 @@
 //! - `--spawn-app` — with `--serve`, additionally spawn a child standing in
 //!   for the confined app (this same binary in `--app` mode), so the
 //!   `core → shim → app` topology is real rather than described.
+//! - `--animate N` — with `--serve`, run the paced animation loop for `N`
+//!   frames before falling into the drain loop, so the realm actually has
+//!   a committed surface. The realm-lifecycle tests (P1.5.3) need a shim
+//!   that is genuinely mid-frame when it is killed: "the scene updates on
+//!   shim death" is only an assertion if something was on the scene, and
+//!   "never a stale frame" is only meaningful if a real frame was there to
+//!   go stale. `N` is deliberately unbounded so a test can leave the shim
+//!   animating indefinitely and kill it at an arbitrary point.
 //! - `--app` — the leaf: block until stdin closes. Holds no core
 //!   connection, which is exactly what its descriptor table must show.
 
@@ -52,6 +60,13 @@ const CORE_FD: RawFd = 3;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |name: &str| args.iter().any(|a| a == name);
+    // `--animate N`: the value is the following argument.
+    let value = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<u32>().ok())
+    };
 
     if flag("--app") {
         // The confined app: nothing to do but stay alive so the harness can
@@ -135,6 +150,16 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    }
+
+    // Paint, if asked. The loop is paced on `frame_done`, so it advances
+    // only as fast as the core presents -- which is what makes "killed
+    // mid-frame" a real state rather than a description. It ends early and
+    // silently when the core hangs up or kills this process: a shim that
+    // panicked on its core disappearing would be testing the fixture's
+    // error handling instead of the core's death path.
+    if let Some(frames) = value("--animate") {
+        let _ = shim.run_paced_animation(frames);
     }
 
     // Serve until the core hangs up (or kills us). Every message is drained

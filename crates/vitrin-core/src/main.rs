@@ -72,6 +72,20 @@ mod dmabuf;
 /// hook point. The nested backend feeds it host input at runtime; seat
 /// delivery to a live shim connection arrives with P1.5.2.
 mod input;
+/// Realm lifecycle (P1.5.3): the realm's death paths — crash detection over
+/// two independent signals (socketpair EOF and `SIGCHLD`, either of which
+/// may arrive first), `waitpid`-authoritative reaping through calloop's
+/// `signalfd` source so no zombie accumulates, the terminal realm state
+/// that makes the chokepoint's existing `no_surface` refusal true, and the
+/// orderly shutdown ladder (hang up → `SIGTERM` → `SIGKILL`) that removes
+/// the realm's runtime tree on the way out. Dead-code-allowed outside tests
+/// for the same reason as `spawn`, whose other half it is: exercised
+/// end-to-end by its tests today (they really fork a shim, really `kill -9`
+/// it mid-capture, and really assert the next capture refuses), and wired
+/// into the session by the same M1.1 integration that calls `spawn_realm` —
+/// see `run_session`.
+#[cfg_attr(not(test), allow(dead_code))]
+mod lifecycle;
 /// The grant table v0 (P1.4.2): the in-memory PRD Doc 2 §5.2 grant store of
 /// the capability kernel — rows keyed by `identity`'s verifier-canonical
 /// principal, answering the enforcement chokepoint's grant-scoped use query
@@ -477,30 +491,48 @@ fn main() -> ExitCode {
 /// wants before anything else happens.
 ///
 /// It is deliberately not called at this commit, because a spawned shim
-/// needs two things that do not exist yet, and half-wiring it would be
-/// worse than not wiring it:
+/// needs **an event loop that services its connection**: the shim blocks on
+/// `configure` and then on the core's replies, so a backend that never
+/// reads the socketpair would leave it wedged at startup forever. That is
+/// the M1.1 integration gap (issue #77) that already leaves `shim` and the
+/// listener unwired.
 ///
-/// - **an event loop that services its connection.** The shim blocks on
-///   `configure` and then on the core's replies; a backend that never reads
-///   the socketpair would leave it wedged at startup forever.
-/// - **`SIGCHLD` reaping (P1.5.3, issue #32).** `SpawnedRealm` holds an
-///   unreaped `Child` on purpose. Spawning into a session that never waits
-///   would accumulate a zombie for every realm restart — lifecycle is #32's
-///   whole subject, and this task must not pre-empt it with a half-policy.
+/// The other blocker P1.5.2 named is gone: `SIGCHLD` reaping and the whole
+/// lifecycle are now `lifecycle` (P1.5.3, issue #32), which adopts the
+/// `SpawnedRealm`'s unreaped `Child` and owns it to the end.
 ///
-/// Until both land, the spawn mechanism is exercised end-to-end by
-/// `spawn`'s own tests, which really fork the mock shim, really place the
-/// socketpair at fd 3, and really assert the child's environment and
-/// descriptor table from procfs.
+/// Until the wiring lands, both halves are exercised end-to-end by their
+/// own tests, which really fork the mock shim, really place the socketpair
+/// at fd 3, really `kill -9` it mid-capture, and really assert the next
+/// capture refuses `no_surface` through the chokepoint.
 ///
 /// Consequence worth stating plainly rather than discovering later:
 /// **issue #31's "`pstree` shows core → shim → app" is satisfied by tests,
-/// not by the shipped binary.** A running `vitrind` forks nothing. Of the
-/// two blockers only `SIGCHLD` reaping belongs to #32; the event-loop half
-/// is the same M1.1 integration gap that already leaves `shim` and the
-/// listener unwired, and no open issue owns it. Whoever closes that gap
-/// closes this line too — the call site is described above, and it is one
-/// `spawn_realm` call.
+/// not by the shipped binary.** A running `vitrind` forks nothing.
+///
+/// # Where lifecycle plugs in (P1.5.3)
+///
+/// Three call sites, all in the same wiring:
+///
+/// - **`lifecycle::child_signal_source()` next to the backend's existing
+///   `SIGINT`/`SIGTERM` source**, and for the same reason it sits there:
+///   `signalfd` only sees signals blocked on *every* thread, and a mask
+///   installed before the backend spawns any is inherited by all of them.
+///   Its callback polls each realm's `RealmLifecycle::poll_exit`.
+/// - **`RealmLifecycle::note_connection_closed` at the shim connection's
+///   removal point**, where `vitrin-ipc`'s event source already funnels
+///   EOF, transport faults, and protocol violations into one
+///   `DisconnectReason`.
+/// - **`RealmLifecycle::shutdown` here**, between `backend()` returning and
+///   `recorder.finish()` below — after the loop has stopped (the ladder
+///   blocks, deliberately, and must not do so inside a live compositor
+///   loop) and before the log closes, so the realm's `realm_died` /
+///   `realm_exited` entries land in the run they belong to rather than
+///   after its footer.
+///
+/// The embedder that owns realms also derives `ServerCtx::realm_view` from
+/// `RealmLifecycle::view_is_live` — the one seam that makes the
+/// chokepoint's `no_surface` refusal true after a shim dies.
 fn run_session<R>(
     consent: ConsentPolicy,
     recorder_path: Option<PathBuf>,

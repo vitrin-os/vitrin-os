@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<!--
+  P1.6.4 acceptance page (a): "Firefox renders and repaints".
+
+  A solid colour proves RENDER. Two solid colours, one after the other, prove
+  REPAINT -- and repaint is the half that actually matters here, because a
+  browser that painted once and then wedged would satisfy a single-colour
+  assertion perfectly. The mock core reports a dominant colour per committed
+  frame, so the assertion is "some frame was dominantly blue, and a LATER
+  frame was dominantly green": one string compare each, against the two
+  colours written below.
+
+  Channel values are multiples of 0x11 so they survive the core's 4-bit
+  histogram quantisation exactly (mock_core.c), which is what lets the shell
+  script compare against the literal CSS colour instead of a tolerance.
+
+  No network, no fonts, no images, no external anything: this file is opened
+  as file:// and everything it needs is in it.
+-->
+<meta charset="utf-8">
+<title>vitrin repaint probe</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body { background: #0000ff; }
+</style>
+<body>
+<script>
+  // 2500 ms is chosen to be comfortably after first paint on a software
+  // renderer and comfortably before the harness's run window closes. The
+  // assertion is on ORDER (blue before green), not on timing, so the exact
+  // value only has to fall inside the run.
+  setTimeout(function () {
+    document.body.style.background = '#00ff00';
+  }, 2500);
+</script>
+</body>

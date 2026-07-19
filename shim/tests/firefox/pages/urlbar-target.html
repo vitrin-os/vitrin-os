@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<!--
+  P1.6.4 acceptance page (c): "injected text lands in the URL bar".
+
+  THE PROBLEM THIS PAGE SOLVES. The URL bar is browser chrome. A Wayland
+  compositor cannot read it -- it has pixels, not a text buffer -- and there
+  is no automation channel into Firefox here (no marionette, no devtools, no
+  network). So "the text landed in the URL bar" has to be inferred from
+  something the browser DOES with it.
+
+  Navigation is that something. The harness focuses the URL bar (Ctrl+L),
+  sends the file:// URL of THIS page as one `vitrin_shim_seat.text` payload
+  ending in "\n", and the IDL's rule that a newline is delivered as Return
+  (P1.6.3, check F) commits it. If this page's colour then becomes the
+  dominant colour of a committed frame, then every link in the chain held:
+  the text reached the URL bar as text, the URL bar parsed it as a URL, and
+  Return actuated it.
+
+  That is a STRONGER claim than "the characters arrived", and it is the only
+  one available without reading Firefox's chrome. Its limit is honest and
+  worth stating: it proves the URL bar received a string that parses as this
+  URL. It does not prove character-for-character fidelity of an arbitrary
+  Unicode payload -- the R5 gate (P1.6.3, check C) proves that, in a GtkEntry,
+  where the bytes can be read back.
+
+  #00ffff is distinct from every other page here, so a frame from the
+  previous page cannot satisfy this assertion.
+-->
+<meta charset="utf-8">
+<title>vitrin urlbar target</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body { background: #00ffff; }
+</style>
+<body></body>

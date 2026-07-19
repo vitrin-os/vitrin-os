@@ -2,8 +2,9 @@
  *
  * Owns the process lifecycle and the single load-bearing bring-up order:
  *
- *   upstream -> globals -> output -> window -> bind socket -> start backend
- *   -> arm the core link -> run loop -> teardown
+ *   upstream -> backend -> ledger -> globals -> output -> window
+ *   -> bind socket -> start backend -> arm the core link -> run loop
+ *   -> teardown
  *
  * The first step is first for a protocol reason, not a stylistic one. The
  * core's `configure` is "guaranteed to precede the processing of any shim
@@ -30,6 +31,7 @@
 #include <wlr/backend.h>
 #include <wlr/util/log.h>
 
+#include "ledger.h"
 #include "server.h"
 #include "upstream.h"
 
@@ -56,14 +58,24 @@ static void parse_args(int argc, char **argv, struct vitrin_config *cfg) {
 	cfg->standalone = false;
 	cfg->width = 1280;
 	cfg->height = 720;
+	cfg->globals_log = NULL;
+	cfg->probe_globals = false;
+	cfg->probe_filter = NULL;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--dmabuf") == 0) {
 			cfg->dmabuf = true;
 		} else if (strcmp(argv[i], "--no-upstream") == 0) {
 			cfg->standalone = true;
+		} else if (strcmp(argv[i], "--probe-globals") == 0) {
+			cfg->probe_globals = true;
+		} else if (strncmp(argv[i], "--probe-globals=", 16) == 0) {
+			cfg->probe_globals = true;
+			cfg->probe_filter = argv[i] + 16;
 		} else if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
 			cfg->socket_name = argv[++i];
+		} else if (strcmp(argv[i], "--globals-log") == 0 && i + 1 < argc) {
+			cfg->globals_log = argv[++i];
 		} else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
 			cfg->width = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
@@ -71,7 +83,8 @@ static void parse_args(int argc, char **argv, struct vitrin_config *cfg) {
 		} else {
 			fprintf(stderr,
 				"usage: %s [--socket NAME] [--dmabuf] [--no-upstream] "
-				"[--width W] [--height H]\n",
+				"[--width W] [--height H] [--globals-log PATH] "
+				"[--probe-globals[=IFACE,IFACE,...]]\n",
 				argv[0]);
 			exit(2);
 		}
@@ -121,6 +134,12 @@ int main(int argc, char **argv) {
 		wlr_log(WLR_ERROR, "backend bring-up failed");
 		goto err;
 	}
+	/* Before the globals, not after: the ledger learns what was advertised
+	 * from the `wl_registry.global` events on the wire, and the client's
+	 * first roundtrip -- which is all of the interesting traffic -- happens
+	 * the instant the socket below is bound. Instrumenting late would leave
+	 * exactly the discovery phase unobserved. */
+	vitrin_ledger_init(&s);
 	if (!vitrin_create_globals(&s)) {
 		wlr_log(WLR_ERROR, "global creation failed");
 		goto err;

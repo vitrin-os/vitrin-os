@@ -3,17 +3,33 @@
  * Advertises exactly the v0 global set (wl_shm and wl_output are created
  * elsewhere -- server.c and output.c respectively):
  *
- *   wl_compositor, xdg_wm_base, wl_seat, wl_data_device_manager,
- *   zxdg_decoration_manager_v1  (+ zwp_linux_dmabuf_v1 iff --dmabuf)
+ *   wl_compositor, wl_subcompositor, xdg_wm_base, wl_seat,
+ *   wl_data_device_manager, zxdg_decoration_manager_v1
+ *   (+ zwp_linux_dmabuf_v1 iff --dmabuf)
  *
  * The global list is a contract, not a floor (see the issue / plan E6): each
  * constructor below creates exactly one wl_global, and every constructor that
- * would sneak in an extra global (subcompositor, viewporter,
- * presentation-time, xdg-output, wl_drm, primary-selection) is deliberately
- * NOT called. Additions are driven empirically -- `wl_data_device_manager`
- * is the first one, added in P1.6.3 because no GTK app can receive keyboard
- * input without it; see the argument at its constructor. P1.6.4's "globals
- * touched" log is the systematic version of that process.
+ * would sneak in an extra global (viewporter, presentation-time, xdg-output,
+ * wl_drm, primary-selection) is deliberately NOT called.
+ *
+ * ADDITIONS ARE DRIVEN EMPIRICALLY, AND EACH ONE CITES ITS EVIDENCE.
+ * `wl_data_device_manager` was the first (P1.6.3, because no GTK app can
+ * receive keyboard input without it) and was argued from a failure
+ * reconstructed by hand. `wl_subcompositor` is the second (P1.6.4) and was
+ * argued from a log line: the "globals touched" ledger (ledger.h) makes an
+ * app's demand for an interface we do not advertise observable, which is what
+ * turned "Firefox segfaults" into "Firefox binds wl_subcompositor". Every
+ * further addition is expected to cite a `globals-demand` line the same way.
+ *
+ * THE EVIDENCE FOR AN ADDITION IS A PRE-ADDITION RUN, and it has to be kept as
+ * one: `shim/docs/globals-demand-wl_subcompositor-140.12.0esr.log` is that run
+ * for this one. A ledger from the shim as it ships cannot contain the demand
+ * line, because a probe is never armed for an interface already in the
+ * contract (ledger.c, in_v0_contract) -- there, the same interface shows up
+ * only as a successful `class=v0` bind, which is the weaker signal ledger.h
+ * exists to argue is insufficient. `globals-touched-firefox-140.12.0esr.log`
+ * is that shipping-state run, and the argument for every interface
+ * deliberately REFUSED is in their companion notes (shim/docs/firefox.md).
  */
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h> /* WL_SEAT_CAPABILITY_* */
@@ -23,10 +39,12 @@
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_linux_dmabuf_v1.h>
 #include <wlr/types/wlr_seat.h>
+#include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 
+#include "ledger.h"
 #include "server.h"
 
 /* Decline server-side decorations: whenever a client asks for a decoration
@@ -39,10 +57,45 @@ static void on_new_deco(struct wl_listener *listener, void *data) {
 }
 
 bool vitrin_create_globals(struct vitrin_shim *s) {
-	/* wl_compositor (creates only this global; wl_subcompositor is a separate
-	 * wlr_subcompositor_create we intentionally never call). */
+	/* wl_compositor. Creates only this global -- `wl_subcompositor` is a
+	 * separate constructor, called deliberately just below rather than
+	 * arriving as a side effect of this one. */
 	s->compositor = wlr_compositor_create(s->display, 6, s->renderer);
 	if (s->compositor == NULL) {
+		return false;
+	}
+
+	/* wl_subcompositor.
+	 *
+	 * ADDED EMPIRICALLY IN P1.6.4, and this one was found by the machinery
+	 * rather than reconstructed by hand: it traces to the two
+	 * `globals-demand: interface=wl_subcompositor` lines (seq=15 and seq=22,
+	 * one per connection) in the pre-addition probe run checked in as
+	 * shim/docs/globals-demand-wl_subcompositor-140.12.0esr.log. That file's
+	 * header says how to regenerate it, and ledger.h explains why a demand for
+	 * a global we do not advertise is otherwise invisible.
+	 *
+	 * IT IS LOAD-BEARING, not a nicety, and the bisection says so in three
+	 * measurements of the same build. With the global absent entirely, Firefox
+	 * 140.12.0esr creates two `wl_surface`s and SEGFAULTS before it ever makes
+	 * an `xdg_surface` -- exit 139, no window mapped, one commit. With it
+	 * advertised as an INERT probe, the window maps but only 3 frames are
+	 * forwarded, because the content subsurface never composites. Implemented
+	 * for real, the same build forwards ~57 and repaints. Both GDK and
+	 * Firefox's own `nsWaylandDisplay` bind it, and Firefox's rendering path
+	 * puts the page content in a subsurface of the toplevel, so the failure is
+	 * not "the browser looks wrong" but "there is no window at all".
+	 *
+	 * IT GRANTS NOTHING ACROSS THE REALM BOUNDARY, by the same argument that
+	 * admitted `wl_data_device_manager` below and for a stronger reason: the
+	 * protocol REQUIRES a subsurface and its parent to belong to the same
+	 * client, and a shim serves exactly one. So this composes one app's own
+	 * surfaces into one window, which is the shim's whole job. It also needs
+	 * no change to the frame path -- `wlr_scene_xdg_surface_create` (xdg.c)
+	 * already covers a toplevel's subsurfaces, so they composite into the
+	 * same buffer and travel upstream as ordinary damage. */
+	if (wlr_subcompositor_create(s->display) == NULL) {
+		wlr_log(WLR_ERROR, "wlr_subcompositor_create failed");
 		return false;
 	}
 
@@ -127,6 +180,13 @@ bool vitrin_create_globals(struct vitrin_shim *s) {
 				"(no DRM fd); continuing with shm only");
 		}
 	}
+
+	/* Last, and only under --probe-globals: the catalogue of interfaces we
+	 * advertise WITHOUT implementing, so an app's demand for one is an
+	 * observable bind rather than silence (ledger.h). Last so that everything
+	 * above it is the real contract and everything after it is not, which is
+	 * also the order the ledger reports them in. */
+	vitrin_ledger_create_probes(s);
 
 	return true;
 }

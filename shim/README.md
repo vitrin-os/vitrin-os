@@ -12,7 +12,7 @@ the checked-in, generated C wire header
 [`include/vitrin-protocol.h`](include/vitrin-protocol.h) (from the protocol
 track, P1.1.2) — regenerate it with `cargo xtask codegen`, never by hand.
 
-## Status — P1.6.3 (virtual-seat input replay)
+## Status — P1.6.4 (Firefox in the realm)
 
 What exists today: a headless compositor that stands up the v0 Wayland
 environment, composites its app's window, **forwards every composed frame up
@@ -21,11 +21,86 @@ to the trusted core** over the socketpair it inherited at fork (`attach` →
 as the app's `wl_surface.frame` callbacks), and **replays the core's
 origin-tagged `vitrin_shim_seat` events into the app through its own
 `wl_seat`** — pointer motion, buttons, high-resolution scroll, keys, and
-Unicode text. **Not yet**: popups are not in the scene graph (an
-`xdg_shell.new_popup` listener is missing, so a menu is neither rendered nor
-clickable — the input path already routes by hit-testing the scene, so it
+Unicode text. **Firefox runs in it**: the pinned ESR renders, repaints,
+scrolls under injected input and navigates from a URL typed into its URL bar,
+all headless with software WebRender and no GPU. Every global an app touches
+is now recorded by a **permanent ledger**, and an interface an app wants but
+does not get is recorded too. **Not yet**: popups are not in the scene graph
+(an `xdg_shell.new_popup` listener is missing, so a menu is neither rendered
+nor clickable — the input path already routes by hit-testing the scene, so it
 needs no change when they land), and `text-input-v3` / IME is the Phase-2
 workstream (E2.8) that retires the synthesized keymap below.
+
+### The "globals touched" ledger, in one pass
+
+The v0 global set is "a contract, not a floor", which is only honest if
+additions are driven by evidence. [`include/ledger.h`](include/ledger.h) is
+that evidence, and [`docs/firefox.md`](docs/firefox.md) is what it produced.
+
+| Step | Where |
+|---|---|
+| Every `wl_registry.global` we send and `bind` we receive | `src/ledger.c` (one `wl_display` protocol logger) |
+| Probe globals: advertised, not implemented, so demand is visible | `src/ledger.c` + `src/probe-catalogue.h.in` |
+| Inert-but-well-formed probe resources | `wl_resource_set_dispatcher`, `src/ledger.c` |
+| Contract drift check (advertised set vs. the list in code) | `src/ledger.c`, at teardown |
+| Records: `globals-offer/bind/demand/touched/summary` | shim log, plus `--globals-log PATH` |
+
+**The crux is that a global we never advertise generates no bind at all.**
+Wayland discovery is push: a client learns what exists from the `global`
+events the server chooses to send, and binds only what it was told about. So
+the single most valuable fact — *the app needed X and X was not there* —
+produces **no wire traffic whatsoever**, and a ledger built by logging
+`wl_registry.bind` is structurally blind to exactly the case it was built
+for. The app's own reaction ranges from a warning on stderr, through silent
+degradation, to a SIGSEGV.
+
+`--probe-globals` closes that hole by making demand bindable: a curated
+catalogue of interfaces the shim does *not* implement is advertised anyway,
+so an app asking for one becomes an ordinary, observable `bind` and a
+`globals-demand` line at `ERROR` level. The probes use the **real** generated
+marshalling tables with a generic dispatcher, so they are inert but
+well-formed — every request demarshals, every `new_id` gets a real child
+resource, destructors really destroy. The cheap alternative (a synthetic
+`wl_interface` with no methods) kills the client on its first request to it,
+which yields one datum per run and a corpse; this way one run surveys the
+whole catalogue. `--probe-globals=IFACE,...` arms a subset, which is what
+turns *"what did the app ask for"* into *"which of those did it actually
+need"* without recompiling.
+
+Probe mode **lies to the client** — an app that waits on an inert global can
+hang — so it is off by default, announced at `ERROR` on startup, stamped into
+every report as `probe_mode=1`, and never used to run a realm. It also
+refuses to shadow a real global: a probe for an interface already in the v0
+set is skipped, because advertising one interface twice lets the app bind the
+inert copy (observed: 3 forwarded frames instead of 55).
+
+**A global was added, empirically — and this time by the machinery.**
+`wl_subcompositor` joined the v0 set here. Firefox 140.12.0esr segfaults
+without it after two `wl_surface`s and before any `xdg_surface`: no window at
+all (exit 139, one commit). The probe run named it — two `globals-demand`
+lines, one per connection, checked in as
+[`docs/globals-demand-wl_subcompositor-140.12.0esr.log`](docs/globals-demand-wl_subcompositor-140.12.0esr.log)
+— and it is now implemented for real with `wlr_subcompositor_create`, which
+the bisection shows was necessary: armed as an inert *probe* the window maps
+but only 3 frames are forwarded, because the content subsurface never
+composites. That evidence file is a **pre-addition** run and has to be,
+since the shipping shim arms no probe for an interface already in the
+contract. It grants nothing
+across the realm boundary — the protocol requires a subsurface and its parent
+to belong to the same client, and a shim serves exactly one. Fifteen other
+interfaces Firefox asks for are refused, each with a written reason
+([`docs/firefox.md`](docs/firefox.md)) and an entry in
+[`docs/firefox-refused-globals.txt`](docs/firefox-refused-globals.txt), which
+the acceptance script enforces: a future ESR that wants something new turns
+the check red instead of going unnoticed.
+
+**A bug Firefox found.** The shim *aborted* — taking the realm with it — on
+`wlr_xdg_surface_schedule_configure: Assertion 'surface->initialized' failed`.
+xdg-shell lets a client set its initial state before the first commit makes
+the surface configurable, and Firefox does exactly that during window
+construction. The fix (`src/xdg.c`) defers the answer to the initial-commit
+path, which configures every toplevel to the view anyway. No test client in
+this tree reaches that path, which is why the ladder ends at a real browser.
 
 ### Input replay, in one pass
 
@@ -174,11 +249,13 @@ far behind the core falls. Measured: an app committing 900 frames while the
 core presents 50 leaves the shim's descriptor count and RSS exactly flat.
 
 Globals advertised in v0 (a contract, not a floor — additions are driven
-empirically by the future "globals touched" log, P1.6.4):
+empirically by the "globals touched" ledger above, and each one cites the
+log line it came from):
 
 | Global | Source |
 |---|---|
 | `wl_compositor` | `wlr_compositor_create` |
+| `wl_subcompositor` | `wlr_subcompositor_create` — **P1.6.4**, see above |
 | `wl_shm` | `wlr_renderer_init_wl_shm` |
 | `xdg_wm_base` | `wlr_xdg_shell_create` |
 | `wl_seat` | `wlr_seat_create` (+ the virtual keyboard, `src/seat.c`) |
@@ -186,6 +263,11 @@ empirically by the future "globals touched" log, P1.6.4):
 | `wl_data_device_manager` | `wlr_data_device_manager_create` — **P1.6.3**, see above |
 | `zxdg_decoration_manager_v1` | `wlr_xdg_decoration_manager_v1_create` (declines SSD) |
 | `zwp_linux_dmabuf_v1` | `wlr_linux_dmabuf_v1_create_with_renderer` — **only with `--dmabuf`** |
+
+This table is also asserted at runtime: the ledger cross-checks the list in
+`src/ledger.c` against the `wl_registry.global` events actually sent and
+reports `globals-contract-drift` if they disagree — so a dependency that
+starts creating a global as a side effect cannot slip in unnoticed.
 
 Server-side decorations are declined (clients always draw their own). Per
 **D3**, shm is the mandatory buffer path; `linux-dmabuf-v1` is opt-in.
@@ -215,7 +297,13 @@ The build needs no Rust toolchain — only the checked-in generated header.
 
 ```bash
 ./build/vitrin-shim [--socket NAME] [--dmabuf] [--no-upstream] [--width W] [--height H]
+                    [--globals-log PATH] [--probe-globals[=IFACE,IFACE,...]]
 ```
+
+`--globals-log PATH` additionally writes the globals ledger to a bare file,
+one record per line with no log prefix — what CI archives and what the
+acceptance script greps. `--probe-globals` is the diagnostic mode described
+above; read the warning it prints before using it.
 
 Normally the core runs it — there is nothing to run it against by hand,
 since it exits unless fd 3 is a core connection. `--no-upstream` drops that
@@ -230,7 +318,7 @@ WLR_RENDERER_ALLOW_SOFTWARE=1`.
 
 ## Acceptance tests
 
-Both are GPU-free, headless, and need no Rust toolchain.
+All are GPU-free, headless, and need no Rust toolchain.
 
 [`tests/acceptance/shim_globals_and_client.sh`](tests/acceptance/shim_globals_and_client.sh)
 — the P1.6.1 criteria: `wayland-info` lists exactly the expected globals, and
@@ -272,6 +360,39 @@ with `VITRIN_SKIP_GTK_GATE=1`).
 ```bash
 BUILD_DIR=./build bash tests/acceptance/seat_input_replay.sh
 ```
+
+[`tests/acceptance/firefox_bringup.sh`](tests/acceptance/firefox_bringup.sh)
+— the P1.6.4 criteria, against the pinned **Firefox ESR 140.12.0**. Nobody
+can literally look at the nested window yet (`spawn_realm` still has no
+non-test caller, inherited from P1.6.2), so every criterion is reduced to
+something measurable in the pixels the shim actually forwarded: `mock_core.c`
+reports a **dominant colour per committed frame**, which is the M1.2
+verification the plan specifies. Each page is a local `file://` URL and the
+profile makes remote requests fail at connect, so **network flake cannot
+redden this test**.
+
+| Check | Page | Assertion |
+|---|---|---|
+| renders **and repaints** | `repaint.html` | `#0000ff`, then `#00ff00` — in that order; plus commits forwarded, zero wire violations, and ≥1 *partial* damage rect |
+| injected scroll works | `scroll.html` | `#ff0000` → `#ffff00`, which the page paints only once the document really scrolled past a third of a viewport |
+| injected text in the URL bar | `urlbar-target.html` | Ctrl+L, then the target's `file://` URL as one `text` payload ending in `\n` → `#00ffff` becomes dominant, i.e. the browser navigated |
+| the ledger | — | the advertised v0 set is exactly the contract; the probe mechanism fired; every demand is in `docs/firefox-refused-globals.txt` |
+
+```bash
+bash tests/firefox/fetch-esr.sh          # pinned + sha256-verified, gitignored
+BUILD_DIR=./build bash tests/acceptance/firefox_bringup.sh
+```
+
+The pin, the Wayland environment, the software-WebRender rationale, the
+profile, and the full record of what Firefox touched are in
+[`docs/firefox.md`](docs/firefox.md). Without the browser the script reports
+`SKIP` loudly and **fails** rather than skipping under `CI` (declare a
+deliberate gap with `VITRIN_SKIP_FIREFOX_GATE=1`) — the same rule the
+conformance test below applies to itself. The shim CI job currently declares
+that gap: fetching a 75 MB browser needs runtime libraries that container has
+not been validated to carry, so these criteria are held on a developer
+machine only, and CI says so in its job summary rather than implying
+otherwise with a green tick.
 
 ### Conformance against the real core
 

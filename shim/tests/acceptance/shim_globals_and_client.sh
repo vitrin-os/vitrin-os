@@ -17,10 +17,24 @@
 # wayland-utils), weston-terminal (Arch/Debian: weston). Runs fully headless
 # and GPU-free (pixman software renderer), so it is CI-safe.
 #
-# Usage: SHIM_BIN=./build/vitrin-shim bash shim/tests/acceptance/shim_globals_and_client.sh
+# Usage: bash shim/tests/acceptance/shim_globals_and_client.sh
+#        BUILD_DIR=/path/to/build bash shim/tests/acceptance/shim_globals_and_client.sh
 set -Eeuo pipefail
 
-SHIM_BIN="${SHIM_BIN:-./build/vitrin-shim}"
+# RESOLVED FROM THIS SCRIPT'S OWN LOCATION, not from the caller's CWD, and it
+# honours BUILD_DIR like its sibling scripts do. The old default was a bare
+# `./build/vitrin-shim`, which meant running this from the repo root picked up
+# whatever happened to be in ./build there -- and a stale meson dir at the repo
+# root (they self-ignore: meson writes a `.gitignore` containing `*`, so git
+# never mentions one) silently supplied a shim built before the last two
+# globals were added. The failure that produces is "advertised global set !=
+# expected v0 contract", which reads as a real regression in globals.c and is
+# not one.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHIM_DIR="$(cd "$HERE/../.." && pwd)"
+BUILD_DIR="${BUILD_DIR:-$SHIM_DIR/build}"
+SHIM_BIN="${SHIM_BIN:-$BUILD_DIR/vitrin-shim}"
+[[ -x "$SHIM_BIN" ]] || { echo "FAIL: missing $SHIM_BIN (run: meson compile -C $BUILD_DIR)" >&2; exit 1; }
 SOCKET_TIMEOUT="${SOCKET_TIMEOUT:-10}"
 CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-5}"
 SOCKET_NAME="${SOCKET_NAME:-wl-vitrin-shim-$$}"
@@ -28,12 +42,28 @@ WANT_DMABUF="${WANT_DMABUF:-0}"
 
 # Expected registry, one interface per line, sorted. wl_shm/wl_output are
 # created by the shim just like the rest; dmabuf is opt-in.
-# wl_data_device_manager joined the set in P1.6.3: GDK will not construct a
-# seat without it (GTK 4 refuses the display outright, GTK 3 silently gets no
-# keyboard), so input replay is unusable by any GTK app in its absence. It is
-# app-internal by construction -- one client per shim means both ends of any
-# transfer are the same app. See the argument in src/globals.c.
-expected=(wl_compositor wl_shm wl_seat wl_output xdg_wm_base wl_data_device_manager zxdg_decoration_manager_v1)
+#
+# TWO ENTRIES HERE WERE ADDED EMPIRICALLY, and each traces to a named failure
+# rather than to a guess -- the "contract, not a floor" rule (plan E6/R2) cuts
+# both ways, so an addition has to be argued and this list is where the
+# argument is enforced.
+#
+#   wl_data_device_manager (P1.6.3): GDK will not construct a seat without it
+#     (GTK 4 refuses the display outright, GTK 3 silently gets no keyboard),
+#     so input replay is unusable by any GTK app in its absence.
+#   wl_subcompositor (P1.6.4): Firefox 140.12.0esr SEGFAULTS without it, after
+#     two wl_surfaces and before any xdg_surface -- no window at all. Found by
+#     the globals ledger's probe catalogue, which is what makes an app's demand
+#     for an interface we do not advertise observable in the first place; the
+#     evidence is the two `globals-demand: interface=wl_subcompositor` lines in
+#     docs/globals-demand-wl_subcompositor-140.12.0esr.log (a PRE-addition run:
+#     the shipping shim arms no probe for an interface already in the set, so
+#     docs/globals-touched-firefox-140.12.0esr.log shows only a class=v0 bind).
+#
+# Both are app-internal by construction -- one client per shim means both ends
+# of any transfer, and both ends of any subsurface relation, are the same app.
+# See the arguments at their constructors in src/globals.c.
+expected=(wl_compositor wl_subcompositor wl_shm wl_seat wl_output xdg_wm_base wl_data_device_manager zxdg_decoration_manager_v1)
 if [[ "$WANT_DMABUF" == "1" ]]; then
 	expected+=(zwp_linux_dmabuf_v1)
 fi

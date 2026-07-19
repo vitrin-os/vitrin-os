@@ -1,0 +1,33 @@
+# The pinned Firefox ESR for Phase 1 (P1.6.4, issue #36).
+#
+# Shell-sourceable on purpose: fetch-esr.sh reads it, CI reads it, and a human
+# reads it. There is exactly one place the version lives.
+#
+# WHY A MOZILLA TARBALL RATHER THAN A DISTRO PACKAGE.
+#
+#   1. Arch ships no firefox-esr at all, so on the development machine there
+#      is no packaged ESR to pin to in the first place.
+#   2. Even where one exists (Debian's firefox-esr, Ubuntu's snap), the
+#      version is the distro's to move. "Pin an ESR so the target stops
+#      moving" (R4) is not satisfied by a name that resolves to a different
+#      build next month, and Firefox's Wayland path changes between releases
+#      -- which is the entire reason R4 exists.
+#   3. The tarball is version-exact and content-addressed: the checksum below
+#      is Mozilla's own published SHA256SUMS entry for this file, so the pin
+#      is verifiable rather than merely stated. A pin that is not checksummed
+#      is not a pin.
+#
+# UPGRADING IS A DELIBERATE ACT (the issue says so: "upgrade deliberately, not
+# by drift"). To move to a new ESR: change the three values below, re-run
+# fetch-esr.sh, re-run the acceptance script, and REGENERATE the checked-in
+# globals ledger (shim/docs/globals-touched-firefox-140.12.0esr.log) -- a new
+# Firefox may want different globals, and that file is the evidence the v0
+# global set is argued from.
+
+VITRIN_FIREFOX_VERSION=140.12.0esr
+VITRIN_FIREFOX_SHA256=3323ee13ac6fe4877fa2e1f4a3aa6b8009f65a620c7bbca96fe86f1a6f433d92
+VITRIN_FIREFOX_URL=https://download-installer.cdn.mozilla.net/pub/firefox/releases/140.12.0esr/linux-x86_64/en-US/firefox-140.12.0esr.tar.xz
+
+# Where fetch-esr.sh unpacks it. Gitignored (see the repo root .gitignore):
+# neither the tarball nor the unpacked browser is ever committed.
+VITRIN_FIREFOX_DIR=shim/.firefox

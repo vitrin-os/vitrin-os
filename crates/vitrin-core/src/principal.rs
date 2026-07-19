@@ -228,7 +228,8 @@ use crate::petitions::{
     Admission, ConnectionId, PetitionRegistry, PetitionRequest, Resolution, Verdict,
 };
 use crate::recorder::{
-    auth_cause_class, Event, Recorder, RequestedAuthority, VERIFIER_UNAVAILABLE_CLASS,
+    self, auth_cause_class, ActuationDetail, Event, Recorder, RequestedAuthority,
+    VERIFIER_UNAVAILABLE_CLASS,
 };
 
 /// The handshake bootstrap object: implicit object 1 on a principal
@@ -571,6 +572,21 @@ impl fmt::Display for DeliveryError {
             }
             DeliveryError::Transport(e) => write!(f, "transport: {e}"),
         }
+    }
+}
+
+/// The flight recorder's fixed cause taxonomy for an undelivered
+/// resolution ([`Event::PetitionUndelivered`]). A class label, never the
+/// `Display` text: the log's cause vocabulary stays closed and free of
+/// anything a peer could shape, exactly as the handshake taxonomy does.
+fn undelivered_reason_class(err: &DeliveryError) -> &'static str {
+    match err {
+        DeliveryError::WrongConnection { .. } => recorder::UNDELIVERED_WRONG_CONNECTION,
+        DeliveryError::ConnectionDead => recorder::UNDELIVERED_CONNECTION_DEAD,
+        DeliveryError::UnknownGrantObject { .. } => recorder::UNDELIVERED_UNKNOWN_GRANT,
+        DeliveryError::AlreadyResolved { .. } => recorder::UNDELIVERED_ALREADY_RESOLVED,
+        DeliveryError::Insert(_) => recorder::UNDELIVERED_INSERT_FAILED,
+        DeliveryError::Transport(_) => recorder::UNDELIVERED_TRANSPORT,
     }
 }
 
@@ -1042,6 +1058,12 @@ impl PrincipalServer {
             .into());
         };
         let verb = kind.verb();
+        // Summarized before the kind moves into the request: an entry that
+        // named only the verb could not tell a move from a button press
+        // from a scroll, nor say how much was typed. Text is summarized by
+        // shape and digest only -- never verbatim (see [`crate::recorder`]
+        // on why the log must not become a keylogger).
+        let detail = ActuationDetail::of(&kind);
         let grant_row = self.grant_row_id(grant_wire_id);
         let request = UseRequest {
             facet_id,
@@ -1065,6 +1087,7 @@ impl PrincipalServer {
             grant_wire_id,
             verb,
             grant_row,
+            detail,
             outcome: &outcome,
         });
         // The `once` rung's active-to-spent transition, recorded from the
@@ -1399,7 +1422,56 @@ impl PrincipalServer {
     /// recorder exists to prevent. On a dying connection the log is
     /// therefore a superset of what reached the wire, and it preserves the
     /// wire's own order (`closed`, then `resolved`).
+    ///
+    /// **A refused delivery is recorded too, from this one funnel.** The
+    /// resolution has already been consumed from the pending registry by
+    /// the time it arrives here, so every early return below *destroys* a
+    /// decision: the petition is gone, the handle never resolves, and
+    /// nothing will ever retry. A human's yes or no would then exist
+    /// nowhere. Wrapping the whole body and recording
+    /// [`Event::PetitionUndelivered`] on any `Err` covers all five refusal
+    /// paths -- and any added later -- structurally, rather than by
+    /// remembering to add a call beside each `return`.
     pub fn deliver_resolution<F>(
+        &mut self,
+        resolution: Resolution,
+        grants: &mut GrantTable,
+        recorder: &mut Recorder,
+        now: Instant,
+        send: &mut F,
+    ) -> Result<(), DeliveryError>
+    where
+        F: FnMut(&[u8], Option<BorrowedFd<'_>>) -> Result<(), TransportError>,
+    {
+        // Captured before the body consumes the resolution: on failure the
+        // decision must still be nameable.
+        let connection = resolution.connection;
+        let grant_wire_id = resolution.grant_wire_id;
+        let (outcome, effective, issuer) = match &resolution.verdict {
+            Verdict::Granted { grant: approved } => (
+                Outcome::Granted,
+                Some(approved.effective),
+                Some(approved.issuer),
+            ),
+            Verdict::Declined { outcome } => (*outcome, None, None),
+        };
+        let result = self.deliver_resolution_inner(resolution, grants, recorder, now, send);
+        if let Err(err) = &result {
+            recorder.record(Event::PetitionUndelivered {
+                connection,
+                grant_wire_id,
+                outcome,
+                effective,
+                issuer,
+                reason: undelivered_reason_class(err),
+            });
+        }
+        result
+    }
+
+    /// The delivery body proper -- see [`Self::deliver_resolution`], which
+    /// wraps it to record decisions this refuses.
+    fn deliver_resolution_inner<F>(
         &mut self,
         resolution: Resolution,
         grants: &mut GrantTable,
@@ -1555,6 +1627,15 @@ impl PrincipalServer {
             if let ObjectKind::Grant(GrantHandleState::Resolved { row: Some(id) }) = kind {
                 if grants.remove(*id) {
                     removed += 1;
+                    // Named per row, not merely counted: teardown is the
+                    // most common way a version-1 grant dies, and the
+                    // revocation and expiry paths already name their ids
+                    // so an E3.4 replay can apply the transition. A count
+                    // alone says how many authorities died, never which.
+                    recorder.record(Event::GrantRemoved {
+                        connection: self.connection,
+                        grant_id: *id,
+                    });
                 }
             }
         }
@@ -1631,6 +1712,7 @@ mod tests {
     };
     use crate::input::PHYSICAL_HOLD_WINDOW;
     use crate::petitions::{ConsentPolicy, PetitionConfig, ScriptedDecision, ScriptedError};
+    use vitrin_protocol::generated::vitrin_actuator_pointer::{Axis, ButtonState};
 
     use super::*;
 
@@ -4318,6 +4400,312 @@ mod tests {
                 assert_eq!(*c, crate::recorder::tests::Json::Str("conn-1".into()));
             }
         }
+    }
+
+    /// The actuation half of "a human can reconstruct what was done": a
+    /// capture entry identifies what was observed, so an actuation entry
+    /// must identify what was actuated. The verb alone cannot distinguish
+    /// a move from a button press from a scroll, nor say how much was
+    /// typed -- and the typed string itself must never be written down.
+    #[test]
+    fn actuation_entries_reconstruct_what_was_done_without_recording_the_text() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 20, 0);
+
+        // Every actuation shape the version-1 wire can carry, end to end.
+        let secret = "correct horse battery staple";
+        for frame in [
+            move_to(37, -4),
+            pointer::requests::Button {
+                button: 0x110,
+                state: ButtonState::Pressed,
+            }
+            .encode(7),
+            pointer::requests::Button {
+                button: 0x110,
+                state: ButtonState::Released,
+            }
+            .encode(7),
+            pointer::requests::Scroll {
+                axis: Axis::Vertical,
+                value120: -120,
+            }
+            .encode(7),
+            type_text(secret),
+        ] {
+            client.send_message(&frame, None).unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        }
+        assert_eq!(shared.actuations.len(), 5, "all five were admitted");
+
+        let entries = shared.log();
+        let uses: Vec<&crate::recorder::tests::Json> =
+            crate::recorder::tests::of_kind(&entries, "use_decision")
+                .into_iter()
+                .filter(|e| e.str("decision") == "allowed" && e.str("verb") != "observe")
+                .collect();
+        assert_eq!(uses.len(), 5);
+
+        // Each is distinguishable from the others -- the property a
+        // verb-only entry cannot provide.
+        let actions: Vec<&str> = uses.iter().map(|e| e.str("input.action")).collect();
+        assert_eq!(
+            actions,
+            vec!["move", "button", "button", "scroll", "type"],
+            "the entry must say WHICH actuation, not just which verb"
+        );
+        // ... and each carries the parameters that reproduce it.
+        assert_eq!(
+            uses[0].at("input.x"),
+            &crate::recorder::tests::Json::Num(37.0)
+        );
+        assert_eq!(
+            uses[0].at("input.y"),
+            &crate::recorder::tests::Json::Num(-4.0)
+        );
+        assert_eq!(uses[1].u64("input.button"), 0x110);
+        assert!(uses[1].bool("input.pressed"));
+        assert!(!uses[2].bool("input.pressed"), "press and release differ");
+        assert_eq!(uses[3].str("input.axis"), "vertical");
+        assert_eq!(
+            uses[3].at("input.value120"),
+            &crate::recorder::tests::Json::Num(-120.0)
+        );
+
+        // The typed string: shape and identity, never the bytes. Agent
+        // text is arbitrary user data -- a flight recorder that wrote it
+        // out would be a keylogger.
+        assert_eq!(uses[4].u64("input.chars"), secret.chars().count() as u64);
+        assert_eq!(uses[4].u64("input.bytes"), secret.len() as u64);
+        assert_eq!(
+            uses[4].str("input.digest"),
+            crate::recorder::ObservationDigest::of(secret.as_bytes()).to_hex()
+        );
+        let raw = std::fs::read_to_string(&shared.log_path).unwrap();
+        assert!(
+            !raw.contains(secret),
+            "typed text must NEVER appear in the log"
+        );
+        assert!(!raw.contains("correct horse"), "not even a prefix of it");
+    }
+
+    /// Connection teardown is the most common way a version-1 grant dies,
+    /// and it is a lifecycle transition an E3.4 replay must be able to
+    /// apply. Revocation and expiry name their ids for exactly that
+    /// reason; teardown must too -- a bare count says how many authorities
+    /// died, never which.
+    #[test]
+    fn teardown_names_every_grant_row_it_removed() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 20, 0);
+        // A second granted petition, so "which rows died" is a real
+        // question rather than a one-row triviality.
+        let second = petition_at(20);
+        client.send_message(&second.encode(3), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 21, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client, 20).outcome, Outcome::Granted);
+
+        let rows = [
+            server.grant_row_id(4).expect("first row"),
+            server.grant_row_id(20).expect("second row"),
+        ];
+        assert_eq!(shared.grants.rows(shared.now).count(), 2);
+
+        server.teardown(
+            &mut shared.petitions,
+            &mut shared.grants,
+            &mut shared.recorder,
+        );
+
+        let entries = shared.log();
+        let removed = crate::recorder::tests::of_kind(&entries, "grant_removed");
+        let named: Vec<&str> = removed.iter().map(|e| e.str("grant_id")).collect();
+        let expected: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+        assert_eq!(
+            named,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "every row teardown deleted is named, not just counted"
+        );
+        for e in &removed {
+            assert_eq!(e.str("transition"), "active_to_removed");
+            assert_eq!(e.str("source"), "connection_teardown");
+            assert_eq!(e.str("connection"), "conn-1");
+        }
+        // The aggregate stays, as the summary it always was.
+        let teardown = crate::recorder::tests::of_kind(&entries, "connection_teardown");
+        assert_eq!(teardown[0].u64("removed_grants"), 2);
+    }
+
+    /// A consent decision is consumed from the pending registry *before*
+    /// delivery is attempted, so a refused delivery destroys it: the
+    /// petition is gone, the handle never resolves, and nothing retries.
+    /// Without a record, a human's yes or no becomes unrecoverable -- and
+    /// the issue requires consent decisions to be recorded.
+    #[test]
+    fn a_consent_decision_that_could_not_be_delivered_is_still_recorded() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        // A human says YES, narrowing to observe.
+        let petition = shared.petitions.pending_ids()[0];
+        let resolution = shared
+            .petitions
+            .resolve_scripted(
+                petition,
+                ScriptedDecision::Approve {
+                    verbs: Verb::OBSERVE,
+                    persistence: PersistenceRung::WhileRunning,
+                    expiry_ms: 0,
+                },
+            )
+            .unwrap();
+        // ... and the petitioner disconnects before the embedder routes it.
+        server.teardown(
+            &mut shared.petitions,
+            &mut shared.grants,
+            &mut shared.recorder,
+        );
+        let err = server
+            .deliver_resolution(
+                resolution,
+                &mut shared.grants,
+                &mut shared.recorder,
+                shared.now,
+                &mut |_, _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DeliveryError::ConnectionDead));
+
+        let entries = shared.log();
+        // No authority changed, so there is no `petition_resolved` ...
+        assert!(
+            crate::recorder::tests::of_kind(&entries, "petition_resolved").is_empty(),
+            "nothing was granted, so nothing may claim to have been"
+        );
+        // ... but the decision itself survives in the log.
+        let lost = crate::recorder::tests::of_kind(&entries, "petition_undelivered");
+        assert_eq!(lost.len(), 1, "the yes must not vanish");
+        assert_eq!(lost[0].str("outcome"), "granted", "the human said yes");
+        assert_eq!(lost[0].str("reason"), "connection_dead");
+        assert_eq!(lost[0].str("issuer"), "scripted_consent");
+        assert_eq!(lost[0].u64("grant_wire_id"), 4);
+        assert_eq!(
+            lost[0].strings("effective.verbs"),
+            vec!["observe"],
+            "including what the decision would have conferred"
+        );
+        assert!(
+            lost[0].is_null("grant_id"),
+            "no row was minted, so none may be named"
+        );
+    }
+
+    /// The other undelivered shape: a decision routed to the wrong
+    /// connection. Same funnel, different class -- the point being that
+    /// the funnel covers every refusal path, not a hand-picked one.
+    #[test]
+    fn a_misrouted_resolution_is_recorded_with_its_own_cause_class() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        let petition = shared.petitions.pending_ids()[0];
+        let mut resolution = shared
+            .petitions
+            .resolve_scripted(petition, ScriptedDecision::Deny)
+            .unwrap();
+        // The embedder routes it to a connection that is not its own.
+        resolution.connection = ConnectionId::from_u64_for_test(999);
+        let err = server
+            .deliver_resolution(
+                resolution,
+                &mut shared.grants,
+                &mut shared.recorder,
+                shared.now,
+                &mut |_, _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DeliveryError::WrongConnection { .. }));
+
+        let entries = shared.log();
+        let lost = crate::recorder::tests::of_kind(&entries, "petition_undelivered");
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].str("reason"), "wrong_connection");
+        assert_eq!(lost[0].str("outcome"), "denied", "the human said no");
+        assert!(lost[0].is_null("effective"));
+    }
+
+    /// The DoS the flight recorder must not become: the chokepoint refuses
+    /// `not_granted` at its FIRST step, before the token bucket, so a
+    /// facet whose grant never resolved granted is judged with no rate
+    /// ceiling at all. The wire coalesces those refusals; the log must be
+    /// bounded too, or an ungranted principal gets an unbounded,
+    /// unratelimited disk-growth and compositor-stall vector for free.
+    #[test]
+    fn an_ungranted_principals_refusal_flood_cannot_grow_the_log_without_bound() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        // Interactive policy: the petition pends forever, so every facet
+        // use is refused `not_granted` with no rate ceiling on the path.
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        const FLOOD: usize = 2_000;
+        for _ in 0..FLOOD {
+            client.send_message(&move_to(1, 1), None).unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        }
+        let during_flood = std::fs::metadata(&shared.log_path).unwrap().len();
+        // Teardown ends the run and flushes its outstanding count, so
+        // nothing is left unaccounted for when the session's story ends.
+        server.teardown(
+            &mut shared.petitions,
+            &mut shared.grants,
+            &mut shared.recorder,
+        );
+
+        let entries = shared.log();
+        let uses = crate::recorder::tests::of_kind(&entries, "use_decision");
+        assert_eq!(
+            uses.len(),
+            1,
+            "the condition is recorded once in full, not {FLOOD} times"
+        );
+        assert_eq!(uses[0].str("refusal"), "not_granted");
+        // Never silent, though: the repeats are accounted for.
+        let summaries = crate::recorder::tests::of_kind(&entries, "use_refusal_summary");
+        let counted: u64 = summaries.iter().map(|s| s.u64("repeats")).sum();
+        assert_eq!(counted + 1, FLOOD as u64, "every refusal is accounted for");
+        assert_eq!(
+            summaries.last().unwrap().u64("total_in_run"),
+            FLOOD as u64,
+            "and the run's total is stated outright"
+        );
+        assert!(
+            during_flood < 4_096,
+            "a {FLOOD}-request flood wrote {during_flood} bytes; it must stay bounded"
+        );
     }
 
     /// A facet whose grant never resolved `granted` has no row at all, and

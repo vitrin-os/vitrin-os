@@ -111,13 +111,91 @@
 //! (digest a subset) was rejected outright: it is exactly the shape B1
 //! forbids.
 //!
+//! ## Actuation detail (the other half of "what was done")
+//!
+//! A capture entry identifies what was *observed* (`frame`, above). The
+//! symmetric question -- what was *actuated* -- needs more than the verb:
+//! `actuate_pointer` alone cannot distinguish a move from a button press
+//! from a scroll, and a reconstruction that cannot tell those apart has
+//! not reconstructed anything. Every `use_decision` for an actuation
+//! therefore carries an `input` object ([`ActuationDetail`]), on refusals
+//! as well as admissions -- what was *attempted* is exactly what a
+//! debugging aid is for. Captures carry `"input": null`; they have a
+//! `frame` instead.
+//!
+//! Pointer parameters are recorded **in full**: `x`/`y`, the evdev button
+//! code and its pressed/released state, the scroll axis and `value120`.
+//! They reconstruct behaviour precisely and leak nothing -- a coordinate
+//! is not a secret. (`x`/`y` are the values *as the agent requested
+//! them*; an admitted motion outside the realm view is clamped at delivery
+//! per the IDL, so a replay pairs these with the view geometry the capture
+//! entries already state. They arrive as `i32` on the wire and are
+//! recorded as integers.)
+//!
+//! **Typed text is recorded by shape only, never verbatim -- and there is
+//! no flag to change that in v0.** `vitrin_actuator_text.type` carries
+//! arbitrary agent-chosen Unicode: passwords, API tokens, private
+//! correspondence. Writing it out would make a debugging aid a keylogger
+//! and a credential store, which is precisely what the secrecy contract
+//! below forbids for *handshake* credentials -- and there is no principled
+//! reason the same bytes become safe because they arrived through a
+//! different interface. So a text entry states `chars`, `bytes`, and a
+//! `digest` over the UTF-8 (same algorithm and tagging as a frame digest):
+//! enough to see that something was typed, how much, and whether the same
+//! string was typed twice or matches a known corpus -- without the log
+//! ever holding the string.
+//!
+//! An opt-in verbatim flag (the `--consent auto-approve` precedent) was
+//! considered and **rejected for v0**, deliberately: a flag is a code path
+//! that *can* leak, and adding one to the TCB to serve a debugging
+//! convenience nobody has needed yet is the wrong direction. Adding the
+//! flag later is additive and reversible; un-leaking a log that already
+//! captured a password is neither.
+//!
 //! ## Secrecy contract (inherited from [`crate::identity`])
 //!
 //! The recorder MUST NOT contain credential bytes; at most
 //! `credential_type` and `credential_bytes` (a length). This module has no
 //! way to express a credential -- [`Event::HandshakeRefused`] takes a
 //! `usize` length, not bytes -- so the rule is structural, not a
-//! convention.
+//! convention. [`ActuationDetail::Text`] is built the same way: it holds a
+//! length and a digest, and has no field a string could be put in.
+//!
+//! ## Bounding refusal floods (never at the cost of B1)
+//!
+//! Every entry costs one synchronous `write(2)` on the compositor thread.
+//! For *admitted* uses that cost is bounded by the grant's own
+//! `max_event_rate`, and B1 makes it non-negotiable anyway. For
+//! **refusals** it is not bounded at all: the chokepoint judges
+//! `not_granted` at its very first step, *before* the token bucket, so a
+//! facet whose grant never resolved `granted` is refused with no rate
+//! ceiling whatsoever -- and nothing downstream supplies one either.
+//! Actuation refusals do coalesce on the wire ([`crate::enforcement`]),
+//! but that bounds the *wire*: before this, one muted wire refusal still
+//! bought a full ~350-byte synchronous write. Capture refusals are not
+//! even coalesced, since the IDL mandates one terminal per
+//! `capture_frame`. Either way an ungranted principal could grow the disk
+//! and stall the compositor for free, at whatever rate it could send.
+//!
+//! So the recorder keeps a **refusal run** per `(connection, grant)`: the
+//! key `(verb, refusal code)` currently repeating, and how many repeats
+//! have been swallowed. The first refusal of a run is written in full;
+//! repeats are counted, not written; and the count surfaces as a
+//! [`Event::UseRefusalSummary`] when the run ends (a different verb/code
+//! on that grant, an admitted use, teardown, or shutdown) or every
+//! [`REFUSAL_SUMMARY_INTERVAL`] while it persists, so a *sustained* flood
+//! is visible while it happens rather than only in the postmortem. The
+//! condition is therefore never silent -- which is the actual requirement
+//! -- while a flood costs ~1 line per second per grant instead of one per
+//! request. Run state is capped at [`MAX_REFUSAL_RUNS`]; at the cap the
+//! open runs are flushed and cleared, which bounds memory and still
+//! amortizes to at most one extra line per refusal.
+//!
+//! **B1 is untouched by any of this.** The bounding is reachable only from
+//! the [`UseOutcome::Refused`] arm; an `Admitted` entry is never
+//! suppressed, never sampled, never aggregated, and always carries its own
+//! frame digest. That is asserted directly, not left to inspection
+//! (`admitted_captures_are_never_suppressed_by_refusal_bounding`).
 //!
 //! Verifier-canonical identities ([`PrincipalIdentity`]) are loggable: they
 //! are the server's own value, shape-validated at construction. A raw
@@ -146,17 +224,43 @@
 //! of authority, and the log would be load-bearing for enforcement --
 //! precisely the property the *signed* journal will have and this one
 //! explicitly does not. So: the first write error logs `tracing::error!`
-//! once, latches the recorder degraded (no further write attempt is made --
-//! a full disk must not produce an error storm at capture rate), and counts
-//! every entry dropped from then on ([`Recorder::dropped_entries`]).
-//! Degradation is announced three ways, because a truncated log is the one
-//! thing that cannot describe itself: the `tracing::error!` at the moment
-//! of failure, a second one naming the total at shutdown, and -- for a
-//! reader who has only the file -- **a gap in `seq`**, since sequence
-//! numbers are assigned to dropped entries too. Silence is what is
-//! forbidden, not degradation. When P6's signed journal lands, *its*
-//! failure policy is a separate decision and may well be fail-closed: a
-//! signed journal is evidence, this is a debugging aid.
+//! once, latches the recorder degraded (no write is attempted at capture
+//! rate while degraded -- a full disk must not produce an error storm),
+//! and counts every entry dropped from then on
+//! ([`Recorder::dropped_entries`]). Silence is what is forbidden, not
+//! degradation. When P6's signed journal lands, *its* failure policy is a
+//! separate decision and may well be fail-closed: a signed journal is
+//! evidence, this is a debugging aid.
+//!
+//! **Degradation is recoverable on a bounded budget -- which is what makes
+//! the file-only evidence real.** A latch that could never lift would make
+//! the "gap in `seq`" this module used to promise structurally
+//! *unproducible*: with no further write ever attempted, dropped entries
+//! are always a contiguous **tail**, never an interior hole, so the file
+//! just ends -- indistinguishable from `SIGKILL` -- and even the closing
+//! `run_ended` naming the loss could never be written. A signal that
+//! cannot occur is not a signal. So a degraded recorder retries, on a
+//! budget a full disk cannot turn into a storm:
+//!
+//! - at most [`RECOVERY_ATTEMPTS`] reopen attempts per run, and never two
+//!   within [`RECOVERY_BACKOFF`] -- so the worst case for a disk that
+//!   stays full is a handful of extra failed `write(2)`s across the whole
+//!   run, not one per capture;
+//! - a successful reopen writes a [`Event::RecordingResumed`] entry
+//!   **first**, naming how many entries the gap swallowed, so the hole is
+//!   self-describing rather than something a reader must infer;
+//! - [`Recorder::finish`] gets one *forced* attempt outside the budget
+//!   (shutdown happens once, so a single extra syscall cannot storm), so a
+//!   transient failure still ends with a `run_ended` stating the total.
+//!
+//! What a reader holding **only the file** therefore sees. If recovery
+//! ever succeeded: an interior gap in `seq`, an explicit
+//! `recording_resumed` naming the loss, and a `run_ended` naming the run
+//! total. If the disk stayed full through shutdown: the file ends
+//! mid-run with no footer -- honestly conceded here, because that case is
+//! genuinely indistinguishable from `SIGKILL` from inside the file alone,
+//! and the two `tracing::error!` lines are then the only evidence. The
+//! recorder does not pretend otherwise.
 //!
 //! **Creation failure at startup is fatal.** A different moment with a
 //! different answer: an operator who asked for a flight recorder and cannot
@@ -180,17 +284,42 @@
 //!   to other appenders -- so even two `vitrind` runs pointed at one file
 //!   interleave whole lines, never fragments (and `run_id` tells them
 //!   apart).
-//! - *Crash truncation*: the only way to get a partial line is a write that
-//!   is interrupted or fails part-way through (`write_all` looping over a
-//!   short write, then erroring). A reader MUST therefore tolerate a
-//!   trailing partial final line; every complete line is complete.
+//! - *Partial lines, and why they cannot poison the next line*: the one
+//!   way to get a fragment is a write that succeeds part-way and then
+//!   fails (`write_all` loops over short writes, so a nearly-full
+//!   filesystem can land a prefix and then `ENOSPC`). Left alone, that
+//!   prefix would swallow whatever a *later* appender writes -- gluing
+//!   run B's first line onto run A's fragment and producing a line that is
+//!   neither a tolerable trailing fragment nor a valid entry, which would
+//!   falsify the interleaving property one bullet up. So the failure path
+//!   makes one best-effort `write(2)` of a lone `\n`, terminating whatever
+//!   landed as its own (invalid) line; recovery likewise prefixes its
+//!   first line with `\n` in case even that terminator failed. Two rules
+//!   for a reader, both cheap: **tolerate at most one invalid line per
+//!   interrupted run, and skip empty lines.** Every other line is a
+//!   complete entry.
 //!
 //! **The file is opened append, never truncated.** A default path carries
 //! the pid, so runs get their own files; an operator who deliberately
 //! points two runs at one path gets an interleaved-but-parseable log rather
-//! than a clobbered one. Mode `0600` at creation: the log carries principal
-//! identities and grant metadata -- session metadata, not secrets, but not
-//! world-readable either.
+//! than a clobbered one.
+//!
+//! **Mode `0600` is enforced on the open descriptor, not merely requested
+//! at creation.** The log carries verifier-canonical identities, peer uids
+//! and pids, realm names and grant rows -- session metadata, not secrets,
+//! but nothing to hand out either. `OpenOptions::mode` applies *only when
+//! the file is created*, and `create(true)` follows an existing symlink,
+//! so a `--recorder` pointed at a pre-existing `0644` file, or at a
+//! symlink into a world-readable directory, would silently append all of
+//! that with whatever permissions were already there -- the stated
+//! justification defeated by the one case it exists for. [`open_append`]
+//! therefore `fstat`s the descriptor it just opened, requires a **regular
+//! file** (a symlink to a fifo, device, or directory is refused, not
+//! written into), and `fchmod`s it to `0600` unconditionally. `fchmod` on
+//! the fd, never a path, so there is no TOCTOU window; and because a file
+//! this process does not own cannot be `fchmod`ed, a symlink aimed at
+//! *someone else's* file fails closed at startup instead of appending to
+//! it.
 //!
 //! **The JSON emitter is hand-rolled** (plan risk R7: no serialization
 //! framework in the TCB, and this is a closed set of ~12 entry shapes). Its
@@ -206,22 +335,25 @@
 //! flight recorder is not wire-visible and this task has zero protocol
 //! impact.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vitrin_ipc::PeerCred;
+use vitrin_protocol::generated::vitrin_actuator_pointer::{Axis, ButtonState};
 use vitrin_protocol::generated::vitrin_consent::ConsentState;
 use vitrin_protocol::generated::vitrin_grant::{
     Outcome, Persistence as WirePersistence, Refusal, Verb,
 };
 
-use crate::enforcement::UseOutcome;
+use crate::enforcement::{UseKind, UseOutcome};
 use crate::grants::{GrantId, Issuer, PersistenceRung};
 use crate::identity::{PrincipalIdentity, RejectionCause};
+use crate::input::SeatInputKind;
 use crate::petitions::{ConnectionId, EffectiveAuthority, PetitionId};
 
 /// The entry-schema version stamped on every line. Bump only when an
@@ -245,6 +377,31 @@ pub(crate) const REVOKE_SCOPE_GRANT: &str = "grant";
 /// [`Event::GrantRevoked::scope`] for every grant of one principal (the
 /// hold-Esc dead-man switch, P1.7.3).
 pub(crate) const REVOKE_SCOPE_PRINCIPAL: &str = "principal";
+
+/// How many times one run may try to reopen its log after a write failure
+/// latched it degraded. Small and fixed: enough that a *transient* failure
+/// (a full filesystem the operator cleared, an `EIO` blip) resumes
+/// recording and leaves the interior gap the module docs promise, few
+/// enough that a filesystem which stays full costs a handful of failed
+/// `write(2)`s across the whole run rather than one per capture.
+const RECOVERY_ATTEMPTS: u32 = 8;
+
+/// Minimum monotonic spacing between two recovery attempts. With
+/// [`RECOVERY_ATTEMPTS`] this bounds recovery cost twice over -- by count
+/// and by rate -- so neither a fast capture loop nor a long session can
+/// turn retrying into the error storm the latch exists to prevent.
+const RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How often a *persisting* refusal run surfaces its repeat count while it
+/// is still running (module docs: a sustained flood must be visible while
+/// it happens, not only in the postmortem). One line per second per grant
+/// is the ceiling a flood can impose on the log.
+const REFUSAL_SUMMARY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Cap on concurrently tracked refusal runs. Reaching it flushes and
+/// clears every open run, which bounds the recorder's memory and still
+/// amortizes to at most one extra line per refusal.
+const MAX_REFUSAL_RUNS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Observation digest
@@ -295,6 +452,118 @@ pub(crate) struct ObservedFrame {
 }
 
 // ---------------------------------------------------------------------------
+// Actuation detail
+// ---------------------------------------------------------------------------
+
+/// What an actuation actually did, beyond naming its verb -- the `input`
+/// member of a `use_decision`. See the module docs for the secrecy
+/// judgement this type encodes: pointer parameters in full, typed text by
+/// shape only.
+///
+/// The `Text` variant has **no field a string can be put in**, so
+/// "the log is not a keylogger" is a property of the type rather than a
+/// convention a later edit could quietly drop -- the same structural trick
+/// [`Event::HandshakeRefused`] uses for credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActuationDetail {
+    /// `vitrin_actuator_pointer.move`, as requested (pre-clamp).
+    Motion { x: i64, y: i64 },
+    /// `vitrin_actuator_pointer.button`: evdev code plus edge.
+    Button { button: u32, pressed: bool },
+    /// `vitrin_actuator_pointer.scroll`: axis plus high-resolution value.
+    Scroll { axis: Axis, value120: i32 },
+    /// `vitrin_actuator_text.type` -- shape only, never the string.
+    Text {
+        /// Unicode scalar values, the unit a human reasons in.
+        chars: u64,
+        /// UTF-8 bytes, the unit the wire and the digest agree on.
+        bytes: u64,
+        /// Over the UTF-8 bytes: identifies the string without holding it.
+        digest: ObservationDigest,
+    },
+}
+
+impl ActuationDetail {
+    /// Summarize one use's payload, or `None` for a capture (which has a
+    /// `frame` instead).
+    ///
+    /// Lives here rather than in [`crate::enforcement`] on purpose: what
+    /// the recorder may write down is the recorder's judgement, so the
+    /// secrecy decision sits in the module whose docs argue it, and the
+    /// chokepoint keeps knowing nothing about a log existing.
+    pub fn of(kind: &UseKind) -> Option<Self> {
+        match kind {
+            UseKind::Capture => None,
+            UseKind::Pointer(input) | UseKind::Text(input) => match input {
+                // The wire carries `i32` and the intake widens it, so the
+                // narrowing is exact for every value that can reach here.
+                SeatInputKind::Motion { x, y } => Some(Self::Motion {
+                    x: *x as i64,
+                    y: *y as i64,
+                }),
+                SeatInputKind::Button { button, state } => Some(Self::Button {
+                    button: *button,
+                    pressed: matches!(state, ButtonState::Pressed),
+                }),
+                SeatInputKind::Scroll { axis, value120 } => Some(Self::Scroll {
+                    axis: *axis,
+                    value120: *value120,
+                }),
+                SeatInputKind::Text { text } => Some(Self::Text {
+                    chars: text.chars().count() as u64,
+                    bytes: text.len() as u64,
+                    digest: ObservationDigest::of(text.as_bytes()),
+                }),
+                // Physical key input never reaches a facet use (the agent
+                // text path is `Text`); typed and shape-only if it ever
+                // does, so no future variant can leak by default.
+                SeatInputKind::Key { .. } => None,
+            },
+        }
+    }
+}
+
+/// The `input` member of a `use_decision`: what the actuation did, or an
+/// explicit `null` for a capture.
+fn write_input(out: &mut String, detail: Option<ActuationDetail>) {
+    let Some(detail) = detail else {
+        return field_null(out, "input");
+    };
+    open_object(out, "input");
+    match detail {
+        ActuationDetail::Motion { x, y } => {
+            field_str(out, "action", "move");
+            field_i64(out, "x", x);
+            field_i64(out, "y", y);
+        }
+        ActuationDetail::Button { button, pressed } => {
+            field_str(out, "action", "button");
+            field_u64(out, "button", u64::from(button));
+            field_bool(out, "pressed", pressed);
+        }
+        ActuationDetail::Scroll { axis, value120 } => {
+            field_str(out, "action", "scroll");
+            field_str(out, "axis", axis_label(axis));
+            field_i64(out, "value120", i64::from(value120));
+        }
+        ActuationDetail::Text {
+            chars,
+            bytes,
+            digest,
+        } => {
+            field_str(out, "action", "type");
+            // Shape and identity only -- module docs. There is deliberately
+            // no `text` member, in any version-1 configuration.
+            field_u64(out, "chars", chars);
+            field_u64(out, "bytes", bytes);
+            field_str(out, "digest_alg", DIGEST_ALG);
+            field_str(out, "digest", &digest.to_hex());
+        }
+    }
+    close_object(out);
+}
+
+// ---------------------------------------------------------------------------
 // Entry kinds
 // ---------------------------------------------------------------------------
 
@@ -335,6 +604,16 @@ pub(crate) enum Event<'a> {
         /// Entries lost after a write failure latched the recorder
         /// degraded (module docs: loud degradation, never silence).
         dropped_entries: u64,
+    },
+    /// The log resumed after a write failure: the first line written past
+    /// the gap, so the hole in `seq` immediately before it is
+    /// self-describing rather than something a reader must infer.
+    RecordingResumed {
+        /// Entries lost so far this run -- the gap's size.
+        dropped_entries: u64,
+        /// Which recovery attempt this was (1-based), against the run's
+        /// [`RECOVERY_ATTEMPTS`] budget.
+        attempt: u32,
     },
     /// A `hello` bound a principal: the verifier-canonical identity is now
     /// what every grant row and enforcement decision keys on.
@@ -420,7 +699,28 @@ pub(crate) enum Event<'a> {
         /// judged against (a rate-limited or revoked use has one; the
         /// outcome alone does not report it).
         grant_row: Option<GrantId>,
+        /// What the actuation did -- `None` for a capture, which carries a
+        /// `frame` instead. Present on refusals too: what was *attempted*
+        /// is exactly what a debugging aid is for.
+        detail: Option<ActuationDetail>,
         outcome: &'a UseOutcome,
+    },
+    /// Repeats of a refusal run that were counted rather than written
+    /// individually (module docs: bounding a refusal flood without ever
+    /// letting the condition go silent). Never emitted for an admitted
+    /// use -- B1 forbids aggregating those.
+    UseRefusalSummary {
+        connection: ConnectionId,
+        grant_wire_id: u32,
+        /// The row the run was judged against; `None` for a facet whose
+        /// grant never resolved `granted` -- the `not_granted` flood.
+        grant_row: Option<GrantId>,
+        verb: Verb,
+        code: Refusal,
+        /// Refusals swallowed since the last line written for this run.
+        repeats: u64,
+        /// Refusals in the run so far, including the one written in full.
+        total: u64,
     },
     /// A `once` grant's single use was consumed by an admitted use: the
     /// active-to-spent lifecycle transition.
@@ -437,6 +737,47 @@ pub(crate) enum Event<'a> {
         /// `grant` for a single revoke, `principal` for the sweep over one
         /// principal's rows.
         scope: &'static str,
+    },
+    /// One grant row deleted outright by connection teardown -- the way a
+    /// version-1 grant most commonly dies (they die with their
+    /// connection).
+    ///
+    /// Named per row for the same reason revocation and expiry are: an
+    /// E3.4 replay reconstructs the grant table by applying lifecycle
+    /// transitions, and a bare count on the teardown line says *how many*
+    /// authorities died without saying *which*. Teardown was the one
+    /// transition still leaving no per-row line; it no longer is. The
+    /// count on [`Event::ConnectionTeardown`] stays, as the summary it
+    /// always was.
+    GrantRemoved {
+        connection: ConnectionId,
+        grant_id: GrantId,
+    },
+    /// A resolution this core decided was **not delivered** to its
+    /// connection -- and therefore appears in no `petition_resolved`
+    /// entry, because no authority changed.
+    ///
+    /// The decision is consumed from the pending registry *before*
+    /// delivery is attempted, so a refused delivery destroys it: the
+    /// petition is gone from the registry, the handle never resolves, and
+    /// without this entry a human's yes or no would be unrecoverable from
+    /// the log. Recorded from one place --
+    /// `PrincipalServer::deliver_resolution`'s error funnel -- so every
+    /// refusal reason, present and future, is covered structurally rather
+    /// than by remembering to add a call.
+    PetitionUndelivered {
+        /// The connection the resolution was addressed to (not
+        /// necessarily the one that refused it -- see `reason`).
+        connection: ConnectionId,
+        grant_wire_id: u32,
+        /// What was decided, so the yes/no survives.
+        outcome: Outcome,
+        /// The authority a granted decision would have conferred.
+        effective: Option<EffectiveAuthority>,
+        /// Which consent path decided; `Some` exactly for `granted`.
+        issuer: Option<Issuer>,
+        /// A fixed class label, never free-form `Display` text.
+        reason: &'static str,
     },
     /// A principal connection closed: its pending petitions were withdrawn
     /// and its grants died with it.
@@ -455,15 +796,19 @@ impl Event<'_> {
         match self {
             Event::RunStarted { .. } => "run_started",
             Event::RunEnded { .. } => "run_ended",
+            Event::RecordingResumed { .. } => "recording_resumed",
             Event::HandshakeBound { .. } => "handshake_bound",
             Event::HandshakeRefused { .. } => "handshake_refused",
             Event::PetitionRequested { .. } => "petition_requested",
             Event::ConsentTransition { .. } => "consent_transition",
             Event::PetitionResolved { .. } => "petition_resolved",
+            Event::PetitionUndelivered { .. } => "petition_undelivered",
             Event::UseDecision { .. } => "use_decision",
+            Event::UseRefusalSummary { .. } => "use_refusal_summary",
             Event::GrantSpent { .. } => "grant_spent",
             Event::GrantExpired { .. } => "grant_expired",
             Event::GrantRevoked { .. } => "grant_revoked",
+            Event::GrantRemoved { .. } => "grant_removed",
             Event::ConnectionTeardown { .. } => "connection_teardown",
         }
     }
@@ -488,6 +833,14 @@ impl Event<'_> {
             }
             Event::RunEnded { dropped_entries } => {
                 field_u64(out, "dropped_entries", dropped_entries);
+            }
+            Event::RecordingResumed {
+                dropped_entries,
+                attempt,
+            } => {
+                field_u64(out, "dropped_entries", dropped_entries);
+                field_u64(out, "attempt", u64::from(attempt));
+                field_u64(out, "attempt_budget", u64::from(RECOVERY_ATTEMPTS));
             }
             Event::HandshakeBound {
                 connection,
@@ -580,17 +933,29 @@ impl Event<'_> {
                     Some(i) => field_str(out, "issuer", issuer_label(i)),
                     None => field_null(out, "issuer"),
                 }
-                match effective {
-                    Some(e) => {
-                        open_object(out, "effective");
-                        write_verbs(out, e.verbs);
-                        field_str(out, "persistence", rung_label(e.persistence));
-                        field_u64(out, "expiry_ms", u64::from(e.expiry_ms));
-                        field_u64(out, "max_event_rate", u64::from(e.max_event_rate.get()));
-                        close_object(out);
-                    }
-                    None => field_null(out, "effective"),
+                write_effective(out, effective);
+            }
+            Event::PetitionUndelivered {
+                connection,
+                grant_wire_id,
+                outcome,
+                effective,
+                issuer,
+                reason,
+            } => {
+                field_display(out, "connection", connection);
+                field_u64(out, "grant_wire_id", u64::from(grant_wire_id));
+                field_str(out, "outcome", outcome_label(outcome));
+                field_str(out, "reason", reason);
+                // No row was minted (except on `transport`, where the
+                // `petition_resolved` beside this line names it), so there
+                // is nothing to name here.
+                field_null(out, "grant_id");
+                match issuer {
+                    Some(i) => field_str(out, "issuer", issuer_label(i)),
+                    None => field_null(out, "issuer"),
                 }
+                write_effective(out, effective);
             }
             Event::UseDecision {
                 connection,
@@ -598,6 +963,7 @@ impl Event<'_> {
                 grant_wire_id,
                 verb,
                 grant_row,
+                detail,
                 outcome,
             } => {
                 field_display(out, "connection", connection);
@@ -633,7 +999,31 @@ impl Event<'_> {
                         write_frame(out, None);
                     }
                 }
+                // What was actuated (or `null` for a capture, whose
+                // `frame` above answers the same question).
+                write_input(out, detail);
                 write_epoch_reference(out);
+            }
+            Event::UseRefusalSummary {
+                connection,
+                grant_wire_id,
+                grant_row,
+                verb,
+                code,
+                repeats,
+                total,
+            } => {
+                field_display(out, "connection", connection);
+                field_u64(out, "grant_wire_id", u64::from(grant_wire_id));
+                match grant_row {
+                    Some(id) => field_display(out, "grant_id", id),
+                    None => field_null(out, "grant_id"),
+                }
+                field_str(out, "verb", verb_label(verb));
+                field_str(out, "decision", "refused");
+                field_str(out, "refusal", refusal_label(code));
+                field_u64(out, "repeats", repeats);
+                field_u64(out, "total_in_run", total);
             }
             Event::GrantSpent {
                 connection,
@@ -652,6 +1042,17 @@ impl Event<'_> {
                 field_display(out, "grant_id", grant_id);
                 field_str(out, "transition", "active_to_revoked");
                 field_str(out, "scope", scope);
+            }
+            Event::GrantRemoved {
+                connection,
+                grant_id,
+            } => {
+                field_display(out, "connection", connection);
+                field_display(out, "grant_id", grant_id);
+                // Removal, not revocation: the row is deleted, not marked
+                // dead (the grant table's documented teardown contract).
+                field_str(out, "transition", "active_to_removed");
+                field_str(out, "source", "connection_teardown");
             }
             Event::ConnectionTeardown {
                 connection,
@@ -687,6 +1088,24 @@ fn write_frame(out: &mut String, frame: Option<ObservedFrame>) {
             close_object(out);
         }
         None => field_null(out, "frame"),
+    }
+}
+
+/// The `effective` member: the authority a granted decision states (or
+/// would have stated, for one that never reached its connection). Shared
+/// by `petition_resolved` and `petition_undelivered` so the two render
+/// identically -- a reader parses one shape.
+fn write_effective(out: &mut String, effective: Option<EffectiveAuthority>) {
+    match effective {
+        Some(e) => {
+            open_object(out, "effective");
+            write_verbs(out, e.verbs);
+            field_str(out, "persistence", rung_label(e.persistence));
+            field_u64(out, "expiry_ms", u64::from(e.expiry_ms));
+            field_u64(out, "max_event_rate", u64::from(e.max_event_rate.get()));
+            close_object(out);
+        }
+        None => field_null(out, "effective"),
     }
 }
 
@@ -749,6 +1168,14 @@ fn verb_label(verb: Verb) -> &'static str {
         Verb::ACTUATE_POINTER => "actuate_pointer",
         Verb::ACTUATE_TEXT => "actuate_text",
         _ => "unknown",
+    }
+}
+
+/// The scroll axis of an `actuate_pointer` scroll.
+fn axis_label(axis: Axis) -> &'static str {
+    match axis {
+        Axis::Vertical => "vertical",
+        Axis::Horizontal => "horizontal",
     }
 }
 
@@ -825,6 +1252,37 @@ pub(crate) fn auth_cause_class(cause: &RejectionCause) -> &'static str {
 /// The class for the third handshake outcome: infrastructure failure, not a
 /// judgement on the credential ([`crate::identity::VerifyOutcome::Unavailable`]).
 pub(crate) const VERIFIER_UNAVAILABLE_CLASS: &str = "verifier_unavailable";
+
+/// [`Event::PetitionUndelivered::reason`] classes -- a fixed taxonomy, so
+/// the entry never embeds a `Display` rendering that could carry
+/// client-controlled text.
+///
+/// The connection was no longer bound (the fatal goodbye, or teardown):
+/// the decision was consumed from the pending registry and is gone. This
+/// is the common one -- an agent that dies while its prompt is up.
+pub(crate) const UNDELIVERED_CONNECTION_DEAD: &str = "connection_dead";
+
+/// The resolution was addressed to a different connection: a routing bug
+/// in the embedder, recorded rather than swallowed.
+pub(crate) const UNDELIVERED_WRONG_CONNECTION: &str = "wrong_connection";
+
+/// The grant handle the resolution names is not a grant object on this
+/// connection.
+pub(crate) const UNDELIVERED_UNKNOWN_GRANT: &str = "unknown_grant_object";
+
+/// The handle had already resolved: the exactly-once guard refused a
+/// second resolution before anything was minted or sent.
+pub(crate) const UNDELIVERED_ALREADY_RESOLVED: &str = "already_resolved";
+
+/// The grant-table insert failed at delivery time (unreachable in
+/// practice; the connection dies fatal `internal`).
+pub(crate) const UNDELIVERED_INSERT_FAILED: &str = "insert_failed";
+
+/// The decision was recorded and the row minted, but the terminal never
+/// reached the wire. Unlike every other class this one accompanies a
+/// `petition_resolved` entry: authority *did* change, the client just
+/// never learned of it.
+pub(crate) const UNDELIVERED_TRANSPORT: &str = "transport";
 
 // ---------------------------------------------------------------------------
 // The hand-rolled JSON emitter
@@ -955,13 +1413,31 @@ impl std::error::Error for RecorderError {
     }
 }
 
+/// One refusal run: the `(verb, code)` currently repeating on one
+/// `(connection, grant)` and how many repeats have been swallowed since
+/// the last line written for it. See the module docs for why refusals are
+/// bounded this way and why admissions never are.
+#[derive(Debug)]
+struct RefusalRun {
+    verb: Verb,
+    code: Refusal,
+    grant_row: Option<GrantId>,
+    /// Swallowed since the last line written for this run.
+    suppressed: u64,
+    /// Refusals in the run so far, the individually written one included.
+    total: u64,
+    /// Monotonic offset at which the current accumulation window opened.
+    window_opened: Duration,
+}
+
 /// The one flight-recorder handle of a core process (module docs: there are
 /// deliberately no other write sites). One log file per run.
 #[derive(Debug)]
 pub(crate) struct Recorder {
-    /// `None` once a write failure latched the recorder degraded -- no
-    /// further write is attempted, so a full disk cannot produce an error
-    /// storm at capture rate.
+    /// `None` while a write failure has this recorder latched degraded --
+    /// no write is attempted at capture rate, so a full disk cannot
+    /// produce an error storm. Lifted only by [`Recorder::try_recover`],
+    /// on the bounded budget below.
     file: Option<File>,
     path: PathBuf,
     run_id: String,
@@ -971,6 +1447,52 @@ pub(crate) struct Recorder {
     seq: u64,
     started: Instant,
     dropped: u64,
+    /// Recovery attempts spent this run, against [`RECOVERY_ATTEMPTS`].
+    recovery_attempts: u32,
+    /// Monotonic offset before which no further recovery may be attempted
+    /// ([`RECOVERY_BACKOFF`] after the last one).
+    recovery_not_before: Duration,
+    /// Whether the next line must be prefixed with `\n` because a write
+    /// failed part-way and may have left an unterminated fragment.
+    fragment_pending: bool,
+    /// Open refusal runs, keyed by `(connection, wire grant id)`. Bounded
+    /// by [`MAX_REFUSAL_RUNS`].
+    refusal_runs: BTreeMap<(ConnectionId, u32), RefusalRun>,
+}
+
+/// Open `path` for append with the file's privacy enforced on the
+/// descriptor rather than merely requested at creation -- the module docs
+/// argue why `OpenOptions::mode` alone is not enough.
+fn open_append(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    // `fstat` through the descriptor: a symlink resolved to something that
+    // is not a regular file (a fifo would block the compositor, a device
+    // could be anything) is refused rather than written into.
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "flight-recorder log must be a regular file",
+        ));
+    }
+    // `fchmod` on the fd -- no path, so no TOCTOU window -- and
+    // unconditional, so it costs one syscall at startup and needs no
+    // "whose uid is this" logic: a file this process cannot chmod is a
+    // file it must not append identities to, and the error says so.
+    let mode = meta.permissions().mode() & 0o777;
+    file.set_permissions(Permissions::from_mode(0o600))?;
+    if mode != 0o600 {
+        tracing::warn!(
+            path = %path.display(),
+            previous_mode = format!("{mode:04o}"),
+            "flight-recorder log existed with wider permissions; tightened to 0600"
+        );
+    }
+    Ok(file)
 }
 
 impl Recorder {
@@ -992,12 +1514,7 @@ impl Recorder {
                     .map_err(fail)?;
             }
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(fail)?;
+        let file = open_append(path).map_err(fail)?;
         Ok(Self::with_file(file, path.to_path_buf()))
     }
 
@@ -1013,6 +1530,10 @@ impl Recorder {
             seq: 1,
             started: Instant::now(),
             dropped: 0,
+            recovery_attempts: 0,
+            recovery_not_before: Duration::ZERO,
+            fragment_pending: false,
+            refusal_runs: BTreeMap::new(),
         }
     }
 
@@ -1031,6 +1552,13 @@ impl Recorder {
     /// Whether a write failure has latched this recorder degraded.
     pub fn is_degraded(&self) -> bool {
         self.file.is_none()
+    }
+
+    /// Recovery attempts spent this run -- how the bounding of
+    /// [`Recorder::try_recover`] is asserted rather than assumed.
+    #[cfg(test)]
+    pub fn recovery_attempts(&self) -> u32 {
+        self.recovery_attempts
     }
 
     /// Record one proactive expiry sweep's result -- the ids
@@ -1060,7 +1588,45 @@ impl Recorder {
     /// a single `write(2)`. Infallible by design -- a diagnostic must never
     /// be able to fail an authority path (module docs), so a write failure
     /// degrades loudly here instead of propagating to the caller.
+    ///
+    /// This is also where the two bounding policies live, both of them
+    /// *before* any line is rendered so neither can be bypassed by a
+    /// future caller: the degraded-recorder recovery attempt, and the
+    /// refusal-run aggregation. An [`UseOutcome::Admitted`] entry passes
+    /// through both untouched -- B1.
     pub fn record(&mut self, event: Event<'_>) {
+        // A degraded recorder gets its bounded chance to come back before
+        // this entry is considered lost, so recovery lands *inside* the
+        // gap it describes rather than after it.
+        self.try_recover(false);
+        // Refusal bounding, and the run-ending flushes that make an
+        // aggregated count land before the line that ended its run.
+        if !self.admit_use_entry(&event) {
+            return;
+        }
+        let line = self.render(&event);
+        self.write_line(&line);
+    }
+
+    /// Close the run: one *forced* recovery attempt (shutdown happens
+    /// once, so a single extra `open`+`write` cannot storm), every open
+    /// refusal run flushed, then the footer. A transient write failure
+    /// therefore still ends with a `run_ended` naming the total lost --
+    /// the file-only evidence the module docs promise.
+    pub fn finish(&mut self) {
+        self.try_recover(true);
+        self.flush_all_refusal_runs();
+        let dropped = self.dropped;
+        self.record(Event::RunEnded {
+            dropped_entries: dropped,
+        });
+    }
+
+    /// Assemble one complete line: the envelope, then the kind-specific
+    /// body. Consumes the entry's `seq` whether or not the line is
+    /// ultimately written, so a dropped entry leaves a hole rather than a
+    /// silent renumbering.
+    fn render(&mut self, event: &Event<'_>) -> String {
         let seq = self.seq;
         self.seq += 1;
         let mut line = String::with_capacity(256);
@@ -1080,7 +1646,189 @@ impl Recorder {
         event.write_body(&mut line);
         line.push('}');
         line.push('\n');
+        line
+    }
+
+    /// Try to lift a degraded latch, on the budget the module docs state:
+    /// at most [`RECOVERY_ATTEMPTS`] per run and never two within
+    /// [`RECOVERY_BACKOFF`] -- unless `forced`, which [`Recorder::finish`]
+    /// uses for its single shutdown attempt.
+    ///
+    /// A successful reopen writes [`Event::RecordingResumed`] first, so
+    /// the gap in `seq` immediately before it is self-describing.
+    fn try_recover(&mut self, forced: bool) {
+        if self.file.is_some() {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        if !forced
+            && (self.recovery_attempts >= RECOVERY_ATTEMPTS || elapsed < self.recovery_not_before)
+        {
+            return;
+        }
+        self.recovery_attempts += 1;
+        self.recovery_not_before = elapsed.saturating_add(RECOVERY_BACKOFF);
+        let Ok(file) = open_append(&self.path) else {
+            return;
+        };
+        self.file = Some(file);
+        let resumed = Event::RecordingResumed {
+            dropped_entries: self.dropped,
+            attempt: self.recovery_attempts,
+        };
+        let line = self.render(&resumed);
+        // Straight to the write site: `record` would re-enter recovery.
+        // If this write fails too, the latch simply re-arms and the
+        // attempt is spent -- which is what bounds the retry.
         self.write_line(&line);
+        if self.file.is_some() {
+            tracing::warn!(
+                path = %self.path.display(),
+                dropped_entries = self.dropped,
+                attempt = self.recovery_attempts,
+                "flight recorder RESUMED after a write failure; the gap in `seq` before this \
+                 point is the entries lost while degraded"
+            );
+        }
+    }
+
+    /// The refusal-flood bound (module docs). Returns whether `event`
+    /// should be written as its own line.
+    ///
+    /// **B1 lives in the first arm**: an admitted use is always written,
+    /// and the only thing its arm does besides return `true` is *end* any
+    /// refusal run on that grant -- it is structurally impossible for this
+    /// function to suppress an admission.
+    fn admit_use_entry(&mut self, event: &Event<'_>) -> bool {
+        match *event {
+            Event::UseDecision {
+                connection,
+                grant_wire_id,
+                outcome: &UseOutcome::Admitted { .. },
+                ..
+            } => {
+                // A success ends the run, exactly as it clears the
+                // chokepoint's wire-side coalescing marks.
+                self.flush_refusal_run(&(connection, grant_wire_id));
+                true
+            }
+            Event::UseDecision {
+                connection,
+                grant_wire_id,
+                verb,
+                grant_row,
+                outcome: &UseOutcome::Refused { code, .. },
+                ..
+            } => self.note_refusal(connection, grant_wire_id, grant_row, verb, code),
+            // A closing connection's runs are summarized before its
+            // teardown line, so the story ends with nothing outstanding.
+            Event::ConnectionTeardown { connection, .. } => {
+                let keys: Vec<(ConnectionId, u32)> = self
+                    .refusal_runs
+                    .range((connection, 0)..=(connection, u32::MAX))
+                    .map(|(k, _)| *k)
+                    .collect();
+                for key in keys {
+                    self.flush_refusal_run(&key);
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Fold one refusal into its run. Returns whether it earns its own
+    /// line: `true` for the first refusal of a run (and for the first
+    /// after a run's key changes), `false` for a repeat, whose count
+    /// surfaces in a [`Event::UseRefusalSummary`] instead.
+    fn note_refusal(
+        &mut self,
+        connection: ConnectionId,
+        grant_wire_id: u32,
+        grant_row: Option<GrantId>,
+        verb: Verb,
+        code: Refusal,
+    ) -> bool {
+        let key = (connection, grant_wire_id);
+        let now = self.started.elapsed();
+        if let Some(run) = self.refusal_runs.get_mut(&key) {
+            if run.verb == verb && run.code == code {
+                run.total += 1;
+                run.suppressed += 1;
+                // A *sustained* flood must stay visible while it is
+                // happening, so a long run reports periodically instead of
+                // only when it ends.
+                if now.saturating_sub(run.window_opened) >= REFUSAL_SUMMARY_INTERVAL {
+                    self.emit_refusal_summary(key, now);
+                }
+                return false;
+            }
+            // The key changed: the old run ends here, and this refusal
+            // begins a new one and is written in full.
+            self.flush_refusal_run(&key);
+        }
+        if self.refusal_runs.len() >= MAX_REFUSAL_RUNS {
+            // Bounded memory. Flushing everything costs at most
+            // MAX_REFUSAL_RUNS lines and can only recur after that many
+            // new keys, so it amortizes to <= 1 extra line per refusal.
+            self.flush_all_refusal_runs();
+        }
+        self.refusal_runs.insert(
+            key,
+            RefusalRun {
+                verb,
+                code,
+                grant_row,
+                suppressed: 0,
+                total: 1,
+                window_opened: now,
+            },
+        );
+        true
+    }
+
+    /// Write the pending summary for one run (if it swallowed anything)
+    /// and open a fresh accumulation window, keeping the run itself.
+    fn emit_refusal_summary(&mut self, key: (ConnectionId, u32), now: Duration) {
+        let Some(run) = self.refusal_runs.get_mut(&key) else {
+            return;
+        };
+        if run.suppressed == 0 {
+            // The individual line already told the whole story; a summary
+            // of nothing would be noise.
+            run.window_opened = now;
+            return;
+        }
+        let summary = Event::UseRefusalSummary {
+            connection: key.0,
+            grant_wire_id: key.1,
+            grant_row: run.grant_row,
+            verb: run.verb,
+            code: run.code,
+            repeats: run.suppressed,
+            total: run.total,
+        };
+        run.suppressed = 0;
+        run.window_opened = now;
+        let line = self.render(&summary);
+        self.write_line(&line);
+    }
+
+    /// End one run: emit its outstanding count, then forget it.
+    fn flush_refusal_run(&mut self, key: &(ConnectionId, u32)) {
+        if !self.refusal_runs.contains_key(key) {
+            return;
+        }
+        self.emit_refusal_summary(*key, self.started.elapsed());
+        self.refusal_runs.remove(key);
+    }
+
+    /// End every open run (the cap, and shutdown).
+    fn flush_all_refusal_runs(&mut self) {
+        let keys: Vec<(ConnectionId, u32)> = self.refusal_runs.keys().copied().collect();
+        for key in keys {
+            self.flush_refusal_run(&key);
+        }
     }
 
     /// The single write site. One `write_all` of one complete, already
@@ -1091,16 +1839,31 @@ impl Recorder {
             self.dropped += 1;
             return;
         };
-        if let Err(err) = file.write_all(line.as_bytes()) {
+        // A previous failure may have landed a partial line; open this one
+        // on a fresh line so the fragment cannot swallow it (module docs).
+        let fragment_pending = std::mem::take(&mut self.fragment_pending);
+        let result = if fragment_pending {
+            file.write_all(b"\n")
+                .and_then(|()| file.write_all(line.as_bytes()))
+        } else {
+            file.write_all(line.as_bytes())
+        };
+        if let Err(err) = result {
+            // `write_all` loops over short writes, so a failure part-way
+            // through can have left a prefix on disk. Terminate it as its
+            // own (invalid) line, best effort: without this the *next*
+            // appender's first line would be glued onto the fragment.
+            let terminated = file.write_all(b"\n").is_ok();
+            self.fragment_pending = !terminated;
             // Loud, once. The recorder is latched degraded so a full disk
             // cannot turn every subsequent capture into another error line.
             tracing::error!(
                 path = %self.path.display(),
                 error = %err,
-                "flight recorder write failed; recording is now DEGRADED for the rest of \
-                 this run (entries will be counted, not written). Captures and actuations \
-                 are unaffected -- the flight recorder v0 is a debugging aid, not an \
-                 authority input."
+                "flight recorder write failed; recording is now DEGRADED (entries will be \
+                 counted, not written) until one of the bounded recovery attempts succeeds. \
+                 Captures and actuations are unaffected -- the flight recorder v0 is a \
+                 debugging aid, not an authority input."
             );
             self.file = None;
             self.dropped += 1;
@@ -1415,14 +2178,31 @@ pub(crate) mod tests {
         (recorder, path)
     }
 
-    /// Every line of the log at `path`, parsed. Asserts each line is
-    /// exactly one JSON object and carries the envelope, so no test has to
-    /// restate the invariant.
+    /// Every line of the log at `path`, parsed, asserting `seq` is
+    /// gap-free -- the normal, undegraded case every test but the
+    /// degradation ones expects.
     pub(crate) fn read_log(path: &Path) -> Vec<Json> {
+        let entries = read_log_allowing_gaps(path);
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.u64("seq"), i as u64 + 1, "seq is gap-free and ascending");
+        }
+        entries
+    }
+
+    /// Every line of the log at `path`, parsed, tolerating the gaps a
+    /// degraded run leaves. Asserts each line is exactly one JSON object
+    /// carrying the envelope, and that `seq` is strictly increasing (the
+    /// ordering authority is never reused), so no test has to restate the
+    /// invariant. Empty lines are skipped, per the reader rules in the
+    /// module docs.
+    pub(crate) fn read_log_allowing_gaps(path: &Path) -> Vec<Json> {
         let text = std::fs::read_to_string(path).expect("log file must be readable");
         let mut entries = Vec::new();
-        let mut expected_seq = 1u64;
+        let mut previous_seq = 0u64;
         for (i, line) in text.lines().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
             let value = Json::parse(line)
                 .unwrap_or_else(|e| panic!("line {} is not valid JSON ({e}): {line}", i + 1));
             assert_eq!(
@@ -1430,12 +2210,12 @@ pub(crate) mod tests {
                 u64::from(SCHEMA_VERSION),
                 "every line carries schema_version"
             );
-            assert_eq!(
-                value.u64("seq"),
-                expected_seq,
-                "seq is gap-free and ascending"
+            let seq = value.u64("seq");
+            assert!(
+                seq > previous_seq,
+                "seq is strictly increasing and never reused ({seq} after {previous_seq})"
             );
-            expected_seq += 1;
+            previous_seq = seq;
             assert!(!value.str("run_id").is_empty());
             assert!(!value.str("kind").is_empty());
             // Present on every line; values are real clock readings, so
@@ -1726,10 +2506,24 @@ pub(crate) mod tests {
             voiced: true,
         };
         let live_row = Some(GrantId::from_u64_for_test(9));
-        for (verb, grant_row, outcome) in [
-            (Verb::OBSERVE, live_row, &admitted),
-            (Verb::ACTUATE_POINTER, live_row, &refused),
-            (Verb::ACTUATE_TEXT, None, &not_granted),
+        for (verb, grant_row, detail, outcome) in [
+            (Verb::OBSERVE, live_row, None, &admitted),
+            (
+                Verb::ACTUATE_POINTER,
+                live_row,
+                Some(ActuationDetail::Motion { x: 3, y: 4 }),
+                &refused,
+            ),
+            (
+                Verb::ACTUATE_TEXT,
+                None,
+                Some(ActuationDetail::Text {
+                    chars: 5,
+                    bytes: 5,
+                    digest: ObservationDigest::of(b"hello"),
+                }),
+                &not_granted,
+            ),
         ] {
             rec.record(Event::UseDecision {
                 connection: ConnectionId::from_u64_for_test(1),
@@ -1737,6 +2531,7 @@ pub(crate) mod tests {
                 grant_wire_id: 10,
                 verb,
                 grant_row,
+                detail,
                 outcome,
             });
         }
@@ -1992,6 +2787,23 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A recorder whose fd rejects writes *and* whose path cannot be
+    /// reopened: the unrecoverable case, where degradation is permanent.
+    /// The path is a directory, so `open_append` fails every time.
+    fn unrecoverable_recorder(label: &str) -> (Recorder, PathBuf) {
+        let dir = scratch_log_path(label)
+            .parent()
+            .expect("scratch paths have a parent")
+            .to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        // A read-only handle on a real file: every write fails EBADF,
+        // deterministically and on every platform this core targets.
+        let read_only = File::open(&probe).expect("open the probe read-only");
+        (Recorder::with_file(read_only, dir.clone()), dir)
+    }
+
     #[test]
     fn a_write_failure_degrades_loudly_and_never_halts_the_caller() {
         let _fd = crate::capture::tests::fd_lock();
@@ -1999,13 +2811,8 @@ pub(crate) mod tests {
         // degraded, every later entry is *counted* rather than written, and
         // `record` still returns normally -- a diagnostic can never fail an
         // authority path.
-        let path = scratch_log_path("write-failure");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"").unwrap();
-        // A read-only handle on a real file: every write fails EBADF,
-        // deterministically and on every platform this core targets.
-        let read_only = File::open(&path).expect("open the scratch log read-only");
-        let mut rec = Recorder::with_file(read_only, path.clone());
+        let (mut rec, dir) = unrecoverable_recorder("write-failure");
+        let probe = dir.join("probe");
 
         assert!(!rec.is_degraded());
         for i in 1..=5u64 {
@@ -2016,19 +2823,170 @@ pub(crate) mod tests {
             assert_eq!(rec.dropped_entries(), i, "every lost entry is counted");
         }
         // Nothing reached the file, and nothing panicked.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert_eq!(std::fs::read_to_string(&probe).unwrap(), "");
 
         // The seq counter advanced anyway, so a later reader sees the gap
         // rather than a silently renumbered log.
-        let recovered = Recorder::create(&path).unwrap();
+        let recovered = Recorder::create(&probe).unwrap();
         assert_eq!(recovered.dropped_entries(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_is_bounded_so_a_permanently_failing_disk_cannot_storm() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The counterweight to recovery existing at all: a filesystem that
+        // stays broken must not buy one reopen+write per capture. The
+        // backoff is what bounds a *burst* (the attempt budget bounds the
+        // run), so a tight loop must spend exactly one attempt.
+        let (mut rec, dir) = unrecoverable_recorder("recovery-bounded");
+        for i in 1..=200u64 {
+            rec.record(Event::GrantExpired {
+                grant_id: GrantId::from_u64_for_test(i),
+            });
+        }
+        assert!(rec.is_degraded(), "the failure never cleared");
+        assert_eq!(rec.dropped_entries(), 200, "every entry is still counted");
+        assert_eq!(
+            rec.recovery_attempts(),
+            1,
+            "200 entries inside one backoff window must cost exactly one \
+             recovery attempt, not 200"
+        );
+        // Shutdown gets its one forced attempt on top -- bounded because
+        // shutdown happens once.
+        rec.finish();
+        assert_eq!(rec.recovery_attempts(), 2);
+        assert!(rec.recovery_attempts() <= RECOVERY_ATTEMPTS + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_transient_write_failure_leaves_an_interior_gap_and_a_footer() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The file-only evidence of degradation, which is the whole point
+        // of the policy: dropped entries must be able to form an INTERIOR
+        // hole -- bracketed by real entries and named by an explicit
+        // marker -- not merely a tail that ends the file indistinguishably
+        // from a SIGKILL.
+        let path = scratch_log_path("transient-failure");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        // A writable recorder first, so the gap has something before it.
+        let mut rec = Recorder::create(&path).unwrap();
+        rec.record(Event::GrantExpired {
+            grant_id: GrantId::from_u64_for_test(1),
+        });
+        // Now break the descriptor while leaving the path openable: the
+        // transient-failure shape (a full filesystem the operator clears).
+        rec.file = Some(File::open(&path).expect("a read-only handle rejects writes"));
+        rec.record(Event::GrantExpired {
+            grant_id: GrantId::from_u64_for_test(2),
+        });
+        assert!(rec.is_degraded(), "the write failed and latched");
+        assert_eq!(rec.dropped_entries(), 1);
+        // The next entry finds the recorder degraded, recovers, and lands.
+        rec.record(Event::GrantExpired {
+            grant_id: GrantId::from_u64_for_test(3),
+        });
+        assert!(!rec.is_degraded(), "recovery lifted the latch");
+        rec.finish();
+
+        let entries = read_log_allowing_gaps(&path);
+        let kinds: Vec<&str> = entries.iter().map(|e| e.str("kind")).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "grant_expired",
+                "recording_resumed",
+                "grant_expired",
+                "run_ended"
+            ],
+            "the marker sits INSIDE the log, between real entries"
+        );
+        // The gap is interior: entries exist on both sides of it, and the
+        // skipped `seq` is exactly the dropped entry.
+        let seqs: Vec<u64> = entries.iter().map(|e| e.u64("seq")).collect();
+        assert_eq!(seqs, vec![1, 3, 4, 5], "seq 2 was consumed and lost");
+        // And the gap describes itself rather than needing to be inferred.
+        assert_eq!(entries[1].u64("dropped_entries"), 1);
+        assert_eq!(entries[1].u64("attempt"), 1);
+        // The footer -- unwritable before recovery existed -- states the
+        // run total.
+        assert_eq!(entries[3].str("kind"), "run_ended");
+        assert_eq!(entries[3].u64("dropped_entries"), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_partial_line_is_terminated_so_the_next_line_stays_parseable() {
+        let _fd = crate::capture::tests::fd_lock();
+        // A write that lands a prefix and then fails leaves an
+        // unterminated fragment. Left alone it would swallow whatever is
+        // appended next -- gluing a later line onto it and producing
+        // something that is neither a tolerable trailing fragment nor a
+        // valid entry. Every line after the fragment must still parse.
+        let path = scratch_log_path("partial-line");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Stand in for the prefix a failed `write_all` left behind.
+        std::fs::write(&path, b"{\"schema_version\":1,\"run_id\":\"tru").unwrap();
+        let mut rec = Recorder::with_file(
+            File::open(&path).expect("a read-only handle rejects writes"),
+            path.clone(),
+        );
+        // This write fails (and so does its `\n` terminator), so the
+        // fragment is still unterminated and the recorder knows it.
+        rec.record(Event::GrantExpired {
+            grant_id: GrantId::from_u64_for_test(1),
+        });
+        assert!(rec.is_degraded());
+        // Recovery reopens the writable path; its first line must not be
+        // glued onto the fragment.
+        rec.record(Event::GrantExpired {
+            grant_id: GrantId::from_u64_for_test(2),
+        });
+        assert!(!rec.is_degraded());
+        rec.finish();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0], "{\"schema_version\":1,\"run_id\":\"tru",
+            "the fragment stays exactly one (invalid) line"
+        );
+        assert!(
+            Json::parse(lines[0]).is_err(),
+            "and it is the one invalid line a reader must tolerate"
+        );
+        for (i, line) in lines.iter().enumerate().skip(1) {
+            if line.is_empty() {
+                continue;
+            }
+            Json::parse(line).unwrap_or_else(|e| {
+                panic!("line {} after the fragment must parse ({e}): {line}", i + 1)
+            });
+        }
+        // The reader helper (which skips empties) sees a clean log after
+        // the fragment is discarded.
+        let after_fragment: String = text
+            .lines()
+            .skip(1)
+            .map(|l| format!("{l}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        std::fs::write(&path, after_fragment).unwrap();
+        let entries = read_log_allowing_gaps(&path);
+        let kinds: Vec<&str> = entries.iter().map(|e| e.str("kind")).collect();
+        assert_eq!(
+            kinds,
+            vec!["recording_resumed", "grant_expired", "run_ended"]
+        );
         cleanup(&path);
     }
 
     #[test]
     fn the_log_file_is_owner_only() {
         let _fd = crate::capture::tests::fd_lock();
-        use std::os::unix::fs::PermissionsExt;
 
         let (rec, path) = scratch_recorder("permissions");
         drop(rec);
@@ -2040,6 +2998,406 @@ pub(crate) mod tests {
             .mode()
             & 0o777;
         assert_eq!(dir_mode, 0o700);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_pre_existing_world_readable_log_is_tightened_before_anything_is_written() {
+        let _fd = crate::capture::tests::fd_lock();
+        // `OpenOptions::mode` applies only when the file is CREATED, so
+        // appending identities, peer uids and grant rows to an operator's
+        // existing 0644 file would leave them world-readable -- the 0600
+        // justification defeated by the one case it exists for.
+        let path = scratch_log_path("pre-existing-mode");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the fixture really is world-readable"
+        );
+
+        let mut rec = Recorder::create(&path).expect("an existing log is appendable");
+        rec.record(Event::HandshakeBound {
+            connection: ConnectionId::from_u64_for_test(1),
+            peer: peer(),
+            identity: &identity("vitrin://local/agent/demo"),
+            credential_type: "static-token",
+            credential_bytes: 32,
+        });
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the log must be private before an identity reaches it"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_symlinked_log_has_its_target_tightened_not_its_link() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The finding's exact shape: `--recorder` aimed at a symlink into a
+        // world-readable directory. `create(true)` follows the link, so the
+        // privacy check must land on the descriptor -- and therefore on the
+        // *target* -- or identities get appended to a 0644 file elsewhere.
+        let dir = scratch_log_path("symlinked")
+            .parent()
+            .expect("scratch paths have a parent")
+            .to_path_buf();
+        let elsewhere = dir.join("world-readable");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, Permissions::from_mode(0o755)).unwrap();
+        let target = elsewhere.join("shared.jsonl");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::set_permissions(&target, Permissions::from_mode(0o644)).unwrap();
+        let link = dir.join("log.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut rec = Recorder::create(&link).expect("a symlinked log is appendable");
+        rec.record(Event::HandshakeBound {
+            connection: ConnectionId::from_u64_for_test(1),
+            peer: peer(),
+            identity: &identity("vitrin://local/agent/demo"),
+            credential_type: "static-token",
+            credential_bytes: 32,
+        });
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the symlink's TARGET is what holds the identities, so it is what \
+             must be private"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_target_that_is_not_a_regular_file_is_refused() {
+        let _fd = crate::capture::tests::fd_lock();
+        // A character device opens for append perfectly happily, so
+        // without an explicit check the core would report "flight recorder
+        // open" and write the session into nothing. A fifo would be worse:
+        // a blocking write on the compositor thread. Neither is a log.
+        let err = Recorder::create(Path::new("/dev/null"))
+            .expect_err("a character device is not a log file");
+        assert!(err.to_string().contains("regular file"), "{err}");
+    }
+
+    // -- actuation detail and its secrecy judgement ------------------------
+
+    #[test]
+    fn pointer_actuations_record_every_parameter_that_reconstructs_them() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The verb alone cannot tell a move from a button press from a
+        // scroll, so an entry carrying only `verb` fails the "a human can
+        // reconstruct what was done" criterion for actuations even while
+        // meeting it for captures. Coordinates, button codes and scroll
+        // deltas leak nothing, so they are recorded in full.
+        let (mut rec, path) = scratch_recorder("pointer-detail");
+        let admitted = UseOutcome::Admitted {
+            grant: GrantId::from_u64_for_test(1),
+            frame: None,
+            spent_once: false,
+        };
+        for (i, detail) in [
+            ActuationDetail::Motion { x: -7, y: 1024 },
+            ActuationDetail::Button {
+                button: 0x110,
+                pressed: true,
+            },
+            ActuationDetail::Button {
+                button: 0x110,
+                pressed: false,
+            },
+            ActuationDetail::Scroll {
+                axis: Axis::Horizontal,
+                value120: -240,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rec.record(Event::UseDecision {
+                connection: ConnectionId::from_u64_for_test(1),
+                facet_wire_id: 20,
+                // Distinct grants: an admitted use is never aggregated
+                // anyway, but this keeps the test about detail alone.
+                grant_wire_id: 10 + i as u32,
+                verb: Verb::ACTUATE_POINTER,
+                grant_row: Some(GrantId::from_u64_for_test(1)),
+                detail: Some(detail),
+                outcome: &admitted,
+            });
+        }
+
+        let entries = read_log(&path);
+        assert_eq!(entries.len(), 4);
+        // Every one is distinguishable from the others -- the property the
+        // verb alone cannot provide.
+        let actions: Vec<&str> = entries.iter().map(|e| e.str("input.action")).collect();
+        assert_eq!(actions, vec!["move", "button", "button", "scroll"]);
+        assert_eq!(entries[0].at("input.x"), &Json::Num(-7.0));
+        assert_eq!(entries[0].u64("input.y"), 1024);
+        assert_eq!(entries[1].u64("input.button"), 0x110);
+        assert!(entries[1].bool("input.pressed"), "press and release differ");
+        assert!(!entries[2].bool("input.pressed"));
+        assert_eq!(entries[3].str("input.axis"), "horizontal");
+        assert_eq!(entries[3].at("input.value120"), &Json::Num(-240.0));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn typed_text_is_recorded_by_shape_and_digest_but_never_verbatim() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The secrecy judgement, asserted rather than documented: agent
+        // text is arbitrary user data -- passwords, tokens, private
+        // correspondence -- so the flight recorder records how much was
+        // typed and which string it was, never the string. There is no
+        // opt-in flag in v0 that changes this.
+        let secret = "hunter2-\u{1f512}-correct-horse-battery-staple";
+        let (mut rec, path) = scratch_recorder("text-secrecy");
+        let admitted = UseOutcome::Admitted {
+            grant: GrantId::from_u64_for_test(1),
+            frame: None,
+            spent_once: false,
+        };
+        let detail = ActuationDetail::of(&UseKind::Text(SeatInputKind::Text {
+            text: secret.to_string(),
+        }));
+        rec.record(Event::UseDecision {
+            connection: ConnectionId::from_u64_for_test(1),
+            facet_wire_id: 20,
+            grant_wire_id: 10,
+            verb: Verb::ACTUATE_TEXT,
+            grant_row: Some(GrantId::from_u64_for_test(1)),
+            detail,
+            outcome: &admitted,
+        });
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains(secret),
+            "typed text must NEVER appear in the log"
+        );
+        assert!(
+            !raw.contains("hunter2"),
+            "not even a prefix of it -- no truncated echo either"
+        );
+        let entries = read_log(&path);
+        let e = &entries[0];
+        assert_eq!(e.str("input.action"), "type");
+        // Shape: enough to reconstruct that something substantial was
+        // typed, and to pair two identical actuations.
+        assert_eq!(e.u64("input.chars"), secret.chars().count() as u64);
+        assert_eq!(e.u64("input.bytes"), secret.len() as u64);
+        assert_eq!(e.str("input.digest_alg"), DIGEST_ALG);
+        assert_eq!(
+            e.str("input.digest"),
+            ObservationDigest::of(secret.as_bytes()).to_hex(),
+            "the digest identifies the string without holding it"
+        );
+        // The entry has no member a string could hide in.
+        let Json::Obj(input) = e.at("input") else {
+            panic!("input is an object");
+        };
+        let keys: Vec<&str> = input.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["action", "chars", "bytes", "digest_alg", "digest"],
+            "no `text` member exists, in any configuration"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_capture_carries_a_frame_and_no_input_block() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rec, path) = scratch_recorder("capture-no-input");
+        let admitted = UseOutcome::Admitted {
+            grant: GrantId::from_u64_for_test(1),
+            frame: Some(ObservedFrame {
+                width: 4,
+                height: 2,
+                stride: 16,
+                bytes: 32,
+                digest: ObservationDigest::of(b"pixels"),
+            }),
+            spent_once: false,
+        };
+        assert_eq!(
+            ActuationDetail::of(&UseKind::Capture),
+            None,
+            "a capture actuates nothing"
+        );
+        rec.record(Event::UseDecision {
+            connection: ConnectionId::from_u64_for_test(1),
+            facet_wire_id: 20,
+            grant_wire_id: 10,
+            verb: Verb::OBSERVE,
+            grant_row: Some(GrantId::from_u64_for_test(1)),
+            detail: None,
+            outcome: &admitted,
+        });
+        let entries = read_log(&path);
+        assert!(entries[0].is_null("input"), "a capture observes, not acts");
+        assert!(!entries[0].is_null("frame"));
+        cleanup(&path);
+    }
+
+    // -- bounding refusal floods (without ever touching B1) ----------------
+
+    /// One refusal on `(conn-1, grant 10)`, as an ungranted facet's flood
+    /// produces it: no row, `not_granted`, muted on the wire.
+    fn record_not_granted(rec: &mut Recorder, verb: Verb) {
+        let refused = UseOutcome::Refused {
+            code: Refusal::NotGranted,
+            voiced: false,
+        };
+        rec.record(Event::UseDecision {
+            connection: ConnectionId::from_u64_for_test(1),
+            facet_wire_id: 20,
+            grant_wire_id: 10,
+            verb,
+            grant_row: None,
+            detail: None,
+            outcome: &refused,
+        });
+    }
+
+    #[test]
+    fn a_refusal_flood_costs_a_bounded_number_of_lines_but_is_never_silent() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The chokepoint refuses `not_granted` at its FIRST step, before
+        // the token bucket, so a facet whose grant never resolved granted
+        // is judged with no rate ceiling at all. The wire coalesces; the
+        // log must not be the remaining unbounded, unratelimited
+        // disk-growth and compositor-stall vector.
+        let (mut rec, path) = scratch_recorder("refusal-flood");
+        const FLOOD: usize = 5_000;
+        for _ in 0..FLOOD {
+            record_not_granted(&mut rec, Verb::ACTUATE_POINTER);
+        }
+        // Nothing outstanding at shutdown.
+        rec.finish();
+
+        let entries = read_log(&path);
+        let uses = of_kind(&entries, "use_decision");
+        assert_eq!(
+            uses.len(),
+            1,
+            "the first refusal of a run is written in full; repeats are not"
+        );
+        assert_eq!(uses[0].str("refusal"), "not_granted");
+        assert!(uses[0].is_null("grant_id"), "an ungranted facet has no row");
+
+        // ... but the condition is never silent: the repeats are counted.
+        let summaries = of_kind(&entries, "use_refusal_summary");
+        assert!(!summaries.is_empty(), "the flood must still be visible");
+        assert!(
+            entries.len() < FLOOD / 10,
+            "a {FLOOD}-request flood must not buy {FLOOD} synchronous writes \
+             (got {} lines)",
+            entries.len()
+        );
+        let counted: u64 = summaries.iter().map(|s| s.u64("repeats")).sum();
+        assert_eq!(
+            counted + 1,
+            FLOOD as u64,
+            "every refusal is accounted for -- one in full, the rest counted"
+        );
+        let last = summaries.last().unwrap();
+        assert_eq!(last.u64("total_in_run"), FLOOD as u64);
+        assert_eq!(last.str("refusal"), "not_granted");
+        assert_eq!(last.str("verb"), "actuate_pointer");
+        assert_eq!(last.str("decision"), "refused");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_refusal_run_ends_when_its_verb_or_code_changes() {
+        let _fd = crate::capture::tests::fd_lock();
+        // Aggregation must never merge distinct conditions: a different
+        // verb or a different refusal code is a different fact and earns
+        // its own full line, with the previous run's count flushed first.
+        let (mut rec, path) = scratch_recorder("refusal-run-boundary");
+        for _ in 0..3 {
+            record_not_granted(&mut rec, Verb::ACTUATE_POINTER);
+        }
+        record_not_granted(&mut rec, Verb::ACTUATE_TEXT);
+        rec.finish();
+
+        let entries = read_log(&path);
+        let kinds: Vec<&str> = entries.iter().map(|e| e.str("kind")).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "use_decision",        // first pointer refusal, in full
+                "use_refusal_summary", // its 2 repeats, flushed by the change
+                "use_decision",        // the text refusal, a new condition
+                "run_ended",
+            ]
+        );
+        assert_eq!(entries[0].str("verb"), "actuate_pointer");
+        assert_eq!(entries[1].u64("repeats"), 2);
+        assert_eq!(entries[1].str("verb"), "actuate_pointer");
+        assert_eq!(entries[2].str("verb"), "actuate_text");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn admitted_captures_are_never_suppressed_by_refusal_bounding() {
+        let _fd = crate::capture::tests::fd_lock();
+        // B1 is absolute and outranks the flood bound: every ALLOWED
+        // capture keeps its own entry with its own frame digest -- never
+        // sampled, never aggregated, no exceptions -- even when it is
+        // buried in a refusal flood on the same grant.
+        let (mut rec, path) = scratch_recorder("b1-vs-bounding");
+        let mut digests = Vec::new();
+        for i in 0..40u8 {
+            for _ in 0..25 {
+                record_not_granted(&mut rec, Verb::ACTUATE_POINTER);
+            }
+            let digest = ObservationDigest::of(&[i; 64]);
+            digests.push(digest.to_hex());
+            let admitted = UseOutcome::Admitted {
+                grant: GrantId::from_u64_for_test(1),
+                frame: Some(ObservedFrame {
+                    width: 8,
+                    height: 2,
+                    stride: 32,
+                    bytes: 64,
+                    digest,
+                }),
+                spent_once: false,
+            };
+            rec.record(Event::UseDecision {
+                connection: ConnectionId::from_u64_for_test(1),
+                facet_wire_id: 20,
+                // The SAME grant the flood is on: the admission must end
+                // the run rather than be swallowed by it.
+                grant_wire_id: 10,
+                verb: Verb::OBSERVE,
+                grant_row: Some(GrantId::from_u64_for_test(1)),
+                detail: None,
+                outcome: &admitted,
+            });
+        }
+        rec.finish();
+
+        let entries = read_log(&path);
+        let allowed: Vec<&Json> = of_kind(&entries, "use_decision")
+            .into_iter()
+            .filter(|e| e.str("decision") == "allowed")
+            .collect();
+        assert_eq!(allowed.len(), 40, "every admitted capture kept its entry");
+        let logged: Vec<&str> = allowed.iter().map(|e| e.str("frame.digest")).collect();
+        assert_eq!(logged, digests, "each with its OWN digest, in order");
+        // The refusals around them were bounded, so this is not merely
+        // "nothing was aggregated at all".
+        assert!(
+            !of_kind(&entries, "use_refusal_summary").is_empty(),
+            "the surrounding refusals really were aggregated"
+        );
         cleanup(&path);
     }
 }

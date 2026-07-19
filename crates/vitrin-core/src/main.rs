@@ -393,7 +393,11 @@ fn main() -> ExitCode {
 /// recorder and cannot have one must learn it before the session, not after
 /// it is unreconstructable), and the closing entry reports how many entries
 /// a mid-run write failure cost, since that is the one thing a truncated
-/// log cannot say about itself.
+/// log cannot say about itself. Closing goes through `Recorder::finish`,
+/// which spends one forced recovery attempt first — a run that degraded
+/// transiently can then still write its footer, and only a run that never
+/// recovered ends with no file-only evidence at all (which the operator
+/// message below says outright rather than implying otherwise).
 ///
 /// The handle stays here for now: nothing at runtime accepts principal
 /// connections yet (the listener wiring is M1.1 integration), and that
@@ -434,17 +438,30 @@ where
 
     let result = backend();
 
+    // `finish` forces one last recovery attempt before writing the footer,
+    // so a run that degraded transiently still closes with a `run_ended`
+    // naming the loss (crates/vitrin-core/src/recorder.rs, degradation
+    // policy).
+    recorder.finish();
     let dropped = recorder.dropped_entries();
-    recorder.record(Event::RunEnded {
-        dropped_entries: dropped,
-    });
     if dropped > 0 {
-        tracing::error!(
-            path = %path.display(),
-            dropped_entries = dropped,
-            "flight recorder was DEGRADED during this run; the log is incomplete \
-             (the gap is visible as skipped `seq` values)"
-        );
+        if recorder.is_degraded() {
+            tracing::error!(
+                path = %path.display(),
+                dropped_entries = dropped,
+                "flight recorder was DEGRADED during this run and never recovered; the log \
+                 ends mid-run with no footer -- from the file alone that is indistinguishable \
+                 from a SIGKILL, so THIS message is the only record that entries were lost"
+            );
+        } else {
+            tracing::error!(
+                path = %path.display(),
+                dropped_entries = dropped,
+                "flight recorder was DEGRADED during this run; the log is incomplete, and the \
+                 gap is marked in the file by skipped `seq` values plus a `recording_resumed` \
+                 entry naming the loss"
+            );
+        }
     }
 
     match result {

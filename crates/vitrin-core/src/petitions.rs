@@ -134,6 +134,31 @@
 //! when the connection dies is phase-refused at delivery and dropped
 //! whole -- safe, because its row was never minted (previous paragraph).
 //!
+//! **The `consent_held` mapping (P1.4.4, issue #28), absent a renderer.**
+//! The IDL keys the chokepoint's `consent_held` refusal on "the
+//! principal's own pending petition **has a prompt up**" -- prompt states
+//! are `queued`, `shown`, `closed`, and "up" is exactly **`shown`**
+//! ("visible; physical input is grabbed by the prompt"): the hold exists
+//! because the human is *actively deciding about this principal*, which a
+//! merely `queued` petition -- waiting behind another prompt or a policy
+//! decision, nothing on screen, no input grab -- does not entail. So the
+//! registry tracks a per-petition `prompt_shown` flag: E7's renderer
+//! (P1.7.2) calls [`PetitionRegistry::mark_prompt_shown`] when it
+//! composites the prompt (the same moment it emits
+//! `vitrin_consent.state(shown)` through the connection's emission path),
+//! and the prompt is *down* when the petition leaves the pending table
+//! (resolution or withdrawal -- the moments that emit/imply `closed`).
+//! The chokepoint asks [`PetitionRegistry::prompt_up_for`], keyed by
+//! verified **identity** (the IDL says "the principal's own", and a
+//! principal spanning several connections is one principal -- the same
+//! keying as the admission cap), so P1.7.2 inherits the enforcement
+//! semantics for free by calling `mark_prompt_shown`: nothing in the
+//! chokepoint changes when the renderer lands. In this build no renderer
+//! exists, so at runtime no prompt is ever `shown` and `consent_held`
+//! never fires -- honest: under `Interactive` nothing is on screen, and
+//! under `AutoApprove` the IDL itself allows "no transitions at all";
+//! tests (and later the renderer) drive the flag.
+//!
 //! **Realm knowledge is a name check in this build.** Version 1 serves the
 //! single well-known realm [`WELL_KNOWN_REALM`]; a petition through a
 //! handle minted with any other name resolves `unavailable` at admission.
@@ -304,6 +329,12 @@ struct PendingPetition {
     /// `admitted_at + consent_timeout`; expired (fail-closed, half-open)
     /// once `now >= deadline`.
     deadline: Instant,
+    /// Whether this petition's consent prompt is currently on screen
+    /// (module docs: the `consent_held` mapping). Set by
+    /// [`PetitionRegistry::mark_prompt_shown`] -- E7's renderer when it
+    /// lands, tests today -- and implicitly cleared when the petition
+    /// leaves the pending table.
+    prompt_shown: bool,
 }
 
 /// The effective authority a granted resolution carries -- what the
@@ -602,6 +633,9 @@ impl PetitionRegistry {
                         consent_wire_id: req.consent_wire_id,
                         requested,
                         deadline,
+                        // Born queued; the renderer (P1.7.2) flips this
+                        // when the prompt actually reaches the screen.
+                        prompt_shown: false,
                     },
                 );
                 Admission::Pending { petition }
@@ -654,6 +688,35 @@ impl PetitionRegistry {
     /// the E7 prompt queue reads the same number).
     pub fn pending_total(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Record that `petition`'s consent prompt is now on screen (module
+    /// docs: the `consent_held` mapping). The consent surface (P1.7.2)
+    /// calls this at the same moment it emits
+    /// `vitrin_consent.state(shown)`; tests drive it directly until the
+    /// renderer lands. Returns whether the petition was pending (a
+    /// resolved or withdrawn petition has no prompt to show -- `false`,
+    /// nothing recorded).
+    pub fn mark_prompt_shown(&mut self, petition: PetitionId) -> bool {
+        match self.pending.get_mut(&petition) {
+            Some(pending) => {
+                pending.prompt_shown = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether this verified identity currently has a consent prompt **on
+    /// screen** for any of its pending petitions, across all of its
+    /// connections -- the `consent_held` judgement the enforcement
+    /// chokepoint (P1.4.4) consults for actuations (module docs: `shown`
+    /// holds, `queued` does not, and resolution/withdrawal ends the hold
+    /// by removing the entry).
+    pub fn prompt_up_for(&self, identity: &PrincipalIdentity) -> bool {
+        self.pending
+            .values()
+            .any(|p| p.prompt_shown && p.identity == *identity)
     }
 
     /// This identity's pending-petition count across all its connections.
@@ -871,6 +934,47 @@ mod tests {
         assert_eq!(reg.pending_total(), 16);
         let req = request("vitrin://local/agent/fifth", conn, 900);
         expect_declined(reg.admit(req, t0), Outcome::Busy);
+    }
+
+    #[test]
+    fn prompt_up_tracks_shown_not_queued_and_ends_with_the_petition() {
+        // The consent_held mapping (module docs): only a SHOWN prompt
+        // holds, keyed by identity across connections, and the hold ends
+        // when the petition leaves the pending table.
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::Interactive);
+        let conn_a = reg.register_connection();
+        let conn_b = reg.register_connection();
+
+        let Admission::Pending { petition } = reg.admit(request(DEMO, conn_a, 10), t0) else {
+            panic!("interactive petition must pend");
+        };
+        // Queued is not up: nothing is on screen yet.
+        assert!(!reg.prompt_up_for(&identity(DEMO)));
+
+        assert!(reg.mark_prompt_shown(petition));
+        assert!(reg.prompt_up_for(&identity(DEMO)));
+        // Identity-keyed: another identity is unaffected, and the same
+        // identity is held regardless of which connection asks.
+        assert!(!reg.prompt_up_for(&identity("vitrin://local/agent/other")));
+
+        // Resolution removes the entry: the prompt is down.
+        let resolution = reg
+            .resolve_scripted(petition, ScriptedDecision::Deny)
+            .unwrap();
+        assert_eq!(resolution.connection, conn_a);
+        assert!(!reg.prompt_up_for(&identity(DEMO)));
+
+        // Withdrawal ends the hold the same way (the prompt disappears
+        // with the petitioner), and a gone petition cannot be marked.
+        let Admission::Pending { petition } = reg.admit(request(DEMO, conn_b, 10), t0) else {
+            panic!("interactive petition must pend");
+        };
+        assert!(reg.mark_prompt_shown(petition));
+        assert!(reg.prompt_up_for(&identity(DEMO)));
+        assert_eq!(reg.withdraw_connection(conn_b), 1);
+        assert!(!reg.prompt_up_for(&identity(DEMO)));
+        assert!(!reg.mark_prompt_shown(petition));
     }
 
     #[test]

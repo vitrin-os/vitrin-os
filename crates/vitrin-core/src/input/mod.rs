@@ -118,6 +118,13 @@
 //! everything) — the shape, placement, and ordering are the deliverable;
 //! both P1.7.x consumers attach without restructuring the router.
 //!
+//! The first real observe-side consumer is [`PresenceHook`] (P1.4.4): it
+//! feeds [`PhysicalPresence`], the physical-activity state behind the
+//! enforcement chokepoint's `preempted` refusal — attached exactly like
+//! P1.7.3's watcher will be (non-consuming, wraps an inner hook), so the
+//! chokepoint's "does physical input own the target" judgement rides the
+//! same single tap point as every other preemption policy.
+//!
 //! # What arrives later (deliberately not here)
 //!
 //! - **Agent actuation intake (P1.4.x):** `vitrin_actuator_pointer` /
@@ -173,8 +180,10 @@ pub(crate) enum SeatInputKind {
     Key { keysym: u32, state: KeyState },
     /// A Unicode string (the agent text-actuation path in v0; human
     /// input-method text becomes its physical twin in a later phase).
-    /// Runtime construction arrives with the P1.4.x actuation intake —
-    /// physical intake never produces it.
+    /// Constructed by the enforcement chokepoint's actuation intake
+    /// (P1.4.4, [`crate::enforcement`]) — physical intake never produces
+    /// it. Dead-code-allowed outside tests until the M1.1 wiring makes
+    /// that intake runtime-reachable.
     #[cfg_attr(not(test), allow(dead_code))]
     Text { text: String },
 }
@@ -202,8 +211,10 @@ impl SeatInput {
         }
     }
 
-    /// Tag input from a principal's actuator. The P1.4.x actuation path
-    /// wraps chokepoint-approved requests with this constructor.
+    /// Tag input from a principal's actuator. The enforcement chokepoint
+    /// (P1.4.4, [`crate::enforcement`]) wraps chokepoint-**admitted**
+    /// requests — and only those — with this constructor; the single-path
+    /// test there pins that no other non-test site mints emulated events.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn emulated(kind: SeatInputKind) -> Self {
         Self {
@@ -357,6 +368,164 @@ impl PreemptionHook for NoopHook {
 
     fn gate(&mut self, _input: &SeatInput) -> Gate {
         Gate::Deliver
+    }
+}
+
+/// How long after the last physical input event the human still "owns the
+/// target" for the enforcement chokepoint's `preempted` judgement (below).
+/// PRD Doc 2 SS8: "when a physical event arrives, in-flight agent
+/// actuations to the same focus are preempted and the agent's actuator is
+/// **transiently suspended**" -- this constant is the transient. 500 ms is
+/// long enough that an agent can never interleave into the middle of a
+/// human's click or keystroke burst, short enough that the human merely
+/// resting their hands does not wedge the agent; deployment tuning can
+/// join the M1.1 configuration surface if field experience demands it.
+pub(crate) const PHYSICAL_HOLD_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Staleness ceiling on the held-button hold: a physically held button
+/// owns the target however long the hold lasts -- but only while the
+/// device shows *any* sign of life within this ceiling. A hold whose
+/// device has been completely silent for the whole ceiling is stale and
+/// stops owning the target, and the next physical event purges it rather
+/// than resurrecting it. The realistic cause of a minute of total device
+/// silence with a button "down" is an unpaired press -- the device
+/// unplugged mid-hold, seat/device teardown, or an intake feeder that
+/// never synthesized the release -- and without an expiry one lost
+/// release would refuse every actuation `preempted` for the life of the
+/// process (PRD Doc 2 SS8 calls preemption a **transient** suspension; a
+/// permanent wedge is an availability bug, not fail-closed caution).
+/// Real drags survive far past the ceiling because any motion -- hand
+/// tremor included -- refreshes the activity clock. The M1.1 intake
+/// wiring SHOULD additionally synthesize releases on device removal (the
+/// libinput convention); this ceiling is the backstop that keeps a
+/// feeder gap from becoming a process-lifetime denial of actuation.
+pub(crate) const PHYSICAL_HOLD_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Physical-input presence: the state behind the enforcement chokepoint's
+/// `preempted` refusal (P1.4.4). "Physical human input owns the target
+/// right now" (IDL) holds while either
+///
+/// - a **physically pressed button is still down** (a human mid-click or
+///   mid-drag owns the target however long that takes, provided the
+///   device has shown life within [`PHYSICAL_HOLD_CEILING`] -- the
+///   stale-hold backstop documented on that constant), or
+/// - **any physical event arrived within [`PHYSICAL_HOLD_WINDOW`]** (the
+///   PRD's transient suspension after human activity).
+///
+/// Fed exclusively with the origin tag bound at intake (B2): emulated
+/// events -- including the chokepoint's own admitted actuations -- never
+/// count, so an agent can never extend its own preemption window. Time is
+/// injected ([`crate::grants`]' clock discipline): `note` records the
+/// caller's `now`, `owns_target` judges at the caller's `now`, and the
+/// chokepoint samples one instant per request for both.
+///
+/// One tracker serves the process in v0 (one realm, one seat, one human);
+/// per-realm presence is the Phase-2 multi-realm generalization.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Default)]
+pub(crate) struct PhysicalPresence {
+    /// Button codes of physically pressed, not-yet-released buttons (a
+    /// multiset, mirroring the router's implicit-grab bookkeeping).
+    held_buttons: Vec<u32>,
+    /// When the most recent physical event was observed.
+    last_activity: Option<std::time::Instant>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PhysicalPresence {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one observed intake event at `now`. Emulated events are
+    /// ignored -- only the physical origin bound at intake counts (B2),
+    /// so an agent's own admitted actuations can never extend its
+    /// preemption window. Takes `(origin, kind)` rather than a
+    /// [`SeatInput`] so that tests outside this module can model an
+    /// observed physical event without a physical-origin *constructor*
+    /// leaking out of intake; the only runtime feeder is
+    /// [`PresenceHook::observe`], which passes the tag intake bound.
+    pub fn note(&mut self, origin: Origin, kind: &SeatInputKind, now: std::time::Instant) {
+        if origin != Origin::Physical {
+            return;
+        }
+        // Self-heal before recording: if the device sat silent past the
+        // stale ceiling, `owns_target` already stopped honoring the held
+        // set ([`PHYSICAL_HOLD_CEILING`]), and fresh activity must not
+        // resurrect a hold whose release was lost during the gap.
+        if self
+            .last_activity
+            .is_some_and(|at| now.saturating_duration_since(at) >= PHYSICAL_HOLD_CEILING)
+        {
+            self.held_buttons.clear();
+        }
+        self.last_activity = Some(now);
+        if let SeatInputKind::Button { button, state } = kind {
+            match state {
+                ButtonState::Pressed => self.held_buttons.push(*button),
+                ButtonState::Released => {
+                    if let Some(i) = self.held_buttons.iter().position(|b| b == button) {
+                        self.held_buttons.remove(i);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The chokepoint's judgement: does physical human input own the
+    /// target at `now`? A held button owns while the device has shown
+    /// life within [`PHYSICAL_HOLD_CEILING`] (the stale-hold backstop);
+    /// any physical event owns within [`PHYSICAL_HOLD_WINDOW`].
+    pub fn owns_target(&self, now: std::time::Instant) -> bool {
+        let within = |window: std::time::Duration| {
+            self.last_activity
+                .is_some_and(|at| now.saturating_duration_since(at) < window)
+        };
+        (!self.held_buttons.is_empty() && within(PHYSICAL_HOLD_CEILING))
+            || within(PHYSICAL_HOLD_WINDOW)
+    }
+}
+
+/// The [`PhysicalPresence`] tracker attached at THE preemption hook point:
+/// an observe-side tap (the P1.7.3 attachment shape -- non-consuming, sees
+/// every event even while a future consent grab consumes delivery),
+/// wrapping an inner hook so the P1.7.x consumers stack beside it. Because
+/// the hook trait deliberately carries no clock (the router never reads
+/// one), the embedder that drives `route` shares a clock cell with this
+/// hook and advances it to the dispatch turn's injected `now` -- the same
+/// single-sample instant the rest of the turn uses.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PresenceHook<H: PreemptionHook> {
+    presence: std::rc::Rc<std::cell::RefCell<PhysicalPresence>>,
+    now: std::rc::Rc<std::cell::Cell<std::time::Instant>>,
+    inner: H,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<H: PreemptionHook> PresenceHook<H> {
+    pub fn new(
+        presence: std::rc::Rc<std::cell::RefCell<PhysicalPresence>>,
+        now: std::rc::Rc<std::cell::Cell<std::time::Instant>>,
+        inner: H,
+    ) -> Self {
+        Self {
+            presence,
+            now,
+            inner,
+        }
+    }
+}
+
+impl<H: PreemptionHook> PreemptionHook for PresenceHook<H> {
+    fn observe(&mut self, input: &SeatInput) {
+        self.presence
+            .borrow_mut()
+            .note(input.origin, &input.kind, self.now.get());
+        self.inner.observe(input);
+    }
+
+    fn gate(&mut self, input: &SeatInput) -> Gate {
+        self.inner.gate(input)
     }
 }
 
@@ -1733,5 +1902,166 @@ mod tests {
             Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             other => panic!("expected a silent wire, got: {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Physical presence (the chokepoint's `preempted` state, P1.4.4)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn physical_presence_holds_while_buttons_are_down_and_for_the_window_after() {
+        let t0 = std::time::Instant::now();
+        let mut presence = PhysicalPresence::new();
+        assert!(!presence.owns_target(t0), "idle by default");
+
+        // Any physical activity opens the transient window...
+        presence.note(Origin::Physical, &motion(1.0, 1.0), t0);
+        assert!(presence.owns_target(t0));
+        assert!(
+            presence.owns_target(t0 + PHYSICAL_HOLD_WINDOW - std::time::Duration::from_millis(1))
+        );
+        // ...which closes (half-open, fail-closed toward the human's side
+        // ending) exactly at the window bound.
+        assert!(!presence.owns_target(t0 + PHYSICAL_HOLD_WINDOW));
+
+        // A held physical button owns the target however long the hold
+        // lasts -- far past the activity window, up to the stale-hold
+        // ceiling (the dedicated test below).
+        presence.note(Origin::Physical, &press(), t0);
+        let much_later = t0 + PHYSICAL_HOLD_CEILING - std::time::Duration::from_millis(1);
+        assert!(presence.owns_target(much_later));
+        // Release at that instant: the hold ends, but the release is
+        // itself physical activity, so the window re-arms from it.
+        presence.note(Origin::Physical, &release(), much_later);
+        assert!(presence.owns_target(much_later));
+        assert!(!presence.owns_target(much_later + PHYSICAL_HOLD_WINDOW));
+
+        // Per-button-code pairing, mirroring the router: releasing a
+        // never-pressed code does not end another button's hold.
+        presence.note(Origin::Physical, &press(), much_later);
+        presence.note(
+            Origin::Physical,
+            &SeatInputKind::Button {
+                button: 0x111,
+                state: ButtonState::Released,
+            },
+            much_later,
+        );
+        assert!(presence.owns_target(much_later + PHYSICAL_HOLD_WINDOW * 2));
+    }
+
+    #[test]
+    fn stale_hold_expires_at_the_ceiling_and_is_never_resurrected() {
+        // The unpaired-press backstop (PHYSICAL_HOLD_CEILING docs): a
+        // Pressed whose Released was lost -- device unplugged mid-hold,
+        // seat teardown, a feeder that never synthesized the release --
+        // must not refuse `preempted` for the life of the process.
+        let t0 = std::time::Instant::now();
+        let mut presence = PhysicalPresence::new();
+        presence.note(Origin::Physical, &press(), t0);
+
+        // Held and alive: owns far past the transient window...
+        assert!(presence.owns_target(t0 + PHYSICAL_HOLD_WINDOW * 4));
+        assert!(
+            presence.owns_target(t0 + PHYSICAL_HOLD_CEILING - std::time::Duration::from_millis(1))
+        );
+        // ...but a full ceiling of device silence disowns it (half-open
+        // bound, mirroring the window's).
+        assert!(!presence.owns_target(t0 + PHYSICAL_HOLD_CEILING));
+
+        // Fresh activity after the stale gap re-arms only the transient
+        // window; the phantom hold was purged, so the agent is unblocked
+        // one window later -- never wedged forever.
+        let resumed = t0 + PHYSICAL_HOLD_CEILING + std::time::Duration::from_secs(1);
+        presence.note(Origin::Physical, &motion(5.0, 5.0), resumed);
+        assert!(presence.owns_target(resumed));
+        assert!(!presence.owns_target(resumed + PHYSICAL_HOLD_WINDOW));
+
+        // A real drag never lapses: each event refreshes the activity
+        // clock while the button stays held, across any total span.
+        let mut t = resumed;
+        presence.note(Origin::Physical, &press(), t);
+        for _ in 0..4 {
+            t += PHYSICAL_HOLD_CEILING / 2;
+            presence.note(Origin::Physical, &motion(6.0, 6.0), t);
+        }
+        assert!(
+            presence.owns_target(t + PHYSICAL_HOLD_WINDOW * 2),
+            "a live hold outlasts the ceiling as long as the device shows life"
+        );
+    }
+
+    #[test]
+    fn emulated_events_never_extend_the_preemption_window() {
+        // An agent's own admitted actuations are origin-tagged emulated;
+        // they must not let the agent preempt itself (or another agent).
+        let t0 = std::time::Instant::now();
+        let mut presence = PhysicalPresence::new();
+        presence.note(Origin::Emulated, &motion(1.0, 1.0), t0);
+        presence.note(Origin::Emulated, &press(), t0);
+        assert!(!presence.owns_target(t0));
+    }
+
+    #[test]
+    fn presence_hook_taps_the_router_at_the_b2_hook_point() {
+        // The tracker attaches exactly like P1.7.3's watcher: an
+        // observe-side tap that sees every event -- including ones a
+        // consuming gate stops -- while delivery proceeds through the
+        // inner hook untouched.
+        let t0 = std::time::Instant::now();
+        let presence = Rc::new(RefCell::new(PhysicalPresence::new()));
+        let clock = Rc::new(Cell::new(t0));
+        let consume = Rc::new(Cell::new(false));
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut router = InputRouter::new(PresenceHook::new(
+            Rc::clone(&presence),
+            Rc::clone(&clock),
+            RecordingHook {
+                log: Rc::clone(&log),
+                consume: Rc::clone(&consume),
+            },
+        ));
+        let view = (64, 48);
+        let surface = Some((64, 48));
+
+        // A delivered physical motion is observed and recorded at the
+        // clock cell's injected instant.
+        assert!(router
+            .route(phys(motion(2.0, 2.0)), view, surface)
+            .is_some());
+        assert!(presence.borrow().owns_target(t0));
+        assert!(!presence.borrow().owns_target(t0 + PHYSICAL_HOLD_WINDOW));
+
+        // A consumed event still reaches the tap (observe precedes the
+        // gate), at the advanced clock.
+        let t1 = t0 + std::time::Duration::from_secs(10);
+        clock.set(t1);
+        consume.set(true);
+        assert!(router
+            .route(phys(motion(3.0, 3.0)), view, surface)
+            .is_none());
+        assert!(presence.borrow().owns_target(t1));
+
+        // Emulated events pass the tap without arming it.
+        let t2 = t1 + std::time::Duration::from_secs(10);
+        clock.set(t2);
+        consume.set(false);
+        assert!(router
+            .route(SeatInput::emulated(scroll()), view, surface)
+            .is_some());
+        assert!(!presence.borrow().owns_target(t2));
+
+        // The inner hook saw everything, in observe-then-gate order.
+        assert_eq!(
+            log.borrow().as_slice(),
+            &[
+                ("observe", Origin::Physical),
+                ("gate", Origin::Physical),
+                ("observe", Origin::Physical),
+                ("gate", Origin::Physical),
+                ("observe", Origin::Emulated),
+                ("gate", Origin::Emulated),
+            ]
+        );
     }
 }

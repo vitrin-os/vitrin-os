@@ -77,9 +77,44 @@
 //! principal's rows allow this use" and MUST NOT back facet-borne uses:
 //! serving a facet's use from whichever row fits would resurrect a dead
 //! grant's inert facets and misattribute the use. No version-1 wire path
-//! needs the principal-keyed form (every use is facet-borne); it remains
-//! as the seam for later non-facet admission, and if P1.4.4 lands with no
-//! caller for it, retiring it is the right call.
+//! needs the principal-keyed form (every use is facet-borne) -- P1.4.4
+//! landed on [`GrantTable::check_use_grant`] alone, and the chokepoint's
+//! single-path test pins `.check_use(` to this module; it remains as the
+//! documented seam for later non-facet admission (Phase-2 selectors), to
+//! be retired if that phase does not claim it.
+//!
+//! **Two-phase admission for the chokepoint (P1.4.4, this task's edit).**
+//! [`GrantTable::check_use_grant`] is a **pure judgement** (`&self`,
+//! consumes nothing); the chokepoint completes an admission with
+//! [`GrantTable::commit_use`], which is what spends a `once` rung's single
+//! use. Split because the chokepoint judges *more* than the row (rate
+//! bucket, consent-held, preemption, surface presence), and the IDL's
+//! transient refusals promise recovery: `consent_held` holds "until the
+//! prompt closes", `preempted` "right now", `rate_limited` hints a refill
+//! -- a `once` grant burned by a refused-and-never-delivered attempt would
+//! break every one of those promises. So refusal consumes nothing, and
+//! authority is consumed exactly by the use the chokepoint finally admits
+//! (`commit_use` runs before the operation itself: a post-admission
+//! server-side failure -- `internal` -- still leaves the `once` spent,
+//! fail-closed, exactly as documented below). The principal-keyed
+//! [`GrantTable::check_use`] keeps its one-call admission semantics: it
+//! answers a different question (admission, not judgement) and backs no
+//! wire path.
+//!
+//! **Proactive expiry: an embedder-polled sweep, advisory only.** The
+//! issue-#28 decision: expiry is checked on use AND flipped proactively so
+//! a dead grant does not *report* itself alive between uses.
+//! [`GrantTable::expire_due`] follows the exact pattern of
+//! [`petitions::expire_due`](crate::petitions::PetitionRegistry::expire_due)
+//! -- injected `now`, embedder-polled (a calloop timer at M1.1; tests call
+//! it directly) -- and flips still-`Active` rows whose deadline passed to
+//! a *stored* expired state, returning the newly dead ids (the flight
+//! recorder's "grant expired without a use" feed, P1.4.5). It is
+//! deliberately **never load-bearing for enforcement**: every read surface
+//! ([`GrantTable::get`], [`GrantTable::rows`]) and every use-time check
+//! already folds `now >= deadline` in, so a late -- or never-run -- poll
+//! extends nothing. Version 1 has no expiry push event (the same growth
+//! seam as revocation), so the sweep drives no wire traffic.
 //!
 //! **Refusal precedence (documented determinism, not policy).** Per row,
 //! verb membership is judged first: a row whose effective set never
@@ -112,7 +147,8 @@
 //!
 //! **What the table does *not* do.** No rate limiting: `max_event_rate` is
 //! stored and handed to the chokepoint in [`Allowed`], but the token bucket
-//! is P1.4.4's, in the input router (PRD Doc 2 sections 5.2/8) -- a
+//! is P1.4.4's, in the enforcement chokepoint
+//! ([`crate::enforcement`]; PRD Doc 2 sections 5.2/8) -- a
 //! table-side bucket would be a second enforcement site. No consent, no
 //! petition policy, no realm existence checks (an unknown realm resolves
 //! `unavailable` in the petition flow, P1.4.3): the table answers exactly
@@ -513,12 +549,19 @@ pub(crate) enum GrantState {
 // The table
 // ---------------------------------------------------------------------------
 
-/// Stored liveness (what queries cannot derive from time alone).
+/// Stored liveness (what queries cannot derive from time alone -- plus the
+/// proactive sweep's stored flip, which queries *could* derive but the
+/// sweep records so a row's death without a use is an explicit,
+/// once-reported event).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Liveness {
     Active,
     /// The `once` rung's single use is consumed.
     Spent,
+    /// The proactive sweep ([`GrantTable::expire_due`]) recorded the time
+    /// bound passing. Advisory bookkeeping: the deadline check in every
+    /// query is what enforces expiry, sweep or no sweep.
+    Expired,
     /// Explicitly revoked (tombstoned so the next use refuses `revoked`).
     Revoked,
 }
@@ -552,7 +595,7 @@ impl Entry {
         if self.deadline.is_some_and(|deadline| now >= deadline) {
             return Some(RefusalReason::Expired);
         }
-        if self.liveness == Liveness::Spent {
+        if matches!(self.liveness, Liveness::Spent | Liveness::Expired) {
             return Some(RefusalReason::Expired);
         }
         None
@@ -567,6 +610,7 @@ impl Entry {
         match self.liveness {
             Liveness::Revoked => GrantState::Revoked,
             _ if self.deadline.is_some_and(|deadline| now >= deadline) => GrantState::Expired,
+            Liveness::Expired => GrantState::Expired,
             Liveness::Spent => GrantState::Spent,
             Liveness::Active => GrantState::Active,
         }
@@ -747,10 +791,11 @@ impl GrantTable {
     /// arriving through a facet co-minted with exactly that grant --
     /// perform `verb` at `now`, on behalf of `principal` (the verified
     /// identity bound to the connection the facet lives on)? One call per
-    /// capture or actuation, from the single enforcement site; the IDL
-    /// makes refusal semantics grant-scoped (a dead grant's facets go
-    /// inert even while a sibling grant of the same principal covers the
-    /// verb), so admission consults only this grant's row.
+    /// capture or actuation, from the single enforcement site
+    /// ([`crate::enforcement`]); the IDL makes refusal semantics
+    /// grant-scoped (a dead grant's facets go inert even while a sibling
+    /// grant of the same principal covers the verb), so the judgement
+    /// consults only this grant's row.
     ///
     /// A missing row (never existed, or removed at connection teardown)
     /// and a `principal` that does not own the row both refuse
@@ -762,22 +807,24 @@ impl GrantTable {
     /// address exactly the granted resource; a finer in-resource target
     /// parameter arrives with Phase-2 selectors).
     ///
-    /// Allowing consumes a `once` row's single use, exactly as
-    /// [`GrantTable::check_use`] does -- fail-closed even if the operation
-    /// later fails server-side.
+    /// **Pure judgement, consumes nothing** (module docs: two-phase
+    /// admission): the chokepoint has further checks to run after this
+    /// one, and a refused use must never burn single-use authority. The
+    /// admission it finally reaches is committed with
+    /// [`GrantTable::commit_use`].
     pub fn check_use_grant(
-        &mut self,
+        &self,
         grant: GrantId,
         principal: &PrincipalIdentity,
         verb: Verb,
         now: Instant,
     ) -> Result<Allowed, RefusalReason> {
         // Same empty-verb guard as `check_use` (module docs): fail closed
-        // before the row is consulted or consumed.
+        // before the row is consulted.
         if verb.bits() == 0 {
             return Err(RefusalReason::NotGranted);
         }
-        let Some(entry) = self.entries.get_mut(&grant) else {
+        let Some(entry) = self.entries.get(&grant) else {
             return Err(RefusalReason::NotGranted);
         };
         if entry.row.principal_id != *principal {
@@ -786,13 +833,50 @@ impl GrantTable {
         if let Some(reason) = entry.refusal_for(verb, now) {
             return Err(reason);
         }
-        if entry.row.persistence == PersistenceRung::Once {
-            entry.liveness = Liveness::Spent;
-        }
         Ok(Allowed {
             grant_id: grant,
             max_event_rate: entry.row.constraints.max_event_rate,
         })
+    }
+
+    /// Commit one admitted use of `grant` (P1.4.4, the second phase of
+    /// two-phase admission): spends a `once` rung's single use; a no-op
+    /// for `while_running`. Called by the enforcement chokepoint exactly
+    /// once per finally-admitted use, after every check passed and
+    /// *before* the operation runs -- so a post-admission server-side
+    /// failure (`internal`) still leaves the `once` consumed, fail-closed
+    /// and never authority-expanding (module docs). Defensive: only an
+    /// `Active` row can be spent, so a misordered call can never turn a
+    /// revoked or expired row into a merely-spent one.
+    pub fn commit_use(&mut self, grant: GrantId) {
+        if let Some(entry) = self.entries.get_mut(&grant) {
+            if entry.row.persistence == PersistenceRung::Once && entry.liveness == Liveness::Active
+            {
+                entry.liveness = Liveness::Spent;
+            }
+        }
+    }
+
+    /// The proactive expiry sweep (P1.4.4; module docs): flip every
+    /// still-`Active` row whose time bound has passed at `now` to the
+    /// stored expired state and return the newly dead ids, ascending.
+    /// Embedder-polled on the same cadence as
+    /// [`PetitionRegistry::expire_due`](crate::petitions::PetitionRegistry::expire_due)
+    /// (a calloop timer at M1.1); idempotent -- a second poll reports
+    /// nothing new -- and advisory: every query already folds the deadline
+    /// in, so enforcement never depends on this having run. Revoked and
+    /// spent rows are already dead and are not reported.
+    pub fn expire_due(&mut self, now: Instant) -> Vec<GrantId> {
+        let mut newly_expired = Vec::new();
+        for (&id, entry) in &mut self.entries {
+            if entry.liveness == Liveness::Active
+                && entry.deadline.is_some_and(|deadline| now >= deadline)
+            {
+                entry.liveness = Liveness::Expired;
+                newly_expired.push(id);
+            }
+        }
+        newly_expired
     }
 
     /// Revoke one grant (panel or policy). Returns whether the grant
@@ -1288,20 +1372,32 @@ mod tests {
         let once_id = table.insert(once, t0).unwrap();
         let wr_id = table.insert(spec(DEMO, Verb::OBSERVE, None), t0).unwrap();
 
-        // Facet-borne use of the once grant consumes the once grant even
-        // though a durable sibling covers the verb: the agent designated
-        // which authority it exercised (no cross-row selection here).
-        assert_eq!(
-            table
-                .check_use_grant(once_id, &principal(DEMO), Verb::OBSERVE, t0)
-                .map(|allowed| allowed.grant_id),
-            Ok(once_id)
-        );
+        // The judgement is pure: asking twice consumes nothing (two-phase
+        // admission, module docs) -- even for a `once` grant, and even
+        // though a durable sibling covers the verb (no cross-row
+        // selection: the agent designated which authority it exercised).
+        for _ in 0..2 {
+            assert_eq!(
+                table
+                    .check_use_grant(once_id, &principal(DEMO), Verb::OBSERVE, t0)
+                    .map(|allowed| allowed.grant_id),
+                Ok(once_id)
+            );
+        }
+        assert_eq!(table.get(once_id, t0).unwrap().1, GrantState::Active);
+        // The commit is what spends the single use, on this row alone.
+        table.commit_use(once_id);
         assert_eq!(table.get(once_id, t0).unwrap().1, GrantState::Spent);
         assert_eq!(
             table.check_use_grant(once_id, &principal(DEMO), Verb::OBSERVE, t0),
             Err(RefusalReason::Expired)
         );
+        // Committing a while_running use is a no-op, forever.
+        table.commit_use(wr_id);
+        assert_eq!(table.get(wr_id, t0).unwrap().1, GrantState::Active);
+        // Committing a dead or missing row changes nothing (defensive).
+        table.commit_use(once_id);
+        assert_eq!(table.get(once_id, t0).unwrap().1, GrantState::Spent);
 
         // An ungranted verb on a live grant refuses `not_granted`...
         assert_eq!(
@@ -1320,6 +1416,59 @@ mod tests {
         assert_eq!(
             table.check_use_grant(wr_id, &principal(DEMO), Verb::OBSERVE, t0),
             Err(RefusalReason::NotGranted)
+        );
+    }
+
+    #[test]
+    fn proactive_sweep_flips_state_without_a_use() {
+        // The issue-#28 acceptance: a time-bounded grant must not linger
+        // *reporting itself* usable until its next call. The sweep flips
+        // stored state with no use in between; enforcement itself never
+        // depends on it (the deadline check runs on every query).
+        let t0 = t0();
+        let mut table = GrantTable::new();
+        let bounded = table
+            .insert(spec(DEMO, Verb::OBSERVE, Some(Duration::from_secs(5))), t0)
+            .unwrap();
+        let unbounded = table.insert(spec(DEMO, Verb::OBSERVE, None), t0).unwrap();
+        let revoked = table
+            .insert(spec(DEMO, Verb::OBSERVE, Some(Duration::from_secs(5))), t0)
+            .unwrap();
+        assert!(table.revoke(revoked));
+
+        // Strictly before the deadline: nothing due.
+        assert!(table
+            .expire_due(t0 + Duration::from_millis(4_999))
+            .is_empty());
+
+        // At the (half-open, fail-closed) deadline: exactly the bounded
+        // active row flips -- the unbounded row lives, and the revoked row
+        // is already dead so it is not re-reported as newly expired.
+        let deadline = t0 + Duration::from_secs(5);
+        assert_eq!(table.expire_due(deadline), vec![bounded]);
+        assert_eq!(table.get(bounded, deadline).unwrap().1, GrantState::Expired);
+        assert_eq!(
+            table.get(unbounded, deadline).unwrap().1,
+            GrantState::Active
+        );
+        assert_eq!(table.get(revoked, deadline).unwrap().1, GrantState::Revoked);
+
+        // Idempotent: the next poll reports nothing new.
+        assert!(table
+            .expire_due(deadline + Duration::from_secs(1))
+            .is_empty());
+
+        // The flipped row refuses `expired` on use, and revoking it later
+        // still wins the precedence (the deliberate act is the loudest
+        // fact) -- the stored flip does not shadow revocation.
+        assert_eq!(
+            table.check_use_grant(bounded, &principal(DEMO), Verb::OBSERVE, deadline),
+            Err(RefusalReason::Expired)
+        );
+        assert!(table.revoke(bounded));
+        assert_eq!(
+            table.check_use_grant(bounded, &principal(DEMO), Verb::OBSERVE, deadline),
+            Err(RefusalReason::Revoked)
         );
     }
 

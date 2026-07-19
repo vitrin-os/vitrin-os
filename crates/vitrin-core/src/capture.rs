@@ -1,4 +1,4 @@
-//! The capture service: the server side of `vitrin_view.capture_frame`
+//! Capture-frame mechanics: the pixel half of `vitrin_view.capture_frame`
 //! (P1.3.6, the observe half of artifact A1).
 //!
 //! One capture = one software copy of the realm view into a **fresh, sealed
@@ -13,7 +13,7 @@
 //!
 //! # Capture timing: latest completed frame, never render-on-demand
 //!
-//! The decision this task settles. A capture reads the compositor's
+//! The decision P1.3.6 settled. A capture reads the compositor's
 //! **retained, last-completed framebuffer** (the headless backend's virtual
 //! output image, [`crate::backend::headless`]); it never triggers a
 //! composite of its own. Rationale:
@@ -36,27 +36,30 @@
 //!   rendering at request time could observe a half-updated scene.
 //! - **Cost isolation.** Compositing cost stays on the compositor's own
 //!   damage/frame cadence and can never be driven by agent request rate;
-//!   the per-grant rate limit (hook below, mechanics P1.4.4) then bounds
-//!   only the copy cost of capture itself.
+//!   the per-grant rate limit (the chokepoint's token bucket, P1.4.4) then
+//!   bounds only the copy cost of capture itself.
 //!
-//! # The enforcement seam (P1.4.4 hook)
+//! # Mechanics only — enforcement lives at the chokepoint (P1.4.4)
 //!
-//! [`CaptureGate`] is where the **single enforcement chokepoint** plugs in.
-//! [`CaptureService::serve`] consults the gate exactly once per
-//! `capture_frame`, before any pixel is copied; there is no other
-//! authority-checking path to a frame. This module ships only the seam —
-//! no policy: the M1.1 walking skeleton installs [`AutoApprove`] (the
-//! auto-approved-grant posture of milestone M1.1), and P1.4.4 replaces it
-//! with the real connection → principal → grant → verbs → constraints check
-//! plus the per-grant `max_event_rate` token bucket.
+//! This module deliberately contains **no authority code and no wire
+//! emission**: P1.3.6's `CaptureGate` seam and its `CaptureService` were
+//! replaced — not wrapped — by the enforcement chokepoint
+//! ([`crate::enforcement::Chokepoint::enforce_use`]), exactly as the seam's
+//! own docs promised. Every `capture_frame` is admitted or refused *there*
+//! (connection → principal → grant → verbs → constraints), and only an
+//! admitted capture reaches [`render_frame`], which converts pixels and
+//! seals the memfd — it cannot refuse, cannot allow, and cannot speak on
+//! the wire. The chokepoint's single-path test pins that `render_frame` has
+//! no caller outside the chokepoint (and this module's own mechanics
+//! tests): there is no legacy capture entry left to bypass enforcement
+//! through.
 
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 use rustix::fs::{MemfdFlags, SealFlags};
-use vitrin_ipc::{Connection, TransportError};
-use vitrin_protocol::generated::vitrin_grant::{self, Refusal, Verb};
 use vitrin_protocol::generated::vitrin_view::{events::FrameReady, Format, FrameFlags};
 
 /// Bytes per pixel of the version-1 capture format (`xrgb8888`); the IDL
@@ -79,217 +82,72 @@ pub(crate) struct RealmViewFrame<'a> {
     pub height: u32,
 }
 
-/// The wire identities a capture answers on: `frame_ready` is an event on
-/// the `vitrin_view` facet, `refused` on its co-minted `vitrin_grant`
-/// handle. Both are connection-scoped object ids (sender-constrained
-/// handles — an id is only ever honored on the connection that minted it).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CaptureIds {
-    /// The `vitrin_view` object the `capture_frame` arrived on.
-    pub view_id: u32,
-    /// The grant handle co-minted with that view (`vitrin_grant.refused`
-    /// is the failure terminal).
-    pub grant_id: u32,
+/// Why [`render_frame`] could not produce a frame. Every case is a
+/// server-side condition (never the agent's fault) that the chokepoint
+/// voices as the recoverable refusal `internal` — fail closed, never a
+/// torn connection and never a contract-violating frame.
+#[derive(Debug)]
+pub(crate) enum CaptureError {
+    /// The readback buffer disagrees with the claimed dimensions — a
+    /// corrupted readback, not a dead realm (an agent must not conclude
+    /// the shim crashed from a readback bug, so this is `internal`, never
+    /// `no_surface`).
+    MisSizedReadback { got: usize, expected: usize },
+    /// The view has a zero dimension. Defense in depth: the chokepoint
+    /// refuses `no_surface` before calling [`render_frame`], so reaching
+    /// this arm is a core bug surfacing typed (`internal`) — `frame_ready`
+    /// dimensions are always nonzero and this module will not fabricate an
+    /// empty frame.
+    DegenerateView { width: u32, height: u32 },
+    /// memfd creation, write, or sealing failed.
+    Memfd(io::Error),
 }
 
-/// A use-time refusal decided by the [`CaptureGate`]: the wire code plus
-/// the `retry_after_ms` refill hint (nonzero only for
-/// [`Refusal::RateLimited`], per the IDL).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CaptureRefusal {
-    pub code: Refusal,
-    pub retry_after_ms: u32,
-}
-
-/// The enforcement-chokepoint seam (P1.4.4 plugs in here).
-///
-/// Called exactly once per `capture_frame`, before any pixel is copied.
-/// `Ok(())` admits the capture; `Err` refuses it recoverably and the
-/// service voices the refusal as `vitrin_grant.refused(observe, code,
-/// retry_after_ms)` — the caller never sends a second verdict.
-///
-/// Invariant (PRD Doc 2 §5, plan P1.4.4): this is the **only** authority
-/// decision on the capture path. Implementations carry the whole
-/// connection → principal → grant → verbs → constraints check and the
-/// per-grant token bucket; no other capture code may accept or refuse on
-/// authority grounds. (The `no_surface` refusal the service itself emits
-/// for a degenerate view is a resource-existence outcome, not an authority
-/// decision — the IDL's "never a stale frame" rule.)
-pub(crate) trait CaptureGate {
-    fn admit_capture(&mut self) -> Result<(), CaptureRefusal>;
-}
-
-/// The M1.1 walking-skeleton gate: every capture is admitted, matching the
-/// milestone's auto-approved-grant posture ("agent … captures a
-/// pixel-correct frame under an auto-approved grant"). Replaced — not
-/// wrapped — by the real chokepoint in P1.4.4.
-pub(crate) struct AutoApprove;
-
-impl CaptureGate for AutoApprove {
-    fn admit_capture(&mut self) -> Result<(), CaptureRefusal> {
-        Ok(())
-    }
-}
-
-/// How one `capture_frame` request was answered (its terminal event, which
-/// [`CaptureService::serve`] has already put on the wire).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CaptureOutcome {
-    /// `frame_ready` sent: a fresh sealed memfd left with the reply.
-    Delivered,
-    /// `vitrin_grant.refused(observe, code, …)` sent.
-    Refused(Refusal),
-}
-
-/// The capture service: answers `capture_frame` requests on one realm view.
-///
-/// Owns nothing but the gate; pixels come in per call (the caller reads
-/// them from the retained framebuffer) and leave as a fresh memfd per
-/// request. Serving is infallible at the protocol level — every failure
-/// after admission maps to a recoverable refusal (`no_surface`,
-/// `internal`), never a torn connection; only transport-level send errors
-/// (peer gone, queue overflow — the P1.2.3 disconnect policy) surface as
-/// `Err`.
-pub(crate) struct CaptureService<G> {
-    gate: G,
-}
-
-impl<G: CaptureGate> CaptureService<G> {
-    pub fn new(gate: G) -> Self {
-        Self { gate }
-    }
-
-    /// Answer one `capture_frame`: consult the gate, copy the latest
-    /// completed frame into a fresh sealed memfd, and send exactly one
-    /// terminal event on `conn` — `frame_ready` (with the memfd riding
-    /// `SCM_RIGHTS`) or `vitrin_grant.refused`. The service's copy of the
-    /// fd is closed before this returns ("the server closes its own copy
-    /// after sending"); `send_or_queue` duplicates it if the frame parks.
-    ///
-    /// Terminals are emitted in call order and never coalesced (the IDL's
-    /// reply-bearing contract): callers dispatch pipelined `capture_frame`
-    /// requests to `serve` in arrival order and the wire order follows.
-    pub fn serve(
-        &mut self,
-        view: RealmViewFrame<'_>,
-        ids: CaptureIds,
-        conn: &mut Connection,
-    ) -> Result<CaptureOutcome, TransportError> {
-        // The single authority decision (see CaptureGate).
-        if let Err(refusal) = self.gate.admit_capture() {
-            return refuse(conn, ids.grant_id, refusal);
-        }
-
-        // Resource existence, not authority: a view with no pixels never
-        // yields a frame (frame_ready's dimensions are always nonzero).
-        // Today this arm is the degenerate-view backstop; when the realm's
-        // surface can genuinely vanish (shim crash, P1.5+) that condition
-        // lands here too.
-        if view.width == 0 || view.height == 0 {
-            return refuse(
-                conn,
-                ids.grant_id,
-                CaptureRefusal {
-                    code: Refusal::NoSurface,
-                    retry_after_ms: 0,
-                },
-            );
-        }
-
-        // A nonzero-dimension view whose readback buffer is mis-sized is a
-        // server-side invariant break (a corrupted readback, not a dead
-        // realm): the IDL's `internal` refusal, never `no_surface` — an
-        // agent must not conclude the shim crashed from a readback bug.
-        let expected_len = view.width as usize * view.height as usize * BYTES_PER_PIXEL;
-        if view.rgba.len() != expected_len {
-            tracing::warn!(
-                got = view.rgba.len(),
-                expected = expected_len,
-                "capture readback length mismatch, refusing internal"
-            );
-            return refuse(
-                conn,
-                ids.grant_id,
-                CaptureRefusal {
-                    code: Refusal::Internal,
-                    retry_after_ms: 0,
-                },
-            );
-        }
-
-        // The copy: convert the readback to the wire pixel format and seal
-        // it into a fresh memfd. A local failure here is the IDL's
-        // `internal` refusal ("server-side failure during this capture"),
-        // recoverable by design.
-        let fd = match sealed_frame_memfd(&rgba_to_xrgb8888(view.rgba)) {
-            Ok(fd) => fd,
-            Err(err) => {
-                tracing::warn!("capture memfd failed, refusing internal: {err}");
-                return refuse(
-                    conn,
-                    ids.grant_id,
-                    CaptureRefusal {
-                        code: Refusal::Internal,
-                        retry_after_ms: 0,
-                    },
-                );
+impl fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CaptureError::MisSizedReadback { got, expected } => {
+                write!(f, "capture readback length {got}, expected {expected}")
             }
-        };
+            CaptureError::DegenerateView { width, height } => {
+                write!(f, "degenerate {width}x{height} view reached render_frame")
+            }
+            CaptureError::Memfd(err) => write!(f, "capture memfd failed: {err}"),
+        }
+    }
+}
 
-        let frame = FrameReady {
-            fd,
-            format: Format::Xrgb8888,
+/// Produce one wire-ready `frame_ready` payload from the latest completed
+/// realm view: convert the readback to xrgb8888 and seal the copy into a
+/// fresh memfd. Pure mechanics — no authority, no wire I/O; the returned
+/// event (and the fd ownership it carries) is the enforcement chokepoint's
+/// to send, and the server-side copy of the fd drops when the event does.
+pub(crate) fn render_frame(view: &RealmViewFrame<'_>) -> Result<FrameReady, CaptureError> {
+    if view.width == 0 || view.height == 0 {
+        return Err(CaptureError::DegenerateView {
             width: view.width,
             height: view.height,
-            // Pinned by the IDL: stride == width * 4 exactly in version 1.
-            stride: view.width * BYTES_PER_PIXEL as u32,
-            // Always 0 in version 1; any set bit would be a server
-            // protocol violation.
-            flags: FrameFlags::default(),
-        };
-        let bytes = frame.encode(ids.view_id);
-        conn.send_or_queue(&bytes, Some(frame.fd.as_fd()))?;
-        // `frame` (and with it the server's only copy of the memfd) drops
-        // here: no fd is retained across requests, so the process fd count
-        // returns to baseline once the receiver closes its end.
-        Ok(CaptureOutcome::Delivered)
+        });
     }
-}
-
-/// Voice a refusal as the capture's terminal:
-/// `vitrin_grant.refused(observe, code, retry_after_ms)` on the grant
-/// handle.
-///
-/// This is the single site where every capture refusal is encoded, so it
-/// enforces the IDL invariant "retry_after_ms is nonzero only for
-/// rate_limited" unconditionally: a faulty [`CaptureGate`] cannot put an
-/// IDL-violating refusal on the wire — the field is zeroed (with a
-/// warning) for every other code, in release builds too.
-fn refuse(
-    conn: &mut Connection,
-    grant_id: u32,
-    refusal: CaptureRefusal,
-) -> Result<CaptureOutcome, TransportError> {
-    let retry_after_ms = if refusal.code == Refusal::RateLimited {
-        refusal.retry_after_ms
-    } else {
-        if refusal.retry_after_ms != 0 {
-            tracing::warn!(
-                code = ?refusal.code,
-                retry_after_ms = refusal.retry_after_ms,
-                "gate emitted nonzero retry_after_ms on a non-rate_limited \
-                 refusal; zeroing it (IDL vitrin_grant.refused invariant)"
-            );
-        }
-        0
-    };
-    let event = vitrin_grant::events::Refused {
-        verb: Verb::OBSERVE,
-        code: refusal.code,
-        retry_after_ms,
-    };
-    conn.send_or_queue(&event.encode(grant_id), None)?;
-    Ok(CaptureOutcome::Refused(refusal.code))
+    let expected = view.width as usize * view.height as usize * BYTES_PER_PIXEL;
+    if view.rgba.len() != expected {
+        return Err(CaptureError::MisSizedReadback {
+            got: view.rgba.len(),
+            expected,
+        });
+    }
+    let fd = sealed_frame_memfd(&rgba_to_xrgb8888(view.rgba)).map_err(CaptureError::Memfd)?;
+    Ok(FrameReady {
+        fd,
+        format: Format::Xrgb8888,
+        width: view.width,
+        height: view.height,
+        // Pinned by the IDL: stride == width * 4 exactly in version 1.
+        stride: view.width * BYTES_PER_PIXEL as u32,
+        // Always 0 in version 1; any set bit would be a server protocol
+        // violation.
+        flags: FrameFlags::default(),
+    })
 }
 
 /// Convert tightly packed RGBA8888 (readback layout: bytes R,G,B,A) to the
@@ -334,12 +192,11 @@ fn sealed_frame_memfd(frame: &[u8]) -> io::Result<OwnedFd> {
 pub(crate) mod tests {
     use std::fs::File;
     use std::io::Write;
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{AsFd, OwnedFd};
     use std::os::unix::fs::FileExt;
     use std::sync::{Mutex, MutexGuard};
 
     use vitrin_ipc::{Connection, Message};
-    use vitrin_protocol::generated::vitrin_grant::{self, Refusal, Verb};
     use vitrin_protocol::generated::vitrin_view::{events::FrameReady, Format};
 
     use super::*;
@@ -358,11 +215,6 @@ pub(crate) mod tests {
     }
 
     const VIEW_ID: u32 = 7;
-    const GRANT_ID: u32 = 5;
-    const IDS: CaptureIds = CaptureIds {
-        view_id: VIEW_ID,
-        grant_id: GRANT_ID,
-    };
 
     /// Number of open fds in this process, via `/proc/self/fd`. The
     /// `read_dir` handle itself appears in the listing, but identically in
@@ -373,28 +225,28 @@ pub(crate) mod tests {
             .count()
     }
 
-    /// Serve one admitted capture of `rgba` and return the client-side
-    /// received message.
-    fn serve_one(
+    /// Render one frame of `rgba` and ship it over a socketpair exactly as
+    /// the chokepoint does (bytes + `SCM_RIGHTS` fd), returning the
+    /// client-side received message — the mechanics half of the old
+    /// end-to-end serve, kept so the memfd/seal assertions still cover the
+    /// transported artifact.
+    fn ship_one(
         server: &mut Connection,
         client: &mut Connection,
         rgba: &[u8],
         width: u32,
         height: u32,
     ) -> Message {
-        let mut service = CaptureService::new(AutoApprove);
-        let outcome = service
-            .serve(
-                RealmViewFrame {
-                    rgba,
-                    width,
-                    height,
-                },
-                IDS,
-                server,
-            )
-            .expect("serve must not hit a transport error on a fresh pair");
-        assert_eq!(outcome, CaptureOutcome::Delivered);
+        let frame = render_frame(&RealmViewFrame {
+            rgba,
+            width,
+            height,
+        })
+        .expect("render_frame must succeed on a well-formed view");
+        server
+            .send_message(&frame.encode(VIEW_ID), Some(frame.fd.as_fd()))
+            .expect("send must succeed on a fresh pair");
+        // `frame` (and the server's only copy of the memfd) drops here.
         client
             .recv_message()
             .expect("client receive must succeed")
@@ -420,17 +272,7 @@ pub(crate) mod tests {
         buf
     }
 
-    /// A gate that refuses everything with a fixed code — the P1.4.4 seam
-    /// exercised from the refusing side.
-    struct RefuseAll(CaptureRefusal);
-
-    impl CaptureGate for RefuseAll {
-        fn admit_capture(&mut self) -> Result<(), CaptureRefusal> {
-            Err(self.0)
-        }
-    }
-
-    /// M1.1 golden: a served capture is byte-for-byte the xrgb8888
+    /// M1.1 golden: a rendered capture is byte-for-byte the xrgb8888
     /// conversion of the synthetic test pattern (per-pixel tolerance
     /// zero), generated in-process — never a committed image file (plan
     /// risk R7: no image codec in the core, not even as a dev-dependency).
@@ -449,7 +291,7 @@ pub(crate) mod tests {
         // What the compositor retains: the composited pattern (the
         // headless golden proves compositing is an identity on it).
         let rgba = test_pattern::render(W, H);
-        let frame = decode_frame(serve_one(&mut server, &mut client, &rgba, W, H));
+        let frame = decode_frame(ship_one(&mut server, &mut client, &rgba, W, H));
 
         // The frame_ready contract, argument by argument.
         assert_eq!(frame.format, Format::Xrgb8888);
@@ -538,8 +380,8 @@ pub(crate) mod tests {
         let (mut server, mut client) = Connection::pair().unwrap();
         let rgba = test_pattern::render(W, H);
 
-        let first = decode_frame(serve_one(&mut server, &mut client, &rgba, W, H));
-        let second = decode_frame(serve_one(&mut server, &mut client, &rgba, W, H));
+        let first = decode_frame(ship_one(&mut server, &mut client, &rgba, W, H));
+        let second = decode_frame(ship_one(&mut server, &mut client, &rgba, W, H));
 
         let a = rustix::fs::fstat(&first.fd).unwrap();
         let b = rustix::fs::fstat(&second.fd).unwrap();
@@ -559,7 +401,7 @@ pub(crate) mod tests {
         const H: u32 = 16;
         let (mut server, mut client) = Connection::pair().unwrap();
         let rgba = test_pattern::render(W, H);
-        let frame = decode_frame(serve_one(&mut server, &mut client, &rgba, W, H));
+        let frame = decode_frame(ship_one(&mut server, &mut client, &rgba, W, H));
 
         let mut file = File::from(frame.fd);
         assert!(file.write_all(b"x").is_err(), "write seal must hold");
@@ -573,10 +415,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// The acceptance criterion verbatim: after N capture/receive/close
-    /// cycles the process's open-fd count is back at baseline — no fd is
-    /// reused across requests and none leaks (server side drops its copy
-    /// inside `serve`, receiver side on frame drop).
+    /// The acceptance criterion verbatim: after N render/ship/close cycles
+    /// the process's open-fd count is back at baseline — no fd is reused
+    /// across requests and none leaks (server side drops its copy after
+    /// sending, receiver side on frame drop).
     #[test]
     fn fd_count_returns_to_baseline() {
         let _fd = fd_lock();
@@ -587,7 +429,7 @@ pub(crate) mod tests {
 
         let baseline = open_fd_count();
         for _ in 0..8 {
-            let frame = decode_frame(serve_one(&mut server, &mut client, &rgba, W, H));
+            let frame = decode_frame(ship_one(&mut server, &mut client, &rgba, W, H));
             assert!(
                 open_fd_count() > baseline,
                 "a delivered frame holds exactly the fresh fd"
@@ -602,183 +444,43 @@ pub(crate) mod tests {
         assert_eq!(open_fd_count(), baseline);
     }
 
-    /// A refusing gate produces exactly one `vitrin_grant.refused(observe,
-    /// code, retry_after_ms)` on the grant object, with no fd — and the
-    /// authority decision is visibly the gate's alone (the seam P1.4.4
-    /// fills).
+    /// The typed mechanics failures: a mis-sized readback and a degenerate
+    /// view are errors — never a fabricated frame, never an fd — which the
+    /// chokepoint voices as `internal` (the readback case must never
+    /// masquerade as a dead realm; the degenerate case is its no_surface
+    /// backstop, unreachable when the chokepoint did its job).
     #[test]
-    fn refused_capture_voices_refused_on_the_grant() {
+    fn render_frame_fails_typed_never_fabricating_a_frame() {
         let _fd = fd_lock();
-        let (mut server, mut client) = Connection::pair().unwrap();
         let rgba = test_pattern::render(16, 16);
         let baseline = open_fd_count();
 
-        let mut service = CaptureService::new(RefuseAll(CaptureRefusal {
-            code: Refusal::RateLimited,
-            retry_after_ms: 250,
-        }));
-        let outcome = service
-            .serve(
-                RealmViewFrame {
-                    rgba: &rgba,
-                    width: 16,
-                    height: 16,
-                },
-                IDS,
-                &mut server,
-            )
-            .unwrap();
-        assert_eq!(outcome, CaptureOutcome::Refused(Refusal::RateLimited));
-        assert_eq!(open_fd_count(), baseline, "a refusal must not create fds");
+        let mis_sized = render_frame(&RealmViewFrame {
+            rgba: &rgba,
+            width: 32, // claims more pixels than the buffer holds
+            height: 32,
+        });
+        assert!(matches!(
+            mis_sized,
+            Err(CaptureError::MisSizedReadback {
+                got,
+                expected
+            }) if got == rgba.len() && expected == 32 * 32 * 4
+        ));
 
-        let msg = client.recv_message().unwrap().unwrap();
-        assert!(msg.fd.is_none(), "a refusal carries no fd");
-        let (object_id, refused) =
-            vitrin_grant::events::Refused::decode(&msg.bytes, msg.fd).unwrap();
-        assert_eq!(object_id, GRANT_ID, "refused is an event on the grant");
-        assert_eq!(refused.verb, Verb::OBSERVE);
-        assert_eq!(refused.code, Refusal::RateLimited);
-        assert_eq!(refused.retry_after_ms, 250);
-    }
-
-    /// A degenerate view (no pixels) refuses `no_surface` rather than
-    /// delivering an empty frame — `frame_ready`'s dimensions are always
-    /// nonzero.
-    #[test]
-    fn degenerate_view_refuses_no_surface() {
-        let _fd = fd_lock();
-        let (mut server, mut client) = Connection::pair().unwrap();
-        let mut service = CaptureService::new(AutoApprove);
-        let outcome = service
-            .serve(
-                RealmViewFrame {
-                    rgba: &[],
-                    width: 0,
-                    height: 0,
-                },
-                IDS,
-                &mut server,
-            )
-            .unwrap();
-        assert_eq!(outcome, CaptureOutcome::Refused(Refusal::NoSurface));
-
-        let msg = client.recv_message().unwrap().unwrap();
-        let (object_id, refused) =
-            vitrin_grant::events::Refused::decode(&msg.bytes, msg.fd).unwrap();
-        assert_eq!(object_id, GRANT_ID);
-        assert_eq!(refused.code, Refusal::NoSurface);
-        assert_eq!(refused.retry_after_ms, 0);
-    }
-
-    /// The wire invariant "retry_after_ms nonzero only for rate_limited"
-    /// holds even against a faulty gate: `refuse()` — the single site
-    /// encoding every capture refusal — zeroes the field for any other
-    /// code instead of trusting the gate's output.
-    #[test]
-    fn faulty_gate_retry_hint_is_zeroed_on_non_rate_limited() {
-        let _fd = fd_lock();
-        let (mut server, mut client) = Connection::pair().unwrap();
-        let rgba = test_pattern::render(16, 16);
-
-        let mut service = CaptureService::new(RefuseAll(CaptureRefusal {
-            code: Refusal::Preempted,
-            retry_after_ms: 999,
-        }));
-        let outcome = service
-            .serve(
-                RealmViewFrame {
-                    rgba: &rgba,
-                    width: 16,
-                    height: 16,
-                },
-                IDS,
-                &mut server,
-            )
-            .unwrap();
-        assert_eq!(outcome, CaptureOutcome::Refused(Refusal::Preempted));
-
-        let msg = client.recv_message().unwrap().unwrap();
-        let (object_id, refused) =
-            vitrin_grant::events::Refused::decode(&msg.bytes, msg.fd).unwrap();
-        assert_eq!(object_id, GRANT_ID);
-        assert_eq!(refused.code, Refusal::Preempted);
-        assert_eq!(
-            refused.retry_after_ms, 0,
-            "retry_after_ms must be zeroed on the wire for non-rate_limited"
-        );
-    }
-
-    /// A nonzero-dimension view with a mis-sized readback buffer is a
-    /// server-side invariant break: it refuses `internal`, never
-    /// `no_surface` — a readback bug must not masquerade as a dead realm.
-    #[test]
-    fn mis_sized_readback_refuses_internal_not_no_surface() {
-        let _fd = fd_lock();
-        let (mut server, mut client) = Connection::pair().unwrap();
-        let rgba = test_pattern::render(16, 16);
-        let mut service = CaptureService::new(AutoApprove);
-        let outcome = service
-            .serve(
-                RealmViewFrame {
-                    rgba: &rgba,
-                    width: 32, // claims more pixels than the buffer holds
-                    height: 32,
-                },
-                IDS,
-                &mut server,
-            )
-            .unwrap();
-        assert_eq!(outcome, CaptureOutcome::Refused(Refusal::Internal));
-
-        let msg = client.recv_message().unwrap().unwrap();
-        assert!(msg.fd.is_none(), "a refusal carries no fd");
-        let (object_id, refused) =
-            vitrin_grant::events::Refused::decode(&msg.bytes, msg.fd).unwrap();
-        assert_eq!(object_id, GRANT_ID);
-        assert_eq!(refused.code, Refusal::Internal);
-        assert_eq!(refused.retry_after_ms, 0);
-    }
-
-    /// Pipelined captures answer strictly in serve order: terminal n
-    /// answers request n, mixing successes and refusals.
-    #[test]
-    fn terminals_arrive_in_request_order() {
-        let _fd = fd_lock();
-        const W: u32 = 16;
-        const H: u32 = 16;
-        let (mut server, mut client) = Connection::pair().unwrap();
-        let rgba = test_pattern::render(W, H);
-
-        // Request 1: delivered. Request 2: refused (degenerate view).
-        // Request 3: delivered.
-        let mut service = CaptureService::new(AutoApprove);
-        for degenerate in [false, true, false] {
-            let (pixels, w, h): (&[u8], u32, u32) = if degenerate {
-                (&[], 0, 0)
-            } else {
-                (&rgba, W, H)
-            };
-            service
-                .serve(
-                    RealmViewFrame {
-                        rgba: pixels,
-                        width: w,
-                        height: h,
-                    },
-                    IDS,
-                    &mut server,
-                )
-                .unwrap();
-        }
-
-        let first = client.recv_message().unwrap().unwrap();
-        assert_eq!(first.header.object_id, VIEW_ID);
-        drop(decode_frame(first));
-        let second = client.recv_message().unwrap().unwrap();
-        assert_eq!(second.header.object_id, GRANT_ID);
-        let third = client.recv_message().unwrap().unwrap();
-        assert_eq!(third.header.object_id, VIEW_ID);
-        drop(decode_frame(third));
+        let degenerate = render_frame(&RealmViewFrame {
+            rgba: &[],
+            width: 0,
+            height: 0,
+        });
+        assert!(matches!(
+            degenerate,
+            Err(CaptureError::DegenerateView {
+                width: 0,
+                height: 0
+            })
+        ));
+        assert_eq!(open_fd_count(), baseline, "failures must not create fds");
     }
 
     /// The swizzle: RGBA bytes → little-endian xrgb8888 bytes (B,G,R,X),

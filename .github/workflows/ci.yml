@@ -57,6 +57,14 @@ jobs:
     # regression or a wedged linker should fail in minutes, not hold the
     # job -- and, on main, the concurrency queue -- for hours.
     timeout-minutes: 30
+    env:
+      # This job has no C toolchain and never builds shim/, so
+      # `c_shim_conforms_to_the_real_core` cannot run here. The test refuses
+      # to skip itself silently under CI (see its doc comment), so the skip
+      # is DECLARED rather than assumed -- which is what makes the
+      # `conformance` job below the only place that check is satisfied, and
+      # makes its removal a red build rather than a quiet loss of coverage.
+      VITRIN_C_SHIM_CONFORMANCE_SKIP: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -256,6 +264,25 @@ jobs:
         working-directory: shim
         run: SHIM_BIN="${RUNNER_TEMP}/shim-build/vitrin-shim" bash tests/acceptance/shim_globals_and_client.sh
 
+      # NOTE: the name is quoted because it contains ": ", which YAML forbids
+      # in a plain scalar -- unquoted, this line makes the WHOLE workflow file
+      # unparseable and every job silently stops running.
+      - name: "Headless acceptance (upstream link: frames, damage, pacing, backpressure)"
+        # The P1.6.2 acceptance criteria, machine-checked against the WIRE by
+        # a peer that spawns the shim exactly as the core does (socketpair at
+        # fd 3). Deliberately Rust-free, like the rest of this job: the core
+        # side of the protocol is reimplemented in C in shim/tests/mock_core.c
+        # so the shim's acceptance proof never needs the workspace built.
+        #
+        # That reimplementation is also this job's blind spot: mock_core.c and
+        # the shim were written by the same hand from the same reading of the
+        # IDL, so a shared misreading passes here. The `conformance` job is
+        # what closes it, by running the same C shim against the REAL Rust
+        # core.
+        if: hashFiles('shim/tests/acceptance/upstream_frame_path.sh') != ''
+        working-directory: shim
+        run: BUILD_DIR="${RUNNER_TEMP}/shim-build" bash tests/acceptance/upstream_frame_path.sh
+
       - name: Meson build DORMANT
         if: hashFiles('shim/meson.build') == ''
         run: |
@@ -268,6 +295,67 @@ jobs:
             echo "automatically when \`shim/meson.build\` lands; the landing PR owns"
             echo "\`shim/ci/install-deps.sh\` (see its header, decision D11)."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  conformance:
+    name: conformance (real C shim against the real Rust core)
+    runs-on: ubuntu-latest
+    # The one job that holds BOTH toolchains, and the only reason it exists.
+    # Every other check on the shim wire has a peer written by the same hand
+    # in the same language: the `rust` job validates the core against
+    # vitrin-mock-shim, the `shim` job validates the shim against
+    # shim/tests/mock_core.c. Both pass if the two sides misread the IDL
+    # identically. This job runs the real C shim, built from the generated
+    # header alone, against the real core's ShimServer -- so a shared
+    # misreading has nowhere left to hide.
+    #
+    # Deliberately NOT folded into the `rust` job: Ubuntu ships no
+    # wlroots-0.19, so the Meson wrap builds it from source (D11), and that
+    # cost has no business sitting in front of fmt/clippy/tests. And
+    # deliberately NOT folded into the `shim` job, whose standing acceptance
+    # criterion is that no Rust toolchain is on PATH.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (pinned toolchain + components from rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install native link deps (libxkbcommon + libpixman for the vitrind backends)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxkbcommon-dev libpixman-1-dev
+
+      - name: Install Meson + wlroots subproject build dependencies
+        # The same list the `shim` job uses, from the same file, so the two
+        # builds of the shim can never diverge in their dependency set.
+        # `sudo` because that script is written for the shim job's root
+        # container; here it runs on a hosted runner.
+        run: sudo bash shim/ci/install-deps.sh
+
+      - name: Build the C shim
+        run: |
+          meson setup "${RUNNER_TEMP}/shim-build" shim
+          meson compile -C "${RUNNER_TEMP}/shim-build"
+
+      # No `hashFiles` gate on the three steps above, unlike the `shim`
+      # job's: that job predates shim/meson.build and its guards exist to
+      # keep main green before P1.6.1 landed. This job is added after, so a
+      # missing meson.build is a broken tree, not a not-yet state -- and a
+      # step that skips itself into a green result is the exact failure this
+      # job was added to fix.
+
+      - name: Cross-track conformance (spawn the C shim from the real core)
+        # The real spawn_realm forks this binary onto a real socketpair at
+        # fd 3; the real ShimServer applies its F_GET_SEALS probe,
+        # geometry-versus-fd-size arithmetic, watermark and bad_order rules
+        # to what comes back, and latches a commit into a real Scene. The
+        # test's own env allowlist passes the software-rendering WLR_* names
+        # through to the shim -- the runners have no GPU.
+        env:
+          VITRIN_C_SHIM_BIN: ${{ runner.temp }}/shim-build/vitrin-shim
+        run: cargo test -p vitrin-core c_shim -- --nocapture
 
   sdk:
     name: sdk (Python ${{ matrix.python }} wire-client unit tests)

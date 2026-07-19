@@ -15,6 +15,7 @@
 #include <wlr/util/log.h>
 
 #include "server.h"
+#include "upstream.h"
 
 bool vitrin_backend_bringup(struct vitrin_shim *s) {
 	s->display = wl_display_create();
@@ -72,6 +73,22 @@ void vitrin_shim_finish(struct vitrin_shim *s) {
 		wl_list_remove(&s->new_deco.link);
 		s->xdg_decoration = NULL;
 	}
+	/* Same reasoning for the xdg-shell listener: xdg_shell is a display
+	 * global, and its new_toplevel signal must have no listeners left when
+	 * wl_display_destroy tears it down. (Per-toplevel listeners are removed
+	 * by toplevel_destroy, which wl_display_destroy_clients triggers.)
+	 * Gated on `xdg_wired`, not on the global's existence: bring-up can fail
+	 * between the two, and removing a never-inserted link dereferences NULL. */
+	if (s->xdg_wired) {
+		wl_list_remove(&s->new_toplevel.link);
+		s->xdg_wired = false;
+	}
+	/* Release the core connection and the frame pool BEFORE the display
+	 * goes: the wire's event source belongs to the display's event loop, so
+	 * removing it afterwards would touch freed memory. Closing our end also
+	 * gives the core its EOF -- the shim-death signal its lifecycle layer
+	 * (P1.5.3) reads -- as early as we can honestly send it. */
+	vitrin_upstream_finish(s);
 	if (s->display != NULL) {
 		wl_display_destroy_clients(s->display);
 		wl_display_destroy(s->display);

@@ -73,6 +73,7 @@ protocols = [
 
 protocol_headers = []
 protocol_sources = []
+xdg_shell_code = []
 foreach p : protocols
   name = p[0]
   xml = wl_protocol_dir / p[1]
@@ -82,13 +83,29 @@ foreach p : protocols
     output: name + '-protocol.h',
     command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
   )
-  protocol_sources += custom_target(
+  # `private-code` emits the marshalling tables, which are the same object on
+  # both sides of the wire -- so the acceptance client below reuses the very
+  # same generated file the shim links, rather than a second copy of it.
+  code = custom_target(
     name + '-private-code',
     input: xml,
     output: name + '-protocol.c',
     command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
   )
+  protocol_sources += code
+  if name == 'xdg-shell'
+    xdg_shell_code = code
+  endif
 endforeach
+
+# Client-side xdg-shell stubs, for the acceptance client below (which is a
+# Wayland CLIENT of the shim, so it needs those, not the server ones).
+xdg_shell_client_header = custom_target(
+  'xdg-shell-client-header',
+  input: wl_protocol_dir / 'stable/xdg-shell/xdg-shell.xml',
+  output: 'xdg-shell-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
 
 inc = include_directories('include')
 shim_deps = [wlroots, wayland_server, pixman, xkbcommon, drm]
@@ -100,6 +117,9 @@ executable(
     'src/server.c',
     'src/globals.c',
     'src/output.c',
+    'src/xdg.c',
+    'src/wire.c',
+    'src/upstream.c',
   ),
   protocol_sources,
   protocol_headers,
@@ -116,3 +136,27 @@ header_test = executable(
   include_directories: inc,
 )
 test('header-compiles', header_test)
+
+# --- P1.6.2 acceptance harness -----------------------------------------
+# The core side of the shim wire, in C. It deliberately links NOTHING but
+# libc and the generated header: the shim's CI job must not pull a Rust
+# toolchain onto PATH (shim/ci/install-deps.sh), so the upstream-link proof
+# has to be able to stand entirely on its own.
+mock_core = executable(
+  'mock-core',
+  files('tests/mock_core.c'),
+  include_directories: inc,
+)
+
+# A deterministic Wayland client: known damage rectangles and a frame counter,
+# which is what turns "damage-only updates" and "paced by the core" into
+# mechanical assertions rather than eyeballed logs.
+wayland_client = dependency('wayland-client')
+damage_client = executable(
+  'damage-client',
+  files('tests/damage_client.c'),
+  xdg_shell_client_header,
+  xdg_shell_code,
+  include_directories: inc,
+  dependencies: [wayland_client],
+)

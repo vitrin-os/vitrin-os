@@ -33,10 +33,36 @@
 //!
 //! | key | type | required | meaning |
 //! |---|---|---|---|
-//! | `id` | string | no (default `"realm-0"`) | the realm's stable, wire-visible name: what `vitrin_principal.get_realm` addresses, what grant rows state, and the directory name of the realm's private runtime tree. At most 64 bytes over `[A-Za-z0-9._-]`, never `.` or `..` |
-//! | `command` | string | **yes** | absolute path of the program the realm launches (P1.5.2 execs it) |
+//! | `id` | string | no (default [`WELL_KNOWN_REALM_ID`]) | the realm's stable, wire-visible name: what `vitrin_principal.get_realm` addresses, what grant rows state, and the directory name of the realm's private runtime tree. Version 0 accepts **only** `"realm-0"` -- see below |
+//! | `command` | string | **yes** | absolute path of the program the realm launches (P1.5.2 execs it); audited at load, see below |
 //! | `args` | array of strings | no (default `[]`) | arguments **after** `argv[0]`; the core supplies `argv[0]` itself from `command` |
 //! | `env_allow` | array of strings | no (default `[]`) | names of environment variables passed through from the core's own environment; see below |
+//!
+//! ## The realm's name is the IDL's, not the operator's (version 0)
+//!
+//! `id` is in the schema, but version 0 refuses every value but
+//! [`WELL_KNOWN_REALM_ID`]. The IDL settles this: `get_realm`'s description
+//! declares `"realm-0"` **the single well-known realm of version 1** -- the
+//! one realm name a conformant client of this protocol version can know
+//! without being told. A session that renamed its only realm would still be
+//! *structurally* legal (`get_realm` always mints a handle, and an unknown
+//! name resolves `unavailable` at petition time), but every conformant
+//! client would petition `realm-0` and be told, forever, that the realm is
+//! absent. The IDL specifies that absence as a **race** against realm
+//! lifecycle, not as a permanent property of a correctly configured
+//! session, so a core that manufactured it from a config key would be lying
+//! in the protocol's own vocabulary.
+//!
+//! This is the same shape as the [`MAX_REALMS`] rule, and it lives in the
+//! same place for the same reason: a *validator* limit on what version-0
+//! configuration may declare, never a narrowing of the model underneath.
+//! [`RealmRegistry`] stays a keyed lookup over whatever it holds
+//! ([`RealmRegistry::resolve_for_petition`] does a real map lookup, not a
+//! constant comparison), so the phase that puts operator-chosen realm names
+//! on the wire deletes this one check and the schema, the registry, and the
+//! addressing path do not move. Widening it sooner is a **protocol** change
+//! first: the IDL description has to stop naming `realm-0` as *the*
+//! version-1 realm before a loader may.
 //!
 //! ## The environment allowlist: names, not pairs, and default-deny
 //!
@@ -54,15 +80,24 @@
 //!   core injects for it (P1.5.2 sets the realm's own `WAYLAND_DISPLAY`,
 //!   pointing at the shim's private socket, plus its runtime directory).
 //!   That is a real, working configuration, not a degenerate one.
-//! - **Literal `name = "value"` pairs would invite exactly the two
-//!   re-litigations this design forbids.** P1.5.2 scrubs `DISPLAY` and the
-//!   host `WAYLAND_DISPLAY` unconditionally, because a confined app that can
-//!   see the host display server is not confined; a config file able to set
-//!   arbitrary values could set those two back and quietly void the
-//!   confinement. Passing *names* cannot: [`RESERVED_ENV`] is refused at
-//!   load, loudly, naming the variable. (A pass-through name whose value
-//!   happens to be attacker-influenced is the operator's own environment --
-//!   the same trust as the config file itself.)
+//! - **Literal `name = "value"` pairs would invite exactly the
+//!   re-litigation this design forbids.** P1.5.2 scrubs the host's display
+//!   variables unconditionally, because a confined app that can see the
+//!   host display server is not confined; a config file able to set
+//!   arbitrary values could set them back and quietly void the confinement.
+//!   Passing *names* narrows that hole but does **not** dissolve it, and
+//!   the difference matters: a name whose value in the core's environment
+//!   *is itself* a host connection re-opens it exactly. `WAYLAND_SOCKET`
+//!   holds the number of an already-connected file descriptor, and
+//!   `XAUTHORITY` the credential that authenticates one -- neither is a
+//!   display *name*, so no amount of name-vs-pair discipline helps. The
+//!   guard is therefore an explicit list, [`RESERVED_ENV`], refused at
+//!   load, loudly, naming the variable and why; its membership rule is "the
+//!   core decides this variable, **or** this variable is a way to reach the
+//!   host display server", not "this variable looks like a display name".
+//!   (A pass-through name whose value is merely attacker-*influenced* is
+//!   the operator's own environment -- the same trust as the config file
+//!   itself. Authority is the line, not influence.)
 //! - Explicit pairs are a plausible future convenience and stay purely
 //!   additive: a later `env_set` key can arrive without changing the
 //!   meaning of `env_allow`.
@@ -89,10 +124,15 @@
 //!   environment is default-deny, so a relative name would silently resolve
 //!   against the *core's* `PATH` instead of anything the operator can see in
 //!   this file. An absolute path is the only spelling that means one thing;
+//! - **a `command` that does not resolve, or that a wider set of people
+//!   than root and the core can replace** -- the transitive half of the
+//!   not-writable policy below;
 //! - **zero or more than one `[[realm]]` table** -- version 0 serves exactly
 //!   one realm. This is a *cardinality* rule in the validator, not a
 //!   grammar limit: the file format is already an array of tables, so Phase
 //!   3 raises [`MAX_REALMS`] and the schema does not move;
+//! - **an `id` that is not the IDL's well-known realm name** -- version 0's
+//!   counterpart of the cardinality rule, argued above;
 //! - **a duplicate key, a duplicate realm id, a duplicate or reserved
 //!   `env_allow` name, or an ill-shaped id** -- each names the offending
 //!   text and why.
@@ -114,6 +154,33 @@
 //! writable by group or other (any `0o022` bit). World-*readable* is fine
 //! -- a command line is not secret. The check runs on the opened fd
 //! (`fstat`), so there is no stat-then-open TOCTOU window.
+//!
+//! ## ... and the same rule for the program it names
+//!
+//! That sentence stays true one link further out: of the program `command`
+//! names, and of every directory on the way to it. A `realm.toml` hardened
+//! to `0600` while `command` points at a group-writable binary hands the
+//! very authority the file check was protecting to a wider set of people
+//! -- and *reads* like a guarantee while doing it, which is the worse half.
+//! The check must be transitive or it is decorative, so loading applies it
+//! transitively ([`audit_spawn_target`]): the program, resolved through
+//! symlinks, must be a regular file, and it and every directory on its
+//! canonical path must be owned by root or by the core's own euid and not
+//! writable by group or other. A world-writable *directory* passes only
+//! with the sticky bit set, which is precisely the property that makes a
+//! `/tmp`-style path unswappable by a non-owner.
+//!
+//! Root counts as a trusted writer here where it does not for `realm.toml`
+//! itself, because the normal case *is* a distribution binary: `/usr/bin`
+//! is root-owned, and a rule that demanded the core's own uid would refuse
+//! every ordinary configuration and teach operators to work around it.
+//!
+//! This is a **startup** audit and deliberately not the last word. It
+//! proves the operator's configuration is coherent and names the exact path
+//! and fault when it is not; it cannot prove anything about the instant of
+//! `execve`. That is P1.5.2's (issue #31) to hold, and it needs its own
+//! check on the descriptor it will actually run -- not a re-resolution of
+//! this name, which is the TOCTOU this one cannot close.
 //!
 //! # Vacancy: what version 0 answers, and where P1.5.2/P1.5.3 flip it
 //!
@@ -170,13 +237,19 @@ use std::path::{Path, PathBuf};
 use crate::grants::RealmId;
 use crate::toml_subset::{self, SubsetError};
 
-/// The default realm id when `realm.toml` omits `id`, and the well-known
-/// name the IDL documents for version 1 ("`realm-0`" is the single realm
-/// `get_realm` can name usefully). A *default*, not a constraint: the
-/// registry serves whatever the file configures, which is what makes the
+/// The realm name the IDL fixes for version 1: `get_realm`'s description
+/// declares `"realm-0"` "the single well-known realm of version 1". Both
+/// the default when `realm.toml` omits `id` and -- in version 0 -- the only
+/// value it may carry (module docs: a session serving some other name
+/// answers every conformant client's `get_realm("realm-0")` petition
+/// `unavailable`, forever).
+///
+/// A *validator* constraint, not a model one: [`RealmRegistry`] serves
+/// whatever it holds and looks names up in a map, which is what keeps the
 /// petition-time existence check a real lookup rather than a constant
-/// comparison wearing a lookup's clothes.
-pub(crate) const DEFAULT_REALM_ID: &str = "realm-0";
+/// comparison wearing a lookup's clothes -- and what makes the later
+/// multi-realm phase a deletion here rather than a re-plumbing.
+pub(crate) const WELL_KNOWN_REALM_ID: &str = "realm-0";
 
 /// Conventional file name under the core's configuration directory.
 pub(crate) const CONFIG_FILE_NAME: &str = "realm.toml";
@@ -185,14 +258,67 @@ pub(crate) const CONFIG_FILE_NAME: &str = "realm.toml";
 /// enforces; Phase 3's fleet raises it without touching the schema.
 pub(crate) const MAX_REALMS: usize = 1;
 
-/// Environment variable names `env_allow` may not carry, because P1.5.2
-/// decides them unconditionally: a confined app that can see the host
-/// display server is not confined, so the host `DISPLAY` and
-/// `WAYLAND_DISPLAY` are scrubbed and the realm's own `WAYLAND_DISPLAY` is
-/// injected. Refusing them here keeps that decision out of reach of
-/// configuration (module docs) instead of letting a file silently void the
-/// confinement.
-pub(crate) const RESERVED_ENV: [&str; 2] = ["DISPLAY", "WAYLAND_DISPLAY"];
+/// Environment variable names `env_allow` may not carry, each paired with
+/// the reason its refusal states. Two kinds, one rule: **configuration does
+/// not get a vote on whether the realm's app can reach the host display
+/// server.**
+///
+/// - Variables the core *injects* for the realm (`WAYLAND_DISPLAY`,
+///   `XDG_RUNTIME_DIR`): a pass-through is either silently overwritten --
+///   config that reads as if it did something -- or, depending on which
+///   side of the merge wins, overwrites the injection and points the app at
+///   the host session.
+/// - Variables that *are* a host connection (`DISPLAY`, `WAYLAND_SOCKET`,
+///   `XAUTHORITY`): an address, an already-open socket, or the credential
+///   that authenticates one.
+///
+/// `WAYLAND_SOCKET` is the entry that motivates spelling the rule out.
+/// `wl_display_connect()` reads it *before* `WAYLAND_DISPLAY` and before
+/// its own `name` argument, and its value is not a display name but the
+/// number of an already-connected file descriptor. In nested mode the core
+/// is itself a Wayland client of the host compositor, so that variable is
+/// exactly what the core's own environment holds -- passing it through
+/// would hand the confined app a live connection to the host compositor,
+/// and the realm's private socket would simply never be consulted. A list
+/// that stopped at display *names* would let one config key undo the
+/// confinement the rest of this file exists to guarantee.
+pub(crate) const RESERVED_ENV: [(&str, &str); 5] = [
+    (
+        "DISPLAY",
+        "it addresses the host X server, which the core scrubs at spawn",
+    ),
+    (
+        "WAYLAND_DISPLAY",
+        "it addresses a Wayland server: the core scrubs the host value and injects the \
+         realm's own private socket at spawn",
+    ),
+    (
+        "WAYLAND_SOCKET",
+        "libwayland reads it before WAYLAND_DISPLAY and treats its value as an \
+         already-connected file descriptor, so passing it through would hand the app a \
+         live connection to the host compositor",
+    ),
+    (
+        "XAUTHORITY",
+        "it is the credential file authenticating a connection to the host X server",
+    ),
+    (
+        "XDG_RUNTIME_DIR",
+        "it names the host session's private runtime directory (host compositor socket, \
+         session bus, agent sockets); the core injects the realm's own runtime directory \
+         at spawn",
+    ),
+];
+
+/// Why `env_allow` may not carry `name`, or `None` if it may. Matching is
+/// exact and case-sensitive, as environment lookup itself is: `getenv`
+/// finds `DISPLAY`, never `display`.
+fn reserved_env_reason(name: &str) -> Option<&'static str> {
+    RESERVED_ENV
+        .iter()
+        .find(|(reserved, _)| *reserved == name)
+        .map(|(_, why)| *why)
+}
 
 /// What one realm will launch: owned by the realm from load time,
 /// **executed by nobody in this build** (P1.5.2, issue #31, owns fork/exec).
@@ -319,12 +445,26 @@ impl RealmRegistry {
         file.read_to_string(&mut text)
             .map_err(|e| at(ErrorKind::Io(e)))?;
         let specs = parse_config(&text).map_err(at)?;
+        // The transitive half of the not-writable policy (module docs), and
+        // the reason it lives *here* rather than in `parse_config`: what a
+        // path means is a fact about this filesystem at this moment, not
+        // about the file's text. Keeping it beside `check_config_security`
+        // -- the other question only a real filesystem can answer -- leaves
+        // parsing pure and total.
+        for spec in &specs {
+            audit_spawn_target(spec.spawn.command()).map_err(at)?;
+        }
         Self::from_specs(specs).map_err(at)
     }
 
     /// Build a registry from parsed tables, enforcing the cross-table
     /// invariants (cardinality, unique ids). Shared by [`load`](Self::load)
     /// and tests, so no constructor can bypass them.
+    ///
+    /// Deliberately *not* the filesystem audit of each realm's `command`:
+    /// that one needs a real filesystem, so it belongs to loading (module
+    /// docs), and a caller synthesizing specs in a test is not describing a
+    /// program this core will exec.
     pub fn from_specs(specs: Vec<RealmSpec>) -> Result<Self, ErrorKind> {
         if specs.is_empty() {
             return Err(ErrorKind::Invalid(
@@ -332,11 +472,7 @@ impl RealmRegistry {
             ));
         }
         if specs.len() > MAX_REALMS {
-            return Err(ErrorKind::Invalid(format!(
-                "{} [[realm]] tables, but this version serves exactly {MAX_REALMS} \
-                 (multi-realm is Phase 3)",
-                specs.len()
-            )));
+            return Err(too_many_realms(specs.len()));
         }
         let mut realms = BTreeMap::new();
         for spec in specs {
@@ -519,6 +655,84 @@ fn check_config_security(file: &fs::File) -> Result<(), ErrorKind> {
     Ok(())
 }
 
+/// Refuse a `command` that a wider set of people than root and the core can
+/// replace -- the not-writable policy applied transitively, one link past
+/// `realm.toml` itself (module docs). Checks the program *and* every
+/// directory on its canonical path, because a writable directory anywhere
+/// on the way is a swap of the program by another name.
+///
+/// Resolving through symlinks first is what makes walking the ancestors
+/// meaningful: a lexical walk of `/opt/app` would never look at the
+/// directory a symlinked `/opt` actually points into. The resolved path is
+/// used for the audit only -- the realm still execs the path the operator
+/// wrote, because `argv[0]` is observable to the program (busybox-style
+/// multi-call binaries dispatch on it) and rewriting it would change what
+/// runs to something the file does not say.
+fn audit_spawn_target(command: &Path) -> Result<(), ErrorKind> {
+    let resolved = fs::canonicalize(command).map_err(|e| {
+        ErrorKind::Invalid(format!(
+            "`command` {} does not resolve to a program ({e}); the core will not start \
+             with a realm whose app it cannot audit",
+            command.display()
+        ))
+    })?;
+    let euid = rustix::process::geteuid().as_raw();
+
+    let st = rustix::fs::stat(&resolved).map_err(|e| ErrorKind::Io(e.into()))?;
+    if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile {
+        return Err(ErrorKind::Insecure(format!(
+            "`command` {} is not a regular file",
+            resolved.display()
+        )));
+    }
+    if let Some(fault) = untrusted_writer(st.st_uid, st.st_mode, euid, false) {
+        return Err(ErrorKind::Insecure(format!(
+            "`command` {} is {fault}; whoever can write the program the trusted core \
+             execs chooses what it runs -- the rule this config file is held to, one \
+             link further out",
+            resolved.display()
+        )));
+    }
+
+    // Skip(1): `ancestors` yields the program itself first, then each
+    // enclosing directory up to `/`.
+    for dir in resolved.ancestors().skip(1) {
+        let st = rustix::fs::stat(dir).map_err(|e| ErrorKind::Io(e.into()))?;
+        if let Some(fault) = untrusted_writer(st.st_uid, st.st_mode, euid, true) {
+            return Err(ErrorKind::Insecure(format!(
+                "`command` {}: directory {} is {fault}; whoever can write a directory on \
+                 the path can swap the program the trusted core execs",
+                resolved.display(),
+                dir.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Can anyone but root or the core replace this filesystem object? Returns
+/// the fault to report, or `None` when only a trusted writer can.
+///
+/// `sticky_tolerated` is for directories: a world-writable directory with
+/// the sticky bit (`/tmp`, mode `1777`) only lets a writer create and
+/// remove entries *it owns*, so it cannot be used to swap someone else's
+/// program -- and the ownership half of this same check still binds on
+/// every component. Files get no such exemption; the bit means something
+/// else entirely on a regular file.
+fn untrusted_writer(uid: u32, raw_mode: u32, euid: u32, sticky_tolerated: bool) -> Option<String> {
+    if uid != 0 && uid != euid {
+        return Some(format!(
+            "owned by uid {uid}, neither root nor the core's uid {euid}"
+        ));
+    }
+    let mode = raw_mode & 0o7777;
+    let sticky = mode & 0o1000 != 0;
+    if mode & 0o022 != 0 && !(sticky_tolerated && sticky) {
+        return Some(format!("mode {mode:04o}, writable by group/other"));
+    }
+    None
+}
+
 /// One `[[realm]]` table under construction, with the line each value came
 /// from so a validation refusal can point at it.
 #[derive(Default)]
@@ -605,7 +819,26 @@ fn parse_config(text: &str) -> Result<Vec<RealmSpec>, ErrorKind> {
         }
     }
 
+    // Cardinality before per-table semantics: how many realms this file
+    // declares is a property of its shape, and complaining about what is
+    // *inside* the second table buries the answer the operator needs (that
+    // there should not be a second table). [`RealmRegistry::from_specs`]
+    // re-checks it as the invariant no constructor can bypass; this one is
+    // here for the message an operator reads.
+    if raw.len() > MAX_REALMS {
+        return Err(too_many_realms(raw.len()));
+    }
+
     raw.into_iter().map(validate_realm).collect()
+}
+
+/// The one wording for "this version serves exactly one realm", shared by
+/// the parser and the registry so the two cannot drift.
+fn too_many_realms(found: usize) -> ErrorKind {
+    ErrorKind::Invalid(format!(
+        "{found} [[realm]] tables, but this version serves exactly {MAX_REALMS} \
+         (multi-realm is Phase 3)"
+    ))
 }
 
 /// Turn one parsed table into a validated spec, applying the documented
@@ -616,9 +849,25 @@ fn validate_realm(raw: RawRealm) -> Result<RealmSpec, ErrorKind> {
     let id = match raw.id {
         Some((text, line)) => {
             validate_realm_id(&text).map_err(|detail| parse_err(line, detail))?;
+            // The IDL, not this file, names the version-1 realm (module
+            // docs). Refused *after* the shape check so a malformed id is
+            // reported as malformed rather than as the wrong name.
+            if text != WELL_KNOWN_REALM_ID {
+                return Err(parse_err(
+                    line,
+                    format!(
+                        "`id` {text:?} is not {WELL_KNOWN_REALM_ID:?}, the single well-known \
+                         realm this protocol version defines: a session serving any other \
+                         name answers every conformant client's \
+                         get_realm({WELL_KNOWN_REALM_ID:?}) petition `unavailable`, forever. \
+                         Omit `id` or write id = {WELL_KNOWN_REALM_ID:?}; operator-chosen \
+                         realm names arrive with the wire's multi-realm phase"
+                    ),
+                ));
+            }
             RealmId::new(text)
         }
-        None => RealmId::new(DEFAULT_REALM_ID),
+        None => RealmId::new(WELL_KNOWN_REALM_ID),
     };
 
     let (command, command_line) = raw.command.ok_or_else(|| {
@@ -656,13 +905,13 @@ fn validate_realm(raw: RawRealm) -> Result<RealmSpec, ErrorKind> {
                     ),
                 ));
             }
-            if RESERVED_ENV.contains(&name.as_str()) {
+            if let Some(why) = reserved_env_reason(&name) {
                 return Err(parse_err(
                     line,
                     format!(
                         "`env_allow` entry {name:?} is decided by the core, not by config: \
-                         the realm's app is confined to its own display server, so the host \
-                         {name} is scrubbed and the realm's own value injected at spawn"
+                         {why}. The realm's app is confined to its own display server, and \
+                         that is not a configurable property"
                     ),
                 ));
             }
@@ -762,9 +1011,10 @@ pub(crate) mod tests {
         RealmRegistry::from_specs(parse_config(text)?)
     }
 
-    /// A scratch `realm.toml` with the given mode, in a private temp dir.
-    /// Returns `(dir, path)`; the caller removes the dir.
-    fn config_file(text: &str, mode: u32) -> (PathBuf, PathBuf) {
+    /// A private (0700) scratch directory owned by this process. Its own
+    /// ancestors are `/tmp` (sticky) and `/`, both of which the spawn-target
+    /// audit accepts, so a program placed inside it is auditable.
+    fn scratch_dir() -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
             "vitrin-realm-test-{}-{}",
@@ -773,10 +1023,47 @@ pub(crate) mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// A file standing in for the realm's program, with the given mode.
+    /// Real, because `command` is audited against a real filesystem.
+    fn program_in(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    /// A `realm.toml` with the given text and mode inside `dir`.
+    fn config_in(dir: &Path, text: &str, mode: u32) -> PathBuf {
         let path = dir.join(CONFIG_FILE_NAME);
         fs::write(&path, text).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    /// A scratch `realm.toml` with the given mode, in a private temp dir.
+    /// Returns `(dir, path)`; the caller removes the dir. For the tests
+    /// whose file never reaches the spawn-target audit.
+    fn config_file(text: &str, mode: u32) -> (PathBuf, PathBuf) {
+        let dir = scratch_dir();
+        let path = config_in(&dir, text, mode);
         (dir, path)
+    }
+
+    /// A loadable session: a scratch dir holding a trusted-writer-clean
+    /// program and a `realm.toml` naming it. `extra` is appended to the
+    /// table. Returns `(dir, config path, program path)`.
+    fn loadable(extra: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = scratch_dir();
+        let program = program_in(&dir, "app", 0o755);
+        let path = config_in(
+            &dir,
+            &format!("[[realm]]\ncommand = \"{}\"\n{extra}", program.display()),
+            0o600,
+        );
+        (dir, path, program)
     }
 
     // -- the realm object and its addressability ---------------------------
@@ -787,7 +1074,7 @@ pub(crate) mod tests {
         // clients -- `get_realm("realm-0")` names *this* object.
         let registry = registry_from(MINIMAL).unwrap();
         assert_eq!(registry.len(), 1);
-        let realm = registry.get(DEFAULT_REALM_ID).expect("realm-0 exists");
+        let realm = registry.get(WELL_KNOWN_REALM_ID).expect("realm-0 exists");
         assert_eq!(realm.id().as_str(), "realm-0");
         assert_eq!(realm.state(), RealmState::Configured);
         assert_eq!(realm.spawn().command(), Path::new("/usr/bin/true"));
@@ -801,17 +1088,55 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn realm_existence_comes_from_config_not_from_a_constant() {
-        // The point of the registry: an id the operator chose resolves, and
-        // the well-known name does NOT when it is not what was configured.
-        // A hardcoded "realm-0" check would pass this test backwards.
-        let registry =
-            registry_from("[[realm]]\nid = \"kiosk\"\ncommand = \"/usr/bin/true\"\n").unwrap();
+    fn realm_existence_is_a_registry_lookup_not_a_constant() {
+        // Existence is whatever the registry holds -- a real keyed lookup,
+        // which is what makes the later multi-realm phase additive. Asserted
+        // on a registry serving a name that is *not* the well-known one: a
+        // hardcoded "realm-0" comparison would pass this backwards.
+        //
+        // Version-0 *config* cannot produce this registry (the id is pinned
+        // to the IDL's well-known name, asserted just below); the model
+        // underneath is deliberately not narrowed to match, so the check
+        // that opens up is one line in the validator.
+        let registry = registry_with(&["kiosk"]);
         assert_eq!(
             registry.resolve_for_petition("kiosk"),
             Some(&RealmId::new("kiosk"))
         );
-        assert_eq!(registry.resolve_for_petition(DEFAULT_REALM_ID), None);
+        assert_eq!(registry.resolve_for_petition(WELL_KNOWN_REALM_ID), None);
+    }
+
+    #[test]
+    fn the_realm_id_is_the_one_the_idl_fixes_for_this_version() {
+        // The IDL declares "realm-0" the single well-known realm of version
+        // 1. A session serving some other name is structurally legal and
+        // practically useless: every conformant client petitions "realm-0"
+        // and is told `unavailable` forever, which the IDL specifies as a
+        // *race*, not as a permanent fact about a configured session.
+        let err = registry_from("[[realm]]\nid = \"kiosk\"\ncommand = \"/usr/bin/true\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kiosk"), "must name the value: {err}");
+        assert!(
+            err.contains("realm-0"),
+            "must name what it should be: {err}"
+        );
+        assert!(
+            err.contains("get_realm"),
+            "must say what breaks, in the client's terms: {err}"
+        );
+
+        // Written explicitly and omitted mean the same thing, and both load.
+        for text in [
+            "[[realm]]\nid = \"realm-0\"\ncommand = \"/usr/bin/true\"\n",
+            "[[realm]]\ncommand = \"/usr/bin/true\"\n",
+        ] {
+            let registry = registry_from(text).unwrap();
+            assert_eq!(
+                registry.resolve_for_petition(WELL_KNOWN_REALM_ID),
+                Some(&RealmId::new(WELL_KNOWN_REALM_ID))
+            );
+        }
     }
 
     #[test]
@@ -828,7 +1153,7 @@ pub(crate) mod tests {
                 "{unknown:?} must not resolve"
             );
         }
-        let realm = registry.get(DEFAULT_REALM_ID).unwrap();
+        let realm = registry.get(WELL_KNOWN_REALM_ID).unwrap();
         assert!(
             realm.admits_petitions(),
             "a configured realm whose app has not started is addressable, not vacant: \
@@ -859,7 +1184,7 @@ pub(crate) mod tests {
             "[[realm]]\ncommand = \"/usr/bin/true\"\nargs = []\nenv_allow = []\n",
         ] {
             let spawn = registry_from(text).unwrap();
-            let spawn = spawn.get(DEFAULT_REALM_ID).unwrap().spawn();
+            let spawn = spawn.get(WELL_KNOWN_REALM_ID).unwrap().spawn();
             assert!(spawn.args().is_empty());
             assert!(spawn.env_allow().is_empty());
         }
@@ -874,7 +1199,7 @@ pub(crate) mod tests {
             "[[realm]]\ncommand = \"/usr/bin/true\"\nenv_allow = [\"HOME\", \"LANG\", \"ABSENT\"]\n",
         )
         .unwrap();
-        let spawn = registry.get(DEFAULT_REALM_ID).unwrap().spawn();
+        let spawn = registry.get(WELL_KNOWN_REALM_ID).unwrap().spawn();
         let env = spawn.inherited_env(|name| match name {
             "HOME" => Some("/home/agent".into()),
             "LANG" => Some("en_US.UTF-8".into()),
@@ -893,7 +1218,7 @@ pub(crate) mod tests {
 
         let empty = registry_from(MINIMAL).unwrap();
         assert!(empty
-            .get(DEFAULT_REALM_ID)
+            .get(WELL_KNOWN_REALM_ID)
             .unwrap()
             .spawn()
             .inherited_env(|_| Some("leaked".into()))
@@ -901,11 +1226,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn config_cannot_re_litigate_the_scrubbed_display_variables() {
-        // P1.5.2 scrubs DISPLAY and the host WAYLAND_DISPLAY
-        // unconditionally; a config able to allow-list them back would
-        // silently void the confinement (module docs).
-        for name in RESERVED_ENV {
+    fn config_cannot_hand_the_app_the_host_display_server() {
+        // P1.5.2 scrubs the host's display variables unconditionally; a
+        // config able to allow-list them back would silently void the
+        // confinement (module docs). Each refusal names the variable and
+        // the specific mechanism, because "it is reserved" teaches the
+        // operator nothing about why their app cannot have it.
+        for (name, _) in RESERVED_ENV {
             let text =
                 format!("[[realm]]\ncommand = \"/usr/bin/true\"\nenv_allow = [\"{name}\"]\n");
             let err = registry_from(&text).unwrap_err().to_string();
@@ -915,6 +1242,26 @@ pub(crate) mod tests {
                 "message must say why it is refused: {err}"
             );
         }
+
+        // Named regression anchors, because the reasoning that produced the
+        // original two-name list does not reach them: WAYLAND_SOCKET is not
+        // a display *name* but the number of an already-connected fd, which
+        // libwayland honors before WAYLAND_DISPLAY and before its own `name`
+        // argument -- so allow-listing it in nested mode (where the core's
+        // own environment carries the host compositor's socket) would hand
+        // the confined app a live host connection and the realm's private
+        // socket would never be consulted. XDG_RUNTIME_DIR is the host
+        // session's socket directory *and* a variable the core injects.
+        for name in ["WAYLAND_SOCKET", "XDG_RUNTIME_DIR", "XAUTHORITY"] {
+            assert!(
+                reserved_env_reason(name).is_some(),
+                "{name} must be unreachable from config"
+            );
+        }
+        // Exact, case-sensitive matching: `getenv` finds DISPLAY, never
+        // display, so refusing the latter would be theater.
+        assert!(reserved_env_reason("display").is_none());
+        assert!(reserved_env_reason("HOME").is_none());
     }
 
     // -- validation strictness --------------------------------------------
@@ -1052,9 +1399,21 @@ pub(crate) mod tests {
         // no drift.
         for id in ["", ".", "..", "../evil", "a/b", "é", &"x".repeat(65)] {
             let text = format!("[[realm]]\nid = \"{id}\"\ncommand = \"/usr/bin/true\"\n");
-            assert!(registry_from(&text).is_err(), "must reject id {id:?}");
+            let err = registry_from(&text)
+                .expect_err(&format!("must reject id {id:?}"))
+                .to_string();
+            assert!(
+                err.contains("legal realm id"),
+                "an ill-shaped id must be reported as ill-shaped, not as the wrong \
+                 name -- the shape check runs first: {err}"
+            );
         }
-        assert!(registry_from("[[realm]]\nid = \"realm.0\"\ncommand = \"/a\"\n").is_ok());
+        // Shape-legal but not the well-known name: the *other* refusal, so
+        // the two checks are visibly distinct and ordered.
+        let err = registry_from("[[realm]]\nid = \"realm.0\"\ncommand = \"/a\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("single well-known realm"), "unexpected: {err}");
     }
 
     #[test]
@@ -1065,7 +1424,9 @@ pub(crate) mod tests {
 
         // Two realms: refused by *cardinality*, with the Phase-3 pointer --
         // the file format already carries an array, so raising MAX_REALMS
-        // is the whole change.
+        // is the whole change. Counted before the tables are validated, so
+        // this is the answer the operator gets whatever is inside the
+        // second one: that there should not be a second one.
         let two = registry_from(
             "[[realm]]\nid = \"a\"\ncommand = \"/a\"\n[[realm]]\nid = \"b\"\ncommand = \"/b\"\n",
         )
@@ -1074,7 +1435,8 @@ pub(crate) mod tests {
         assert!(two.contains("exactly 1"), "unexpected: {two}");
         assert!(two.contains("Phase 3"), "unexpected: {two}");
 
-        // Same id twice is a duplicate, whatever the cardinality rule says.
+        // And enforced again by the constructor, so a caller that skips the
+        // parser cannot build a registry the wire could not describe.
         assert!(RealmRegistry::from_specs(vec![
             parse_config(MINIMAL).unwrap().remove(0),
             parse_config(MINIMAL).unwrap().remove(0),
@@ -1120,19 +1482,139 @@ pub(crate) mod tests {
     #[test]
     fn a_well_formed_file_loads_from_disk() {
         let _fd = crate::capture::tests::fd_lock();
-        let (dir, path) = config_file(
-            "# a realm\n[[realm]]\ncommand = \"/usr/bin/true\"\nargs = [\"--version\"]\n",
+        let dir = scratch_dir();
+        let program = program_in(&dir, "app", 0o755);
+        // World-readable is fine: a command line is not secret material.
+        let path = config_in(
+            &dir,
+            &format!(
+                "# a realm\n[[realm]]\ncommand = \"{}\"\nargs = [\"--version\"]\n",
+                program.display()
+            ),
             0o644,
         );
-        // World-readable is fine: a command line is not secret material.
         let registry = RealmRegistry::load(&path).unwrap();
         assert_eq!(registry.len(), 1);
-        assert_eq!(
-            registry.get(DEFAULT_REALM_ID).unwrap().spawn().args(),
-            ["--version"]
-        );
+        let realm = registry.get(WELL_KNOWN_REALM_ID).unwrap();
+        assert_eq!(realm.spawn().args(), ["--version"]);
+        // The path the operator wrote is the path the realm will exec:
+        // auditing resolves symlinks, executing must not (argv[0] is
+        // observable to the program).
+        assert_eq!(realm.spawn().command(), program);
         assert_eq!(registry.iter().count(), 1);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    // -- the program the core will exec ------------------------------------
+
+    #[test]
+    fn a_command_only_a_trusted_writer_can_replace_is_required() {
+        // The not-writable policy is transitive or it is decorative: a
+        // 0600 realm.toml naming a group-writable program hands exactly the
+        // authority the file check protects to everyone who can write that
+        // program (module docs).
+        let _fd = crate::capture::tests::fd_lock();
+
+        // The clean case, and the same program made world-writable.
+        let (dir, path, program) = loadable("");
+        assert!(RealmRegistry::load(&path).is_ok());
+        for mode in [0o777, 0o757, 0o775] {
+            fs::set_permissions(&program, fs::Permissions::from_mode(mode)).unwrap();
+            let err = RealmRegistry::load(&path).unwrap_err();
+            assert!(
+                matches!(err.kind, ErrorKind::Insecure(_)),
+                "mode {mode:03o} must be refused, got {err:?}"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains(&program.display().to_string()),
+                "must name the program: {text}"
+            );
+            assert!(
+                text.contains("writable by group/other"),
+                "must name the fault: {text}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_writable_directory_on_the_commands_path_is_refused() {
+        // Swapping the program is the same attack whether the attacker
+        // writes the file or the directory holding it, so the audit walks
+        // every component. A sticky world-writable directory (/tmp) is the
+        // documented exception -- a non-owner cannot replace an entry it
+        // does not own -- and is what the scratch dirs themselves sit in.
+        let _fd = crate::capture::tests::fd_lock();
+        let dir = scratch_dir();
+        let wide = dir.join("wide");
+        fs::create_dir(&wide).unwrap();
+        fs::set_permissions(&wide, fs::Permissions::from_mode(0o777)).unwrap();
+        let program = program_in(&wide, "app", 0o755);
+        let path = config_in(
+            &dir,
+            &format!("[[realm]]\ncommand = \"{}\"\n", program.display()),
+            0o600,
+        );
+
+        let err = RealmRegistry::load(&path).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Insecure(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains(&wide.display().to_string()),
+            "must name the offending directory, not just the program: {text}"
+        );
+        assert!(text.contains("swap"), "must say what it enables: {text}");
+
+        // The sticky bit is what makes the same mode safe on a directory.
+        fs::set_permissions(&wide, fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(RealmRegistry::load(&path).is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_command_that_does_not_resolve_is_a_hard_startup_error() {
+        // Fail closed and loud: a realm whose app does not exist has
+        // nothing to serve, and learning that at startup beats learning it
+        // from a spawn failure with no configuration context.
+        let _fd = crate::capture::tests::fd_lock();
+        let dir = scratch_dir();
+        let missing = dir.join("nope");
+        let path = config_in(
+            &dir,
+            &format!("[[realm]]\ncommand = \"{}\"\n", missing.display()),
+            0o600,
+        );
+        let text = RealmRegistry::load(&path).unwrap_err().to_string();
+        assert!(
+            text.contains(&missing.display().to_string()),
+            "must name the command: {text}"
+        );
+        assert!(text.contains("does not resolve"), "unexpected: {text}");
+
+        // A directory is not a program either.
+        let path = config_in(
+            &dir,
+            &format!("[[realm]]\ncommand = \"{}\"\n", dir.display()),
+            0o600,
+        );
+        let err = RealmRegistry::load(&path).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Insecure(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected: {err}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_audit_is_a_property_of_loading_not_of_parsing() {
+        // Parsing stays pure and total: it answers questions about text.
+        // Whether a path names a program only this filesystem can say, so
+        // the audit lives beside the config-file security check and specs
+        // built in-process (tests, and P1.5.2's fixtures) do not pretend to
+        // have been audited.
+        assert!(registry_from("[[realm]]\ncommand = \"/nonexistent/app\"\n").is_ok());
     }
 
     #[test]

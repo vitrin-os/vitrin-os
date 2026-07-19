@@ -875,7 +875,7 @@ mod tests {
     /// the well-known default id, exactly what a minimal `realm.toml`
     /// produces.
     fn realms() -> RealmRegistry {
-        crate::realm::tests::registry_with(&[crate::realm::DEFAULT_REALM_ID])
+        crate::realm::tests::registry_with(&[crate::realm::WELL_KNOWN_REALM_ID])
     }
 
     /// A wire-valid whole-realm petition for `who`, with wire ids picked by
@@ -885,7 +885,7 @@ mod tests {
         PetitionRequest {
             connection,
             identity: identity(who),
-            realm_name: crate::realm::DEFAULT_REALM_ID.into(),
+            realm_name: crate::realm::WELL_KNOWN_REALM_ID.into(),
             grant_wire_id,
             consent_wire_id: grant_wire_id + 1,
             resource: String::new(),
@@ -963,7 +963,7 @@ mod tests {
         };
 
         let mut req = request(DEMO, conn, 20);
-        req.realm_name = crate::realm::DEFAULT_REALM_ID.into();
+        req.realm_name = crate::realm::WELL_KNOWN_REALM_ID.into();
         expect_declined(reg.admit(req, t0, &realms), Outcome::Unavailable);
 
         // An empty registry is the vacant case the IDL folds into the same

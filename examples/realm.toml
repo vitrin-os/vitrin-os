@@ -22,6 +22,14 @@
 # Unlike principals.toml it may be world-READABLE: a command line is not
 # secret material.
 #
+# The same rule is applied to what `command` names, because a hardened
+# realm.toml pointing at a program anyone can overwrite protects nothing:
+# the program (resolved through symlinks) must be a regular file, and it and
+# every directory on its path must be owned by root or by the uid running
+# vitrind and not writable by group or other. A world-writable DIRECTORY is
+# accepted only with the sticky bit (/tmp-style), which is what stops a
+# non-owner from swapping an entry it does not own.
+#
 # Conventional location: $XDG_CONFIG_HOME/vitrin/realm.toml
 # (~/.config/vitrin/realm.toml). Override with `vitrind --realm PATH`.
 # Startup FAILS -- loudly, naming this file and the problem -- if it is
@@ -30,16 +38,23 @@
 # nobody asked for.
 
 [[realm]]
-# Optional. The realm's stable, wire-visible identity: what an agent
-# addresses with `vitrin_principal.get_realm("realm-0")`, what the MVP's
-# whole-realm grant scope names (`realm:realm-0`), and the directory name
-# of the realm's private runtime tree
-# ($XDG_RUNTIME_DIR/vitrin-0/<id>/). Defaults to "realm-0", the well-known
-# name of protocol version 1. At most 64 bytes over [A-Za-z0-9._-], never
-# `.` or `..`.
+# Optional, and in this protocol version it may only be spelled "realm-0".
+# The realm's stable, wire-visible identity: what an agent addresses with
+# `vitrin_principal.get_realm("realm-0")`, what the MVP's whole-realm grant
+# scope names (`realm:realm-0`), and the directory name of the realm's
+# private runtime tree ($XDG_RUNTIME_DIR/vitrin-0/<id>/).
+#
+# The protocol -- not this file -- fixes that name: the IDL declares
+# "realm-0" the single well-known realm of version 1, so it is the one realm
+# name a conformant client can know without being told. A session serving
+# some other name would answer every such client's get_realm("realm-0")
+# petition `unavailable`, forever. Operator-chosen realm names arrive with
+# the wire's multi-realm phase, together with the enumeration that makes
+# them discoverable.
 #id = "realm-0"
 
-# REQUIRED. Absolute path of the program this realm launches. Relative
+# REQUIRED. Absolute path of the program this realm launches, which must
+# exist and pass the transitive not-writable check described above. Relative
 # names are refused: they would resolve through the core's own $PATH, so
 # what actually executed would depend on ambient environment this file
 # cannot show. (P1.5.2 executes it; this version only owns the config.)
@@ -58,7 +73,17 @@ command = "/usr/bin/foot"
 # passed -- not an error, because config validity must not depend on which
 # machine loads it.
 #
-# DISPLAY and WAYLAND_DISPLAY are refused here: the core scrubs the host
-# values unconditionally, because an app that can reach the host display
-# server is not confined. That is not a config decision.
+# These names are refused here, because an app that can reach the host
+# display server is not confined and that is not a config decision:
+#
+#   DISPLAY          addresses the host X server
+#   WAYLAND_DISPLAY  addresses a Wayland server; the core injects the
+#                    realm's own private socket instead
+#   WAYLAND_SOCKET   is an ALREADY-CONNECTED file descriptor, which
+#                    libwayland honors before WAYLAND_DISPLAY -- passing it
+#                    through would connect the app straight to the host
+#                    compositor and the realm's socket would never be used
+#   XAUTHORITY       is the credential authenticating a host X connection
+#   XDG_RUNTIME_DIR  names the host session's socket directory; the core
+#                    injects the realm's own runtime directory instead
 #env_allow = ["HOME", "LANG", "XDG_SESSION_TYPE"]

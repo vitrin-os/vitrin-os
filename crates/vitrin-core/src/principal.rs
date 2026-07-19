@@ -1792,7 +1792,7 @@ mod tests {
             let (recorder, log_path) = crate::recorder::tests::scratch_recorder("principal");
             Self {
                 petitions: PetitionRegistry::new(policy, PetitionConfig::default()),
-                realms: crate::realm::tests::registry_with(&[crate::realm::DEFAULT_REALM_ID]),
+                realms: crate::realm::tests::registry_with(&[crate::realm::WELL_KNOWN_REALM_ID]),
                 grants: GrantTable::new(),
                 now: Instant::now(),
                 view: Some((crate::test_pattern::render(VIEW_W, VIEW_H), VIEW_W, VIEW_H)),
@@ -3178,8 +3178,12 @@ mod tests {
             Some("realm-0")
         );
 
-        // Now the inversion, on a fresh rig whose realm.toml configured a
-        // differently named realm.
+        // Now the inversion, on a fresh rig whose registry holds a
+        // differently named realm. Version-0 *config* cannot produce that
+        // registry -- `realm.toml` pins the id to the IDL's well-known name
+        // -- but the addressing path underneath is name-agnostic, and that
+        // is what this asserts: nothing between the wire and the registry
+        // privileges "realm-0".
         let mut shared = Shared::new(ConsentPolicy::Interactive);
         shared.realms = crate::realm::tests::registry_with(&["kiosk"]);
         let (mut server, mut core, mut client) = connect(&mut shared);

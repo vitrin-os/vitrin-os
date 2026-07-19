@@ -211,14 +211,19 @@
 //!   `no_surface`. Authority without a target is inert, not dangerous.
 //!
 //! **The flip point is one predicate**, [`Realm::admits_petitions`], and it
-//! is the only thing P1.5.2/P1.5.3 need to touch. Version 0 has a single
-//! [`RealmState`] variant, `Configured`, and the predicate returns `true`
-//! for it. When P1.5.2 spawns and P1.5.3 detects exit, they add variants
-//! (`Running`, `Exited`, ...) and decide there whether a realm whose app has
-//! terminated for good is vacant -- a one-arm change in one function, with
-//! no signature, no caller, and no wire behavior moving. [`crate::petitions`]
-//! asks [`RealmRegistry::resolve_for_petition`], which is the registry's
-//! only petition-time entry point and already routes through that predicate.
+//! stayed the only thing P1.5.2/P1.5.3 had to touch. P1.5.2 added
+//! [`RealmState::Running`] (still `true`: a launched app that has not
+//! painted is unpainted, not absent) and P1.5.3 added
+//! [`RealmState::Exited`], which is where the answer finally flips to
+//! `false` -- a one-arm change in one function, no signature, no caller and
+//! no wire behavior moving. [`crate::petitions`] asks
+//! [`RealmRegistry::resolve_for_petition`], the registry's only
+//! petition-time entry point, which already routed through the predicate.
+//!
+//! The `Exited` arm is argued in full at the predicate itself. In one line:
+//! `no_surface` means *not right now* and `unavailable` means *not ever*,
+//! and a realm whose shim is gone in a build with no restart policy is the
+//! second one.
 //!
 //! # Where the config path comes from
 //!
@@ -368,10 +373,9 @@ impl SpawnConfig {
     }
 }
 
-/// A realm's lifecycle state. P1.5.3 adds the terminal ones (`Exited`,
-/// and whatever crash detection needs); [`Realm::admits_petitions`] is
-/// where every variant decides vacancy (module docs), and it is the only
-/// place that has to change.
+/// A realm's lifecycle state. [`Realm::admits_petitions`] is where every
+/// variant decides vacancy (module docs), and it is the only place that has
+/// to change when a variant is added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RealmState {
     /// Described by `realm.toml` and addressable; no app process yet.
@@ -381,6 +385,18 @@ pub(crate) enum RealmState {
     /// the shim. Says nothing about whether the app has painted -- that
     /// stays the chokepoint's `no_surface` judgement, not a realm state.
     Running { pid: u32 },
+    /// **Terminal** (P1.5.3): the realm's shim is gone -- it crashed, its
+    /// connection died, or shutdown tore it down -- and nothing will bring
+    /// it back. `pid` is the process that was serving the realm, retained
+    /// so the log and a reader can tie this state to the `realm_died`
+    /// entry; it names a process that no longer exists.
+    ///
+    /// Terminal is a statement about *this build*, not about realms: the
+    /// MVP has no restart policy by decision (supervision is a later
+    /// concern), so "the shim died" and "the realm is over" coincide. When
+    /// supervision arrives it adds a `Restarting` variant beside this one
+    /// and answers the predicate below for itself; nothing else moves.
+    Exited { pid: u32 },
 }
 
 /// One realm: its wire-visible identity, the app it owns, and its state.
@@ -423,8 +439,32 @@ impl Realm {
             // further along: an app that has started but not yet committed
             // a surface is still merely unpainted. The petition-time answer
             // only changes when a realm can no longer be served at all,
-            // which is P1.5.3's terminal states.
+            // which is the terminal state below.
             RealmState::Running { .. } => true,
+            // **Vacant** (P1.5.3, the flip this predicate was written for).
+            // This is the one state where "the realm cannot be served"
+            // stops being a liveness fact and becomes an addressing one:
+            // with no restart policy in the MVP, a realm whose shim is gone
+            // is gone for the rest of the session, which is precisely the
+            // IDL's `vacant` -- "a name that is unknown *or vacant* yields a
+            // handle whose petitions resolve `unavailable`".
+            //
+            // It is not a contradiction of the "unpainted is not absent"
+            // rule above; it is the same rule's other side. `no_surface`
+            // says *not right now*, and an agent that hears it may sensibly
+            // retry. `unavailable` says *not ever*, and an agent that hears
+            // it should stop asking. Answering a petition for a dead realm
+            // with a live handle would park a consent prompt in front of a
+            // human about authority over nothing, and then hold the
+            // petitioner's own actuations under `consent_held` while it
+            // waited (the chokepoint's step 5b) -- a prompt that cannot
+            // matter, blocking a client that cannot be served.
+            //
+            // Fail-closed is unaffected in the other direction: grants
+            // already issued over this realm keep refusing `no_surface` at
+            // the chokepoint. Nothing here widens authority, and use-time
+            // liveness stays exactly where it was.
+            RealmState::Exited { .. } => false,
         }
     }
 }
@@ -527,11 +567,31 @@ impl RealmRegistry {
     ///
     /// State transitions live on the registry rather than on [`Realm`] so
     /// there is one owner of realm state, the way there is one grant table
-    /// -- P1.5.3's exit handling adds its transitions here beside this one.
+    /// -- [`mark_exited`](Self::mark_exited) is its sibling.
     pub fn mark_running(&mut self, id: &RealmId, pid: u32) -> bool {
         match self.realms.get_mut(id) {
             Some(realm) => {
                 realm.state = RealmState::Running { pid };
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record that this realm's shim is gone for good (P1.5.3): the realm
+    /// stops admitting petitions from here on ([`Realm::admits_petitions`]).
+    /// Returns whether the realm existed.
+    ///
+    /// Deliberately **not** idempotence-enforcing: this writes a terminal
+    /// state, so writing it twice writes the same thing, and a registry
+    /// that refused the second write would be a second place death is
+    /// counted. Idempotence -- "one death produces one log entry, one
+    /// scene clear, one transition" -- is [`crate::lifecycle`]'s single
+    /// latch, and it is the only caller.
+    pub fn mark_exited(&mut self, id: &RealmId, pid: u32) -> bool {
+        match self.realms.get_mut(id) {
+            Some(realm) => {
+                realm.state = RealmState::Exited { pid };
                 true
             }
             None => false,
@@ -1253,6 +1313,47 @@ pub(crate) mod tests {
         assert_eq!(
             registry.resolve_for_petition(WELL_KNOWN_REALM_ID),
             Some(&id)
+        );
+    }
+
+    #[test]
+    fn an_exited_realm_is_vacant_and_stops_resolving() {
+        // P1.5.3's state arm, and the ONE place the petition-time answer
+        // finally flips (module docs): `no_surface` means "not right now",
+        // `unavailable` means "not ever", and with no restart policy a
+        // realm whose shim is gone is the second.
+        let mut registry = registry_from(MINIMAL).unwrap();
+        let id = RealmId::new(WELL_KNOWN_REALM_ID);
+        assert!(registry.mark_running(&id, 4242));
+        assert!(registry.mark_exited(&id, 4242));
+        assert!(!registry.mark_exited(&RealmId::new("realm-1"), 1));
+
+        let realm = registry.get(WELL_KNOWN_REALM_ID).unwrap();
+        assert_eq!(realm.state(), RealmState::Exited { pid: 4242 });
+        assert!(
+            !realm.admits_petitions(),
+            "a realm whose shim is gone for good is vacant, not merely unpainted"
+        );
+        assert_eq!(
+            registry.resolve_for_petition(WELL_KNOWN_REALM_ID),
+            None,
+            "the IDL's `unavailable`: the same answer an unknown name gets, deliberately \
+             indistinguishable to the client"
+        );
+
+        // Still *in* the registry, and still owning its spawn config: the
+        // realm object outlives its process, which is what keeps realm ids
+        // and process lifetimes separate concepts.
+        assert_eq!(realm.id(), &id);
+        assert!(realm.spawn().command().is_absolute());
+
+        // Terminal is terminal, and writing it twice writes the same thing
+        // -- idempotence lives in `crate::lifecycle`'s latch, not here, so
+        // the registry must not fight it.
+        assert!(registry.mark_exited(&id, 4242));
+        assert_eq!(
+            registry.get(WELL_KNOWN_REALM_ID).unwrap().state(),
+            RealmState::Exited { pid: 4242 }
         );
     }
 

@@ -1705,9 +1705,10 @@ impl PrincipalServer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::Cell;
     use std::collections::HashMap;
+    use std::os::fd::AsFd;
     use std::path::PathBuf;
 
     use vitrin_ipc::Connection;
@@ -2083,6 +2084,76 @@ mod tests {
         assert_eq!(ev.height, VIEW_H);
         assert_eq!(ev.stride, VIEW_W * 4);
         ev
+    }
+
+    /// What one `capture_frame` produced at the enforcement chokepoint --
+    /// **which terminal the client saw**, never what any state says.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum CaptureOutcome {
+        /// A `frame_ready` arrived, carrying these dimensions.
+        Frame { width: u32, height: u32 },
+        /// A `refused` arrived with this code, and no `frame_ready`
+        /// exists on the wire at all.
+        Refused(Refusal),
+    }
+
+    /// Drive exactly one `vitrin_view.capture_frame` end to end --
+    /// handshake, realm, petition, auto-approved grant, then the capture --
+    /// against `view` as the realm's live view, and report the single
+    /// terminal the client saw.
+    ///
+    /// Exists for [`crate::lifecycle`], whose acceptance criterion is that
+    /// a capture after a shim's death yields **no frame at all**. Asserting
+    /// "the delivered bytes differ from the last good ones" would be
+    /// satisfied by a stale frame that happened to differ, so the assertion
+    /// has to be about which terminal arrived -- and that means running a
+    /// real chokepoint decision over a real socketpair rather than
+    /// inspecting core state.
+    ///
+    /// Mints socketpairs and a memfd, so **the caller must already hold
+    /// [`crate::capture::tests::fd_lock`]** -- it deliberately does not take
+    /// it itself, because every caller is a test that is already counting
+    /// descriptors under that lock and the mutex is not reentrant.
+    pub(crate) fn capture_once(view: Option<crate::capture::RealmViewFrame<'_>>) -> CaptureOutcome {
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+        shared.view = view.map(|v| (v.rgba.to_vec(), v.width, v.height));
+
+        client.send_message(&capture_frame(), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).expect("dispatch the capture");
+
+        let msg = client.recv_message().unwrap().unwrap();
+        let outcome = match msg.header.object_id {
+            // The view facet: the only object `frame_ready` addresses.
+            6 => {
+                let (_, ev) = view::events::FrameReady::decode(&msg.bytes, msg.fd)
+                    .expect("a well-formed frame_ready");
+                CaptureOutcome::Frame {
+                    width: ev.width,
+                    height: ev.height,
+                }
+            }
+            // The co-minted grant handle: the only object `refused`
+            // addresses.
+            4 => {
+                let (_, ev) = grant::events::Refused::decode(&msg.bytes, msg.fd)
+                    .expect("a well-formed refused");
+                CaptureOutcome::Refused(ev.code)
+            }
+            other => panic!("unexpected terminal on object {other}"),
+        };
+
+        // Exactly one terminal per `capture_frame` (IDL), and -- the whole
+        // point of this helper -- when that terminal is a refusal there is
+        // no `frame_ready` anywhere behind it. A stale frame would show up
+        // here.
+        let flags = rustix::fs::fcntl_getfl(client.as_fd()).unwrap();
+        rustix::fs::fcntl_setfl(client.as_fd(), flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+        match client.recv_message() {
+            Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("exactly one terminal per capture_frame; a second arrived: {other:?}"),
+        }
+        outcome
     }
 
     /// The standard granted-rig setup: auto-approve policy, bind, realm 3,

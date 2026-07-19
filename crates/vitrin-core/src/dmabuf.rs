@@ -616,6 +616,13 @@ mod tests {
         // readable fdinfo without dmabuf keys — NotADmabuf, never a blocked
         // syscall. (The accepting arm needs a real dmabuf: the env-gated
         // GPU test covers it.)
+        //
+        // Takes the fd-quiescence lock like every other test in this crate
+        // that opens a descriptor: it was the last one that did not, and
+        // the two descriptors it holds live across its assertions were
+        // landing inside other tests' `/proc/self/fd` measurements (issue
+        // #74's intermittent `fd_count_returns_to_baseline`).
+        let _fd = crate::capture::tests::fd_lock();
         let memfd: OwnedFd =
             rustix::fs::memfd_create("vitrin-probe-test", MemfdFlags::CLOEXEC).expect("memfd");
         assert!(matches!(

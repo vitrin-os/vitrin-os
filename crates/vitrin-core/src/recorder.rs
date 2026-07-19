@@ -814,6 +814,54 @@ pub(crate) enum Event<'a> {
         /// never free-form `Display` text, per this log's convention.
         cause_class: &'static str,
     },
+    /// A realm lost its surface (P1.5.3): its shim connection ended, or its
+    /// process did, and the realm is over -- the MVP has no restart policy.
+    ///
+    /// **The security-relevant half of a realm's death**, and the reason it
+    /// is a separate entry from [`Event::RealmExited`] rather than one entry
+    /// carrying an exit status. This is the instant the surface left the
+    /// scene and every subsequent capture began refusing `no_surface`; the
+    /// exit status may not be known yet (a shim that closes its core
+    /// connection but keeps running is dead to the core for a whole grace
+    /// period before it is a corpse), and a log that waited for it would
+    /// leave the authority-visible transition unrecorded for exactly as
+    /// long as the anomaly lasted. Two facts, two entries, each written
+    /// when it becomes true.
+    ///
+    /// Emitted **once** per realm death: [`crate::lifecycle`] latches the
+    /// transition, so the EOF and the `SIGCHLD` for one death produce one
+    /// of these no matter which arrives first, or whether both do.
+    RealmDied {
+        realm: &'a RealmId,
+        /// The shim that was serving the realm. It may already be reaped.
+        pid: u32,
+        /// Which observation ended the realm, from a closed vocabulary
+        /// ([`crate::lifecycle::DeathCause::label`]) -- never free-form
+        /// `Display` text, per this log's convention.
+        cause: &'static str,
+    },
+    /// A realm's shim process was reaped (P1.5.3): the bookkeeping half of
+    /// the death above, carrying the classified exit status. Its presence
+    /// is also the log's evidence that **no zombie was left behind** -- the
+    /// core waited on this pid and collected it.
+    RealmExited {
+        realm: &'a RealmId,
+        pid: u32,
+        /// `exited`, `signaled`, or `unknown`
+        /// ([`crate::lifecycle::ExitClass`]).
+        disposition: &'static str,
+        /// The exit code, for `exited`; `null` otherwise.
+        code: Option<i32>,
+        /// The terminating signal number, for `signaled`; `null` otherwise.
+        /// A `kill -9` of a shim mid-frame lands here as 9.
+        signal: Option<i32>,
+        /// Whether the core sent that signal itself (the shutdown ladder)
+        /// or merely observed it (a crash). The difference between "we
+        /// terminated the realm" and "the realm died" is not recoverable
+        /// from the signal number alone -- SIGKILL is both the ladder's
+        /// last rung and the classic external `kill -9`.
+        core_initiated: bool,
+    },
     /// A principal connection closed: its pending petitions were withdrawn
     /// and its grants died with it.
     ConnectionTeardown {
@@ -846,6 +894,8 @@ impl Event<'_> {
             Event::GrantRemoved { .. } => "grant_removed",
             Event::RealmSpawned { .. } => "realm_spawned",
             Event::RealmSpawnFailed { .. } => "realm_spawn_failed",
+            Event::RealmDied { .. } => "realm_died",
+            Event::RealmExited { .. } => "realm_exited",
             Event::ConnectionTeardown { .. } => "connection_teardown",
         }
     }
@@ -1120,6 +1170,37 @@ impl Event<'_> {
                 field_display(out, "command", command.display());
                 field_str(out, "cause_class", cause_class);
                 field_null(out, "pid");
+            }
+            Event::RealmDied { realm, pid, cause } => {
+                field_display(out, "realm", realm);
+                field_u64(out, "pid", u64::from(pid));
+                field_str(out, "cause", cause);
+                // Stated as a fact of this build rather than left for a
+                // reader to infer from the absence of a later spawn: the
+                // MVP has no restart policy, so this death is terminal and
+                // the realm stops admitting petitions here.
+                field_bool(out, "restarting", false);
+            }
+            Event::RealmExited {
+                realm,
+                pid,
+                disposition,
+                code,
+                signal,
+                core_initiated,
+            } => {
+                field_display(out, "realm", realm);
+                field_u64(out, "pid", u64::from(pid));
+                field_str(out, "disposition", disposition);
+                match code {
+                    Some(code) => field_i64(out, "code", i64::from(code)),
+                    None => field_null(out, "code"),
+                }
+                match signal {
+                    Some(signal) => field_i64(out, "signal", i64::from(signal)),
+                    None => field_null(out, "signal"),
+                }
+                field_bool(out, "core_initiated", core_initiated);
             }
             Event::ConnectionTeardown {
                 connection,

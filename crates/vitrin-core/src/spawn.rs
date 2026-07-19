@@ -153,6 +153,25 @@
 //!   termination on exactly that signal. The closure resets every
 //!   disposition to `SIG_DFL`, so a realm's process tree starts from a
 //!   defined state instead of an inherited one.
+//! - **The blocked signal *mask*** -- the same hazard through the other
+//!   mechanism, and the one P1.5.3 (#32) found by building on the promise
+//!   above. A disposition reset is not a mask reset: a *blocked* signal is
+//!   never delivered to any disposition at all, so `SIG_DFL` on a blocked
+//!   `SIGTERM` is still an unkillable realm. The blocked set crosses
+//!   `fork` and `execve` untouched and `std::process::Command` does not
+//!   clear it (measured on this toolchain: a child spawned with
+//!   `SIGTERM|SIGCHLD` blocked reports exactly that `SigBlk`). This is not
+//!   hypothetical for *this* core: **both backends block `SIGINT` and
+//!   `SIGTERM`** the moment they install calloop's `signalfd` source
+//!   (`backend::headless`, `backend::winit`), and P1.5.3 blocks `SIGCHLD`
+//!   on top of them so its reaper can see child deaths -- so every realm
+//!   a real `vitrind` spawns would inherit a blocked `SIGTERM`, its
+//!   termination ladder's polite rung would be a silent no-op, and every
+//!   realm would die by `SIGKILL`. A confined app would also be unable to
+//!   reap *its own* children by `SIGCHLD`. The closure clears the mask
+//!   outright; `crate::lifecycle` owns the termination ladder that depends
+//!   on it, and `spawn::tests::the_child_starts_with_an_empty_signal_mask`
+//!   is the assertion that keeps it true.
 //!
 //! # The realm's private runtime directory
 //!
@@ -206,10 +225,17 @@
 //!   name, and the realm lock excludes the only same-uid process that has
 //!   business here. A same-uid process outside that chain still could, and
 //!   that is D9's territory, not a mode bit's.
-//! - **Removal at exit belongs to P1.5.3 (#32)**, which owns lifecycle. What
-//!   this task guarantees is that a crashed run is self-healing at the next
-//!   start (the purge above) and that a *failed* spawn leaves nothing behind
-//!   ([`RuntimeDirGuard`]): fail-closed means no half-prepared realm.
+//! - **Removal at exit belonged to P1.5.3 (#32)**, which owns lifecycle,
+//!   and now exists: [`remove_runtime_dir`] is the seam
+//!   [`RuntimeDirGuard::keep`] left open, and [`crate::lifecycle`] calls it
+//!   on an *orderly* shutdown only (a crash deliberately keeps the tree as
+//!   evidence -- that module's docs argue it). It reuses this module's
+//!   verified-parent + `O_NOFOLLOW` purge rather than a second delete path,
+//!   so "the core recursively deletes a directory" stays one routine with
+//!   one set of proofs. What this task already guaranteed is unchanged: a
+//!   crashed run is self-healing at the next start (the purge above), and a
+//!   *failed* spawn leaves nothing behind ([`RuntimeDirGuard`]) -- fail-closed
+//!   means no half-prepared realm.
 //!
 //! # Environment hygiene
 //!
@@ -299,13 +325,15 @@
 //! namespace, so there is nothing to reach rather than nothing advertised.
 //! It is not closed by this file and cannot be.
 //!
-//! # Not in this task
+//! # Not in this module
 //!
 //! Crash detection, `SIGCHLD` reaping, exit propagation, and shutdown
-//! ordering are all P1.5.3 (#32). This module deliberately keeps the
-//! [`std::process::Child`] handle alive inside [`SpawnedRealm`] and never
-//! waits on it, so #32 inherits an unreaped, unlost process handle rather
-//! than having to re-derive one from a pid.
+//! ordering are all [`crate::lifecycle`] (P1.5.3, #32). This module keeps
+//! the [`std::process::Child`] handle alive inside [`SpawnedRealm`] and
+//! never waits on it, so lifecycle adopts an unreaped, unlost process
+//! handle ([`SpawnedRealm::into_parts`]) rather than re-deriving one from a
+//! pid -- which is exactly the pid-reuse race a `Child` exists to avoid.
+//! Nothing here decides when a realm dies or what that means.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -385,18 +413,90 @@ impl SpawnPaths {
     }
 }
 
+/// An unreaped [`Child`] that terminates and waits on itself if it is
+/// dropped instead of being handed on.
+///
+/// `std::process::Child` has no `Drop`: dropping one abandons the process,
+/// which keeps running and, once it exits, becomes a zombie for the core's
+/// entire session because nothing will ever `waitpid` it. That is the
+/// correct default for a general-purpose handle and exactly the wrong one
+/// here, because [`spawn_realm`] documents every one of its errors as a
+/// *refusal* -- "never a partially-launched realm" -- and the window
+/// between it returning and [`crate::lifecycle::RealmLifecycle::adopt`]
+/// taking ownership is not error-free. Realm bring-up
+/// ([`SpawnedRealm::start_shim_session`]) sends `configure` over the
+/// inherited socketpair and fails with `EPIPE` against a shim that exec'd
+/// successfully and then died at once -- a wrapper that returns nonzero, a
+/// binary missing a shared library, a shim that rejects its environment --
+/// and a `?` there drops the [`SpawnedRealm`] mid-unwind.
+///
+/// So the guarantee is made structural rather than left to every caller
+/// remembering it: the process is killed and reaped by the type system, on
+/// every path out including a panic, until the moment ownership genuinely
+/// moves to [`crate::lifecycle`] (which has a `Drop` of its own from
+/// `adopt` onwards, so the two are contiguous with no gap between them).
+#[derive(Debug)]
+struct GuardedChild(Option<Child>);
+
+impl GuardedChild {
+    fn get(&self) -> &Child {
+        // Unreachable: `release` consumes `self`, so the `None` state is
+        // observable only from inside `Drop`.
+        self.0
+            .as_ref()
+            .expect("the child is present until released")
+    }
+
+    fn get_mut(&mut self) -> &mut Child {
+        self.0
+            .as_mut()
+            .expect("the child is present until released")
+    }
+
+    /// Hand the process on to an owner that will reap it, disarming the
+    /// guard. Consumes `self`, so it cannot be released twice.
+    fn release(mut self) -> Child {
+        self.0.take().expect("the child is present until released")
+    }
+}
+
+impl Drop for GuardedChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        tracing::warn!(
+            pid = child.id(),
+            "a spawned shim was dropped before the realm came up; SIGKILLing and reaping it \
+             so the refusal leaves no runaway process and no zombie"
+        );
+        // `SIGKILL` and a blocking wait, matching `RealmLifecycle`'s own
+        // last-resort drop: there is nowhere left to report a polite
+        // failure to, and this realm never became live enough to owe its
+        // app an orderly teardown.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// A realm whose app has been launched: the core's half of the identity
 /// pair (the socketpair end the shim does *not* hold), the process handle,
 /// and the private directory the realm was given.
 ///
-/// The [`Child`] is retained and never waited on: reaping, crash detection,
-/// and exit propagation are P1.5.3 (#32), and losing the handle here would
-/// force that task to re-derive one from a pid -- which is exactly the
-/// pid-reuse race a `Child` exists to avoid.
+/// The [`Child`] is retained rather than waited on: reaping, crash
+/// detection, and exit propagation are P1.5.3 (#32), and losing the handle
+/// here would force that task to re-derive one from a pid -- which is
+/// exactly the pid-reuse race a `Child` exists to avoid. The single
+/// exception is a [`SpawnedRealm`] that is *dropped* before
+/// [`Self::into_parts`] hands it on, which kills and reaps
+/// ([`GuardedChild`]): a realm that never came up is a refusal, and a
+/// refusal must not leave a process behind.
 #[derive(Debug)]
 pub(crate) struct SpawnedRealm {
     realm_id: RealmId,
-    child: Child,
+    /// The shim process, reaped on drop if the realm is never adopted
+    /// ([`GuardedChild`]).
+    child: GuardedChild,
     runtime_dir: PathBuf,
     connection: Connection,
     /// This realm's exclusive `flock`, held for as long as the realm is
@@ -416,7 +516,7 @@ impl SpawnedRealm {
 
     /// The shim's process id.
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.child.get().id()
     }
 
     /// The realm's private runtime directory (mode `0700`), which the shim
@@ -431,11 +531,33 @@ impl SpawnedRealm {
         &mut self.connection
     }
 
-    /// The process handle, unreaped. Exposed so P1.5.3 (#32) -- and, today,
-    /// this module's tests -- can terminate and wait deterministically.
-    /// This task deliberately implements no lifecycle policy of its own.
+    /// The process handle, unreaped. Exposed so [`crate::lifecycle`] --
+    /// and, today, this module's tests -- can terminate and wait
+    /// deterministically. This module implements no lifecycle policy of its
+    /// own.
     pub fn child_mut(&mut self) -> &mut Child {
-        &mut self.child
+        self.child.get_mut()
+    }
+
+    /// Hand the whole live realm to [`crate::lifecycle`], which owns it
+    /// from birth to death.
+    ///
+    /// Deliberately a move rather than a set of borrows: every resource
+    /// here has to die together and in an order (connection, then process,
+    /// then directory, and the realm lock last of all -- releasing it
+    /// earlier would let a second core purge a tree this one is still
+    /// tearing down). Split ownership is how one of them gets forgotten.
+    pub fn into_parts(self) -> SpawnedParts {
+        SpawnedParts {
+            realm_id: self.realm_id,
+            // The one place the reap guard is disarmed: `lifecycle` owns
+            // the process from here, and its own `Drop` takes over with no
+            // window in between.
+            child: self.child.release(),
+            runtime_dir: self.runtime_dir,
+            connection: self.connection,
+            realm_lock: self._realm_lock,
+        }
     }
 
     /// Bring the shim session up on the inherited connection: build the
@@ -466,6 +588,20 @@ impl SpawnedRealm {
         server.send_configure(&mut |bytes: &[u8]| conn.send_message(bytes, None))?;
         Ok(server)
     }
+}
+
+/// A [`SpawnedRealm`] taken apart for [`crate::lifecycle`] to adopt: every
+/// resource one live realm owns, moved out together
+/// ([`SpawnedRealm::into_parts`]).
+#[derive(Debug)]
+pub(crate) struct SpawnedParts {
+    pub realm_id: RealmId,
+    pub child: Child,
+    pub runtime_dir: PathBuf,
+    pub connection: Connection,
+    /// The realm's exclusive `flock`, held until the realm is fully torn
+    /// down. Never read; its existence is the effect (see [`SpawnedRealm`]).
+    pub realm_lock: fs::File,
 }
 
 /// Why a spawn did not happen. Every variant is a **refusal**, never a
@@ -687,9 +823,9 @@ where
     //   * it captures `shim_raw` (a `RawFd`) and `sig_max` (a `c_int`) by
     //     value -- integers, no heap data, no `Drop` type in scope;
     //   * every syscall it makes is on signal-safety(7)'s async-signal-safe
-    //     list: `close_range`, `signal`, and `dup3` (or `fcntl` when the
-    //     source already sits on the target descriptor, where `dup3` would
-    //     return EINVAL);
+    //     list: `close_range`, `signal`, `sigemptyset`, `sigprocmask`, and
+    //     `dup3` (or `fcntl` when the source already sits on the target
+    //     descriptor, where `dup3` would return EINVAL);
     //   * `io::Error::last_os_error()` is `from_raw_os_error` over `errno`
     //     and allocates nothing;
     //   * it does not allocate, lock, log, format, or call back into Rust
@@ -733,7 +869,31 @@ where
                 sig += 1;
             }
 
-            // (3) The one descriptor that must survive, placed after the
+            // (3) The signal MASK to a defined state, for the same reason
+            // and against a different mechanism. `execve` resets nothing
+            // here: the blocked set crosses `fork` *and* `execve`
+            // untouched, and `std::process::Command` does not clear it
+            // (measured -- see the module docs' companion note). The core
+            // blocks SIGINT/SIGTERM the moment either backend installs
+            // calloop's signalfd source, and P1.5.3 blocks SIGCHLD on top,
+            // so without this line every realm this core spawns inherits a
+            // *blocked* SIGTERM and the termination ladder's polite rung
+            // silently degrades to SIGKILL every time. Step (2) above
+            // cannot help: SIG_DFL is a disposition, and a blocked signal
+            // is never delivered to any disposition at all.
+            //
+            // `sigprocmask`, not `pthread_sigmask`: only the former is on
+            // signal-safety(7)'s async-signal-safe list, and POSIX's
+            // "unspecified in a multi-threaded process" caveat does not
+            // apply -- a forked child has exactly one thread.
+            let mut empty = core::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            if libc::sigemptyset(empty.as_mut_ptr()) < 0
+                || libc::sigprocmask(libc::SIG_SETMASK, empty.as_ptr(), core::ptr::null_mut()) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+
+            // (4) The one descriptor that must survive, placed after the
             // sweep and therefore without FD_CLOEXEC.
             let rc = if shim_raw == SHIM_CORE_FD {
                 libc::fcntl(SHIM_CORE_FD, libc::F_SETFD, 0)
@@ -759,7 +919,7 @@ where
 
     Ok(SpawnedRealm {
         realm_id: realm.id().clone(),
-        child,
+        child: GuardedChild(Some(child)),
         runtime_dir,
         connection: core_side,
         // The realm is now live, and the lock that proved it was free
@@ -1052,28 +1212,7 @@ fn prepare_runtime_tree(parent: &Path) -> Result<OwnedFd, String> {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(format!("cannot create {}: {e}", parent.display())),
     }
-    let fd = rustix::fs::open(
-        parent,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| {
-        format!(
-            "{} is not a directory this core may use ({e}); refusing",
-            parent.display()
-        )
-    })?;
-    let st =
-        rustix::fs::fstat(&fd).map_err(|e| format!("cannot stat {}: {e}", parent.display()))?;
-    let euid = rustix::process::geteuid().as_raw();
-    if st.st_uid != euid {
-        return Err(format!(
-            "{} is owned by uid {}, not the core's uid {euid}; refusing to place realm \
-             runtime directories in a tree this core does not own",
-            parent.display(),
-            st.st_uid
-        ));
-    }
+    let fd = open_owned_dir(parent)?;
     // Through the descriptor, so this cannot be redirected at a target the
     // check above did not see.
     rustix::fs::fchmod(&fd, Mode::from_bits_truncate(RUNTIME_DIR_MODE)).map_err(|e| {
@@ -1083,6 +1222,76 @@ fn prepare_runtime_tree(parent: &Path) -> Result<OwnedFd, String> {
         )
     })?;
     Ok(fd)
+}
+
+/// Open `dir` as a directory this core owns: `O_NOFOLLOW | O_DIRECTORY`, and
+/// then `fstat`-confirmed to belong to this euid.
+///
+/// Factored out of [`prepare_runtime_tree`] so [`remove_runtime_dir`] reaches
+/// the realm tree through the *same* verified descriptor the spawn path used
+/// rather than a second, weaker resolution of the same name -- the delete
+/// below is recursive, and a cleanup routine that re-derives its own root is
+/// how one ends up deleting somebody's home directory.
+fn open_owned_dir(dir: &Path) -> Result<OwnedFd, String> {
+    let fd = rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| {
+        format!(
+            "{} is not a directory this core may use ({e}); refusing",
+            dir.display()
+        )
+    })?;
+    let st = rustix::fs::fstat(&fd).map_err(|e| format!("cannot stat {}: {e}", dir.display()))?;
+    let euid = rustix::process::geteuid().as_raw();
+    if st.st_uid != euid {
+        return Err(format!(
+            "{} is owned by uid {}, not the core's uid {euid}; refusing to place realm \
+             runtime directories in a tree this core does not own",
+            dir.display(),
+            st.st_uid
+        ));
+    }
+    Ok(fd)
+}
+
+/// Remove a realm's private runtime directory at an **orderly** exit -- the
+/// seam [`RuntimeDirGuard::keep`] deliberately left open for P1.5.3 (#32).
+///
+/// Called by [`crate::lifecycle`] only after that module has confirmed the
+/// realm's shim is reaped, and only on an orderly shutdown: a crash keeps
+/// the tree (its docs argue why, and the next spawn's stale-purge collects
+/// it either way). Two properties this spelling buys that a plain
+/// `remove_dir_all` would not:
+///
+/// - It goes through [`purge_stale_runtime_dir`], so the *one* recursive
+///   delete in this crate is the one whose `O_NOFOLLOW | O_DIRECTORY` open,
+///   directory-type check and ownership check are already argued and
+///   already tested. A second delete path would be a second set of proofs
+///   to keep true.
+/// - It is reached through the verified parent descriptor, so the only
+///   component still resolved by name is the last one -- and the caller
+///   still holds the realm `flock`, which excludes the only same-uid
+///   process with any business at this path.
+///
+/// Errors are returned rather than swallowed so the caller can log them; a
+/// failure here is untidy, never unsafe (the next spawn purges what is
+/// left).
+pub(crate) fn remove_runtime_dir(runtime_dir: &Path) -> Result<(), String> {
+    let parent = runtime_dir
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", runtime_dir.display()))?;
+    let name = runtime_dir
+        .file_name()
+        .ok_or_else(|| format!("{} has no final path component", runtime_dir.display()))?;
+    // Deliberately not `prepare_runtime_tree`: at shutdown there is nothing
+    // to create and nothing to chmod, and a cleanup routine that would
+    // *mkdir* the tree it is about to delete from is one refactor away from
+    // creating the very thing it then removes.
+    let parent_fd = open_owned_dir(parent)?;
+    purge_stale_runtime_dir(&parent_fd, name, runtime_dir)
 }
 
 impl Drop for RuntimeDirGuard {
@@ -1096,9 +1305,13 @@ impl Drop for RuntimeDirGuard {
     }
 }
 
-/// Remove a runtime directory left by a previous run -- after proving it is
-/// one, and only ever called once this realm's `flock` has proven that
-/// "previous run" is a run that is gone (module docs).
+/// Recursively remove a realm runtime directory -- after proving it *is* a
+/// directory this core owns. The crate's single recursive delete, with two
+/// callers: [`RuntimeDirGuard::create`], purging a tree this realm's `flock`
+/// has just proven belongs to a run that is gone, and [`remove_runtime_dir`],
+/// clearing this run's own tree at an orderly exit. Both hold the realm lock
+/// across the call, which is what excludes the only same-uid process with
+/// business at this path.
 ///
 /// The `O_NOFOLLOW | O_DIRECTORY` open is the whole point: a recursive
 /// delete that followed a planted symlink is how a cleanup routine deletes
@@ -1121,32 +1334,29 @@ fn purge_stale_runtime_dir(parent_fd: &OwnedFd, name: &OsStr, path: &Path) -> Re
         OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|e| {
-        format!("already exists and is not a directory this core may replace ({e}); refusing")
-    })?;
-    let st =
-        rustix::fs::fstat(&fd).map_err(|e| format!("already exists but cannot stat it: {e}"))?;
+    .map_err(|e| format!("is not a directory this core may remove ({e}); refusing"))?;
+    let st = rustix::fs::fstat(&fd).map_err(|e| format!("exists but cannot be stat'ed: {e}"))?;
     // Stated rather than inferred from the open flags. `O_PATH | O_NOFOLLOW`
     // deliberately opens a *symlink itself* instead of failing, and it is
     // only the accompanying `O_DIRECTORY` that rejects one -- an interaction
     // subtle enough that the recursive delete below should not rest on it.
     if rustix::fs::FileType::from_raw_mode(st.st_mode) != FileType::Directory {
-        return Err("already exists and is not a directory; refusing to replace it".into());
+        return Err("is not a directory; refusing to remove it".into());
     }
     let euid = rustix::process::geteuid().as_raw();
     if st.st_uid != euid {
         return Err(format!(
-            "already exists and is owned by uid {}, not the core's uid {euid}; refusing to \
-             replace a directory this core did not create",
+            "is owned by uid {}, not the core's uid {euid}; refusing to remove a directory \
+             this core did not create",
             st.st_uid
         ));
     }
     drop(fd);
-    fs::remove_dir_all(path).map_err(|e| format!("cannot purge the stale directory: {e}"))
+    fs::remove_dir_all(path).map_err(|e| format!("cannot remove the directory: {e}"))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
@@ -1161,10 +1371,10 @@ mod tests {
     /// How long a test waits for a child to reach a state it must reach
     /// (exec'd, forked a grandchild). Generous: these are process
     /// operations on a loaded CI runner, not a latency assertion.
-    const DEADLINE: Duration = Duration::from_secs(10);
+    pub(crate) const DEADLINE: Duration = Duration::from_secs(10);
 
     /// A private scratch tree standing in for `$XDG_RUNTIME_DIR`.
-    fn scratch() -> PathBuf {
+    pub(crate) fn scratch() -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
             "vitrin-spawn-test-{}-{}",
@@ -1194,7 +1404,7 @@ mod tests {
     ///
     /// A bare `cargo test -p vitrin-core` still needs
     /// `cargo build -p vitrin-mock-shim` first, which the panic says.
-    fn mock_shim_bin() -> PathBuf {
+    pub(crate) fn mock_shim_bin() -> PathBuf {
         let exe = std::env::current_exe().expect("the test binary has a path");
         // .../target/<profile>/deps/<test-bin>
         let deps = exe.parent().expect("test binary has a parent directory");
@@ -1214,7 +1424,7 @@ mod tests {
     }
 
     /// Poll until `f` returns `Some`, or fail with `what` after [`DEADLINE`].
-    fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    pub(crate) fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
         let deadline = Instant::now() + DEADLINE;
         loop {
             if let Some(v) = f() {
@@ -1232,7 +1442,7 @@ mod tests {
     /// `/proc/<pid>/environ` would report the test harness's environment and
     /// `/proc/<pid>/fd` its descriptors. `/proc/<pid>/exe` flipping to the
     /// spawned program is the observable moment that copy is gone.
-    fn wait_for_exec(pid: u32, program: &Path) {
+    pub(crate) fn wait_for_exec(pid: u32, program: &Path) {
         let expected = fs::canonicalize(program).expect("the program resolves");
         wait_for(&format!("pid {pid} to exec {}", expected.display()), || {
             let link = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
@@ -1266,7 +1476,7 @@ mod tests {
     }
 
     /// A child's open descriptors, as `number -> readlink target`.
-    fn child_fds_of(pid: u32) -> BTreeMap<i32, String> {
+    pub(crate) fn child_fds_of(pid: u32) -> BTreeMap<i32, String> {
         fs::read_dir(format!("/proc/{pid}/fd"))
             .expect("child fd directory is readable")
             .filter_map(|entry| {
@@ -1291,7 +1501,7 @@ mod tests {
     /// lists the children of one **thread**, and the test harness is
     /// multi-threaded, so it answers a different question than the one
     /// being asked and silently omits a child forked on another thread.
-    fn ppid_of(pid: u32) -> Option<u32> {
+    pub(crate) fn ppid_of(pid: u32) -> Option<u32> {
         let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
         status
             .lines()
@@ -1304,7 +1514,7 @@ mod tests {
     /// Direct children of `pid`, by scanning procfs for processes whose
     /// parent is `pid` (see [`ppid_of`] for why the per-thread `children`
     /// file is not used).
-    fn children_of(pid: u32) -> BTreeSet<u32> {
+    pub(crate) fn children_of(pid: u32) -> BTreeSet<u32> {
         let mut found = BTreeSet::new();
         let Ok(entries) = fs::read_dir("/proc") else {
             return found;
@@ -1823,6 +2033,96 @@ mod tests {
         );
     }
 
+    /// The bits of a procfs `status` file's `SigBlk` mask, as signal
+    /// numbers.
+    ///
+    /// The path is a parameter because the blocked mask is **per thread**:
+    /// `/proc/<pid>/status` reports the thread-group leader's, which is
+    /// the right answer for a freshly `exec`ed child (single-threaded, so
+    /// pid == tid) and the wrong one for this multi-threaded test harness,
+    /// where `pthread_sigmask` affects only the calling thread and
+    /// `/proc/thread-self/status` is the honest reading.
+    fn blocked_signals_at(status_path: &str) -> BTreeSet<i32> {
+        let status = fs::read_to_string(status_path).expect("status is readable");
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("SigBlk:"))
+            .expect("status reports SigBlk");
+        let mask = u64::from_str_radix(line.trim_start_matches("SigBlk:").trim(), 16)
+            .expect("SigBlk is hexadecimal");
+        (0..64)
+            .filter(|b| mask >> b & 1 == 1)
+            .map(|b| b + 1)
+            .collect()
+    }
+
+    #[test]
+    fn the_child_starts_with_an_empty_signal_mask() {
+        // The mask half of "a realm's process tree starts from a defined
+        // state" (module docs). `execve` does not clear the blocked set and
+        // `std::process::Command` does not either, so without the closure's
+        // `sigprocmask` the child inherits whatever the core had blocked --
+        // and this core blocks SIGINT/SIGTERM the moment either backend
+        // installs calloop's signalfd source, plus SIGCHLD for
+        // `crate::lifecycle`'s reaper.
+        //
+        // A *blocked* SIGTERM is not the same failure as an *ignored* one
+        // and is not fixed by the disposition reset the sibling test
+        // covers: SIG_DFL on a blocked signal is still an unkillable realm,
+        // because a blocked signal is never delivered to any disposition at
+        // all. It would silently degrade every realm's shutdown to SIGKILL
+        // and leave the confined app unable to reap its own children.
+        //
+        // Asserted on the child's ACTUAL mask, from the kernel, and made
+        // able to fail: this run blocks three signals across the fork, so
+        // deleting the closure's reset makes them show up below.
+        let _fd = fd_lock();
+
+        let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: sigset manipulation and `pthread_sigmask` on this thread
+        // only, with two stack sigsets this call initializes. Restored
+        // before the test returns, so no other test inherits the mask.
+        unsafe {
+            libc::sigemptyset(blocked.as_mut_ptr());
+            libc::sigaddset(blocked.as_mut_ptr(), libc::SIGTERM);
+            libc::sigaddset(blocked.as_mut_ptr(), libc::SIGCHLD);
+            libc::sigaddset(blocked.as_mut_ptr(), libc::SIGUSR1);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, blocked.as_ptr(), previous.as_mut_ptr()),
+                0
+            );
+        }
+        let ours = blocked_signals_at("/proc/thread-self/status");
+        for sig in [libc::SIGTERM, libc::SIGCHLD, libc::SIGUSR1] {
+            assert!(
+                ours.contains(&sig),
+                "the core must really have signal {sig} blocked, else the assertion \
+                 below proves nothing: {ours:?}"
+            );
+        }
+
+        let mut h = Harness::new("spawn-signal-mask");
+        let (spawned, _server) = h.spawn_mock(&["--serve"], &[], &[]);
+        let child = blocked_signals_at(&format!("/proc/{}/status", spawned.pid()));
+        h.reap(spawned);
+
+        // SAFETY: restoring the mask this test installed, same thread.
+        unsafe {
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, previous.as_ptr(), std::ptr::null_mut()),
+                0
+            );
+        }
+
+        assert!(
+            child.is_empty(),
+            "the child's signal mask must be empty: the core's blocked set crosses fork \
+             AND execve, so an inherited block would make the realm immune to the very \
+             signal crate::lifecycle terminates it with -- got {child:?}"
+        );
+    }
+
     #[test]
     fn the_app_does_not_inherit_the_core_connection() {
         // The shim's obligation (module docs): set FD_CLOEXEC on fd 3 at
@@ -2225,6 +2525,60 @@ mod tests {
         );
         fs::set_permissions(&vendor, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_spawned_realm_dropped_before_adoption_leaves_no_process_and_no_zombie() {
+        // The gap between `spawn_realm` returning and
+        // `RealmLifecycle::adopt` taking over. `std::process::Child` has no
+        // `Drop`, so without the guard this window abandons the shim: it
+        // keeps running, and once it exits it is a zombie for the core's
+        // whole session because nothing will ever wait on it.
+        //
+        // The window is real, not theoretical: `start_shim_session` sits
+        // inside it and is fallible (a blocking `configure` that fails with
+        // EPIPE against a shim that exec'd and died at once), so a plain `?`
+        // there drops a `SpawnedRealm` mid-unwind. Every other zombie test
+        // in this repo reaches `adopt` first and cannot see it.
+        /// A pid's procfs state character, or `None` if it is gone
+        /// entirely. Reading the state is the point: a zombie's `/proc`
+        /// entry still exists, so "the directory is gone" would pass for
+        /// exactly the failure under test.
+        fn proc_state(pid: u32) -> Option<char> {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // The comm field may contain ')' and spaces, so the state is
+            // the first token after the LAST ')'.
+            let after = stat.rsplit_once(')')?.1;
+            after.split_whitespace().next()?.chars().next()
+        }
+
+        let _fd = fd_lock();
+        let mut h = Harness::new("spawn-drop-before-adopt");
+        // Spawned but NOT brought up: the shim is parked on its
+        // socketpair, exactly where it sits when a caller bails out
+        // between `spawn_realm` and `adopt`.
+        let bin = mock_shim_bin();
+        let realm = realm_with_spawn("realm-0", &bin, &["--serve".to_string()], &[]);
+        let paths = h.paths();
+        let spawned = spawn_realm_with_env(&realm, &paths, &mut h.recorder, |_| None)
+            .expect("spawn must succeed against a scratch runtime tree");
+        let pid = spawned.pid();
+        wait_for_exec(pid, &bin);
+        assert!(
+            proc_state(pid).is_some_and(|s| s != 'Z'),
+            "the shim is running before the drop"
+        );
+
+        drop(spawned);
+
+        assert!(
+            proc_state(pid) != Some('Z'),
+            "a dropped SpawnedRealm must reap its shim, not merely abandon it as a zombie"
+        );
+        assert!(
+            !children_of(std::process::id()).contains(&pid),
+            "the shim must not remain an unreaped child of the core"
+        );
     }
 
     #[test]

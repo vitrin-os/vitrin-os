@@ -75,7 +75,18 @@ mod grants;
 /// when the principal listener wiring lands (M1.1 integration).
 #[cfg_attr(not(test), allow(dead_code))]
 mod identity;
-/// The principal-connection protocol server (P1.4.1): the server side of the
+/// The grant request flow (P1.4.3): the petition lifecycle state machine of
+/// the capability kernel -- pending-petition registry, admission policy
+/// (caps, `busy`, `unsupported`, `unavailable`), the consent-policy seam
+/// (`--consent`), the consent timeout, and the build-gated scripted-consent
+/// injector. Dead-code-allowed outside tests for the same reason as
+/// `principal`, which drives it end-to-end over socketpairs today; the M1.1
+/// listener wiring constructs the registry from the parsed consent policy
+/// and polls its timeout.
+#[cfg_attr(not(test), allow(dead_code))]
+mod petitions;
+/// The principal-connection protocol server (P1.4.1) and the wire half of
+/// the petition flow (P1.4.3): the server side of the
 /// P1.1.3 handshake state machine (`vitrin_handshake` + `vitrin_principal`),
 /// where `identity` binds and where the per-connection object table enforces
 /// sender-constrained handles. Dead-code-allowed outside tests for the same
@@ -97,6 +108,8 @@ mod test_pattern;
 
 use std::process::ExitCode;
 
+use crate::petitions::ConsentPolicy;
+
 const USAGE: &str = "\
 vitrind — Vitrin OS trusted core
 
@@ -107,6 +120,11 @@ USAGE:
                                 Run headless: a fixed-size virtual output
                                 (default 1280x800) composited in software
                                 (pixman) and retained in memory for capture.
+    vitrind [--consent MODE]    Consent policy for grant petitions:
+                                `interactive` (default; petitions await the
+                                consent surface) or `auto-approve` (every
+                                petition granted as requested — headless CI
+                                and demos ONLY; loudly logged).
     vitrind --help              Show this help.
     vitrind --version           Show the version.
 ";
@@ -119,8 +137,13 @@ const DEFAULT_HEADLESS_SIZE: (u32, u32) = (1280, 800);
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
-    RunNested,
-    RunHeadless { size: (u32, u32) },
+    RunNested {
+        consent: ConsentPolicy,
+    },
+    RunHeadless {
+        size: (u32, u32),
+        consent: ConsentPolicy,
+    },
     Help,
     Version,
 }
@@ -136,10 +159,13 @@ enum Mode {
 /// Hand-rolled argument parsing: the surface is a handful of flags, which does
 /// not justify pulling an argument-parsing crate into the TCB (plan risk R7).
 /// `--size` consumes the following argument (`--size 1280x800`) and is only
-/// meaningful with `--headless`.
+/// meaningful with `--headless`. `--consent` takes `MODE` as either a
+/// following argument or `--consent=MODE` (the issue-#27 spelling), valid
+/// with both run modes, defaulting to the fail-closed `interactive`.
 fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, String> {
     let mut mode: Option<Mode> = None;
     let mut size: Option<(u32, u32)> = None;
+    let mut consent: Option<ConsentPolicy> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg {
@@ -154,22 +180,61 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     .ok_or("`--size` requires a `WxH` value (e.g. `--size 1280x800`)")?;
                 size = Some(parse_size(value)?);
             }
+            "--consent" => {
+                let value = args
+                    .next()
+                    .ok_or("`--consent` requires a mode (`interactive` or `auto-approve`)")?;
+                set_consent(&mut consent, parse_consent(value)?)?;
+            }
             "--help" | "-h" => return Ok(Action::Help),
             "--version" | "-V" => return Ok(Action::Version),
-            other => return Err(format!("unknown argument `{other}`")),
+            other => {
+                if let Some(value) = other.strip_prefix("--consent=") {
+                    set_consent(&mut consent, parse_consent(value)?)?;
+                } else {
+                    return Err(format!("unknown argument `{other}`"));
+                }
+            }
         }
     }
+
+    // The fail-closed default: nothing is granted without a consent
+    // surface unless auto-approve was explicitly flagged.
+    let consent = consent.unwrap_or(ConsentPolicy::Interactive);
 
     // `--help`/`--version` already returned above, so only the run modes
     // remain to resolve; `--size` is meaningless without `--headless`.
     match (mode, size) {
-        (Some(Mode::Nested), None) => Ok(Action::RunNested),
+        (Some(Mode::Nested), None) => Ok(Action::RunNested { consent }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
         (Some(Mode::Headless), size) => Ok(Action::RunHeadless {
             size: size.unwrap_or(DEFAULT_HEADLESS_SIZE),
+            consent,
         }),
         (None, Some(_)) => Err("`--size` requires `--headless`".into()),
         (None, None) => Err("no mode given (expected `--nested` or `--headless`)".into()),
+    }
+}
+
+/// Parse a `--consent` mode value.
+fn parse_consent(value: &str) -> Result<ConsentPolicy, String> {
+    match value {
+        "interactive" => Ok(ConsentPolicy::Interactive),
+        "auto-approve" => Ok(ConsentPolicy::AutoApprove),
+        other => Err(format!(
+            "unknown `--consent` mode `{other}` (expected `interactive` or `auto-approve`)"
+        )),
+    }
+}
+
+/// Record the selected consent policy, rejecting a repeat flag.
+fn set_consent(slot: &mut Option<ConsentPolicy>, policy: ConsentPolicy) -> Result<(), String> {
+    match slot {
+        None => {
+            *slot = Some(policy);
+            Ok(())
+        }
+        Some(_) => Err("`--consent` given more than once".into()),
     }
 }
 
@@ -238,8 +303,9 @@ fn main() -> ExitCode {
             println!("vitrind {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Action::RunNested => {
+        Action::RunNested { consent } => {
             init_tracing();
+            announce_consent_policy(consent);
             match backend::winit::run() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
@@ -248,8 +314,9 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Action::RunHeadless { size } => {
+        Action::RunHeadless { size, consent } => {
             init_tracing();
+            announce_consent_policy(consent);
             match backend::headless::run(size) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
@@ -258,6 +325,24 @@ fn main() -> ExitCode {
                 }
             }
         }
+    }
+}
+
+/// The loud startup announcement the consent policy owes (plan risk R6):
+/// auto-approve must never run silently. The parsed policy is consumed by
+/// the M1.1 listener wiring (which constructs the `PetitionRegistry` from
+/// it); until that wiring lands, nothing at runtime accepts principal
+/// connections, so the announcement is the flag's only runtime effect.
+fn announce_consent_policy(policy: ConsentPolicy) {
+    match policy {
+        ConsentPolicy::AutoApprove => tracing::warn!(
+            "CONSENT POLICY: AUTO-APPROVE -- every grant petition will be granted \
+             as requested with NO human decision. Headless CI and demos only."
+        ),
+        ConsentPolicy::Interactive => tracing::info!(
+            "consent policy: interactive (the consent renderer lands with E7; \
+             until then petitions pend and resolve timed_out)"
+        ),
     }
 }
 
@@ -279,14 +364,22 @@ mod tests {
 
     #[test]
     fn nested_flag_selects_nested_mode() {
-        assert_eq!(parse_args(["--nested"]), Ok(Action::RunNested));
+        assert_eq!(
+            parse_args(["--nested"]),
+            Ok(Action::RunNested {
+                consent: ConsentPolicy::Interactive
+            })
+        );
     }
 
     #[test]
     fn headless_flag_defaults_to_1280x800() {
         assert_eq!(
             parse_args(["--headless"]),
-            Ok(Action::RunHeadless { size: (1280, 800) })
+            Ok(Action::RunHeadless {
+                size: (1280, 800),
+                consent: ConsentPolicy::Interactive
+            })
         );
     }
 
@@ -294,12 +387,56 @@ mod tests {
     fn headless_size_is_parsed() {
         assert_eq!(
             parse_args(["--headless", "--size", "1280x800"]),
-            Ok(Action::RunHeadless { size: (1280, 800) })
+            Ok(Action::RunHeadless {
+                size: (1280, 800),
+                consent: ConsentPolicy::Interactive
+            })
         );
         assert_eq!(
             parse_args(["--headless", "--size", "640x480"]),
-            Ok(Action::RunHeadless { size: (640, 480) })
+            Ok(Action::RunHeadless {
+                size: (640, 480),
+                consent: ConsentPolicy::Interactive
+            })
         );
+    }
+
+    #[test]
+    fn consent_defaults_to_interactive_and_parses_both_spellings() {
+        // Fail-closed default: no flag means interactive (nothing granted
+        // without a consent surface).
+        for args in [
+            vec!["--headless", "--consent", "auto-approve"],
+            vec!["--headless", "--consent=auto-approve"],
+        ] {
+            assert_eq!(
+                parse_args(args),
+                Ok(Action::RunHeadless {
+                    size: (1280, 800),
+                    consent: ConsentPolicy::AutoApprove
+                })
+            );
+        }
+        assert_eq!(
+            parse_args(["--nested", "--consent=interactive"]),
+            Ok(Action::RunNested {
+                consent: ConsentPolicy::Interactive
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_or_repeated_consent_is_an_error() {
+        assert!(parse_args(["--headless", "--consent", "yolo"]).is_err());
+        assert!(parse_args(["--headless", "--consent=--nested"]).is_err());
+        // `--consent` as the final argument has no value to consume.
+        assert!(parse_args(["--headless", "--consent"]).is_err());
+        assert!(parse_args([
+            "--headless",
+            "--consent=auto-approve",
+            "--consent=interactive"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -326,7 +463,8 @@ mod tests {
         assert_eq!(
             parse_args(["--headless", "--size", "2147483647x1"]),
             Ok(Action::RunHeadless {
-                size: (2147483647, 1)
+                size: (2147483647, 1),
+                consent: ConsentPolicy::Interactive
             })
         );
     }

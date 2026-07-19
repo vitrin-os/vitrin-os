@@ -70,38 +70,123 @@
 //! `SO_PEERCRED`) is thereby structural: the table *is* the connection, and
 //! the identity was verified against that connection's peercred.
 //!
+//! # The petition flow (P1.4.3, issue #27)
+//!
+//! `vitrin_realm.request_grant` is served here: the wire-facing half of the
+//! grant request flow, split from the policy half in [`petitions`] along
+//! the connection boundary. This module owns everything connection-scoped
+//! -- decode, the non-zero-verb rule (fatal `invalid_argument`), the
+//! petition-rate ceiling and live-petition cap (fatal
+//! `resource_exhausted`, denial-of-service confinement per the
+//! conventions), the multi-`new_id` rule (five ids, distinct, strictly
+//! increasing, above the watermark -- enforced by allocating them in
+//! argument order through the same [`allocate_id`] every mint uses), the
+//! per-connection object table, and event emission. [`petitions`] owns
+//! everything policy-scoped (realm existence, reserved flags, durable
+//! rungs, resource granularity, admission caps, the consent decision) --
+//! so the petition-policy razor has one home and the object-graph razor
+//! has another.
+//!
+//! **One emission path, exactly-once `resolved`.** Every resolution --
+//! immediate (admission refusals, auto-approve) or deferred (scripted
+//! consent, timeout) -- is delivered by
+//! [`deliver_resolution`](PrincipalServer::deliver_resolution): consent
+//! `state` transitions first, then the `resolved` terminal, and the grant
+//! handle's pending-to-resolved flip is checked there, making a double
+//! `resolved` structurally impossible on top of the registry's
+//! consume-on-resolve. Delivery is **phase-gated**: after the fatal
+//! goodbye (the connection's terminal event -- conventions 5.2, error
+//! then close) or after [`teardown`](PrincipalServer::teardown), a routed
+//! resolution is refused typed ([`DeliveryError::ConnectionDead`]) and
+//! dropped whole -- nothing is ever sent on a dead connection. And a
+//! granted verdict **mints its grant-table row here, at delivery** -- not
+//! when the consent decision was made -- in the same single-threaded step
+//! that flips the handle, so authority exists if and only if its wire
+//! handle resolved: the teardown scan is complete by construction, and an
+//! approval whose petitioner disconnected while the decision was in
+//! flight evaporates without ever creating a row ("all of the principal's
+//! grants die with the connection" has no window; see
+//! [`petitions`]' module docs for the full decision). The
+//! petition-lifecycle events are exempt from the sync barrier by
+//! construction: a pending petition emits only `queued` during dispatch,
+//! so a later `done` never waits on consent.
+//!
+//! **Facets are minted inert; their *use* is the P1.4.4 seam.** The five
+//! co-minted objects enter the object table with their roles (the facets
+//! carrying their co-minted grant's wire id, which is what the enforcement
+//! chokepoint keys on when it lands). A capture or actuation request on a
+//! facet in this build is the honest server limitation `internal`/"not
+//! implemented" -- exactly the seam pattern `request_grant` itself
+//! occupied before this task -- and **deliberately not** a
+//! `refused(not_granted)`: answering an authority question here, without
+//! consulting the grant table, would be a second (and lying) enforcement
+//! voice; issue #28 replaces those arms with the single chokepoint.
+//! Requests on the grant and consent objects are fatal `invalid_opcode`
+//! (their interfaces define no requests in version 1 -- grammar, not
+//! authority).
+//!
+//! **Teardown contract.** The embedder MUST call
+//! [`teardown`](PrincipalServer::teardown) when the connection closes: it
+//! withdraws the connection's pending petitions (consent is in-context --
+//! the prompt disappears with the petitioner, no events) and removes the
+//! connection's granted rows from the [`GrantTable`] (version-1 grants die
+//! with their connection; removal, not revocation -- see the grant table's
+//! module docs, whose contract this fulfills). Its scan over resolved
+//! grant handles is complete because rows are minted only at delivery
+//! (above): no row of this connection can hide behind a still-pending
+//! handle, and a consent decision still in flight at teardown mints
+//! nothing.
+//!
 //! # Scope seams (marked, not smuggled)
 //!
-//! - `vitrin_realm.request_grant` on a minted realm handle is **P1.4.3
-//!   (issue #27)**: this build refuses it fatal `internal` with a logged
-//!   "not implemented" -- honest server limitation, not a protocol
-//!   judgement -- and #27 replaces that arm with the petition flow.
+//! - **Facet use** (capture and actuation through the minted facets) is
+//!   **P1.4.4 (issue #28)**: the single enforcement chokepoint. See above.
 //! - The **unauthenticated deadline** (conventions 7.1 SHOULD) is a wall
 //!   clock owned by the runtime wiring: nothing at runtime accepts
 //!   principal connections yet (the listener wiring lands with M1.1
 //!   integration), and the deadline is a calloop timer armed at accept and
 //!   disarmed on [`is_bound`](PrincipalServer::is_bound) -- flagged in the
 //!   task summary rather than half-built here.
-//! - The flight recorder (P1.4.5) will observe handshakes through the same
-//!   embedder that logs [`PrincipalFault`]s today.
+//! - The **consent-timeout timer** is likewise M1.1 wiring: the embedder
+//!   polls [`PetitionRegistry::expire_due`] (petitions' module docs) and
+//!   routes each returned resolution to its connection's
+//!   [`deliver_resolution`](PrincipalServer::deliver_resolution).
+//! - The flight recorder (P1.4.5) will observe handshakes and petitions
+//!   through the same embedder that logs [`PrincipalFault`]s today.
 //!
 //! [`identity`]: crate::identity
+//! [`petitions`]: crate::petitions
 //! [`Verifier`]: crate::identity::Verifier
 //! [`Verifier::verify`]: crate::identity::Verifier::verify
 //! [`VerifyOutcome`]: crate::identity::VerifyOutcome
+//! [`allocate_id`]: PrincipalServer::allocate_id
+//! [`GrantTable`]: crate::grants::GrantTable
+//! [`PetitionRegistry::expire_due`]: crate::petitions::PetitionRegistry::expire_due
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use vitrin_ipc::{Message, PeerCred, TransportError};
 use vitrin_protocol::error::DecodeError;
+use vitrin_protocol::generated::vitrin_actuator_pointer as pointer;
+use vitrin_protocol::generated::vitrin_actuator_text as text;
+use vitrin_protocol::generated::vitrin_consent as consent;
+use vitrin_protocol::generated::vitrin_consent::ConsentState;
+use vitrin_protocol::generated::vitrin_grant as grant;
+use vitrin_protocol::generated::vitrin_grant::{Outcome, Persistence as WirePersistence, Verb};
 use vitrin_protocol::generated::vitrin_handshake as handshake;
 use vitrin_protocol::generated::vitrin_handshake::Error as WireError;
 use vitrin_protocol::generated::vitrin_principal as principal;
 use vitrin_protocol::generated::vitrin_realm as realm;
+use vitrin_protocol::generated::vitrin_view as view;
 use vitrin_protocol::generated::PROTOCOL_VERSION;
 
+use crate::grants::{GrantId, GrantTable, InsertError};
 use crate::identity::{PresentedCredential, PrincipalIdentity, Verifier, VerifyOutcome};
+use crate::petitions::{
+    Admission, ConnectionId, PetitionRegistry, PetitionRequest, Resolution, Verdict,
+};
 
 /// The handshake bootstrap object: implicit object 1 on a principal
 /// connection, never created by a message (conventions section 3).
@@ -123,6 +208,27 @@ pub(crate) const AUTH_REFUSED_PHRASE: &str = "authentication refused";
 /// permanent per-connection allocation; a compliant client needs exactly
 /// one (`realm-0`), and 16 mirrors the shim server's surface cap.
 pub(crate) const MAX_LIVE_REALMS: usize = 16;
+
+/// Cap on petitions per connection -- the live-object cap's petition half:
+/// every `request_grant` permanently allocates five object ids (no
+/// destructors in version 1), so unbounded petitioning is unbounded server
+/// state. 256 petitions (1280 objects) is generous for a legitimate
+/// long-lived agent that re-petitions after expiries and denials, and
+/// tiny as a denial-of-service bound; breach is fatal
+/// `resource_exhausted`, confining the DoS to the offending connection.
+pub(crate) const MAX_LIVE_PETITIONS: usize = 256;
+
+/// Burst capacity of the per-connection petition-rate token bucket (the
+/// conventions' "server-side petition-rate ceiling"; breach is fatal
+/// `resource_exhausted`). A compliant client sends a handful of petitions
+/// at startup; 8 in one burst is plenty, and the bucket refills at
+/// [`PETITION_REFILL_PER_SEC`].
+pub(crate) const PETITION_RATE_BURST: u32 = 8;
+
+/// Sustained petition-rate refill, tokens per second. One petition per
+/// second sustained keeps even a busy-refused retry loop wire-legal while
+/// bounding how fast a hostile connection can burn ids and prompt slots.
+pub(crate) const PETITION_REFILL_PER_SEC: u32 = 1;
 
 /// A protocol violation by the principal client: the fatal conditions of
 /// conventions section 5.2 as they arise on this connection class. Always
@@ -166,12 +272,21 @@ pub(crate) enum PrincipalViolation {
     /// always 1: a malformed `get_realm` cites the principal, not the
     /// handshake object).
     Malformed { object_id: u32, source: DecodeError },
+    /// `invalid_argument`: a petition with an empty verb set (the IDL:
+    /// "verbs ... MUST be non-zero (an empty petition is fatal
+    /// invalid_argument)") -- argument validation the generated decoder
+    /// cannot see, since `Verb(0)` is a legal wire bitmask elsewhere.
+    ZeroVerbs { object_id: u32 },
     /// `resource_exhausted`: a documented per-connection bound was
     /// breached ([`MAX_LIVE_REALMS`], object-id exhaustion).
     ResourceExhausted(&'static str),
-    /// `internal`: this build cannot serve the request -- the P1.4.3 seam
-    /// (`request_grant` before the grant flow lands).
+    /// `internal`: this build cannot serve the request -- the P1.4.4 seam
+    /// (facet use before the enforcement chokepoint lands; module docs).
     Unimplemented { object_id: u32, what: &'static str },
+    /// `internal`: a server-side failure poisoned this request (a
+    /// can't-happen condition surfacing typed rather than as a panic --
+    /// the TCB does not panic on reachable input).
+    ServerError { object_id: u32, detail: String },
     /// `internal`: a frame was dispatched after a fatal condition already
     /// killed this connection -- an embedder-contract violation made inert
     /// (defense in depth; see the module docs on DEAD).
@@ -190,10 +305,11 @@ impl PrincipalViolation {
             }
             PrincipalViolation::InvalidObject { .. } => WireError::InvalidObject,
             PrincipalViolation::Malformed { source, .. } => source.to_wire_error(),
+            PrincipalViolation::ZeroVerbs { .. } => WireError::InvalidArgument,
             PrincipalViolation::ResourceExhausted(_) => WireError::ResourceExhausted,
-            PrincipalViolation::Unimplemented { .. } | PrincipalViolation::ConnectionDead => {
-                WireError::Internal
-            }
+            PrincipalViolation::Unimplemented { .. }
+            | PrincipalViolation::ServerError { .. }
+            | PrincipalViolation::ConnectionDead => WireError::Internal,
         }
     }
 
@@ -205,6 +321,8 @@ impl PrincipalViolation {
             | PrincipalViolation::UnknownOpcode { object_id, .. }
             | PrincipalViolation::InvalidObject { object_id, .. }
             | PrincipalViolation::Malformed { object_id, .. }
+            | PrincipalViolation::ZeroVerbs { object_id }
+            | PrincipalViolation::ServerError { object_id, .. }
             | PrincipalViolation::Unimplemented { object_id, .. } => *object_id,
             _ => HANDSHAKE_ID,
         }
@@ -228,10 +346,12 @@ impl PrincipalViolation {
             }
             PrincipalViolation::InvalidObject { detail, .. } => (*detail).into(),
             PrincipalViolation::Malformed { source, .. } => source.to_string(),
+            PrincipalViolation::ZeroVerbs { .. } => "petition verb set is empty".into(),
             PrincipalViolation::ResourceExhausted(detail) => (*detail).into(),
             PrincipalViolation::Unimplemented { what, .. } => {
                 format!("{what} is not implemented in this build")
             }
+            PrincipalViolation::ServerError { .. } => "server-side failure".into(),
             PrincipalViolation::ConnectionDead => "connection already dead".into(),
         }
     }
@@ -278,11 +398,20 @@ impl fmt::Display for PrincipalViolation {
             PrincipalViolation::Malformed { object_id, source } => {
                 write!(f, "malformed message on object {object_id}: {source}")
             }
+            PrincipalViolation::ZeroVerbs { object_id } => {
+                write!(
+                    f,
+                    "invalid_argument: empty petition verb set on object {object_id}"
+                )
+            }
             PrincipalViolation::ResourceExhausted(detail) => {
                 write!(f, "resource_exhausted: {detail}")
             }
             PrincipalViolation::Unimplemented { object_id, what } => {
                 write!(f, "internal: {what} on object {object_id} not implemented")
+            }
+            PrincipalViolation::ServerError { object_id, detail } => {
+                write!(f, "internal: {detail} (object {object_id})")
             }
             PrincipalViolation::ConnectionDead => {
                 write!(f, "internal: message dispatched to a dead connection")
@@ -323,6 +452,74 @@ impl From<TransportError> for PrincipalFault {
     }
 }
 
+/// Why [`PrincipalServer::deliver_resolution`] refused or failed to
+/// deliver. `WrongConnection` and `UnknownGrantObject` are core-side
+/// routing bugs and `AlreadyResolved` a replayed resolution -- nothing is
+/// sent, the client connection stays intact, and the embedder logs the
+/// bug (killing an innocent connection over a misrouted resolution would
+/// punish the wrong party). `ConnectionDead` is an expected race, not a
+/// bug: the embedder drops the resolution. `Transport` and `Insert` are
+/// terminal: the embedder closes and tears down.
+#[derive(Debug)]
+pub(crate) enum DeliveryError {
+    /// The resolution belongs to a different connection (embedder routing
+    /// bug); nothing was sent. Checked before the phase gate so a
+    /// misrouted resolution is never silently dropped as `ConnectionDead`
+    /// -- its rightful (live) connection still owes its client the
+    /// terminal.
+    WrongConnection {
+        expected: ConnectionId,
+        got: ConnectionId,
+    },
+    /// The connection is no longer in its bound steady state: a fatal
+    /// already killed it (the `error` goodbye is the connection's terminal
+    /// event -- nothing may follow it) or teardown already ran. Nothing is
+    /// sent, and dropping the resolution is safe by construction: granted
+    /// rows are minted at delivery, so an undeliverable approval leaves no
+    /// authority behind. An expected race (the consent decider resolves
+    /// while the connection dies), not an embedder bug.
+    ConnectionDead,
+    /// No grant handle with this wire id exists on this connection
+    /// (routing bug); nothing was sent.
+    UnknownGrantObject { wire_id: u32 },
+    /// The grant handle already resolved -- the exactly-once guard
+    /// (a replayed resolution is refused before any row is minted or
+    /// anything is sent).
+    AlreadyResolved { wire_id: u32 },
+    /// The delivery-time row insert failed -- unreachable (every decision
+    /// is narrowing-validated before it becomes an approval; defense in
+    /// depth). The grant handle would otherwise stay pending forever (its
+    /// registry entry is already consumed), hanging the client, so the
+    /// connection has been killed: fatal `internal` goodbye sent
+    /// best-effort, phase dead. The embedder closes and tears down.
+    Insert(InsertError),
+    /// Sending an event failed; the connection is dying.
+    Transport(TransportError),
+}
+
+impl fmt::Display for DeliveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DeliveryError::WrongConnection { expected, got } => {
+                write!(f, "resolution for {got} routed to {expected}")
+            }
+            DeliveryError::ConnectionDead => {
+                write!(f, "connection dead or torn down; resolution dropped")
+            }
+            DeliveryError::UnknownGrantObject { wire_id } => {
+                write!(f, "no grant handle with wire id {wire_id}")
+            }
+            DeliveryError::AlreadyResolved { wire_id } => {
+                write!(f, "grant handle {wire_id} already resolved (exactly-once)")
+            }
+            DeliveryError::Insert(e) => {
+                write!(f, "delivery-time grant insert failed: {e}")
+            }
+            DeliveryError::Transport(e) => write!(f, "transport: {e}"),
+        }
+    }
+}
+
 /// The handshake phase of one principal connection (conventions 7.1).
 /// VERIFYING is transient inside the `hello` dispatch in this build (module
 /// docs), so it has no resting representation.
@@ -334,6 +531,44 @@ enum Phase {
     Bound,
     /// A fatal condition ended this connection; nothing dispatches again.
     Dead,
+}
+
+/// What a client-minted object id names on this connection: the dispatch
+/// table's row, one entry per allocated id (the principal object and the
+/// bootstrap handshake object are held separately, as before). Version 1
+/// has no destructors, so entries are permanent -- an id's kind never
+/// changes, only a grant's resolution state does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObjectKind {
+    /// A realm address handle (`get_realm`), remembering the requested
+    /// name -- naming is not authority; the name is judged at petition
+    /// time.
+    Realm { name: String },
+    /// A grant handle co-minted by `request_grant`.
+    Grant(GrantHandleState),
+    /// A consent observer co-minted by `request_grant` (events only).
+    Consent,
+    /// The observation facet, inert until its grant confers `observe`;
+    /// `grant` is the co-minted grant handle's wire id (the chokepoint's
+    /// key, P1.4.4).
+    View { grant: u32 },
+    /// The pointer facet (see [`ObjectKind::View`]).
+    Pointer { grant: u32 },
+    /// The text facet (see [`ObjectKind::View`]).
+    Text { grant: u32 },
+}
+
+/// A grant handle's lifecycle on the wire: born pending, flipped exactly
+/// once by [`PrincipalServer::deliver_resolution`] -- the server-side half
+/// of the IDL's "resolved fires exactly once ever".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrantHandleState {
+    /// Awaiting its `resolved` terminal.
+    Pending,
+    /// Resolved; `row` is the grant-table row iff the outcome was
+    /// `granted` (what the P1.4.4 chokepoint queries, and what teardown
+    /// removes).
+    Resolved { row: Option<GrantId> },
 }
 
 /// The per-connection principal protocol server. One instance per accepted
@@ -348,6 +583,10 @@ pub(crate) struct PrincipalServer {
     /// of the sender-constraint triple, captured at construction and handed
     /// to the verifier on `hello`.
     peer: PeerCred,
+    /// This connection's core-global id
+    /// ([`PetitionRegistry::register_connection`]): how deferred
+    /// resolutions route back, and what teardown withdraws by.
+    connection: ConnectionId,
     /// Highest object id allocated on this connection (starts at the
     /// bootstrap id); every `new_id` must exceed it -- strictly increasing,
     /// never reused (conventions 3.1).
@@ -356,24 +595,45 @@ pub(crate) struct PrincipalServer {
     principal_id: Option<u32>,
     /// The verifier-canonical bound identity; what P1.4.2 keys grants by.
     identity: Option<PrincipalIdentity>,
-    /// Realm handle id -> requested realm name. `BTreeMap` so iteration
-    /// (and hence log output) is deterministic.
-    realms: BTreeMap<u32, String>,
+    /// The per-connection object table: id -> kind, for every id a request
+    /// has minted. `BTreeMap` so iteration (and hence log output) is
+    /// deterministic. This map living inside the per-connection server --
+    /// and nowhere else -- is what makes handles sender-constrained
+    /// (module docs).
+    objects: BTreeMap<u32, ObjectKind>,
+    /// Live realm handles, against [`MAX_LIVE_REALMS`].
+    realm_count: usize,
+    /// Petitions ever minted on this connection, against
+    /// [`MAX_LIVE_PETITIONS`] (never decremented: version 1 has no
+    /// destructors, so every petition's five objects are permanent).
+    petition_count: usize,
+    /// Petition-rate token bucket: remaining burst tokens.
+    petition_tokens: u32,
+    /// The bucket's refill anchor (the instant up to which refill has been
+    /// credited); `None` until the first petition arms it.
+    petition_refill_anchor: Option<Instant>,
 }
 
 impl PrincipalServer {
     /// A fresh server for one accepted connection, with the `SO_PEERCRED`
-    /// the transport captured at accept ([`Connection::peer_cred`]).
+    /// the transport captured at accept ([`Connection::peer_cred`]) and
+    /// the connection id the embedder minted for it
+    /// ([`PetitionRegistry::register_connection`]).
     ///
     /// [`Connection::peer_cred`]: vitrin_ipc::Connection::peer_cred
-    pub fn new(peer: PeerCred) -> Self {
+    pub fn new(peer: PeerCred, connection: ConnectionId) -> Self {
         Self {
             phase: Phase::Connected,
             peer,
+            connection,
             watermark: HANDSHAKE_ID,
             principal_id: None,
             identity: None,
-            realms: BTreeMap::new(),
+            objects: BTreeMap::new(),
+            realm_count: 0,
+            petition_count: 0,
+            petition_tokens: PETITION_RATE_BURST,
+            petition_refill_anchor: None,
         }
     }
 
@@ -389,24 +649,31 @@ impl PrincipalServer {
         self.identity.as_ref()
     }
 
-    /// Dispatch one decoded frame from the principal connection.
+    /// Dispatch one decoded frame from the principal connection, against
+    /// the core-shared capability-kernel state (`petitions`, `grants`) at
+    /// the injected instant `now` -- the server never reads a clock, so
+    /// one consistent `now` governs each request's whole decision (the
+    /// grant table's injected-clock discipline, upheld here).
     ///
     /// `Err` means the connection must die: the wire goodbye
     /// (`vitrin_handshake.error`) has already been sent best-effort for
     /// protocol violations (never for transport faults -- the queue that
     /// would carry it is the thing that failed), the violation has been
-    /// logged, and the embedder closes the connection and dispatches
-    /// nothing further.
+    /// logged, and the embedder closes the connection, calls
+    /// [`teardown`](Self::teardown), and dispatches nothing further.
     pub fn handle_message<F>(
         &mut self,
         msg: Message,
         verifier: &dyn Verifier,
+        petitions: &mut PetitionRegistry,
+        grants: &mut GrantTable,
+        now: Instant,
         send: &mut F,
     ) -> Result<(), PrincipalFault>
     where
         F: FnMut(&[u8]) -> Result<(), TransportError>,
     {
-        let result = self.dispatch(msg, verifier, send);
+        let result = self.dispatch(msg, verifier, petitions, grants, now, send);
         if let Err(fault) = &result {
             let was_dead = self.phase == Phase::Dead;
             self.phase = Phase::Dead;
@@ -443,6 +710,9 @@ impl PrincipalServer {
         &mut self,
         msg: Message,
         verifier: &dyn Verifier,
+        petitions: &mut PetitionRegistry,
+        grants: &mut GrantTable,
+        now: Instant,
         send: &mut F,
     ) -> Result<(), PrincipalFault>
     where
@@ -477,6 +747,10 @@ impl PrincipalServer {
                             // Single-threaded in-order dispatch: everything
                             // received before this sync has been processed
                             // and its events queued, so done goes out now.
+                            // Pending petitions do NOT hold it back --
+                            // their lifecycle events are exempt from the
+                            // barrier (IDL: done confirms registration,
+                            // never resolution).
                             let done = handshake::events::Done {
                                 cookie: sync.cookie,
                             };
@@ -490,21 +764,65 @@ impl PrincipalServer {
                         principal::requests::GetRealm::OPCODE => self.handle_get_realm(msg),
                         _ => Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into()),
                     }
-                } else if self.realms.contains_key(&object_id) {
-                    match opcode {
-                        // The P1.4.3 seam: the petition flow (grant + consent
-                        // + facets) replaces this arm in issue #27. Until
-                        // then the honest answer is a server-side limitation,
-                        // fatal `internal` -- never a fake judgement on the
-                        // petition.
-                        realm::requests::RequestGrant::OPCODE => {
-                            Err(PrincipalViolation::Unimplemented {
-                                object_id,
-                                what: "request_grant (P1.4.3)",
+                } else if let Some(kind) = self.objects.get(&object_id).cloned() {
+                    match kind {
+                        ObjectKind::Realm { name } => match opcode {
+                            realm::requests::RequestGrant::OPCODE => {
+                                self.handle_request_grant(msg, name, petitions, grants, now, send)
                             }
-                            .into())
+                            _ => {
+                                Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
+                            }
+                        },
+                        // vitrin_grant and vitrin_consent define no
+                        // requests in version 1: any opcode on them is
+                        // grammar (invalid_opcode), never an authority
+                        // judgement.
+                        ObjectKind::Grant(_) | ObjectKind::Consent => {
+                            Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
                         }
-                        _ => Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into()),
+                        // Facet use is the P1.4.4 seam (module docs): the
+                        // honest server limitation, never a second
+                        // enforcement voice -- #28 replaces these arms
+                        // with the single chokepoint.
+                        ObjectKind::View { .. } => match opcode {
+                            view::requests::CaptureFrame::OPCODE => {
+                                Err(PrincipalViolation::Unimplemented {
+                                    object_id,
+                                    what: "capture_frame (P1.4.4)",
+                                }
+                                .into())
+                            }
+                            _ => {
+                                Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
+                            }
+                        },
+                        ObjectKind::Pointer { .. } => match opcode {
+                            pointer::requests::Move::OPCODE
+                            | pointer::requests::Button::OPCODE
+                            | pointer::requests::Scroll::OPCODE => {
+                                Err(PrincipalViolation::Unimplemented {
+                                    object_id,
+                                    what: "pointer actuation (P1.4.4)",
+                                }
+                                .into())
+                            }
+                            _ => {
+                                Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
+                            }
+                        },
+                        ObjectKind::Text { .. } => match opcode {
+                            text::requests::Type::OPCODE => {
+                                Err(PrincipalViolation::Unimplemented {
+                                    object_id,
+                                    what: "text actuation (P1.4.4)",
+                                }
+                                .into())
+                            }
+                            _ => {
+                                Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
+                            }
+                        },
                     }
                 } else {
                     // The sender-constraint kill site: ids not in *this*
@@ -592,12 +910,320 @@ impl PrincipalServer {
         // 1 has no destructors, so every realm handle is a permanent
         // allocation, and unbounded minting is the conventions' fatal
         // resource_exhausted.
-        if self.realms.len() >= MAX_LIVE_REALMS {
+        if self.realm_count >= MAX_LIVE_REALMS {
             return Err(PrincipalViolation::ResourceExhausted("live-realm cap exceeded").into());
         }
         self.allocate_id(req.realm)?;
-        self.realms.insert(req.realm, req.name);
+        self.objects
+            .insert(req.realm, ObjectKind::Realm { name: req.name });
+        self.realm_count += 1;
         Ok(())
+    }
+
+    /// `vitrin_realm.request_grant`: the petition flow's wire half (module
+    /// docs). Order of checks: grammar (decode), the non-zero-verb rule,
+    /// the per-connection resource bounds (cap then rate -- bounds precede
+    /// any allocation, the `get_realm` precedent), the multi-`new_id`
+    /// rule, then admission in [`petitions`](crate::petitions), which
+    /// either resolves on the spot (delivered immediately through the one
+    /// emission path) or leaves the petition pending with its consent
+    /// observer `queued`.
+    fn handle_request_grant<F>(
+        &mut self,
+        msg: Message,
+        realm_name: String,
+        petitions: &mut PetitionRegistry,
+        grants: &mut GrantTable,
+        now: Instant,
+        send: &mut F,
+    ) -> Result<(), PrincipalFault>
+    where
+        F: FnMut(&[u8]) -> Result<(), TransportError>,
+    {
+        let object_id = msg.header.object_id;
+        let (_, req) = realm::requests::RequestGrant::decode(&msg.bytes, msg.fd)
+            .map_err(|source| PrincipalViolation::Malformed { object_id, source })?;
+        // An empty petition is fatal invalid_argument (IDL): argument
+        // validation the decoder cannot do, since Verb(0) is a legal
+        // bitmask value in other positions.
+        if req.verbs.bits() == 0 {
+            return Err(PrincipalViolation::ZeroVerbs { object_id }.into());
+        }
+        // Per-connection resource bounds precede allocation: every
+        // petition permanently allocates five ids, so the cap and the rate
+        // ceiling are checked before any state changes.
+        if self.petition_count >= MAX_LIVE_PETITIONS {
+            return Err(PrincipalViolation::ResourceExhausted("live-petition cap exceeded").into());
+        }
+        if !self.take_petition_token(now) {
+            return Err(
+                PrincipalViolation::ResourceExhausted("petition-rate ceiling exceeded").into(),
+            );
+        }
+        // The multi-new_id rule (conventions 3.2): allocating the five ids
+        // in argument order through the single watermark allocator is
+        // exactly "distinct, strictly increasing in argument order, and
+        // all above the watermark" -- any violation dies invalid_object
+        // before the petition exists.
+        for id in [req.grant, req.consent, req.view, req.pointer, req.text] {
+            self.allocate_id(id)?;
+        }
+        self.objects
+            .insert(req.grant, ObjectKind::Grant(GrantHandleState::Pending));
+        self.objects.insert(req.consent, ObjectKind::Consent);
+        self.objects
+            .insert(req.view, ObjectKind::View { grant: req.grant });
+        self.objects
+            .insert(req.pointer, ObjectKind::Pointer { grant: req.grant });
+        self.objects
+            .insert(req.text, ObjectKind::Text { grant: req.grant });
+        self.petition_count += 1;
+
+        // Bound phase implies a bound identity; surfacing the impossible
+        // case typed keeps the TCB panic-free on reachable input.
+        let Some(identity) = self.identity.clone() else {
+            return Err(PrincipalViolation::ServerError {
+                object_id,
+                detail: "petition dispatched with no bound identity".into(),
+            }
+            .into());
+        };
+        let admission = petitions.admit(
+            PetitionRequest {
+                connection: self.connection,
+                identity,
+                realm_name,
+                grant_wire_id: req.grant,
+                consent_wire_id: req.consent,
+                resource: req.resource,
+                verbs: req.verbs,
+                expiry_ms: req.expiry_ms,
+                max_event_rate: req.max_event_rate,
+                persistence: req.persistence,
+                flags: req.flags,
+            },
+            now,
+        );
+        match admission {
+            Admission::Pending { .. } => {
+                // The prompt lifecycle began: it is waiting on the consent
+                // surface (or, in this build, the timeout).
+                let queued = consent::events::State {
+                    state: ConsentState::Queued,
+                };
+                send(&queued.encode(req.consent))?;
+                Ok(())
+            }
+            Admission::Resolved(resolution) => {
+                self.deliver_resolution(resolution, grants, now, send)
+                    .map_err(|e| {
+                        match e {
+                            DeliveryError::Transport(t) => PrincipalFault::Transport(t),
+                            // Unreachable for a resolution minted for the
+                            // petition just registered (the connection is
+                            // bound and the handle pending); typed,
+                            // fail-closed. An `Insert` failure already
+                            // killed the connection inside delivery, so
+                            // this mapping only keeps the embedder
+                            // contract (log and close) -- the funnel's
+                            // was-dead guard prevents a second goodbye.
+                            other => PrincipalViolation::ServerError {
+                                object_id,
+                                detail: other.to_string(),
+                            }
+                            .into(),
+                        }
+                    })
+            }
+        }
+    }
+
+    /// Refill-then-take on the petition-rate token bucket
+    /// ([`PETITION_RATE_BURST`] / [`PETITION_REFILL_PER_SEC`]), integer
+    /// arithmetic on the injected `now`. Returns whether a token was
+    /// available; a `false` is the fatal `resource_exhausted` ceiling.
+    fn take_petition_token(&mut self, now: Instant) -> bool {
+        let anchor = *self.petition_refill_anchor.get_or_insert(now);
+        let elapsed_secs = now.saturating_duration_since(anchor).as_secs();
+        let refill = elapsed_secs.saturating_mul(u64::from(PETITION_REFILL_PER_SEC));
+        if refill > 0 {
+            let tokens = (u64::from(self.petition_tokens) + refill)
+                .min(u64::from(PETITION_RATE_BURST)) as u32;
+            self.petition_tokens = tokens;
+            self.petition_refill_anchor = Some(if tokens == PETITION_RATE_BURST {
+                // Full bucket: excess credit is dropped, the clock
+                // restarts here.
+                now
+            } else {
+                // Credit whole seconds only; the fractional remainder
+                // stays banked in the anchor.
+                anchor + Duration::from_secs(elapsed_secs)
+            });
+        }
+        if self.petition_tokens == 0 {
+            return false;
+        }
+        self.petition_tokens -= 1;
+        true
+    }
+
+    /// Deliver one petition resolution on this connection: the **single
+    /// emission path** for the petition terminal (module docs), shared by
+    /// immediate resolutions (admission refusals, auto-approve) and
+    /// deferred ones the embedder routes here (scripted consent, timeout).
+    ///
+    /// Delivery is phase-gated: on a connection no longer bound -- the
+    /// fatal goodbye is the connection's terminal event (conventions 5.2),
+    /// and [`teardown`](Self::teardown) ends the conversation just as
+    /// finally -- the resolution is refused typed and dropped whole,
+    /// nothing sent. For a granted verdict **the grant-table row is minted
+    /// here**, at the injected `now`, in the same single-threaded step
+    /// that flips the wire handle: authority exists if and only if its
+    /// handle resolved, so the teardown scan is complete and an
+    /// undelivered approval leaves no row behind (module docs). Emits the
+    /// closing consent transition (when a prompt lifecycle existed), then
+    /// exactly one `vitrin_grant.resolved`; the handle's
+    /// pending-to-resolved flip is the exactly-once guard -- a replayed
+    /// resolution is refused typed before any row is minted or anything is
+    /// sent.
+    pub fn deliver_resolution<F>(
+        &mut self,
+        resolution: Resolution,
+        grants: &mut GrantTable,
+        now: Instant,
+        send: &mut F,
+    ) -> Result<(), DeliveryError>
+    where
+        F: FnMut(&[u8]) -> Result<(), TransportError>,
+    {
+        // Addressing before the phase gate: a resolution for another
+        // connection must surface as the routing bug it is, not vanish as
+        // this connection's dead-drop.
+        if resolution.connection != self.connection {
+            return Err(DeliveryError::WrongConnection {
+                expected: self.connection,
+                got: resolution.connection,
+            });
+        }
+        // The phase gate (module docs): after the fatal goodbye or after
+        // teardown nothing more is ever sent -- and no authority is ever
+        // minted -- on this connection.
+        if self.phase != Phase::Bound {
+            return Err(DeliveryError::ConnectionDead);
+        }
+        let Some(ObjectKind::Grant(state)) = self.objects.get_mut(&resolution.grant_wire_id) else {
+            return Err(DeliveryError::UnknownGrantObject {
+                wire_id: resolution.grant_wire_id,
+            });
+        };
+        // The exactly-once guard runs before any state changes: a replayed
+        // granted resolution must not mint a second row.
+        if matches!(state, GrantHandleState::Resolved { .. }) {
+            return Err(DeliveryError::AlreadyResolved {
+                wire_id: resolution.grant_wire_id,
+            });
+        }
+        // Authority is born here, not at decision time: the row insert and
+        // the handle flip are one delivery step, so no teardown
+        // interleaving can observe a row without a resolved handle.
+        let row = match &resolution.verdict {
+            Verdict::Granted { grant: approved } => match approved.insert_row(grants, now) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    // Unreachable (decisions are validated before they
+                    // become approvals), surfaced as this entry point's
+                    // own fatal funnel: the handle can never resolve now
+                    // (its registry entry is consumed), and a client hung
+                    // on a permanently pending grant is what denial must
+                    // never be -- so the connection dies fatal internal,
+                    // best-effort goodbye first, DEAD so nothing else
+                    // dispatches.
+                    tracing::warn!(
+                        peer_uid = self.peer.uid,
+                        error = %e,
+                        "delivery-time grant insert failed; principal connection fatal"
+                    );
+                    self.phase = Phase::Dead;
+                    let goodbye = handshake::events::Error {
+                        object_id: resolution.grant_wire_id,
+                        code: WireError::Internal,
+                        message: "server-side failure".into(),
+                    };
+                    let _ = send(&goodbye.encode(HANDSHAKE_ID));
+                    return Err(DeliveryError::Insert(e));
+                }
+            },
+            Verdict::Declined { .. } => None,
+        };
+        *state = GrantHandleState::Resolved { row };
+        if resolution.emit_closed {
+            let closed = consent::events::State {
+                state: ConsentState::Closed,
+            };
+            send(&closed.encode(resolution.consent_wire_id)).map_err(DeliveryError::Transport)?;
+        }
+        // The terminal: effective authority on granted, zeroed trailing
+        // arguments otherwise (IDL).
+        let resolved = match resolution.verdict {
+            Verdict::Granted { grant: approved } => grant::events::Resolved {
+                outcome: Outcome::Granted,
+                verbs: approved.effective.verbs,
+                persistence: WirePersistence::from(approved.effective.persistence),
+                expiry_ms: approved.effective.expiry_ms,
+            },
+            Verdict::Declined { outcome } => grant::events::Resolved {
+                outcome,
+                verbs: Verb::default(),
+                persistence: WirePersistence::Once,
+                expiry_ms: 0,
+            },
+        };
+        send(&resolved.encode(resolution.grant_wire_id)).map_err(DeliveryError::Transport)?;
+        Ok(())
+    }
+
+    /// Connection teardown (module docs: the embedder MUST call this when
+    /// the connection closes, for any reason): withdraws this connection's
+    /// pending petitions -- no events, the petitioner is gone -- and
+    /// removes its granted rows from the grant table (version-1 grants die
+    /// with their connection; removal, not revocation -- the grant table's
+    /// documented teardown contract). The resolved-handle scan is complete
+    /// by construction: rows are minted only at delivery, in the same step
+    /// that flips the handle, so no row of this connection can exist
+    /// behind a still-pending handle -- and a consent decision still in
+    /// flight when the connection dies mints nothing, because its late
+    /// delivery is phase-refused. Idempotent, and leaves the server DEAD
+    /// so a buggy embedder cannot dispatch (or deliver) into a torn-down
+    /// connection.
+    pub fn teardown(&mut self, petitions: &mut PetitionRegistry, grants: &mut GrantTable) {
+        let withdrawn = petitions.withdraw_connection(self.connection);
+        let mut removed = 0usize;
+        for kind in self.objects.values() {
+            if let ObjectKind::Grant(GrantHandleState::Resolved { row: Some(id) }) = kind {
+                if grants.remove(*id) {
+                    removed += 1;
+                }
+            }
+        }
+        if withdrawn > 0 || removed > 0 {
+            tracing::info!(
+                connection = %self.connection,
+                withdrawn_petitions = withdrawn,
+                removed_grants = removed,
+                "principal connection teardown"
+            );
+        }
+        self.phase = Phase::Dead;
+    }
+
+    /// The grant-table row behind a wire grant handle, if that handle
+    /// resolved `granted`: the P1.4.4 chokepoint's wire-to-row key, and
+    /// the tests' bridge from wire ids to table state.
+    pub fn grant_row_id(&self, grant_wire_id: u32) -> Option<GrantId> {
+        match self.objects.get(&grant_wire_id) {
+            Some(ObjectKind::Grant(GrantHandleState::Resolved { row })) => *row,
+            _ => None,
+        }
     }
 
     /// Enforce the watermark rule (conventions 3.1) for one `new_id`:
@@ -635,14 +1261,21 @@ mod tests {
 
     use vitrin_ipc::Connection;
 
+    use crate::grants::{GrantState, Issuer, PersistenceRung, RefusalReason};
     use crate::identity::{
         BoundPrincipal, RejectionCause, StaticPrincipal, StaticVerifier, STATIC_TOKEN_SCHEME,
     };
+    use crate::petitions::{ConsentPolicy, PetitionConfig, ScriptedDecision, ScriptedError};
 
     use super::*;
 
     const TOKEN: &str = "9b2f4c1d8a7e5f30619b2f4c1d8a7e5f30619b2f4c1d8a7e5f30619b2f4c1d8a";
     const DEMO_IDENTITY: &str = "vitrin://local/agent/demo";
+
+    /// The full version-1 verb set, as the demo agent petitions for it.
+    fn all_verbs() -> Verb {
+        Verb::OBSERVE | Verb::ACTUATE_POINTER | Verb::ACTUATE_TEXT
+    }
 
     fn my_uid() -> u32 {
         rustix::process::geteuid().as_raw()
@@ -660,18 +1293,54 @@ mod tests {
         .unwrap()
     }
 
-    /// A fresh per-connection server + socketpair: core end, client end.
-    fn setup() -> (PrincipalServer, Connection, Connection) {
-        let (core, client) = Connection::pair().expect("socketpair");
-        let server = PrincipalServer::new(core.peer_cred());
-        (server, core, client)
+    /// The core-shared capability-kernel state one test rig hosts (the
+    /// registry and grant table every connection of the rig shares), plus
+    /// the injected clock all dispatch runs at -- tests advance `now` as
+    /// values, never sleep.
+    struct Shared {
+        petitions: PetitionRegistry,
+        grants: GrantTable,
+        now: Instant,
     }
 
-    /// Receive and dispatch exactly `n` client messages on the core side.
+    impl Shared {
+        fn new(policy: ConsentPolicy) -> Self {
+            Self {
+                petitions: PetitionRegistry::new(policy, PetitionConfig::default()),
+                grants: GrantTable::new(),
+                now: Instant::now(),
+            }
+        }
+    }
+
+    /// A fresh per-connection server + socketpair on `shared`: core end,
+    /// client end.
+    fn connect(shared: &mut Shared) -> (PrincipalServer, Connection, Connection) {
+        let (core, client) = Connection::pair().expect("socketpair");
+        let connection = shared.petitions.register_connection();
+        (
+            PrincipalServer::new(core.peer_cred(), connection),
+            core,
+            client,
+        )
+    }
+
+    /// One-rig setup for the single-connection tests, on the fail-closed
+    /// default policy (interactive); petition tests that need another
+    /// policy build their own [`Shared`].
+    fn setup() -> (PrincipalServer, Connection, Connection, Shared) {
+        let mut shared = Shared::new(ConsentPolicy::Interactive);
+        let (server, core, client) = connect(&mut shared);
+        (server, core, client, shared)
+    }
+
+    /// Receive and dispatch exactly `n` client messages on the core side,
+    /// at the rig's injected `now`.
     fn process_n(
         server: &mut PrincipalServer,
         core: &mut Connection,
         verifier: &dyn Verifier,
+        shared: &mut Shared,
         n: usize,
     ) -> Result<(), PrincipalFault> {
         for _ in 0..n {
@@ -679,7 +1348,14 @@ mod tests {
                 .recv_message()
                 .expect("core receive")
                 .expect("a message must be waiting");
-            server.handle_message(msg, verifier, &mut |frame| core.send_message(frame, None))?;
+            server.handle_message(
+                msg,
+                verifier,
+                &mut shared.petitions,
+                &mut shared.grants,
+                shared.now,
+                &mut |frame| core.send_message(frame, None),
+            )?;
         }
         Ok(())
     }
@@ -726,22 +1402,29 @@ mod tests {
             .expect("send sync");
     }
 
-    /// A schema-legal whole-realm petition (observe only), used only as a
-    /// well-formed frame toward realm handles -- its resolution is #27.
-    fn whole_realm_petition() -> realm::requests::RequestGrant {
+    /// A schema-legal whole-realm petition minting ids `base..base+5` in
+    /// argument order (grant, consent, view, pointer, text): all three
+    /// verbs, `while_running`, wire defaults. Tests tweak fields.
+    fn petition_at(base: u32) -> realm::requests::RequestGrant {
         realm::requests::RequestGrant {
-            grant: 4,
-            consent: 5,
-            view: 6,
-            pointer: 7,
-            text: 8,
+            grant: base,
+            consent: base + 1,
+            view: base + 2,
+            pointer: base + 3,
+            text: base + 4,
             resource: String::new(),
-            verbs: vitrin_protocol::generated::vitrin_grant::Verb::OBSERVE,
+            verbs: all_verbs(),
             expiry_ms: 0,
             max_event_rate: 0,
-            persistence: vitrin_protocol::generated::vitrin_grant::Persistence::Once,
+            persistence: WirePersistence::WhileRunning,
             flags: 0,
         }
+    }
+
+    /// The standard petition: ids 4..=8, right after the standard preamble
+    /// (principal 2, realm 3).
+    fn petition_frame() -> realm::requests::RequestGrant {
+        petition_at(4)
     }
 
     /// Complete a successful handshake with principal id 2 and return the
@@ -751,13 +1434,44 @@ mod tests {
         core: &mut Connection,
         client: &mut Connection,
         verifier: &dyn Verifier,
+        shared: &mut Shared,
     ) -> String {
         send_hello(client, 2, DEMO_IDENTITY, TOKEN);
-        process_n(server, core, verifier, 1).expect("handshake");
+        process_n(server, core, verifier, shared, 1).expect("handshake");
         let msg = client.recv_message().unwrap().unwrap();
         let (object_id, bound) = principal::events::Bound::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, 2, "bound arrives on the pre-allocated principal");
         bound.identity
+    }
+
+    /// The standard petition preamble: bind (principal 2) and mint realm
+    /// handle 3 for `realm-0`.
+    fn bind_with_realm(
+        server: &mut PrincipalServer,
+        core: &mut Connection,
+        client: &mut Connection,
+        verifier: &dyn Verifier,
+        shared: &mut Shared,
+    ) {
+        bind(server, core, client, verifier, shared);
+        send_get_realm(client, 2, 3, "realm-0");
+        process_n(server, core, verifier, shared, 1).expect("get_realm");
+    }
+
+    /// Route one resolution to its connection's emission path, against the
+    /// rig's shared grant table at the rig's injected clock (rows are
+    /// minted at delivery).
+    fn deliver(
+        server: &mut PrincipalServer,
+        core: &mut Connection,
+        shared: &mut Shared,
+        resolution: Resolution,
+    ) {
+        server
+            .deliver_resolution(resolution, &mut shared.grants, shared.now, &mut |frame| {
+                core.send_message(frame, None)
+            })
+            .expect("deliver resolution");
     }
 
     /// Assert the next client-visible event is the fatal goodbye with the
@@ -783,14 +1497,58 @@ mod tests {
         }
     }
 
+    /// Assert the next client-visible event is a consent `state`
+    /// transition on the given observer.
+    fn expect_consent_state(client: &mut Connection, consent_id: u32, want: ConsentState) {
+        let msg = client.recv_message().unwrap().unwrap();
+        let (object_id, ev) = consent::events::State::decode(&msg.bytes, msg.fd).unwrap();
+        assert_eq!(
+            object_id, consent_id,
+            "consent state arrives on the co-minted observer"
+        );
+        assert_eq!(ev.state, want);
+    }
+
+    /// Assert the next client-visible event is `resolved` on the given
+    /// grant handle, returning it for outcome assertions.
+    fn expect_resolved(client: &mut Connection, grant_id: u32) -> grant::events::Resolved {
+        let msg = client.recv_message().unwrap().unwrap();
+        let (object_id, ev) = grant::events::Resolved::decode(&msg.bytes, msg.fd).unwrap();
+        assert_eq!(
+            object_id, grant_id,
+            "resolved arrives on the co-minted grant handle"
+        );
+        ev
+    }
+
+    /// Fence: sync, dispatch it, and require `done` as the *very next*
+    /// client-visible event -- proving the connection survived (recoverable
+    /// outcomes never kill it) and that no unread event was queued ahead.
+    fn sync_fence(
+        server: &mut PrincipalServer,
+        core: &mut Connection,
+        client: &mut Connection,
+        verifier: &dyn Verifier,
+        shared: &mut Shared,
+        cookie: u32,
+    ) {
+        send_sync(client, cookie);
+        process_n(server, core, verifier, shared, 1).expect("sync must dispatch");
+        let msg = client.recv_message().unwrap().unwrap();
+        let (object_id, done) = handshake::events::Done::decode(&msg.bytes, msg.fd).unwrap();
+        assert_eq!(object_id, HANDSHAKE_ID);
+        assert_eq!(done.cookie, cookie, "done must be the next event in stream");
+    }
+
     // -- acceptance: bind + refusals ---------------------------------------
 
     #[test]
     fn successful_handshake_sends_bound_with_the_canonical_identity() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
+        let (mut server, mut core, mut client, mut shared) = setup();
         assert!(!server.is_bound());
-        let identity = bind(&mut server, &mut core, &mut client, &verifier);
+        let identity = bind(&mut server, &mut core, &mut client, &verifier, &mut shared);
         assert_eq!(identity, DEMO_IDENTITY);
         assert!(server.is_bound());
         assert_eq!(server.bound_identity().unwrap().as_str(), DEMO_IDENTITY);
@@ -798,6 +1556,7 @@ mod tests {
 
     #[test]
     fn refused_handshake_is_wire_uniform_across_causes() {
+        let _fd = crate::capture::tests::fd_lock();
         // Wrong token, missing (empty) token, unknown identity, peercred
         // mismatch, and verifier outage must produce byte-identical error
         // frames: auth_failed with the fixed phrase, no bound, nothing else.
@@ -834,10 +1593,10 @@ mod tests {
         ];
         let mut frames: Vec<(Vec<u8>, &str)> = Vec::new();
         for (verifier, identity, credential, label) in cases {
-            let (mut server, mut core, mut client) = setup();
+            let (mut server, mut core, mut client, mut shared) = setup();
             send_hello(&mut client, 2, identity, credential);
             expect_violation(
-                process_n(&mut server, &mut core, verifier, 1),
+                process_n(&mut server, &mut core, verifier, &mut shared, 1),
                 "auth_failed",
             );
             let mut msg = client.recv_message().unwrap().unwrap();
@@ -858,10 +1617,11 @@ mod tests {
 
     #[test]
     fn refusal_log_detail_names_the_cause_but_never_the_credential() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
+        let (mut server, mut core, mut client, mut shared) = setup();
         send_hello(&mut client, 2, DEMO_IDENTITY, "super-secret-wrong-token");
-        let fault = process_n(&mut server, &mut core, &verifier, 1).unwrap_err();
+        let fault = process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap_err();
         let log_line = fault.to_string();
         assert!(log_line.contains("does not match the registered token"));
         assert!(log_line.contains(DEMO_IDENTITY));
@@ -872,6 +1632,7 @@ mod tests {
 
     #[test]
     fn version_check_precedes_verification() {
+        let _fd = crate::capture::tests::fd_lock();
         struct Counting<'a> {
             inner: &'a StaticVerifier,
             calls: &'a Cell<u32>,
@@ -889,10 +1650,10 @@ mod tests {
             calls: &calls,
         };
 
-        let (mut server, mut core, mut client) = setup();
+        let (mut server, mut core, mut client, mut shared) = setup();
         send_hello_versioned(&mut client, PROTOCOL_VERSION + 1, 2, DEMO_IDENTITY, TOKEN);
         expect_violation(
-            process_n(&mut server, &mut core, &counting, 1),
+            process_n(&mut server, &mut core, &counting, &mut shared, 1),
             "version_unsupported",
         );
         let err = expect_error(&mut client, WireError::VersionUnsupported);
@@ -903,11 +1664,12 @@ mod tests {
 
     #[test]
     fn traffic_before_hello_is_pre_handshake() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
+        let (mut server, mut core, mut client, mut shared) = setup();
         send_sync(&mut client, 7);
         expect_violation(
-            process_n(&mut server, &mut core, &verifier, 1),
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
             "pre_handshake",
         );
         expect_error(&mut client, WireError::PreHandshake);
@@ -915,6 +1677,7 @@ mod tests {
 
     #[test]
     fn malformed_hello_dies_by_grammar_before_the_verifier_runs() {
+        let _fd = crate::capture::tests::fd_lock();
         struct Panicking;
         impl Verifier for Panicking {
             fn verify(&self, _p: &PresentedCredential<'_>) -> VerifyOutcome {
@@ -939,10 +1702,10 @@ mod tests {
         vitrin_protocol::wire::write_string(&mut frame, TOKEN, 32768);
         vitrin_protocol::wire::patch_size(&mut frame);
 
-        let (mut server, mut core, mut client) = setup();
+        let (mut server, mut core, mut client, mut shared) = setup();
         client.send_message(&frame, None).unwrap();
         expect_violation(
-            process_n(&mut server, &mut core, &Panicking, 1),
+            process_n(&mut server, &mut core, &Panicking, &mut shared, 1),
             "malformed",
         );
         let err = expect_error(&mut client, WireError::InvalidArgument);
@@ -954,14 +1717,15 @@ mod tests {
 
     #[test]
     fn malformed_frames_cite_the_object_they_targeted() {
+        let _fd = crate::capture::tests::fd_lock();
         // The IDL defines error.object_id as the id of the object where the
         // error occurred, "which may be 1" -- not always 1. A malformed
         // get_realm on the bound principal (object 2) must cite object 2,
         // so client-side debugging is not misdirected to the handshake
         // object. Here the name argument is invalid UTF-8.
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
-        bind(&mut server, &mut core, &mut client, &verifier);
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind(&mut server, &mut core, &mut client, &verifier, &mut shared);
         let mut frame = Vec::new();
         vitrin_protocol::wire::FrameHeader {
             object_id: 2,
@@ -977,7 +1741,7 @@ mod tests {
 
         client.send_message(&frame, None).unwrap();
         expect_violation(
-            process_n(&mut server, &mut core, &verifier, 1),
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
             "malformed message on object 2",
         );
         let err = expect_error(&mut client, WireError::InvalidArgument);
@@ -989,12 +1753,13 @@ mod tests {
 
     #[test]
     fn second_hello_is_invalid_opcode() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
-        bind(&mut server, &mut core, &mut client, &verifier);
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind(&mut server, &mut core, &mut client, &verifier, &mut shared);
         send_hello(&mut client, 3, DEMO_IDENTITY, TOKEN);
         expect_violation(
-            process_n(&mut server, &mut core, &verifier, 1),
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
             "second hello",
         );
         expect_error(&mut client, WireError::InvalidOpcode);
@@ -1002,22 +1767,26 @@ mod tests {
 
     #[test]
     fn sync_answers_done_after_bound() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
-        bind(&mut server, &mut core, &mut client, &verifier);
-        send_sync(&mut client, 0xdead_beef);
-        process_n(&mut server, &mut core, &verifier, 1).unwrap();
-        let msg = client.recv_message().unwrap().unwrap();
-        let (object_id, done) = handshake::events::Done::decode(&msg.bytes, msg.fd).unwrap();
-        assert_eq!(object_id, HANDSHAKE_ID);
-        assert_eq!(done.cookie, 0xdead_beef);
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            0xdead_beef,
+        );
     }
 
     #[test]
     fn unknown_opcodes_are_invalid_opcode() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
-        bind(&mut server, &mut core, &mut client, &verifier);
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind(&mut server, &mut core, &mut client, &verifier, &mut shared);
         // Opcode 9 exists on no version-1 interface; try it on the
         // handshake object and on the principal.
         for object_id in [HANDSHAKE_ID, 2] {
@@ -1031,12 +1800,12 @@ mod tests {
             .encode_with_placeholder_size(&mut frame);
             vitrin_protocol::wire::patch_size(&mut frame);
             client.send_message(&frame, None).unwrap();
-            let result = process_n(&mut server, &mut core, &verifier, 1);
+            let result = process_n(&mut server, &mut core, &verifier, &mut shared, 1);
             expect_violation(result, "invalid_opcode");
             expect_error(&mut client, WireError::InvalidOpcode);
             // Each fatal kills the connection; re-handshake on a fresh one.
-            (server, core, client) = setup();
-            bind(&mut server, &mut core, &mut client, &verifier);
+            (server, core, client, shared) = setup();
+            bind(&mut server, &mut core, &mut client, &verifier, &mut shared);
         }
     }
 
@@ -1044,17 +1813,23 @@ mod tests {
 
     #[test]
     fn get_realm_mints_under_the_watermark_rule() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
-        bind(&mut server, &mut core, &mut client, &verifier);
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind(&mut server, &mut core, &mut client, &verifier, &mut shared);
         send_get_realm(&mut client, 2, 3, "realm-0");
-        process_n(&mut server, &mut core, &verifier, 1).unwrap();
-        assert_eq!(server.realms.get(&3).map(String::as_str), Some("realm-0"));
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        assert_eq!(
+            server.objects.get(&3),
+            Some(&ObjectKind::Realm {
+                name: "realm-0".into()
+            })
+        );
 
         // Reusing an id at/below the watermark is fatal invalid_object.
         send_get_realm(&mut client, 2, 3, "realm-0");
         expect_violation(
-            process_n(&mut server, &mut core, &verifier, 1),
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
             "invalid_object",
         );
         expect_error(&mut client, WireError::InvalidObject);
@@ -1062,23 +1837,24 @@ mod tests {
 
     #[test]
     fn hello_new_id_must_respect_the_watermark_rule() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
         // Id 1 is the bootstrap object: claiming it as the principal new_id
         // is at/below the watermark, fatal invalid_object -- before any
         // verification happens.
-        let (mut server, mut core, mut client) = setup();
+        let (mut server, mut core, mut client, mut shared) = setup();
         send_hello(&mut client, HANDSHAKE_ID, DEMO_IDENTITY, TOKEN);
         expect_violation(
-            process_n(&mut server, &mut core, &verifier, 1),
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
             "invalid_object",
         );
         expect_error(&mut client, WireError::InvalidObject);
 
         // The reserved server range is equally out.
-        let (mut server, mut core, mut client) = setup();
+        let (mut server, mut core, mut client, mut shared) = setup();
         send_hello(&mut client, 0xff00_0000, DEMO_IDENTITY, TOKEN);
         expect_violation(
-            process_n(&mut server, &mut core, &verifier, 1),
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
             "invalid_object",
         );
         expect_error(&mut client, WireError::InvalidObject);
@@ -1086,16 +1862,24 @@ mod tests {
 
     #[test]
     fn realm_cap_is_resource_exhausted() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
-        bind(&mut server, &mut core, &mut client, &verifier);
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind(&mut server, &mut core, &mut client, &verifier, &mut shared);
         for i in 0..MAX_LIVE_REALMS as u32 {
             send_get_realm(&mut client, 2, 3 + i, "realm-0");
         }
-        process_n(&mut server, &mut core, &verifier, MAX_LIVE_REALMS).unwrap();
+        process_n(
+            &mut server,
+            &mut core,
+            &verifier,
+            &mut shared,
+            MAX_LIVE_REALMS,
+        )
+        .unwrap();
         send_get_realm(&mut client, 2, 100, "realm-0");
         expect_violation(
-            process_n(&mut server, &mut core, &verifier, 1),
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
             "resource_exhausted",
         );
         expect_error(&mut client, WireError::ResourceExhausted);
@@ -1103,41 +1887,908 @@ mod tests {
 
     #[test]
     fn id_space_exhaustion_is_resource_exhausted() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
-        bind(&mut server, &mut core, &mut client, &verifier);
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind(&mut server, &mut core, &mut client, &verifier, &mut shared);
         server.exhaust_id_space_for_test();
         send_get_realm(&mut client, 2, CLIENT_ID_MAX, "realm-0");
         expect_violation(
-            process_n(&mut server, &mut core, &verifier, 1),
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
             "object-id space exhausted",
         );
         expect_error(&mut client, WireError::ResourceExhausted);
     }
 
+    // -- acceptance: petition lifecycle (P1.4.3) ---------------------------
+
     #[test]
-    fn request_grant_is_the_p143_seam() {
-        // Until issue #27 lands, a petition on a legal realm handle is an
-        // honest server-side limitation: fatal internal, logged -- never a
-        // fake resolution and never invalid_opcode (the opcode is defined).
+    fn auto_approved_petition_resolves_granted_with_a_usable_row() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The walking-skeleton flow (IDL flow 1): under the loudly-logged
+        // auto-approve policy the petition resolves granted immediately --
+        // consent `closed`, then the `resolved` terminal carrying the
+        // effective authority -- and the grant handle is backed by a live,
+        // usable grant-table row.
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
-        bind(&mut server, &mut core, &mut client, &verifier);
-        send_get_realm(&mut client, 2, 3, "realm-0");
-        let grant = whole_realm_petition();
-        client.send_message(&grant.encode(3), None).unwrap();
-        process_n(&mut server, &mut core, &verifier, 1).unwrap();
-        expect_violation(
-            process_n(&mut server, &mut core, &verifier, 1),
-            "not implemented",
+        let mut shared = Shared::new(ConsentPolicy::AutoApprove);
+        let (mut server, mut core, mut client) = connect(&mut shared);
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+
+        let mut req = petition_frame();
+        req.expiry_ms = 300_000;
+        client.send_message(&req.encode(3), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+
+        expect_consent_state(&mut client, 5, ConsentState::Closed);
+        let resolved = expect_resolved(&mut client, 4);
+        assert_eq!(resolved.outcome, Outcome::Granted);
+        assert_eq!(resolved.verbs, all_verbs(), "effective = requested");
+        assert_eq!(resolved.persistence, WirePersistence::WhileRunning);
+        assert_eq!(resolved.expiry_ms, 300_000);
+
+        // The handle is usable in the table: an active row that admits
+        // every granted verb through the grant-scoped chokepoint query.
+        let row = server.grant_row_id(4).expect("wire handle maps to a row");
+        let identity = server.bound_identity().unwrap().clone();
+        assert_eq!(
+            shared.grants.get(row, shared.now).unwrap().1,
+            GrantState::Active
         );
-        expect_error(&mut client, WireError::Internal);
+        for verb in [Verb::OBSERVE, Verb::ACTUATE_POINTER, Verb::ACTUATE_TEXT] {
+            assert_eq!(
+                shared
+                    .grants
+                    .check_use_grant(row, &identity, verb, shared.now)
+                    .map(|a| a.grant_id),
+                Ok(row)
+            );
+        }
+        let (grant_row, _) = shared.grants.get(row, shared.now).unwrap();
+        assert_eq!(
+            grant_row.constraints.max_event_rate.get(),
+            20,
+            "wire rate 0 resolves to the documented server default"
+        );
+        assert_eq!(
+            grant_row.constraints.expiry,
+            Some(Duration::from_millis(300_000))
+        );
+        assert_eq!(grant_row.issuer, Issuer::AutoApprovePolicy);
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            1,
+        );
+    }
+
+    #[test]
+    fn denied_petition_resolves_denied_cleanly() {
+        let _fd = crate::capture::tests::fd_lock();
+        // pending -> denied: a clean protocol event -- never a hang, never
+        // a connection death (IDL flow 3).
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        let pending = shared.petitions.pending_ids();
+        assert_eq!(pending.len(), 1);
+        let resolution = shared
+            .petitions
+            .resolve_scripted(pending[0], ScriptedDecision::Deny)
+            .unwrap();
+        deliver(&mut server, &mut core, &mut shared, resolution);
+
+        expect_consent_state(&mut client, 5, ConsentState::Closed);
+        let resolved = expect_resolved(&mut client, 4);
+        assert_eq!(resolved.outcome, Outcome::Denied);
+        assert_eq!(resolved.verbs, Verb::default(), "trailing arguments zeroed");
+        assert_eq!(resolved.persistence, WirePersistence::Once);
+        assert_eq!(resolved.expiry_ms, 0);
+
+        // No authority came into existence, and the connection lives.
+        assert_eq!(server.grant_row_id(4), None);
+        assert_eq!(shared.grants.rows(shared.now).count(), 0);
+        assert_eq!(shared.petitions.pending_total(), 0);
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            2,
+        );
+    }
+
+    #[test]
+    fn pending_petition_times_out_cleanly() {
+        let _fd = crate::capture::tests::fd_lock();
+        // pending -> timeout: expires without consent at exactly the
+        // 120-second default deadline (fail-closed, half-open), resolving
+        // timed_out as a clean event.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        let deadline = shared.now + Duration::from_secs(120);
+        assert!(
+            shared
+                .petitions
+                .expire_due(deadline - Duration::from_millis(1))
+                .is_empty(),
+            "still pending strictly before the deadline"
+        );
+        let due = shared.petitions.expire_due(deadline);
+        assert_eq!(due.len(), 1, "expired at exactly the deadline");
+        deliver(
+            &mut server,
+            &mut core,
+            &mut shared,
+            due.into_iter().next().unwrap(),
+        );
+
+        expect_consent_state(&mut client, 5, ConsentState::Closed);
+        let resolved = expect_resolved(&mut client, 4);
+        assert_eq!(resolved.outcome, Outcome::TimedOut);
+        assert_eq!(resolved.verbs, Verb::default());
+        assert_eq!(shared.petitions.pending_total(), 0);
+        assert_eq!(shared.grants.rows(shared.now).count(), 0);
+        // Petitioning again later is legal (IDL): the same realm handle
+        // petitions anew and pends anew.
+        client
+            .send_message(&petition_at(9).encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 10, ConsentState::Queued);
+        assert_eq!(shared.petitions.pending_total(), 1);
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            3,
+        );
+    }
+
+    #[test]
+    fn excess_petitions_resolve_busy_across_connections_of_one_identity() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The admission cap is per verified identity ACROSS ALL ITS
+        // CONNECTIONS (IDL): 3 pending on connection A plus 1 on B fill
+        // the cap of 4, and B's next petition resolves busy immediately --
+        // with no consent transitions (no prompt lifecycle ever began).
+        let verifier = demo_verifier();
+        let mut shared = Shared::new(ConsentPolicy::Interactive);
+        let (mut server_a, mut core_a, mut client_a) = connect(&mut shared);
+        let (mut server_b, mut core_b, mut client_b) = connect(&mut shared);
+        bind_with_realm(
+            &mut server_a,
+            &mut core_a,
+            &mut client_a,
+            &verifier,
+            &mut shared,
+        );
+        bind_with_realm(
+            &mut server_b,
+            &mut core_b,
+            &mut client_b,
+            &verifier,
+            &mut shared,
+        );
+
+        for base in [4, 9, 14] {
+            client_a
+                .send_message(&petition_at(base).encode(3), None)
+                .unwrap();
+            process_n(&mut server_a, &mut core_a, &verifier, &mut shared, 1).unwrap();
+            expect_consent_state(&mut client_a, base + 1, ConsentState::Queued);
+        }
+        client_b
+            .send_message(&petition_at(4).encode(3), None)
+            .unwrap();
+        process_n(&mut server_b, &mut core_b, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client_b, 5, ConsentState::Queued);
+        assert_eq!(shared.petitions.pending_total(), 4);
+
+        // The fifth concurrent petition of this identity: busy, on B, as
+        // the very next event (decoding it as resolved also proves no
+        // consent transition preceded it).
+        client_b
+            .send_message(&petition_at(9).encode(3), None)
+            .unwrap();
+        process_n(&mut server_b, &mut core_b, &verifier, &mut shared, 1).unwrap();
+        let resolved = expect_resolved(&mut client_b, 9);
+        assert_eq!(resolved.outcome, Outcome::Busy);
+        assert_eq!(resolved.verbs, Verb::default());
+        assert_eq!(shared.petitions.pending_total(), 4, "busy consumed no slot");
+
+        // Retrying after an outstanding petition resolves is legal: deny
+        // one of A's, then B's next petition pends normally.
+        let first = shared.petitions.pending_ids()[0];
+        let resolution = shared
+            .petitions
+            .resolve_scripted(first, ScriptedDecision::Deny)
+            .unwrap();
+        deliver(&mut server_a, &mut core_a, &mut shared, resolution);
+        expect_consent_state(&mut client_a, 5, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client_a, 4).outcome, Outcome::Denied);
+
+        client_b
+            .send_message(&petition_at(14).encode(3), None)
+            .unwrap();
+        process_n(&mut server_b, &mut core_b, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client_b, 15, ConsentState::Queued);
+    }
+
+    #[test]
+    fn effective_authority_may_be_narrower_than_requested() {
+        let _fd = crate::capture::tests::fd_lock();
+        // Scripted approval narrows the petition (fewer verbs, shorter
+        // rung, tighter expiry); resolved carries the EFFECTIVE authority
+        // and the row states it -- the ungranted verb refuses not_granted
+        // at the chokepoint query.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        let mut req = petition_frame();
+        req.expiry_ms = 600_000;
+        client.send_message(&req.encode(3), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        let petition = shared.petitions.pending_ids()[0];
+        let resolution = shared
+            .petitions
+            .resolve_scripted(
+                petition,
+                ScriptedDecision::Approve {
+                    verbs: Verb::OBSERVE,
+                    persistence: PersistenceRung::Once,
+                    expiry_ms: 60_000,
+                },
+            )
+            .unwrap();
+        deliver(&mut server, &mut core, &mut shared, resolution);
+
+        expect_consent_state(&mut client, 5, ConsentState::Closed);
+        let resolved = expect_resolved(&mut client, 4);
+        assert_eq!(resolved.outcome, Outcome::Granted);
+        assert_eq!(resolved.verbs, Verb::OBSERVE, "narrower than requested");
+        assert_eq!(resolved.persistence, WirePersistence::Once);
+        assert_eq!(resolved.expiry_ms, 60_000);
+
+        let row = server.grant_row_id(4).unwrap();
+        let identity = server.bound_identity().unwrap().clone();
+        let (grant_row, _) = shared.grants.get(row, shared.now).unwrap();
+        assert_eq!(grant_row.verbs, Verb::OBSERVE);
+        assert_eq!(grant_row.persistence, PersistenceRung::Once);
+        assert_eq!(grant_row.issuer, Issuer::ScriptedConsent);
+        // The verbs the human did not grant refuse not_granted; the one
+        // granted verb admits (and, Once, is spent by that admission).
+        assert_eq!(
+            shared
+                .grants
+                .check_use_grant(row, &identity, Verb::ACTUATE_TEXT, shared.now),
+            Err(RefusalReason::NotGranted)
+        );
+        assert!(shared
+            .grants
+            .check_use_grant(row, &identity, Verb::OBSERVE, shared.now)
+            .is_ok());
+    }
+
+    #[test]
+    fn resolved_fires_exactly_once_ever() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        let petition = shared.petitions.pending_ids()[0];
+        let resolution = shared
+            .petitions
+            .resolve_scripted(
+                petition,
+                ScriptedDecision::Approve {
+                    verbs: all_verbs(),
+                    persistence: PersistenceRung::WhileRunning,
+                    expiry_ms: 0,
+                },
+            )
+            .unwrap();
+        let replay = resolution.clone();
+        deliver(&mut server, &mut core, &mut shared, resolution);
+        expect_consent_state(&mut client, 5, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client, 4).outcome, Outcome::Granted);
+
+        // The registry consumed the petition: a second decision has
+        // nothing to decide...
+        assert_eq!(
+            shared
+                .petitions
+                .resolve_scripted(petition, ScriptedDecision::Deny)
+                .unwrap_err(),
+            ScriptedError::NotPending
+        );
+        // ...the timeout sweep finds nothing...
+        assert!(shared
+            .petitions
+            .expire_due(shared.now + Duration::from_secs(100_000))
+            .is_empty());
+        // ...and a replayed delivery is refused by the wire-side
+        // exactly-once guard before anything is sent -- and before any row
+        // is minted: the table still holds exactly the one row.
+        let err = server
+            .deliver_resolution(replay, &mut shared.grants, shared.now, &mut |frame| {
+                core.send_message(frame, None)
+            })
+            .unwrap_err();
+        assert!(matches!(err, DeliveryError::AlreadyResolved { wire_id: 4 }));
+        assert_eq!(shared.grants.rows(shared.now).count(), 1);
+        // Nothing further reached the client: done is the next event.
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            4,
+        );
+    }
+
+    #[test]
+    fn pending_petitions_are_withdrawn_on_disconnect() {
+        let _fd = crate::capture::tests::fd_lock();
+        // Connection teardown withdraws the closing connection's pending
+        // petitions (no events -- the petitioner is gone) and removes its
+        // granted rows; another connection of the same identity is
+        // untouched.
+        let verifier = demo_verifier();
+        let mut shared = Shared::new(ConsentPolicy::Interactive);
+        let (mut server_a, mut core_a, mut client_a) = connect(&mut shared);
+        let (mut server_b, mut core_b, mut client_b) = connect(&mut shared);
+        bind_with_realm(
+            &mut server_a,
+            &mut core_a,
+            &mut client_a,
+            &verifier,
+            &mut shared,
+        );
+        bind_with_realm(
+            &mut server_b,
+            &mut core_b,
+            &mut client_b,
+            &verifier,
+            &mut shared,
+        );
+
+        // A: one granted row (scripted) + one pending petition.
+        client_a
+            .send_message(&petition_at(4).encode(3), None)
+            .unwrap();
+        client_a
+            .send_message(&petition_at(9).encode(3), None)
+            .unwrap();
+        process_n(&mut server_a, &mut core_a, &verifier, &mut shared, 2).unwrap();
+        expect_consent_state(&mut client_a, 5, ConsentState::Queued);
+        expect_consent_state(&mut client_a, 10, ConsentState::Queued);
+        let first = shared.petitions.pending_ids()[0];
+        let resolution = shared
+            .petitions
+            .resolve_scripted(
+                first,
+                ScriptedDecision::Approve {
+                    verbs: Verb::OBSERVE,
+                    persistence: PersistenceRung::WhileRunning,
+                    expiry_ms: 0,
+                },
+            )
+            .unwrap();
+        deliver(&mut server_a, &mut core_a, &mut shared, resolution);
+        expect_consent_state(&mut client_a, 5, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client_a, 4).outcome, Outcome::Granted);
+        let row_a = server_a.grant_row_id(4).unwrap();
+
+        // B: one pending petition.
+        client_b
+            .send_message(&petition_at(4).encode(3), None)
+            .unwrap();
+        process_n(&mut server_b, &mut core_b, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client_b, 5, ConsentState::Queued);
+        assert_eq!(shared.petitions.pending_total(), 2);
+
+        // A's connection closes: its pending petition is withdrawn and its
+        // granted row is removed -- grants die with the connection.
+        server_a.teardown(&mut shared.petitions, &mut shared.grants);
+        assert_eq!(shared.petitions.pending_total(), 1);
+        assert!(shared.grants.get(row_a, shared.now).is_none());
+        // The identity's next use of the removed row's authority is
+        // not_granted (removal, not revocation -- module docs contract).
+        let identity = server_b.bound_identity().unwrap().clone();
+        assert_eq!(
+            shared
+                .grants
+                .check_use_grant(row_a, &identity, Verb::OBSERVE, shared.now),
+            Err(RefusalReason::NotGranted)
+        );
+        // The timeout sweep later finds only B's petition.
+        let due = shared
+            .petitions
+            .expire_due(shared.now + Duration::from_secs(3600));
+        assert_eq!(due.len(), 1);
+        deliver(
+            &mut server_b,
+            &mut core_b,
+            &mut shared,
+            due.into_iter().next().unwrap(),
+        );
+        expect_consent_state(&mut client_b, 5, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client_b, 4).outcome, Outcome::TimedOut);
+        // Teardown is idempotent.
+        server_a.teardown(&mut shared.petitions, &mut shared.grants);
+    }
+
+    #[test]
+    fn undelivered_approval_leaves_no_row_behind_teardown() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The disconnect-in-flight race: a petition is approved (scripted
+        // today, E7 human consent tomorrow) but the petitioner's connection
+        // dies before the embedder routes the resolution. Because the row
+        // is minted at delivery, the approval alone creates no authority,
+        // teardown leaves the table empty, and the late delivery is
+        // refused whole -- "all of the principal's grants die with the
+        // connection" (vitrin_principal) holds with no window.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        let petition = shared.petitions.pending_ids()[0];
+        let resolution = shared
+            .petitions
+            .resolve_scripted(
+                petition,
+                ScriptedDecision::Approve {
+                    verbs: Verb::OBSERVE,
+                    persistence: PersistenceRung::WhileRunning,
+                    expiry_ms: 0,
+                },
+            )
+            .unwrap();
+        // The decision alone mints nothing.
+        assert_eq!(shared.grants.rows(shared.now).count(), 0);
+
+        // The connection dies before the resolution is routed back.
+        server.teardown(&mut shared.petitions, &mut shared.grants);
+        assert_eq!(shared.grants.rows(shared.now).count(), 0);
+
+        // The embedder's late routing is refused whole: no events, no row,
+        // and the handle never resolves (its petitioner no longer exists).
+        let mut sent = 0usize;
+        let err = server
+            .deliver_resolution(resolution, &mut shared.grants, shared.now, &mut |_| {
+                sent += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(err, DeliveryError::ConnectionDead));
+        assert_eq!(sent, 0, "nothing is sent on a torn-down connection");
+        assert_eq!(
+            shared.grants.rows(shared.now).count(),
+            0,
+            "no authority survives its connection"
+        );
+    }
+
+    #[test]
+    fn no_resolution_is_delivered_after_the_fatal_goodbye() {
+        let _fd = crate::capture::tests::fd_lock();
+        // Error-then-close terminality (conventions 5.2): the fatal
+        // goodbye is the connection's terminal event, so a resolution the
+        // consent-timeout poll returns between the fatal and the
+        // embedder's close/teardown callback must not emit anything.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        // A protocol violation kills the connection: goodbye out, DEAD.
+        let mut frame = Vec::new();
+        vitrin_protocol::wire::FrameHeader {
+            object_id: HANDSHAKE_ID,
+            size: 0,
+            opcode: 9,
+            fd_count: 0,
+        }
+        .encode_with_placeholder_size(&mut frame);
+        vitrin_protocol::wire::patch_size(&mut frame);
+        client.send_message(&frame, None).unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "invalid_opcode",
+        );
+        expect_error(&mut client, WireError::InvalidOpcode);
+
+        // The timeout poll still returns the petition (only teardown
+        // withdraws it), but delivery on the dead connection is refused
+        // with nothing sent: the goodbye stays the terminal frame.
+        let due = shared
+            .petitions
+            .expire_due(shared.now + Duration::from_secs(120));
+        assert_eq!(due.len(), 1);
+        let mut sent = 0usize;
+        let err = server
+            .deliver_resolution(
+                due.into_iter().next().unwrap(),
+                &mut shared.grants,
+                shared.now,
+                &mut |_| {
+                    sent += 1;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, DeliveryError::ConnectionDead));
+        assert_eq!(
+            sent, 0,
+            "the fatal error event is the connection's terminal"
+        );
+    }
+
+    #[test]
+    fn durable_rungs_reserved_flags_and_finer_resources_resolve_unsupported() {
+        let _fd = crate::capture::tests::fd_lock();
+        // Well-formed, in-range petitions the deployment declines resolve
+        // unsupported -- honest refusal, never a protocol error, never a
+        // connection death (IDL). No consent transitions: the prompt
+        // lifecycle never began.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+
+        let mut until_revoked = petition_at(4);
+        until_revoked.persistence = WirePersistence::UntilRevoked;
+        let mut always = petition_at(9);
+        always.persistence = WirePersistence::Always;
+        let mut flagged = petition_at(14);
+        flagged.flags = 0b1; // reserved one_shot bit
+        let mut finer = petition_at(19);
+        finer.resource = "surface:main".into();
+
+        for (req, grant_id) in [(until_revoked, 4), (always, 9), (flagged, 14), (finer, 19)] {
+            client.send_message(&req.encode(3), None).unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+            let resolved = expect_resolved(&mut client, grant_id);
+            assert_eq!(resolved.outcome, Outcome::Unsupported);
+            assert_eq!(resolved.verbs, Verb::default());
+        }
+        assert_eq!(shared.petitions.pending_total(), 0);
+        assert_eq!(shared.grants.rows(shared.now).count(), 0);
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            5,
+        );
+    }
+
+    #[test]
+    fn unknown_realm_petitions_resolve_unavailable() {
+        let _fd = crate::capture::tests::fd_lock();
+        // get_realm succeeds structurally for any name; the petition is
+        // where absence surfaces, as unavailable -- a race, not a protocol
+        // error (IDL flow 5).
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        send_get_realm(&mut client, 2, 3, "realm-does-not-exist");
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 2).unwrap();
+        let resolved = expect_resolved(&mut client, 4);
+        assert_eq!(resolved.outcome, Outcome::Unavailable);
+        assert_eq!(shared.petitions.pending_total(), 0);
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            6,
+        );
+    }
+
+    #[test]
+    fn zero_verb_petitions_are_fatal_invalid_argument() {
+        let _fd = crate::capture::tests::fd_lock();
+        // An empty petition is something a correct client can never intend
+        // (IDL): fatal invalid_argument, not a resolution.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        let mut req = petition_frame();
+        req.verbs = Verb::default();
+        client.send_message(&req.encode(3), None).unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "empty petition verb set",
+        );
+        let err = expect_error(&mut client, WireError::InvalidArgument);
+        assert_eq!(err.object_id, 3, "the citation names the realm handle");
+    }
+
+    #[test]
+    fn petition_new_ids_follow_the_multi_new_id_rule() {
+        let _fd = crate::capture::tests::fd_lock();
+        // Non-distinct, non-increasing, at/below-watermark, and
+        // reserved-range id sets are each fatal invalid_object
+        // (conventions 3.2), before any petition exists.
+        let verifier = demo_verifier();
+        let cases: [(&str, [u32; 5]); 4] = [
+            ("duplicate ids", [4, 5, 6, 7, 7]),
+            ("non-increasing order", [4, 5, 6, 8, 7]),
+            ("at/below the watermark", [3, 5, 6, 7, 8]),
+            ("reserved server range", [4, 5, 6, 7, 0xff00_0000]),
+        ];
+        for (label, [g, c, v, p, t]) in cases {
+            let (mut server, mut core, mut client, mut shared) = setup();
+            bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+            let mut req = petition_frame();
+            (req.grant, req.consent, req.view, req.pointer, req.text) = (g, c, v, p, t);
+            client.send_message(&req.encode(3), None).unwrap();
+            let result = process_n(&mut server, &mut core, &verifier, &mut shared, 1);
+            expect_violation(result, "invalid_object");
+            expect_error(&mut client, WireError::InvalidObject);
+            assert_eq!(
+                shared.petitions.pending_total(),
+                0,
+                "{label}: no petition may exist"
+            );
+        }
+    }
+
+    #[test]
+    fn petition_rate_ceiling_is_fatal_resource_exhausted() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The burst allows PETITION_RATE_BURST petitions at one instant;
+        // one more is the documented DoS-confinement fatal.
+        let verifier = demo_verifier();
+        let mut shared = Shared::new(ConsentPolicy::AutoApprove);
+        let (mut server, mut core, mut client) = connect(&mut shared);
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        for i in 0..PETITION_RATE_BURST {
+            let base = 4 + 5 * i;
+            client
+                .send_message(&petition_at(base).encode(3), None)
+                .unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+            expect_consent_state(&mut client, base + 1, ConsentState::Closed);
+            assert_eq!(expect_resolved(&mut client, base).outcome, Outcome::Granted);
+        }
+        let base = 4 + 5 * PETITION_RATE_BURST;
+        client
+            .send_message(&petition_at(base).encode(3), None)
+            .unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "petition-rate ceiling",
+        );
+        expect_error(&mut client, WireError::ResourceExhausted);
+    }
+
+    #[test]
+    fn petition_rate_refills_with_time() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let mut shared = Shared::new(ConsentPolicy::AutoApprove);
+        let (mut server, mut core, mut client) = connect(&mut shared);
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        // Drain the burst.
+        for i in 0..PETITION_RATE_BURST {
+            let base = 4 + 5 * i;
+            client
+                .send_message(&petition_at(base).encode(3), None)
+                .unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+            expect_consent_state(&mut client, base + 1, ConsentState::Closed);
+            expect_resolved(&mut client, base);
+        }
+        // One second refills exactly one token: the next petition is
+        // served, the one after (same instant) is the fatal ceiling.
+        shared.now += Duration::from_secs(1);
+        let base = 4 + 5 * PETITION_RATE_BURST;
+        client
+            .send_message(&petition_at(base).encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, base + 1, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client, base).outcome, Outcome::Granted);
+        let base = base + 5;
+        client
+            .send_message(&petition_at(base).encode(3), None)
+            .unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "petition-rate ceiling",
+        );
+        expect_error(&mut client, WireError::ResourceExhausted);
+    }
+
+    #[test]
+    fn live_petition_cap_is_fatal_resource_exhausted() {
+        let _fd = crate::capture::tests::fd_lock();
+        // Every petition permanently allocates five ids; the cap bounds
+        // the permanent population and its breach is fatal (conventions
+        // 5.2). Time advances one second per petition so the rate bucket
+        // never binds first.
+        let verifier = demo_verifier();
+        let mut shared = Shared::new(ConsentPolicy::AutoApprove);
+        let (mut server, mut core, mut client) = connect(&mut shared);
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        for i in 0..MAX_LIVE_PETITIONS as u32 {
+            shared.now += Duration::from_secs(1);
+            let base = 4 + 5 * i;
+            client
+                .send_message(&petition_at(base).encode(3), None)
+                .unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+            expect_consent_state(&mut client, base + 1, ConsentState::Closed);
+            expect_resolved(&mut client, base);
+        }
+        shared.now += Duration::from_secs(1);
+        let base = 4 + 5 * MAX_LIVE_PETITIONS as u32;
+        client
+            .send_message(&petition_at(base).encode(3), None)
+            .unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "live-petition cap",
+        );
+        expect_error(&mut client, WireError::ResourceExhausted);
+    }
+
+    #[test]
+    fn sync_done_does_not_wait_for_pending_petitions() {
+        let _fd = crate::capture::tests::fd_lock();
+        // PETITION EVENT ORDERING (IDL): done confirms the petition was
+        // registered and its consent initiated -- queued precedes it --
+        // but never waits for resolution.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        send_sync(&mut client, 42);
+        process_n(&mut server, &mut core, &verifier, &mut shared, 2).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+        let msg = client.recv_message().unwrap().unwrap();
+        let (object_id, done) = handshake::events::Done::decode(&msg.bytes, msg.fd).unwrap();
+        assert_eq!(object_id, HANDSHAKE_ID);
+        assert_eq!(done.cookie, 42, "done arrives with the petition unresolved");
+        assert_eq!(shared.petitions.pending_total(), 1);
+    }
+
+    #[test]
+    fn grant_and_consent_objects_define_no_requests() {
+        let _fd = crate::capture::tests::fd_lock();
+        // Any opcode on the co-minted grant or consent object is grammar
+        // (invalid_opcode), never an authority judgement.
+        let verifier = demo_verifier();
+        for object_id in [4u32, 5] {
+            let (mut server, mut core, mut client, mut shared) = setup();
+            bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+            client
+                .send_message(&petition_frame().encode(3), None)
+                .unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+            expect_consent_state(&mut client, 5, ConsentState::Queued);
+            let mut frame = Vec::new();
+            vitrin_protocol::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: 0,
+                fd_count: 0,
+            }
+            .encode_with_placeholder_size(&mut frame);
+            vitrin_protocol::wire::patch_size(&mut frame);
+            client.send_message(&frame, None).unwrap();
+            expect_violation(
+                process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+                "invalid_opcode",
+            );
+            expect_error(&mut client, WireError::InvalidOpcode);
+        }
+    }
+
+    #[test]
+    fn facet_use_is_the_p144_seam() {
+        let _fd = crate::capture::tests::fd_lock();
+        // Capture and actuation through the minted facets are the honest
+        // server limitation until the enforcement chokepoint lands (#28):
+        // fatal internal "not implemented" -- deliberately NOT a
+        // refused(not_granted), which would be a second enforcement voice
+        // (module docs).
+        let verifier = demo_verifier();
+        let frames: [(&str, Vec<u8>); 4] = [
+            ("capture_frame", view::requests::CaptureFrame {}.encode(6)),
+            (
+                "pointer move",
+                pointer::requests::Move { x: 10, y: 20 }.encode(7),
+            ),
+            (
+                "pointer button",
+                pointer::requests::Button {
+                    button: 0x110,
+                    state: pointer::ButtonState::Pressed,
+                }
+                .encode(7),
+            ),
+            (
+                "text type",
+                text::requests::Type { text: "hi".into() }.encode(8),
+            ),
+        ];
+        for (label, frame) in frames {
+            let mut shared = Shared::new(ConsentPolicy::AutoApprove);
+            let (mut server, mut core, mut client) = connect(&mut shared);
+            bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+            client
+                .send_message(&petition_frame().encode(3), None)
+                .unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+            expect_consent_state(&mut client, 5, ConsentState::Closed);
+            assert_eq!(expect_resolved(&mut client, 4).outcome, Outcome::Granted);
+
+            client.send_message(&frame, None).unwrap();
+            expect_violation(
+                process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+                "not implemented",
+            );
+            let err = expect_error(&mut client, WireError::Internal);
+            assert!(
+                err.message.contains("P1.4.4"),
+                "{label}: the goodbye names the seam"
+            );
+        }
     }
 
     // -- acceptance: sender constraint -------------------------------------
 
     #[test]
     fn handles_are_sender_constrained_across_connections() {
+        let _fd = crate::capture::tests::fd_lock();
         // Connection A binds and mints realm handle 3. Connection B binds
         // with the same verifier and presents A's handle: B's per-connection
         // table does not know it, so B dies fatal invalid_object -- while A
@@ -1145,20 +2796,34 @@ mod tests {
         // model enforced end to end: the identity layer introduces no
         // cross-connection handle namespace.
         let verifier = demo_verifier();
-        let (mut server_a, mut core_a, mut client_a) = setup();
-        bind(&mut server_a, &mut core_a, &mut client_a, &verifier);
+        let mut shared = Shared::new(ConsentPolicy::Interactive);
+        let (mut server_a, mut core_a, mut client_a) = connect(&mut shared);
+        bind(
+            &mut server_a,
+            &mut core_a,
+            &mut client_a,
+            &verifier,
+            &mut shared,
+        );
         send_get_realm(&mut client_a, 2, 3, "realm-0");
-        process_n(&mut server_a, &mut core_a, &verifier, 1).unwrap();
+        process_n(&mut server_a, &mut core_a, &verifier, &mut shared, 1).unwrap();
 
-        let (mut server_b, mut core_b, mut client_b) = setup();
-        bind(&mut server_b, &mut core_b, &mut client_b, &verifier);
+        let (mut server_b, mut core_b, mut client_b) = connect(&mut shared);
+        bind(
+            &mut server_b,
+            &mut core_b,
+            &mut client_b,
+            &verifier,
+            &mut shared,
+        );
         // B presents A's realm handle (id 3). B's own table has ids 1 and 2
         // only. B could even have minted nothing: the number is meaningless
         // outside the connection that allocated it.
-        let foreign = whole_realm_petition();
-        client_b.send_message(&foreign.encode(3), None).unwrap();
+        client_b
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
         expect_violation(
-            process_n(&mut server_b, &mut core_b, &verifier, 1),
+            process_n(&mut server_b, &mut core_b, &verifier, &mut shared, 1),
             "unknown or foreign object id",
         );
         expect_error(&mut client_b, WireError::InvalidObject);
@@ -1167,45 +2832,58 @@ mod tests {
         // A is untouched: its handle still exists and its connection still
         // answers the sync barrier.
         assert!(server_a.is_bound());
-        assert_eq!(server_a.realms.get(&3).map(String::as_str), Some("realm-0"));
-        send_sync(&mut client_a, 99);
-        process_n(&mut server_a, &mut core_a, &verifier, 1).unwrap();
-        let msg = client_a.recv_message().unwrap().unwrap();
-        let (_, done) = handshake::events::Done::decode(&msg.bytes, msg.fd).unwrap();
-        assert_eq!(done.cookie, 99);
+        assert_eq!(
+            server_a.objects.get(&3),
+            Some(&ObjectKind::Realm {
+                name: "realm-0".into()
+            })
+        );
+        sync_fence(
+            &mut server_a,
+            &mut core_a,
+            &mut client_a,
+            &verifier,
+            &mut shared,
+            99,
+        );
     }
 
     // -- acceptance: failed handshake drops pipelined traffic --------------
 
     #[test]
     fn requests_pipelined_behind_a_failed_hello_are_never_processed() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
+        let (mut server, mut core, mut client, mut shared) = setup();
         // Pipeline: bad hello + get_realm in one burst.
         send_hello(&mut client, 2, DEMO_IDENTITY, "wrong-token");
         send_get_realm(&mut client, 2, 3, "realm-0");
         expect_violation(
-            process_n(&mut server, &mut core, &verifier, 1),
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
             "auth_failed",
         );
         // The embedder contract closes here. Even if a buggy embedder kept
         // dispatching, the DEAD phase refuses to process the queued mint.
         expect_violation(
-            process_n(&mut server, &mut core, &verifier, 1),
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
             "dead connection",
         );
-        assert!(server.realms.is_empty(), "the queued mint must not execute");
+        assert!(
+            server.objects.is_empty(),
+            "the queued mint must not execute"
+        );
     }
 
     #[test]
     fn requests_pipelined_behind_a_successful_hello_are_served_after_bound() {
+        let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let (mut server, mut core, mut client) = setup();
+        let (mut server, mut core, mut client, mut shared) = setup();
         // hello + get_realm + sync pipelined in one burst (Flow 2).
         send_hello(&mut client, 2, DEMO_IDENTITY, TOKEN);
         send_get_realm(&mut client, 2, 3, "realm-0");
         send_sync(&mut client, 5);
-        process_n(&mut server, &mut core, &verifier, 3).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 3).unwrap();
         // Client-visible order: bound first, then done; the mint executed.
         let msg = client.recv_message().unwrap().unwrap();
         let (_, bound) = principal::events::Bound::decode(&msg.bytes, msg.fd).unwrap();
@@ -1213,13 +2891,19 @@ mod tests {
         let msg = client.recv_message().unwrap().unwrap();
         let (_, done) = handshake::events::Done::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(done.cookie, 5);
-        assert_eq!(server.realms.get(&3).map(String::as_str), Some("realm-0"));
+        assert_eq!(
+            server.objects.get(&3),
+            Some(&ObjectKind::Realm {
+                name: "realm-0".into()
+            })
+        );
     }
 
     // -- acceptance: the trait fits a non-static verifier ------------------
 
     #[test]
     fn a_mock_nonstatic_verifier_fits_the_trait_shape() {
+        let _fd = crate::capture::tests::fd_lock();
         // The future-proofing check made concrete: a directory-backed
         // verifier standing in for an SVID/OIDC verifier -- it consults
         // out-of-registry state, *canonicalizes* the claimed identity
@@ -1259,14 +2943,21 @@ mod tests {
 
         // Bound identity is the verifier-canonical form, not the claimed
         // echo: the claimed trust domain is upper-cased on the wire.
-        let (mut server, mut core, mut client) = setup();
+        let (mut server, mut core, mut client, mut shared) = setup();
         send_hello(
             &mut client,
             2,
             "spiffe://PROD.example/workload/scraper",
             "directory-credential-0123",
         );
-        process_n(&mut server, &mut core, &verifier as &dyn Verifier, 1).unwrap();
+        process_n(
+            &mut server,
+            &mut core,
+            &verifier as &dyn Verifier,
+            &mut shared,
+            1,
+        )
+        .unwrap();
         let msg = client.recv_message().unwrap().unwrap();
         let (_, bound) = principal::events::Bound::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(bound.identity, "spiffe://prod.example/workload/scraper");
@@ -1274,7 +2965,7 @@ mod tests {
 
         // An outage is wire-uniform auth_failed, like every refusal.
         verifier.outage.set(true);
-        let (mut server, mut core, mut client) = setup();
+        let (mut server, mut core, mut client, mut shared) = setup();
         send_hello(
             &mut client,
             2,
@@ -1282,7 +2973,13 @@ mod tests {
             "directory-credential-0123",
         );
         expect_violation(
-            process_n(&mut server, &mut core, &verifier as &dyn Verifier, 1),
+            process_n(
+                &mut server,
+                &mut core,
+                &verifier as &dyn Verifier,
+                &mut shared,
+                1,
+            ),
             "verifier unavailable",
         );
         let err = expect_error(&mut client, WireError::AuthFailed);

@@ -134,14 +134,23 @@
 //! enforcement semantics by calling `mark_prompt_shown` -- no chokepoint
 //! change.
 //!
-//! # One natural emission site (the P1.4.5 seam)
+//! # One natural emission site (the P1.4.5 seam, now consumed)
 //!
 //! Every decision -- allow or refuse, voiced or coalesced -- funnels
 //! through the tail of [`Chokepoint::enforce_use`] and is summarized in
 //! its returned [`UseOutcome`]; every refusal frame is built in
-//! [`Chokepoint::voice_refusal`]. The flight recorder (issue #29) hooks
-//! those two points and sees every enforcement decision without a third
-//! code path appearing.
+//! [`Chokepoint::voice_refusal`], whose result (`voiced`) rides back in
+//! that same summary. The flight recorder (P1.4.5, [`crate::recorder`])
+//! consumes exactly that return value at `enforce_use`'s single caller and
+//! **does not appear in this module at all**: authority code stays
+//! authority code, no third code path appears, and the grep-provable
+//! single-path property is unaffected by the existence of a log.
+//!
+//! Two facts the recorder needs are therefore carried out through
+//! [`UseOutcome`] rather than fetched by a second observer: the delivered
+//! frame's B1 observation digest (produced on the capture copy path, see
+//! [`crate::capture::render_frame`]) and whether this admission spent a
+//! `once` rung ([`GrantTable::commit_use`]'s return).
 //!
 //! # Clock discipline
 //!
@@ -163,6 +172,7 @@ use crate::grants::{GrantId, GrantTable};
 use crate::identity::PrincipalIdentity;
 use crate::input::{PhysicalPresence, SeatInput, SeatInputKind};
 use crate::petitions::PetitionRegistry;
+use crate::recorder::ObservedFrame;
 
 /// Nanoseconds per second, for exact integer bucket arithmetic.
 const NANOS_PER_SEC: u64 = 1_000_000_000;
@@ -201,8 +211,9 @@ pub(crate) enum UseKind {
 
 impl UseKind {
     /// The verb this use exercises (also the `verb` argument of any
-    /// refusal, which identifies the facet to the client).
-    fn verb(&self) -> Verb {
+    /// refusal, which identifies the facet to the client, and the `verb`
+    /// field of the flight recorder's `use_decision` entry).
+    pub fn verb(&self) -> Verb {
         match self {
             UseKind::Capture => Verb::OBSERVE,
             UseKind::Pointer(_) => Verb::ACTUATE_POINTER,
@@ -239,12 +250,25 @@ pub(crate) struct UseEnv<'a> {
 }
 
 /// How one use was decided -- the chokepoint's summary of its own
-/// decision, and the shape the flight recorder (P1.4.5) will consume.
+/// decision, and the shape the flight recorder (P1.4.5) consumes. Every
+/// fact the recorder's `use_decision` entry states is here, so the recorder
+/// observes the chokepoint through its return value and never appears
+/// inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UseOutcome {
     /// Admitted: the operation ran (frame sent, or actuation handed to
     /// the sink) under this grant row.
-    Admitted { grant: GrantId },
+    Admitted {
+        grant: GrantId,
+        /// The delivered observation's identity (B1) -- `Some` for an
+        /// admitted capture, `None` for an actuation, which delivers no
+        /// frame to identify.
+        frame: Option<ObservedFrame>,
+        /// Whether this admission consumed a `once` rung's single use --
+        /// the active-to-spent grant lifecycle transition, reported at the
+        /// instant it happens.
+        spent_once: bool,
+    },
     /// Refused with this code; `voiced` says whether a `refused` event
     /// was actually emitted (`false` = coalesced away under the delivery
     /// classification's MAY-bounds -- possible only for actuations).
@@ -480,7 +504,7 @@ impl Chokepoint {
         // authority is consumed by the admitted use even if the server
         // fails it below (`internal`) -- fail-closed, never
         // authority-expanding (the grant table's documented decision).
-        grants.commit_use(allowed.grant_id);
+        let spent_once = grants.commit_use(allowed.grant_id);
         if let Some(state) = self.states.get_mut(&req.grant_wire_id) {
             state.clear_mutes();
         }
@@ -498,7 +522,7 @@ impl Chokepoint {
                     }),
                 };
                 match rendered {
-                    Ok(frame) => {
+                    Ok((frame, digest)) => {
                         // Exactly one terminal per capture, in request
                         // order: the frame, with its fresh sealed memfd
                         // riding SCM_RIGHTS. The server's copy of the fd
@@ -506,6 +530,17 @@ impl Chokepoint {
                         send(&frame.encode(req.facet_id), Some(frame.fd.as_fd()))?;
                         Ok(UseOutcome::Admitted {
                             grant: allowed.grant_id,
+                            // B1: the delivered observation, identified by
+                            // the digest the copy path computed over the
+                            // very bytes just sent.
+                            frame: Some(ObservedFrame {
+                                width: frame.width,
+                                height: frame.height,
+                                stride: frame.stride,
+                                bytes: u64::from(frame.stride) * u64::from(frame.height),
+                                digest,
+                            }),
+                            spent_once,
                         })
                     }
                     Err(err) => {
@@ -540,6 +575,9 @@ impl Chokepoint {
                 (env.actuations)(SeatInput::emulated(kind));
                 Ok(UseOutcome::Admitted {
                     grant: allowed.grant_id,
+                    // An actuation delivers no observation to identify.
+                    frame: None,
+                    spent_once,
                 })
             }
         }

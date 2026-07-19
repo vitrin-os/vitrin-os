@@ -58,6 +58,21 @@ rustix = { version = "1", features = ["fs", "process"] }
 # production dmabuf import path (`crate::dmabuf`) needs no allocator — it
 # receives fds — and builds in every configuration.
 gbm = { version = "0.18", default-features = false, optional = true }
+# The observation-digest hash of the flight recorder (P1.4.5, backward
+# requirement B1: every capture entry identifies what was observed). The one
+# hash dependency the TCB takes, and deliberately not hand-rolled -- rolling
+# a hash function is the wrong trade in a trusted core. Chosen over `sha2`
+# on *worst-case* hot-path throughput: SHA-256's fast path needs the SHA-NI
+# CPU extension, and without it (Skylake-SP class hardware, many CI runners)
+# it collapses to ~0.2 GB/s -- ~20 ms on a single 1280x800 frame -- whereas
+# BLAKE3's SIMD floor is SSE2 and it measures ~4 GB/s here (~1 ms/frame).
+# `default-features = false` drops `std` (nothing here needs it) and
+# `features = ["pure"]` drops the vendored assembly, so the crate is pure
+# Rust with runtime-dispatched intrinsics and the build invokes NO C
+# toolchain (verified by building with CC pointing at a nonexistent binary).
+# The algorithm is tagged in every recorder entry (`frame.digest_alg`), so
+# swapping it is a schema-visible, non-breaking change.
+blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
 
 [features]
 # Compile the real-GPU dmabuf tests (P1.3.5). Requires a machine with a DRM

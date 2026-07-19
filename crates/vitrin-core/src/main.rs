@@ -17,11 +17,14 @@
 //!   (P1.3.7) land, every request is checked at a single site against the
 //!   grant table. No second authority-checking code path.
 //! - **Budgeted dependencies** (plan risk R7): the core links Smithay (its
-//!   winit and pixman-software-renderer backends), calloop, and a tracing
-//!   subscriber — nothing else, at runtime or in tests. The headless capture
-//!   golden asserts against the deterministic test pattern in-process, so it
-//!   needs no image codec; PNG serialization is the SDK's job (P1.8.2), never
-//!   the core.
+//!   winit and pixman-software-renderer backends), calloop, a tracing
+//!   subscriber, and — since P1.4.5 — one pure-Rust hash crate for the
+//!   flight recorder's observation digests. Nothing else, at runtime or in
+//!   tests. The headless capture golden asserts against the deterministic
+//!   test pattern in-process, so it needs no image codec; PNG serialization
+//!   is the SDK's job (P1.8.2), never the core. There is deliberately no
+//!   serialization framework: the recorder's JSON-lines emitter is
+//!   hand-rolled over a closed set of entry shapes.
 //!
 //! Scope so far: two presentation backends presenting the same composed
 //! realm view (`scene`, P1.3.3 — single maximized surface, layout policy
@@ -107,6 +110,18 @@ mod petitions;
 /// -- nothing at runtime accepts principal connections before then.
 #[cfg_attr(not(test), allow(dead_code))]
 mod principal;
+/// The flight-recorder log v0 (P1.4.5): the journal seed — a JSON-lines
+/// event log of handshakes, grant lifecycle transitions, consent decisions,
+/// and every enforcement decision, carrying an observation digest on every
+/// delivered capture and null-versioned epoch-reference fields (backward
+/// requirement B1). Explicitly NOT the signed P6 journal: no signatures, no
+/// tamper evidence, never consulted by an authority decision. The run's
+/// single handle is created below in `main`; the per-connection emission
+/// sites are exercised end-to-end by `principal`'s tests today and become
+/// runtime-reachable with the M1.1 listener wiring, so the module is
+/// dead-code-allowed outside tests like its siblings.
+#[cfg_attr(not(test), allow(dead_code))]
+mod recorder;
 mod scene;
 /// The shim-facing protocol server (P1.3.4): `vitrin_shim_session` +
 /// `vitrin_shim_surface`, feeding `Scene::commit`. Dead-code-allowed outside
@@ -118,9 +133,11 @@ mod scene;
 mod shim;
 mod test_pattern;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::petitions::ConsentPolicy;
+use crate::recorder::{Event, Recorder};
 
 const USAGE: &str = "\
 vitrind — Vitrin OS trusted core
@@ -137,9 +154,18 @@ USAGE:
                                 consent surface) or `auto-approve` (every
                                 petition granted as requested — headless CI
                                 and demos ONLY; loudly logged).
+    vitrind [--recorder PATH]   Flight-recorder log for this run (JSON
+                                lines, appended). Default:
+                                $XDG_RUNTIME_DIR/vitrin-0/flight-recorder-<pid>.jsonl
+                                Startup FAILS if the log cannot be opened.
     vitrind --help              Show this help.
     vitrind --version           Show the version.
 ";
+
+/// Base name of the default flight-recorder log inside the core's runtime
+/// directory; the pid keeps concurrent runs in separate files ("one log
+/// file per run") without a randomness dependency.
+const RECORDER_FILE_PREFIX: &str = "flight-recorder";
 
 /// The default virtual-output size for `--headless` when `--size` is omitted;
 /// matches the nested backend's initial window size so the two backends agree
@@ -151,10 +177,12 @@ const DEFAULT_HEADLESS_SIZE: (u32, u32) = (1280, 800);
 enum Action {
     RunNested {
         consent: ConsentPolicy,
+        recorder: Option<PathBuf>,
     },
     RunHeadless {
         size: (u32, u32),
         consent: ConsentPolicy,
+        recorder: Option<PathBuf>,
     },
     Help,
     Version,
@@ -174,10 +202,14 @@ enum Mode {
 /// meaningful with `--headless`. `--consent` takes `MODE` as either a
 /// following argument or `--consent=MODE` (the issue-#27 spelling), valid
 /// with both run modes, defaulting to the fail-closed `interactive`.
+/// `--recorder` follows the same two spellings (the `--consent` precedent)
+/// and takes the run's flight-recorder log path (P1.4.5); omitted, the
+/// default under the core's runtime directory is used.
 fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, String> {
     let mut mode: Option<Mode> = None;
     let mut size: Option<(u32, u32)> = None;
     let mut consent: Option<ConsentPolicy> = None;
+    let mut recorder: Option<PathBuf> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg {
@@ -198,11 +230,19 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     .ok_or("`--consent` requires a mode (`interactive` or `auto-approve`)")?;
                 set_consent(&mut consent, parse_consent(value)?)?;
             }
+            "--recorder" => {
+                let value = args
+                    .next()
+                    .ok_or("`--recorder` requires a log path (e.g. `--recorder /tmp/run.jsonl`)")?;
+                set_recorder(&mut recorder, value)?;
+            }
             "--help" | "-h" => return Ok(Action::Help),
             "--version" | "-V" => return Ok(Action::Version),
             other => {
                 if let Some(value) = other.strip_prefix("--consent=") {
                     set_consent(&mut consent, parse_consent(value)?)?;
+                } else if let Some(value) = other.strip_prefix("--recorder=") {
+                    set_recorder(&mut recorder, value)?;
                 } else {
                     return Err(format!("unknown argument `{other}`"));
                 }
@@ -217,15 +257,30 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     // `--help`/`--version` already returned above, so only the run modes
     // remain to resolve; `--size` is meaningless without `--headless`.
     match (mode, size) {
-        (Some(Mode::Nested), None) => Ok(Action::RunNested { consent }),
+        (Some(Mode::Nested), None) => Ok(Action::RunNested { consent, recorder }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
         (Some(Mode::Headless), size) => Ok(Action::RunHeadless {
             size: size.unwrap_or(DEFAULT_HEADLESS_SIZE),
             consent,
+            recorder,
         }),
         (None, Some(_)) => Err("`--size` requires `--headless`".into()),
         (None, None) => Err("no mode given (expected `--nested` or `--headless`)".into()),
     }
+}
+
+/// Record the flight-recorder log path, rejecting a repeat flag and an
+/// empty value (an empty path can never open, and failing here names the
+/// flag rather than surfacing a bare ENOENT at startup).
+fn set_recorder(slot: &mut Option<PathBuf>, value: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--recorder` given more than once".into());
+    }
+    if value.is_empty() {
+        return Err("`--recorder` requires a non-empty log path".into());
+    }
+    *slot = Some(PathBuf::from(value));
+    Ok(())
 }
 
 /// Parse a `--consent` mode value.
@@ -315,29 +370,102 @@ fn main() -> ExitCode {
             println!("vitrind {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Action::RunNested { consent } => {
+        Action::RunNested { consent, recorder } => {
             init_tracing();
             announce_consent_policy(consent);
-            match backend::winit::run() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(err) => {
-                    tracing::error!("fatal: {err}");
-                    ExitCode::FAILURE
-                }
-            }
+            run_session(consent, recorder, backend::winit::run)
         }
-        Action::RunHeadless { size, consent } => {
+        Action::RunHeadless {
+            size,
+            consent,
+            recorder,
+        } => {
             init_tracing();
             announce_consent_policy(consent);
-            match backend::headless::run(size) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(err) => {
-                    tracing::error!("fatal: {err}");
-                    ExitCode::FAILURE
-                }
-            }
+            run_session(consent, recorder, || backend::headless::run(size))
         }
     }
+}
+
+/// Open the run's flight recorder, run the backend inside it, and close the
+/// log. The recorder brackets the whole session: creation failure is fatal
+/// *before* the backend starts (P1.4.5 — an operator who asked for a flight
+/// recorder and cannot have one must learn it before the session, not after
+/// it is unreconstructable), and the closing entry reports how many entries
+/// a mid-run write failure cost, since that is the one thing a truncated
+/// log cannot say about itself.
+///
+/// The handle stays here for now: nothing at runtime accepts principal
+/// connections yet (the listener wiring is M1.1 integration), and that
+/// wiring hands this same single handle to each connection's `ServerCtx`.
+fn run_session<R>(consent: ConsentPolicy, recorder_path: Option<PathBuf>, backend: R) -> ExitCode
+where
+    R: FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+{
+    let path = match recorder_path {
+        Some(path) => path,
+        None => match default_recorder_path() {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!(
+                    "fatal: cannot place the flight-recorder log: {err}; \
+                     pass an explicit `--recorder PATH`"
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let mut recorder = match Recorder::create(&path) {
+        Ok(recorder) => recorder,
+        Err(err) => {
+            tracing::error!("fatal: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(path = %path.display(), run_id = recorder.run_id(), "flight recorder open");
+    recorder.record(Event::RunStarted {
+        pid: std::process::id(),
+        core_version: env!("CARGO_PKG_VERSION"),
+        consent_policy: match consent {
+            ConsentPolicy::Interactive => "interactive",
+            ConsentPolicy::AutoApprove => "auto-approve",
+        },
+    });
+
+    let result = backend();
+
+    let dropped = recorder.dropped_entries();
+    recorder.record(Event::RunEnded {
+        dropped_entries: dropped,
+    });
+    if dropped > 0 {
+        tracing::error!(
+            path = %path.display(),
+            dropped_entries = dropped,
+            "flight recorder was DEGRADED during this run; the log is incomplete \
+             (the gap is visible as skipped `seq` values)"
+        );
+    }
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            tracing::error!("fatal: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `$XDG_RUNTIME_DIR/vitrin-0/flight-recorder-<pid>.jsonl` — the run's log
+/// beside the core's socket, in the directory that already holds this
+/// session's artifacts. A core that cannot name its runtime directory
+/// cannot serve a session either, so failing here is honest rather than
+/// silently logging somewhere else.
+fn default_recorder_path() -> Result<PathBuf, vitrin_ipc::PathError> {
+    Ok(vitrin_ipc::paths::runtime_dir()?.join(format!(
+        "{RECORDER_FILE_PREFIX}-{}.jsonl",
+        std::process::id()
+    )))
 }
 
 /// The loud startup announcement the consent policy owes (plan risk R6):
@@ -379,7 +507,8 @@ mod tests {
         assert_eq!(
             parse_args(["--nested"]),
             Ok(Action::RunNested {
-                consent: ConsentPolicy::Interactive
+                consent: ConsentPolicy::Interactive,
+                recorder: None
             })
         );
     }
@@ -390,7 +519,8 @@ mod tests {
             parse_args(["--headless"]),
             Ok(Action::RunHeadless {
                 size: (1280, 800),
-                consent: ConsentPolicy::Interactive
+                consent: ConsentPolicy::Interactive,
+                recorder: None
             })
         );
     }
@@ -401,14 +531,16 @@ mod tests {
             parse_args(["--headless", "--size", "1280x800"]),
             Ok(Action::RunHeadless {
                 size: (1280, 800),
-                consent: ConsentPolicy::Interactive
+                consent: ConsentPolicy::Interactive,
+                recorder: None
             })
         );
         assert_eq!(
             parse_args(["--headless", "--size", "640x480"]),
             Ok(Action::RunHeadless {
                 size: (640, 480),
-                consent: ConsentPolicy::Interactive
+                consent: ConsentPolicy::Interactive,
+                recorder: None
             })
         );
     }
@@ -425,16 +557,89 @@ mod tests {
                 parse_args(args),
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
-                    consent: ConsentPolicy::AutoApprove
+                    consent: ConsentPolicy::AutoApprove,
+                    recorder: None
                 })
             );
         }
         assert_eq!(
             parse_args(["--nested", "--consent=interactive"]),
             Ok(Action::RunNested {
-                consent: ConsentPolicy::Interactive
+                consent: ConsentPolicy::Interactive,
+                recorder: None
             })
         );
+    }
+
+    #[test]
+    fn recorder_path_parses_both_spellings_and_defaults_to_none() {
+        // Omitted, the run uses the default path under the core's runtime
+        // directory (resolved at startup, not here) -- `None` is "not
+        // given", never "no recorder".
+        assert_eq!(
+            parse_args(["--headless"]),
+            Ok(Action::RunHeadless {
+                size: (1280, 800),
+                consent: ConsentPolicy::Interactive,
+                recorder: None
+            })
+        );
+        for args in [
+            vec!["--headless", "--recorder", "/tmp/run.jsonl"],
+            vec!["--headless", "--recorder=/tmp/run.jsonl"],
+        ] {
+            assert_eq!(
+                parse_args(args),
+                Ok(Action::RunHeadless {
+                    size: (1280, 800),
+                    consent: ConsentPolicy::Interactive,
+                    recorder: Some(PathBuf::from("/tmp/run.jsonl"))
+                })
+            );
+        }
+        // Valid with the nested mode too, and alongside --consent.
+        assert_eq!(
+            parse_args([
+                "--nested",
+                "--consent=auto-approve",
+                "--recorder=/tmp/n.jsonl"
+            ]),
+            Ok(Action::RunNested {
+                consent: ConsentPolicy::AutoApprove,
+                recorder: Some(PathBuf::from("/tmp/n.jsonl"))
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_or_repeated_recorder_is_an_error() {
+        // No value to consume, an empty path, and a repeat flag.
+        assert!(parse_args(["--headless", "--recorder"]).is_err());
+        assert!(parse_args(["--headless", "--recorder="]).is_err());
+        assert!(parse_args(["--headless", "--recorder", ""]).is_err());
+        assert!(parse_args([
+            "--headless",
+            "--recorder=/tmp/a.jsonl",
+            "--recorder=/tmp/b.jsonl"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn the_default_recorder_path_lives_beside_the_core_socket() {
+        // Not env-dependent in this assertion: the shape is what matters --
+        // the run's log lands in the core's own runtime directory, named
+        // per-pid so concurrent runs never share a file.
+        if let Ok(path) = default_recorder_path() {
+            let dir = vitrin_ipc::paths::runtime_dir().expect("runtime dir resolved above");
+            assert_eq!(path.parent(), Some(dir.as_path()));
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with(RECORDER_FILE_PREFIX), "{name}");
+            assert!(
+                name.ends_with(&format!("-{}.jsonl", std::process::id())),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -476,7 +681,8 @@ mod tests {
             parse_args(["--headless", "--size", "2147483647x1"]),
             Ok(Action::RunHeadless {
                 size: (2147483647, 1),
-                consent: ConsentPolicy::Interactive
+                consent: ConsentPolicy::Interactive,
+                recorder: None
             })
         );
     }

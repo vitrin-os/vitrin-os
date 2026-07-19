@@ -37,13 +37,25 @@
 //! realm spawn manager provides the inherited socketpair (P1.5.2).
 
 mod backend;
-/// The `vitrin_view.capture_frame` service (P1.3.6). Dead-code-allowed
-/// outside tests for the same reason as `headless::render_once`: the module
-/// is fully exercised by its tests today and gets wired to live protocol
-/// dispatch when the enforcement chokepoint lands (P1.4.4, M1.1
-/// integration) — nothing at runtime calls it before then.
+/// Capture-frame mechanics (P1.3.6): the sealed-memfd pixel path behind
+/// `vitrin_view.frame_ready`. Pure mechanics — the authority decision on
+/// every capture lives in `enforcement` (P1.4.4), whose single-path test
+/// pins that this module's entry has no other caller. Dead-code-allowed
+/// outside tests for the same reason as `headless::render_once`: fully
+/// exercised by its tests today, runtime-reachable when the M1.1 listener
+/// wiring lands.
 #[cfg_attr(not(test), allow(dead_code))]
 mod capture;
+/// The enforcement chokepoint (P1.4.4): THE single function every capture
+/// and actuation passes through — `connection → principal → grant → verbs
+/// → constraints` — with the per-grant token bucket, the one
+/// `vitrin_grant.refused` emission site, and the admitted-operation
+/// dispatch (frame delivery / origin-tagged actuation intake).
+/// Dead-code-allowed outside tests for the same reason as `principal`,
+/// which drives it end-to-end over socketpairs today; the M1.1 listener
+/// wiring makes it runtime-reachable.
+#[cfg_attr(not(test), allow(dead_code))]
+mod enforcement;
 /// The dmabuf import path (P1.3.5): the zero-copy mechanics behind the shim
 /// server's `kind=dmabuf` commits — importer seam, hostile-fd probe, GLES
 /// import + probe render, copy instrumentation. Dead-code-allowed outside
@@ -60,11 +72,11 @@ mod input;
 /// The grant table v0 (P1.4.2): the in-memory PRD Doc 2 §5.2 grant store of
 /// the capability kernel — rows keyed by `identity`'s verifier-canonical
 /// principal, answering the enforcement chokepoint's grant-scoped use query
-/// (the P1.4.4 chain: connection → principal → grant → verbs →
-/// constraints). Dead-code-allowed outside tests
-/// for the same reason as `capture`: fully exercised by its tests today,
-/// consumed when the petition flow inserts rows (P1.4.3) and the
-/// enforcement chokepoint queries them (P1.4.4).
+/// and admission commit (the P1.4.4 chain: connection → principal → grant →
+/// verbs → constraints), plus the embedder-polled proactive expiry sweep.
+/// Dead-code-allowed outside tests for the same reason as `capture`: fully
+/// exercised by its tests today, consumed by the petition flow (P1.4.3) and
+/// the enforcement chokepoint (P1.4.4).
 #[cfg_attr(not(test), allow(dead_code))]
 mod grants;
 /// The identity layer of the capability kernel (P1.4.1): the pluggable

@@ -375,9 +375,7 @@ mod tests {
         use vitrin_ipc::Connection;
         use vitrin_protocol::generated::vitrin_view::{events::FrameReady, Format};
 
-        use crate::capture::{
-            AutoApprove, CaptureIds, CaptureOutcome, CaptureService, RealmViewFrame,
-        };
+        use crate::capture::{render_frame, RealmViewFrame};
         use crate::scene::{tests::client_pixels, SurfaceContent, LETTERBOX_RGBA};
 
         let _fd = crate::capture::tests::fd_lock();
@@ -432,25 +430,23 @@ mod tests {
         }
         assert_eq!(retained[..4], LETTERBOX_RGBA, "matte at the view corner");
 
-        // The same buffer appears in a served capture: the capture service
-        // reads the same retained frame and delivers its xrgb8888 form.
+        // The same buffer appears in a served capture: the capture
+        // mechanics (which the enforcement chokepoint invokes for every
+        // admitted capture_frame) read the same retained frame and deliver
+        // its xrgb8888 form.
         let (mut server, mut client) = Connection::pair().expect("socketpair");
-        let mut service = CaptureService::new(AutoApprove);
-        let outcome = service
-            .serve(
-                RealmViewFrame {
-                    rgba: &retained,
-                    width: VW,
-                    height: VH,
-                },
-                CaptureIds {
-                    view_id: 7,
-                    grant_id: 5,
-                },
-                &mut server,
+        let rendered = render_frame(&RealmViewFrame {
+            rgba: &retained,
+            width: VW,
+            height: VH,
+        })
+        .expect("render the retained view");
+        server
+            .send_message(
+                &rendered.encode(7),
+                Some(std::os::fd::AsFd::as_fd(&rendered.fd)),
             )
-            .expect("serve capture");
-        assert_eq!(outcome, CaptureOutcome::Delivered);
+            .expect("ship the frame");
         let msg = client
             .recv_message()
             .expect("client receive")

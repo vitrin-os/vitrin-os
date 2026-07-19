@@ -435,7 +435,7 @@ mod tests {
         // admitted capture_frame) read the same retained frame and deliver
         // its xrgb8888 form.
         let (mut server, mut client) = Connection::pair().expect("socketpair");
-        let rendered = render_frame(&RealmViewFrame {
+        let (rendered, _digest) = render_frame(&RealmViewFrame {
             rgba: &retained,
             width: VW,
             height: VH,

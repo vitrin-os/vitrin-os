@@ -198,6 +198,15 @@ impl GrantId {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Test-only: a row id without a row, so unit tests of pure consumers
+    /// (the flight recorder's entry shapes) need not stand up a table.
+    /// Never available outside `cfg(test)`: outside tests, ids are minted
+    /// by [`GrantTable::insert`] and nowhere else.
+    #[cfg(test)]
+    pub fn from_u64_for_test(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 impl fmt::Display for GrantId {
@@ -848,12 +857,23 @@ impl GrantTable {
     /// and never authority-expanding (module docs). Defensive: only an
     /// `Active` row can be spent, so a misordered call can never turn a
     /// revoked or expired row into a merely-spent one.
-    pub fn commit_use(&mut self, grant: GrantId) {
-        if let Some(entry) = self.entries.get_mut(&grant) {
-            if entry.row.persistence == PersistenceRung::Once && entry.liveness == Liveness::Active
+    ///
+    /// Returns whether this call **consumed** single-use authority (`true`
+    /// exactly for a `once` row that was still active): the active-to-spent
+    /// lifecycle transition, reported at the instant it happens so the
+    /// flight recorder (P1.4.5) records it without a second query -- and,
+    /// being a return value, without the table learning that a recorder
+    /// exists.
+    pub fn commit_use(&mut self, grant: GrantId) -> bool {
+        match self.entries.get_mut(&grant) {
+            Some(entry)
+                if entry.row.persistence == PersistenceRung::Once
+                    && entry.liveness == Liveness::Active =>
             {
                 entry.liveness = Liveness::Spent;
+                true
             }
+            _ => false,
         }
     }
 
@@ -897,14 +917,16 @@ impl GrantTable {
 
     /// Revoke every grant of one principal -- the hold-Esc dead-man
     /// switch's table half (P1.7.3): "a core-level revoke of the active
-    /// principal's grants". Returns how many grants this call newly
-    /// revoked.
-    pub fn revoke_principal(&mut self, principal: &PrincipalIdentity) -> usize {
-        let mut revoked = 0;
-        for entry in self.entries.values_mut() {
+    /// principal's grants". Returns the ids this call newly revoked,
+    /// ascending (the count is `.len()`); naming them rather than counting
+    /// them is what lets the flight recorder (P1.4.5) say *which* authority
+    /// a dead-man switch killed, which a bare count cannot.
+    pub fn revoke_principal(&mut self, principal: &PrincipalIdentity) -> Vec<GrantId> {
+        let mut revoked = Vec::new();
+        for (&id, entry) in &mut self.entries {
             if entry.row.principal_id == *principal && entry.liveness != Liveness::Revoked {
                 entry.liveness = Liveness::Revoked;
-                revoked += 1;
+                revoked.push(id);
             }
         }
         revoked
@@ -1188,13 +1210,19 @@ mod tests {
     fn revoke_principal_kills_all_and_only_that_principals_grants() {
         let t0 = t0();
         let mut table = GrantTable::new();
-        table.insert(spec(DEMO, Verb::OBSERVE, None), t0).unwrap();
-        table
+        let observe = table.insert(spec(DEMO, Verb::OBSERVE, None), t0).unwrap();
+        let pointer = table
             .insert(spec(DEMO, Verb::ACTUATE_POINTER, None), t0)
             .unwrap();
         table.insert(spec(OTHER, Verb::OBSERVE, None), t0).unwrap();
 
-        assert_eq!(table.revoke_principal(&principal(DEMO)), 2);
+        // The ids are *named*, ascending, not merely counted -- what the
+        // flight recorder needs to say which authority a dead-man switch
+        // killed.
+        assert_eq!(
+            table.revoke_principal(&principal(DEMO)),
+            vec![observe, pointer]
+        );
         assert_eq!(
             use_at(&mut table, DEMO, Verb::OBSERVE, t0),
             Err(RefusalReason::Revoked)
@@ -1206,7 +1234,7 @@ mod tests {
         // The other principal is untouched.
         assert!(use_at(&mut table, OTHER, Verb::OBSERVE, t0).is_ok());
         // Nothing left to newly revoke.
-        assert_eq!(table.revoke_principal(&principal(DEMO)), 0);
+        assert!(table.revoke_principal(&principal(DEMO)).is_empty());
     }
 
     #[test]

@@ -153,9 +153,40 @@
 //!   polls [`PetitionRegistry::expire_due`] (petitions' module docs) and
 //!   routes each returned resolution to its connection's
 //!   [`deliver_resolution`](PrincipalServer::deliver_resolution).
-//! - The flight recorder (P1.4.5) will observe handshakes and petitions
-//!   through the same embedder that logs [`PrincipalFault`]s today.
 //!
+//! # The flight recorder's emission sites (P1.4.5, issue #29)
+//!
+//! This module is where most of the [`recorder`]'s entries are written,
+//! and each one is written at a site that was *already* the single site
+//! for the thing it records -- so an event cannot be recorded twice and
+//! cannot be missed by adding a second path:
+//!
+//! - [`handle_hello`](PrincipalServer::handle_hello)'s verify arm: the two
+//!   handshake outcomes, honoring the secrecy contract (canonical identity
+//!   on a bind; a fixed cause class plus the *claimed* identity and the
+//!   credential's **length** on a refusal -- never its bytes);
+//! - [`handle_request_grant`](PrincipalServer::handle_request_grant): the
+//!   petition's requested authority, recorded before admission judges it,
+//!   plus the `queued` consent transition;
+//! - [`deliver_resolution`](PrincipalServer::deliver_resolution): the
+//!   `closed` transition and the resolution's outcome, effective authority,
+//!   row id and issuer -- recorded at the flip, before the sends (see that
+//!   method's docs for why);
+//! - [`serve_facet_use`](PrincipalServer::serve_facet_use): every
+//!   enforcement decision, read out of the chokepoint's returned
+//!   [`UseOutcome`] rather than from inside it, so [`enforcement`] holds no
+//!   recorder call at all;
+//! - [`teardown`](PrincipalServer::teardown): the connection's end.
+//!
+//! The remaining entries have no connection to write them -- the proactive
+//! expiry and revocation sweeps -- and are recorded by the embedder through
+//! [`Recorder::record_expiry_sweep`] / [`Recorder::record_revocations`], on
+//! the same poll cadence that drives the sweeps themselves.
+//!
+//! [`recorder`]: crate::recorder
+//! [`Recorder::record_expiry_sweep`]: crate::recorder::Recorder::record_expiry_sweep
+//! [`Recorder::record_revocations`]: crate::recorder::Recorder::record_revocations
+//! [`UseOutcome`]: crate::enforcement::UseOutcome
 //! [`identity`]: crate::identity
 //! [`petitions`]: crate::petitions
 //! [`enforcement`]: crate::enforcement
@@ -189,12 +220,16 @@ use vitrin_protocol::generated::vitrin_view as view;
 use vitrin_protocol::generated::PROTOCOL_VERSION;
 
 use crate::capture::RealmViewFrame;
-use crate::enforcement::{Chokepoint, UseEnv, UseKind, UseRequest};
+use crate::enforcement::{Chokepoint, UseEnv, UseKind, UseOutcome, UseRequest};
 use crate::grants::{GrantId, GrantTable, InsertError};
 use crate::identity::{PresentedCredential, PrincipalIdentity, Verifier, VerifyOutcome};
 use crate::input::{PhysicalPresence, SeatInput, SeatInputKind};
 use crate::petitions::{
     Admission, ConnectionId, PetitionRegistry, PetitionRequest, Resolution, Verdict,
+};
+use crate::recorder::{
+    self, auth_cause_class, ActuationDetail, Event, Recorder, RequestedAuthority,
+    VERIFIER_UNAVAILABLE_CLASS,
 };
 
 /// The handshake bootstrap object: implicit object 1 on a principal
@@ -540,6 +575,21 @@ impl fmt::Display for DeliveryError {
     }
 }
 
+/// The flight recorder's fixed cause taxonomy for an undelivered
+/// resolution ([`Event::PetitionUndelivered`]). A class label, never the
+/// `Display` text: the log's cause vocabulary stays closed and free of
+/// anything a peer could shape, exactly as the handshake taxonomy does.
+fn undelivered_reason_class(err: &DeliveryError) -> &'static str {
+    match err {
+        DeliveryError::WrongConnection { .. } => recorder::UNDELIVERED_WRONG_CONNECTION,
+        DeliveryError::ConnectionDead => recorder::UNDELIVERED_CONNECTION_DEAD,
+        DeliveryError::UnknownGrantObject { .. } => recorder::UNDELIVERED_UNKNOWN_GRANT,
+        DeliveryError::AlreadyResolved { .. } => recorder::UNDELIVERED_ALREADY_RESOLVED,
+        DeliveryError::Insert(_) => recorder::UNDELIVERED_INSERT_FAILED,
+        DeliveryError::Transport(_) => recorder::UNDELIVERED_TRANSPORT,
+    }
+}
+
 /// The handshake phase of one principal connection (conventions 7.1).
 /// VERIFYING is transient inside the `hello` dispatch in this build (module
 /// docs), so it has no resting representation.
@@ -620,6 +670,12 @@ pub(crate) struct ServerCtx<'a> {
     /// Where chokepoint-admitted, origin-tagged actuations go (M1.1: the
     /// realm's input router toward the shim seat).
     pub actuations: &'a mut dyn FnMut(SeatInput),
+    /// The core's single flight-recorder handle (P1.4.5,
+    /// [`crate::recorder`]): every handshake outcome, petition lifecycle
+    /// transition, consent transition, and enforcement decision this
+    /// connection produces is recorded through *this* handle and no other
+    /// write site.
+    pub recorder: &'a mut Recorder,
 }
 
 /// The per-connection principal protocol server. One instance per accepted
@@ -779,7 +835,7 @@ impl PrincipalServer {
             Phase::Dead => Err(PrincipalViolation::ConnectionDead.into()),
             Phase::Connected => {
                 if object_id == HANDSHAKE_ID && opcode == handshake::requests::Hello::OPCODE {
-                    self.handle_hello(msg, ctx.verifier, send)
+                    self.handle_hello(msg, ctx.verifier, ctx.recorder, send)
                 } else {
                     // Any parsed traffic before a first hello, whatever the
                     // object or opcode, is pre_handshake.
@@ -972,6 +1028,14 @@ impl PrincipalServer {
     /// identity, and the facet's co-minted grant row -- and delegates the
     /// entire authority decision plus the admitted operation. This
     /// function makes no authority judgement of its own.
+    ///
+    /// It is also the flight recorder's single `use_decision` site
+    /// (P1.4.5): the chokepoint's returned [`UseOutcome`] carries every
+    /// fact the entry states -- allowed or refused, the refusal code and
+    /// whether it was voiced, the grant row, the delivered frame's B1
+    /// observation digest, and whether a `once` rung was spent -- so the
+    /// recorder observes enforcement from outside it and
+    /// [`enforcement`](crate::enforcement) needs no recorder call at all.
     fn serve_facet_use<F>(
         &mut self,
         facet_id: u32,
@@ -993,10 +1057,18 @@ impl PrincipalServer {
             }
             .into());
         };
+        let verb = kind.verb();
+        // Summarized before the kind moves into the request: an entry that
+        // named only the verb could not tell a move from a button press
+        // from a scroll, nor say how much was typed. Text is summarized by
+        // shape and digest only -- never verbatim (see [`crate::recorder`]
+        // on why the log must not become a keylogger).
+        let detail = ActuationDetail::of(&kind);
+        let grant_row = self.grant_row_id(grant_wire_id);
         let request = UseRequest {
             facet_id,
             grant_wire_id,
-            grant_row: self.grant_row_id(grant_wire_id),
+            grant_row,
             principal: &identity,
             kind,
         };
@@ -1005,10 +1077,36 @@ impl PrincipalServer {
             presence: ctx.presence,
             actuations: &mut *ctx.actuations,
         };
-        self.chokepoint
+        let outcome = self
+            .chokepoint
             .enforce_use(request, ctx.grants, ctx.petitions, env, ctx.now, send)
-            .map(|_outcome| ()) // the P1.4.5 flight recorder consumes the outcome
-            .map_err(PrincipalFault::Transport)
+            .map_err(PrincipalFault::Transport)?;
+        ctx.recorder.record(Event::UseDecision {
+            connection: self.connection,
+            facet_wire_id: facet_id,
+            grant_wire_id,
+            verb,
+            grant_row,
+            detail,
+            outcome: &outcome,
+        });
+        // The `once` rung's active-to-spent transition, recorded from the
+        // same outcome so the grant table never learns a recorder exists.
+        // (A transport death inside `enforce_use` returns above, so a use
+        // whose frame never reached the wire records nothing -- the
+        // connection is already dying and its teardown entry follows.)
+        if let UseOutcome::Admitted {
+            grant,
+            spent_once: true,
+            ..
+        } = outcome
+        {
+            ctx.recorder.record(Event::GrantSpent {
+                connection: self.connection,
+                grant_id: grant,
+            });
+        }
+        Ok(())
     }
 
     /// `hello`: the IDL's fixed check order -- grammar (decode), version,
@@ -1016,10 +1114,18 @@ impl PrincipalServer {
     /// `version_unsupported` and `invalid_object` reveal nothing about the
     /// credential, and refused verification reveals nothing beyond the
     /// uniform `auth_failed`.
+    ///
+    /// Both handshake outcomes are recorded here, at the single site that
+    /// decides them (P1.4.5), honoring the secrecy contract: the
+    /// verifier-canonical identity on a bind; on a refusal a fixed cause
+    /// class plus the *claimed* identity and scheme (client-controlled,
+    /// exactly escaped, never trusted) and the credential's **length**
+    /// only. The credential bytes are not passed to the recorder at all.
     fn handle_hello<F>(
         &mut self,
         msg: Message,
         verifier: &dyn Verifier,
+        recorder: &mut Recorder,
         send: &mut F,
     ) -> Result<(), PrincipalFault>
     where
@@ -1045,23 +1151,48 @@ impl PrincipalServer {
             credential: hello.credential.as_bytes(),
             peer: self.peer,
         };
-        let cause = match verifier.verify(&presented) {
+        let (cause, cause_class) = match verifier.verify(&presented) {
             VerifyOutcome::Bound(bound) => {
                 let event = principal::events::Bound {
                     identity: bound.identity.as_str().to_owned(),
                 };
                 send(&event.encode(hello.principal), None)?;
                 self.principal_id = Some(hello.principal);
-                self.identity = Some(bound.identity);
                 self.phase = Phase::Bound;
+                // Recorded only once the connection is *actually* bound.
+                // Unlike a granted resolution -- where authority is minted
+                // before the send, so the entry must precede it -- nothing
+                // exists here until the phase flips: a `bound` event that
+                // failed to send leaves no principal and no authority, so
+                // an entry claiming one would be a lie the teardown entry
+                // (`identity: null`) would then contradict.
+                recorder.record(Event::HandshakeBound {
+                    connection: self.connection,
+                    peer: self.peer,
+                    identity: &bound.identity,
+                    credential_type: &hello.credential_type,
+                    credential_bytes: hello.credential.len(),
+                });
+                self.identity = Some(bound.identity);
                 return Ok(());
             }
             // Both non-Bound outcomes are wire-uniform auth_failed; they
             // differ only in the logged cause (rejected client vs. broken
             // verifier infrastructure).
-            VerifyOutcome::Rejected(cause) => cause.to_string(),
-            VerifyOutcome::Unavailable(detail) => format!("verifier unavailable: {detail}"),
+            VerifyOutcome::Rejected(cause) => (cause.to_string(), auth_cause_class(&cause)),
+            VerifyOutcome::Unavailable(detail) => (
+                format!("verifier unavailable: {detail}"),
+                VERIFIER_UNAVAILABLE_CLASS,
+            ),
         };
+        recorder.record(Event::HandshakeRefused {
+            connection: self.connection,
+            peer: self.peer,
+            cause_class,
+            claimed_identity: &hello.identity,
+            credential_type: &hello.credential_type,
+            credential_bytes: hello.credential.len(),
+        });
         Err(PrincipalViolation::AuthFailed {
             claimed_identity: hello.identity,
             credential_type: hello.credential_type,
@@ -1160,26 +1291,48 @@ impl PrincipalServer {
             }
             .into());
         };
-        let admission = ctx.petitions.admit(
-            PetitionRequest {
-                connection: self.connection,
-                identity,
-                realm_name,
-                grant_wire_id: req.grant,
-                consent_wire_id: req.consent,
-                resource: req.resource,
-                verbs: req.verbs,
-                expiry_ms: req.expiry_ms,
-                max_event_rate: req.max_event_rate,
-                persistence: req.persistence,
-                flags: req.flags,
+        let petition = PetitionRequest {
+            connection: self.connection,
+            identity,
+            realm_name,
+            grant_wire_id: req.grant,
+            consent_wire_id: req.consent,
+            resource: req.resource,
+            verbs: req.verbs,
+            expiry_ms: req.expiry_ms,
+            max_event_rate: req.max_event_rate,
+            persistence: req.persistence,
+            flags: req.flags,
+        };
+        // Recorded *before* the policy decision, so a petition refused
+        // `busy`/`unsupported`/`unavailable` still leaves a record of what
+        // it asked for -- the requested authority is only knowable here.
+        ctx.recorder.record(Event::PetitionRequested {
+            connection: petition.connection,
+            identity: &petition.identity,
+            realm_name: &petition.realm_name,
+            grant_wire_id: petition.grant_wire_id,
+            consent_wire_id: petition.consent_wire_id,
+            resource: &petition.resource,
+            requested: RequestedAuthority {
+                verbs: petition.verbs,
+                persistence: petition.persistence,
+                expiry_ms: petition.expiry_ms,
+                max_event_rate: petition.max_event_rate,
+                flags: petition.flags,
             },
-            now,
-        );
+        });
+        let admission = ctx.petitions.admit(petition, now);
         match admission {
-            Admission::Pending { .. } => {
+            Admission::Pending { petition } => {
                 // The prompt lifecycle began: it is waiting on the consent
                 // surface (or, in this build, the timeout).
+                ctx.recorder.record(Event::ConsentTransition {
+                    connection: self.connection,
+                    consent_wire_id: req.consent,
+                    state: ConsentState::Queued,
+                    petition: Some(petition),
+                });
                 let queued = consent::events::State {
                     state: ConsentState::Queued,
                 };
@@ -1187,7 +1340,7 @@ impl PrincipalServer {
                 Ok(())
             }
             Admission::Resolved(resolution) => {
-                self.deliver_resolution(resolution, ctx.grants, now, send)
+                self.deliver_resolution(resolution, ctx.grants, ctx.recorder, now, send)
                     .map_err(|e| {
                         match e {
                             DeliveryError::Transport(t) => PrincipalFault::Transport(t),
@@ -1258,10 +1411,71 @@ impl PrincipalServer {
     /// pending-to-resolved flip is the exactly-once guard -- a replayed
     /// resolution is refused typed before any row is minted or anything is
     /// sent.
+    ///
+    /// **Recording order (P1.4.5, decided here).** Both entries -- the
+    /// closing consent transition and the resolution itself -- are recorded
+    /// after the handle flip and row mint but *before* either send. The
+    /// recorder's subject is the moment authority changes, not the moment
+    /// the client learns of it: written after the sends, a transport
+    /// failure between the mint and the wire would leave a live grant row
+    /// with no line naming it -- exactly the unreconstructable state the
+    /// recorder exists to prevent. On a dying connection the log is
+    /// therefore a superset of what reached the wire, and it preserves the
+    /// wire's own order (`closed`, then `resolved`).
+    ///
+    /// **A refused delivery is recorded too, from this one funnel.** The
+    /// resolution has already been consumed from the pending registry by
+    /// the time it arrives here, so every early return below *destroys* a
+    /// decision: the petition is gone, the handle never resolves, and
+    /// nothing will ever retry. A human's yes or no would then exist
+    /// nowhere. Wrapping the whole body and recording
+    /// [`Event::PetitionUndelivered`] on any `Err` covers all five refusal
+    /// paths -- and any added later -- structurally, rather than by
+    /// remembering to add a call beside each `return`.
     pub fn deliver_resolution<F>(
         &mut self,
         resolution: Resolution,
         grants: &mut GrantTable,
+        recorder: &mut Recorder,
+        now: Instant,
+        send: &mut F,
+    ) -> Result<(), DeliveryError>
+    where
+        F: FnMut(&[u8], Option<BorrowedFd<'_>>) -> Result<(), TransportError>,
+    {
+        // Captured before the body consumes the resolution: on failure the
+        // decision must still be nameable.
+        let connection = resolution.connection;
+        let grant_wire_id = resolution.grant_wire_id;
+        let (outcome, effective, issuer) = match &resolution.verdict {
+            Verdict::Granted { grant: approved } => (
+                Outcome::Granted,
+                Some(approved.effective),
+                Some(approved.issuer),
+            ),
+            Verdict::Declined { outcome } => (*outcome, None, None),
+        };
+        let result = self.deliver_resolution_inner(resolution, grants, recorder, now, send);
+        if let Err(err) = &result {
+            recorder.record(Event::PetitionUndelivered {
+                connection,
+                grant_wire_id,
+                outcome,
+                effective,
+                issuer,
+                reason: undelivered_reason_class(err),
+            });
+        }
+        result
+    }
+
+    /// The delivery body proper -- see [`Self::deliver_resolution`], which
+    /// wraps it to record decisions this refuses.
+    fn deliver_resolution_inner<F>(
+        &mut self,
+        resolution: Resolution,
+        grants: &mut GrantTable,
+        recorder: &mut Recorder,
         now: Instant,
         send: &mut F,
     ) -> Result<(), DeliveryError>
@@ -1328,6 +1542,34 @@ impl PrincipalServer {
             Verdict::Declined { .. } => None,
         };
         *state = GrantHandleState::Resolved { row };
+        // Recorded here, at the instant authority changed and before any
+        // send can fail (doc comment above). The prompt is down because the
+        // petition left the pending table, so no petition id remains to
+        // name.
+        if resolution.emit_closed {
+            recorder.record(Event::ConsentTransition {
+                connection: self.connection,
+                consent_wire_id: resolution.consent_wire_id,
+                state: ConsentState::Closed,
+                petition: None,
+            });
+        }
+        let (outcome, effective, issuer) = match &resolution.verdict {
+            Verdict::Granted { grant: approved } => (
+                Outcome::Granted,
+                Some(approved.effective),
+                Some(approved.issuer),
+            ),
+            Verdict::Declined { outcome } => (*outcome, None, None),
+        };
+        recorder.record(Event::PetitionResolved {
+            connection: self.connection,
+            grant_wire_id: resolution.grant_wire_id,
+            outcome,
+            effective,
+            grant_id: row,
+            issuer,
+        });
         if resolution.emit_closed {
             let closed = consent::events::State {
                 state: ConsentState::Closed,
@@ -1368,16 +1610,41 @@ impl PrincipalServer {
     /// delivery is phase-refused. Idempotent, and leaves the server DEAD
     /// so a buggy embedder cannot dispatch (or deliver) into a torn-down
     /// connection.
-    pub fn teardown(&mut self, petitions: &mut PetitionRegistry, grants: &mut GrantTable) {
+    ///
+    /// Recorded unconditionally (P1.4.5), unlike the `tracing` line beside
+    /// it: a connection that withdrew nothing and held nothing still ends a
+    /// session, and a reconstruction that cannot see a principal leave is
+    /// incomplete.
+    pub fn teardown(
+        &mut self,
+        petitions: &mut PetitionRegistry,
+        grants: &mut GrantTable,
+        recorder: &mut Recorder,
+    ) {
         let withdrawn = petitions.withdraw_connection(self.connection);
         let mut removed = 0usize;
         for kind in self.objects.values() {
             if let ObjectKind::Grant(GrantHandleState::Resolved { row: Some(id) }) = kind {
                 if grants.remove(*id) {
                     removed += 1;
+                    // Named per row, not merely counted: teardown is the
+                    // most common way a version-1 grant dies, and the
+                    // revocation and expiry paths already name their ids
+                    // so an E3.4 replay can apply the transition. A count
+                    // alone says how many authorities died, never which.
+                    recorder.record(Event::GrantRemoved {
+                        connection: self.connection,
+                        grant_id: *id,
+                    });
                 }
             }
         }
+        recorder.record(Event::ConnectionTeardown {
+            connection: self.connection,
+            identity: self.identity.as_ref(),
+            withdrawn_petitions: withdrawn,
+            removed_grants: removed,
+        });
         if withdrawn > 0 || removed > 0 {
             tracing::info!(
                 connection = %self.connection,
@@ -1431,6 +1698,7 @@ impl PrincipalServer {
 mod tests {
     use std::cell::Cell;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     use vitrin_ipc::Connection;
     use vitrin_protocol::generated::vitrin_grant::Refusal;
@@ -1444,6 +1712,7 @@ mod tests {
     };
     use crate::input::PHYSICAL_HOLD_WINDOW;
     use crate::petitions::{ConsentPolicy, PetitionConfig, ScriptedDecision, ScriptedError};
+    use vitrin_protocol::generated::vitrin_actuator_pointer::{Axis, ButtonState};
 
     use super::*;
 
@@ -1491,10 +1760,18 @@ mod tests {
         view: Option<(Vec<u8>, u32, u32)>,
         presence: PhysicalPresence,
         actuations: Vec<SeatInput>,
+        /// The rig's single flight-recorder handle (P1.4.5): every test in
+        /// this module drives the real recorder, so the emission wiring is
+        /// exercised by the whole suite and not only by the tests that
+        /// read the log back.
+        recorder: Recorder,
+        /// Where [`Shared::recorder`] writes; `read_log` reads it.
+        log_path: PathBuf,
     }
 
     impl Shared {
         fn new(policy: ConsentPolicy) -> Self {
+            let (recorder, log_path) = crate::recorder::tests::scratch_recorder("principal");
             Self {
                 petitions: PetitionRegistry::new(policy, PetitionConfig::default()),
                 grants: GrantTable::new(),
@@ -1502,7 +1779,21 @@ mod tests {
                 view: Some((crate::test_pattern::render(VIEW_W, VIEW_H), VIEW_W, VIEW_H)),
                 presence: PhysicalPresence::new(),
                 actuations: Vec::new(),
+                recorder,
+                log_path,
             }
+        }
+
+        /// Every entry this rig has recorded so far, parsed (the envelope
+        /// invariants are asserted by `read_log` itself).
+        fn log(&self) -> Vec<crate::recorder::tests::Json> {
+            crate::recorder::tests::read_log(&self.log_path)
+        }
+    }
+
+    impl Drop for Shared {
+        fn drop(&mut self) {
+            crate::recorder::tests::cleanup(&self.log_path);
         }
     }
 
@@ -1544,6 +1835,8 @@ mod tests {
             view,
             presence,
             actuations,
+            recorder,
+            ..
         } = shared;
         let mut sink = |input: SeatInput| actuations.push(input);
         for _ in 0..n {
@@ -1563,6 +1856,7 @@ mod tests {
                 }),
                 presence,
                 actuations: &mut sink,
+                recorder,
             };
             server.handle_message(msg, &mut ctx, &mut |frame, fd| core.send_message(frame, fd))?;
         }
@@ -1680,6 +1974,7 @@ mod tests {
             .deliver_resolution(
                 resolution,
                 &mut shared.grants,
+                &mut shared.recorder,
                 shared.now,
                 &mut |frame, fd| core.send_message(frame, fd),
             )
@@ -2524,9 +2819,13 @@ mod tests {
         // exactly-once guard before anything is sent -- and before any row
         // is minted: the table still holds exactly the one row.
         let err = server
-            .deliver_resolution(replay, &mut shared.grants, shared.now, &mut |frame, fd| {
-                core.send_message(frame, fd)
-            })
+            .deliver_resolution(
+                replay,
+                &mut shared.grants,
+                &mut shared.recorder,
+                shared.now,
+                &mut |frame, fd| core.send_message(frame, fd),
+            )
             .unwrap_err();
         assert!(matches!(err, DeliveryError::AlreadyResolved { wire_id: 4 }));
         assert_eq!(shared.grants.rows(shared.now).count(), 1);
@@ -2604,7 +2903,11 @@ mod tests {
 
         // A's connection closes: its pending petition is withdrawn and its
         // granted row is removed -- grants die with the connection.
-        server_a.teardown(&mut shared.petitions, &mut shared.grants);
+        server_a.teardown(
+            &mut shared.petitions,
+            &mut shared.grants,
+            &mut shared.recorder,
+        );
         assert_eq!(shared.petitions.pending_total(), 1);
         // Removal, not revocation (the grant table's documented teardown
         // contract): the row is gone outright.
@@ -2623,7 +2926,11 @@ mod tests {
         expect_consent_state(&mut client_b, 5, ConsentState::Closed);
         assert_eq!(expect_resolved(&mut client_b, 4).outcome, Outcome::TimedOut);
         // Teardown is idempotent.
-        server_a.teardown(&mut shared.petitions, &mut shared.grants);
+        server_a.teardown(
+            &mut shared.petitions,
+            &mut shared.grants,
+            &mut shared.recorder,
+        );
     }
 
     #[test]
@@ -2661,17 +2968,27 @@ mod tests {
         assert_eq!(shared.grants.rows(shared.now).count(), 0);
 
         // The connection dies before the resolution is routed back.
-        server.teardown(&mut shared.petitions, &mut shared.grants);
+        server.teardown(
+            &mut shared.petitions,
+            &mut shared.grants,
+            &mut shared.recorder,
+        );
         assert_eq!(shared.grants.rows(shared.now).count(), 0);
 
         // The embedder's late routing is refused whole: no events, no row,
         // and the handle never resolves (its petitioner no longer exists).
         let mut sent = 0usize;
         let err = server
-            .deliver_resolution(resolution, &mut shared.grants, shared.now, &mut |_, _| {
-                sent += 1;
-                Ok(())
-            })
+            .deliver_resolution(
+                resolution,
+                &mut shared.grants,
+                &mut shared.recorder,
+                shared.now,
+                &mut |_, _| {
+                    sent += 1;
+                    Ok(())
+                },
+            )
             .unwrap_err();
         assert!(matches!(err, DeliveryError::ConnectionDead));
         assert_eq!(sent, 0, "nothing is sent on a torn-down connection");
@@ -2727,6 +3044,7 @@ mod tests {
             .deliver_resolution(
                 due.into_iter().next().unwrap(),
                 &mut shared.grants,
+                &mut shared.recorder,
                 shared.now,
                 &mut |_, _| {
                     sent += 1;
@@ -3828,5 +4146,788 @@ mod tests {
         );
         let err = expect_error(&mut client, WireError::AuthFailed);
         assert_eq!(err.message, AUTH_REFUSED_PHRASE);
+    }
+
+    // -- acceptance: the flight recorder (P1.4.5, issue #29) ---------------
+
+    /// The B1 acceptance, at the level that matters: over a multi-capture
+    /// run, EVERY delivered capture has a `use_decision` entry carrying a
+    /// digest; the digest varies with frame content; and it equals an
+    /// independently computed hash of the bytes the agent actually
+    /// received out of the sealed memfd.
+    #[test]
+    fn every_delivered_capture_carries_a_digest_of_the_bytes_the_agent_got() {
+        use std::os::unix::fs::FileExt;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 20, 0);
+
+        // Three captures, with the realm's content changed between them so
+        // the digests must differ; the middle content is restored at the
+        // end so a repeat of an identical view digests identically.
+        let mut delivered: Vec<(Vec<u8>, String)> = Vec::new();
+        for view in [
+            crate::test_pattern::render(VIEW_W, VIEW_H),
+            vec![0x20u8; (VIEW_W * VIEW_H * 4) as usize],
+            crate::test_pattern::render(VIEW_W, VIEW_H),
+        ] {
+            shared.view = Some((view, VIEW_W, VIEW_H));
+            client.send_message(&capture_frame(), None).unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+            let frame = expect_frame(&mut client, 6);
+
+            // What the agent actually holds: the sealed memfd's bytes.
+            let len = (frame.stride * frame.height) as usize;
+            let mut bytes = vec![0u8; len];
+            std::fs::File::from(frame.fd)
+                .read_exact_at(&mut bytes, 0)
+                .expect("the delivered memfd is readable");
+            let independent = crate::recorder::ObservationDigest::of(&bytes).to_hex();
+            delivered.push((bytes, independent));
+        }
+
+        let entries = shared.log();
+        let captures: Vec<&crate::recorder::tests::Json> =
+            crate::recorder::tests::of_kind(&entries, "use_decision")
+                .into_iter()
+                .filter(|e| e.str("verb") == "observe" && e.str("decision") == "allowed")
+                .collect();
+        assert_eq!(captures.len(), 3, "one entry per admitted capture");
+
+        for (entry, (bytes, independent)) in captures.iter().zip(&delivered) {
+            // B1: never sampled -- every one of them carries a digest ...
+            assert!(!entry.is_null("frame"), "every capture entry has a frame");
+            assert_eq!(entry.str("frame.digest_alg"), crate::recorder::DIGEST_ALG);
+            // ... and it is the digest of exactly the delivered bytes.
+            assert_eq!(
+                entry.str("frame.digest"),
+                independent,
+                "the entry must identify the bytes the agent received"
+            );
+            assert_eq!(entry.u64("frame.bytes"), bytes.len() as u64);
+            assert_eq!(entry.u64("frame.width"), u64::from(VIEW_W));
+            assert_eq!(entry.u64("frame.height"), u64::from(VIEW_H));
+            assert_eq!(entry.str("frame.format"), "xrgb8888");
+        }
+        // Content sensitivity, and determinism on identical content.
+        assert_ne!(
+            captures[0].str("frame.digest"),
+            captures[1].str("frame.digest"),
+            "a different realm view must produce a different digest"
+        );
+        assert_eq!(
+            captures[0].str("frame.digest"),
+            captures[2].str("frame.digest"),
+            "identical content digests identically"
+        );
+
+        // A refused capture delivers nothing, so it identifies nothing --
+        // the honest null, not a fabricated digest.
+        shared.grants.revoke(server.grant_row_id(4).unwrap());
+        client.send_message(&capture_frame(), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_refused(&mut client, 4, Verb::OBSERVE, Refusal::Revoked);
+        let entries = shared.log();
+        let last = entries.last().expect("entries exist");
+        assert_eq!(last.str("kind"), "use_decision");
+        assert_eq!(last.str("decision"), "refused");
+        assert_eq!(last.str("refusal"), "revoked");
+        assert!(last.is_null("frame"));
+        assert_eq!(
+            last.str("grant_id"),
+            server.grant_row_id(4).unwrap().to_string(),
+            "a revoked use still names the row that died"
+        );
+    }
+
+    /// The headline acceptance criterion: a demo run's log lets a human
+    /// reconstruct the session -- who connected, what was granted, and what
+    /// was done. Drives one full flow (handshake -> petition -> consent ->
+    /// captures -> actuations -> refusals -> teardown) and reads the story
+    /// back out of the file.
+    #[test]
+    fn a_demo_runs_log_reconstructs_the_whole_session() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        // A rate of 2/s so an over-rate capture is refused inside the run.
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 2, 0);
+
+        // Two captures (the burst the 2/s bucket allows), then a third that
+        // the ceiling refuses.
+        for _ in 0..2 {
+            client.send_message(&capture_frame(), None).unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+            expect_frame(&mut client, 6);
+        }
+        client.send_message(&capture_frame(), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_refused(&mut client, 4, Verb::OBSERVE, Refusal::RateLimited);
+
+        // One pointer move and one typed string, a token apart so both are
+        // admitted.
+        shared.now += Duration::from_millis(500);
+        client.send_message(&move_to(10, 12), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        shared.now += Duration::from_millis(500);
+        client.send_message(&type_text("hello"), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        assert_eq!(shared.actuations.len(), 2);
+
+        // A second petition, refused by policy, so the log carries a
+        // request that never became authority.
+        let mut bad = petition_at(20);
+        bad.persistence = WirePersistence::Always;
+        client.send_message(&bad.encode(3), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        assert_eq!(
+            expect_resolved(&mut client, 20).outcome,
+            Outcome::Unsupported
+        );
+
+        server.teardown(
+            &mut shared.petitions,
+            &mut shared.grants,
+            &mut shared.recorder,
+        );
+
+        // --- now read the session back out of the log ---------------------
+        let entries = shared.log();
+        let kinds: Vec<&str> = entries.iter().map(|e| e.str("kind")).collect();
+
+        // WHO connected: one bind, naming the verifier-canonical identity
+        // and the kernel-attested peer -- and no credential bytes anywhere.
+        let bound = crate::recorder::tests::of_kind(&entries, "handshake_bound");
+        assert_eq!(bound.len(), 1, "kinds seen: {kinds:?}");
+        assert_eq!(bound[0].str("identity"), DEMO_IDENTITY);
+        assert_eq!(bound[0].str("credential_type"), STATIC_TOKEN_SCHEME);
+        assert_eq!(bound[0].u64("credential_bytes"), TOKEN.len() as u64);
+        assert_eq!(bound[0].u64("peer_uid"), u64::from(my_uid()));
+        let raw = std::fs::read_to_string(&shared.log_path).unwrap();
+        assert!(
+            !raw.contains(TOKEN),
+            "the credential must NEVER appear in the log"
+        );
+
+        // WHAT WAS ASKED and WHAT WAS GRANTED: two petitions requested, two
+        // resolved, one granted with its effective authority and row id.
+        let requested = crate::recorder::tests::of_kind(&entries, "petition_requested");
+        assert_eq!(requested.len(), 2);
+        assert_eq!(
+            requested[0].strings("requested.verbs"),
+            vec!["observe", "actuate_pointer", "actuate_text"]
+        );
+        assert_eq!(requested[0].str("realm_name"), "realm-0");
+        assert_eq!(requested[1].str("requested.persistence"), "always");
+
+        let resolved = crate::recorder::tests::of_kind(&entries, "petition_resolved");
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].str("outcome"), "granted");
+        assert_eq!(resolved[0].str("issuer"), "auto_approve_policy");
+        assert_eq!(resolved[0].u64("effective.max_event_rate"), 2);
+        assert_eq!(
+            resolved[0].strings("effective.verbs"),
+            vec!["observe", "actuate_pointer", "actuate_text"]
+        );
+        let granted_row = resolved[0].str("grant_id").to_string();
+        assert_eq!(resolved[1].str("outcome"), "unsupported");
+        assert!(resolved[1].is_null("grant_id"));
+
+        // The consent lifecycle: auto-approve stands in for the prompt and
+        // announces its close (the IDL's only-closed shape).
+        let consent = crate::recorder::tests::of_kind(&entries, "consent_transition");
+        assert_eq!(consent.len(), 1);
+        assert_eq!(consent[0].str("state"), "closed");
+
+        // WHAT WAS DONE: every chokepoint decision, in order, each naming
+        // the grant it was judged against.
+        let uses = crate::recorder::tests::of_kind(&entries, "use_decision");
+        let story: Vec<(&str, &str)> = uses
+            .iter()
+            .map(|e| (e.str("verb"), e.str("decision")))
+            .collect();
+        assert_eq!(
+            story,
+            vec![
+                ("observe", "allowed"),
+                ("observe", "allowed"),
+                ("observe", "refused"),
+                ("actuate_pointer", "allowed"),
+                ("actuate_text", "allowed"),
+            ]
+        );
+        assert_eq!(uses[2].str("refusal"), "rate_limited");
+        assert!(uses[2].bool("refusal_voiced"));
+        // Every decision names the row it was judged against -- the
+        // refusal included, since a rate-limited use has a live grant.
+        for e in &uses {
+            assert_eq!(e.str("grant_id"), granted_row);
+            assert_eq!(e.u64("grant_wire_id"), 4);
+            assert_eq!(
+                e.u64("facet_wire_id"),
+                if e.str("verb") == "observe" {
+                    6
+                } else if e.str("verb") == "actuate_pointer" {
+                    7
+                } else {
+                    8
+                }
+            );
+        }
+        // Captures identify what was observed; actuations have no frame.
+        assert!(!uses[0].is_null("frame"));
+        assert!(uses[3].is_null("frame"), "an actuation delivers no frame");
+
+        // B1: epoch reference slots on every decision, explicitly null.
+        for e in &uses {
+            assert!(e.is_null("epoch.observed"));
+            assert!(e.is_null("epoch.expected"));
+            assert!(e.is_null("epoch.target"));
+        }
+
+        // AND HOW IT ENDED.
+        let teardown = crate::recorder::tests::of_kind(&entries, "connection_teardown");
+        assert_eq!(teardown.len(), 1);
+        assert_eq!(teardown[0].str("identity"), DEMO_IDENTITY);
+        assert_eq!(teardown[0].u64("removed_grants"), 1);
+        assert_eq!(teardown[0].u64("withdrawn_petitions"), 0);
+
+        // Nothing was lost, and the whole run is one connection's story.
+        assert_eq!(shared.recorder.dropped_entries(), 0);
+        assert!(!shared.recorder.is_degraded());
+        for e in &entries {
+            if let Some(c) = e.path("connection") {
+                assert_eq!(*c, crate::recorder::tests::Json::Str("conn-1".into()));
+            }
+        }
+    }
+
+    /// The actuation half of "a human can reconstruct what was done": a
+    /// capture entry identifies what was observed, so an actuation entry
+    /// must identify what was actuated. The verb alone cannot distinguish
+    /// a move from a button press from a scroll, nor say how much was
+    /// typed -- and the typed string itself must never be written down.
+    #[test]
+    fn actuation_entries_reconstruct_what_was_done_without_recording_the_text() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 20, 0);
+
+        // Every actuation shape the version-1 wire can carry, end to end.
+        let secret = "correct horse battery staple";
+        for frame in [
+            move_to(37, -4),
+            pointer::requests::Button {
+                button: 0x110,
+                state: ButtonState::Pressed,
+            }
+            .encode(7),
+            pointer::requests::Button {
+                button: 0x110,
+                state: ButtonState::Released,
+            }
+            .encode(7),
+            pointer::requests::Scroll {
+                axis: Axis::Vertical,
+                value120: -120,
+            }
+            .encode(7),
+            type_text(secret),
+        ] {
+            client.send_message(&frame, None).unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        }
+        assert_eq!(shared.actuations.len(), 5, "all five were admitted");
+
+        let entries = shared.log();
+        let uses: Vec<&crate::recorder::tests::Json> =
+            crate::recorder::tests::of_kind(&entries, "use_decision")
+                .into_iter()
+                .filter(|e| e.str("decision") == "allowed" && e.str("verb") != "observe")
+                .collect();
+        assert_eq!(uses.len(), 5);
+
+        // Each is distinguishable from the others -- the property a
+        // verb-only entry cannot provide.
+        let actions: Vec<&str> = uses.iter().map(|e| e.str("input.action")).collect();
+        assert_eq!(
+            actions,
+            vec!["move", "button", "button", "scroll", "type"],
+            "the entry must say WHICH actuation, not just which verb"
+        );
+        // ... and each carries the parameters that reproduce it.
+        assert_eq!(
+            uses[0].at("input.x"),
+            &crate::recorder::tests::Json::Num(37.0)
+        );
+        assert_eq!(
+            uses[0].at("input.y"),
+            &crate::recorder::tests::Json::Num(-4.0)
+        );
+        assert_eq!(uses[1].u64("input.button"), 0x110);
+        assert!(uses[1].bool("input.pressed"));
+        assert!(!uses[2].bool("input.pressed"), "press and release differ");
+        assert_eq!(uses[3].str("input.axis"), "vertical");
+        assert_eq!(
+            uses[3].at("input.value120"),
+            &crate::recorder::tests::Json::Num(-120.0)
+        );
+
+        // The typed string: shape and identity, never the bytes. Agent
+        // text is arbitrary user data -- a flight recorder that wrote it
+        // out would be a keylogger.
+        assert_eq!(uses[4].u64("input.chars"), secret.chars().count() as u64);
+        assert_eq!(uses[4].u64("input.bytes"), secret.len() as u64);
+        assert_eq!(
+            uses[4].str("input.digest"),
+            crate::recorder::ObservationDigest::of(secret.as_bytes()).to_hex()
+        );
+        let raw = std::fs::read_to_string(&shared.log_path).unwrap();
+        assert!(
+            !raw.contains(secret),
+            "typed text must NEVER appear in the log"
+        );
+        assert!(!raw.contains("correct horse"), "not even a prefix of it");
+    }
+
+    /// Connection teardown is the most common way a version-1 grant dies,
+    /// and it is a lifecycle transition an E3.4 replay must be able to
+    /// apply. Revocation and expiry name their ids for exactly that
+    /// reason; teardown must too -- a bare count says how many authorities
+    /// died, never which.
+    #[test]
+    fn teardown_names_every_grant_row_it_removed() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 20, 0);
+        // A second granted petition, so "which rows died" is a real
+        // question rather than a one-row triviality.
+        let second = petition_at(20);
+        client.send_message(&second.encode(3), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 21, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client, 20).outcome, Outcome::Granted);
+
+        let rows = [
+            server.grant_row_id(4).expect("first row"),
+            server.grant_row_id(20).expect("second row"),
+        ];
+        assert_eq!(shared.grants.rows(shared.now).count(), 2);
+
+        server.teardown(
+            &mut shared.petitions,
+            &mut shared.grants,
+            &mut shared.recorder,
+        );
+
+        let entries = shared.log();
+        let removed = crate::recorder::tests::of_kind(&entries, "grant_removed");
+        let named: Vec<&str> = removed.iter().map(|e| e.str("grant_id")).collect();
+        let expected: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+        assert_eq!(
+            named,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "every row teardown deleted is named, not just counted"
+        );
+        for e in &removed {
+            assert_eq!(e.str("transition"), "active_to_removed");
+            assert_eq!(e.str("source"), "connection_teardown");
+            assert_eq!(e.str("connection"), "conn-1");
+        }
+        // The aggregate stays, as the summary it always was.
+        let teardown = crate::recorder::tests::of_kind(&entries, "connection_teardown");
+        assert_eq!(teardown[0].u64("removed_grants"), 2);
+    }
+
+    /// A consent decision is consumed from the pending registry *before*
+    /// delivery is attempted, so a refused delivery destroys it: the
+    /// petition is gone, the handle never resolves, and nothing retries.
+    /// Without a record, a human's yes or no becomes unrecoverable -- and
+    /// the issue requires consent decisions to be recorded.
+    #[test]
+    fn a_consent_decision_that_could_not_be_delivered_is_still_recorded() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        // A human says YES, narrowing to observe.
+        let petition = shared.petitions.pending_ids()[0];
+        let resolution = shared
+            .petitions
+            .resolve_scripted(
+                petition,
+                ScriptedDecision::Approve {
+                    verbs: Verb::OBSERVE,
+                    persistence: PersistenceRung::WhileRunning,
+                    expiry_ms: 0,
+                },
+            )
+            .unwrap();
+        // ... and the petitioner disconnects before the embedder routes it.
+        server.teardown(
+            &mut shared.petitions,
+            &mut shared.grants,
+            &mut shared.recorder,
+        );
+        let err = server
+            .deliver_resolution(
+                resolution,
+                &mut shared.grants,
+                &mut shared.recorder,
+                shared.now,
+                &mut |_, _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DeliveryError::ConnectionDead));
+
+        let entries = shared.log();
+        // No authority changed, so there is no `petition_resolved` ...
+        assert!(
+            crate::recorder::tests::of_kind(&entries, "petition_resolved").is_empty(),
+            "nothing was granted, so nothing may claim to have been"
+        );
+        // ... but the decision itself survives in the log.
+        let lost = crate::recorder::tests::of_kind(&entries, "petition_undelivered");
+        assert_eq!(lost.len(), 1, "the yes must not vanish");
+        assert_eq!(lost[0].str("outcome"), "granted", "the human said yes");
+        assert_eq!(lost[0].str("reason"), "connection_dead");
+        assert_eq!(lost[0].str("issuer"), "scripted_consent");
+        assert_eq!(lost[0].u64("grant_wire_id"), 4);
+        assert_eq!(
+            lost[0].strings("effective.verbs"),
+            vec!["observe"],
+            "including what the decision would have conferred"
+        );
+        assert!(
+            lost[0].is_null("grant_id"),
+            "no row was minted, so none may be named"
+        );
+    }
+
+    /// The other undelivered shape: a decision routed to the wrong
+    /// connection. Same funnel, different class -- the point being that
+    /// the funnel covers every refusal path, not a hand-picked one.
+    #[test]
+    fn a_misrouted_resolution_is_recorded_with_its_own_cause_class() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        let petition = shared.petitions.pending_ids()[0];
+        let mut resolution = shared
+            .petitions
+            .resolve_scripted(petition, ScriptedDecision::Deny)
+            .unwrap();
+        // The embedder routes it to a connection that is not its own.
+        resolution.connection = ConnectionId::from_u64_for_test(999);
+        let err = server
+            .deliver_resolution(
+                resolution,
+                &mut shared.grants,
+                &mut shared.recorder,
+                shared.now,
+                &mut |_, _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DeliveryError::WrongConnection { .. }));
+
+        let entries = shared.log();
+        let lost = crate::recorder::tests::of_kind(&entries, "petition_undelivered");
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].str("reason"), "wrong_connection");
+        assert_eq!(lost[0].str("outcome"), "denied", "the human said no");
+        assert!(lost[0].is_null("effective"));
+    }
+
+    /// The DoS the flight recorder must not become: the chokepoint refuses
+    /// `not_granted` at its FIRST step, before the token bucket, so a
+    /// facet whose grant never resolved granted is judged with no rate
+    /// ceiling at all. The wire coalesces those refusals; the log must be
+    /// bounded too, or an ungranted principal gets an unbounded,
+    /// unratelimited disk-growth and compositor-stall vector for free.
+    #[test]
+    fn an_ungranted_principals_refusal_flood_cannot_grow_the_log_without_bound() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        // Interactive policy: the petition pends forever, so every facet
+        // use is refused `not_granted` with no rate ceiling on the path.
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        const FLOOD: usize = 2_000;
+        for _ in 0..FLOOD {
+            client.send_message(&move_to(1, 1), None).unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        }
+        let during_flood = std::fs::metadata(&shared.log_path).unwrap().len();
+        // Teardown ends the run and flushes its outstanding count, so
+        // nothing is left unaccounted for when the session's story ends.
+        server.teardown(
+            &mut shared.petitions,
+            &mut shared.grants,
+            &mut shared.recorder,
+        );
+
+        let entries = shared.log();
+        let uses = crate::recorder::tests::of_kind(&entries, "use_decision");
+        assert_eq!(
+            uses.len(),
+            1,
+            "the condition is recorded once in full, not {FLOOD} times"
+        );
+        assert_eq!(uses[0].str("refusal"), "not_granted");
+        // Never silent, though: the repeats are accounted for.
+        let summaries = crate::recorder::tests::of_kind(&entries, "use_refusal_summary");
+        let counted: u64 = summaries.iter().map(|s| s.u64("repeats")).sum();
+        assert_eq!(counted + 1, FLOOD as u64, "every refusal is accounted for");
+        assert_eq!(
+            summaries.last().unwrap().u64("total_in_run"),
+            FLOOD as u64,
+            "and the run's total is stated outright"
+        );
+        assert!(
+            during_flood < 4_096,
+            "a {FLOOD}-request flood wrote {during_flood} bytes; it must stay bounded"
+        );
+    }
+
+    /// A facet whose grant never resolved `granted` has no row at all, and
+    /// the entry says so with an explicit null rather than inventing one --
+    /// the honest counterpart to a refusal that *does* name its row.
+    #[test]
+    fn an_ungranted_facets_refusal_names_no_row() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        // Interactive policy: the petition pends, so the facets are inert.
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        client.send_message(&capture_frame(), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_refused(&mut client, 4, Verb::OBSERVE, Refusal::NotGranted);
+
+        let entries = shared.log();
+        let uses = crate::recorder::tests::of_kind(&entries, "use_decision");
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].str("decision"), "refused");
+        assert_eq!(uses[0].str("refusal"), "not_granted");
+        assert!(
+            uses[0].is_null("grant_id"),
+            "a pending grant has no row, so the entry must not invent one"
+        );
+        assert_eq!(uses[0].u64("grant_wire_id"), 4, "but the handle is named");
+        assert!(uses[0].is_null("frame"));
+    }
+
+    /// A refused handshake is recorded with the cause class, the *claimed*
+    /// identity (client-controlled, exactly escaped), and the credential's
+    /// length only -- never its bytes. The wire stays uniform.
+    #[test]
+    fn a_refused_handshake_is_recorded_without_the_credential() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        // A hostile claimed identity: quotes, a brace, a control char, and
+        // an attempt to forge a second `identity` member.
+        // Quotes, a brace, a newline, DEL, and an attempt to forge a
+        // second `identity` member. (No NUL: the wire decoder rejects an
+        // embedded NUL as `invalid_argument` before verification runs, so
+        // that byte can never reach the recorder from a hello -- the
+        // NUL case is covered by the recorder's own escaper tests.)
+        let hostile = "vitrin://local/{\", \"identity\": \"admin\n\u{7f}";
+        let secret = "super-secret-credential-bytes-0123456789";
+        send_hello(&mut client, 2, hostile, secret);
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "auth_failed",
+        );
+        expect_error(&mut client, WireError::AuthFailed);
+
+        let entries = shared.log();
+        let refused = crate::recorder::tests::of_kind(&entries, "handshake_refused");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].str("cause_class"), "unknown_identity");
+        assert_eq!(
+            refused[0].str("claimed_identity"),
+            hostile,
+            "recorded exactly, escaped -- never trusted, never reshaped"
+        );
+        assert!(
+            refused[0].is_null("identity"),
+            "nothing bound, so there is no canonical identity to state"
+        );
+        assert_eq!(refused[0].u64("credential_bytes"), secret.len() as u64);
+        let raw = std::fs::read_to_string(&shared.log_path).unwrap();
+        assert!(
+            !raw.contains(secret),
+            "credential bytes must never be logged"
+        );
+    }
+
+    /// A `once` grant's spend and the two grant-lifecycle sweeps
+    /// (proactive expiry, revocation) are recorded through the same single
+    /// handle -- the transitions a grant undergoes with no wire traffic at
+    /// all, which are exactly the ones a log must not miss.
+    #[test]
+    fn grant_lifecycle_transitions_without_wire_traffic_are_recorded() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let mut shared = Shared::new(ConsentPolicy::AutoApprove);
+        let (mut server, mut core, mut client) = connect(&mut shared);
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+
+        // A `once` grant, spent by its first capture.
+        let mut once = petition_frame();
+        once.persistence = WirePersistence::Once;
+        client.send_message(&once.encode(3), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client, 4).outcome, Outcome::Granted);
+        let once_row = server.grant_row_id(4).unwrap();
+
+        client.send_message(&capture_frame(), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_frame(&mut client, 6);
+
+        let so_far = shared.log();
+        let spent = crate::recorder::tests::of_kind(&so_far, "grant_spent")
+            .iter()
+            .map(|e| e.str("grant_id").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(spent, vec![once_row.to_string()]);
+
+        // A second, time-bounded grant that the proactive sweep kills
+        // without any use touching it.
+        let mut timed = petition_at(20);
+        timed.expiry_ms = 1_000;
+        client.send_message(&timed.encode(3), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 21, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client, 20).outcome, Outcome::Granted);
+        let timed_row = server.grant_row_id(20).unwrap();
+
+        let expired = shared
+            .grants
+            .expire_due(shared.now + Duration::from_secs(2));
+        assert_eq!(expired, vec![timed_row]);
+        shared.recorder.record_expiry_sweep(&expired);
+
+        // And a revocation, both shapes.
+        let mut third = petition_at(30);
+        third.persistence = WirePersistence::WhileRunning;
+        client.send_message(&third.encode(3), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 31, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client, 30).outcome, Outcome::Granted);
+        let third_row = server.grant_row_id(30).unwrap();
+        assert!(shared.grants.revoke(third_row));
+        shared
+            .recorder
+            .record_revocations(&[third_row], crate::recorder::REVOKE_SCOPE_GRANT);
+        // The dead-man switch names every row it newly revoked -- the
+        // spent `once` and the swept-expired one included (the table's
+        // documented "revoking an expired or spent grant is permitted"),
+        // but not the one already revoked above.
+        let by_principal = shared
+            .grants
+            .revoke_principal(&PrincipalIdentity::parse(DEMO_IDENTITY).unwrap());
+        assert_eq!(by_principal, vec![once_row, timed_row]);
+        shared
+            .recorder
+            .record_revocations(&by_principal, crate::recorder::REVOKE_SCOPE_PRINCIPAL);
+
+        let entries = shared.log();
+        let sweep = crate::recorder::tests::of_kind(&entries, "grant_expired");
+        assert_eq!(sweep.len(), 1);
+        assert_eq!(sweep[0].str("grant_id"), timed_row.to_string());
+        assert_eq!(sweep[0].str("source"), "proactive_sweep");
+        assert_eq!(sweep[0].str("transition"), "active_to_expired");
+
+        let revoked = crate::recorder::tests::of_kind(&entries, "grant_revoked");
+        assert_eq!(
+            revoked
+                .iter()
+                .map(|e| (e.str("grant_id").to_string(), e.str("scope").to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (third_row.to_string(), "grant".to_string()),
+                (once_row.to_string(), "principal".to_string()),
+                (timed_row.to_string(), "principal".to_string()),
+            ]
+        );
+    }
+
+    /// A pending petition's `queued` transition and its `timed_out`
+    /// terminal are both recorded, naming the pending petition while it
+    /// exists -- the interactive path a demo without a consent surface
+    /// actually takes.
+    #[test]
+    fn a_pending_petition_records_queued_then_its_timeout() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        let so_far = shared.log();
+        let queued = crate::recorder::tests::of_kind(&so_far, "consent_transition");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].str("state"), "queued");
+        assert_eq!(queued[0].str("petition"), "petition-1");
+        assert_eq!(queued[0].u64("consent_wire_id"), 5);
+
+        shared.now += Duration::from_secs(120);
+        let due = shared.petitions.expire_due(shared.now);
+        assert_eq!(due.len(), 1);
+        deliver(
+            &mut server,
+            &mut core,
+            &mut shared,
+            due.into_iter().next().unwrap(),
+        );
+        expect_consent_state(&mut client, 5, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client, 4).outcome, Outcome::TimedOut);
+
+        let entries = shared.log();
+        let transitions = crate::recorder::tests::of_kind(&entries, "consent_transition");
+        assert_eq!(
+            transitions
+                .iter()
+                .map(|e| e.str("state"))
+                .collect::<Vec<_>>(),
+            vec!["queued", "closed"]
+        );
+        // The prompt is down, so the closed transition names no petition.
+        assert!(transitions[1].is_null("petition"));
+        let resolved = crate::recorder::tests::of_kind(&entries, "petition_resolved");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].str("outcome"), "timed_out");
+        assert!(resolved[0].is_null("effective"));
     }
 }

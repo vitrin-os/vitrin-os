@@ -200,6 +200,17 @@ pub(crate) const WELL_KNOWN_REALM: &str = "realm-0";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ConnectionId(u64);
 
+impl ConnectionId {
+    /// Test-only: a connection id without a registry, so unit tests of pure
+    /// consumers (the flight recorder's entry shapes) need not stand one
+    /// up. Outside `cfg(test)` ids are minted by
+    /// [`PetitionRegistry::register_connection`] and nowhere else.
+    #[cfg(test)]
+    pub fn from_u64_for_test(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 impl fmt::Display for ConnectionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "conn-{}", self.0)

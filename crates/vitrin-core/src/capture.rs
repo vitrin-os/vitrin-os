@@ -53,6 +53,20 @@
 //! no caller outside the chokepoint (and this module's own mechanics
 //! tests): there is no legacy capture entry left to bypass enforcement
 //! through.
+//!
+//! # The observation digest rides the copy path (P1.4.5, B1)
+//!
+//! [`render_frame`] returns the frame's [`ObservationDigest`] alongside the
+//! event. This is the only point in the core that holds the exact bytes
+//! delivered to the agent without re-reading the sealed memfd, so it is
+//! where the flight recorder's B1 digest is computed — unconditionally, for
+//! every capture, never sampled (see [`crate::recorder`] for the decision
+//! and its measured cost). Digesting here also keeps the recorder out of
+//! both this module and the chokepoint: capture produces the fact, the
+//! chokepoint hands it back in its [`UseOutcome`], and the connection
+//! server records it.
+//!
+//! [`UseOutcome`]: crate::enforcement::UseOutcome
 
 use std::fmt;
 use std::fs::File;
@@ -61,6 +75,8 @@ use std::os::fd::OwnedFd;
 
 use rustix::fs::{MemfdFlags, SealFlags};
 use vitrin_protocol::generated::vitrin_view::{events::FrameReady, Format, FrameFlags};
+
+use crate::recorder::ObservationDigest;
 
 /// Bytes per pixel of the version-1 capture format (`xrgb8888`); the IDL
 /// pins `stride == width * 4` exactly.
@@ -118,11 +134,19 @@ impl fmt::Display for CaptureError {
 }
 
 /// Produce one wire-ready `frame_ready` payload from the latest completed
-/// realm view: convert the readback to xrgb8888 and seal the copy into a
-/// fresh memfd. Pure mechanics — no authority, no wire I/O; the returned
-/// event (and the fd ownership it carries) is the enforcement chokepoint's
-/// to send, and the server-side copy of the fd drops when the event does.
-pub(crate) fn render_frame(view: &RealmViewFrame<'_>) -> Result<FrameReady, CaptureError> {
+/// realm view: convert the readback to xrgb8888, digest the result, and
+/// seal the copy into a fresh memfd. Pure mechanics — no authority, no wire
+/// I/O; the returned event (and the fd ownership it carries) is the
+/// enforcement chokepoint's to send, and the server-side copy of the fd
+/// drops when the event does.
+///
+/// The second return value is the B1 observation digest over **exactly**
+/// the bytes the memfd carries — computed before sealing, from the same
+/// buffer that is written, so the digest and the delivered frame cannot
+/// disagree (module docs).
+pub(crate) fn render_frame(
+    view: &RealmViewFrame<'_>,
+) -> Result<(FrameReady, ObservationDigest), CaptureError> {
     if view.width == 0 || view.height == 0 {
         return Err(CaptureError::DegenerateView {
             width: view.width,
@@ -136,18 +160,23 @@ pub(crate) fn render_frame(view: &RealmViewFrame<'_>) -> Result<FrameReady, Capt
             expected,
         });
     }
-    let fd = sealed_frame_memfd(&rgba_to_xrgb8888(view.rgba)).map_err(CaptureError::Memfd)?;
-    Ok(FrameReady {
-        fd,
-        format: Format::Xrgb8888,
-        width: view.width,
-        height: view.height,
-        // Pinned by the IDL: stride == width * 4 exactly in version 1.
-        stride: view.width * BYTES_PER_PIXEL as u32,
-        // Always 0 in version 1; any set bit would be a server protocol
-        // violation.
-        flags: FrameFlags::default(),
-    })
+    let pixels = rgba_to_xrgb8888(view.rgba);
+    let digest = ObservationDigest::of(&pixels);
+    let fd = sealed_frame_memfd(&pixels).map_err(CaptureError::Memfd)?;
+    Ok((
+        FrameReady {
+            fd,
+            format: Format::Xrgb8888,
+            width: view.width,
+            height: view.height,
+            // Pinned by the IDL: stride == width * 4 exactly in version 1.
+            stride: view.width * BYTES_PER_PIXEL as u32,
+            // Always 0 in version 1; any set bit would be a server protocol
+            // violation.
+            flags: FrameFlags::default(),
+        },
+        digest,
+    ))
 }
 
 /// Convert tightly packed RGBA8888 (readback layout: bytes R,G,B,A) to the
@@ -237,12 +266,15 @@ pub(crate) mod tests {
         width: u32,
         height: u32,
     ) -> Message {
-        let frame = render_frame(&RealmViewFrame {
+        let (frame, digest) = render_frame(&RealmViewFrame {
             rgba,
             width,
             height,
         })
         .expect("render_frame must succeed on a well-formed view");
+        // B1's core promise, asserted at the mechanics layer: the digest is
+        // over exactly the bytes that go into the memfd.
+        assert_eq!(digest, ObservationDigest::of(&rgba_to_xrgb8888(rgba)));
         server
             .send_message(&frame.encode(VIEW_ID), Some(frame.fd.as_fd()))
             .expect("send must succeed on a fresh pair");

@@ -283,6 +283,21 @@ jobs:
         working-directory: shim
         run: BUILD_DIR="${RUNNER_TEMP}/shim-build" bash tests/acceptance/upstream_frame_path.sh
 
+      # NOTE: quoted for the same reason as the step above -- the name contains
+      # ": ", which YAML forbids in a plain scalar.
+      - name: "Headless acceptance (seat input replay: events, keymap, coordinates, origin tag)"
+        # The P1.6.3 acceptance criteria, checked by three witnesses that share
+        # no code: the mock core plays a scripted run of `vitrin_shim_seat`
+        # events and traces each one, the shim writes its own delivery trace,
+        # and a real Wayland client resolves every key through the keymap it
+        # was sent. The R5 gate additionally drives a real GtkEntry -- that
+        # criterion is about the toolkit's input-method layer, which no keysym
+        # stream can stand in for, and the script FAILS rather than skipping it
+        # under CI (libgtk-3-dev is installed by shim/ci/install-deps.sh).
+        if: hashFiles('shim/tests/acceptance/seat_input_replay.sh') != ''
+        working-directory: shim
+        run: BUILD_DIR="${RUNNER_TEMP}/shim-build" bash tests/acceptance/seat_input_replay.sh
+
       - name: Meson build DORMANT
         if: hashFiles('shim/meson.build') == ''
         run: |

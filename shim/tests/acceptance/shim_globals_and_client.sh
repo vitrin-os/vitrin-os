@@ -28,7 +28,12 @@ WANT_DMABUF="${WANT_DMABUF:-0}"
 
 # Expected registry, one interface per line, sorted. wl_shm/wl_output are
 # created by the shim just like the rest; dmabuf is opt-in.
-expected=(wl_compositor wl_shm wl_seat wl_output xdg_wm_base zxdg_decoration_manager_v1)
+# wl_data_device_manager joined the set in P1.6.3: GDK will not construct a
+# seat without it (GTK 4 refuses the display outright, GTK 3 silently gets no
+# keyboard), so input replay is unusable by any GTK app in its absence. It is
+# app-internal by construction -- one client per shim means both ends of any
+# transfer are the same app. See the argument in src/globals.c.
+expected=(wl_compositor wl_shm wl_seat wl_output xdg_wm_base wl_data_device_manager zxdg_decoration_manager_v1)
 if [[ "$WANT_DMABUF" == "1" ]]; then
 	expected+=(zwp_linux_dmabuf_v1)
 fi

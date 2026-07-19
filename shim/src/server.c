@@ -83,6 +83,12 @@ void vitrin_shim_finish(struct vitrin_shim *s) {
 		wl_list_remove(&s->new_toplevel.link);
 		s->xdg_wired = false;
 	}
+	/* The virtual keyboard, likewise before the display goes: it is attached
+	 * to the seat (a display global) and holds a listener on its own signals
+	 * that `wlr_keyboard_finish` asserts is gone. seat.c owns the ordering;
+	 * calling it here is what guarantees it runs on every exit path,
+	 * including main()'s partial-bring-up one. */
+	vitrin_seat_finish(s);
 	/* Release the core connection and the frame pool BEFORE the display
 	 * goes: the wire's event source belongs to the display's event loop, so
 	 * removing it afterwards would touch freed memory. Closing our end also

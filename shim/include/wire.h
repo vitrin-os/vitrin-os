@@ -98,6 +98,19 @@ struct vitrin_wire_slot {
  * connection dead (the transport then refuses every later operation). */
 typedef bool (*vitrin_wire_handler_t)(void *data, const uint8_t *frame, size_t len);
 
+/* Called once per event-loop wakeup, after every complete frame that wakeup
+ * delivered has been handed to the handler above.
+ *
+ * This exists because a batch boundary is real protocol information, not a
+ * scheduling artefact: the core writes all the events it routed from one
+ * cause in one go, so frames that arrive together are frames that belong
+ * together. Input replay needs exactly that to place `wl_pointer.frame`
+ * correctly (seat.h, "pointer batching"). It fires whether or not the batch
+ * contained anything the consumer cares about -- deciding that is the
+ * consumer's job, and it keeps this layer ignorant of message meaning, which
+ * is the whole point of the split with the generated header. */
+typedef void (*vitrin_wire_drained_t)(void *data);
+
 /* Called once, from the event loop, when the connection is finished for any
  * reason -- the core hung up (the first rung of its shutdown ladder), a
  * transport error, or a framing violation. The event source is already gone
@@ -126,6 +139,7 @@ struct vitrin_wire {
 
 	struct wl_event_source *source;
 	vitrin_wire_handler_t handler;
+	vitrin_wire_drained_t on_drained;
 	vitrin_wire_closed_t on_closed;
 	void *handler_data;
 };
@@ -164,7 +178,8 @@ bool vitrin_wire_recv_sync(struct vitrin_wire *w, int timeout_ms,
  * and a request from the app are dispatched by one thread with no locking
  * and no ordering questions between them. */
 bool vitrin_wire_arm(struct vitrin_wire *w, struct wl_event_loop *loop,
-	vitrin_wire_handler_t handler, vitrin_wire_closed_t on_closed, void *data);
+	vitrin_wire_handler_t handler, vitrin_wire_drained_t on_drained,
+	vitrin_wire_closed_t on_closed, void *data);
 
 /* Remove the event source and close the descriptor (idempotent). */
 void vitrin_wire_finish(struct vitrin_wire *w);

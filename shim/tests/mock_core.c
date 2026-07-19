@@ -41,6 +41,41 @@
  *   --defer-release    hold `buffer_done` until the NEXT commit, which is
  *                      the dmabuf passthrough timing regime and the case a
  *                      one-slot buffer pool would deadlock on
+ *
+ * INPUT INJECTION (P1.6.3). `--input FILE` plays a script of
+ * `vitrin_shim_seat` events at the shim, which is what turns "the app
+ * receives exactly the scripted synthetic events" into an assertion rather
+ * than a hope. The script is deliberately written by the test rather than
+ * generated here, so the expectation and the stimulus are the same text.
+ *
+ *   delay MS
+ *   motion X Y             physical|emulated
+ *   button EVDEV_CODE      pressed|released  physical|emulated
+ *   scroll vertical|horizontal V120          physical|emulated
+ *   key KEYSYM             pressed|released  physical|emulated
+ *   text physical|emulated UTF-8 REST OF LINE  (\n, \t, \\, \xNN escapes)
+ *
+ * WIRE BATCHING. Consecutive script events with no `delay` between them are
+ * written to the socket in ONE `send`, and a `delay` is a flush. That is
+ * what makes the shim's pointer-frame grouping testable: `vitrin_shim_seat`
+ * runs over SOCK_STREAM, which has no message boundaries, so "arrived in one
+ * batch" means "arrived in one recvmsg" and nothing else. The real core
+ * issues one sendmsg per event and relies on the kernel to coalesce the ones
+ * it emits back-to-back -- true in practice, but a race, and a test that
+ * depended on winning it would be flaky. Writing them together produces the
+ * identical byte stream the shim sees when the race is won, deterministically.
+ *
+ * Every event is traced on the way out as `EV seat_send ... origin=...`, so
+ * the harness can correlate the core's record of what it sent against the
+ * shim's record of what it delivered and the client's record of what
+ * arrived -- three independent witnesses, which is the only way the origin
+ * tag's survival (B2) is checkable without a shim -> core message that does
+ * not exist.
+ *
+ * Playback starts once the shim has forwarded `--input-after-commits`
+ * frames, because a commit is the first observable proof that the app has
+ * mapped a window: firing input at a realm with nothing in it would test
+ * the drop path, not the delivery path.
  */
 #define _GNU_SOURCE
 
@@ -65,6 +100,34 @@
 #define CORE_FD 3
 #define RX_CAP 65536
 #define MAX_PENDING_DAMAGE 128
+#define MAX_INPUT_EVENTS 128
+/* `vitrin_shim_seat.text` is capped at 4096 bytes by the IDL; the encoder
+ * refuses more, so the script parser refuses more too. */
+#define MAX_INPUT_TEXT 4096
+
+enum input_kind {
+	INPUT_DELAY = 0,
+	INPUT_MOTION,
+	INPUT_BUTTON,
+	INPUT_SCROLL,
+	INPUT_KEY,
+	INPUT_TEXT,
+};
+
+/* One line of an `--input` script, parsed up front so a malformed script is
+ * a startup failure rather than a mid-run surprise. */
+struct input_event {
+	enum input_kind kind;
+	uint32_t origin;
+	double x, y;      /* motion */
+	uint32_t code;    /* button code / keysym */
+	uint32_t state;   /* pressed / released */
+	uint32_t axis;    /* scroll */
+	int32_t value120; /* scroll */
+	int delay_ms;     /* delay */
+	char text[MAX_INPUT_TEXT];
+	size_t text_len;
+};
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) {
@@ -111,6 +174,21 @@ struct core {
 	bool frame_due;
 	struct timespec frame_at;
 
+	/* scripted seat input */
+	struct input_event input[MAX_INPUT_EVENTS];
+	int input_len;
+	int input_next;
+	uint64_t input_after_commits;
+	int64_t input_due_ms; /* -1 until playback has been armed */
+	uint64_t seat_sends;
+	/* Events encoded but not yet written: everything the script asked for
+	 * since the last `delay`. Big enough for two maximal `text` payloads, so
+	 * a burst of ordinary pointer/key events is never split by capacity;
+	 * anything larger flushes early, which costs a batch boundary and
+	 * nothing else. */
+	uint8_t seat_batch[2 * (MAX_INPUT_TEXT + 64)];
+	size_t seat_batch_len;
+
 	/* accounting the acceptance script asserts on */
 	uint64_t commits;
 	uint64_t frame_dones;
@@ -122,6 +200,12 @@ struct core {
 
 	int failures;
 };
+
+/* One core, at file scope rather than on main's stack: the parsed input
+ * script lives inside it and a script of 128 maximal `text` payloads is
+ * half a megabyte, which is not a stack frame. Parsing straight into it
+ * also means the script is loaded before the fork, with no copy. */
+static struct core g_core;
 
 static void trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void trace(const char *fmt, ...) {
@@ -207,6 +291,332 @@ static void send_frame_done(struct core *c) {
 	c->frame_dones++;
 	c->inflight--;
 	trace("EV frame_done time_ms=%u inflight=%d", ev.time_ms, c->inflight);
+}
+
+/* ---- scripted seat input (core -> shim) ------------------------------- */
+
+static const char *origin_name(uint32_t o) {
+	return o == VITRIN_SHIM_SEAT_ORIGIN_PHYSICAL ? "physical" : "emulated";
+}
+
+static bool parse_origin(const char *tok, uint32_t *out) {
+	if (tok == NULL) {
+		return false;
+	}
+	if (strcmp(tok, "physical") == 0) {
+		*out = VITRIN_SHIM_SEAT_ORIGIN_PHYSICAL;
+		return true;
+	}
+	if (strcmp(tok, "emulated") == 0) {
+		*out = VITRIN_SHIM_SEAT_ORIGIN_EMULATED;
+		return true;
+	}
+	return false;
+}
+
+static bool parse_state(const char *tok, uint32_t *out) {
+	if (tok == NULL) {
+		return false;
+	}
+	if (strcmp(tok, "pressed") == 0) {
+		*out = 1;
+		return true;
+	}
+	if (strcmp(tok, "released") == 0) {
+		*out = 0;
+		return true;
+	}
+	return false;
+}
+
+static int hexval(char ch) {
+	if (ch >= '0' && ch <= '9') { return ch - '0'; }
+	if (ch >= 'a' && ch <= 'f') { return ch - 'a' + 10; }
+	if (ch >= 'A' && ch <= 'F') { return ch - 'A' + 10; }
+	return -1;
+}
+
+/* Copy a script line's text payload, expanding the escapes the script format
+ * defines. `\n` and `\t` matter specifically: the IDL requires the shim to
+ * render them as Return and Tab, so a script has to be able to contain them
+ * without containing a literal newline. `\xNN` matters for the opposite
+ * reason: the shim must NOT render any other control character as a
+ * keystroke, and a test of that has to be able to put a raw 0x08 or 0x1b in
+ * a payload while the script file itself stays readable. */
+static size_t unescape(const char *in, char *out, size_t cap) {
+	size_t n = 0;
+	for (const char *p = in; *p != '\0' && n + 1 < cap; p++) {
+		if (*p != '\\' || p[1] == '\0') {
+			out[n++] = *p;
+			continue;
+		}
+		p++;
+		switch (*p) {
+		case 'n': out[n++] = '\n'; break;
+		case 't': out[n++] = '\t'; break;
+		case '\\': out[n++] = '\\'; break;
+		case 'x': {
+			/* Exactly two hex digits. `hi >= 0` proves p[1] is not the
+			 * terminator, so reading p[2] stays inside the string. */
+			int hi = hexval(p[1]);
+			int lo = hi >= 0 ? hexval(p[2]) : -1;
+			if (lo < 0) {
+				goto literal;
+			}
+			out[n++] = (char)(unsigned char)(hi * 16 + lo);
+			p += 2;
+			break;
+		}
+		default:
+		literal:
+			out[n++] = '\\';
+			if (n + 1 < cap) {
+				out[n++] = *p;
+			}
+			break;
+		}
+	}
+	out[n] = '\0';
+	return n;
+}
+
+/* Parse the whole script before anything is spawned. A bad script must fail
+ * the run loudly, not silently deliver fewer events than the assertions
+ * expect. */
+static bool load_input_script(struct core *c, const char *path) {
+	FILE *f = fopen(path, "r");
+	if (f == NULL) {
+		fprintf(stderr, "cannot open input script %s: %s\n", path, strerror(errno));
+		return false;
+	}
+	char line[MAX_INPUT_TEXT + 256];
+	int lineno = 0;
+	bool ok = true;
+	while (fgets(line, sizeof(line), f) != NULL) {
+		lineno++;
+		char *nl = strchr(line, '\n');
+		if (nl != NULL) {
+			*nl = '\0';
+		}
+		char *p = line;
+		while (*p == ' ' || *p == '\t') {
+			p++;
+		}
+		if (*p == '\0' || *p == '#') {
+			continue;
+		}
+		if (c->input_len >= MAX_INPUT_EVENTS) {
+			fprintf(stderr, "input script %s:%d: more than %d events\n",
+				path, lineno, MAX_INPUT_EVENTS);
+			ok = false;
+			break;
+		}
+		struct input_event *ev = &c->input[c->input_len];
+		memset(ev, 0, sizeof(*ev));
+
+		char *save = NULL;
+		char *verb = strtok_r(p, " \t", &save);
+		if (verb == NULL) {
+			continue;
+		}
+		if (strcmp(verb, "delay") == 0) {
+			char *ms = strtok_r(NULL, " \t", &save);
+			if (ms == NULL) { ok = false; }
+			ev->kind = INPUT_DELAY;
+			ev->delay_ms = ms != NULL ? atoi(ms) : 0;
+		} else if (strcmp(verb, "motion") == 0) {
+			char *xs = strtok_r(NULL, " \t", &save);
+			char *ys = strtok_r(NULL, " \t", &save);
+			char *os = strtok_r(NULL, " \t", &save);
+			ok = ok && xs != NULL && ys != NULL && parse_origin(os, &ev->origin);
+			ev->kind = INPUT_MOTION;
+			ev->x = xs != NULL ? atof(xs) : 0;
+			ev->y = ys != NULL ? atof(ys) : 0;
+		} else if (strcmp(verb, "button") == 0) {
+			char *cs = strtok_r(NULL, " \t", &save);
+			char *ss = strtok_r(NULL, " \t", &save);
+			char *os = strtok_r(NULL, " \t", &save);
+			ok = ok && cs != NULL && parse_state(ss, &ev->state) &&
+				parse_origin(os, &ev->origin);
+			ev->kind = INPUT_BUTTON;
+			ev->code = cs != NULL ? (uint32_t)strtoul(cs, NULL, 0) : 0;
+		} else if (strcmp(verb, "scroll") == 0) {
+			char *as = strtok_r(NULL, " \t", &save);
+			char *vs = strtok_r(NULL, " \t", &save);
+			char *os = strtok_r(NULL, " \t", &save);
+			ok = ok && as != NULL && vs != NULL && parse_origin(os, &ev->origin);
+			ev->kind = INPUT_SCROLL;
+			ev->axis = (as != NULL && strcmp(as, "horizontal") == 0)
+				? VITRIN_ACTUATOR_POINTER_AXIS_HORIZONTAL
+				: VITRIN_ACTUATOR_POINTER_AXIS_VERTICAL;
+			ev->value120 = vs != NULL ? (int32_t)strtol(vs, NULL, 0) : 0;
+		} else if (strcmp(verb, "key") == 0) {
+			char *ks = strtok_r(NULL, " \t", &save);
+			char *ss = strtok_r(NULL, " \t", &save);
+			char *os = strtok_r(NULL, " \t", &save);
+			ok = ok && ks != NULL && parse_state(ss, &ev->state) &&
+				parse_origin(os, &ev->origin);
+			ev->kind = INPUT_KEY;
+			ev->code = ks != NULL ? (uint32_t)strtoul(ks, NULL, 0) : 0;
+		} else if (strcmp(verb, "text") == 0) {
+			char *os = strtok_r(NULL, " \t", &save);
+			ok = ok && parse_origin(os, &ev->origin);
+			ev->kind = INPUT_TEXT;
+			/* The rest of the line, verbatim -- spaces included. */
+			ev->text_len = unescape(save != NULL ? save : "", ev->text, sizeof(ev->text));
+		} else {
+			fprintf(stderr, "input script %s:%d: unknown verb '%s'\n", path, lineno, verb);
+			ok = false;
+		}
+		if (!ok) {
+			fprintf(stderr, "input script %s:%d: malformed\n", path, lineno);
+			break;
+		}
+		c->input_len++;
+	}
+	fclose(f);
+	return ok;
+}
+
+/* Write everything the script has produced since the last flush as ONE
+ * socket write, so the shim receives it in one recvmsg and the frame-grouping
+ * rule it applies per batch is exercised deterministically. */
+static void flush_seat_batch(struct core *c) {
+	if (c->seat_batch_len == 0) {
+		return;
+	}
+	size_t len = c->seat_batch_len;
+	c->seat_batch_len = 0;
+	if (!core_send(c, c->seat_batch, len)) {
+		fail(c, "cannot send a %zu-byte seat event batch", len);
+	}
+}
+
+static void send_seat_event(struct core *c, const struct input_event *ev) {
+	uint8_t buf[MAX_INPUT_TEXT + 64];
+	int32_t n = -1;
+
+	switch (ev->kind) {
+	case INPUT_MOTION: {
+		vitrin_shim_seat_evt_motion_t m = {
+			.x = vitrin_fixed_from_double(ev->x),
+			.y = vitrin_fixed_from_double(ev->y),
+			.origin = (vitrin_shim_seat_origin_t)ev->origin,
+		};
+		n = vitrin_shim_seat_evt_motion_encode(&m, c->seat_id, buf, sizeof(buf));
+		if (n > 0) {
+			trace("EV seat_send n=%llu event=motion origin=%s x=%.3f y=%.3f",
+				(unsigned long long)(c->seat_sends + 1), origin_name(ev->origin),
+				ev->x, ev->y);
+		}
+		break;
+	}
+	case INPUT_BUTTON: {
+		vitrin_shim_seat_evt_button_t m = {
+			.button = ev->code,
+			.state = (vitrin_actuator_pointer_button_state_t)ev->state,
+			.origin = (vitrin_shim_seat_origin_t)ev->origin,
+		};
+		n = vitrin_shim_seat_evt_button_encode(&m, c->seat_id, buf, sizeof(buf));
+		if (n > 0) {
+			trace("EV seat_send n=%llu event=button origin=%s button=%u state=%s",
+				(unsigned long long)(c->seat_sends + 1), origin_name(ev->origin),
+				ev->code, ev->state ? "pressed" : "released");
+		}
+		break;
+	}
+	case INPUT_SCROLL: {
+		vitrin_shim_seat_evt_scroll_t m = {
+			.axis = (vitrin_actuator_pointer_axis_t)ev->axis,
+			.value120 = ev->value120,
+			.origin = (vitrin_shim_seat_origin_t)ev->origin,
+		};
+		n = vitrin_shim_seat_evt_scroll_encode(&m, c->seat_id, buf, sizeof(buf));
+		if (n > 0) {
+			trace("EV seat_send n=%llu event=scroll origin=%s axis=%s value120=%d",
+				(unsigned long long)(c->seat_sends + 1), origin_name(ev->origin),
+				ev->axis == VITRIN_ACTUATOR_POINTER_AXIS_HORIZONTAL
+					? "horizontal" : "vertical",
+				ev->value120);
+		}
+		break;
+	}
+	case INPUT_KEY: {
+		vitrin_shim_seat_evt_key_t m = {
+			.keysym = ev->code,
+			.state = (vitrin_shim_seat_key_state_t)ev->state,
+			.origin = (vitrin_shim_seat_origin_t)ev->origin,
+		};
+		n = vitrin_shim_seat_evt_key_encode(&m, c->seat_id, buf, sizeof(buf));
+		if (n > 0) {
+			trace("EV seat_send n=%llu event=key origin=%s keysym=0x%08x state=%s",
+				(unsigned long long)(c->seat_sends + 1), origin_name(ev->origin),
+				ev->code, ev->state ? "pressed" : "released");
+		}
+		break;
+	}
+	case INPUT_TEXT: {
+		vitrin_shim_seat_evt_text_t m = {
+			.text = {.len = (uint32_t)ev->text_len, .data = (const uint8_t *)ev->text},
+			.origin = (vitrin_shim_seat_origin_t)ev->origin,
+		};
+		n = vitrin_shim_seat_evt_text_encode(&m, c->seat_id, buf, sizeof(buf));
+		if (n > 0) {
+			trace("EV seat_send n=%llu event=text origin=%s bytes=%zu",
+				(unsigned long long)(c->seat_sends + 1), origin_name(ev->origin),
+				ev->text_len);
+		}
+		break;
+	}
+	case INPUT_DELAY:
+	default:
+		return;
+	}
+
+	if (n < 0) {
+		fail(c, "cannot encode seat event kind %d", (int)ev->kind);
+		return;
+	}
+	/* Append to the pending batch rather than writing now -- see the wire
+	 * batching note at the top of this file. Flushing when the frame does
+	 * not fit keeps the buffer bounded without ever splitting a frame. */
+	if (c->seat_batch_len + (size_t)n > sizeof(c->seat_batch)) {
+		flush_seat_batch(c);
+	}
+	memcpy(c->seat_batch + c->seat_batch_len, buf, (size_t)n);
+	c->seat_batch_len += (size_t)n;
+	c->seat_sends++;
+}
+
+/* Advance the script. Called once per poll iteration; playback is armed by
+ * the shim's Nth commit and paced by the script's own `delay` entries. */
+static void pump_input(struct core *c) {
+	if (c->input_len == 0 || c->input_next >= c->input_len || !c->seat_created) {
+		return;
+	}
+	if (c->input_due_ms < 0) {
+		if (c->commits < c->input_after_commits) {
+			return;
+		}
+		c->input_due_ms = now_ms();
+		trace("EV input_armed after_commits=%llu events=%d",
+			(unsigned long long)c->commits, c->input_len);
+	}
+	while (c->input_next < c->input_len && now_ms() >= c->input_due_ms) {
+		const struct input_event *ev = &c->input[c->input_next++];
+		if (ev->kind == INPUT_DELAY) {
+			/* A `delay` is the batch boundary: everything before it goes out
+			 * now, so the shim sees the pause the script asked for. */
+			flush_seat_batch(c);
+			c->input_due_ms = now_ms() + ev->delay_ms;
+			continue;
+		}
+		send_seat_event(c, ev);
+	}
+	flush_seat_batch(c);
+	if (c->input_next >= c->input_len) {
+		trace("EV input_done sends=%llu", (unsigned long long)c->seat_sends);
+	}
 }
 
 /* ---- request handling ------------------------------------------------ */
@@ -614,7 +1024,8 @@ static pid_t spawn_shim(int shim_end, char **argv) {
 static void usage(void) {
 	fprintf(stderr,
 		"usage: mock-core [--realm NAME] [--size WxH] [--frames N] [--run-ms MS]\n"
-		"                 [--frame-delay MS] [--defer-release] -- SHIM_ARGV...\n");
+		"                 [--frame-delay MS] [--defer-release]\n"
+		"                 [--input SCRIPT] [--input-after-commits N] -- SHIM_ARGV...\n");
 	exit(2);
 }
 
@@ -625,6 +1036,8 @@ int main(int argc, char **argv) {
 	int run_ms = 10000;
 	int frame_delay = 0;
 	bool defer_release = false;
+	const char *input_script = NULL;
+	uint64_t input_after_commits = 3;
 	int shim_argi = 0;
 
 	for (int i = 1; i < argc; i++) {
@@ -642,6 +1055,10 @@ int main(int argc, char **argv) {
 			frame_delay = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "--defer-release") == 0) {
 			defer_release = true;
+		} else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
+			input_script = argv[++i];
+		} else if (strcmp(argv[i], "--input-after-commits") == 0 && i + 1 < argc) {
+			input_after_commits = strtoull(argv[++i], NULL, 10);
 		} else if (strcmp(argv[i], "--") == 0 && i + 1 < argc) {
 			shim_argi = i + 1;
 			break;
@@ -657,6 +1074,13 @@ int main(int argc, char **argv) {
 	signal(SIGTERM, on_signal);
 	signal(SIGPIPE, SIG_IGN);
 
+	/* Parse the script BEFORE the socketpair and the fork: a malformed
+	 * script must fail the run without ever having spawned a shim, or the
+	 * test would report a partial injection as a shim fault. */
+	if (input_script != NULL && !load_input_script(&g_core, input_script)) {
+		return 2;
+	}
+
 	int sv[2];
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
 		perror("socketpair");
@@ -670,18 +1094,20 @@ int main(int argc, char **argv) {
 	}
 	close(sv[1]);
 
-	struct core c = {0};
-	c.fd = sv[0];
-	c.watermark = 1;
-	c.frame_delay_ms = frame_delay;
-	c.defer_release = defer_release;
-	c.retained_fd = -1;
-	c.pending.fd = -1;
+	struct core *c = &g_core;
+	c->fd = sv[0];
+	c->watermark = 1;
+	c->frame_delay_ms = frame_delay;
+	c->defer_release = defer_release;
+	c->retained_fd = -1;
+	c->pending.fd = -1;
+	c->input_after_commits = input_after_commits;
+	c->input_due_ms = -1; /* armed by the Nth commit, not by the clock */
 
 	trace("EV spawned shim_pid=%d", (int)shim);
 
 	/* The core's first message, before anything is read. */
-	send_configure(&c, realm, width, height);
+	send_configure(c, realm, width, height);
 	trace("EV configure realm=%s width=%u height=%u", realm, width, height);
 
 	int64_t deadline = now_ms() + run_ms;
@@ -691,12 +1117,17 @@ int main(int argc, char **argv) {
 		if (remaining <= 0) {
 			break;
 		}
-		if (want_frames > 0 && c.commits >= want_frames && !c.frame_due) {
+		/* An unfinished input script keeps the run alive: stopping on the
+		 * frame count while events are still queued would silently deliver
+		 * fewer than the test scripted, which is the one failure mode a
+		 * stimulus generator must not have. */
+		bool input_pending = c->input_next < c->input_len;
+		if (want_frames > 0 && c->commits >= want_frames && !c->frame_due && !input_pending) {
 			break;
 		}
 
 		int timeout = remaining > 50 ? 50 : (int)remaining;
-		struct pollfd pfd = {.fd = c.fd, .events = POLLIN};
+		struct pollfd pfd = {.fd = c->fd, .events = POLLIN};
 		int pr = poll(&pfd, 1, timeout);
 		if (pr < 0 && errno != EINTR) {
 			perror("poll");
@@ -704,7 +1135,7 @@ int main(int argc, char **argv) {
 			break;
 		}
 		if (pr > 0) {
-			int r = core_fill(&c);
+			int r = core_fill(c);
 			if (r == 0) {
 				trace("EV shim_eof");
 				break;
@@ -714,31 +1145,33 @@ int main(int argc, char **argv) {
 				break;
 			}
 		}
-		if (c.frame_due) {
+		if (c->frame_due) {
 			struct timespec now;
 			clock_gettime(CLOCK_MONOTONIC, &now);
-			if (now.tv_sec > c.frame_at.tv_sec ||
-					(now.tv_sec == c.frame_at.tv_sec && now.tv_nsec >= c.frame_at.tv_nsec)) {
-				c.frame_due = false;
-				send_frame_done(&c);
+			if (now.tv_sec > c->frame_at.tv_sec ||
+					(now.tv_sec == c->frame_at.tv_sec && now.tv_nsec >= c->frame_at.tv_nsec)) {
+				c->frame_due = false;
+				send_frame_done(c);
 			}
 		}
+		pump_input(c);
 	}
 
 	trace("SUMMARY commits=%llu frame_dones=%llu buffer_dones=%llu max_inflight=%d "
-		"last_damage_area=%llu last_damage_rects=%d failures=%d",
-		(unsigned long long)c.commits, (unsigned long long)c.frame_dones,
-		(unsigned long long)c.buffer_dones, c.max_inflight,
-		(unsigned long long)c.last_damage_area, c.last_damage_rects, c.failures);
+		"last_damage_area=%llu last_damage_rects=%d seat_sends=%llu failures=%d",
+		(unsigned long long)c->commits, (unsigned long long)c->frame_dones,
+		(unsigned long long)c->buffer_dones, c->max_inflight,
+		(unsigned long long)c->last_damage_area, c->last_damage_rects,
+		(unsigned long long)c->seat_sends, c->failures);
 
 	/* Hang up: socketpair EOF is how the core tells a shim to go away, and
 	 * the first rung of the P1.5.3 shutdown ladder. */
-	close(c.fd);
-	if (c.pending.present) {
-		close(c.pending.fd);
+	close(c->fd);
+	if (c->pending.present) {
+		close(c->pending.fd);
 	}
-	if (c.retained_fd >= 0) {
-		close(c.retained_fd);
+	if (c->retained_fd >= 0) {
+		close(c->retained_fd);
 	}
 
 	int status = 0;
@@ -758,7 +1191,7 @@ int main(int argc, char **argv) {
 		waitpid(shim, &status, 0);
 	}
 
-	if (c.failures > 0) {
+	if (c->failures > 0) {
 		exit_code = 1;
 	}
 	return exit_code;

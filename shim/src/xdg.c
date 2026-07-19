@@ -71,6 +71,12 @@ static void toplevel_map(struct wl_listener *listener, void *data) {
 	/* Single-maximized: the window's origin IS the view's origin. */
 	wlr_scene_node_set_position(&t->tree->node, 0, 0);
 	wlr_scene_node_set_enabled(&t->tree->node, true);
+	/* Keyboard focus is synthesized shim-side and held on the app for as
+	 * long as it has a window -- version 1's whole focus policy, and the
+	 * reason there is no focus event on the wire (seat.h, IDL
+	 * `vitrin_shim_seat`). Taken at map rather than at creation because an
+	 * unmapped surface cannot legally receive input. */
+	vitrin_seat_focus_keyboard(t->shim, t->toplevel->base->surface);
 	wlr_log(WLR_INFO, "app window mapped: \"%s\" (%s)",
 		t->toplevel->title ? t->toplevel->title : "(untitled)",
 		t->toplevel->app_id ? t->toplevel->app_id : "(no app id)");
@@ -80,6 +86,11 @@ static void toplevel_unmap(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vitrin_toplevel *t = wl_container_of(listener, t, unmap);
 	wlr_scene_node_set_enabled(&t->tree->node, false);
+	/* Give the keyboard back before the surface stops being able to hold
+	 * it. (Pointer focus needs no such call: wlroots drops it itself when
+	 * the surface is destroyed, and an unmapped surface is out of the scene
+	 * so the next hit test cannot find it.) */
+	vitrin_seat_unfocus_keyboard(t->shim, t->toplevel->base->surface);
 }
 
 static void toplevel_destroy(struct wl_listener *listener, void *data) {
@@ -125,10 +136,20 @@ static void on_new_toplevel(struct wl_listener *listener, void *data) {
 	t->shim = s;
 	t->toplevel = toplevel;
 
-	/* One call covers the toplevel, its subsurfaces AND its popups, so menus
-	 * and tooltips reach the realm view without any extra plumbing -- which
-	 * matters for the apps on the P1.6.4 ladder far more than for the
-	 * single-rectangle case. */
+	/* Covers the toplevel and its subsurfaces, and applies the client's
+	 * window geometry as a position offset -- so a client with CSD shadow
+	 * insets is placed by its geometry rectangle rather than by its buffer,
+	 * which is what makes view coordinates land on the right pixels for
+	 * every GTK/Qt app.
+	 *
+	 * NOT popups: `wlr_scene_xdg_surface_create` positions a popup xdg
+	 * surface but does not create scene nodes for popups a client makes
+	 * later -- that needs an `xdg_shell.events.new_popup` listener, which
+	 * this shim does not have yet (tinywl's `server_new_xdg_popup` is the
+	 * shape it will take). Until it does, a menu or tooltip is neither
+	 * rendered nor clickable. The input path is already ready for them:
+	 * seat.c routes by hit-testing this scene, so a popup becomes
+	 * addressable the moment it becomes visible, with no change there. */
 	t->tree = wlr_scene_xdg_surface_create(&s->scene->tree, toplevel->base);
 	if (t->tree == NULL) {
 		wlr_log(WLR_ERROR, "cannot add the toplevel to the scene");

@@ -19,10 +19,16 @@
 # expat + libxml2 (DTD-validated protocol parsing). Drop them if the base image
 # ever ships wayland >= 1.23.1.
 #
-# The last line adds the shim's headless-acceptance tooling (not wlroots build
-# deps): wayland-info (wayland-utils) checks the advertised globals and
+# The last two lines add the shim's headless-acceptance tooling (not wlroots
+# build deps): wayland-info (wayland-utils) checks the advertised globals and
 # weston-terminal (weston) is the blind client; fonts-dejavu-core lets
 # weston-terminal render glyphs in the bare container.
+#
+# libgtk-3-dev is for the P1.6.3 R5 gate -- "héllo→世界 arrives intact in a GTK
+# text field". That criterion is about the toolkit's INPUT-METHOD layer, not
+# about keysyms, so nothing but a real GtkEntry can prove it; and a criterion
+# that only ever reports SKIP in CI is a criterion nobody is holding. It is a
+# pure C/GLib package, so the no-Rust invariant below is untouched.
 #
 # Invariant checked by CI after this script runs: nothing here may pull
 # rustc/cargo onto PATH (the shim job's no-Rust acceptance criterion).
@@ -37,4 +43,5 @@ apt-get install -y -qq \
   libdrm-dev libgbm-dev libinput-dev libudev-dev libseat-dev \
   libdisplay-info-dev libliftoff-dev hwdata \
   libexpat1-dev libxml2-dev \
-  weston wayland-utils fonts-dejavu-core
+  weston wayland-utils fonts-dejavu-core \
+  libgtk-3-dev

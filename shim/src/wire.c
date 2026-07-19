@@ -485,6 +485,13 @@ static int wire_ready(int fd, uint32_t mask, void *data) {
 	if (vitrin_wire_alive(w) &&
 			(mask & (WL_EVENT_READABLE | WL_EVENT_HANGUP | WL_EVENT_ERROR)) != 0) {
 		if (wire_fill(w) && wire_dispatch(w)) {
+			/* Everything this wakeup delivered has now been handed on, so
+			 * this is the batch boundary (see vitrin_wire_drained_t). It runs
+			 * before the mask update because a drain handler may itself
+			 * queue sends. */
+			if (w->on_drained != NULL) {
+				w->on_drained(w->handler_data);
+			}
 			/* A handler may have queued sends. */
 			wire_update_mask(w);
 		}
@@ -496,8 +503,10 @@ static int wire_ready(int fd, uint32_t mask, void *data) {
 }
 
 bool vitrin_wire_arm(struct vitrin_wire *w, struct wl_event_loop *loop,
-		vitrin_wire_handler_t handler, vitrin_wire_closed_t on_closed, void *data) {
+		vitrin_wire_handler_t handler, vitrin_wire_drained_t on_drained,
+		vitrin_wire_closed_t on_closed, void *data) {
 	w->handler = handler;
+	w->on_drained = on_drained;
 	w->on_closed = on_closed;
 	w->handler_data = data;
 	w->source = wl_event_loop_add_fd(loop, w->fd, WL_EVENT_READABLE, wire_ready, w);

@@ -27,6 +27,7 @@
 #include <wlr/types/wlr_scene.h>
 #include <wlr/util/log.h>
 
+#include "seat.h"
 #include "server.h"
 #include "upstream.h"
 #include "vitrin-protocol.h"
@@ -586,13 +587,11 @@ static bool upstream_message(void *data, const uint8_t *frame, size_t len) {
 		}
 		return true;
 	case VITRIN_SEAT_ID:
-		/* Input replay is P1.6.3. The seat object exists from startup on
-		 * purpose (see upstream.h) -- so it is addressable the moment the
-		 * core has input to route -- and until the replay lands the honest
-		 * thing is to say out loud that an event was received and dropped,
-		 * rather than to have no seat and make the core drop it silently. */
-		wlr_log(WLR_DEBUG, "seat event (opcode %u) dropped: input replay is P1.6.3",
-			hdr.opcode);
+		/* Input replay (P1.6.3). Everything past the routing decision --
+		 * decoding, the origin tag, the dynamic keymap, the view ->
+		 * surface-local mapping -- lives in seat.c; see seat.h for why this
+		 * is the only call into it. */
+		vitrin_seat_handle_event(s, frame, len);
 		return true;
 	default:
 		/* Version 1 has no other objects. The core is the TCB, so this is
@@ -702,6 +701,14 @@ bool vitrin_upstream_open(struct vitrin_shim *s) {
 	return true;
 }
 
+/* One wakeup's worth of core traffic has been dispatched. The only thing
+ * that cares is input replay: the pointer events this batch carried belong
+ * to one group, and `wl_pointer.frame` is how the app is told so (seat.h,
+ * "pointer batching"). */
+static void upstream_drained(void *data) {
+	vitrin_seat_frame_boundary((struct vitrin_shim *)data);
+}
+
 /* The core is gone. Socketpair EOF is how the core says so -- the first rung
  * of its orderly shutdown ladder (P1.5.3), before it escalates to SIGTERM --
  * and a shim that only died on the signal would make every clean shutdown
@@ -724,7 +731,8 @@ bool vitrin_upstream_start(struct vitrin_shim *s) {
 	if (!s->up.active) {
 		return true;
 	}
-	return vitrin_wire_arm(&s->up.wire, s->loop, upstream_message, upstream_closed, s);
+	return vitrin_wire_arm(&s->up.wire, s->loop, upstream_message, upstream_drained,
+		upstream_closed, s);
 }
 
 void vitrin_upstream_finish(struct vitrin_shim *s) {

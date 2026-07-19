@@ -18,6 +18,7 @@
 
 #include <wayland-server-core.h>
 
+#include "seat.h"
 #include "upstream.h"
 
 /* Forward-declare the wlroots types we hold pointers to, so this header
@@ -72,6 +73,10 @@ struct vitrin_shim {
 	struct wlr_compositor *compositor;
 	struct wlr_xdg_shell *xdg_shell;
 	struct wlr_seat *seat;
+	/* Virtual-seat input replay (P1.6.3, seat.h): the dynamic keymap and
+	 * the pointer/keyboard state the core's `vitrin_shim_seat` events are
+	 * replayed through. Lives beside the `wl_seat` it drives. */
+	struct vitrin_seat_replay replay;
 	struct wlr_xdg_decoration_manager_v1 *xdg_decoration;
 	struct wl_listener new_deco; /* xdg_decoration.new_toplevel_decoration */
 

@@ -118,6 +118,7 @@ executable(
     'src/globals.c',
     'src/output.c',
     'src/xdg.c',
+    'src/seat.c',
     'src/wire.c',
     'src/upstream.c',
   ),
@@ -160,3 +161,45 @@ damage_client = executable(
   include_directories: inc,
   dependencies: [wayland_client],
 )
+
+# --- P1.6.3 acceptance harness -----------------------------------------
+# The input half of the wire, from the app's side: a client that receives
+# seat input and resolves every key through the keymap the shim sent it,
+# with xkbcommon, exactly as a real toolkit does. That is what makes the
+# dynamic keymap (D7) testable rather than merely plausible -- and "no
+# duplicates" is a claim only the receiving end can settle.
+input_echo_client = executable(
+  'input-echo-client',
+  files('tests/input_echo_client.c'),
+  xdg_shell_client_header,
+  xdg_shell_code,
+  include_directories: inc,
+  dependencies: [wayland_client, xkbcommon],
+)
+
+# The R5 gate's app: a real GTK text entry, so "héllo→世界 arrives intact in a
+# GTK text field" is measured through a real input-method stack rather than
+# inferred from a keysym stream. OPTIONAL on purpose -- the shim's CI job
+# must stay a small C/wlroots job and must not grow a GTK dependency to
+# build (shim/ci/install-deps.sh), so the probe is built where GTK happens
+# to be present and the acceptance script skips the gate, loudly, where it
+# is not. GTK3 first: its GtkEntry is the widget in most of the legacy apps
+# this shim exists to confine.
+gtk3 = dependency('gtk+-3.0', required: false)
+gtk4 = dependency('gtk4', required: false)
+gtk_entry_probe = disabler()
+if gtk3.found()
+  gtk_entry_probe = executable(
+    'gtk-entry-probe',
+    files('tests/gtk_entry_probe.c'),
+    dependencies: [gtk3],
+  )
+elif gtk4.found()
+  gtk_entry_probe = executable(
+    'gtk-entry-probe',
+    files('tests/gtk_entry_probe.c'),
+    dependencies: [gtk4],
+  )
+else
+  message('GTK not found: the R5 text-field gate will report SKIP, not PASS')
+endif

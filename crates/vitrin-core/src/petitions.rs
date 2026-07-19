@@ -159,13 +159,20 @@
 //! under `AutoApprove` the IDL itself allows "no transitions at all";
 //! tests (and later the renderer) drive the flag.
 //!
-//! **Realm knowledge is a name check in this build.** Version 1 serves the
-//! single well-known realm [`WELL_KNOWN_REALM`]; a petition through a
-//! handle minted with any other name resolves `unavailable` at admission.
-//! Realm *liveness* (vacant/closed while pending) belongs to the realm
-//! manager (P1.5) and joins this check when realms gain lifecycle; surface
-//! vacancy today is a use-time `no_surface` concern (P1.4.4), never a
-//! petition-time lie.
+//! **Realm knowledge is the realm registry's, not this module's** (P1.5.1,
+//! issue #30). Admission asks [`RealmRegistry::resolve_for_petition`]
+//! whether the name the handle was minted with denotes a petitionable
+//! realm, and refuses `unavailable` when it does not -- the IDL's "unknown
+//! **or vacant**" pair, deliberately indistinguishable to the client
+//! because realm absence is a race, not a protocol error. This module
+//! judges no realm facts of its own: which realms exist comes from
+//! `realm.toml`, and whether a realm is vacant is
+//! [`crate::realm::Realm::admits_petitions`], where P1.5.2/P1.5.3 add
+//! lifecycle without touching admission. (Before P1.5.1 this was a
+//! hardcoded comparison against the well-known name.) Surface vacancy
+//! remains a use-time `no_surface` concern (P1.4.4), never a petition-time
+//! lie: a configured realm whose app has not painted is addressable, and
+//! authority over it is inert rather than absent.
 //!
 //! **Policy-check order at admission** (documented determinism):
 //! `unavailable` (addressing: which realm) precedes `unsupported` (policy:
@@ -186,11 +193,7 @@ use crate::grants::{
     GrantId, GrantSpec, GrantTable, InsertError, Issuer, PersistenceRung, RealmId, ResourceRef,
 };
 use crate::identity::PrincipalIdentity;
-
-/// The single well-known realm of version 1 (IDL: `"realm-0"` is the one
-/// realm `get_realm` can name usefully). The realm manager (P1.5) takes
-/// ownership of realm existence when realms gain lifecycle.
-pub(crate) const WELL_KNOWN_REALM: &str = "realm-0";
+use crate::realm::RealmRegistry;
 
 /// A core-global, never-reused identifier for one accepted principal
 /// connection, minted by [`PetitionRegistry::register_connection`]. The
@@ -541,7 +544,15 @@ impl PetitionRegistry {
     /// approval) or enter it pending for a consent decision. Infallible by
     /// construction: admission decides, it never writes the grant table --
     /// rows are minted at delivery (module docs).
-    pub fn admit(&mut self, req: PetitionRequest, now: Instant) -> Admission {
+    ///
+    /// `realms` is the core's realm registry (P1.5.1), consulted for the
+    /// addressing check only; this module holds no realm state of its own.
+    pub fn admit(
+        &mut self,
+        req: PetitionRequest,
+        now: Instant,
+        realms: &RealmRegistry,
+    ) -> Admission {
         let declined = |outcome: Outcome| {
             Admission::Resolved(Resolution {
                 connection: req.connection,
@@ -554,11 +565,12 @@ impl PetitionRegistry {
         };
 
         // Addressing first: which realm is being asked about. Realm absence
-        // is a race, not a protocol error (IDL); in this build the check is
-        // the well-known name (module docs: liveness joins with P1.5).
-        if req.realm_name != WELL_KNOWN_REALM {
+        // is a race, not a protocol error (IDL), and unknown and vacant are
+        // one answer here by design -- the registry collapses them so a
+        // petitioner cannot probe which realms merely exist.
+        let Some(realm) = realms.resolve_for_petition(&req.realm_name).cloned() else {
             return declined(Outcome::Unavailable);
-        }
+        };
 
         // Policy refusals, each "honest refusal rather than
         // accepted-and-unenforced" (IDL): a set reserved flag bit, a
@@ -589,7 +601,6 @@ impl PetitionRegistry {
             expiry_ms: req.expiry_ms,
             max_event_rate: self.resolve_rate(req.max_event_rate),
         };
-        let realm = RealmId::new(WELL_KNOWN_REALM);
 
         match self.policy {
             ConsentPolicy::AutoApprove => {
@@ -860,6 +871,13 @@ mod tests {
         PetitionRegistry::new(policy, PetitionConfig::default())
     }
 
+    /// The realm registry admission consults: one configured realm under
+    /// the well-known default id, exactly what a minimal `realm.toml`
+    /// produces.
+    fn realms() -> RealmRegistry {
+        crate::realm::tests::registry_with(&[crate::realm::DEFAULT_REALM_ID])
+    }
+
     /// A wire-valid whole-realm petition for `who`, with wire ids picked by
     /// the caller (arbitrary at this level -- object rules are the
     /// connection server's).
@@ -867,7 +885,7 @@ mod tests {
         PetitionRequest {
             connection,
             identity: identity(who),
-            realm_name: WELL_KNOWN_REALM.into(),
+            realm_name: crate::realm::DEFAULT_REALM_ID.into(),
             grant_wire_id,
             consent_wire_id: grant_wire_id + 1,
             resource: String::new(),
@@ -907,24 +925,80 @@ mod tests {
         req.realm_name = "realm-9".into();
         req.flags = 1;
         req.persistence = WirePersistence::Always;
-        expect_declined(reg.admit(req, t0), Outcome::Unavailable);
+        expect_declined(reg.admit(req, t0, &realms()), Outcome::Unavailable);
 
         // Reserved flags before rung: both set, flags is checked first --
         // but both are the same outcome, so assert each in isolation.
         let mut req = request(DEMO, conn, 20);
         req.flags = 0b1;
-        expect_declined(reg.admit(req, t0), Outcome::Unsupported);
+        expect_declined(reg.admit(req, t0, &realms()), Outcome::Unsupported);
         let mut req = request(DEMO, conn, 30);
         req.persistence = WirePersistence::UntilRevoked;
-        expect_declined(reg.admit(req, t0), Outcome::Unsupported);
+        expect_declined(reg.admit(req, t0, &realms()), Outcome::Unsupported);
         let mut req = request(DEMO, conn, 40);
         req.resource = "surface:main".into();
-        expect_declined(reg.admit(req, t0), Outcome::Unsupported);
+        expect_declined(reg.admit(req, t0, &realms()), Outcome::Unsupported);
 
         // None of the refusals entered the pending table (and admission
         // never writes the grant table at all -- rows are minted at
         // delivery).
         assert_eq!(reg.pending_total(), 0);
+    }
+
+    #[test]
+    fn admission_resolves_the_realm_name_against_the_registry() {
+        // P1.5.1: the `unavailable` judgement is a registry lookup, not a
+        // comparison against a well-known constant. A registry that serves
+        // only "kiosk" admits "kiosk" and refuses "realm-0" -- the exact
+        // inversion a hardcode could not produce.
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::Interactive);
+        let conn = reg.register_connection();
+        let realms = crate::realm::tests::registry_with(&["kiosk"]);
+
+        let mut req = request(DEMO, conn, 10);
+        req.realm_name = "kiosk".into();
+        let Admission::Pending { .. } = reg.admit(req, t0, &realms) else {
+            panic!("a configured realm must admit petitions");
+        };
+
+        let mut req = request(DEMO, conn, 20);
+        req.realm_name = crate::realm::DEFAULT_REALM_ID.into();
+        expect_declined(reg.admit(req, t0, &realms), Outcome::Unavailable);
+
+        // An empty registry is the vacant case the IDL folds into the same
+        // answer: every name resolves unavailable, none is distinguishable.
+        let empty = crate::realm::tests::registry_with(&[]);
+        let mut req = request(DEMO, conn, 30);
+        req.realm_name = "kiosk".into();
+        expect_declined(reg.admit(req, t0, &empty), Outcome::Unavailable);
+        assert_eq!(reg.pending_total(), 1, "only the kiosk petition pended");
+    }
+
+    #[test]
+    fn a_granted_petition_states_the_registrys_realm_id_on_its_row() {
+        // The realm a grant attaches to is the registry's id, not a
+        // constant: `realm:<id>` is the MVP's whole-realm grant scope.
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::AutoApprove);
+        let conn = reg.register_connection();
+        let realms = crate::realm::tests::registry_with(&["kiosk"]);
+        let mut req = request(DEMO, conn, 10);
+        req.realm_name = "kiosk".into();
+
+        let Admission::Resolved(res) = reg.admit(req, t0, &realms) else {
+            panic!("auto-approve resolves immediately");
+        };
+        let Verdict::Granted { grant } = res.verdict else {
+            panic!("auto-approve grants");
+        };
+        assert_eq!(grant.realm, RealmId::new("kiosk"));
+        let mut grants = GrantTable::new();
+        let row = grant.insert_row(&mut grants, t0).unwrap();
+        assert_eq!(
+            grants.get(row, t0).unwrap().0.realm_id,
+            RealmId::new("kiosk")
+        );
     }
 
     #[test]
@@ -939,12 +1013,15 @@ mod tests {
         for who in 0..4 {
             for i in 0..4 {
                 let req = request(&format!("vitrin://local/agent/a{who}"), conn, 100 * who + i);
-                assert!(matches!(reg.admit(req, t0), Admission::Pending { .. }));
+                assert!(matches!(
+                    reg.admit(req, t0, &realms()),
+                    Admission::Pending { .. }
+                ));
             }
         }
         assert_eq!(reg.pending_total(), 16);
         let req = request("vitrin://local/agent/fifth", conn, 900);
-        expect_declined(reg.admit(req, t0), Outcome::Busy);
+        expect_declined(reg.admit(req, t0, &realms()), Outcome::Busy);
     }
 
     #[test]
@@ -957,7 +1034,8 @@ mod tests {
         let conn_a = reg.register_connection();
         let conn_b = reg.register_connection();
 
-        let Admission::Pending { petition } = reg.admit(request(DEMO, conn_a, 10), t0) else {
+        let Admission::Pending { petition } = reg.admit(request(DEMO, conn_a, 10), t0, &realms())
+        else {
             panic!("interactive petition must pend");
         };
         // Queued is not up: nothing is on screen yet.
@@ -978,7 +1056,8 @@ mod tests {
 
         // Withdrawal ends the hold the same way (the prompt disappears
         // with the petitioner), and a gone petition cannot be marked.
-        let Admission::Pending { petition } = reg.admit(request(DEMO, conn_b, 10), t0) else {
+        let Admission::Pending { petition } = reg.admit(request(DEMO, conn_b, 10), t0, &realms())
+        else {
             panic!("interactive petition must pend");
         };
         assert!(reg.mark_prompt_shown(petition));
@@ -997,7 +1076,7 @@ mod tests {
         // Petition: observe|text, while_running, bounded to 60s.
         let mut req = request(DEMO, conn, 10);
         req.expiry_ms = 60_000;
-        let Admission::Pending { petition } = reg.admit(req, t0) else {
+        let Admission::Pending { petition } = reg.admit(req, t0, &realms()) else {
             panic!("interactive petition must pend");
         };
 
@@ -1050,7 +1129,7 @@ mod tests {
         // A once-rung petition cannot be approved while_running.
         let mut once = request(DEMO, conn, 20);
         once.persistence = WirePersistence::Once;
-        let Admission::Pending { petition: once_pet } = reg.admit(once, t0) else {
+        let Admission::Pending { petition: once_pet } = reg.admit(once, t0, &realms()) else {
             panic!("interactive petition must pend");
         };
         assert!(matches!(
@@ -1106,12 +1185,12 @@ mod tests {
 
         for wire in [10, 20] {
             assert!(matches!(
-                reg.admit(request(DEMO, a, wire), t0),
+                reg.admit(request(DEMO, a, wire), t0, &realms()),
                 Admission::Pending { .. }
             ));
         }
         assert!(matches!(
-            reg.admit(request(DEMO, b, 10), t0),
+            reg.admit(request(DEMO, b, 10), t0, &realms()),
             Admission::Pending { .. }
         ));
 
@@ -1134,7 +1213,7 @@ mod tests {
 
         // rate 0 -> the documented 20/s default, on the approval and on
         // the row its delivery-time insert mints.
-        let Admission::Resolved(res) = reg.admit(request(DEMO, conn, 10), t0) else {
+        let Admission::Resolved(res) = reg.admit(request(DEMO, conn, 10), t0, &realms()) else {
             panic!("auto-approve resolves immediately");
         };
         let Verdict::Granted { grant } = res.verdict else {
@@ -1150,7 +1229,7 @@ mod tests {
         // An explicit rate is honored verbatim.
         let mut req = request(DEMO, conn, 20);
         req.max_event_rate = 5;
-        let Admission::Resolved(res) = reg.admit(req, t0) else {
+        let Admission::Resolved(res) = reg.admit(req, t0, &realms()) else {
             panic!("auto-approve resolves immediately");
         };
         let Verdict::Granted { grant } = res.verdict else {

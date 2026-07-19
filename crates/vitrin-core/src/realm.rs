@@ -1,0 +1,1189 @@
+//! The realm object and the realm registry (P1.5.1, issue #30): the core's
+//! model of *what a realm is*, loaded from `realm.toml` at startup.
+//!
+//! A realm is an **addressing scope** (IDL, `vitrin_realm`: "grants attach
+//! to realms, and apps launch into realms ... deliberately authority-free")
+//! plus the ownership of one confined app. Concretely, one [`Realm`] here:
+//!
+//! - carries the stable [`RealmId`] the wire names (`get_realm("realm-0")`)
+//!   and every grant row keys on ([`crate::grants`]'s `realm_id` column);
+//!   the MVP's whole-realm grant scope, `realm:realm-0`, is this id;
+//! - **owns** the spawn configuration of its app ([`SpawnConfig`]) without
+//!   executing it -- launching is P1.5.2 (issue #31), lifecycle and crash
+//!   detection are P1.5.3 (issue #32);
+//! - is the subject of the composited realm view ([`crate::scene`], P1.3.3)
+//!   that capture reads, and of the chokepoint's `no_surface` judgement
+//!   when that view is not live ([`crate::enforcement`]).
+//!
+//! [`RealmRegistry`] is the **single source of truth for realm existence**.
+//! Before this task, [`crate::petitions`] answered "does this realm exist?"
+//! with a hardcoded comparison against the well-known name; it now asks the
+//! registry, so the answer comes from configuration and from realm state
+//! rather than from a constant. Version 0 holds exactly one realm, but the
+//! registry is a keyed collection, so Phase 3's fleet adds rows and
+//! lifecycle events rather than replacing the addressing model -- exactly
+//! the IDL's reason for putting realm ids on the wire from day one.
+//!
+//! # `realm.toml` schema (decided here, per issue #30)
+//!
+//! An array of `[[realm]]` tables in the core's strict TOML subset
+//! ([`crate::toml_subset`] -- the same dialect as `principals.toml`; see
+//! `examples/realm.toml` for a commented template). Version 0 requires
+//! **exactly one** table. Keys:
+//!
+//! | key | type | required | meaning |
+//! |---|---|---|---|
+//! | `id` | string | no (default `"realm-0"`) | the realm's stable, wire-visible name: what `vitrin_principal.get_realm` addresses, what grant rows state, and the directory name of the realm's private runtime tree. At most 64 bytes over `[A-Za-z0-9._-]`, never `.` or `..` |
+//! | `command` | string | **yes** | absolute path of the program the realm launches (P1.5.2 execs it) |
+//! | `args` | array of strings | no (default `[]`) | arguments **after** `argv[0]`; the core supplies `argv[0]` itself from `command` |
+//! | `env_allow` | array of strings | no (default `[]`) | names of environment variables passed through from the core's own environment; see below |
+//!
+//! ## The environment allowlist: names, not pairs, and default-deny
+//!
+//! `env_allow` lists variable **names** whose values are copied from the
+//! core's environment into the app's. It is deliberately *not* a
+//! `name = "value"` map, and version 0 has no key that is:
+//!
+//! - **Default-deny is the only safe default for a TCB-spawned child.** The
+//!   core's environment is a session environment: it holds the host
+//!   compositor's socket, the session bus address, agent-forwarding sockets,
+//!   and whatever the operator's shell exported. Inheriting it wholesale
+//!   would hand a confined app the ambient authority the confinement exists
+//!   to remove. An **absent or empty `env_allow` therefore means an empty
+//!   inherited environment** -- the app starts with nothing but what the
+//!   core injects for it (P1.5.2 sets the realm's own `WAYLAND_DISPLAY`,
+//!   pointing at the shim's private socket, plus its runtime directory).
+//!   That is a real, working configuration, not a degenerate one.
+//! - **Literal `name = "value"` pairs would invite exactly the two
+//!   re-litigations this design forbids.** P1.5.2 scrubs `DISPLAY` and the
+//!   host `WAYLAND_DISPLAY` unconditionally, because a confined app that can
+//!   see the host display server is not confined; a config file able to set
+//!   arbitrary values could set those two back and quietly void the
+//!   confinement. Passing *names* cannot: [`RESERVED_ENV`] is refused at
+//!   load, loudly, naming the variable. (A pass-through name whose value
+//!   happens to be attacker-influenced is the operator's own environment --
+//!   the same trust as the config file itself.)
+//! - Explicit pairs are a plausible future convenience and stay purely
+//!   additive: a later `env_set` key can arrive without changing the
+//!   meaning of `env_allow`.
+//!
+//! A name in `env_allow` that is unset in the core's environment is simply
+//! not passed -- not an error. Config validity must not depend on ambient
+//! environment, or the same file would load on one machine and fail on
+//! another; `HOME` being unset is a property of the run, not of the file.
+//! Name *shape* is validated ([`is_env_name`]): a POSIX portable name, so a
+//! typo like `"LANG=en_US"` is refused rather than becoming an
+//! unsettable variable.
+//!
+//! # Validation strictness (decided here): refuse, never default
+//!
+//! Beyond the subset's own grammar, loading refuses:
+//!
+//! - **an unknown key** -- a security-relevant config whose typo'd key
+//!   silently does nothing (`env_alow`) is a fail-open trap that reads like
+//!   success;
+//! - **a missing or empty `command`** -- a realm with no app is not a realm
+//!   with a default app, and there is no sane program to guess;
+//! - **a relative `command`** -- resolution through `PATH` would make what
+//!   the TCB executes depend on ambient environment, and the child's
+//!   environment is default-deny, so a relative name would silently resolve
+//!   against the *core's* `PATH` instead of anything the operator can see in
+//!   this file. An absolute path is the only spelling that means one thing;
+//! - **zero or more than one `[[realm]]` table** -- version 0 serves exactly
+//!   one realm. This is a *cardinality* rule in the validator, not a
+//!   grammar limit: the file format is already an array of tables, so Phase
+//!   3 raises [`MAX_REALMS`] and the schema does not move;
+//! - **a duplicate key, a duplicate realm id, a duplicate or reserved
+//!   `env_allow` name, or an ill-shaped id** -- each names the offending
+//!   text and why.
+//!
+//! Every refusal is a hard startup error carrying the file path, the line
+//! where a line is meaningful, and the specific problem. A core that comes
+//! up with a realm the operator did not describe is worse than a core that
+//! does not come up.
+//!
+//! # File permissions (decided here): not-writable, unlike `principals.toml`
+//!
+//! `realm.toml` holds no secrets, so it is *not* held to the
+//! secret-material posture [`crate::identity`] applies to `principals.toml`
+//! (which refuses any group/other access because it holds bearer tokens).
+//! It is held to a different one for a different reason: this file names
+//! the program the TCB will execute, so **whoever can write it chooses what
+//! the trusted core spawns**. Loading therefore refuses a file that is not
+//! a regular file, is not owned by the core's own effective uid, or is
+//! writable by group or other (any `0o022` bit). World-*readable* is fine
+//! -- a command line is not secret. The check runs on the opened fd
+//! (`fstat`), so there is no stat-then-open TOCTOU window.
+//!
+//! # Vacancy: what version 0 answers, and where P1.5.2/P1.5.3 flip it
+//!
+//! The IDL is precise: `get_realm` always succeeds structurally, and "a name
+//! that is unknown **or vacant** yields a handle whose petitions resolve
+//! `unavailable` -- realm absence is a race, not a protocol error". So the
+//! core must answer, at petition time, one question: does this name denote a
+//! realm that can be petitioned for?
+//!
+//! **Version 0's answer: a configured realm is petitionable, whether or not
+//! its app is running.** Unknown and vacant coincide today -- a name resolves
+//! to a realm or it does not. The reasoning:
+//!
+//! - A realm *is* its addressing scope plus its spawn ownership, and both
+//!   exist the moment the config loads. Grants attach to realms, not to
+//!   processes; `realm:realm-0` is meaningful before the app starts and
+//!   stays meaningful across a restart, which is precisely why realm ids and
+//!   process lifetimes are separate concepts.
+//! - Petition time is an **addressing** question. Whether anything is on
+//!   screen is a **use-time** question, and the enforcement chokepoint
+//!   already answers it, refusing `no_surface` when the realm view is not
+//!   live (P1.4.4). Answering "unavailable" at petition time for a realm
+//!   that exists would move a liveness fact into an addressing answer and
+//!   tell the agent the realm is *absent* when it is merely *not yet
+//!   painted*. [`crate::petitions`] already recorded this split.
+//! - Fail-closed is preserved by the layer that owns it: an agent may hold a
+//!   grant over a realm whose app never starts, and every use of it refuses
+//!   `no_surface`. Authority without a target is inert, not dangerous.
+//!
+//! **The flip point is one predicate**, [`Realm::admits_petitions`], and it
+//! is the only thing P1.5.2/P1.5.3 need to touch. Version 0 has a single
+//! [`RealmState`] variant, `Configured`, and the predicate returns `true`
+//! for it. When P1.5.2 spawns and P1.5.3 detects exit, they add variants
+//! (`Running`, `Exited`, ...) and decide there whether a realm whose app has
+//! terminated for good is vacant -- a one-arm change in one function, with
+//! no signature, no caller, and no wire behavior moving. [`crate::petitions`]
+//! asks [`RealmRegistry::resolve_for_petition`], which is the registry's
+//! only petition-time entry point and already routes through that predicate.
+//!
+//! # Where the config path comes from
+//!
+//! `vitrind --realm PATH` (the `--consent` / `--recorder` spelling: both
+//! `--realm PATH` and `--realm=PATH`), defaulting to
+//! `$XDG_CONFIG_HOME/vitrin/realm.toml` -- falling back, per the XDG base
+//! directory specification, to `$HOME/.config/vitrin/realm.toml`. That is
+//! the same directory `principals.toml` is conventionally read from.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+
+use crate::grants::RealmId;
+use crate::toml_subset::{self, SubsetError};
+
+/// The default realm id when `realm.toml` omits `id`, and the well-known
+/// name the IDL documents for version 1 ("`realm-0`" is the single realm
+/// `get_realm` can name usefully). A *default*, not a constraint: the
+/// registry serves whatever the file configures, which is what makes the
+/// petition-time existence check a real lookup rather than a constant
+/// comparison wearing a lookup's clothes.
+pub(crate) const DEFAULT_REALM_ID: &str = "realm-0";
+
+/// Conventional file name under the core's configuration directory.
+pub(crate) const CONFIG_FILE_NAME: &str = "realm.toml";
+
+/// How many realms version 0 serves. The cardinality rule the loader
+/// enforces; Phase 3's fleet raises it without touching the schema.
+pub(crate) const MAX_REALMS: usize = 1;
+
+/// Environment variable names `env_allow` may not carry, because P1.5.2
+/// decides them unconditionally: a confined app that can see the host
+/// display server is not confined, so the host `DISPLAY` and
+/// `WAYLAND_DISPLAY` are scrubbed and the realm's own `WAYLAND_DISPLAY` is
+/// injected. Refusing them here keeps that decision out of reach of
+/// configuration (module docs) instead of letting a file silently void the
+/// confinement.
+pub(crate) const RESERVED_ENV: [&str; 2] = ["DISPLAY", "WAYLAND_DISPLAY"];
+
+/// What one realm will launch: owned by the realm from load time,
+/// **executed by nobody in this build** (P1.5.2, issue #31, owns fork/exec).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpawnConfig {
+    /// Absolute path of the program to execute.
+    command: PathBuf,
+    /// Arguments after `argv[0]`; the core supplies `argv[0]` from
+    /// [`command`](Self::command).
+    args: Vec<String>,
+    /// Names passed through from the core's environment (module docs:
+    /// names, not pairs; empty means an empty inherited environment).
+    env_allow: Vec<String>,
+}
+
+impl SpawnConfig {
+    pub fn command(&self) -> &Path {
+        &self.command
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    pub fn env_allow(&self) -> &[String] {
+        &self.env_allow
+    }
+
+    /// The inherited half of the app's environment: each allow-listed name
+    /// that `lookup` resolves, in allowlist order. Names the lookup does
+    /// not resolve are skipped (module docs: an unset variable is a
+    /// property of the run, not a config error).
+    ///
+    /// `lookup` is a parameter rather than a direct `std::env` read so the
+    /// semantics are testable without mutating process state; P1.5.2 calls
+    /// it with `std::env::var`, then adds the variables the core injects
+    /// and scrubs [`RESERVED_ENV`] -- which cannot appear here, because
+    /// loading refused them.
+    pub fn inherited_env<F>(&self, lookup: F) -> Vec<(String, String)>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        self.env_allow
+            .iter()
+            .filter_map(|name| lookup(name).map(|value| (name.clone(), value)))
+            .collect()
+    }
+}
+
+/// A realm's lifecycle state. Version 0 has exactly one variant: nothing
+/// spawns yet. P1.5.2 adds the running states and P1.5.3 the terminal ones;
+/// [`Realm::admits_petitions`] is where those variants decide vacancy
+/// (module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RealmState {
+    /// Described by `realm.toml` and addressable; no app process yet.
+    Configured,
+}
+
+/// One realm: its wire-visible identity, the app it owns, and its state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Realm {
+    id: RealmId,
+    spawn: SpawnConfig,
+    state: RealmState,
+}
+
+impl Realm {
+    /// The stable, wire-visible id: what `get_realm` addresses and what
+    /// grant rows state.
+    pub fn id(&self) -> &RealmId {
+        &self.id
+    }
+
+    /// The app this realm owns (P1.5.2 executes it).
+    pub fn spawn(&self) -> &SpawnConfig {
+        &self.spawn
+    }
+
+    pub fn state(&self) -> RealmState {
+        self.state
+    }
+
+    /// **The vacancy predicate** (module docs): may a petition naming this
+    /// realm be admitted, or is the realm vacant and its petitions bound to
+    /// resolve `unavailable`? The single place realm state becomes a
+    /// petition-time answer -- P1.5.2/P1.5.3 add their state arms here and
+    /// nothing else moves.
+    pub fn admits_petitions(&self) -> bool {
+        match self.state {
+            // Configured but not yet running is addressable, not vacant: a
+            // grant over a realm whose app has not painted is inert at the
+            // enforcement chokepoint (`no_surface`), never a lie about the
+            // realm's existence.
+            RealmState::Configured => true,
+        }
+    }
+}
+
+/// The core's realm registry: **the** answer to realm existence, and the
+/// owner of every realm's spawn configuration. One instance per core
+/// process, beside the one grant table and the one petition registry.
+///
+/// Version 0 holds exactly one realm ([`MAX_REALMS`]); the map keying is
+/// what makes Phase 3's multiplicity additive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RealmRegistry {
+    /// Keyed by id, so lookup is by the name the wire carries and
+    /// enumeration is deterministic.
+    realms: BTreeMap<RealmId, Realm>,
+}
+
+impl RealmRegistry {
+    /// Read, validate, and load `realm.toml` at `path`. Every error names
+    /// the path (module docs); startup aborts on any of them.
+    pub fn load(path: &Path) -> Result<Self, RealmConfigError> {
+        let at = |kind: ErrorKind| RealmConfigError {
+            path: path.to_path_buf(),
+            kind,
+        };
+        let mut file = fs::File::open(path).map_err(|e| at(ErrorKind::Io(e)))?;
+        check_config_security(&file).map_err(at)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .map_err(|e| at(ErrorKind::Io(e)))?;
+        let specs = parse_config(&text).map_err(at)?;
+        Self::from_specs(specs).map_err(at)
+    }
+
+    /// Build a registry from parsed tables, enforcing the cross-table
+    /// invariants (cardinality, unique ids). Shared by [`load`](Self::load)
+    /// and tests, so no constructor can bypass them.
+    pub fn from_specs(specs: Vec<RealmSpec>) -> Result<Self, ErrorKind> {
+        if specs.is_empty() {
+            return Err(ErrorKind::Invalid(
+                "no [[realm]] table: the core has nothing to serve".into(),
+            ));
+        }
+        if specs.len() > MAX_REALMS {
+            return Err(ErrorKind::Invalid(format!(
+                "{} [[realm]] tables, but this version serves exactly {MAX_REALMS} \
+                 (multi-realm is Phase 3)",
+                specs.len()
+            )));
+        }
+        let mut realms = BTreeMap::new();
+        for spec in specs {
+            let realm = Realm {
+                id: spec.id.clone(),
+                spawn: spec.spawn,
+                state: RealmState::Configured,
+            };
+            if realms.insert(spec.id.clone(), realm).is_some() {
+                return Err(ErrorKind::Invalid(format!(
+                    "duplicate realm id {:?}",
+                    spec.id.as_str()
+                )));
+            }
+        }
+        Ok(Self { realms })
+    }
+
+    /// **The petition-time existence query** ([`crate::petitions`]'s
+    /// `unavailable` judgement): the realm id a wire name denotes, or
+    /// `None` when the name is unknown *or* the realm is vacant -- the two
+    /// cases the IDL deliberately makes indistinguishable to the client.
+    /// Routed through [`Realm::admits_petitions`], so realm state joins the
+    /// answer in P1.5.2/P1.5.3 without a new call site.
+    pub fn resolve_for_petition(&self, name: &str) -> Option<&RealmId> {
+        self.realms
+            .get(&RealmId::new(name))
+            .filter(|realm| realm.admits_petitions())
+            .map(Realm::id)
+    }
+
+    /// The realm with this id, whatever its state (the spawn manager's
+    /// lookup; petitions use [`resolve_for_petition`](Self::resolve_for_petition)).
+    pub fn get(&self, name: &str) -> Option<&Realm> {
+        self.realms.get(&RealmId::new(name))
+    }
+
+    /// Every realm, in id order.
+    pub fn iter(&self) -> impl Iterator<Item = &Realm> {
+        self.realms.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.realms.len()
+    }
+}
+
+/// One validated `[[realm]]` table, before it becomes a [`Realm`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RealmSpec {
+    pub id: RealmId,
+    pub spawn: SpawnConfig,
+}
+
+/// `$XDG_CONFIG_HOME/vitrin/realm.toml`, falling back to
+/// `$HOME/.config/vitrin/realm.toml` (XDG base directory specification).
+/// A core that cannot name its configuration directory cannot find its
+/// realm either, so this is an error rather than a silent relative path.
+pub(crate) fn default_config_path() -> Result<PathBuf, ConfigPathError> {
+    Ok(config_dir()?.join(CONFIG_FILE_NAME))
+}
+
+/// `$XDG_CONFIG_HOME/vitrin` (or `$HOME/.config/vitrin`) -- also where
+/// `principals.toml` conventionally lives, so the `--principals` flag can
+/// reuse this when the M1.1 listener wiring lands.
+fn config_dir() -> Result<PathBuf, ConfigPathError> {
+    // Per the XDG spec, a relative $XDG_CONFIG_HOME must be ignored:
+    // honoring one would make the config location depend on the cwd
+    // vitrind happened to be started from.
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return Ok(dir.join("vitrin"));
+        }
+    }
+    let home = std::env::var_os("HOME").ok_or(ConfigPathError::NoConfigHome)?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err(ConfigPathError::NoConfigHome);
+    }
+    Ok(home.join(".config").join("vitrin"))
+}
+
+/// Why the default configuration path could not be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfigPathError {
+    /// Neither an absolute `$XDG_CONFIG_HOME` nor an absolute `$HOME`.
+    NoConfigHome,
+}
+
+impl fmt::Display for ConfigPathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigPathError::NoConfigHome => write!(
+                f,
+                "neither $XDG_CONFIG_HOME nor $HOME names an absolute directory"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigPathError {}
+
+/// Why loading `realm.toml` failed -- always a hard startup error, always
+/// naming the file. The core must not come up with a realm the operator
+/// did not describe.
+#[derive(Debug)]
+pub(crate) struct RealmConfigError {
+    pub path: PathBuf,
+    pub kind: ErrorKind,
+}
+
+/// The problem itself, path-free so the pure constructors can produce it.
+#[derive(Debug)]
+pub(crate) enum ErrorKind {
+    /// Filesystem failure opening or reading the file (including "no such
+    /// file": a core with no realm config has nothing to serve).
+    Io(io::Error),
+    /// The file's type, ownership, or mode fails the not-writable policy.
+    Insecure(String),
+    /// The file is outside the strict TOML subset, or a value at a known
+    /// line is malformed.
+    Parse { line: usize, detail: String },
+    /// The tables parse but violate a schema or cross-table rule.
+    Invalid(String),
+}
+
+impl From<SubsetError> for ErrorKind {
+    fn from(e: SubsetError) -> Self {
+        ErrorKind::Parse {
+            line: e.line,
+            detail: e.detail,
+        }
+    }
+}
+
+impl fmt::Display for RealmConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "realm config {}: {}", self.path.display(), self.kind)
+    }
+}
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ErrorKind::Io(e) => write!(f, "i/o error: {e}"),
+            ErrorKind::Insecure(detail) => write!(f, "refused: {detail}"),
+            ErrorKind::Parse { line, detail } => write!(f, "parse error at line {line}: {detail}"),
+            ErrorKind::Invalid(detail) => write!(f, "invalid: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for RealmConfigError {}
+
+/// Refuse a config file that is not a regular file, is not owned by the
+/// core's euid, or is group/other **writable** -- whoever can write this
+/// file chooses what the trusted core executes (module docs). Checked on
+/// the opened fd, so no stat-then-open TOCTOU.
+fn check_config_security(file: &fs::File) -> Result<(), ErrorKind> {
+    let st = rustix::fs::fstat(file).map_err(|e| ErrorKind::Io(e.into()))?;
+    if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile {
+        return Err(ErrorKind::Insecure("not a regular file".into()));
+    }
+    let euid = rustix::process::geteuid().as_raw();
+    if st.st_uid != euid {
+        return Err(ErrorKind::Insecure(format!(
+            "owned by uid {}, not the core's uid {euid}; it names the program the \
+             trusted core will execute",
+            st.st_uid
+        )));
+    }
+    let mode = st.st_mode & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(ErrorKind::Insecure(format!(
+            "mode {mode:03o} is writable by group/other; whoever can write it chooses \
+             what the trusted core spawns -- chmod go-w it"
+        )));
+    }
+    Ok(())
+}
+
+/// One `[[realm]]` table under construction, with the line each value came
+/// from so a validation refusal can point at it.
+#[derive(Default)]
+struct RawRealm {
+    id: Option<(String, usize)>,
+    command: Option<(String, usize)>,
+    args: Option<Vec<String>>,
+    env_allow: Option<(Vec<String>, usize)>,
+}
+
+/// Parse the strict TOML subset into validated specs. Anything outside the
+/// documented schema is an error, never a guess (module docs).
+fn parse_config(text: &str) -> Result<Vec<RealmSpec>, ErrorKind> {
+    let parse_err = |line: usize, detail: String| ErrorKind::Parse { line, detail };
+    let mut raw: Vec<RawRealm> = Vec::new();
+    for (idx, raw_line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            let (header, rest) = toml_subset::table_header(line)
+                .ok_or_else(|| parse_err(line_no, "malformed table header".into()))?;
+            if !matches!(rest.trim_start().chars().next(), None | Some('#')) {
+                return Err(parse_err(
+                    line_no,
+                    "trailing content after table header".into(),
+                ));
+            }
+            if header != "[[realm]]" {
+                return Err(parse_err(
+                    line_no,
+                    "only [[realm]] tables are allowed in this file".into(),
+                ));
+            }
+            raw.push(RawRealm::default());
+            continue;
+        }
+        let Some(realm) = raw.last_mut() else {
+            return Err(parse_err(
+                line_no,
+                "key outside any [[realm]] table (top-level keys are not allowed)".into(),
+            ));
+        };
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| parse_err(line_no, "expected `key = value`".into()))?;
+        let key = key.trim();
+        let value = value.trim_start();
+        match key {
+            "id" => {
+                if realm.id.is_some() {
+                    return Err(parse_err(line_no, "duplicate `id` key".into()));
+                }
+                realm.id = Some((toml_subset::basic_string(value, line_no)?, line_no));
+            }
+            "command" => {
+                if realm.command.is_some() {
+                    return Err(parse_err(line_no, "duplicate `command` key".into()));
+                }
+                realm.command = Some((toml_subset::basic_string(value, line_no)?, line_no));
+            }
+            "args" => {
+                if realm.args.is_some() {
+                    return Err(parse_err(line_no, "duplicate `args` key".into()));
+                }
+                realm.args = Some(toml_subset::string_array(value, line_no)?);
+            }
+            "env_allow" => {
+                if realm.env_allow.is_some() {
+                    return Err(parse_err(line_no, "duplicate `env_allow` key".into()));
+                }
+                realm.env_allow = Some((toml_subset::string_array(value, line_no)?, line_no));
+            }
+            other => {
+                return Err(parse_err(
+                    line_no,
+                    format!(
+                        "unknown key {other:?} (this schema defines id, command, args, env_allow)"
+                    ),
+                ));
+            }
+        }
+    }
+
+    raw.into_iter().map(validate_realm).collect()
+}
+
+/// Turn one parsed table into a validated spec, applying the documented
+/// defaults and refusing everything the module docs say is refused.
+fn validate_realm(raw: RawRealm) -> Result<RealmSpec, ErrorKind> {
+    let parse_err = |line: usize, detail: String| ErrorKind::Parse { line, detail };
+
+    let id = match raw.id {
+        Some((text, line)) => {
+            validate_realm_id(&text).map_err(|detail| parse_err(line, detail))?;
+            RealmId::new(text)
+        }
+        None => RealmId::new(DEFAULT_REALM_ID),
+    };
+
+    let (command, command_line) = raw.command.ok_or_else(|| {
+        ErrorKind::Invalid(format!(
+            "realm {id} is missing `command` (the program the realm launches)"
+        ))
+    })?;
+    if command.is_empty() {
+        return Err(parse_err(
+            command_line,
+            "`command` is empty; a realm with no app is not a realm with a default app".into(),
+        ));
+    }
+    if !Path::new(&command).is_absolute() {
+        return Err(parse_err(
+            command_line,
+            format!(
+                "`command` {command:?} is not an absolute path; a relative program would \
+                 resolve through the core's own $PATH, which this file cannot show"
+            ),
+        ));
+    }
+    let command = PathBuf::from(command);
+
+    let mut env_allow = Vec::new();
+    if let Some((names, line)) = raw.env_allow {
+        for name in names {
+            if !is_env_name(&name) {
+                return Err(parse_err(
+                    line,
+                    format!(
+                        "`env_allow` entry {name:?} is not an environment variable name \
+                         (expected [A-Za-z_][A-Za-z0-9_]*; env_allow carries NAMES passed \
+                         through from the core's environment, not name=value pairs)"
+                    ),
+                ));
+            }
+            if RESERVED_ENV.contains(&name.as_str()) {
+                return Err(parse_err(
+                    line,
+                    format!(
+                        "`env_allow` entry {name:?} is decided by the core, not by config: \
+                         the realm's app is confined to its own display server, so the host \
+                         {name} is scrubbed and the realm's own value injected at spawn"
+                    ),
+                ));
+            }
+            if env_allow.contains(&name) {
+                return Err(parse_err(
+                    line,
+                    format!("duplicate `env_allow` entry {name:?}"),
+                ));
+            }
+            env_allow.push(name);
+        }
+    }
+
+    Ok(RealmSpec {
+        id,
+        spawn: SpawnConfig {
+            command,
+            args: raw.args.unwrap_or_default(),
+            env_allow,
+        },
+    })
+}
+
+/// A realm id must be usable both on the wire (`get_realm`'s `name`, max
+/// 64 bytes) and as the single path component of the realm's private
+/// runtime directory. Rather than restate those rules, ask the transport's
+/// own validator -- the one definition of a legal realm id -- by having it
+/// build that directory path under an arbitrary base: the function is pure
+/// and validates the id before joining, so id rules can never drift
+/// between the two crates.
+fn validate_realm_id(id: &str) -> Result<(), String> {
+    vitrin_ipc::paths::shim_runtime_dir_in(Path::new("/"), id)
+        .map(|_| ())
+        .map_err(|e| {
+            format!(
+                "`id` {id:?} is not a legal realm id ({e}); it must be at most 64 bytes over \
+                 [A-Za-z0-9._-] and never `.` or `..`, because it names both the wire realm \
+                 and the realm's private runtime directory"
+            )
+        })
+}
+
+/// A POSIX portable environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+/// Deliberately stricter than what `setenv` tolerates, so a `"LANG=en_US"`
+/// entry is refused as the misunderstanding it is rather than becoming an
+/// unsettable variable.
+fn is_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    /// The minimal valid file: one realm, one absolute command.
+    const MINIMAL: &str = "[[realm]]\ncommand = \"/usr/bin/true\"\n";
+
+    /// A registry holding exactly the named realms, all `Configured` --
+    /// what a `realm.toml` naming them would produce. The fixture other
+    /// modules' tests build their realm environment from, so no test
+    /// invents a realm the loader could not have produced.
+    ///
+    /// Bypasses [`MAX_REALMS`] deliberately: callers that need two realms
+    /// are testing addressing, not the version-0 cardinality rule (which
+    /// [`RealmRegistry::from_specs`] enforces and this module's own tests
+    /// cover).
+    pub(crate) fn registry_with(ids: &[&str]) -> RealmRegistry {
+        RealmRegistry {
+            realms: ids
+                .iter()
+                .map(|id| {
+                    let id = RealmId::new(*id);
+                    let realm = Realm {
+                        id: id.clone(),
+                        spawn: SpawnConfig {
+                            command: PathBuf::from("/usr/bin/true"),
+                            args: Vec::new(),
+                            env_allow: Vec::new(),
+                        },
+                        state: RealmState::Configured,
+                    };
+                    (id, realm)
+                })
+                .collect(),
+        }
+    }
+
+    fn registry_from(text: &str) -> Result<RealmRegistry, ErrorKind> {
+        RealmRegistry::from_specs(parse_config(text)?)
+    }
+
+    /// A scratch `realm.toml` with the given mode, in a private temp dir.
+    /// Returns `(dir, path)`; the caller removes the dir.
+    fn config_file(text: &str, mode: u32) -> (PathBuf, PathBuf) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vitrin-realm-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, text).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        (dir, path)
+    }
+
+    // -- the realm object and its addressability ---------------------------
+
+    #[test]
+    fn the_realm_is_addressable_by_a_stable_id_defaulting_to_realm_0() {
+        // Acceptance criterion 1: the realm has a stable id visible to
+        // clients -- `get_realm("realm-0")` names *this* object.
+        let registry = registry_from(MINIMAL).unwrap();
+        assert_eq!(registry.len(), 1);
+        let realm = registry.get(DEFAULT_REALM_ID).expect("realm-0 exists");
+        assert_eq!(realm.id().as_str(), "realm-0");
+        assert_eq!(realm.state(), RealmState::Configured);
+        assert_eq!(realm.spawn().command(), Path::new("/usr/bin/true"));
+        assert!(realm.spawn().args().is_empty());
+        assert!(realm.spawn().env_allow().is_empty());
+        // The id is what grant rows key on: same value, same type.
+        assert_eq!(
+            registry.resolve_for_petition("realm-0"),
+            Some(&RealmId::new("realm-0"))
+        );
+    }
+
+    #[test]
+    fn realm_existence_comes_from_config_not_from_a_constant() {
+        // The point of the registry: an id the operator chose resolves, and
+        // the well-known name does NOT when it is not what was configured.
+        // A hardcoded "realm-0" check would pass this test backwards.
+        let registry =
+            registry_from("[[realm]]\nid = \"kiosk\"\ncommand = \"/usr/bin/true\"\n").unwrap();
+        assert_eq!(
+            registry.resolve_for_petition("kiosk"),
+            Some(&RealmId::new("kiosk"))
+        );
+        assert_eq!(registry.resolve_for_petition(DEFAULT_REALM_ID), None);
+    }
+
+    #[test]
+    fn unknown_names_resolve_to_nothing_and_a_configured_realm_admits_petitions() {
+        // The IDL's "unknown or vacant" pair: version 0 answers vacancy by
+        // presence alone, and a configured-but-not-running realm is NOT
+        // vacant (module docs). P1.5.2/P1.5.3 flip this in
+        // `Realm::admits_petitions` and nowhere else.
+        let registry = registry_from(MINIMAL).unwrap();
+        for unknown in ["realm-1", "", "realm-0 ", "REALM-0"] {
+            assert_eq!(
+                registry.resolve_for_petition(unknown),
+                None,
+                "{unknown:?} must not resolve"
+            );
+        }
+        let realm = registry.get(DEFAULT_REALM_ID).unwrap();
+        assert!(
+            realm.admits_petitions(),
+            "a configured realm whose app has not started is addressable, not vacant: \
+             liveness is the chokepoint's no_surface judgement, not a petition-time lie"
+        );
+    }
+
+    // -- schema: required, optional, and defaulted keys --------------------
+
+    #[test]
+    fn args_and_env_allow_parse_and_default_to_empty() {
+        let registry = registry_from(
+            "[[realm]]\n\
+             id = \"realm-0\"\n\
+             command = \"/usr/bin/foot\"\n\
+             args = [\"-e\", \"bash\", \"-lc\", \"echo hi\"]\n\
+             env_allow = [\"HOME\", \"LANG\"]\n",
+        )
+        .unwrap();
+        let spawn = registry.get("realm-0").unwrap().spawn();
+        assert_eq!(spawn.command(), Path::new("/usr/bin/foot"));
+        assert_eq!(spawn.args(), ["-e", "bash", "-lc", "echo hi"]);
+        assert_eq!(spawn.env_allow(), ["HOME", "LANG"]);
+
+        // Omitted entirely, and explicitly empty, mean the same thing.
+        for text in [
+            MINIMAL,
+            "[[realm]]\ncommand = \"/usr/bin/true\"\nargs = []\nenv_allow = []\n",
+        ] {
+            let spawn = registry_from(text).unwrap();
+            let spawn = spawn.get(DEFAULT_REALM_ID).unwrap().spawn();
+            assert!(spawn.args().is_empty());
+            assert!(spawn.env_allow().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_env_allowlist_passes_named_variables_and_nothing_else() {
+        // Default-deny (module docs): an empty allowlist inherits NOTHING,
+        // and a name the core's environment does not define is skipped
+        // rather than failing the run.
+        let registry = registry_from(
+            "[[realm]]\ncommand = \"/usr/bin/true\"\nenv_allow = [\"HOME\", \"LANG\", \"ABSENT\"]\n",
+        )
+        .unwrap();
+        let spawn = registry.get(DEFAULT_REALM_ID).unwrap().spawn();
+        let env = spawn.inherited_env(|name| match name {
+            "HOME" => Some("/home/agent".into()),
+            "LANG" => Some("en_US.UTF-8".into()),
+            // Deliberately resolvable but never asked for: the allowlist,
+            // not the lookup, decides what crosses.
+            "SSH_AUTH_SOCK" => Some("/run/user/1000/ssh-agent".into()),
+            _ => None,
+        });
+        assert_eq!(
+            env,
+            vec![
+                ("HOME".to_string(), "/home/agent".to_string()),
+                ("LANG".to_string(), "en_US.UTF-8".to_string()),
+            ]
+        );
+
+        let empty = registry_from(MINIMAL).unwrap();
+        assert!(empty
+            .get(DEFAULT_REALM_ID)
+            .unwrap()
+            .spawn()
+            .inherited_env(|_| Some("leaked".into()))
+            .is_empty());
+    }
+
+    #[test]
+    fn config_cannot_re_litigate_the_scrubbed_display_variables() {
+        // P1.5.2 scrubs DISPLAY and the host WAYLAND_DISPLAY
+        // unconditionally; a config able to allow-list them back would
+        // silently void the confinement (module docs).
+        for name in RESERVED_ENV {
+            let text =
+                format!("[[realm]]\ncommand = \"/usr/bin/true\"\nenv_allow = [\"{name}\"]\n");
+            let err = registry_from(&text).unwrap_err().to_string();
+            assert!(err.contains(name), "message must name the variable: {err}");
+            assert!(
+                err.contains("confined"),
+                "message must say why it is refused: {err}"
+            );
+        }
+    }
+
+    // -- validation strictness --------------------------------------------
+
+    #[test]
+    fn a_missing_or_empty_or_relative_command_is_refused_with_a_reason() {
+        let missing = registry_from("[[realm]]\nid = \"realm-0\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("missing `command`"),
+            "unexpected: {missing}"
+        );
+
+        let empty = registry_from("[[realm]]\ncommand = \"\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("`command` is empty"), "unexpected: {empty}");
+
+        for relative in ["foot", "./foot", "bin/foot"] {
+            let err = registry_from(&format!("[[realm]]\ncommand = \"{relative}\"\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("absolute") && err.contains("$PATH"),
+                "a relative command must be refused with its reason: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_keys_and_duplicate_keys_are_refused_at_their_line() {
+        // A typo'd security-relevant key that silently did nothing would
+        // read exactly like one that works (module docs).
+        let err = registry_from("[[realm]]\ncommand = \"/usr/bin/true\"\nenv_alow = [\"HOME\"]\n")
+            .unwrap_err();
+        match &err {
+            ErrorKind::Parse { line, detail } => {
+                assert_eq!(*line, 3);
+                assert!(detail.contains("env_alow"), "{detail}");
+                assert!(
+                    detail.contains("env_allow"),
+                    "must list the real keys: {detail}"
+                );
+            }
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+
+        for (text, why) in [
+            (
+                "[[realm]]\ncommand = \"/a\"\ncommand = \"/b\"\n",
+                "duplicate command",
+            ),
+            (
+                "[[realm]]\nid = \"a\"\nid = \"b\"\ncommand = \"/a\"\n",
+                "duplicate id",
+            ),
+            (
+                "[[realm]]\ncommand = \"/a\"\nargs = []\nargs = []\n",
+                "duplicate args",
+            ),
+            (
+                "[[realm]]\ncommand = \"/a\"\nenv_allow = []\nenv_allow = []\n",
+                "duplicate env_allow",
+            ),
+        ] {
+            assert!(registry_from(text).is_err(), "must reject: {why}");
+        }
+    }
+
+    #[test]
+    fn bad_types_and_non_subset_toml_are_refused() {
+        for (text, why) in [
+            (
+                "[[realm]]\ncommand = 42\n",
+                "integer where a string belongs",
+            ),
+            (
+                "[[realm]]\ncommand = [\"/usr/bin/true\"]\n",
+                "array where a string belongs",
+            ),
+            (
+                "[[realm]]\ncommand = \"/a\"\nargs = \"-e\"\n",
+                "string where an array belongs",
+            ),
+            (
+                "[[realm]]\ncommand = \"/a\"\nenv_allow = \"HOME\"\n",
+                "string where an array belongs",
+            ),
+            ("[realm]\ncommand = \"/a\"\n", "single-bracket table"),
+            ("[[realm]] junk\n", "trailing content after header"),
+            ("[[principal]]\ncommand = \"/a\"\n", "foreign table"),
+            ("command = \"/a\"\n", "key outside any table"),
+            ("[[realm]]\ncommand\n", "no `=`"),
+            ("[[realm]]\ncommand = \"/a\" junk\n", "trailing junk"),
+        ] {
+            assert!(registry_from(text).is_err(), "must reject: {why}");
+        }
+    }
+
+    #[test]
+    fn env_allow_entries_must_be_environment_variable_names() {
+        for (entry, why) in [
+            ("LANG=en_US", "a name=value pair, not a name"),
+            ("1ST", "leading digit"),
+            ("", "empty"),
+            ("with space", "space"),
+            ("lower-case", "hyphen"),
+        ] {
+            let text =
+                format!("[[realm]]\ncommand = \"/usr/bin/true\"\nenv_allow = [\"{entry}\"]\n");
+            let err = registry_from(&text);
+            assert!(err.is_err(), "must reject {entry:?}: {why}");
+        }
+        let dup = "[[realm]]\ncommand = \"/a\"\nenv_allow = [\"HOME\", \"HOME\"]\n";
+        assert!(registry_from(dup).is_err(), "duplicate entries are refused");
+        // Underscored and digit-bearing names are ordinary and accepted.
+        let ok =
+            "[[realm]]\ncommand = \"/a\"\nenv_allow = [\"_X\", \"XDG_SESSION_TYPE\", \"A1\"]\n";
+        assert_eq!(
+            registry_from(ok)
+                .unwrap()
+                .get("realm-0")
+                .unwrap()
+                .spawn()
+                .env_allow(),
+            ["_X", "XDG_SESSION_TYPE", "A1"]
+        );
+    }
+
+    #[test]
+    fn realm_ids_that_could_escape_the_runtime_tree_are_refused() {
+        // The id names the realm's private runtime directory, so it is
+        // validated by the transport's own realm-id rule -- one definition,
+        // no drift.
+        for id in ["", ".", "..", "../evil", "a/b", "é", &"x".repeat(65)] {
+            let text = format!("[[realm]]\nid = \"{id}\"\ncommand = \"/usr/bin/true\"\n");
+            assert!(registry_from(&text).is_err(), "must reject id {id:?}");
+        }
+        assert!(registry_from("[[realm]]\nid = \"realm.0\"\ncommand = \"/a\"\n").is_ok());
+    }
+
+    #[test]
+    fn the_cardinality_rule_is_exactly_one_realm_in_v0() {
+        // Zero realms: the core has nothing to serve.
+        let none = registry_from("# just a comment\n").unwrap_err().to_string();
+        assert!(none.contains("no [[realm]] table"), "unexpected: {none}");
+
+        // Two realms: refused by *cardinality*, with the Phase-3 pointer --
+        // the file format already carries an array, so raising MAX_REALMS
+        // is the whole change.
+        let two = registry_from(
+            "[[realm]]\nid = \"a\"\ncommand = \"/a\"\n[[realm]]\nid = \"b\"\ncommand = \"/b\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(two.contains("exactly 1"), "unexpected: {two}");
+        assert!(two.contains("Phase 3"), "unexpected: {two}");
+
+        // Same id twice is a duplicate, whatever the cardinality rule says.
+        assert!(RealmRegistry::from_specs(vec![
+            parse_config(MINIMAL).unwrap().remove(0),
+            parse_config(MINIMAL).unwrap().remove(0),
+        ])
+        .is_err());
+    }
+
+    // -- loading from disk --------------------------------------------------
+
+    #[test]
+    fn loading_names_the_file_and_the_problem() {
+        // Acceptance criterion 3: a parse error fails loudly, naming the
+        // path, the line, and the specific problem -- asserted on the
+        // message an operator reads, not merely on the error type.
+        let _fd = crate::capture::tests::fd_lock();
+        let (dir, path) = config_file("[[realm]]\ncommand = \"relative/foot\"\n", 0o600);
+        let err = RealmRegistry::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains(&path.display().to_string()),
+            "must name the file: {err}"
+        );
+        assert!(err.contains("line 2"), "must name the line: {err}");
+        assert!(err.contains("absolute"), "must name the problem: {err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_file_is_a_hard_startup_error_naming_the_path() {
+        let _fd = crate::capture::tests::fd_lock();
+        let path = std::env::temp_dir().join(format!(
+            "vitrin-realm-absent-{}/realm.toml",
+            std::process::id()
+        ));
+        let err = RealmRegistry::load(&path).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Io(_)));
+        let text = err.to_string();
+        assert!(
+            text.contains(&path.display().to_string()),
+            "must name the path: {text}"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_file_loads_from_disk() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (dir, path) = config_file(
+            "# a realm\n[[realm]]\ncommand = \"/usr/bin/true\"\nargs = [\"--version\"]\n",
+            0o644,
+        );
+        // World-readable is fine: a command line is not secret material.
+        let registry = RealmRegistry::load(&path).unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.get(DEFAULT_REALM_ID).unwrap().spawn().args(),
+            ["--version"]
+        );
+        assert_eq!(registry.iter().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_group_or_world_writable_config_is_refused() {
+        // Not the secret-material policy principals.toml uses: this file
+        // names what the TCB executes, so *writability* is the threat.
+        let _fd = crate::capture::tests::fd_lock();
+        for mode in [0o666, 0o622, 0o662, 0o620, 0o602] {
+            let (dir, path) = config_file(MINIMAL, mode);
+            match RealmRegistry::load(&path) {
+                Err(RealmConfigError {
+                    kind: ErrorKind::Insecure(detail),
+                    ..
+                }) => assert!(detail.contains("chmod go-w"), "unexpected: {detail}"),
+                other => panic!("mode {mode:03o} must be refused, got {other:?}"),
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_non_regular_config_is_refused() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (dir, path) = config_file(MINIMAL, 0o600);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            RealmRegistry::load(&path).map_err(|e| e.kind),
+            // Opening a directory for read succeeds on Linux only until the
+            // first read; the fstat probe refuses it first.
+            Err(ErrorKind::Insecure(_)) | Err(ErrorKind::Io(_))
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // -- the default config path --------------------------------------------
+
+    #[test]
+    fn the_default_config_path_is_the_xdg_one() {
+        // Not env-mutating (tests share a process): the shape is what
+        // matters -- `<config home>/vitrin/realm.toml`, the same directory
+        // principals.toml is conventionally read from.
+        if let Ok(path) = default_config_path() {
+            assert!(path.is_absolute(), "{}", path.display());
+            assert_eq!(path.file_name().unwrap(), CONFIG_FILE_NAME);
+            assert_eq!(path.parent().unwrap().file_name().unwrap(), "vitrin");
+            let expected = match std::env::var_os("XDG_CONFIG_HOME") {
+                Some(dir) if Path::new(&dir).is_absolute() => PathBuf::from(dir),
+                _ => PathBuf::from(std::env::var_os("HOME").unwrap()).join(".config"),
+            };
+            assert_eq!(path.parent().unwrap().parent().unwrap(), expected);
+        }
+    }
+}

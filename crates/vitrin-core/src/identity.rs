@@ -65,16 +65,15 @@
 //! | `token` | string | yes | the pre-shared random bearer token, compared byte-wise constant-time against `hello`'s `credential`; at least 16 bytes (64 random hex chars recommended: `openssl rand -hex 32`) |
 //! | `uid` | integer | no | additionally require the connecting peer's `SO_PEERCRED` uid to equal this value; must equal the uid the core itself runs as, or the registry is refused at load (see the `SO_PEERCRED` policy section) |
 //!
-//! The file is parsed by a **hand-rolled strict TOML subset** rather than a
-//! TOML crate: plan risk R7 names config parsing as the classic TCB
-//! dependency-creep vector, and this schema is three scalar keys. The subset
-//! accepts exactly: comments, blank lines, `[[principal]]` headers, `key =
-//! "basic string"` (escapes limited to `\\` and `\"`), and `key = integer`.
-//! Everything else -- other table headers, dotted keys, inline tables,
-//! arrays, multi-line or literal strings, other escapes -- is a load error,
-//! never a guess. Every file this parser accepts is valid TOML, so external
-//! tooling interoperates and a later swap to a full parser changes nothing
-//! user-visible.
+//! The file is parsed by a **hand-rolled strict TOML subset**
+//! ([`crate::toml_subset`]) rather than a TOML crate: plan risk R7 names
+//! config parsing as the classic TCB dependency-creep vector, and this
+//! schema is three scalar keys. This module contributes only the key
+//! vocabulary above -- comments, blank lines, `[[principal]]` headers,
+//! `key = "basic string"`, and `key = integer` come from the shared lexer,
+//! which every core config file is written in. Everything else -- other
+//! table headers, dotted keys, inline tables, arrays, multi-line or
+//! literal strings, other escapes -- is a load error, never a guess.
 //!
 //! # Registry-file permission checks (decided here)
 //!
@@ -136,6 +135,8 @@ use std::io::{self, Read};
 use std::path::Path;
 
 use vitrin_ipc::PeerCred;
+
+use crate::toml_subset::{self, SubsetError};
 
 /// The wire bound on identity strings (`vitrin_handshake.hello.identity`
 /// and `vitrin_principal.bound.identity`, conventions 2.3): the SPIFFE-ID
@@ -618,6 +619,18 @@ impl fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
+/// Every lexical problem the shared subset reports becomes a registry
+/// parse error at the same line, so this module's messages keep naming
+/// the file's own coordinates.
+impl From<SubsetError> for RegistryError {
+    fn from(e: SubsetError) -> Self {
+        RegistryError::Parse {
+            line: e.line,
+            detail: e.detail,
+        }
+    }
+}
+
 /// One `[[principal]]` table under construction.
 #[derive(Default)]
 struct RawRow {
@@ -641,8 +654,8 @@ fn parse_registry(text: &str) -> Result<Vec<StaticPrincipal>, RegistryError> {
             continue;
         }
         if line.starts_with('[') {
-            let (header, rest) =
-                split_header(line).ok_or_else(|| parse_err(line_no, "malformed table header"))?;
+            let (header, rest) = toml_subset::table_header(line)
+                .ok_or_else(|| parse_err(line_no, "malformed table header"))?;
             if !matches!(rest.trim_start().chars().next(), None | Some('#')) {
                 return Err(parse_err(line_no, "trailing content after table header"));
             }
@@ -671,19 +684,19 @@ fn parse_registry(text: &str) -> Result<Vec<StaticPrincipal>, RegistryError> {
                 if row.identity.is_some() {
                     return Err(parse_err(line_no, "duplicate `identity` key"));
                 }
-                row.identity = Some((parse_basic_string(value, line_no)?, line_no));
+                row.identity = Some((toml_subset::basic_string(value, line_no)?, line_no));
             }
             "token" => {
                 if row.token.is_some() {
                     return Err(parse_err(line_no, "duplicate `token` key"));
                 }
-                row.token = Some(parse_basic_string(value, line_no)?);
+                row.token = Some(toml_subset::basic_string(value, line_no)?);
             }
             "uid" => {
                 if row.uid.is_some() {
                     return Err(parse_err(line_no, "duplicate `uid` key"));
                 }
-                row.uid = Some(parse_integer(value, line_no)?);
+                row.uid = Some(toml_subset::integer(value, line_no)?);
             }
             other => {
                 return Err(RegistryError::Parse {
@@ -716,93 +729,6 @@ fn parse_registry(text: &str) -> Result<Vec<StaticPrincipal>, RegistryError> {
         });
     }
     Ok(rows)
-}
-
-/// Split a `[[principal]]`-shaped header off the front of `line`. Returns
-/// the header text (brackets included) and the remainder.
-fn split_header(line: &str) -> Option<(&str, &str)> {
-    let rest = line.strip_prefix("[[")?;
-    let end = rest.find("]]")?;
-    let name = &rest[..end];
-    if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.is_empty() {
-        Some((&line[..end + 4], &rest[end + 2..]))
-    } else {
-        None
-    }
-}
-
-/// Parse a TOML basic string (`"..."`) at the start of `value`, allowing
-/// only the `\\` and `\"` escapes and rejecting control characters; the
-/// remainder may hold only whitespace or a comment. Multi-line strings,
-/// literal strings, and other escapes are outside the subset.
-fn parse_basic_string(value: &str, line: usize) -> Result<String, RegistryError> {
-    let err = |detail: &str| RegistryError::Parse {
-        line,
-        detail: detail.to_owned(),
-    };
-    let mut chars = value.char_indices();
-    match chars.next() {
-        Some((_, '"')) => {}
-        _ => return Err(err("expected a double-quoted string value")),
-    }
-    let mut out = String::new();
-    let mut escaped = false;
-    for (i, c) in chars {
-        if escaped {
-            match c {
-                '\\' | '"' => out.push(c),
-                _ => {
-                    return Err(err(
-                        "escape outside the supported subset (only \\\\ and \\\" are allowed)",
-                    ))
-                }
-            }
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' => escaped = true,
-            '"' => {
-                let rest = value[i + 1..].trim_start();
-                if !matches!(rest.chars().next(), None | Some('#')) {
-                    return Err(err("trailing content after string value"));
-                }
-                return Ok(out);
-            }
-            c if c.is_control() => return Err(err("control character inside string value")),
-            c => out.push(c),
-        }
-    }
-    Err(err("unterminated string value"))
-}
-
-/// Parse a bare non-negative decimal integer fitting `u32` (the uid
-/// domain); the remainder may hold only whitespace or a comment. Leading
-/// zeros are rejected: TOML 1.0 forbids them, and the subset's invariant
-/// is that every accepted file is valid TOML (module docs) -- `007` must
-/// not load today only to break under external tooling or a future parser
-/// swap. A bare `0` stays legal.
-fn parse_integer(value: &str, line: usize) -> Result<u32, RegistryError> {
-    let err = |detail: &str| RegistryError::Parse {
-        line,
-        detail: detail.to_owned(),
-    };
-    let end = value
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(value.len());
-    let (digits, rest) = value.split_at(end);
-    if digits.is_empty() {
-        return Err(err("expected a non-negative integer value"));
-    }
-    if digits.len() > 1 && digits.starts_with('0') {
-        return Err(err("leading zeros are not valid TOML integers"));
-    }
-    if !matches!(rest.trim_start().chars().next(), None | Some('#')) {
-        return Err(err("trailing content after integer value"));
-    }
-    digits
-        .parse::<u32>()
-        .map_err(|_| err("integer does not fit u32"))
 }
 
 #[cfg(test)]

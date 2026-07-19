@@ -1,0 +1,64 @@
+# Vitrin OS realm configuration -- the realm manager's input (P1.5.1).
+#
+# One [[realm]] table describing the realm this session serves: its
+# wire-visible id, and the app it owns. This file is parsed by the same
+# deliberately strict TOML subset as principals.toml (see
+# `crates/vitrin-core/src/toml_subset.rs` for the dialect and
+# `crates/vitrin-core/src/realm.rs` for the schema and every decision
+# below): comments, blank lines, [[realm]] headers, `key = "string"` and
+# `key = ["a", "b"]` -- nothing else. Every file this subset accepts is
+# valid TOML.
+#
+# Version 0 requires EXACTLY ONE [[realm]] table. That is a cardinality
+# rule, not a format limit: the file is already an array of tables, so
+# Phase 3's fleet adds tables without changing anything here.
+#
+# SECURITY -- this file names the program the trusted core will execute, so
+# whoever can write it chooses what vitrind spawns. It is refused unless it
+# is:
+#   - a regular file,
+#   - owned by the uid running vitrind, and
+#   - not writable by group or other:  chmod go-w realm.toml
+# Unlike principals.toml it may be world-READABLE: a command line is not
+# secret material.
+#
+# Conventional location: $XDG_CONFIG_HOME/vitrin/realm.toml
+# (~/.config/vitrin/realm.toml). Override with `vitrind --realm PATH`.
+# Startup FAILS -- loudly, naming this file and the problem -- if it is
+# missing or malformed. There is deliberately no silent default: a core
+# that came up with a realm nobody described would be running an app
+# nobody asked for.
+
+[[realm]]
+# Optional. The realm's stable, wire-visible identity: what an agent
+# addresses with `vitrin_principal.get_realm("realm-0")`, what the MVP's
+# whole-realm grant scope names (`realm:realm-0`), and the directory name
+# of the realm's private runtime tree
+# ($XDG_RUNTIME_DIR/vitrin-0/<id>/). Defaults to "realm-0", the well-known
+# name of protocol version 1. At most 64 bytes over [A-Za-z0-9._-], never
+# `.` or `..`.
+#id = "realm-0"
+
+# REQUIRED. Absolute path of the program this realm launches. Relative
+# names are refused: they would resolve through the core's own $PATH, so
+# what actually executed would depend on ambient environment this file
+# cannot show. (P1.5.2 executes it; this version only owns the config.)
+command = "/usr/bin/foot"
+
+# Optional (default []). Arguments AFTER argv[0] -- the core supplies
+# argv[0] itself from `command`.
+#args = ["-e", "bash"]
+
+# Optional (default []). NAMES of environment variables copied from
+# vitrind's own environment into the app's. Not name=value pairs: the app
+# starts default-deny, and an empty or absent allowlist means it inherits
+# NOTHING but what the core injects for it (its own WAYLAND_DISPLAY,
+# pointing at the shim's private socket, and its runtime directory). A
+# listed name that vitrind's environment does not define is simply not
+# passed -- not an error, because config validity must not depend on which
+# machine loads it.
+#
+# DISPLAY and WAYLAND_DISPLAY are refused here: the core scrubs the host
+# values unconditionally, because an app that can reach the host display
+# server is not confined. That is not a config decision.
+#env_allow = ["HOME", "LANG", "XDG_SESSION_TYPE"]

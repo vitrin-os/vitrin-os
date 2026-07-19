@@ -119,6 +119,57 @@ of the core. Frame buffers move as dmabuf file descriptors over `SCM_RIGHTS`
 (zero-copy, one extra IPC hop — the gamescope/Qubes precedent). Window
 management policy, decoration, and theming stay out of the core, permanently.
 
+## Security notes — what the MVP does and does not confine
+
+Vitrin's design claims are strong, and the Phase-1 MVP does not yet deliver
+all of them. The gaps below are **deliberate, settled decisions with a
+scheduled closure**, not oversights — and they are stated here, at the front
+of the security story, rather than buried in a module doc, because a
+half-believed confinement claim is worse than an honest gap.
+
+**Realm confinement today is environment-structural only.** When the core
+launches a realm's app it forks a per-app shim, hands it one end of a
+socketpair as its identity (no credential, no handshake — holding the
+descriptor *is* being that realm's shim), gives it a private `0700` runtime
+directory, and builds its environment from nothing: only names the operator
+allow-listed in `realm.toml`, plus a `WAYLAND_DISPLAY` pointing at that
+realm's own private socket. `DISPLAY`, the host `WAYLAND_DISPLAY`,
+`WAYLAND_SOCKET`, `XAUTHORITY` and the host `XDG_RUNTIME_DIR` cannot reach
+the app at all. No unrelated descriptor of the core's — the agent listener,
+the flight-recorder log, other realms' sockets, capture memfds — crosses the
+fork.
+
+That is the complete list of what confines a realm right now.
+
+- **No sandbox (decision D9, closes in Phase 2).** There are **no
+  namespaces, no seccomp filter, and no Landlock policy**. The shim and its
+  app run as the core's own uid with the core's full view of the filesystem
+  and the network. An app that ignores `WAYLAND_DISPLAY` and connects
+  directly to a path it already knows is not stopped by anything in the
+  MVP. Real sandboxing arrives with the Phase-2 powerbox (E2.6/E2.7).
+  Environment hygiene confines the well-behaved; it does not contain the
+  hostile.
+- **The session D-Bus is reachable (known hole, closes with P13 in Phase
+  2).** The core advertises no `DBUS_SESSION_BUS_ADDRESS` and points
+  `XDG_RUNTIME_DIR` at the realm's private directory, so a well-behaved
+  client finds no bus. But advertisement is not reachability:
+  `/run/user/<uid>/bus` is still on the filesystem and still connectable by
+  any process of that uid, and the abstract-socket namespace is still
+  shared. In practice, running Firefox — the Phase-1 acceptance app —
+  means allow-listing `DBUS_SESSION_BUS_ADDRESS` explicitly, which turns
+  the implicit hole into an audited one. This is a lateral-escape path of
+  exactly the shape [PRD](docs/PRD.md) §15 catalogues (D-Bus activation of a
+  privileged helper); **P13** closes it with a loopback-only network
+  namespace plus an empty mount namespace, so that there is nothing to
+  reach rather than nothing advertised.
+- **Same-uid separation is not attempted.** The `0700` runtime directory
+  bounds other *users* on the machine, not other processes of this user.
+
+The spawn path and every decision above are documented in full in
+[`crates/vitrin-core/src/spawn.rs`](crates/vitrin-core/src/spawn.rs);
+`realm.toml`'s own security rules are in
+[`examples/realm.toml`](examples/realm.toml).
+
 ## Repository layout
 
 | Path | What it is |

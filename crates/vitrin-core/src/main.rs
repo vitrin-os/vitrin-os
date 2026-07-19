@@ -142,6 +142,19 @@ mod scene;
 /// nothing at runtime creates a shim connection before then.
 #[cfg_attr(not(test), allow(dead_code))]
 mod shim;
+/// The realm spawn model (P1.5.2): the core's only process-creating code —
+/// `fork`/`exec` of the realm's shim with its end of the identity socketpair
+/// placed at a fixed descriptor (identity assigned at fork, never claimed),
+/// a private `0700` runtime directory, and an environment built from nothing
+/// that names only that realm's own socket. Read its module docs before
+/// believing any confinement claim: the D9 sandboxing deferral (no
+/// namespaces, no seccomp, no Landlock) and the session-D-Bus hole are
+/// stated there in full. Dead-code-allowed outside tests for the same reason
+/// as `shim`: exercised end-to-end by its tests today (it really forks the
+/// mock shim, which really forks an app), and wired into the session when
+/// the event loop can service the connection — see `run_session`.
+#[cfg_attr(not(test), allow(dead_code))]
+mod spawn;
 mod test_pattern;
 /// The strict TOML subset every core configuration file is written in
 /// (P1.4.1's `principals.toml`, P1.5.1's `realm.toml`): one hand-rolled
@@ -453,8 +466,32 @@ fn main() -> ExitCode {
 /// nothing at runtime accepts principal connections yet (the listener
 /// wiring is M1.1 integration), and that wiring hands this same single
 /// recorder handle and this same registry to each connection's
-/// `ServerCtx`. The registry is also what P1.5.2 will spawn from — it is
-/// already the only place the realm's command lives.
+/// `ServerCtx`. The registry is also what the spawn manager launches from —
+/// it is already the only place the realm's command lives.
+///
+/// # Where the spawn goes, and why it is not called here yet (P1.5.2)
+///
+/// `spawn::spawn_realm` belongs immediately after the recorder opens and
+/// before `backend()` takes the thread: the realm must exist for the
+/// session's whole life, and the spawn is a `realm_spawned` entry the log
+/// wants before anything else happens.
+///
+/// It is deliberately not called at this commit, because a spawned shim
+/// needs two things that do not exist yet, and half-wiring it would be
+/// worse than not wiring it:
+///
+/// - **an event loop that services its connection.** The shim blocks on
+///   `configure` and then on the core's replies; a backend that never reads
+///   the socketpair would leave it wedged at startup forever.
+/// - **`SIGCHLD` reaping (P1.5.3, issue #32).** `SpawnedRealm` holds an
+///   unreaped `Child` on purpose. Spawning into a session that never waits
+///   would accumulate a zombie for every realm restart — lifecycle is #32's
+///   whole subject, and this task must not pre-empt it with a half-policy.
+///
+/// Until both land, the spawn mechanism is exercised end-to-end by
+/// `spawn`'s own tests, which really fork the mock shim, really place the
+/// socketpair at fd 3, and really assert the child's environment and
+/// descriptor table from procfs.
 fn run_session<R>(
     consent: ConsentPolicy,
     recorder_path: Option<PathBuf>,
@@ -590,7 +627,7 @@ fn announce_realms(realms: &RealmRegistry) {
             command = %realm.spawn().command().display(),
             args = realm.spawn().args().len(),
             env_allow = ?realm.spawn().env_allow(),
-            "realm configured (not started: spawning lands with P1.5.2)"
+            "realm configured (not started: see run_session for where the spawn is wired)"
         );
     }
 }

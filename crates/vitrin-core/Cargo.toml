@@ -48,6 +48,19 @@ vitrin-ipc = { path = "../vitrin-ipc" }
 # check and its SO_PEERCRED same-user policy -- a feature bump on an
 # existing dependency, not a new one.
 rustix = { version = "1", features = ["fs", "process"] }
+# Exactly two raw syscalls, in exactly one place: the `dup3`/`fcntl` that
+# places the shim's end of the identity socketpair on fd 3 between `fork`
+# and `execve` (P1.5.2, `spawn`). Nothing else in the core links libc
+# directly. Justified against plan risk R7 on two counts: it is already in
+# the dependency graph (Smithay, calloop and nix all pull it, so this adds
+# no transitive surface at all), and rustix — the crate the core otherwise
+# uses for every syscall — cannot express this one safely: its `dup3` takes
+# `&mut OwnedFd` for the target, so aiming at a fixed descriptor number
+# would mean fabricating an `OwnedFd` for a descriptor that may not be open
+# and whose drop would close a descriptor we do not own. A thin `extern "C"`
+# call is both the honest and the async-signal-safe spelling in a post-fork
+# context, where anything richer risks an allocation.
+libc = "0.2"
 
 # GBM buffer allocation for the env-gated real-GPU dmabuf tests (P1.3.5,
 # M1.5) — the test-side allocator that mints *genuine* dmabufs from a render

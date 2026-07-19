@@ -123,7 +123,15 @@ pub fn shim_socket_path_in(xdg_runtime_dir: &Path, realm_id: &str) -> Result<Pat
     Ok(shim_runtime_dir_in(xdg_runtime_dir, realm_id)?.join(SHIM_SOCKET_NAME))
 }
 
-fn xdg_runtime_dir() -> Result<PathBuf, PathError> {
+/// `$XDG_RUNTIME_DIR` itself, validated: set, non-empty, and absolute.
+///
+/// Public because the core's realm spawn manager (P1.5.2) has to hold the
+/// runtime *base* rather than re-derive it per call -- every helper here
+/// comes in a pure `*_in` form precisely so the spawn path stays
+/// deterministic, and those forms need the base. Exposing the one validated
+/// reader keeps that from becoming a second, drifting copy of the XDG rules
+/// in another crate.
+pub fn xdg_runtime_dir() -> Result<PathBuf, PathError> {
     let dir = env::var_os("XDG_RUNTIME_DIR").ok_or(PathError::RuntimeDirUnset)?;
     if dir.is_empty() {
         return Err(PathError::RuntimeDirUnset);

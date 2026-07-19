@@ -87,3 +87,38 @@ command = "/usr/bin/foot"
 #   XDG_RUNTIME_DIR  names the host session's socket directory; the core
 #                    injects the realm's own runtime directory instead
 #env_allow = ["HOME", "LANG", "XDG_SESSION_TYPE"]
+
+# ---------------------------------------------------------------------------
+# WHAT THIS FILE CANNOT PROMISE YOU (read before trusting the list above)
+# ---------------------------------------------------------------------------
+#
+# Everything above is ENVIRONMENT hygiene, and in this MVP that is the ONLY
+# confinement a realm gets. There are no namespaces, no seccomp, and no
+# Landlock (decision D9): the shim and the app run as the same uid as
+# vitrind, with vitrind's full view of the filesystem and the network. An app
+# that ignores WAYLAND_DISPLAY and connects to a socket path it already knows
+# is not stopped by anything here. Real sandboxing arrives with the Phase-2
+# powerbox (E2.6/E2.7).
+#
+# The sharpest instance is the SESSION D-BUS, and it is a deliberate,
+# documented hole:
+#
+#   - Nothing here advertises the bus: the core injects no
+#     DBUS_SESSION_BUS_ADDRESS, and it points XDG_RUNTIME_DIR at the realm's
+#     own private directory rather than the host session's, so a well-behaved
+#     client finds nothing.
+#   - But /run/user/<uid>/bus is still on the filesystem, and any process of
+#     this uid can still connect to it directly. Not advertising a socket is
+#     not the same as it being unreachable.
+#   - Firefox -- the Phase-1 acceptance app -- wants the bus, so running it
+#     in practice means adding DBUS_SESSION_BUS_ADDRESS to env_allow above.
+#     That is allowed, and it makes an implicit hole an explicit one.
+#
+# Reaching the session bus is a lateral-escape path (D-Bus activation of a
+# privileged helper -- PRD Doc 2 section 15). It is closed by pillar P13 in
+# Phase 2: a loopback-only network namespace plus an empty mount namespace,
+# so there is nothing to reach rather than nothing advertised. It is not
+# closed by this file, and it cannot be.
+#
+# Full reasoning: crates/vitrin-core/src/spawn.rs and the README's security
+# notes.

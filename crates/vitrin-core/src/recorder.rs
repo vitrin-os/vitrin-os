@@ -1,9 +1,9 @@
 //! The flight-recorder log v0 (P1.4.5, issue #29): the journal seed --
 //! a JSON-lines structured event log recording handshakes, grant lifecycle
-//! transitions, consent decisions, and **every** enforcement decision, with
-//! an observation digest on every delivered capture and epoch-ready
-//! reference fields present-but-null from day one (backward requirement
-//! B1).
+//! transitions, consent decisions, realm launches, and **every** enforcement
+//! decision, with an observation digest on every delivered capture and
+//! epoch-ready reference fields present-but-null from day one (backward
+//! requirement B1).
 //!
 //! # What this is NOT
 //!
@@ -31,7 +31,11 @@
 //! that *already* were the single site for the thing being recorded
 //! (`handle_hello`'s verify arm, `deliver_resolution`'s flip, `teardown`),
 //! so no event can be recorded twice and none can be missed by adding a
-//! second path.
+//! second path. Realm launches (P1.5.2) are the same shape taken one step
+//! further: [`crate::spawn`] takes a `&mut Recorder` as a *required*
+//! argument and journals both outcomes in one funnel wrapped around the
+//! spawn, so an error path added inside it is covered structurally rather
+//! than by remembering to add a call.
 //!
 //! One [`Recorder`] handle per core process, threaded through
 //! `ServerCtx::recorder`; there are deliberately no ad-hoc writes anywhere
@@ -351,7 +355,7 @@ use vitrin_protocol::generated::vitrin_grant::{
 };
 
 use crate::enforcement::{UseKind, UseOutcome};
-use crate::grants::{GrantId, Issuer, PersistenceRung};
+use crate::grants::{GrantId, Issuer, PersistenceRung, RealmId};
 use crate::identity::{PrincipalIdentity, RejectionCause};
 use crate::input::SeatInputKind;
 use crate::petitions::{ConnectionId, EffectiveAuthority, PetitionId};
@@ -779,6 +783,37 @@ pub(crate) enum Event<'a> {
         /// A fixed class label, never free-form `Display` text.
         reason: &'static str,
     },
+    /// A realm's app was launched (P1.5.2): the identity-at-fork moment.
+    /// The reconstruction needs it because every later realm fact -- which
+    /// process painted, what a capture observed -- hangs off this pid, and
+    /// because *what the trusted core executed* is the single most
+    /// security-relevant act of a session.
+    RealmSpawned {
+        realm: &'a RealmId,
+        /// The shim's pid: the process holding the other end of the
+        /// identity socketpair.
+        pid: u32,
+        command: &'a Path,
+        /// The realm's private runtime directory (mode `0700`) -- where the
+        /// app-facing socket the child's `WAYLAND_DISPLAY` names lives.
+        runtime_dir: &'a Path,
+        /// Environment variable **names** passed through from the core's
+        /// environment -- never their values. A value is whatever the
+        /// operator's session holds (`SSH_AUTH_SOCK`, an API token in a
+        /// generously-configured allowlist) and the log's secrecy contract
+        /// applies to it exactly as it does to credential bytes.
+        env_allow: &'a [String],
+    },
+    /// A realm's app could not be launched. Recorded because a refusal is
+    /// the *fail-closed* outcome: nothing was created, so nothing else in
+    /// the log would otherwise say the realm was ever meant to run.
+    RealmSpawnFailed {
+        realm: &'a RealmId,
+        command: &'a Path,
+        /// A fixed label from [`crate::spawn::SpawnError::cause_class`] --
+        /// never free-form `Display` text, per this log's convention.
+        cause_class: &'static str,
+    },
     /// A principal connection closed: its pending petitions were withdrawn
     /// and its grants died with it.
     ConnectionTeardown {
@@ -809,6 +844,8 @@ impl Event<'_> {
             Event::GrantExpired { .. } => "grant_expired",
             Event::GrantRevoked { .. } => "grant_revoked",
             Event::GrantRemoved { .. } => "grant_removed",
+            Event::RealmSpawned { .. } => "realm_spawned",
+            Event::RealmSpawnFailed { .. } => "realm_spawn_failed",
             Event::ConnectionTeardown { .. } => "connection_teardown",
         }
     }
@@ -1054,6 +1091,36 @@ impl Event<'_> {
                 field_str(out, "transition", "active_to_removed");
                 field_str(out, "source", "connection_teardown");
             }
+            Event::RealmSpawned {
+                realm,
+                pid,
+                command,
+                runtime_dir,
+                env_allow,
+            } => {
+                field_display(out, "realm", realm);
+                field_u64(out, "pid", u64::from(pid));
+                field_display(out, "command", command.display());
+                field_display(out, "runtime_dir", runtime_dir.display());
+                // Names only -- see the variant's docs. The core's two
+                // injections are stated as facts of the model rather than
+                // as data, because they are not configurable: the child's
+                // WAYLAND_DISPLAY is always its own shim's socket inside
+                // `runtime_dir`, and its XDG_RUNTIME_DIR is always
+                // `runtime_dir` itself.
+                write_string_array(out, "env_allow", env_allow);
+                field_bool(out, "env_cleared", true);
+            }
+            Event::RealmSpawnFailed {
+                realm,
+                command,
+                cause_class,
+            } => {
+                field_display(out, "realm", realm);
+                field_display(out, "command", command.display());
+                field_str(out, "cause_class", cause_class);
+                field_null(out, "pid");
+            }
             Event::ConnectionTeardown {
                 connection,
                 identity,
@@ -1153,6 +1220,19 @@ fn write_verbs(out: &mut String, verbs: Verb) {
     }
     out.push(']');
     field_u64(out, "verbs_bits", u64::from(verbs.bits()));
+}
+
+/// A JSON array of strings, each escaped like any other string value.
+fn write_string_array(out: &mut String, k: &str, values: &[String]) {
+    key(out, k);
+    out.push('[');
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(out, value);
+    }
+    out.push(']');
 }
 
 // ---------------------------------------------------------------------------

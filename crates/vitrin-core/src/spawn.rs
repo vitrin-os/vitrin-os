@@ -413,18 +413,90 @@ impl SpawnPaths {
     }
 }
 
+/// An unreaped [`Child`] that terminates and waits on itself if it is
+/// dropped instead of being handed on.
+///
+/// `std::process::Child` has no `Drop`: dropping one abandons the process,
+/// which keeps running and, once it exits, becomes a zombie for the core's
+/// entire session because nothing will ever `waitpid` it. That is the
+/// correct default for a general-purpose handle and exactly the wrong one
+/// here, because [`spawn_realm`] documents every one of its errors as a
+/// *refusal* -- "never a partially-launched realm" -- and the window
+/// between it returning and [`crate::lifecycle::RealmLifecycle::adopt`]
+/// taking ownership is not error-free. Realm bring-up
+/// ([`SpawnedRealm::start_shim_session`]) sends `configure` over the
+/// inherited socketpair and fails with `EPIPE` against a shim that exec'd
+/// successfully and then died at once -- a wrapper that returns nonzero, a
+/// binary missing a shared library, a shim that rejects its environment --
+/// and a `?` there drops the [`SpawnedRealm`] mid-unwind.
+///
+/// So the guarantee is made structural rather than left to every caller
+/// remembering it: the process is killed and reaped by the type system, on
+/// every path out including a panic, until the moment ownership genuinely
+/// moves to [`crate::lifecycle`] (which has a `Drop` of its own from
+/// `adopt` onwards, so the two are contiguous with no gap between them).
+#[derive(Debug)]
+struct GuardedChild(Option<Child>);
+
+impl GuardedChild {
+    fn get(&self) -> &Child {
+        // Unreachable: `release` consumes `self`, so the `None` state is
+        // observable only from inside `Drop`.
+        self.0
+            .as_ref()
+            .expect("the child is present until released")
+    }
+
+    fn get_mut(&mut self) -> &mut Child {
+        self.0
+            .as_mut()
+            .expect("the child is present until released")
+    }
+
+    /// Hand the process on to an owner that will reap it, disarming the
+    /// guard. Consumes `self`, so it cannot be released twice.
+    fn release(mut self) -> Child {
+        self.0.take().expect("the child is present until released")
+    }
+}
+
+impl Drop for GuardedChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        tracing::warn!(
+            pid = child.id(),
+            "a spawned shim was dropped before the realm came up; SIGKILLing and reaping it \
+             so the refusal leaves no runaway process and no zombie"
+        );
+        // `SIGKILL` and a blocking wait, matching `RealmLifecycle`'s own
+        // last-resort drop: there is nowhere left to report a polite
+        // failure to, and this realm never became live enough to owe its
+        // app an orderly teardown.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// A realm whose app has been launched: the core's half of the identity
 /// pair (the socketpair end the shim does *not* hold), the process handle,
 /// and the private directory the realm was given.
 ///
-/// The [`Child`] is retained and never waited on: reaping, crash detection,
-/// and exit propagation are P1.5.3 (#32), and losing the handle here would
-/// force that task to re-derive one from a pid -- which is exactly the
-/// pid-reuse race a `Child` exists to avoid.
+/// The [`Child`] is retained rather than waited on: reaping, crash
+/// detection, and exit propagation are P1.5.3 (#32), and losing the handle
+/// here would force that task to re-derive one from a pid -- which is
+/// exactly the pid-reuse race a `Child` exists to avoid. The single
+/// exception is a [`SpawnedRealm`] that is *dropped* before
+/// [`Self::into_parts`] hands it on, which kills and reaps
+/// ([`GuardedChild`]): a realm that never came up is a refusal, and a
+/// refusal must not leave a process behind.
 #[derive(Debug)]
 pub(crate) struct SpawnedRealm {
     realm_id: RealmId,
-    child: Child,
+    /// The shim process, reaped on drop if the realm is never adopted
+    /// ([`GuardedChild`]).
+    child: GuardedChild,
     runtime_dir: PathBuf,
     connection: Connection,
     /// This realm's exclusive `flock`, held for as long as the realm is
@@ -444,7 +516,7 @@ impl SpawnedRealm {
 
     /// The shim's process id.
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.child.get().id()
     }
 
     /// The realm's private runtime directory (mode `0700`), which the shim
@@ -464,7 +536,7 @@ impl SpawnedRealm {
     /// deterministically. This module implements no lifecycle policy of its
     /// own.
     pub fn child_mut(&mut self) -> &mut Child {
-        &mut self.child
+        self.child.get_mut()
     }
 
     /// Hand the whole live realm to [`crate::lifecycle`], which owns it
@@ -478,7 +550,10 @@ impl SpawnedRealm {
     pub fn into_parts(self) -> SpawnedParts {
         SpawnedParts {
             realm_id: self.realm_id,
-            child: self.child,
+            // The one place the reap guard is disarmed: `lifecycle` owns
+            // the process from here, and its own `Drop` takes over with no
+            // window in between.
+            child: self.child.release(),
             runtime_dir: self.runtime_dir,
             connection: self.connection,
             realm_lock: self._realm_lock,
@@ -844,7 +919,7 @@ where
 
     Ok(SpawnedRealm {
         realm_id: realm.id().clone(),
-        child,
+        child: GuardedChild(Some(child)),
         runtime_dir,
         connection: core_side,
         // The realm is now live, and the lock that proved it was free
@@ -2450,6 +2525,60 @@ pub(crate) mod tests {
         );
         fs::set_permissions(&vendor, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_spawned_realm_dropped_before_adoption_leaves_no_process_and_no_zombie() {
+        // The gap between `spawn_realm` returning and
+        // `RealmLifecycle::adopt` taking over. `std::process::Child` has no
+        // `Drop`, so without the guard this window abandons the shim: it
+        // keeps running, and once it exits it is a zombie for the core's
+        // whole session because nothing will ever wait on it.
+        //
+        // The window is real, not theoretical: `start_shim_session` sits
+        // inside it and is fallible (a blocking `configure` that fails with
+        // EPIPE against a shim that exec'd and died at once), so a plain `?`
+        // there drops a `SpawnedRealm` mid-unwind. Every other zombie test
+        // in this repo reaches `adopt` first and cannot see it.
+        /// A pid's procfs state character, or `None` if it is gone
+        /// entirely. Reading the state is the point: a zombie's `/proc`
+        /// entry still exists, so "the directory is gone" would pass for
+        /// exactly the failure under test.
+        fn proc_state(pid: u32) -> Option<char> {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // The comm field may contain ')' and spaces, so the state is
+            // the first token after the LAST ')'.
+            let after = stat.rsplit_once(')')?.1;
+            after.split_whitespace().next()?.chars().next()
+        }
+
+        let _fd = fd_lock();
+        let mut h = Harness::new("spawn-drop-before-adopt");
+        // Spawned but NOT brought up: the shim is parked on its
+        // socketpair, exactly where it sits when a caller bails out
+        // between `spawn_realm` and `adopt`.
+        let bin = mock_shim_bin();
+        let realm = realm_with_spawn("realm-0", &bin, &["--serve".to_string()], &[]);
+        let paths = h.paths();
+        let spawned = spawn_realm_with_env(&realm, &paths, &mut h.recorder, |_| None)
+            .expect("spawn must succeed against a scratch runtime tree");
+        let pid = spawned.pid();
+        wait_for_exec(pid, &bin);
+        assert!(
+            proc_state(pid).is_some_and(|s| s != 'Z'),
+            "the shim is running before the drop"
+        );
+
+        drop(spawned);
+
+        assert!(
+            proc_state(pid) != Some('Z'),
+            "a dropped SpawnedRealm must reap its shim, not merely abandon it as a zombie"
+        );
+        assert!(
+            !children_of(std::process::id()).contains(&pid),
+            "the shim must not remain an unreaped child of the core"
+        );
     }
 
     #[test]

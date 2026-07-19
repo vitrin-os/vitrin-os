@@ -532,7 +532,10 @@ fn main() -> ExitCode {
 ///
 /// The embedder that owns realms also derives `ServerCtx::realm_view` from
 /// `RealmLifecycle::view_is_live` — the one seam that makes the
-/// chokepoint's `no_surface` refusal true after a shim dies.
+/// chokepoint's `no_surface` refusal true after a shim dies — and passes
+/// its backend as `RealmTeardown::retained`, so the death funnel scrubs the
+/// framebuffer a capture reads back. The first is the refusal; the second
+/// is why a mistake in the first cannot serve the dead realm's last frame.
 fn run_session<R>(
     consent: ConsentPolicy,
     recorder_path: Option<PathBuf>,

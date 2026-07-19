@@ -204,6 +204,33 @@ impl HeadlessState {
     }
 }
 
+impl crate::lifecycle::RetainedOutput for HeadlessState {
+    /// Composite an **empty** [`Scene`] into the retained framebuffer, so
+    /// the last frame the dead realm painted is gone from the one buffer
+    /// [`Self::latest_frame_rgba`] reads back.
+    ///
+    /// An empty scene rather than a memset: [`Scene::compose`] on an empty
+    /// scene *is* the deterministic background, so this reuses the single
+    /// composition implementation instead of inventing a second idea of
+    /// what an unpainted realm looks like. It deliberately does not touch
+    /// `self.scene` -- the death funnel has already cleared that through
+    /// `ShimServer::connection_closed`, and this type must not become a
+    /// second place a realm's death is decided.
+    ///
+    /// This keeps [`Self::latest_frame_rgba`] a pure read: the recomposite
+    /// happens on the death path, never on the capture path, so capture
+    /// still observes "what the compositor last finished" and the goldens
+    /// stay deterministic.
+    fn scrub_retained_frame(&mut self) -> Result<(), Box<dyn Error>> {
+        composite(
+            &mut self.renderer,
+            &mut self.framebuffer,
+            self.size,
+            &Scene::new(),
+        )
+    }
+}
+
 /// Blit the composed realm view ([`Scene::compose`]) into `framebuffer` at
 /// `size`, 1:1 and upright.
 ///
@@ -365,6 +392,78 @@ mod tests {
     /// and the nested backend uploads the same `Scene::compose` output as
     /// its window texture (same seam, same bytes; GL presentation itself
     /// needs a display, so CI proves the shared-seam half).
+    #[test]
+    fn scrubbing_the_retained_frame_removes_the_dead_realms_pixels() {
+        // The other half of `lifecycle`'s scrub property, on real pixels:
+        // `lifecycle` proves the death funnel drives this seam, and this
+        // proves the seam really erases what the shim painted.
+        //
+        // Without it, `latest_frame_rgba` -- documented as "the capture
+        // service's actual pixel source" and deliberately a pure read that
+        // never recomposites -- keeps returning the dead realm's last frame
+        // byte for byte for the rest of the session, with nothing between
+        // those bytes and an agent but the embedder remembering to gate on
+        // `view_is_live`.
+        use crate::lifecycle::RetainedOutput;
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+
+        let _fd = crate::capture::tests::fd_lock();
+        const VW: u32 = 96;
+        const VH: u32 = 64;
+        const SW: u32 = 48;
+        const SH: u32 = 32;
+
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessState> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state =
+            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+
+        let pixels = client_pixels(SW, SH);
+        state.scene.commit(
+            SurfaceContent::from_rgba(pixels.clone(), SW, SH).expect("well-formed content"),
+        );
+        state.redraw().expect("composite the committed surface");
+        let painted = state.latest_frame_rgba().expect("readback");
+        let background = test_pattern::render(VW, VH);
+        assert_ne!(
+            painted, background,
+            "the realm must really have painted, or the scrub below proves nothing"
+        );
+
+        // The realm dies: the scene loses its surface (what the death
+        // funnel does through `ShimServer::connection_closed`)...
+        state.scene.clear_surface();
+        assert_eq!(
+            state.latest_frame_rgba().expect("readback"),
+            painted,
+            "clearing the scene alone must NOT change the retained frame -- that is exactly \
+             the staleness the scrub exists for, and capture reads the retained frame"
+        );
+
+        // ...and the funnel scrubs the retained frame.
+        state.scrub_retained_frame().expect("scrub");
+        let scrubbed = state.latest_frame_rgba().expect("readback");
+        assert_eq!(
+            scrubbed, background,
+            "a scrubbed retained frame is the empty-scene background, byte for byte"
+        );
+        assert!(
+            !scrubbed
+                .windows(pixels.len().min(scrubbed.len()))
+                .any(|w| w == &pixels[..w.len()]),
+            "no run of the dead realm's committed pixels may survive in the framebuffer"
+        );
+
+        // Still a pure read: the scrub happened on the death path, so
+        // capture does not recomposite and stays deterministic.
+        assert_eq!(
+            state.latest_frame_rgba().expect("second readback"),
+            scrubbed,
+            "capture must remain a pure read after a scrub"
+        );
+    }
+
     #[test]
     fn committed_shm_buffer_reaches_retained_framebuffer_and_capture() {
         use std::fs::File;

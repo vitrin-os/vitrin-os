@@ -100,7 +100,12 @@
 //! 2. [`RealmLifecycle::die`] runs the realm through
 //!    [`ShimServer::connection_closed`] -- the pre-existing teardown funnel,
 //!    not a new one -- which calls [`Scene::clear_surface`], retires any
-//!    retained zero-copy content, and resets the input router.
+//!    retained zero-copy content, and resets the input router. It then
+//!    scrubs the backend's **retained frame** ([`RetainedOutput`]), which
+//!    clearing the scene does not do: [`Scene::compose`] is pure and so
+//!    self-heals, but a framebuffer is a cache of a past composition and
+//!    would otherwise hold the dead realm's last painted pixels for the
+//!    rest of the session.
 //! 3. The scene now has no committed surface, so
 //!    [`RealmLifecycle::view_is_live`] answers `false` and the embedder
 //!    passes `realm_view: None` for every subsequent dispatch turn.
@@ -111,7 +116,10 @@
 //! Step 3 is the only new seam, and it is deliberately a *fact* rather than
 //! a judgement: [`view_is_live`] reports whether the realm has a live view,
 //! and the chokepoint alone decides what that means for authority. There is
-//! still exactly one enforcement site.
+//! still exactly one enforcement site. Step 2's scrub is **not** a second
+//! predicate and is never consulted -- it removes the bytes rather than
+//! answering a question about them, so the chain has one authority and two
+//! layers.
 //!
 //! [`view_is_live`]: RealmLifecycle::view_is_live
 //!
@@ -449,11 +457,53 @@ pub(crate) struct RealmTeardown<'a, H: PreemptionHook> {
     /// The realm's input router: seat state must not survive into a next
     /// shim generation.
     pub router: &'a mut InputRouter<H>,
+    /// The backend's retained output, if this embedder composites into one:
+    /// the last completed frame is scrubbed with the realm, so no readback
+    /// can return a pixel the dead shim painted.
+    ///
+    /// Optional and a trait object for exactly the reasons [`Self::importer`]
+    /// is: not every embedder has one, and `lifecycle` must not name a
+    /// backend type.
+    pub retained: Option<&'a mut dyn RetainedOutput>,
     /// The core's single realm registry: where the terminal state lands,
     /// and through it the single vacancy predicate.
     pub realms: &'a mut RealmRegistry,
     /// The run's single flight-recorder handle.
     pub recorder: &'a mut Recorder,
+}
+
+/// The compositor's **retained output**: the framebuffer a capture reads
+/// back, as opposed to the [`Scene`] a frame is composed *from*.
+///
+/// The two go stale independently, and only one of them is self-healing.
+/// [`Scene::compose`] is pure -- clear the surface and it yields the
+/// deterministic background on the very next call -- but a retained
+/// framebuffer is a *cache of a past composition*, and
+/// [`crate::capture`]'s pixel source is documented as "always retained
+/// output, never a fresh render". So a realm whose shim just died leaves
+/// its last painted frame sitting in that buffer, byte for byte, until
+/// something composites over it, and the headless backend composites only
+/// on a scene commit -- which a dead realm will never send again.
+///
+/// # This is defense in depth, and deliberately not a second predicate
+///
+/// [`RealmLifecycle::view_is_live`] remains the *single* fact behind every
+/// `no_surface` refusal, and the enforcement chokepoint remains the single
+/// place that judges it. This trait adds no predicate, answers no authority
+/// question, and is never consulted: it is a scrub, so that the bytes
+/// behind the one predicate are harmless even if a future embedder wires
+/// the predicate wrong. One boolean deep is thin for the property this
+/// task exists to guarantee; a boolean plus "the buffer no longer holds
+/// those pixels" is two.
+pub(crate) trait RetainedOutput {
+    /// Scrub the retained frame back to the empty-scene background.
+    ///
+    /// After this returns `Ok`, a readback cannot yield any pixel the dead
+    /// realm's shim painted. Implementations composite an **empty**
+    /// [`Scene`] through the same [`Scene::compose`] every frame goes
+    /// through, rather than defining a second idea of what an unpainted
+    /// realm looks like.
+    fn scrub_retained_frame(&mut self) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 /// One live realm, from the moment [`crate::spawn`] hands it over until
@@ -488,10 +538,32 @@ pub(crate) struct RealmLifecycle {
     death: Option<DeathCause>,
     /// The classified exit status, once the process has been reaped.
     exit: Option<ExitClass>,
-    /// Whether the core sent the signal that ended this shim. Recorded
-    /// because the signal number cannot say: `SIGKILL` is both the
-    /// ladder's last rung and the classic external `kill -9`.
-    core_initiated: bool,
+    /// Every signal this core actually delivered to this shim, deduplicated.
+    ///
+    /// A *set of signals* rather than a "the core signalled at some point"
+    /// latch, because [`Self::core_initiated`] has to answer a strictly
+    /// narrower question -- did the core send **the signal that actually
+    /// ended this process** -- and a latch answers a wider one that is
+    /// false whenever the two differ. Two reachable paths make them differ,
+    /// one of them on every ordinary crash:
+    ///
+    /// - The core asks a hung-up-but-living shim to leave (`SIGTERM`, in
+    ///   [`Self::note_connection_closed`]) and an operator then `kill -9`s
+    ///   it. A latch would report the resulting `signal: 9` as the core's
+    ///   doing.
+    /// - A plain external `kill -9` of a live shim. The kernel releases a
+    ///   dying task's descriptors (`exit_files`) **before** it makes the
+    ///   task reapable (`exit_notify`), so the socketpair EOF genuinely
+    ///   precedes `waitpid` succeeding -- measured at 348/400 on this
+    ///   kernel. `note_connection_closed` therefore finds the child
+    ///   unreaped on the ordinary crash path and sends its `SIGTERM` into a
+    ///   process already inside `do_exit`. Harmless as a signal, fatal as
+    ///   evidence: a latch would mark the run's one honest record of an
+    ///   external kill as core-initiated.
+    ///
+    /// Recorded only on a `kill(2)` that *succeeded*: a signal the kernel
+    /// refused was never delivered and must not be claimed.
+    core_signals: Vec<i32>,
     /// Whether the runtime tree has already been removed, so a second
     /// [`RealmLifecycle::shutdown`] does not log a failure to delete
     /// something that is correctly gone.
@@ -512,7 +584,7 @@ impl RealmLifecycle {
             _realm_lock: parts.realm_lock,
             death: None,
             exit: None,
-            core_initiated: false,
+            core_signals: Vec::new(),
             runtime_dir_removed: false,
         }
     }
@@ -548,6 +620,30 @@ impl RealmLifecycle {
     /// is provably no zombie for this realm: the core waited on it.
     pub fn is_reaped(&self) -> bool {
         self.child.is_none()
+    }
+
+    /// **Did the core send the signal that ended this shim?** The one
+    /// question `realm_exited.core_initiated` answers, and the only thing
+    /// that can distinguish the ladder's last rung from an operator's
+    /// `kill -9` -- the signal number is `9` either way.
+    ///
+    /// Deliberately computed from the terminating signal rather than
+    /// latched when a signal is sent (see [`Self::core_signals`]): the core
+    /// signalling *something* at *some point* is a different and wider fact
+    /// than the core having caused *this* death, and reporting the wider
+    /// one would let the log claim kills the core did not make.
+    ///
+    /// `false` for a shim that ran to completion (`disposition: exited`),
+    /// including one that exited from inside its own `SIGTERM` handler: no
+    /// signal terminated it, so there is no signal to attribute. That the
+    /// core drove the teardown is already stated, once, by
+    /// `realm_died.cause = "shutdown"` -- this field is not a second way to
+    /// say it.
+    pub fn core_initiated(&self) -> bool {
+        match self.exit {
+            Some(ExitClass::Signaled { signal }) => self.core_signals.contains(&signal),
+            _ => false,
+        }
     }
 
     /// The runtime directory this realm was given, while it still exists.
@@ -616,10 +712,19 @@ impl RealmLifecycle {
             // again and must not keep holding the realm's runtime tree.
             // Asked, not killed: it may be mid-teardown of its own app,
             // and the ladder escalates later if it is not.
+            //
+            // "not been reaped", NOT "is still running": reaching here does
+            // not mean the shim is alive. The kernel releases a dying
+            // task's descriptors before it makes the task reapable, so on
+            // an ordinary `kill -9` the EOF above arrives while the shim is
+            // still inside `do_exit` and this `SIGTERM` lands on a process
+            // that is already leaving. That costs nothing -- but it is
+            // exactly why [`Self::core_initiated`] is derived from the
+            // terminating signal instead of being latched here.
             tracing::info!(
                 realm = %self.realm_id,
                 pid = self.pid,
-                "shim connection ended but its process is still running; asking it to exit"
+                "shim connection ended and its process has not been reaped; asking it to exit"
             );
             self.signal(libc::SIGTERM);
         }
@@ -706,11 +811,12 @@ impl RealmLifecycle {
             }
         };
 
-        // Only now, with the shim provably reaped, and only on this
-        // orderly path -- a crash keeps the tree (module docs). The realm
-        // `flock` is still held and is released after this, when `self`
-        // drops: a second core must not be able to call this tree stale
-        // while it is being taken apart.
+        // Only now, with the shim dead by every rung's construction (the
+        // ladder ends in `SIGKILL`, which cannot be refused), and only on
+        // this orderly path -- a crash keeps the tree (module docs). The
+        // realm `flock` is still held and is released after this, when
+        // `self` drops: a second core must not be able to call this tree
+        // stale while it is being taken apart.
         self.remove_runtime_dir();
         rung
     }
@@ -749,6 +855,30 @@ impl RealmLifecycle {
                 // had a server.
                 teardown.scene.clear_surface();
                 teardown.router.reset();
+            }
+        }
+
+        // 1b. ...and the *retained* frame is scrubbed, which clearing the
+        //     scene does not do. `Scene::compose` is pure, so the scene is
+        //     already harmless; a backend framebuffer is a cache of a past
+        //     composition and still holds the dead realm's last painted
+        //     frame until something composites over it (see
+        //     [`RetainedOutput`]). `take()` for the same reason the
+        //     importer above uses it.
+        //
+        //     A failure here is loud but not fatal, and explicitly not
+        //     fail-open: the chokepoint's `no_surface` refusal rests on
+        //     `view_is_live`, which is already `false` -- this step only
+        //     removes the bytes that refusal is protecting.
+        if let Some(retained) = teardown.retained.take() {
+            if let Err(err) = retained.scrub_retained_frame() {
+                tracing::error!(
+                    realm = %self.realm_id,
+                    %err,
+                    "could not scrub the dead realm's retained frame; captures still refuse \
+                     no_surface (view_is_live is false), but the last painted frame is still \
+                     resident in the backend's framebuffer"
+                );
             }
         }
 
@@ -811,12 +941,12 @@ impl RealmLifecycle {
             disposition: class.disposition(),
             code: class.code(),
             signal: class.signal(),
-            core_initiated: self.core_initiated,
+            core_initiated: self.core_initiated(),
         });
         tracing::info!(
             realm = %self.realm_id,
             pid = self.pid,
-            core_initiated = self.core_initiated,
+            core_initiated = self.core_initiated(),
             "realm shim reaped: {class}"
         );
     }
@@ -851,11 +981,13 @@ impl RealmLifecycle {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        self.core_initiated = true;
         // `Child::kill` rather than a raw `kill(2)`: std owns this handle's
         // reaped-ness and refuses to signal a pid it has already waited on.
-        if let Err(err) = child.kill() {
-            tracing::error!(realm = %self.realm_id, pid = self.pid, %err, "SIGKILL failed");
+        match child.kill() {
+            Ok(()) => self.note_core_signal(libc::SIGKILL),
+            Err(err) => {
+                tracing::error!(realm = %self.realm_id, pid = self.pid, %err, "SIGKILL failed")
+            }
         }
         match child.wait() {
             Ok(status) => {
@@ -867,16 +999,33 @@ impl RealmLifecycle {
                 self.collect_exit(status, teardown);
             }
             Err(err) => {
-                // The child was taken, so nothing will wait on it again --
-                // but SIGKILL was delivered, so there is no runaway
-                // process, only an uncollected status.
+                // Put the handle back too. An uncollected status *is* a
+                // zombie, so leaving the handle dropped here would make
+                // `is_reaped()` -- documented as "provably no zombie: the
+                // core waited on it" -- assert exactly the thing that did
+                // not happen, and would strand the realm with no
+                // `realm_exited` entry, which the recorder documents as the
+                // log's evidence that nothing was left behind. Restored, the
+                // guarantee stays honest and `Drop`'s last-resort wait still
+                // has something to collect with.
+                self.child = Some(child);
                 tracing::error!(
                     realm = %self.realm_id,
                     pid = self.pid,
                     %err,
-                    "waiting on the SIGKILLed shim failed; its exit status is lost"
+                    "waiting on the SIGKILLed shim failed; it may be left unreaped"
                 );
             }
+        }
+    }
+
+    /// Remember a signal this core actually delivered to the shim, for
+    /// [`Self::core_initiated`]. Deduplicated because the ladder can send
+    /// the same signal twice and the set is only ever asked a membership
+    /// question.
+    fn note_core_signal(&mut self, signal: i32) {
+        if !self.core_signals.contains(&signal) {
+            self.core_signals.push(signal);
         }
     }
 
@@ -894,7 +1043,6 @@ impl RealmLifecycle {
             tracing::error!(realm = %self.realm_id, pid = self.pid, "pid is out of range for kill(2)");
             return;
         };
-        self.core_initiated = true;
         // SAFETY: `kill(2)` takes two integers, touches no memory, and
         // cannot alias anything. `pid` names a process this core forked and
         // has not reaped (checked immediately above), so it is this realm's
@@ -903,7 +1051,12 @@ impl RealmLifecycle {
         if rc < 0 {
             let err = std::io::Error::last_os_error();
             tracing::warn!(realm = %self.realm_id, pid = self.pid, signal, %err, "kill failed");
+            return;
         }
+        // Recorded *after* the syscall succeeded, never before it: this set
+        // is evidence for [`Self::core_initiated`], and a signal the kernel
+        // refused was never delivered.
+        self.note_core_signal(signal);
     }
 
     /// Remove the realm's private runtime tree -- orderly shutdown only
@@ -931,10 +1084,14 @@ impl RealmLifecycle {
 
 impl Drop for RealmLifecycle {
     /// Last-resort hygiene, not a policy path: a [`RealmLifecycle`] dropped
-    /// without [`RealmLifecycle::shutdown`] -- an embedder bug, or a panic
-    /// unwinding past it -- must not leave a zombie or a runaway shim
-    /// behind. `SIGKILL` and a blocking wait, because there is no longer
-    /// anywhere to report a polite failure to.
+    /// while its shim is still unreaped must not leave a zombie or a
+    /// runaway behind. Reachable two ways -- a drop that skipped
+    /// [`RealmLifecycle::shutdown`] entirely (an embedder bug, or a panic
+    /// unwinding past it), and the ladder's own `wait` failing after it
+    /// delivered `SIGKILL`, which puts the handle back rather than dropping
+    /// it precisely so this net still has something to collect. `SIGKILL`
+    /// and a blocking wait, because there is no longer anywhere to report a
+    /// polite failure to.
     ///
     /// This deliberately does *not* remove the runtime directory: that
     /// decision belongs to `shutdown`, which knows the exit was orderly.
@@ -945,7 +1102,7 @@ impl Drop for RealmLifecycle {
         tracing::warn!(
             realm = %self.realm_id,
             pid = self.pid,
-            "realm dropped without shutdown(); SIGKILLing and reaping its shim so no \
+            "realm dropped with its shim still unreaped; SIGKILLing and waiting so no \
              zombie is left behind"
         );
         let _ = child.kill();
@@ -1086,6 +1243,41 @@ mod tests {
         children_of(std::process::id())
     }
 
+    /// A stand-in for the backend's retained framebuffer, counting the
+    /// scrubs the death funnel drives.
+    ///
+    /// A fake here and the real thing in `backend::headless` -- this file
+    /// asserts that the funnel *drives the seam*, exactly once and on every
+    /// death path; `backend::headless`'s own test asserts that the seam
+    /// really removes the painted pixels. Splitting it that way keeps a
+    /// pixman renderer out of the lifecycle suite while leaving both halves
+    /// of the property pinned.
+    struct FakeRetained {
+        scrubs: usize,
+        /// Make the scrub fail, to prove a failing backend cannot take the
+        /// session down or stop the realm from dying.
+        fails: bool,
+    }
+
+    impl FakeRetained {
+        fn new() -> Self {
+            Self {
+                scrubs: 0,
+                fails: false,
+            }
+        }
+    }
+
+    impl RetainedOutput for FakeRetained {
+        fn scrub_retained_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            self.scrubs += 1;
+            if self.fails {
+                return Err("the backend refused to recomposite".into());
+            }
+            Ok(())
+        }
+    }
+
     /// One lifecycle test's world: a scratch runtime tree, the run's
     /// flight recorder, and the realm-side state a death has to touch.
     struct Rig {
@@ -1095,6 +1287,7 @@ mod tests {
         scene: Scene,
         shim: Option<ShimServer>,
         router: InputRouter<NoopHook>,
+        retained: FakeRetained,
         realms: RealmRegistry,
     }
 
@@ -1108,6 +1301,7 @@ mod tests {
                 scene: Scene::new(),
                 shim: None,
                 router: InputRouter::new(NoopHook),
+                retained: FakeRetained::new(),
                 realms: crate::realm::tests::registry_with(&["realm-0"]),
             }
         }
@@ -1119,6 +1313,7 @@ mod tests {
                 shim: &mut self.shim,
                 importer: None,
                 router: &mut self.router,
+                retained: Some(&mut self.retained),
                 realms: &mut self.realms,
                 recorder: &mut self.recorder,
             }
@@ -1398,7 +1593,7 @@ mod tests {
             // did not send it.
             assert_eq!(life.exit(), Some(ExitClass::Signaled { signal: 9 }));
             assert!(!life.exit().unwrap().is_clean());
-            assert!(!life.core_initiated);
+            assert!(!life.core_initiated());
 
             // Orderly shutdown of an already-dead realm: nothing to kill.
             assert_eq!(
@@ -1532,7 +1727,7 @@ mod tests {
                 "a compliant shim must exit on its core's hangup, before any signal"
             );
             assert!(
-                !life.core_initiated,
+                !life.core_initiated(),
                 "the polite path must not have signalled anything"
             );
             assert_eq!(life.exit(), Some(ExitClass::Exited { code: 0 }));
@@ -1729,10 +1924,122 @@ mod tests {
         reap_within_deadline(&mut rig, &mut life);
         assert_eq!(life.exit(), Some(ExitClass::Signaled { signal: 15 }));
         assert!(
-            life.core_initiated,
+            life.core_initiated(),
             "the core sent that SIGTERM and the log must say so"
         );
         assert!(!is_zombie(pid));
+
+        let _ = life.shutdown(quick_timing(), &mut rig.teardown());
+    }
+
+    // -- attribution: whose signal actually ended the shim ------------------
+
+    #[test]
+    fn a_core_sigterm_followed_by_an_external_kill_is_not_recorded_as_the_cores_doing() {
+        // The deterministic half of the attribution bug a per-realm latch
+        // has. This shim hangs up but keeps running, so the core really
+        // does send it a SIGTERM -- and it really does ignore it. An
+        // operator then `kill -9`s it. The core sent A signal; it did not
+        // send THE signal that ended this process, and `core_initiated` is
+        // documented as answering the second question.
+        //
+        // Without per-signal attribution the log reads
+        // `signal: 9, core_initiated: true` -- the core claiming a kill it
+        // did not make, in the run's only record of an operator's kill.
+        let _fd = fd_lock();
+        let (pid, entries) = {
+            let mut rig = Rig::new("lifecycle-attribution");
+            let mut life = rig.spawn_program(
+                "/bin/sh",
+                // Close fd 3, ignore SIGTERM, then live on.
+                &[
+                    "-c",
+                    r#"exec 3<&- 2>/dev/null; trap "" TERM; while :; do sleep 0.05; done"#,
+                ],
+            );
+            let pid = life.pid();
+
+            // The hangup: the core observes EOF and asks it to leave.
+            assert_eq!(
+                wait_for_death(&mut rig, &mut life),
+                DeathCause::ConnectionClosed
+            );
+            assert!(!life.is_reaped(), "it ignores SIGTERM, so it is still here");
+
+            // The core's SIGTERM really was delivered -- otherwise this
+            // test would prove nothing about attribution.
+            assert_eq!(
+                life.core_signals,
+                vec![libc::SIGTERM],
+                "the core must really have sent SIGTERM for the misattribution to be possible"
+            );
+
+            // Somebody else ends it.
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+            reap_within_deadline(&mut rig, &mut life);
+
+            assert_eq!(life.exit(), Some(ExitClass::Signaled { signal: 9 }));
+            assert!(
+                !life.core_initiated(),
+                "the core sent SIGTERM, not the SIGKILL that ended it: attribution is \
+                 per-signal, not 'the core signalled at some point'"
+            );
+            (pid, rig.entries())
+        };
+
+        let exited = of_kind(&entries, "realm_exited");
+        assert_eq!(exited.len(), 1);
+        assert_eq!(exited[0].u64("signal"), 9);
+        assert!(
+            !exited[0].bool("core_initiated"),
+            "the journal must not attribute an external kill -9 to the core merely because \
+             the core had asked the same process to exit earlier"
+        );
+        assert!(!is_zombie(pid));
+        assert!(!unreaped_children().contains(&pid));
+    }
+
+    #[test]
+    fn the_core_sigterm_that_does_end_a_shim_is_still_attributed_to_the_core() {
+        // The other side of the same razor: narrowing attribution must not
+        // narrow it into uselessness. Here the core's SIGTERM IS the signal
+        // that ends the shim, so the log must say so -- this is what keeps
+        // the field able to distinguish the ladder's last rung from an
+        // operator's kill, which is its whole reason to exist.
+        let _fd = fd_lock();
+        let mut rig = Rig::new("lifecycle-attribution-true");
+        let mut life =
+            rig.spawn_program("/bin/sh", &["-c", "exec 3<&- 2>/dev/null; exec sleep 300"]);
+        let pid = life.pid();
+
+        wait_for_death(&mut rig, &mut life);
+        reap_within_deadline(&mut rig, &mut life);
+
+        assert_eq!(life.exit(), Some(ExitClass::Signaled { signal: 15 }));
+        assert!(
+            life.core_initiated(),
+            "the core sent the SIGTERM that ended this shim"
+        );
+        assert!(!is_zombie(pid));
+        let _ = life.shutdown(quick_timing(), &mut rig.teardown());
+    }
+
+    #[test]
+    fn a_signal_the_kernel_refused_is_never_claimed_as_the_cores() {
+        // `core_signals` is evidence, so it records deliveries rather than
+        // intentions: an out-of-range or otherwise refused `kill(2)` must
+        // leave the set empty. Signal 0 is the probe signal -- it is
+        // delivered to nothing -- so `kill` succeeds and it is recorded;
+        // an invalid signal number is refused with EINVAL and must not be.
+        let _fd = fd_lock();
+        let mut rig = Rig::new("lifecycle-refused-signal");
+        let mut life = rig.spawn(&["--serve"]);
+
+        life.signal(libc::SIGCHLD.wrapping_add(4096));
+        assert!(
+            life.core_signals.is_empty(),
+            "a kill(2) the kernel refused was never delivered and must not be claimed"
+        );
 
         let _ = life.shutdown(quick_timing(), &mut rig.teardown());
     }
@@ -1764,7 +2071,7 @@ mod tests {
         );
         assert_eq!(life.exit(), Some(ExitClass::Signaled { signal: 9 }));
         assert!(
-            life.core_initiated,
+            life.core_initiated(),
             "the core sent this SIGKILL; the log must distinguish it from an external kill -9"
         );
         // The ladder really waited before escalating -- it did not skip
@@ -2011,6 +2318,98 @@ mod tests {
             !life.view_is_live(&scene),
             "a DEAD realm has no view even if some scene still holds a surface"
         );
+        let _ = life.shutdown(quick_timing(), &mut rig.teardown());
+    }
+
+    // -- the retained frame: scrubbed with the realm ----------------------
+
+    #[test]
+    fn the_death_funnel_scrubs_the_retained_frame_exactly_once() {
+        // Clearing the scene is not enough on its own. `Scene::compose` is
+        // pure, so the scene self-heals; the backend's framebuffer is a
+        // cache of a past composition and keeps the dead realm's last
+        // painted frame until something composites over it. The funnel
+        // drives that, through the bundle, so an embedder cannot hold a
+        // dead realm's pixels by forgetting a step.
+        let _fd = fd_lock();
+        let mut rig = Rig::new("lifecycle-scrub");
+        let mut life = rig.spawn(&["--serve", "--animate", "100000"]);
+        wait_until_painted(&mut rig, &mut life);
+        assert_eq!(
+            rig.retained.scrubs, 0,
+            "a live realm's retained frame is its own"
+        );
+
+        assert_eq!(
+            unsafe { libc::kill(life.pid() as libc::pid_t, libc::SIGKILL) },
+            0
+        );
+        wait_for_death(&mut rig, &mut life);
+        assert_eq!(
+            rig.retained.scrubs, 1,
+            "the death funnel must scrub the retained frame"
+        );
+
+        // Latched with everything else the death does: repeated
+        // observations and the shutdown ladder must not scrub again.
+        reap_within_deadline(&mut rig, &mut life);
+        for _ in 0..3 {
+            life.note_connection_closed(DeathCause::ConnectionFault, &mut rig.teardown());
+            life.poll_exit(&mut rig.teardown());
+        }
+        let _ = life.shutdown(quick_timing(), &mut rig.teardown());
+        assert_eq!(
+            rig.retained.scrubs, 1,
+            "the scrub rides the death latch: one death, one scrub"
+        );
+    }
+
+    #[test]
+    fn a_realm_that_dies_before_bring_up_still_scrubs_the_retained_frame() {
+        // The no-`ShimServer` arm of the funnel. A realm that died before
+        // its session came up has no server to run `connection_closed`
+        // through, and that arm is exactly where a second, hand-rolled
+        // teardown path forgets a step.
+        let _fd = fd_lock();
+        let mut rig = Rig::new("lifecycle-scrub-early");
+        let mut life = rig.spawn_program("/bin/sh", &["-c", "exec sleep 300"]);
+        assert!(rig.shim.is_none(), "no session came up in this rig");
+
+        life.note_connection_closed(DeathCause::ConnectionClosed, &mut rig.teardown());
+        assert_eq!(
+            rig.retained.scrubs, 1,
+            "the server-less arm must scrub too: a realm with no shim session can still \
+             have had something composited for it"
+        );
+        let _ = life.shutdown(quick_timing(), &mut rig.teardown());
+    }
+
+    #[test]
+    fn a_failing_scrub_does_not_stop_the_realm_from_dying() {
+        // Fail-closed check on the defense-in-depth layer: the scrub is
+        // best effort and loud, and a backend that cannot recomposite must
+        // not keep a dead realm alive, abort the session, or -- above all
+        // -- leave `view_is_live` true.
+        let _fd = fd_lock();
+        let mut rig = Rig::new("lifecycle-scrub-fails");
+        let mut life = rig.spawn(&["--serve", "--animate", "100000"]);
+        wait_until_painted(&mut rig, &mut life);
+        rig.retained.fails = true;
+
+        assert_eq!(
+            unsafe { libc::kill(life.pid() as libc::pid_t, libc::SIGKILL) },
+            0
+        );
+        wait_for_death(&mut rig, &mut life);
+        reap_within_deadline(&mut rig, &mut life);
+
+        assert_eq!(rig.retained.scrubs, 1, "it was attempted");
+        assert!(!life.is_alive(), "the realm still died");
+        assert!(
+            !life.view_is_live(&rig.scene),
+            "the primary refusal must not depend on the backend's scrub succeeding"
+        );
+        assert_eq!(rig.scene.surface_size(), None);
         let _ = life.shutdown(quick_timing(), &mut rig.teardown());
     }
 

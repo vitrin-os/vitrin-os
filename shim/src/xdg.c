@@ -109,10 +109,33 @@ static void toplevel_destroy(struct wl_listener *listener, void *data) {
 
 /* xdg-shell requires a configure in reply to a state request even when the
  * compositor changes nothing -- not answering is a protocol violation. The
- * answer is always the same here: the window already is the whole view. */
+ * answer is always the same here: the window already is the whole view.
+ *
+ * THE `initialized` GUARD IS NOT DEFENSIVE PROGRAMMING, IT IS THE PROTOCOL.
+ * xdg-shell lets a client set its initial state -- `set_maximized`,
+ * `set_fullscreen`, `set_title` -- on a brand-new toplevel BEFORE the first
+ * commit that makes the surface configurable, and Firefox does exactly that
+ * (found by the P1.6.4 bring-up: 140.12.0esr requests maximize during window
+ * construction). wlroots answers a configure scheduled against a surface that
+ * has not had its initial commit with `assert(surface->initialized)`, so this
+ * handler running one instruction too early does not misbehave -- IT ABORTS
+ * THE WHOLE SHIM, killing the realm, from an ordinary and legal client
+ * request.
+ *
+ * Doing nothing here is not skipping the answer, it is deferring it to the
+ * one place that can send it: `toplevel_commit` configures every toplevel to
+ * the view on its initial commit, which is the first moment a configure is
+ * legal and is guaranteed to come. So the client's request is honoured with
+ * the same geometry either way, one round trip later.
+ *
+ * Neither weston-terminal nor any test client in this tree reaches this path,
+ * which is precisely why the ladder ends at a real browser. */
 static void toplevel_request_maximize(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vitrin_toplevel *t = wl_container_of(listener, t, request_maximize);
+	if (!t->toplevel->base->initialized) {
+		return;
+	}
 	configure_to_view(t);
 	wlr_xdg_surface_schedule_configure(t->toplevel->base);
 }
@@ -120,6 +143,9 @@ static void toplevel_request_maximize(struct wl_listener *listener, void *data) 
 static void toplevel_request_fullscreen(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vitrin_toplevel *t = wl_container_of(listener, t, request_fullscreen);
+	if (!t->toplevel->base->initialized) {
+		return;
+	}
 	configure_to_view(t);
 	wlr_xdg_surface_schedule_configure(t->toplevel->base);
 }

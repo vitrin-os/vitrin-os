@@ -14,6 +14,7 @@
 #include <wlr/types/wlr_scene.h>
 #include <wlr/util/log.h>
 
+#include "ledger.h"
 #include "server.h"
 #include "upstream.h"
 
@@ -97,6 +98,12 @@ void vitrin_shim_finish(struct vitrin_shim *s) {
 	vitrin_upstream_finish(s);
 	if (s->display != NULL) {
 		wl_display_destroy_clients(s->display);
+		/* The globals ledger dumps between the two: its client-destroy
+		 * listeners fire during destroy_clients (so dumping earlier would
+		 * omit the "the app disconnected" records that are half the point),
+		 * while its protocol logger and client-created listener are owned by
+		 * the display (so dumping later would touch freed memory). */
+		vitrin_ledger_finish(s);
 		wl_display_destroy(s->display);
 		s->display = NULL;
 	}

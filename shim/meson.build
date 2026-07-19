@@ -98,6 +98,115 @@ foreach p : protocols
   endif
 endforeach
 
+# --- P1.6.4 probe catalogue --------------------------------------------
+# Interfaces the shim DOES NOT IMPLEMENT, compiled in so `--probe-globals`
+# can advertise them and make an app's demand for one an observable
+# `wl_registry.bind` (shim/include/ledger.h explains why demand is otherwise
+# invisible). Only the marshalling tables are used; there is no server
+# implementation of any of these and there is not meant to be one.
+#
+# THE LIST IS EVIDENCE-DERIVED, not aspirational: it is the union of the
+# registry interface names referenced by the three toolkits on the R4
+# bring-up ladder, read out of the shipped binaries --
+#   strings libxul.so /usr/lib/libgdk-3.so.0 /usr/lib/libgtk-4.so.1
+# -- restricted to registry-bindable singletons. An interface no toolkit on
+# the ladder mentions cannot be demanded by one, so probing it would only
+# dilute the report.
+#
+# `wl_subcompositor` is deliberately NOT here: it lives in the core protocol,
+# so its marshalling table is already linked, and probing it is a one-line
+# entry in the catalogue array rather than a scanner invocation.
+#
+# Each row is [candidate xml paths..., 'interface_symbol_stem']. Candidates
+# are tried in order and the first that exists wins, because protocols
+# migrate between unstable/ and stable/ across wayland-protocols releases and
+# a hard-coded path would make the shim fail to CONFIGURE on a machine whose
+# wayland-protocols is a version off. A row that resolves to nothing is
+# reported at configure time and dropped from the catalogue -- the catalogue
+# size is stamped into every ledger report, so a run can never silently probe
+# fewer interfaces than its reader assumes.
+fs = import('fs')
+probe_protocols = [
+  [['stable/viewporter/viewporter.xml'], 'wp_viewporter'],
+  [['stable/presentation-time/presentation-time.xml'], 'wp_presentation'],
+  [['unstable/pointer-constraints/pointer-constraints-unstable-v1.xml'], 'zwp_pointer_constraints_v1'],
+  [['unstable/relative-pointer/relative-pointer-unstable-v1.xml'], 'zwp_relative_pointer_manager_v1'],
+  [['unstable/pointer-gestures/pointer-gestures-unstable-v1.xml'], 'zwp_pointer_gestures_v1'],
+  [['unstable/primary-selection/primary-selection-unstable-v1.xml'], 'zwp_primary_selection_device_manager_v1'],
+  [['unstable/idle-inhibit/idle-inhibit-unstable-v1.xml'], 'zwp_idle_inhibit_manager_v1'],
+  [['unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml'], 'zwp_keyboard_shortcuts_inhibit_manager_v1'],
+  [['unstable/text-input/text-input-unstable-v3.xml'], 'zwp_text_input_manager_v3'],
+  [['stable/tablet/tablet-v2.xml', 'unstable/tablet/tablet-unstable-v2.xml'], 'zwp_tablet_manager_v2'],
+  [['unstable/xdg-output/xdg-output-unstable-v1.xml'], 'zxdg_output_manager_v1'],
+  [['unstable/xdg-foreign/xdg-foreign-unstable-v2.xml'], 'zxdg_exporter_v2'],
+  [['staging/xdg-activation/xdg-activation-v1.xml'], 'xdg_activation_v1'],
+  [['staging/fractional-scale/fractional-scale-v1.xml'], 'wp_fractional_scale_manager_v1'],
+  [['staging/single-pixel-buffer/single-pixel-buffer-v1.xml'], 'wp_single_pixel_buffer_manager_v1'],
+  [['staging/cursor-shape/cursor-shape-v1.xml'], 'wp_cursor_shape_manager_v1'],
+  [['staging/content-type/content-type-v1.xml'], 'wp_content_type_manager_v1'],
+  [['staging/xdg-dialog/xdg-dialog-v1.xml'], 'xdg_dialog_v1'],
+  [['staging/xdg-system-bell/xdg-system-bell-v1.xml'], 'xdg_system_bell_v1'],
+  [['staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml'], 'xdg_toplevel_icon_manager_v1'],
+]
+
+# wl_subcompositor comes from the core protocol, already linked.
+probe_externs = []
+probe_rows = ['\t&wl_subcompositor_interface,']
+probe_missing = []
+foreach p : probe_protocols
+  xml = ''
+  foreach candidate : p[0]
+    if xml == '' and fs.exists(wl_protocol_dir / candidate)
+      xml = wl_protocol_dir / candidate
+    endif
+  endforeach
+  if xml == ''
+    probe_missing += p[1]
+    continue
+  endif
+  # `probe-` prefixed output names: these are separate custom_targets from the
+  # ones above and Meson requires distinct output filenames.
+  protocol_headers += custom_target(
+    'probe-' + p[1] + '-server-header',
+    input: xml,
+    output: 'probe-' + p[1] + '-protocol.h',
+    command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+  )
+  protocol_sources += custom_target(
+    'probe-' + p[1] + '-private-code',
+    input: xml,
+    output: 'probe-' + p[1] + '-protocol.c',
+    command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+  )
+  probe_externs += 'extern const struct wl_interface @0@_interface;'.format(p[1])
+  probe_rows += '\t&@0@_interface,'.format(p[1])
+endforeach
+
+if probe_missing.length() > 0
+  # Not an error: a machine one wayland-protocols release behind still builds
+  # a working shim, it just probes a smaller catalogue -- and the catalogue
+  # size travels in the report, so nobody reads a short run as a complete one.
+  #
+  # warning(), not message(): a dropped row silently narrows what
+  # firefox_bringup.sh check (D) can possibly observe, and message() is
+  # invisible in a normal ninja build. The acceptance script also asserts the
+  # catalogue size outright (EXPECT_CATALOGUE), so a short catalogue fails the
+  # test rather than quietly weakening it -- this warning is what tells the
+  # operator WHY before they get there.
+  warning('probe catalogue: no XML found for ' + ', '.join(probe_missing) +
+    ' -- these will NOT be probed by --probe-globals, so firefox_bringup.sh' +
+    ' check (D) will fail its EXPECT_CATALOGUE assertion')
+endif
+
+probe_catalogue_h = configure_file(
+  output: 'probe-catalogue.h',
+  configuration: {
+    'VITRIN_PROBE_EXTERNS': '\n'.join(probe_externs),
+    'VITRIN_PROBE_ROWS': '\n'.join(probe_rows),
+  },
+  input: 'src/probe-catalogue.h.in',
+)
+
 # Client-side xdg-shell stubs, for the acceptance client below (which is a
 # Wayland CLIENT of the shim, so it needs those, not the server ones).
 xdg_shell_client_header = custom_target(
@@ -121,9 +230,11 @@ executable(
     'src/seat.c',
     'src/wire.c',
     'src/upstream.c',
+    'src/ledger.c',
   ),
   protocol_sources,
   protocol_headers,
+  probe_catalogue_h,
   include_directories: inc,
   dependencies: shim_deps,
   install: true,

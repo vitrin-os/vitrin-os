@@ -1,0 +1,33 @@
+# Interfaces Firefox 140.12.0esr asks for and the v0 global set DELIBERATELY
+# does not provide (P1.6.4, issue #36).
+#
+# MACHINE-READABLE ON PURPOSE. The P1.6.4 acceptance script
+# (tests/acceptance/firefox_bringup.sh, check D) runs the shim with
+# --probe-globals and requires every `globals-demand` line to name an
+# interface listed here. So this file is not a note, it is an ALLOWLIST OF
+# THINGS ALREADY DECIDED: the day a new ESR wants something new, the check
+# goes red and a human has to make a decision -- add the global to
+# shim/src/globals.c citing the demand line, or add it here with the reason
+# written up in firefox.md. Silencing it by editing this file without writing
+# the reason defeats the whole mechanism.
+#
+# One interface per line. Blank lines and '#' comments ignored. The argument
+# for each is in firefox.md, section "What Firefox asked for and did not get".
+#
+# Evidence: globals-touched-firefox-140.12.0esr.log
+
+wp_cursor_shape_manager_v1
+wp_fractional_scale_manager_v1
+wp_presentation
+wp_viewporter
+xdg_activation_v1
+zwp_idle_inhibit_manager_v1
+zwp_keyboard_shortcuts_inhibit_manager_v1
+zwp_pointer_constraints_v1
+zwp_pointer_gestures_v1
+zwp_primary_selection_device_manager_v1
+zwp_relative_pointer_manager_v1
+zwp_tablet_manager_v2
+zwp_text_input_manager_v3
+zxdg_exporter_v2
+zxdg_output_manager_v1

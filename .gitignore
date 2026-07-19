@@ -9,3 +9,8 @@
 /shim/subprojects/*
 !/shim/subprojects/wlroots.wrap
 !/shim/subprojects/wayland-protocols.wrap
+# The pinned Firefox ESR that shim/tests/firefox/fetch-esr.sh downloads and
+# checksum-verifies (P1.6.4). ~75 MB compressed, ~250 MB unpacked, and
+# reproducible from shim/tests/firefox/firefox-esr.pin -- so the PIN is
+# checked in and the browser never is.
+/shim/.firefox/

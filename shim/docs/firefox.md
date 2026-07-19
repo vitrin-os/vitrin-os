@@ -1,0 +1,315 @@
+# Firefox in a realm (P1.6.4)
+
+Firefox is the MVP's real app and the top of the R4 bring-up ladder
+(`weston-terminal` → GTK app → Firefox). This page is what a person needs to
+run it, plus the record of what running it actually taught us.
+
+Companion files in this directory:
+
+| File | What it is |
+|---|---|
+| [`globals-touched-firefox-140.12.0esr.log`](globals-touched-firefox-140.12.0esr.log) | Raw, unedited ledger output from a probe run — the evidence |
+| [`firefox-refused-globals.txt`](firefox-refused-globals.txt) | The machine-readable allowlist of interfaces we knowingly refuse |
+
+---
+
+## 1. The pin
+
+**Firefox ESR 140.12.0**, as a Mozilla tarball, sha256
+`3323ee13ac6fe4877fa2e1f4a3aa6b8009f65a620c7bbca96fe86f1a6f433d92`.
+
+The single source of truth is
+[`../tests/firefox/firefox-esr.pin`](../tests/firefox/firefox-esr.pin), which
+is shell-sourceable so the fetch script, CI and a human all read the same
+three values.
+
+```bash
+bash shim/tests/firefox/fetch-esr.sh          # fetch if absent, verify always
+bash shim/tests/firefox/fetch-esr.sh --print  # just print the binary path
+```
+
+It lands in `shim/.firefox/` — **gitignored**. Neither the tarball nor the
+unpacked browser is ever committed.
+
+**Why a tarball and not a distro package.** Arch ships no `firefox-esr` at
+all, so on the development machine there is nothing to pin to. Where a
+package does exist (Debian, Ubuntu) the version is the distro's to move, and
+"pin an ESR so the target stops moving" (R4) is not satisfied by a name that
+resolves to a different build next month — Firefox's Wayland path changes
+between releases, which is the entire reason R4 exists. The tarball is
+version-exact, and Mozilla publishes `SHA256SUMS` for it, so the pin is
+*verifiable* rather than merely stated. A pin that is not checksummed is not
+a pin, so `fetch-esr.sh` hashes into a temporary name and only moves the file
+into place after the comparison passes — there is no path through it that
+leaves an unverified browser on disk.
+
+**Upgrading is a deliberate act.** Change the three values in the pin file,
+re-run the fetch, re-run the acceptance script, and **regenerate the checked-in
+ledger** — a new Firefox may want different globals, and that log is what the
+global set is argued from.
+
+---
+
+## 2. The Wayland environment
+
+```
+MOZ_ENABLE_WAYLAND=1     use the Wayland backend, not XWayland
+GDK_BACKEND=wayland      and make GTK agree, so a stray DISPLAY cannot
+                         silently drop the whole browser onto X11
+MOZ_ACCELERATED=0        no GPU compositing; see software WebRender below
+LIBGL_ALWAYS_SOFTWARE=1  and no GL driver probing behind its back
+MOZ_CRASHREPORTER_DISABLE=1   a crash must fail the run, not open a dialog
+GTK_A11Y=none            no accessibility bus…
+NO_AT_BRIDGE=1           …and no AT-SPI bridge: neither exists here, and
+                         waiting for them adds ~20 s of nothing to startup
+```
+
+The harness passes these with `env -i`, so the browser inherits *exactly* this
+and nothing from the operator's session — no host `WAYLAND_DISPLAY`, no
+`DISPLAY`, no theme, no locale. A test that passes only on a machine with the
+right desktop session is not a test.
+
+### Software WebRender is a documented supported configuration
+
+Not a workaround — a supported configuration, and the plan says so (issue #36:
+"software WebRender fallback is a documented supported configuration
+(CI/GPU-less parity with D3's shm-first posture)").
+
+The reason is structural. The shim runs on wlroots' **headless backend with
+the pixman renderer** and never touches a DRM device — the trusted core owns
+the screen. There is no GPU in that picture by construction, and CI will never
+have one. D3 makes the same choice on the buffer path: shm is the mandatory v0
+path and dmabuf is an opt-in optimization. A browser configuration that needed
+hardware would contradict the architecture, not merely be inconvenient.
+
+So the profile pins WebRender's CPU backend (SWGL) explicitly:
+
+```js
+user_pref("gfx.webrender.software", true);
+user_pref("gfx.webrender.all", true);
+user_pref("layers.acceleration.disabled", true);
+```
+
+`webrender.all` alongside `webrender.software` is load-bearing: without it,
+Firefox on a machine where it cannot probe a GPU can fall back *further*, to
+the legacy Basic compositor. That still paints, so nothing looks broken — it
+is simply a different code path from the one the demo and CI are meant to
+exercise, and the drift would be silent.
+
+Measured on this configuration: a 1024×768 realm view, 55–1200 forwarded
+frames over a 20-second run depending on how hard the page works the
+compositor, `max_inflight=1` throughout (the P1.6.2 backpressure rule holds
+under a real browser), and genuine partial damage — a typical run has commits
+carrying 46 080 px of damage against a 786 432 px surface, so Firefox's
+incremental repaints survive the shim's damage path rather than being
+flattened into full-surface blits.
+
+---
+
+## 3. The profile
+
+[`../tests/firefox/profile.user.js`](../tests/firefox/profile.user.js), copied
+to `<profile>/user.js`. A **fresh profile per scenario** — a profile that
+persists across runs accumulates session state, and "deterministic" then means
+"deterministic until someone runs it twice".
+
+Four guarantees, in order of how badly each would corrupt a result:
+
+1. **No network.** Not "less network" — none. Every remote request is pointed
+   at `127.0.0.1:1`, where nothing listens, so it fails at connect
+   *immediately* rather than hanging for a timeout. The individual feature
+   switches (telemetry, Safe Browsing, Normandy, captive-portal detection,
+   blocklists, GMP, region lookup, DoH) are still set, because a request never
+   issued costs nothing and the list doubles as documentation of what Firefox
+   would otherwise phone home about. The pages under test are `file://` URLs,
+   which proxying does not touch. **Network flake cannot redden this test.**
+2. **No first-run UI.** The welcome tour, the "what's new" page and the
+   default-browser prompt all paint over the content area — the exact thing
+   being measured. `browser.startup.homepage_override.mstone = "ignore"` is
+   the specific switch that matters: without it, a *fresh* profile on a pinned
+   build still shows a "what's new" tab, because "fresh profile" reads to
+   Firefox as "upgraded from nothing".
+3. **No update machinery.** An update check that succeeds is a network
+   dependency; one that half-succeeds can restart the browser mid-run. The pin
+   is meaningless if the binary can update itself out from under it.
+4. **URL-bar determinism.** `keyword.enabled = false` stops a typed URL
+   becoming a *search* (which, behind the dead proxy, would be an error page
+   and would fail the assertion for the wrong reason); the suggestion prefs
+   stop an autocomplete dropdown painting over the content area between the
+   keystrokes and the Return.
+
+---
+
+## 4. What Firefox actually touched
+
+Read [`globals-touched-firefox-140.12.0esr.log`](globals-touched-firefox-140.12.0esr.log)
+for the raw record. The mechanism that produced it — and why an interface we
+do *not* advertise is otherwise completely invisible — is documented in
+[`../include/ledger.h`](../include/ledger.h).
+
+### Bound from the v0 set
+
+| Interface | Advertised | Firefox asked for | Note |
+|---|---|---|---|
+| `wl_compositor` | 6 | 3 and 4 | two registries: GDK's and Firefox's own `nsWaylandDisplay` |
+| `wl_subcompositor` | 1 | 1 | **added here** — see below |
+| `wl_shm` | 2 | 1 | three binds, one per connection |
+| `wl_output` | 4 | 2 | |
+| `wl_seat` | 9 | 5 and 8 | |
+| `xdg_wm_base` | 6 | 6 | |
+| `wl_data_device_manager` | 3 | 3 | added in P1.6.3 for GDK |
+| `zxdg_decoration_manager_v1` | 1 | — | **never bound.** Firefox draws its own decorations and does not negotiate; the global costs nothing and is kept for apps that do. |
+
+### The addition: `wl_subcompositor`
+
+This is the one global P1.6.4 added, and it is the whole point of the
+exercise, so the trail is worth stating end to end:
+
+1. Firefox segfaulted after creating exactly two `wl_surface`s, before ever
+   creating an `xdg_surface`. No window, no frames, and nothing in the shim's
+   log that explained it. (Exit 139, core dumped; 1 commit forwarded.)
+2. A probe run produced `globals-demand: interface=wl_subcompositor` — twice,
+   from GDK and from Firefox's own display code. Those two lines, with the
+   whole run around them, are checked in as
+   [`globals-demand-wl_subcompositor-140.12.0esr.log`](globals-demand-wl_subcompositor-140.12.0esr.log)
+   at `seq=15` and `seq=22`. Read each next to its neighbours: `seq=15` sits
+   with `wl_compositor` v3 (GDK's bind), `seq=22` with `wl_compositor` v4 and
+   `wl_seat` v8 (`nsWaylandDisplay`'s).
+3. Bisecting with `--probe-globals=wl_subcompositor` (nothing else in the
+   catalogue armed) took the same build from **segfault, 2 surfaces, no
+   window** to **window mapped, ran to the end of the timebox**. One
+   interface, decisive.
+4. It was then implemented for real — `wlr_subcompositor_create`, not a stub —
+   and the probe entry retired. A stub would not have done: with the interface
+   present but *inert*, the window maps and only **3** frames are forwarded
+   against the ~57 the shipping build manages, because Firefox's content
+   subsurface never composites.
+
+That evidence file is necessarily a **pre-addition** run: once an interface is
+in the v0 set the shim refuses to arm a probe for it (`in_v0_contract`, so an
+inert copy can never shadow the real one), and it can then only appear in a
+ledger as a successful `class=v0` bind — the weaker signal. The file's header
+records the two-line source edit that reproduces it.
+
+It grants nothing across the realm boundary, by a stronger version of the
+argument that admitted `wl_data_device_manager`: the protocol *requires* a
+subsurface and its parent to belong to the same client, and a shim serves
+exactly one client. So this composes one app's own surfaces into one window,
+which is the shim's job description. It also needed no change to the frame
+path: `wlr_scene_xdg_surface_create` already covers a toplevel's subsurfaces,
+so they composite into the same buffer and travel upstream as ordinary damage.
+
+### What Firefox asked for and did not get
+
+Fifteen interfaces, all refused deliberately. The list is mirrored in
+[`firefox-refused-globals.txt`](firefox-refused-globals.txt), which the
+acceptance script enforces. Firefox degrades gracefully on every one — it
+renders, repaints, scrolls and navigates without them, which is the empirical
+part of "no more than is genuinely needed".
+
+| Interface | Why not |
+|---|---|
+| `wp_viewporter` | Surface scaling/cropping. The realm view is 1:1 and the shim does no scaling; adding it would advertise a capability with nothing behind it. Revisit only if HiDPI enters the realm model. |
+| `wp_fractional_scale_manager_v1` | Same reason, fractional. The realm view has one integer scale. |
+| `wp_presentation` | Presentation timestamps. v0 paces the app with the core's `frame_done` relay (PRD Doc 2 §4.4) — that *is* the presentation clock, and a second, unsynchronised one would be a lie about when pixels were shown. |
+| `wp_cursor_shape_manager_v1` | Lets a client name a cursor instead of supplying a buffer. The shim has no cursor at all — the core owns the pointer, and cursor rendering is the core's business. |
+| `zwp_pointer_constraints_v1` | Pointer lock/confinement. Would fight the actuation model head-on: D10 says the agent addresses realm-view pixel coordinates, and a client that can warp or confine the pointer can invalidate what the agent observed between observation and actuation. Needs a deliberate design pass, not a stub. |
+| `zwp_relative_pointer_manager_v1` | The other half of pointer lock. Same argument; also, v0's seat vocabulary has no relative-motion event to feed it. |
+| `zwp_pointer_gestures_v1` | Pinch/swipe/hold. v0 has no gesture event on the wire; advertising this invites a client to wait for gestures that can never arrive. |
+| `zwp_tablet_manager_v2` | Same shape, for a device class the realm has no vocabulary for. |
+| `zwp_text_input_manager_v3` | IME. This is explicitly the **Phase-2 E2.8 workstream** (D7): the dynamic-keymap technique is the Phase-1 answer and `text-input-v3` is what retires it. Adding an inert one now would make apps *stop* using the keymap path that works. |
+| `zwp_primary_selection_device_manager_v1` | Middle-click paste. Unlike `wl_data_device_manager` — which GDK treats as a prerequisite for having a seat at all — nothing depends on this to function; it is convenience, and the same one-client argument that makes it harmless also makes it useless. |
+| `zwp_keyboard_shortcuts_inhibit_manager_v1` | Lets a client ask the compositor to stop intercepting shortcuts. The shim intercepts none: every key it delivers came from the core. Nothing to inhibit. |
+| `xdg_activation_v1` | Cross-app focus transfer and startup notification. Explicitly *between* applications, which is exactly what a realm boundary exists to mediate. If it ever lands it belongs to the core, not to a per-app shim. |
+| `zxdg_exporter_v2` | xdg-foreign: hands another process a handle to your surface so it can parent a window to it. A capability-native display server does not get to hand out ambient cross-app surface handles. |
+| `zxdg_output_manager_v1` | Logical output geometry. Superseded by `wl_output` v4, which the shim advertises and Firefox binds; the information is already available. |
+| `zwp_idle_inhibit_manager_v1` | "Do not blank the screen while this video plays." A realm has no screen and no idle timer; the host's screen is the core's, and inhibiting it from inside a confined app is a decision for the core. |
+
+Five catalogue entries went **untouched** by Firefox — no demand at all:
+`wp_single_pixel_buffer_manager_v1`, `wp_content_type_manager_v1`,
+`xdg_dialog_v1`, `xdg_system_bell_v1`, `xdg_toplevel_icon_manager_v1`. They
+stay in the probe catalogue because GTK 4 references them and the catalogue is
+for the whole bring-up ladder, not for Firefox alone.
+
+---
+
+## 5. A bug Firefox found
+
+The shim **aborted** — not misbehaved, aborted, taking the realm with it — the
+first time a real browser ran against it:
+
+```
+vitrin-shim: types/xdg_shell/wlr_xdg_surface.c:168:
+  wlr_xdg_surface_schedule_configure: Assertion `surface->initialized' failed.
+```
+
+xdg-shell lets a client set its initial state (`set_maximized`,
+`set_fullscreen`, `set_title`) on a brand-new toplevel **before** the first
+commit that makes the surface configurable. Firefox does exactly that during
+window construction. The shim's `request_maximize` handler answered
+immediately, as the protocol requires it to answer *eventually*, and wlroots
+answered a configure scheduled against an uninitialised surface with an
+assertion.
+
+The fix (`../src/xdg.c`) is to defer: a state request that arrives before the
+initial commit is honoured by the initial-commit path, which configures every
+toplevel to the view anyway and is the first moment a configure is legal. Same
+geometry, one round trip later.
+
+Neither `weston-terminal` nor any test client in this tree reaches that path,
+which is precisely why the ladder ends at a real browser. The acceptance
+script now checks the shim log for `Assertion` on every scenario.
+
+---
+
+## 6. Running it
+
+```bash
+bash shim/tests/firefox/fetch-esr.sh
+meson compile -C shim/build
+BUILD_DIR=./build bash shim/tests/acceptance/firefox_bringup.sh
+```
+
+Without the browser the script **skips loudly and exits 0** locally, and
+**fails** under `CI` unless the gap is declared with
+`VITRIN_SKIP_FIREFOX_GATE=1` — the same rule the P1.6.2 conformance test and
+the P1.6.3 GTK gate apply to themselves. A named acceptance criterion that
+only ever reports SKIP on the machine that gates merges is a criterion nobody
+is holding.
+
+To survey the globals yourself:
+
+```bash
+# everything an app wants, including what we do not provide
+./build/vitrin-shim --no-upstream --probe-globals --globals-log /tmp/g.log
+
+# bisect: arm one candidate and see whether the app stops failing
+./build/vitrin-shim --no-upstream --probe-globals=wp_viewporter --globals-log /tmp/g.log
+```
+
+The bisect example names an interface that is **not** in the v0 set, because
+those are the only ones a probe can be armed for. Naming a contract interface
+(`--probe-globals=wl_subcompositor`) arms *nothing* — advertising an interface
+twice, once real and once inert, would let the app bind the inert copy and
+measure a browser strictly worse than the real one. The shim says so at
+`ERROR` rather than leaving you with a run that reports `demanded=0`, which
+would read as "the app did not want it" when the truth is "it was never
+offered, so the question was never asked":
+
+```
+--probe-globals=wl_subcompositor: 'wl_subcompositor' IS ALREADY IN THE V0 SET
+and was not armed -- ... To re-test whether it is still needed, remove it from
+globals.c and from vitrin_v0_contract[], then probe it.
+```
+
+A typo (`--probe-globals=wp_viewporer`) gets the same treatment, naming the
+catalogue size so you can tell a misspelling from a build that dropped the
+row. Re-probing a contract interface is deliberately a source edit, not a
+flag: see the header of
+[`globals-demand-wl_subcompositor-140.12.0esr.log`](globals-demand-wl_subcompositor-140.12.0esr.log),
+which is exactly that procedure, run.
+
+`--probe-globals` **lies to the client** — it advertises interfaces backed by
+nothing, so an app that waits on one can hang. It is a diagnostic mode, it is
+off by default, it announces itself at `ERROR` level on startup, and every
+report it produces carries `probe_mode=1`. Never run a realm with it.

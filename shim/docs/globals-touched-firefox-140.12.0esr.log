@@ -1,0 +1,311 @@
+# "Globals touched" ledger -- Firefox 140.12.0esr, probe run. CHECKED-IN EVIDENCE.
+#
+# This is the raw, unedited output of `vitrin-shim --globals-log`, produced by
+# the run described below. It is the evidence the v0 global set is argued
+# from: every interface Firefox asks for and does NOT get is refused with a
+# written reason in firefox.md, indexed by firefox-refused-globals.txt.
+#
+# THIS IS A RUN OF THE SHIM AS IT SHIPS, so it is NOT where the argument for
+# adding `wl_subcompositor` lives -- that global is in the v0 set by the time
+# this run happens, so no probe is armed for it (ledger.c, in_v0_contract) and
+# it can only appear here as `class=v0` offers and binds. A successful bind is
+# the weaker signal; the demand line is the stronger one, and it is in the
+# pre-addition run checked in beside this file as
+# globals-demand-wl_subcompositor-140.12.0esr.log. An earlier version of this
+# header claimed the demand line was in THIS file. It never was.
+#
+# HOW TO REGENERATE (verbatim; the only variable is the temp dir):
+#
+#   bash shim/tests/firefox/fetch-esr.sh
+#   meson compile -C shim/build
+#   RT=$(mktemp -d); chmod 700 "$RT"
+#   export XDG_RUNTIME_DIR="$RT" WLR_BACKENDS=headless WLR_RENDERER=pixman \
+#          WLR_RENDERER_ALLOW_SOFTWARE=1 WLR_LIBINPUT_NO_DEVICES=1
+#   unset WAYLAND_DISPLAY DISPLAY
+#   ./shim/build/mock-core --size 1024x768 --run-ms 22000 \
+#     -- ./shim/build/vitrin-shim --socket ff0 --probe-globals \
+#        --globals-log "$RT/g.log" >"$RT/core.log" 2>"$RT/shim.log" &
+#   # ... wait for $RT/ff0, then, with a fresh profile carrying
+#   # shim/tests/firefox/profile.user.js as user.js:
+#   env -i HOME="$RT/prof" XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY=ff0 \
+#       PATH=/usr/bin:/bin MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
+#       MOZ_ACCELERATED=0 LIBGL_ALWAYS_SOFTWARE=1 MOZ_CRASHREPORTER_DISABLE=1 \
+#       GTK_A11Y=none NO_AT_BRIDGE=1 \
+#       timeout 22 shim/.firefox/firefox/firefox --profile "$RT/prof" \
+#       --no-remote "file://$PWD/shim/tests/firefox/pages/repaint.html"
+#
+# WHAT TO READ FIRST:
+#   `globals-demand:`  -- the crux. Each one is Firefox binding an interface
+#                         the v0 set does not provide. These are only visible
+#                         because --probe-globals advertised them; without it
+#                         a wanted-but-absent interface produces NO WIRE
+#                         TRAFFIC AT ALL (see shim/include/ledger.h).
+#   `globals-touched:` -- one aggregate row per interface, at the end.
+#   `globals-summary:` -- totals. `drift=0` means the advertised v0 set and
+#                         the contract list in ledger.c agree.
+#
+# CONTEXT FOR THIS RUN:
+#   Firefox   140.12.0esr (pinned, sha256-verified; tests/firefox/firefox-esr.pin)
+#   shim      p1.6.4-firefox-bringup, --probe-globals, 20 probes armed
+#             (21 in the catalogue; wl_subcompositor is excluded because it
+#             is now a real global, so probing it would shadow the real one)
+#   renderer  headless wlroots + pixman, software WebRender, no GPU
+#   clients   3 connections -- Firefox's parent process makes two (a short
+#             early one and the long-lived one) and a child process makes one.
+#             Their binds are interleaved below; the aggregate rows are what
+#             the contract is argued from.
+#   result    55 frames forwarded to the core, window mapped, no wire
+#             violations, drift=0
+#
+# ---------------------------------------------------------------------------
+globals-log: version=1 probe_mode=1 catalogue=21 view=1024x768
+globals-log: probes_armed=20 catalogue=21 filter=(all) (these interfaces are ADVERTISED BUT NOT IMPLEMENTED)
+globals-client: seq=1 event=connected clients=1 binds=0
+globals-client: seq=2 event=gone clients=0 binds=0
+globals-client: seq=3 event=connected clients=1 binds=0
+globals-offer: seq=4 interface=wl_shm version=2 name=1 class=v0
+globals-offer: seq=5 interface=wl_compositor version=6 name=2 class=v0
+globals-offer: seq=6 interface=wl_subcompositor version=1 name=3 class=v0
+globals-offer: seq=7 interface=xdg_wm_base version=6 name=4 class=v0
+globals-offer: seq=8 interface=wl_seat version=9 name=5 class=v0
+globals-offer: seq=9 interface=wl_data_device_manager version=3 name=6 class=v0
+globals-offer: seq=10 interface=zxdg_decoration_manager_v1 version=1 name=7 class=v0
+globals-offer: seq=11 interface=wp_viewporter version=1 name=8 class=probe
+globals-offer: seq=12 interface=wp_presentation version=2 name=9 class=probe
+globals-offer: seq=13 interface=zwp_pointer_constraints_v1 version=1 name=10 class=probe
+globals-offer: seq=14 interface=zwp_relative_pointer_manager_v1 version=1 name=11 class=probe
+globals-offer: seq=15 interface=zwp_pointer_gestures_v1 version=3 name=12 class=probe
+globals-offer: seq=16 interface=zwp_primary_selection_device_manager_v1 version=1 name=13 class=probe
+globals-offer: seq=17 interface=zwp_idle_inhibit_manager_v1 version=1 name=14 class=probe
+globals-offer: seq=18 interface=zwp_keyboard_shortcuts_inhibit_manager_v1 version=1 name=15 class=probe
+globals-offer: seq=19 interface=zwp_text_input_manager_v3 version=2 name=16 class=probe
+globals-offer: seq=20 interface=zwp_tablet_manager_v2 version=2 name=17 class=probe
+globals-offer: seq=21 interface=zxdg_output_manager_v1 version=3 name=18 class=probe
+globals-offer: seq=22 interface=zxdg_exporter_v2 version=1 name=19 class=probe
+globals-offer: seq=23 interface=xdg_activation_v1 version=1 name=20 class=probe
+globals-offer: seq=24 interface=wp_fractional_scale_manager_v1 version=1 name=21 class=probe
+globals-offer: seq=25 interface=wp_single_pixel_buffer_manager_v1 version=1 name=22 class=probe
+globals-offer: seq=26 interface=wp_cursor_shape_manager_v1 version=2 name=23 class=probe
+globals-offer: seq=27 interface=wp_content_type_manager_v1 version=1 name=24 class=probe
+globals-offer: seq=28 interface=xdg_dialog_v1 version=1 name=25 class=probe
+globals-offer: seq=29 interface=xdg_system_bell_v1 version=1 name=26 class=probe
+globals-offer: seq=30 interface=xdg_toplevel_icon_manager_v1 version=1 name=27 class=probe
+globals-offer: seq=31 interface=wl_output version=4 name=28 class=v0
+globals-bind: seq=32 interface=wl_shm class=v0 version_requested=1 version_advertised=2
+globals-bind: seq=33 interface=wl_compositor class=v0 version_requested=3 version_advertised=6
+globals-bind: seq=34 interface=wl_subcompositor class=v0 version_requested=1 version_advertised=1
+globals-bind: seq=35 interface=wl_data_device_manager class=v0 version_requested=3 version_advertised=3
+globals-bind: seq=36 interface=zwp_pointer_gestures_v1 class=probe version_requested=1 version_advertised=3
+globals-demand: seq=36 interface=zwp_pointer_gestures_v1 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=37 interface=zwp_primary_selection_device_manager_v1 class=probe version_requested=1 version_advertised=1
+globals-demand: seq=37 interface=zwp_primary_selection_device_manager_v1 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=38 interface=zwp_keyboard_shortcuts_inhibit_manager_v1 class=probe version_requested=1 version_advertised=1
+globals-demand: seq=38 interface=zwp_keyboard_shortcuts_inhibit_manager_v1 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=39 interface=zwp_tablet_manager_v2 class=probe version_requested=1 version_advertised=2
+globals-demand: seq=39 interface=zwp_tablet_manager_v2 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=40 interface=zxdg_output_manager_v1 class=probe version_requested=3 version_advertised=3
+globals-demand: seq=40 interface=zxdg_output_manager_v1 version_requested=3 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=41 interface=zxdg_exporter_v2 class=probe version_requested=1 version_advertised=1
+globals-demand: seq=41 interface=zxdg_exporter_v2 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=42 interface=xdg_activation_v1 class=probe version_requested=1 version_advertised=1
+globals-demand: seq=42 interface=xdg_activation_v1 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=43 interface=wp_cursor_shape_manager_v1 class=probe version_requested=1 version_advertised=2
+globals-demand: seq=43 interface=wp_cursor_shape_manager_v1 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=44 interface=wl_output class=v0 version_requested=2 version_advertised=4
+globals-bind: seq=45 interface=wl_seat class=v0 version_requested=5 version_advertised=9
+globals-bind: seq=46 interface=xdg_wm_base class=v0 version_requested=6 version_advertised=6
+globals-offer: seq=47 interface=wl_shm version=2 name=1 class=v0
+globals-offer: seq=48 interface=wl_compositor version=6 name=2 class=v0
+globals-offer: seq=49 interface=wl_subcompositor version=1 name=3 class=v0
+globals-offer: seq=50 interface=xdg_wm_base version=6 name=4 class=v0
+globals-offer: seq=51 interface=wl_seat version=9 name=5 class=v0
+globals-offer: seq=52 interface=wl_data_device_manager version=3 name=6 class=v0
+globals-offer: seq=53 interface=zxdg_decoration_manager_v1 version=1 name=7 class=v0
+globals-offer: seq=54 interface=wp_viewporter version=1 name=8 class=probe
+globals-offer: seq=55 interface=wp_presentation version=2 name=9 class=probe
+globals-offer: seq=56 interface=zwp_pointer_constraints_v1 version=1 name=10 class=probe
+globals-offer: seq=57 interface=zwp_relative_pointer_manager_v1 version=1 name=11 class=probe
+globals-offer: seq=58 interface=zwp_pointer_gestures_v1 version=3 name=12 class=probe
+globals-offer: seq=59 interface=zwp_primary_selection_device_manager_v1 version=1 name=13 class=probe
+globals-offer: seq=60 interface=zwp_idle_inhibit_manager_v1 version=1 name=14 class=probe
+globals-offer: seq=61 interface=zwp_keyboard_shortcuts_inhibit_manager_v1 version=1 name=15 class=probe
+globals-offer: seq=62 interface=zwp_text_input_manager_v3 version=2 name=16 class=probe
+globals-offer: seq=63 interface=zwp_tablet_manager_v2 version=2 name=17 class=probe
+globals-offer: seq=64 interface=zxdg_output_manager_v1 version=3 name=18 class=probe
+globals-offer: seq=65 interface=zxdg_exporter_v2 version=1 name=19 class=probe
+globals-offer: seq=66 interface=xdg_activation_v1 version=1 name=20 class=probe
+globals-offer: seq=67 interface=wp_fractional_scale_manager_v1 version=1 name=21 class=probe
+globals-offer: seq=68 interface=wp_single_pixel_buffer_manager_v1 version=1 name=22 class=probe
+globals-offer: seq=69 interface=wp_cursor_shape_manager_v1 version=2 name=23 class=probe
+globals-offer: seq=70 interface=wp_content_type_manager_v1 version=1 name=24 class=probe
+globals-offer: seq=71 interface=xdg_dialog_v1 version=1 name=25 class=probe
+globals-offer: seq=72 interface=xdg_system_bell_v1 version=1 name=26 class=probe
+globals-offer: seq=73 interface=xdg_toplevel_icon_manager_v1 version=1 name=27 class=probe
+globals-offer: seq=74 interface=wl_output version=4 name=28 class=v0
+globals-bind: seq=75 interface=wl_shm class=v0 version_requested=1 version_advertised=2
+globals-bind: seq=76 interface=wl_compositor class=v0 version_requested=4 version_advertised=6
+globals-bind: seq=77 interface=wl_subcompositor class=v0 version_requested=1 version_advertised=1
+globals-bind: seq=78 interface=wl_seat class=v0 version_requested=8 version_advertised=9
+globals-bind: seq=79 interface=wp_viewporter class=probe version_requested=1 version_advertised=1
+globals-demand: seq=79 interface=wp_viewporter version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=80 interface=zwp_pointer_constraints_v1 class=probe version_requested=1 version_advertised=1
+globals-demand: seq=80 interface=zwp_pointer_constraints_v1 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=81 interface=zwp_relative_pointer_manager_v1 class=probe version_requested=1 version_advertised=1
+globals-demand: seq=81 interface=zwp_relative_pointer_manager_v1 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=82 interface=zwp_pointer_gestures_v1 class=probe version_requested=3 version_advertised=3
+globals-demand: seq=82 interface=zwp_pointer_gestures_v1 version_requested=3 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=83 interface=zwp_idle_inhibit_manager_v1 class=probe version_requested=1 version_advertised=1
+globals-demand: seq=83 interface=zwp_idle_inhibit_manager_v1 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=84 interface=xdg_activation_v1 class=probe version_requested=1 version_advertised=1
+globals-demand: seq=84 interface=xdg_activation_v1 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-bind: seq=85 interface=wp_fractional_scale_manager_v1 class=probe version_requested=1 version_advertised=1
+globals-demand: seq=85 interface=wp_fractional_scale_manager_v1 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-client: seq=86 event=connected clients=2 binds=26
+globals-offer: seq=87 interface=wl_shm version=2 name=1 class=v0
+globals-offer: seq=88 interface=wl_compositor version=6 name=2 class=v0
+globals-offer: seq=89 interface=wl_subcompositor version=1 name=3 class=v0
+globals-offer: seq=90 interface=xdg_wm_base version=6 name=4 class=v0
+globals-offer: seq=91 interface=wl_seat version=9 name=5 class=v0
+globals-offer: seq=92 interface=wl_data_device_manager version=3 name=6 class=v0
+globals-offer: seq=93 interface=zxdg_decoration_manager_v1 version=1 name=7 class=v0
+globals-offer: seq=94 interface=wp_viewporter version=1 name=8 class=probe
+globals-offer: seq=95 interface=wp_presentation version=2 name=9 class=probe
+globals-offer: seq=96 interface=zwp_pointer_constraints_v1 version=1 name=10 class=probe
+globals-offer: seq=97 interface=zwp_relative_pointer_manager_v1 version=1 name=11 class=probe
+globals-offer: seq=98 interface=zwp_pointer_gestures_v1 version=3 name=12 class=probe
+globals-offer: seq=99 interface=zwp_primary_selection_device_manager_v1 version=1 name=13 class=probe
+globals-offer: seq=100 interface=zwp_idle_inhibit_manager_v1 version=1 name=14 class=probe
+globals-offer: seq=101 interface=zwp_keyboard_shortcuts_inhibit_manager_v1 version=1 name=15 class=probe
+globals-offer: seq=102 interface=zwp_text_input_manager_v3 version=2 name=16 class=probe
+globals-offer: seq=103 interface=zwp_tablet_manager_v2 version=2 name=17 class=probe
+globals-offer: seq=104 interface=zxdg_output_manager_v1 version=3 name=18 class=probe
+globals-offer: seq=105 interface=zxdg_exporter_v2 version=1 name=19 class=probe
+globals-offer: seq=106 interface=xdg_activation_v1 version=1 name=20 class=probe
+globals-offer: seq=107 interface=wp_fractional_scale_manager_v1 version=1 name=21 class=probe
+globals-offer: seq=108 interface=wp_single_pixel_buffer_manager_v1 version=1 name=22 class=probe
+globals-offer: seq=109 interface=wp_cursor_shape_manager_v1 version=2 name=23 class=probe
+globals-offer: seq=110 interface=wp_content_type_manager_v1 version=1 name=24 class=probe
+globals-offer: seq=111 interface=xdg_dialog_v1 version=1 name=25 class=probe
+globals-offer: seq=112 interface=xdg_system_bell_v1 version=1 name=26 class=probe
+globals-offer: seq=113 interface=xdg_toplevel_icon_manager_v1 version=1 name=27 class=probe
+globals-offer: seq=114 interface=wl_output version=4 name=28 class=v0
+globals-offer: seq=115 interface=wl_shm version=2 name=1 class=v0
+globals-offer: seq=116 interface=wl_compositor version=6 name=2 class=v0
+globals-offer: seq=117 interface=wl_subcompositor version=1 name=3 class=v0
+globals-offer: seq=118 interface=xdg_wm_base version=6 name=4 class=v0
+globals-offer: seq=119 interface=wl_seat version=9 name=5 class=v0
+globals-offer: seq=120 interface=wl_data_device_manager version=3 name=6 class=v0
+globals-offer: seq=121 interface=zxdg_decoration_manager_v1 version=1 name=7 class=v0
+globals-offer: seq=122 interface=wp_viewporter version=1 name=8 class=probe
+globals-offer: seq=123 interface=wp_presentation version=2 name=9 class=probe
+globals-offer: seq=124 interface=zwp_pointer_constraints_v1 version=1 name=10 class=probe
+globals-offer: seq=125 interface=zwp_relative_pointer_manager_v1 version=1 name=11 class=probe
+globals-offer: seq=126 interface=zwp_pointer_gestures_v1 version=3 name=12 class=probe
+globals-offer: seq=127 interface=zwp_primary_selection_device_manager_v1 version=1 name=13 class=probe
+globals-offer: seq=128 interface=zwp_idle_inhibit_manager_v1 version=1 name=14 class=probe
+globals-offer: seq=129 interface=zwp_keyboard_shortcuts_inhibit_manager_v1 version=1 name=15 class=probe
+globals-offer: seq=130 interface=zwp_text_input_manager_v3 version=2 name=16 class=probe
+globals-offer: seq=131 interface=zwp_tablet_manager_v2 version=2 name=17 class=probe
+globals-offer: seq=132 interface=zxdg_output_manager_v1 version=3 name=18 class=probe
+globals-offer: seq=133 interface=zxdg_exporter_v2 version=1 name=19 class=probe
+globals-offer: seq=134 interface=xdg_activation_v1 version=1 name=20 class=probe
+globals-offer: seq=135 interface=wp_fractional_scale_manager_v1 version=1 name=21 class=probe
+globals-offer: seq=136 interface=wp_single_pixel_buffer_manager_v1 version=1 name=22 class=probe
+globals-offer: seq=137 interface=wp_cursor_shape_manager_v1 version=2 name=23 class=probe
+globals-offer: seq=138 interface=wp_content_type_manager_v1 version=1 name=24 class=probe
+globals-offer: seq=139 interface=xdg_dialog_v1 version=1 name=25 class=probe
+globals-offer: seq=140 interface=xdg_system_bell_v1 version=1 name=26 class=probe
+globals-offer: seq=141 interface=xdg_toplevel_icon_manager_v1 version=1 name=27 class=probe
+globals-offer: seq=142 interface=wl_output version=4 name=28 class=v0
+globals-offer: seq=143 interface=wl_shm version=2 name=1 class=v0
+globals-offer: seq=144 interface=wl_compositor version=6 name=2 class=v0
+globals-offer: seq=145 interface=wl_subcompositor version=1 name=3 class=v0
+globals-offer: seq=146 interface=xdg_wm_base version=6 name=4 class=v0
+globals-offer: seq=147 interface=wl_seat version=9 name=5 class=v0
+globals-offer: seq=148 interface=wl_data_device_manager version=3 name=6 class=v0
+globals-offer: seq=149 interface=zxdg_decoration_manager_v1 version=1 name=7 class=v0
+globals-offer: seq=150 interface=wp_viewporter version=1 name=8 class=probe
+globals-offer: seq=151 interface=wp_presentation version=2 name=9 class=probe
+globals-offer: seq=152 interface=zwp_pointer_constraints_v1 version=1 name=10 class=probe
+globals-offer: seq=153 interface=zwp_relative_pointer_manager_v1 version=1 name=11 class=probe
+globals-offer: seq=154 interface=zwp_pointer_gestures_v1 version=3 name=12 class=probe
+globals-offer: seq=155 interface=zwp_primary_selection_device_manager_v1 version=1 name=13 class=probe
+globals-offer: seq=156 interface=zwp_idle_inhibit_manager_v1 version=1 name=14 class=probe
+globals-offer: seq=157 interface=zwp_keyboard_shortcuts_inhibit_manager_v1 version=1 name=15 class=probe
+globals-offer: seq=158 interface=zwp_text_input_manager_v3 version=2 name=16 class=probe
+globals-offer: seq=159 interface=zwp_tablet_manager_v2 version=2 name=17 class=probe
+globals-offer: seq=160 interface=zxdg_output_manager_v1 version=3 name=18 class=probe
+globals-offer: seq=161 interface=zxdg_exporter_v2 version=1 name=19 class=probe
+globals-offer: seq=162 interface=xdg_activation_v1 version=1 name=20 class=probe
+globals-offer: seq=163 interface=wp_fractional_scale_manager_v1 version=1 name=21 class=probe
+globals-offer: seq=164 interface=wp_single_pixel_buffer_manager_v1 version=1 name=22 class=probe
+globals-offer: seq=165 interface=wp_cursor_shape_manager_v1 version=2 name=23 class=probe
+globals-offer: seq=166 interface=wp_content_type_manager_v1 version=1 name=24 class=probe
+globals-offer: seq=167 interface=xdg_dialog_v1 version=1 name=25 class=probe
+globals-offer: seq=168 interface=xdg_system_bell_v1 version=1 name=26 class=probe
+globals-offer: seq=169 interface=xdg_toplevel_icon_manager_v1 version=1 name=27 class=probe
+globals-offer: seq=170 interface=wl_output version=4 name=28 class=v0
+globals-bind: seq=171 interface=wl_shm class=v0 version_requested=1 version_advertised=2
+globals-bind: seq=172 interface=wp_presentation class=probe version_requested=1 version_advertised=2
+globals-demand: seq=172 interface=wp_presentation version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-client: seq=173 event=gone clients=1 binds=2
+globals-offer: seq=174 interface=wl_shm version=2 name=1 class=v0
+globals-offer: seq=175 interface=wl_compositor version=6 name=2 class=v0
+globals-offer: seq=176 interface=wl_subcompositor version=1 name=3 class=v0
+globals-offer: seq=177 interface=xdg_wm_base version=6 name=4 class=v0
+globals-offer: seq=178 interface=wl_seat version=9 name=5 class=v0
+globals-offer: seq=179 interface=wl_data_device_manager version=3 name=6 class=v0
+globals-offer: seq=180 interface=zxdg_decoration_manager_v1 version=1 name=7 class=v0
+globals-offer: seq=181 interface=wp_viewporter version=1 name=8 class=probe
+globals-offer: seq=182 interface=wp_presentation version=2 name=9 class=probe
+globals-offer: seq=183 interface=zwp_pointer_constraints_v1 version=1 name=10 class=probe
+globals-offer: seq=184 interface=zwp_relative_pointer_manager_v1 version=1 name=11 class=probe
+globals-offer: seq=185 interface=zwp_pointer_gestures_v1 version=3 name=12 class=probe
+globals-offer: seq=186 interface=zwp_primary_selection_device_manager_v1 version=1 name=13 class=probe
+globals-offer: seq=187 interface=zwp_idle_inhibit_manager_v1 version=1 name=14 class=probe
+globals-offer: seq=188 interface=zwp_keyboard_shortcuts_inhibit_manager_v1 version=1 name=15 class=probe
+globals-offer: seq=189 interface=zwp_text_input_manager_v3 version=2 name=16 class=probe
+globals-offer: seq=190 interface=zwp_tablet_manager_v2 version=2 name=17 class=probe
+globals-offer: seq=191 interface=zxdg_output_manager_v1 version=3 name=18 class=probe
+globals-offer: seq=192 interface=zxdg_exporter_v2 version=1 name=19 class=probe
+globals-offer: seq=193 interface=xdg_activation_v1 version=1 name=20 class=probe
+globals-offer: seq=194 interface=wp_fractional_scale_manager_v1 version=1 name=21 class=probe
+globals-offer: seq=195 interface=wp_single_pixel_buffer_manager_v1 version=1 name=22 class=probe
+globals-offer: seq=196 interface=wp_cursor_shape_manager_v1 version=2 name=23 class=probe
+globals-offer: seq=197 interface=wp_content_type_manager_v1 version=1 name=24 class=probe
+globals-offer: seq=198 interface=xdg_dialog_v1 version=1 name=25 class=probe
+globals-offer: seq=199 interface=xdg_system_bell_v1 version=1 name=26 class=probe
+globals-offer: seq=200 interface=xdg_toplevel_icon_manager_v1 version=1 name=27 class=probe
+globals-offer: seq=201 interface=wl_output version=4 name=28 class=v0
+globals-bind: seq=202 interface=zwp_text_input_manager_v3 class=probe version_requested=1 version_advertised=2
+globals-demand: seq=202 interface=zwp_text_input_manager_v3 version_requested=1 (the app bound a PROBE global -- it wants an interface the v0 set does not provide)
+globals-client: seq=203 event=gone clients=0 binds=29
+globals-touched: interface=wp_viewporter class=probe advertised=1 binds=1 version_min=1 version_max=1 first_seq=79 last_seq=79 status=bound
+globals-touched: interface=wp_presentation class=probe advertised=2 binds=1 version_min=1 version_max=1 first_seq=172 last_seq=172 status=bound
+globals-touched: interface=zwp_pointer_constraints_v1 class=probe advertised=1 binds=1 version_min=1 version_max=1 first_seq=80 last_seq=80 status=bound
+globals-touched: interface=zwp_relative_pointer_manager_v1 class=probe advertised=1 binds=1 version_min=1 version_max=1 first_seq=81 last_seq=81 status=bound
+globals-touched: interface=zwp_pointer_gestures_v1 class=probe advertised=3 binds=2 version_min=1 version_max=3 first_seq=36 last_seq=82 status=bound
+globals-touched: interface=zwp_primary_selection_device_manager_v1 class=probe advertised=1 binds=1 version_min=1 version_max=1 first_seq=37 last_seq=37 status=bound
+globals-touched: interface=zwp_idle_inhibit_manager_v1 class=probe advertised=1 binds=1 version_min=1 version_max=1 first_seq=83 last_seq=83 status=bound
+globals-touched: interface=zwp_keyboard_shortcuts_inhibit_manager_v1 class=probe advertised=1 binds=1 version_min=1 version_max=1 first_seq=38 last_seq=38 status=bound
+globals-touched: interface=zwp_text_input_manager_v3 class=probe advertised=2 binds=1 version_min=1 version_max=1 first_seq=202 last_seq=202 status=bound
+globals-touched: interface=zwp_tablet_manager_v2 class=probe advertised=2 binds=1 version_min=1 version_max=1 first_seq=39 last_seq=39 status=bound
+globals-touched: interface=zxdg_output_manager_v1 class=probe advertised=3 binds=1 version_min=3 version_max=3 first_seq=40 last_seq=40 status=bound
+globals-touched: interface=zxdg_exporter_v2 class=probe advertised=1 binds=1 version_min=1 version_max=1 first_seq=41 last_seq=41 status=bound
+globals-touched: interface=xdg_activation_v1 class=probe advertised=1 binds=2 version_min=1 version_max=1 first_seq=42 last_seq=84 status=bound
+globals-touched: interface=wp_fractional_scale_manager_v1 class=probe advertised=1 binds=1 version_min=1 version_max=1 first_seq=85 last_seq=85 status=bound
+globals-touched: interface=wp_single_pixel_buffer_manager_v1 class=probe advertised=1 binds=0 version_min=0 version_max=0 first_seq=0 last_seq=0 status=untouched
+globals-touched: interface=wp_cursor_shape_manager_v1 class=probe advertised=2 binds=1 version_min=1 version_max=1 first_seq=43 last_seq=43 status=bound
+globals-touched: interface=wp_content_type_manager_v1 class=probe advertised=1 binds=0 version_min=0 version_max=0 first_seq=0 last_seq=0 status=untouched
+globals-touched: interface=xdg_dialog_v1 class=probe advertised=1 binds=0 version_min=0 version_max=0 first_seq=0 last_seq=0 status=untouched
+globals-touched: interface=xdg_system_bell_v1 class=probe advertised=1 binds=0 version_min=0 version_max=0 first_seq=0 last_seq=0 status=untouched
+globals-touched: interface=xdg_toplevel_icon_manager_v1 class=probe advertised=1 binds=0 version_min=0 version_max=0 first_seq=0 last_seq=0 status=untouched
+globals-touched: interface=wl_shm class=v0 advertised=2 binds=3 version_min=1 version_max=1 first_seq=32 last_seq=171 status=bound
+globals-touched: interface=wl_compositor class=v0 advertised=6 binds=2 version_min=3 version_max=4 first_seq=33 last_seq=76 status=bound
+globals-touched: interface=wl_subcompositor class=v0 advertised=1 binds=2 version_min=1 version_max=1 first_seq=34 last_seq=77 status=bound
+globals-touched: interface=xdg_wm_base class=v0 advertised=6 binds=1 version_min=6 version_max=6 first_seq=46 last_seq=46 status=bound
+globals-touched: interface=wl_seat class=v0 advertised=9 binds=2 version_min=5 version_max=8 first_seq=45 last_seq=78 status=bound
+globals-touched: interface=wl_data_device_manager class=v0 advertised=3 binds=1 version_min=3 version_max=3 first_seq=35 last_seq=35 status=bound
+globals-touched: interface=zxdg_decoration_manager_v1 class=v0 advertised=1 binds=0 version_min=0 version_max=0 first_seq=0 last_seq=0 status=untouched
+globals-touched: interface=wl_output class=v0 advertised=4 binds=1 version_min=2 version_max=2 first_seq=44 last_seq=44 status=bound
+globals-summary: clients=3 advertised=28 bound=22 untouched=6 demanded=17 probe_mode=1 probes_armed=20 catalogue=21 drift=0 overflow=0

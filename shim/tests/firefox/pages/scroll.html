@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<!--
+  P1.6.4 acceptance page (b): "injected pointer scroll works in the page".
+
+  THE PROBLEM THIS PAGE SOLVES. Nobody can look at the nested window (see the
+  README: `spawn_realm` still has no non-test caller), so "the scroll worked"
+  has to be observable in the pixels that cross the wire. A page that merely
+  scrolls does not give that: its content moves, which changes the frame
+  digest, but so does a caret blink, a scrollbar fade, or the browser
+  repainting for its own reasons. A digest change proves SOMETHING happened,
+  not that scrolling happened.
+
+  So the page turns scroll position into a dominant colour. It is three
+  viewport-heights tall and starts red; once the document has actually
+  scrolled past a third of a viewport it repaints the whole page yellow. The
+  assertion is then the same one-string compare as every other check here --
+  dominant colour #ffff00 -- and it can only be satisfied by the document
+  genuinely having scrolled.
+
+  Colours are multiples of 0x11 (see repaint.html). Note they are also
+  distinct from repaint.html's, so a harness bug that loaded the wrong page
+  cannot accidentally pass.
+
+  `scrollY > innerHeight / 3` rather than `> 0`: a stray one-pixel scroll, or
+  a browser restoring a scroll position, should not satisfy this. A wheel
+  notch is ~100 px and the harness sends several, so the real signal clears
+  the bar by a wide margin.
+-->
+<meta charset="utf-8">
+<title>vitrin scroll probe</title>
+<style>
+  html, body { margin: 0; padding: 0; }
+  body { background: #ff0000; height: 300vh; }
+  #marker { position: fixed; inset: 0; background: transparent; }
+</style>
+<body>
+<div id="marker"></div>
+<script>
+  var fired = false;
+  function check() {
+    if (fired) { return; }
+    if (window.scrollY > window.innerHeight / 3) {
+      fired = true;
+      // Paint BOTH the document background and a fixed full-viewport overlay:
+      // the overlay guarantees the whole visible area is the new colour
+      // regardless of where in the tall document the viewport ended up.
+      document.body.style.background = '#ffff00';
+      document.getElementById('marker').style.background = '#ffff00';
+    }
+  }
+  window.addEventListener('scroll', check, { passive: true });
+  // Belt and braces: some scroll paths (smooth scrolling, compositor-side
+  // scrolling that never reaches the main thread promptly) can deliver the
+  // event late or coalesced. Polling makes the observation independent of
+  // which path the browser took to move the document.
+  setInterval(check, 100);
+</script>
+</body>

@@ -298,6 +298,47 @@ jobs:
         working-directory: shim
         run: BUILD_DIR="${RUNNER_TEMP}/shim-build" bash tests/acceptance/seat_input_replay.sh
 
+      # NOTE: quoted because the name contains ": " -- see the two steps above.
+      - name: "Headless acceptance (Firefox bring-up: render, scroll, URL bar, globals ledger)"
+        # The P1.6.4 acceptance criteria. The script FAILS rather than skipping
+        # under CI unless the gap is declared, which is the same rule the
+        # `conformance` job's cross-track test applies to itself -- a criterion
+        # that only ever reports SKIP on the machine gating merges is a
+        # criterion nobody is holding.
+        #
+        # THE GAP IS DECLARED HERE, DELIBERATELY, AND IT IS A REAL GAP. Firefox
+        # is a 75 MB tarball fetched from Mozilla (shim/tests/firefox/fetch-esr.sh)
+        # and it needs a system library set this bare ubuntu:24.04 container does
+        # not fully carry -- libgtk-3-dev covers most of it, but at least
+        # libasound2t64 and libseccomp2 are additionally required, and that list
+        # has never been validated in this container. Turning the gate on with an
+        # unvalidated dependency list would trade a known, visible gap for an
+        # intermittent red nobody can reproduce locally.
+        #
+        # TO CLOSE IT: add the missing runtime libraries to
+        # shim/ci/install-deps.sh, cache shim/.firefox keyed on
+        # shim/tests/firefox/firefox-esr.pin, run fetch-esr.sh, and drop the
+        # VITRIN_SKIP_FIREFOX_GATE line below. Until then the criteria are held
+        # on a developer machine only, and this notice says so on every run
+        # rather than letting a green tick imply otherwise.
+        if: hashFiles('shim/tests/acceptance/firefox_bringup.sh') != ''
+        working-directory: shim
+        env:
+          VITRIN_SKIP_FIREFOX_GATE: "1"
+        run: |
+          BUILD_DIR="${RUNNER_TEMP}/shim-build" bash tests/acceptance/firefox_bringup.sh
+          echo "::notice title=P1.6.4 Firefox gate declared SKIPPED::the pinned Firefox ESR is not fetched in CI, so the render/scroll/URL-bar/globals-ledger criteria were NOT proved by this run."
+          {
+            echo "## shim job: P1.6.4 Firefox gate SKIPPED (declared)"
+            echo ""
+            echo "The pinned Firefox ESR is not fetched in this job, so **none** of"
+            echo "\`firefox_bringup.sh\`'s criteria ran. They are held on a developer"
+            echo "machine (see \`shim/docs/firefox.md\`). The script refuses to skip"
+            echo "silently under CI; this job declares the gap with"
+            echo "\`VITRIN_SKIP_FIREFOX_GATE=1\`. See the step's comment for what it"
+            echo "would take to hold the gate here."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Meson build DORMANT
         if: hashFiles('shim/meson.build') == ''
         run: |

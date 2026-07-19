@@ -18,6 +18,7 @@
 
 #include <wayland-server-core.h>
 
+#include "ledger.h"
 #include "seat.h"
 #include "upstream.h"
 
@@ -53,6 +54,21 @@ struct vitrin_config {
 	 * core's `configure` whenever there is an upstream link -- the realm-view
 	 * geometry is the core's to decide, not this process's. */
 	int width, height;
+	/* Also write the globals ledger (ledger.h) to this path, one record per
+	 * line with no log prefix. NULL = shim log only. */
+	const char *globals_log;
+	/* Advertise the probe catalogue: interfaces the shim does NOT implement,
+	 * offered purely so that an app's demand for one becomes an observable
+	 * `wl_registry.bind`. A DIAGNOSTIC MODE -- it lies to the client, so it
+	 * is off by default and announced loudly when on (ledger.h). */
+	bool probe_globals;
+	/* Restrict the probe catalogue to this comma-separated list of interface
+	 * names, or NULL for all of it. This is what turns the ledger from "what
+	 * did the app ask for" into "which of those did it actually NEED": a
+	 * whole-catalogue run answers the first question, and bisecting with this
+	 * answers the second, without recompiling and without adding anything to
+	 * the real global set on a guess. */
+	const char *probe_filter;
 };
 
 struct vitrin_shim {
@@ -61,6 +77,13 @@ struct vitrin_shim {
 	/* Phase A0 -- the core link (upstream.c/wire.c). Opened before any
 	 * wlroots object exists, because its `configure` sizes everything. */
 	struct vitrin_upstream up;
+
+	/* The "globals touched" ledger (P1.6.4, ledger.h): what the app was
+	 * offered, what it bound, and -- via the probe catalogue -- what it
+	 * wanted that the v0 set does not provide. Armed before the socket is
+	 * bound, because all the interesting traffic is a client's first
+	 * roundtrip. */
+	struct vitrin_ledger ledger;
 
 	/* Phase A -- core. */
 	struct wl_display *display;

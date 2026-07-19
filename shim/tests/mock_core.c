@@ -34,6 +34,14 @@
  *   commit   likewise; latches pending state; copies the pixels out with
  *            pread, exactly as the core's copy-in does -- never mmap
  *
+ * EACH COMMIT IS ALSO MEASURED, not just validated: the copy-in pass reports
+ * an FNV-1a digest (did the pixels change?) and the DOMINANT COLOUR with its
+ * coverage (what is on screen?). The second one is what the M1.2 verification
+ * asks for -- "Firefox smoke: local page rendering a known solid color,
+ * assert dominant color" -- and it is deliberately computed here, in the
+ * core's own copy-in, rather than by a separate screenshot tool: what gets
+ * asserted is then exactly the bytes that crossed the wire.
+ *
  * Options exist to make the core behave badly on purpose, which is what the
  * backpressure criterion needs:
  *
@@ -188,6 +196,21 @@ struct core {
 	 * nothing else. */
 	uint8_t seat_batch[2 * (MAX_INPUT_TEXT + 64)];
 	size_t seat_batch_len;
+
+	/* --dump-frame: write the Nth committed frame out as a binary PPM, for
+	 * looking at with human eyes. The acceptance criteria are all asserted
+	 * on bytes (dominant colour, digest, damage), which is what makes them
+	 * mechanical -- but "Firefox renders in the realm" is a claim somebody
+	 * will eventually want to SEE rather than read a hex triple of, and
+	 * nothing else in the tree can produce a picture: vitrind never spawns a
+	 * shim yet, so there is no nested window to screenshot.
+	 *
+	 * PPM (P6) rather than PNG deliberately: a header plus raw RGB bytes
+	 * needs no codec, and this binary links nothing but libc on purpose --
+	 * the shim CI job must not pull a Rust toolchain, and it should not grow
+	 * an image library either. Converting to PNG is the viewer's problem. */
+	const char *dump_path;
+	uint64_t dump_at;
 
 	/* accounting the acceptance script asserts on */
 	uint64_t commits;
@@ -754,19 +777,59 @@ static void handle_damage(struct core *c, const uint8_t *f, size_t len) {
 	trace("EV damage x=%d y=%d w=%d h=%d", req.x, req.y, req.width, req.height);
 }
 
+/* Dominant-colour histogram: 4 bits per channel, so 4096 buckets.
+ *
+ * The M1.2 verification is "Firefox smoke (local page rendering a known solid
+ * color, assert dominant color)" (plan section 5), and this is what makes
+ * that assertion mechanical without an image codec in a test binary that
+ * links only libc. Four bits per channel rather than eight for two reasons:
+ * 8-bit buckets are a 16 MiB array, and a browser does not paint a "solid"
+ * colour solid -- subpixel antialiasing, colour management and compositing
+ * all smear a flat #0000ff across neighbouring values. Quantising to the top
+ * nibble collapses that smear into one bucket while still separating any two
+ * colours a test would sensibly pick.
+ *
+ * The bucket is reported EXPANDED (nibble n -> byte n*0x11), so a page
+ * painted in a colour whose channels are multiples of 0x11 -- which is what
+ * the test pages use -- round-trips to exactly the value the CSS asked for,
+ * and the assertion in the shell script is a plain string compare against
+ * the colour in the HTML. */
+#define HIST_BUCKETS 4096
+
 /* The copy-in: pread rows bounded by the validated geometry, never a
  * mapping, so an fd that lied since attach is a clean short read rather
  * than SIGBUS. FNV-1a over the copied bytes gives the shell script a
- * content fingerprint without an image codec anywhere. */
-static uint64_t copy_in_digest(struct core *c, uint64_t *out_bytes) {
+ * content fingerprint without an image codec anywhere, and the histogram
+ * gives it the dominant colour on the same pass over the same pixels. */
+static uint64_t copy_in_digest(struct core *c, uint64_t *out_bytes,
+		uint32_t *out_dominant, unsigned *out_dominant_pct) {
 	uint64_t hash = 1469598103934665603ull;
 	size_t row_bytes = (size_t)c->pending.width * 4;
 	uint8_t *row = malloc(row_bytes);
-	if (row == NULL) {
+	uint32_t *hist = calloc(HIST_BUCKETS, sizeof(*hist));
+	if (row == NULL || hist == NULL) {
 		fail(c, "out of memory in copy-in");
+		free(row);
+		free(hist);
 		return 0;
 	}
+	/* Opened before the row loop so the dump costs one pass, not two: the
+	 * rows are already being read here under validated geometry, and reading
+	 * the fd a second time would be reading a buffer the shim may by then
+	 * have been told it can reuse. NULL means "not dumping this frame",
+	 * which is every frame but at most one. */
+	FILE *dump = NULL;
+	if (c->dump_path != NULL && c->commits == c->dump_at) {
+		dump = fopen(c->dump_path, "wb");
+		if (dump == NULL) {
+			trace("EV dump_failed path=%s errno=%d", c->dump_path, errno);
+		} else {
+			fprintf(dump, "P6\n%u %u\n255\n", c->pending.width, c->pending.height);
+		}
+	}
+
 	uint64_t total = 0;
+	uint64_t pixels = 0;
 	for (uint32_t y = 0; y < c->pending.height; y++) {
 		size_t got = 0;
 		while (got < row_bytes) {
@@ -775,6 +838,7 @@ static uint64_t copy_in_digest(struct core *c, uint64_t *out_bytes) {
 			if (n <= 0) {
 				fail(c, "invalid_buffer: copy-in short read at row %u", y);
 				free(row);
+				free(hist);
 				return 0;
 			}
 			got += (size_t)n;
@@ -783,9 +847,51 @@ static uint64_t copy_in_digest(struct core *c, uint64_t *out_bytes) {
 			hash ^= row[i];
 			hash *= 1099511628211ull;
 		}
+		/* Both version-1 formats are 32 bits little-endian with the same
+		 * channel order in memory -- byte 0 blue, byte 1 green, byte 2 red --
+		 * so XRGB8888 and ARGB8888 are read identically here and only the
+		 * ignored fourth byte differs. */
+		for (size_t i = 0; i + 3 < row_bytes; i += 4) {
+			unsigned b = row[i] >> 4, g = row[i + 1] >> 4, r = row[i + 2] >> 4;
+			hist[(r << 8) | (g << 4) | b]++;
+			pixels++;
+		}
+		/* Same memory-order note as the histogram above: byte 0 is blue,
+		 * byte 2 is red, and PPM wants R,G,B -- so this is a swap, not a
+		 * copy. The fourth byte is ignored under both v1 formats. */
+		if (dump != NULL) {
+			for (size_t i = 0; i + 3 < row_bytes; i += 4) {
+				fputc(row[i + 2], dump);
+				fputc(row[i + 1], dump);
+				fputc(row[i], dump);
+			}
+		}
 		total += row_bytes;
 	}
+	if (dump != NULL) {
+		bool ok = ferror(dump) == 0;
+		if (fclose(dump) != 0 || !ok) {
+			trace("EV dump_failed path=%s (write error)", c->dump_path);
+		} else {
+			trace("EV dump_written path=%s commit=%llu %ux%u",
+				c->dump_path, (unsigned long long)c->commits,
+				c->pending.width, c->pending.height);
+		}
+	}
 	free(row);
+
+	uint32_t best = 0, best_count = 0;
+	for (uint32_t i = 0; i < HIST_BUCKETS; i++) {
+		if (hist[i] > best_count) {
+			best_count = hist[i];
+			best = i;
+		}
+	}
+	free(hist);
+	*out_dominant = (uint32_t)(((best >> 8) & 0xf) * 0x11) << 16 |
+		(uint32_t)(((best >> 4) & 0xf) * 0x11) << 8 |
+		(uint32_t)((best & 0xf) * 0x11);
+	*out_dominant_pct = pixels > 0 ? (unsigned)((uint64_t)best_count * 100 / pixels) : 0;
 	*out_bytes = total;
 	return hash;
 }
@@ -815,8 +921,10 @@ static void handle_commit(struct core *c, const uint8_t *f, size_t len) {
 	uint64_t digest = 0, bytes = 0;
 	uint32_t committed_id = 0;
 	uint64_t surface_area = 0;
+	uint32_t dominant = 0;
+	unsigned dominant_pct = 0;
 	if (c->pending.present) {
-		digest = copy_in_digest(c, &bytes);
+		digest = copy_in_digest(c, &bytes, &dominant, &dominant_pct);
 		committed_id = c->pending.buffer_id;
 		surface_area = (uint64_t)c->pending.width * c->pending.height;
 
@@ -846,10 +954,11 @@ static void handle_commit(struct core *c, const uint8_t *f, size_t len) {
 		c->max_inflight = c->inflight;
 	}
 	trace("EV commit n=%llu buffer_id=%u rects=%d damage_area=%llu surface_area=%llu "
-		"bytes=%llu digest=%016llx inflight=%d",
+		"bytes=%llu digest=%016llx dominant=%06x dominant_pct=%u inflight=%d",
 		(unsigned long long)c->commits, committed_id, c->damage_len,
 		(unsigned long long)area, (unsigned long long)surface_area,
-		(unsigned long long)bytes, (unsigned long long)digest, c->inflight);
+		(unsigned long long)bytes, (unsigned long long)digest,
+		dominant, dominant_pct, c->inflight);
 
 	c->damage_len = 0;
 
@@ -1025,7 +1134,8 @@ static void usage(void) {
 	fprintf(stderr,
 		"usage: mock-core [--realm NAME] [--size WxH] [--frames N] [--run-ms MS]\n"
 		"                 [--frame-delay MS] [--defer-release]\n"
-		"                 [--input SCRIPT] [--input-after-commits N] -- SHIM_ARGV...\n");
+		"                 [--input SCRIPT] [--input-after-commits N]\n"
+		"                 [--dump-frame N:PATH] -- SHIM_ARGV...\n");
 	exit(2);
 }
 
@@ -1038,6 +1148,8 @@ int main(int argc, char **argv) {
 	bool defer_release = false;
 	const char *input_script = NULL;
 	uint64_t input_after_commits = 3;
+	const char *dump_path = NULL;
+	uint64_t dump_at = 0;
 	int shim_argi = 0;
 
 	for (int i = 1; i < argc; i++) {
@@ -1059,6 +1171,18 @@ int main(int argc, char **argv) {
 			input_script = argv[++i];
 		} else if (strcmp(argv[i], "--input-after-commits") == 0 && i + 1 < argc) {
 			input_after_commits = strtoull(argv[++i], NULL, 10);
+		} else if (strcmp(argv[i], "--dump-frame") == 0 && i + 1 < argc) {
+			/* N:PATH -- the commit index to capture, then where to put it.
+			 * Which frame matters: frame 0 of a browser is usually blank,
+			 * so a caller wants to name one after the paint it cares about. */
+			const char *spec = argv[++i];
+			const char *colon = strchr(spec, ':');
+			if (colon == NULL || colon == spec || colon[1] == '\0') {
+				fprintf(stderr, "mock-core: --dump-frame wants N:PATH\n");
+				usage();
+			}
+			dump_at = strtoull(spec, NULL, 10);
+			dump_path = colon + 1;
 		} else if (strcmp(argv[i], "--") == 0 && i + 1 < argc) {
 			shim_argi = i + 1;
 			break;
@@ -1102,6 +1226,8 @@ int main(int argc, char **argv) {
 	c->retained_fd = -1;
 	c->pending.fd = -1;
 	c->input_after_commits = input_after_commits;
+	c->dump_path = dump_path;
+	c->dump_at = dump_at;
 	c->input_due_ms = -1; /* armed by the Nth commit, not by the clock */
 
 	trace("EV spawned shim_pid=%d", (int)shim);

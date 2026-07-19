@@ -5,6 +5,13 @@
 //! ├── core.sock                              <- core_socket_path(): the
 //! │                                             principal-facing listener
 //! ├── core.sock.lock                         <- Listener's flock guard
+//! ├── <realm_id>.lock                        <- realm_lock_path(): the
+//! │                                             spawn manager's flock guard
+//! │                                             for one realm. A sibling of
+//! │                                             the directory below, not a
+//! │                                             file in it: winning this
+//! │                                             lock is what licenses
+//! │                                             purging that directory
 //! └── <realm_id>/                            <- shim_runtime_dir(): one
 //!     │                                         private dir per spawned shim
 //!     └── wayland-0                          <- shim_socket_path(): the
@@ -44,6 +51,11 @@ pub const CORE_SOCKET_NAME: &str = "core.sock";
 /// [`shim_runtime_dir_in`] directory -- the value the core puts in the
 /// app's `WAYLAND_DISPLAY` (as an absolute path) at spawn time.
 pub const SHIM_SOCKET_NAME: &str = "wayland-0";
+
+/// Suffix of every `flock` guard file in the runtime tree: the listener's
+/// `core.sock.lock` and each realm's `<realm_id>.lock`. One spelling, so
+/// "what is a lock file here" stays a single answer.
+pub const LOCK_SUFFIX: &str = ".lock";
 
 /// Why a convention path could not be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +124,26 @@ pub fn shim_runtime_dir_in(xdg_runtime_dir: &Path, realm_id: &str) -> Result<Pat
     Ok(runtime_dir_in(xdg_runtime_dir).join(realm_id))
 }
 
+/// `$XDG_RUNTIME_DIR/vitrin-0/<realm_id>.lock` -- the realm-ownership lock
+/// the core's spawn manager (P1.5.2) holds for a live realm.
+///
+/// A *sibling* of the realm's directory, not a file inside it: winning this
+/// lock is what licenses purging that directory, and a lock file living
+/// inside the thing it protects would be deleted by the very act it
+/// authorized. Same `.lock` suffix convention as [`core_socket_path`]'s
+/// guard, one level down.
+pub fn realm_lock_path(realm_id: &str) -> Result<PathBuf, PathError> {
+    realm_lock_path_in(&xdg_runtime_dir()?, realm_id)
+}
+
+/// [`realm_lock_path`] against an explicit XDG runtime base.
+pub fn realm_lock_path_in(xdg_runtime_dir: &Path, realm_id: &str) -> Result<PathBuf, PathError> {
+    let dir = shim_runtime_dir_in(xdg_runtime_dir, realm_id)?;
+    let mut p = dir.into_os_string();
+    p.push(LOCK_SUFFIX);
+    Ok(PathBuf::from(p))
+}
+
 /// `$XDG_RUNTIME_DIR/vitrin-0/<realm_id>/wayland-0` -- the shim's private,
 /// app-facing Wayland socket.
 pub fn shim_socket_path(realm_id: &str) -> Result<PathBuf, PathError> {
@@ -123,7 +155,15 @@ pub fn shim_socket_path_in(xdg_runtime_dir: &Path, realm_id: &str) -> Result<Pat
     Ok(shim_runtime_dir_in(xdg_runtime_dir, realm_id)?.join(SHIM_SOCKET_NAME))
 }
 
-fn xdg_runtime_dir() -> Result<PathBuf, PathError> {
+/// `$XDG_RUNTIME_DIR` itself, validated: set, non-empty, and absolute.
+///
+/// Public because the core's realm spawn manager (P1.5.2) has to hold the
+/// runtime *base* rather than re-derive it per call -- every helper here
+/// comes in a pure `*_in` form precisely so the spawn path stays
+/// deterministic, and those forms need the base. Exposing the one validated
+/// reader keeps that from becoming a second, drifting copy of the XDG rules
+/// in another crate.
+pub fn xdg_runtime_dir() -> Result<PathBuf, PathError> {
     let dir = env::var_os("XDG_RUNTIME_DIR").ok_or(PathError::RuntimeDirUnset)?;
     if dir.is_empty() {
         return Err(PathError::RuntimeDirUnset);
@@ -174,6 +214,12 @@ mod tests {
             shim_socket_path_in(base, "realm-0").unwrap(),
             Path::new("/run/user/1000/vitrin-0/realm-0/wayland-0")
         );
+        // A sibling of the realm directory, never a file inside it: the
+        // purge this lock authorizes would delete a lock file kept there.
+        assert_eq!(
+            realm_lock_path_in(base, "realm-0").unwrap(),
+            Path::new("/run/user/1000/vitrin-0/realm-0.lock")
+        );
     }
 
     #[test]
@@ -193,6 +239,13 @@ mod tests {
                 shim_runtime_dir_in(base, id),
                 Err(PathError::InvalidRealmId(id.to_string())),
                 "realm id {id:?} must be rejected"
+            );
+            // The lock path is derived from the same validated id, so a
+            // hostile id cannot reach the filesystem through it either.
+            assert_eq!(
+                realm_lock_path_in(base, id),
+                Err(PathError::InvalidRealmId(id.to_string())),
+                "realm id {id:?} must be rejected for the lock path too"
             );
         }
         // Dots inside an id are fine; only the traversal names are not.

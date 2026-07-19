@@ -48,6 +48,24 @@ vitrin-ipc = { path = "../vitrin-ipc" }
 # check and its SO_PEERCRED same-user policy -- a feature bump on an
 # existing dependency, not a new one.
 rustix = { version = "1", features = ["fs", "process"] }
+# A handful of raw syscalls in exactly one place: the post-`fork`,
+# pre-`execve` closure in `spawn` (P1.5.2), which must be async-signal-safe
+# and therefore cannot allocate. It performs `close_range` (marks every
+# descriptor above stdio close-on-exec, so nothing of the core's crosses the
+# fork), `signal` (resets inherited SIG_IGN dispositions, so the confined
+# app is not immune to the signals lifecycle terminates it with), and
+# `dup3`/`fcntl` (places the shim's end of the identity socketpair on fd 3).
+# Nothing else in the core links libc directly. Justified against plan risk
+# R7 on two counts: it is already in the dependency graph (Smithay, calloop
+# and nix all pull it, so this adds no transitive surface at all), and
+# rustix — the crate the core otherwise uses for every syscall — cannot
+# express these: it has no `close_range` or `signal` binding at all, and its
+# `dup3` takes `&mut OwnedFd` for the target, so aiming at a fixed descriptor
+# number would mean fabricating an `OwnedFd` for a descriptor that may not be
+# open and whose drop would close a descriptor we do not own. A thin
+# `extern "C"` call is both the honest and the async-signal-safe spelling in
+# a post-fork context, where anything richer risks an allocation.
+libc = "0.2"
 
 # GBM buffer allocation for the env-gated real-GPU dmabuf tests (P1.3.5,
 # M1.5) — the test-side allocator that mints *genuine* dmabufs from a render

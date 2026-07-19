@@ -368,14 +368,19 @@ impl SpawnConfig {
     }
 }
 
-/// A realm's lifecycle state. Version 0 has exactly one variant: nothing
-/// spawns yet. P1.5.2 adds the running states and P1.5.3 the terminal ones;
-/// [`Realm::admits_petitions`] is where those variants decide vacancy
-/// (module docs).
+/// A realm's lifecycle state. P1.5.3 adds the terminal ones (`Exited`,
+/// and whatever crash detection needs); [`Realm::admits_petitions`] is
+/// where every variant decides vacancy (module docs), and it is the only
+/// place that has to change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RealmState {
     /// Described by `realm.toml` and addressable; no app process yet.
     Configured,
+    /// The realm's shim has been forked and `exec`ed ([`crate::spawn`]):
+    /// the core holds its end of the identity socketpair and this pid is
+    /// the shim. Says nothing about whether the app has painted -- that
+    /// stays the chokepoint's `no_surface` judgement, not a realm state.
+    Running { pid: u32 },
 }
 
 /// One realm: its wire-visible identity, the app it owns, and its state.
@@ -414,6 +419,12 @@ impl Realm {
             // enforcement chokepoint (`no_surface`), never a lie about the
             // realm's existence.
             RealmState::Configured => true,
+            // Running is the same answer for the same reason, one step
+            // further along: an app that has started but not yet committed
+            // a surface is still merely unpainted. The petition-time answer
+            // only changes when a realm can no longer be served at all,
+            // which is P1.5.3's terminal states.
+            RealmState::Running { .. } => true,
         }
     }
 }
@@ -508,6 +519,23 @@ impl RealmRegistry {
     /// lookup; petitions use [`resolve_for_petition`](Self::resolve_for_petition)).
     pub fn get(&self, name: &str) -> Option<&Realm> {
         self.realms.get(&RealmId::new(name))
+    }
+
+    /// Record that this realm's app is running under `pid`
+    /// ([`crate::spawn`] has forked and `exec`ed its shim). Returns whether
+    /// the realm existed.
+    ///
+    /// State transitions live on the registry rather than on [`Realm`] so
+    /// there is one owner of realm state, the way there is one grant table
+    /// -- P1.5.3's exit handling adds its transitions here beside this one.
+    pub fn mark_running(&mut self, id: &RealmId, pid: u32) -> bool {
+        match self.realms.get_mut(id) {
+            Some(realm) => {
+                realm.state = RealmState::Running { pid };
+                true
+            }
+            None => false,
+        }
     }
 
     /// Every realm, in id order.
@@ -719,7 +747,18 @@ fn audit_spawn_target(command: &Path) -> Result<(), ErrorKind> {
 /// program -- and the ownership half of this same check still binds on
 /// every component. Files get no such exemption; the bit means something
 /// else entirely on a regular file.
-fn untrusted_writer(uid: u32, raw_mode: u32, euid: u32, sticky_tolerated: bool) -> Option<String> {
+///
+/// Shared with [`crate::spawn`], which re-applies exactly this rule to the
+/// descriptor it is about to `exec` (module docs: the startup audit cannot
+/// speak for the instant of `execve`). One definition, two call sites --
+/// two copies of "who may replace this" would eventually disagree, and the
+/// quieter copy would be the one that matters.
+pub(crate) fn untrusted_writer(
+    uid: u32,
+    raw_mode: u32,
+    euid: u32,
+    sticky_tolerated: bool,
+) -> Option<String> {
     if uid != 0 && uid != euid {
         return Some(format!(
             "owned by uid {uid}, neither root nor the core's uid {euid}"
@@ -1007,6 +1046,39 @@ pub(crate) mod tests {
         }
     }
 
+    /// A [`SpawnConfig`] with exactly these fields -- the constructor
+    /// [`crate::spawn`]'s tests need, because the struct's fields are
+    /// private and the loader (deliberately) cannot produce some of the
+    /// states the spawn path must still refuse.
+    pub(crate) fn spawn_config_with(
+        command: &Path,
+        args: &[String],
+        env_allow: &[String],
+    ) -> SpawnConfig {
+        SpawnConfig {
+            command: command.to_path_buf(),
+            args: args.to_vec(),
+            env_allow: env_allow.to_vec(),
+        }
+    }
+
+    /// A `Configured` realm launching `command` -- the fixture
+    /// [`crate::spawn`]'s tests execute. Bypasses the loader's filesystem
+    /// audits on purpose: those are `RealmRegistry::load`'s, and the spawn
+    /// path is required to re-check what it will actually run.
+    pub(crate) fn realm_with_spawn(
+        id: &str,
+        command: &Path,
+        args: &[String],
+        env_allow: &[String],
+    ) -> Realm {
+        Realm {
+            id: RealmId::new(id),
+            spawn: spawn_config_with(command, args, env_allow),
+            state: RealmState::Configured,
+        }
+    }
+
     fn registry_from(text: &str) -> Result<RealmRegistry, ErrorKind> {
         RealmRegistry::from_specs(parse_config(text)?)
     }
@@ -1158,6 +1230,29 @@ pub(crate) mod tests {
             realm.admits_petitions(),
             "a configured realm whose app has not started is addressable, not vacant: \
              liveness is the chokepoint's no_surface judgement, not a petition-time lie"
+        );
+    }
+
+    #[test]
+    fn a_running_realm_is_addressable_and_records_its_pid() {
+        // P1.5.2's state arm: spawning changes what the realm *is doing*,
+        // never whether its name resolves. The wire answer is identical
+        // before and after the fork -- which is what "no signature, no
+        // caller, no wire behavior moves" means in practice.
+        let mut registry = registry_from(MINIMAL).unwrap();
+        let id = RealmId::new(WELL_KNOWN_REALM_ID);
+        assert!(registry.mark_running(&id, 4242));
+        assert!(!registry.mark_running(&RealmId::new("realm-1"), 1));
+
+        let realm = registry.get(WELL_KNOWN_REALM_ID).unwrap();
+        assert_eq!(realm.state(), RealmState::Running { pid: 4242 });
+        assert!(
+            realm.admits_petitions(),
+            "a running realm whose app has not painted is still merely unpainted"
+        );
+        assert_eq!(
+            registry.resolve_for_petition(WELL_KNOWN_REALM_ID),
+            Some(&id)
         );
     }
 

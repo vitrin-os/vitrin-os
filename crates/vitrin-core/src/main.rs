@@ -492,6 +492,15 @@ fn main() -> ExitCode {
 /// `spawn`'s own tests, which really fork the mock shim, really place the
 /// socketpair at fd 3, and really assert the child's environment and
 /// descriptor table from procfs.
+///
+/// Consequence worth stating plainly rather than discovering later:
+/// **issue #31's "`pstree` shows core → shim → app" is satisfied by tests,
+/// not by the shipped binary.** A running `vitrind` forks nothing. Of the
+/// two blockers only `SIGCHLD` reaping belongs to #32; the event-loop half
+/// is the same M1.1 integration gap that already leaves `shim` and the
+/// listener unwired, and no open issue owns it. Whoever closes that gap
+/// closes this line too — the call site is described above, and it is one
+/// `spawn_realm` call.
 fn run_session<R>(
     consent: ConsentPolicy,
     recorder_path: Option<PathBuf>,

@@ -137,7 +137,10 @@ realm's own private socket. `DISPLAY`, the host `WAYLAND_DISPLAY`,
 `WAYLAND_SOCKET`, `XAUTHORITY` and the host `XDG_RUNTIME_DIR` cannot reach
 the app at all. No unrelated descriptor of the core's — the agent listener,
 the flight-recorder log, other realms' sockets, capture memfds — crosses the
-fork.
+fork, and the child starts from a defined signal state rather than inheriting
+whatever the operator's shell happened to be ignoring. Both are enforced by
+the fork itself (a `close_range` sweep and a disposition reset between `fork`
+and `execve`), not by every other module remembering to be careful.
 
 That is the complete list of what confines a realm right now.
 
@@ -164,6 +167,14 @@ That is the complete list of what confines a realm right now.
   reach rather than nothing advertised.
 - **Same-uid separation is not attempted.** The `0700` runtime directory
   bounds other *users* on the machine, not other processes of this user.
+  Note what the realm's `XDG_RUNTIME_DIR` therefore is and is not: its value,
+  `$XDG_RUNTIME_DIR/vitrin-0/<realm>`, sits one level below the directory
+  holding the core's own agent socket and this run's flight-recorder log, so
+  it names the control plane as much as it hides it. Redirecting it means a
+  well-behaved client finds its own realm's socket instead of the host
+  session's — it does not mean the app cannot reach the rest, because under
+  D9 it runs as the core's uid and can derive those paths with or without a
+  variable pointing at them.
 
 The spawn path and every decision above are documented in full in
 [`crates/vitrin-core/src/spawn.rs`](crates/vitrin-core/src/spawn.rs);

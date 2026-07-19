@@ -92,21 +92,67 @@
 //!   closures, an `environ` pointer swap, and `execvp`. It also takes the
 //!   environment read lock across the fork and `mem::forget`s it in the
 //!   child, so no non-async-signal-safe unlock happens there.
-//! - **The registered closure is two syscalls and no Rust.** It captures a
-//!   single `RawFd` by value -- an integer -- and calls `libc::dup3` (or
-//!   `libc::fcntl`), then constructs its error with
+//! - **The registered closure is syscalls and no Rust.** It captures three
+//!   integers by value (a `RawFd` and two signal numbers) and calls only
+//!   `close_range`, `signal`, and `dup3`/`fcntl` -- every one of them on
+//!   signal-safety(7)'s async-signal-safe list. Its errors come from
 //!   `io::Error::last_os_error()`, which is `from_raw_os_error` over
 //!   `errno` and allocates nothing. There is no `String`, no `Vec`, no
 //!   `PathBuf`, no formatting, no logging, and no `Drop` impl in scope that
-//!   could take a lock.
+//!   could take a lock. Everything it needs that *would* allocate or read
+//!   global state -- the descriptor number, `SIGRTMAX()` -- is computed in
+//!   the parent and captured.
 //! - **Order is exploited, not assumed.** std runs its stdio `dup2`s
 //!   *before* the closures, so the closure's `dup3` onto fd 3 cannot race
 //!   or be undone by stdio setup. The parent independently guarantees the
 //!   source descriptor is `>= 3` (see [`spawn_realm`]), so stdio placement
-//!   can never clobber it either.
+//!   can never clobber it either. Inside the closure the order is equally
+//!   load-bearing and equally deliberate: the descriptor sweep runs
+//!   *before* the `dup3`, because a sweep afterwards would mark the shim's
+//!   own connection close-on-exec and hand the child an empty fd 3.
 //!
-//! That is the entire `unsafe` surface of this module: one closure, two
+//! That is the entire `unsafe` surface of this module: one closure, four
 //! possible syscalls, no memory operations.
+//!
+//! # What the child does *not* inherit, made structural
+//!
+//! Two things cross `execve` by default that a confined child must not get,
+//! and neither is prevented by the discipline the rest of the core keeps.
+//! Both are closed inside the closure, because that is the only place they
+//! *can* be closed:
+//!
+//! - **Descriptors.** `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` marks every
+//!   descriptor above stdio close-on-exec. Until this existed, "no unrelated
+//!   descriptor of the core's crosses the fork" rested entirely on every
+//!   other module remembering `O_CLOEXEC` -- true today (P1.2.1's discipline
+//!   holds, and the tests assert it), but a property of code this file does
+//!   not own, and one the DRM/udev/libinput/EGL backends (E4/E7) will put
+//!   third-party fd creation inside. One syscall converts a convention into
+//!   a guarantee. `CLOSE_RANGE_CLOEXEC` rather than an outright
+//!   `close_range(..., 0)`: std reports `execve` failure to the parent
+//!   through a pipe it opened before the fork, and *closing* that pipe would
+//!   turn "no such program" into a spawn that reports success and dies --
+//!   marking it close-on-exec keeps the report working right up to a
+//!   successful `execve`. The kernel does the closing, atomically, at the
+//!   only instant it is correct. On a kernel too old to have the flag
+//!   (before 5.11) the call fails, the closure returns that error, and the
+//!   spawn is refused with [`SpawnError::Exec`] carrying the errno: fail
+//!   closed, because a child confined only on the assumption that every
+//!   other module remembered `O_CLOEXEC` is not confined, it is trusted.
+//! - **Ignored signals.** `execve` resets *caught* signals to `SIG_DFL` but
+//!   deliberately preserves `SIG_IGN`, and std resets only `SIGPIPE`. So
+//!   every disposition the core inherited from its own launch context
+//!   survives into the shim and, transitively, into the app: a POSIX shell
+//!   sets `SIGINT`/`SIGQUIT` to `SIG_IGN` for a background job, which is the
+//!   ordinary `vitrind &` development and demo path, and a service manager
+//!   may add others. Measured on this toolchain, an ignored `SIGINT`,
+//!   `SIGQUIT` **and `SIGTERM` all reach the app.** That last one is not
+//!   hygiene: a display server whose whole promise is revocable authority
+//!   cannot spawn a child that is immune to `SIGTERM` because of how the
+//!   operator happened to start the core, and P1.5.3 (#32) builds
+//!   termination on exactly that signal. The closure resets every
+//!   disposition to `SIG_DFL`, so a realm's process tree starts from a
+//!   defined state instead of an inherited one.
 //!
 //! # The realm's private runtime directory
 //!
@@ -124,15 +170,42 @@
 //!   the app all run as the *same* uid in the MVP, so `0700` bounds other
 //!   users, not other processes of this user. Separating those is the
 //!   powerbox work (E2.6/E2.7), not something a mode bit can do.
-//! - **A pre-existing directory is stale garbage and is purged, not
-//!   reused.** Exactly one core serves a given runtime tree (the listener's
-//!   `flock` guard enforces that), so a directory already at this path
-//!   belongs to a run that is gone; reusing it would carry a dead run's
-//!   socket file and scratch into a new run's confinement. It is removed and
-//!   recreated -- but only after being opened `O_NOFOLLOW | O_DIRECTORY` and
-//!   confirmed to be a real directory owned by this euid, because a blind
-//!   recursive delete through a planted symlink is how a cleanup routine
-//!   deletes a home directory.
+//! - **The enclosing `vitrin-0` tree is verified, not just created.** It is
+//!   `mkdir`ed, then opened `O_NOFOLLOW | O_DIRECTORY`, confirmed to be a
+//!   directory owned by this euid, and chmodded *through that descriptor*.
+//!   The path-based `create_dir_all` + `set_permissions` this replaced both
+//!   follow symlinks: a symlink planted at `vitrin-0` was silently accepted,
+//!   its target chmodded to `0700`, and every realm directory created inside
+//!   a tree the core did not choose -- so `WAYLAND_DISPLAY` would name a
+//!   socket somewhere else entirely. The realm directory one level down was
+//!   already careful about exactly this; the parent now matches it.
+//! - **A pre-existing directory is stale garbage, but only a *proven* stale
+//!   one is purged.** The purge is a recursive delete, so what licenses it
+//!   has to be a fact, not an assumption. The fact is an `flock` on
+//!   `<realm_id>.lock`, taken non-blocking before the purge and held for the
+//!   realm's whole life ([`RealmLock`]): winning it proves no live core owns
+//!   this realm, so anything at the path belongs to a run that is gone.
+//!   Losing it means a second `vitrind` is serving this realm right now, and
+//!   the spawn is refused ([`SpawnError::RealmBusy`]) instead of deleting a
+//!   live run's socket directory out from under it -- which is precisely
+//!   what the previous "the listener's `flock` guard enforces one core per
+//!   tree" justification permitted, because **nothing in the core
+//!   constructs a `Listener`**, so that lock was never held by anybody.
+//!   Reusing a stale directory instead of purging is not an option either:
+//!   it would carry a dead run's socket file and scratch into a new run's
+//!   confinement.
+//! - **The purge is bound to what it verified as tightly as std allows.**
+//!   The realm directory is reached with `openat` *through the verified
+//!   parent descriptor*, `O_NOFOLLOW | O_DIRECTORY`, and confirmed to be a
+//!   directory owned by this euid -- a blind recursive delete through a
+//!   planted symlink is how a cleanup routine deletes a home directory. The
+//!   honest residual: std has no `remove_dir_all` rooted at a descriptor, so
+//!   the delete itself re-resolves the final component by path. What closes
+//!   that gap is not the check but the chain around it -- the parent is held
+//!   open and proven `0700` and ours, so no *other* uid can substitute the
+//!   name, and the realm lock excludes the only same-uid process that has
+//!   business here. A same-uid process outside that chain still could, and
+//!   that is D9's territory, not a mode bit's.
 //! - **Removal at exit belongs to P1.5.3 (#32)**, which owns lifecycle. What
 //!   this task guarantees is that a crashed run is self-healing at the next
 //!   start (the purge above) and that a *failed* spawn leaves nothing behind
@@ -154,7 +227,26 @@
 //! again with [`SpawnError::ReservedEnv`] -- deliberately redundant: the
 //! filter is the guarantee, the error is the alarm. A reserved name arriving
 //! here means the validator was bypassed, and a TCB that silently repairs a
-//! bypassed validator hides the bug that matters.
+//! bypassed validator hides the bug that matters. The `command` path gets
+//! the same treatment for the same reason: [`launch`] refuses a relative one
+//! even though [`crate::realm`] already does, because a relative program
+//! resolves against the child's `current_dir` -- which this module points at
+//! the realm's own runtime directory, a directory the confined app can
+//! write. Auditing one inode and `exec`ing whatever the app dropped at that
+//! name is the one divergence the audit must not have.
+//!
+//! What the injected `XDG_RUNTIME_DIR` is *not*: a jail. Its value is
+//! `$XDG_RUNTIME_DIR/vitrin-0/<realm_id>`, a subdirectory of the tree that
+//! also holds the core's own principal-facing `core.sock` and this run's
+//! flight-recorder log -- so the value names the core's control plane one
+//! level up (`../core.sock`). That is worth stating plainly, but it is not
+//! worth relocating: under D9 the child runs as the core's uid and can
+//! derive `/run/user/<uid>` from `getuid()` whether or not any variable
+//! points at it, so moving the realm tree elsewhere would change what the
+//! app is *told*, not what it can reach. The variable is redirected so a
+//! well-behaved client finds its own realm's socket instead of the host
+//! session's, which is a confinement of the well-behaved -- the same
+//! qualifier the whole D9 section below carries.
 //!
 //! Stdio: **stdin is `/dev/null`**, stdout and stderr are inherited. A child
 //! sharing the operator's terminal *stdin* would be competing for the
@@ -215,12 +307,11 @@
 //! waits on it, so #32 inherits an unreaped, unlost process handle rather
 //! than having to re-derive one from a pid.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -283,6 +374,15 @@ impl SpawnPaths {
     fn shim_socket(&self, realm_id: &str) -> Result<PathBuf, paths::PathError> {
         paths::shim_socket_path_in(&self.xdg_runtime_dir, realm_id)
     }
+
+    /// `$XDG_RUNTIME_DIR/vitrin-0/<realm_id>.lock` -- the realm-ownership
+    /// lock. Deliberately a *sibling* of the realm directory rather than a
+    /// file inside it: the purge this lock authorizes is a recursive delete
+    /// of that directory, and a lock file the purge could delete would be a
+    /// lock that stops meaning anything at the moment it matters most.
+    fn realm_lock(&self, realm_id: &str) -> Result<PathBuf, paths::PathError> {
+        paths::realm_lock_path_in(&self.xdg_runtime_dir, realm_id)
+    }
 }
 
 /// A realm whose app has been launched: the core's half of the identity
@@ -299,6 +399,12 @@ pub(crate) struct SpawnedRealm {
     child: Child,
     runtime_dir: PathBuf,
     connection: Connection,
+    /// This realm's exclusive `flock`, held for as long as the realm is
+    /// live so no second core can decide this realm's runtime directory is
+    /// stale and delete it (module docs). Never read -- its existence *is*
+    /// the effect, and the kernel releases it even if the core is killed
+    /// without unwinding.
+    _realm_lock: fs::File,
 }
 
 impl SpawnedRealm {
@@ -372,9 +478,18 @@ pub(crate) enum SpawnError {
     Path(paths::PathError),
     /// The realm's private runtime directory could not be prepared.
     RuntimeDir { path: PathBuf, detail: String },
+    /// Another live process holds this realm's lock: a second core is
+    /// already serving it. Refused rather than purging its runtime
+    /// directory out from under it (module docs).
+    RealmBusy { realm: String, lock: PathBuf },
     /// The program failed the trusted-writer audit *at spawn time* -- the
     /// re-check on the descriptor, not a re-reading of the config.
     ProgramAudit { path: PathBuf, detail: String },
+    /// The program is not an absolute path. Like [`Self::ReservedEnv`] this
+    /// is an alarm rather than a filter: [`crate::realm`] already refuses
+    /// it at load, so reaching here means the validator was bypassed
+    /// (module docs).
+    RelativeCommand { path: PathBuf },
     /// A [`RESERVED_ENV`] name reached the spawn path, which is only
     /// possible if the config validator was bypassed (module docs).
     ReservedEnv { name: &'static str },
@@ -393,7 +508,9 @@ impl SpawnError {
         match self {
             SpawnError::Path(_) => "invalid_realm_id",
             SpawnError::RuntimeDir { .. } => "runtime_dir",
+            SpawnError::RealmBusy { .. } => "realm_busy",
             SpawnError::ProgramAudit { .. } => "program_audit",
+            SpawnError::RelativeCommand { .. } => "relative_command",
             SpawnError::ReservedEnv { .. } => "reserved_env",
             SpawnError::Socketpair(_) => "socketpair",
             SpawnError::Exec { .. } => "exec",
@@ -408,10 +525,25 @@ impl fmt::Display for SpawnError {
             SpawnError::RuntimeDir { path, detail } => {
                 write!(f, "realm runtime directory {}: {detail}", path.display())
             }
+            SpawnError::RealmBusy { realm, lock } => write!(
+                f,
+                "realm {realm} is already served by another live vitrind (its lock {} is \
+                 held); refusing to spawn a second one, because preparing this realm's \
+                 runtime directory would delete the running one's socket",
+                lock.display()
+            ),
             SpawnError::ProgramAudit { path, detail } => write!(
                 f,
                 "refusing to exec {}: {detail} (re-checked at spawn time, not at config load)",
                 path.display()
+            ),
+            SpawnError::RelativeCommand { path } => write!(
+                f,
+                "`command` {path:?} is not an absolute path; it would resolve against the \
+                 child's working directory -- the realm's own runtime directory, which the \
+                 confined app can write -- so the core would audit one program and exec \
+                 another. Realm config validation refuses this already; it reached the \
+                 spawn path, which means validation was bypassed"
             ),
             SpawnError::ReservedEnv { name } => write!(
                 f,
@@ -496,6 +628,7 @@ where
     let realm_id = realm.id().as_str();
     let runtime_dir = paths.realm_dir(realm_id)?;
     let socket_path = paths.shim_socket(realm_id)?;
+    let lock_path = paths.realm_lock(realm_id)?;
     let spawn = realm.spawn();
 
     // Preconditions first, in the order that leaves the least behind: pure
@@ -506,7 +639,7 @@ where
 
     // From here on the call owns filesystem state; the guard unwinds it on
     // every error path (fail closed).
-    let guard = RuntimeDirGuard::create(&runtime_dir)?;
+    let guard = RuntimeDirGuard::create(&runtime_dir, &lock_path, realm_id)?;
 
     // The identity pair. `Connection::pair` is the transport's own
     // socketpair primitive: `SOCK_CLOEXEC` from birth, so neither end can
@@ -540,17 +673,23 @@ where
     // app gets to compete for. Diagnostics keep their inherited path.
     cmd.stdin(Stdio::null());
 
+    // Read in the parent, where reading a libc global is free of consequence,
+    // and captured as a plain integer: `SIGRTMAX()` is the last signal number
+    // this platform's C library admits to having.
+    let sig_max = libc::SIGRTMAX();
+
     // SAFETY: this closure runs in the forked child, between `fork` and
     // `execve`, where only async-signal-safe operations are permitted (the
     // core is multi-threaded; any lock held by another thread at fork time
     // -- the allocator's included -- is held forever in the child).
     //
     // It satisfies that requirement by construction:
-    //   * it captures `shim_raw`, a `RawFd`, by value -- an integer, no heap
-    //     data, no `Drop` type in scope;
-    //   * it performs exactly one syscall, `dup3` (or `fcntl` when the
+    //   * it captures `shim_raw` (a `RawFd`) and `sig_max` (a `c_int`) by
+    //     value -- integers, no heap data, no `Drop` type in scope;
+    //   * every syscall it makes is on signal-safety(7)'s async-signal-safe
+    //     list: `close_range`, `signal`, and `dup3` (or `fcntl` when the
     //     source already sits on the target descriptor, where `dup3` would
-    //     return EINVAL), both async-signal-safe per signal-safety(7);
+    //     return EINVAL);
     //   * `io::Error::last_os_error()` is `from_raw_os_error` over `errno`
     //     and allocates nothing;
     //   * it does not allocate, lock, log, format, or call back into Rust
@@ -563,6 +702,39 @@ where
     // other thread's concurrent `exec`.
     unsafe {
         cmd.pre_exec(move || {
+            // (1) Descriptor sweep, FIRST: everything above stdio becomes
+            // close-on-exec, `shim_raw` included. Doing this after the
+            // `dup3` below would mark the shim's own connection and hand
+            // the child an empty fd 3. Marking rather than closing keeps
+            // std's exec-failure pipe alive until `execve` succeeds
+            // (module docs); the kernel closes the marked set atomically.
+            if libc::close_range(
+                SHIM_CORE_FD as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+            ) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+
+            // (2) Signal dispositions to a defined state. `execve` preserves
+            // SIG_IGN, so without this the app inherits whatever the
+            // operator's launch context ignored -- measurably including
+            // SIGTERM, which would make the realm unkillable by the very
+            // signal P1.5.3 terminates it with. Errors are ignored on
+            // purpose: SIGKILL/SIGSTOP cannot be reset and the real-time
+            // range is sparse, so the only reportable outcome would be
+            // "this signal never needed resetting".
+            let mut sig = 1;
+            while sig <= sig_max {
+                if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
+                sig += 1;
+            }
+
+            // (3) The one descriptor that must survive, placed after the
+            // sweep and therefore without FD_CLOEXEC.
             let rc = if shim_raw == SHIM_CORE_FD {
                 libc::fcntl(SHIM_CORE_FD, libc::F_SETFD, 0)
             } else {
@@ -584,13 +756,16 @@ where
     // one process other than the core holds it, which is what makes "holding
     // this descriptor is being realm N's shim" true rather than aspirational.
     drop(shim_fd);
-    guard.keep();
 
     Ok(SpawnedRealm {
         realm_id: realm.id().clone(),
         child,
         runtime_dir,
         connection: core_side,
+        // The realm is now live, and the lock that proved it was free
+        // becomes the lock that says it is taken -- held until this struct
+        // drops (or the process dies, which the kernel handles).
+        _realm_lock: guard.keep(),
     })
 }
 
@@ -645,15 +820,21 @@ fn reject_reserved_env(spawn: &SpawnConfig) -> Result<(), SpawnError> {
     Ok(())
 }
 
-/// Re-audit the program **at spawn time**, on an opened descriptor, against
-/// the same trusted-writer rule `realm.toml` loading applies
-/// ([`untrusted_writer`] -- one definition, two call sites).
+/// Re-audit the program **at spawn time** against the same trusted-writer
+/// rule `realm.toml` loading applies ([`untrusted_writer`] -- one
+/// definition, two call sites) -- the program *and every directory on its
+/// canonical path*, because a writable directory anywhere on the way is a
+/// swap of the program by another name.
 ///
 /// This is deliberately not a re-run of the config-load audit: that one
 /// proved the operator's configuration was coherent, possibly minutes ago
 /// and certainly before this process decided to exec anything. What it could
 /// never prove is anything about the instant of `execve`, and
-/// `crate::realm`'s docs hand that question here.
+/// `crate::realm`'s docs hand that question here. Which is exactly why the
+/// ancestor walk has to be here too: the window this check exists to cover
+/// is a window in which a directory's mode can change as easily as a file's,
+/// and a re-check that skipped half the policy would be most confident
+/// precisely where it was least entitled to be.
 ///
 /// What remains honest about the residual window: this checks an inode
 /// through an open descriptor and then `execve`s a *path*, so a swap between
@@ -664,13 +845,32 @@ fn reject_reserved_env(spawn: &SpawnConfig) -> Result<(), SpawnError> {
 /// unsandboxed spawn. It lands with the powerbox (E2.6/E2.7), which
 /// re-opens the exec primitive anyway.
 fn audit_program_at_spawn(command: &Path) -> Result<(), SpawnError> {
+    // Before anything else: a relative program would be resolved by
+    // `execvp` against the child's working directory, which `launch` sets
+    // to the realm's own runtime directory -- writable by the confined app.
+    // The audit below would then describe a different file than the one
+    // that runs. `crate::realm` refuses this at load; reaching here means
+    // validation was bypassed (module docs).
+    if !command.is_absolute() {
+        return Err(SpawnError::RelativeCommand {
+            path: command.to_path_buf(),
+        });
+    }
+
     let refuse = |detail: String| SpawnError::ProgramAudit {
         path: command.to_path_buf(),
         detail,
     };
+    // Resolved first, for the same reason `crate::realm` resolves: a lexical
+    // walk of `/opt/app` would never look at the directory a symlinked
+    // `/opt` actually points into. The realm still execs the path the
+    // operator wrote -- `argv[0]` is observable to the program.
+    let resolved = fs::canonicalize(command)
+        .map_err(|e| refuse(format!("does not resolve to a program ({e})")))?;
+
     // O_PATH: the audit needs the inode's metadata, not its contents, and
     // an O_PATH descriptor needs no read permission on the program.
-    let fd = rustix::fs::open(command, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
+    let fd = rustix::fs::open(&resolved, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
         .map_err(|e| refuse(format!("cannot open the program ({e})")))?;
     let st =
         rustix::fs::fstat(&fd).map_err(|e| refuse(format!("cannot stat the program ({e})")))?;
@@ -682,6 +882,21 @@ fn audit_program_at_spawn(command: &Path) -> Result<(), SpawnError> {
         return Err(refuse(format!(
             "{fault}; whoever can write the program the trusted core execs chooses what it runs"
         )));
+    }
+
+    // Skip(1): `ancestors` yields the program itself first, then each
+    // enclosing directory up to `/`. `sticky_tolerated` matches the load
+    // audit -- a 1777 directory only lets a writer touch entries it owns.
+    for dir in resolved.ancestors().skip(1) {
+        let st = rustix::fs::stat(dir)
+            .map_err(|e| refuse(format!("cannot stat directory {} ({e})", dir.display())))?;
+        if let Some(fault) = untrusted_writer(st.st_uid, st.st_mode, euid, true) {
+            return Err(refuse(format!(
+                "directory {} is {fault}; whoever can write a directory on the path can \
+                 swap the program the trusted core execs",
+                dir.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -696,12 +911,18 @@ fn audit_program_at_spawn(command: &Path) -> Result<(), SpawnError> {
 struct RuntimeDirGuard {
     path: PathBuf,
     armed: bool,
+    /// The realm lock, held from before the purge until either the spawn
+    /// commits (moved into [`SpawnedRealm`] by [`RuntimeDirGuard::keep`])
+    /// or this guard drops and releases it. `Option` only so `keep` can
+    /// move it out of a type that implements `Drop`.
+    lock: Option<fs::File>,
 }
 
 impl RuntimeDirGuard {
-    /// Create `$XDG_RUNTIME_DIR/vitrin-0/<realm>` fresh at mode `0700`,
-    /// purging a stale directory left by a run that is gone (module docs).
-    fn create(path: &Path) -> Result<Self, SpawnError> {
+    /// Take the realm's lock, then create
+    /// `$XDG_RUNTIME_DIR/vitrin-0/<realm>` fresh at mode `0700`, purging a
+    /// directory the lock has just proven stale (module docs).
+    fn create(path: &Path, lock_path: &Path, realm_id: &str) -> Result<Self, SpawnError> {
         let refuse = |detail: String| SpawnError::RuntimeDir {
             path: path.to_path_buf(),
             detail,
@@ -709,40 +930,159 @@ impl RuntimeDirGuard {
 
         // The enclosing `vitrin-0` tree may not exist yet: the listener
         // creates it when it binds, and a spawn can precede that.
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| refuse(format!("cannot create {}: {e}", parent.display())))?;
-            fs::set_permissions(parent, fs::Permissions::from_mode(RUNTIME_DIR_MODE))
-                .map_err(|e| refuse(format!("cannot chmod {}: {e}", parent.display())))?;
-        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| refuse("has no parent directory".into()))?;
+        let parent_fd = prepare_runtime_tree(parent).map_err(refuse)?;
 
-        match rustix::fs::mkdir(path, Mode::from_bits_truncate(RUNTIME_DIR_MODE)) {
+        // Named relative to the verified parent from here on, so every
+        // component these calls act on is a component that was checked.
+        let name = path
+            .file_name()
+            .ok_or_else(|| refuse("has no final path component".into()))?;
+        let lock_name = lock_path
+            .file_name()
+            .ok_or_else(|| refuse("lock path has no final component".into()))?;
+
+        // Before the destructive part, and it is what licenses it: winning
+        // this proves no other live core owns this realm (module docs).
+        let lock = lock_realm(&parent_fd, lock_name, lock_path, realm_id)?;
+
+        match rustix::fs::mkdirat(&parent_fd, name, Mode::from_bits_truncate(RUNTIME_DIR_MODE)) {
             Ok(()) => {}
             Err(rustix::io::Errno::EXIST) => {
-                purge_stale_runtime_dir(path).map_err(refuse)?;
-                rustix::fs::mkdir(path, Mode::from_bits_truncate(RUNTIME_DIR_MODE)).map_err(
-                    |e| refuse(format!("cannot recreate after purging a stale one: {e}")),
-                )?;
+                purge_stale_runtime_dir(&parent_fd, name, path).map_err(refuse)?;
+                rustix::fs::mkdirat(&parent_fd, name, Mode::from_bits_truncate(RUNTIME_DIR_MODE))
+                    .map_err(|e| {
+                        refuse(format!("cannot recreate after purging a stale one: {e}"))
+                    })?;
             }
             Err(e) => return Err(refuse(format!("cannot create: {e}"))),
         }
+
         // `mkdir`'s mode is masked by the process umask, so state the mode
         // rather than hoping for it: this directory holds the socket that
-        // drives the realm.
-        fs::set_permissions(path, fs::Permissions::from_mode(RUNTIME_DIR_MODE))
+        // drives the realm. Through a descriptor opened `O_NOFOLLOW` on the
+        // directory just created, so the chmod cannot land on a substituted
+        // target the way a path-based one could.
+        let dir_fd = rustix::fs::openat(
+            &parent_fd,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| refuse(format!("cannot reopen the directory just created: {e}")))?;
+        rustix::fs::fchmod(&dir_fd, Mode::from_bits_truncate(RUNTIME_DIR_MODE))
             .map_err(|e| refuse(format!("cannot chmod to {RUNTIME_DIR_MODE:o}: {e}")))?;
 
         Ok(Self {
             path: path.to_path_buf(),
             armed: true,
+            lock: Some(lock),
         })
     }
 
     /// The spawn succeeded: the directory now belongs to the running realm,
-    /// and its removal is P1.5.3's (#32).
-    fn keep(mut self) {
+    /// and its removal is P1.5.3's (#32). Yields the realm lock, which the
+    /// live [`SpawnedRealm`] holds from here on -- the guard disarms, the
+    /// lock does not.
+    fn keep(mut self) -> fs::File {
         self.armed = false;
+        self.lock
+            .take()
+            .expect("the guard owns its lock until keep() consumes it, exactly once")
     }
+}
+
+/// Take this realm's exclusive, non-blocking `flock`.
+///
+/// The lock file is created if absent and **never unlinked**. That is the
+/// whole reason this is simpler than [`vitrin_ipc::Listener`]'s equivalent:
+/// the listener unlinks its lock file on drop, which opens a race where a
+/// binder can win the lock on an orphaned inode, and it pays for that with
+/// an fstat/stat re-verification retry loop. A lock file that is never
+/// removed has no such race -- every process that ever opens this path
+/// opens the same inode -- and the file costs one inode on a tmpfs that the
+/// session's end removes wholesale.
+///
+/// Opened `openat`-relative to the verified parent and `O_NOFOLLOW`, like
+/// every other name this module touches: a lock taken on a symlink's target
+/// is a lock on a file nobody else will consult, which is worse than no lock
+/// because it looks like one. `lock_path` is carried only to name the file
+/// in errors.
+fn lock_realm(
+    parent_fd: &OwnedFd,
+    lock_name: &OsStr,
+    lock_path: &Path,
+    realm_id: &str,
+) -> Result<fs::File, SpawnError> {
+    let fd = rustix::fs::openat(
+        parent_fd,
+        lock_name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|e| SpawnError::RuntimeDir {
+        path: lock_path.to_path_buf(),
+        detail: format!("cannot open the realm lock: {e}"),
+    })?;
+    let file = fs::File::from(fd);
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+        |_| SpawnError::RealmBusy {
+            realm: realm_id.to_string(),
+            lock: lock_path.to_path_buf(),
+        },
+    )?;
+    Ok(file)
+}
+
+/// Create (if needed) and verify the enclosing `vitrin-0` tree, returning a
+/// descriptor for it.
+///
+/// Every step is descriptor-bound on purpose. The path-based
+/// `create_dir_all` + `set_permissions` this replaced both follow symlinks,
+/// so a symlink planted at `vitrin-0` was accepted silently, its target
+/// chmodded to `0700`, and every realm directory then created inside a tree
+/// the core did not choose (module docs).
+fn prepare_runtime_tree(parent: &Path) -> Result<OwnedFd, String> {
+    // Only the final `vitrin-0` component is ours to make: `$XDG_RUNTIME_DIR`
+    // is the session manager's, and silently building a *path* that should
+    // already exist would paper over a misconfigured environment.
+    match rustix::fs::mkdir(parent, Mode::from_bits_truncate(RUNTIME_DIR_MODE)) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(e) => return Err(format!("cannot create {}: {e}", parent.display())),
+    }
+    let fd = rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| {
+        format!(
+            "{} is not a directory this core may use ({e}); refusing",
+            parent.display()
+        )
+    })?;
+    let st =
+        rustix::fs::fstat(&fd).map_err(|e| format!("cannot stat {}: {e}", parent.display()))?;
+    let euid = rustix::process::geteuid().as_raw();
+    if st.st_uid != euid {
+        return Err(format!(
+            "{} is owned by uid {}, not the core's uid {euid}; refusing to place realm \
+             runtime directories in a tree this core does not own",
+            parent.display(),
+            st.st_uid
+        ));
+    }
+    // Through the descriptor, so this cannot be redirected at a target the
+    // check above did not see.
+    rustix::fs::fchmod(&fd, Mode::from_bits_truncate(RUNTIME_DIR_MODE)).map_err(|e| {
+        format!(
+            "cannot chmod {} to {RUNTIME_DIR_MODE:o}: {e}",
+            parent.display()
+        )
+    })?;
+    Ok(fd)
 }
 
 impl Drop for RuntimeDirGuard {
@@ -757,12 +1097,27 @@ impl Drop for RuntimeDirGuard {
 }
 
 /// Remove a runtime directory left by a previous run -- after proving it is
-/// one. The `O_NOFOLLOW | O_DIRECTORY` open is the whole point: a recursive
+/// one, and only ever called once this realm's `flock` has proven that
+/// "previous run" is a run that is gone (module docs).
+///
+/// The `O_NOFOLLOW | O_DIRECTORY` open is the whole point: a recursive
 /// delete that followed a planted symlink is how a cleanup routine deletes
-/// someone's home directory.
-fn purge_stale_runtime_dir(path: &Path) -> Result<(), String> {
-    let fd = rustix::fs::open(
-        path,
+/// someone's home directory. It is an `openat` through the caller's verified
+/// parent descriptor, so the only component still resolved by name is the
+/// last one.
+///
+/// The residual, stated rather than implied: std offers no `remove_dir_all`
+/// rooted at a descriptor, so the delete re-resolves that last component. It
+/// is `parent_fd` and the realm lock -- not this check -- that make the
+/// substitution window uninteresting: the parent is proven `0700` and ours,
+/// so no other uid can rename entries in it, and the lock excludes the only
+/// same-uid process with any business here. (std's own `remove_dir_all`
+/// walks with `openat`/`O_NOFOLLOW` internally, so the *traversal* below the
+/// top is not the exposure.)
+fn purge_stale_runtime_dir(parent_fd: &OwnedFd, name: &OsStr, path: &Path) -> Result<(), String> {
+    let fd = rustix::fs::openat(
+        parent_fd,
+        name,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
@@ -794,6 +1149,7 @@ fn purge_stale_runtime_dir(path: &Path) -> Result<(), String> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1338,6 +1694,136 @@ mod tests {
     }
 
     #[test]
+    fn a_descriptor_the_core_left_inheritable_still_does_not_cross_the_fork() {
+        // The decoys in the test above are all CLOEXEC from birth, so they
+        // prove the rest of the core keeps P1.2.1's discipline -- they
+        // cannot prove this module does anything. These are opened
+        // *deliberately without* CLOEXEC, the only kind of descriptor the
+        // closure's `close_range` sweep is the difference for. Remove the
+        // sweep and this test fails; that is its whole job.
+        let _fd = fd_lock();
+
+        // Several, because one is not enough to be sure of catching
+        // anything: the lowest free descriptor may well *be* `SHIM_CORE_FD`,
+        // and the closure's `dup3` closes whatever sits there as a side
+        // effect -- so a lone decoy can vanish for a reason that has nothing
+        // to do with descriptor hygiene, and the test would pass vacuously.
+        // Opening four guarantees at least one lands above the target.
+        let decoys: Vec<OwnedFd> = (0..4)
+            .map(|_| {
+                rustix::fs::open("/proc/self/status", OFlags::RDONLY, Mode::empty())
+                    .expect("inheritable decoy")
+            })
+            .collect();
+        let above: Vec<i32> = decoys
+            .iter()
+            .map(|d| d.as_raw_fd())
+            .filter(|n| *n > SHIM_CORE_FD)
+            .collect();
+        assert!(
+            !above.is_empty(),
+            "the decoys must be able to detect a leak, or this test proves nothing"
+        );
+
+        let mut h = Harness::new("spawn-inheritable-fd");
+        let (spawned, _server) = h.spawn_mock(&["--serve"], &[], &[]);
+        let fds = child_fds_of(spawned.pid());
+
+        assert_eq!(
+            fds.keys().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2, SHIM_CORE_FD],
+            "descriptors the core left inheritable ({above:?}) must still not reach \
+             the child: {fds:?}"
+        );
+
+        drop(decoys);
+        h.reap(spawned);
+    }
+
+    // -- acceptance: the child starts from a defined signal state ----------
+
+    /// The bits of `/proc/<pid>/status`'s `SigIgn` mask, as signal numbers.
+    fn ignored_signals_of(pid: u32) -> BTreeSet<i32> {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).expect("status is readable");
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("SigIgn:"))
+            .expect("status reports SigIgn");
+        let mask = u64::from_str_radix(line.trim_start_matches("SigIgn:").trim(), 16)
+            .expect("SigIgn is hexadecimal");
+        (0..64)
+            .filter(|b| mask >> b & 1 == 1)
+            .map(|b| b + 1)
+            .collect()
+    }
+
+    #[test]
+    fn an_ignored_signal_in_the_cores_launch_context_never_reaches_the_child() {
+        // `execve` preserves SIG_IGN and std resets only SIGPIPE, so without
+        // the closure's reset loop the operator's launch context decides
+        // which signals the confined app is immune to -- SIGTERM included,
+        // which is the signal P1.5.3 terminates a realm with.
+        //
+        // Made deterministic without any `unsafe` in this crate: `sh`'s
+        // `trap "" SIG` is SIG_IGN, so re-running this one test under a
+        // trapping shell gives the *core* an inherited SigIgn to launder.
+        // The inner run does the spawning and asserting; the outer run only
+        // arranges the launch context and reports the inner verdict.
+        const INNER: &str = "VITRIN_SPAWN_SIGTEST_INNER";
+        let _fd = fd_lock();
+
+        if std::env::var_os(INNER).is_some() {
+            // Inner: this process was exec'd with SIGINT/SIGQUIT/SIGTERM
+            // ignored, exactly as `vitrind &` from a shell would be.
+            let inherited = ignored_signals_of(std::process::id());
+            for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                assert!(
+                    inherited.contains(&sig),
+                    "the wrapper must hand this run signal {sig} ignored, else the \
+                     assertion below proves nothing: {inherited:?}"
+                );
+            }
+
+            let mut h = Harness::new("spawn-signal-reset");
+            let (spawned, _server) = h.spawn_mock(&["--serve"], &[], &[]);
+            let child = ignored_signals_of(spawned.pid());
+            h.reap(spawned);
+
+            for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                assert!(
+                    !child.contains(&sig),
+                    "signal {sig} crossed execve as SIG_IGN: the realm's app inherited \
+                     the operator's launch context, and SIGTERM immunity would make the \
+                     realm unkillable by the signal lifecycle terminates it with: {child:?}"
+                );
+            }
+            return;
+        }
+
+        // Outer: re-run *this test only* under a shell that ignores the
+        // three signals. `$0` is the test binary; `--exact` keeps the inner
+        // run to this one test, and `--test-threads=1` keeps its harness
+        // from interleaving anything else with the spawn.
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                r#"trap "" INT QUIT TERM; exec "$0" --exact \
+                   spawn::tests::an_ignored_signal_in_the_cores_launch_context_never_reaches_the_child \
+                   --test-threads=1 --nocapture"#,
+            )
+            .arg(&exe)
+            .env(INNER, "1")
+            .stdin(Stdio::null())
+            .status()
+            .expect("re-running this test under a trapping shell");
+        assert!(
+            status.success(),
+            "the inner run (launched with INT/QUIT/TERM ignored) failed: {status}"
+        );
+    }
+
+    #[test]
     fn the_app_does_not_inherit_the_core_connection() {
         // The shim's obligation (module docs): set FD_CLOEXEC on fd 3 at
         // startup so nothing it spawns can speak to the core. Asserted on
@@ -1549,20 +2035,31 @@ mod tests {
 
     // -- runtime directory -------------------------------------------------
 
+    /// The (realm directory, realm lock) pair [`RuntimeDirGuard::create`]
+    /// takes, derived from a scratch base exactly the way [`launch`] does.
+    fn dir_and_lock(base: &Path) -> (PathBuf, PathBuf) {
+        let paths = SpawnPaths::under(base);
+        (
+            paths.realm_dir("realm-0").unwrap(),
+            paths.realm_lock("realm-0").unwrap(),
+        )
+    }
+
     #[test]
     fn a_stale_runtime_directory_is_purged_not_reused() {
         // A directory at this path belongs to a run that is gone: reusing it
         // would carry a dead run's socket into a new run's confinement.
         let _fd = fd_lock();
         let base = scratch();
-        let realm_dir = base.join("vitrin-0/realm-0");
+        let (realm_dir, lock) = dir_and_lock(&base);
         fs::create_dir_all(&realm_dir).unwrap();
         let stale = realm_dir.join("wayland-0");
         fs::write(&stale, b"stale socket from a crashed run").unwrap();
         // Deliberately wrong mode, as a crashed run may well have left.
         fs::set_permissions(&realm_dir, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let guard = RuntimeDirGuard::create(&realm_dir).expect("a stale directory is purged");
+        let guard = RuntimeDirGuard::create(&realm_dir, &lock, "realm-0")
+            .expect("a stale directory is purged");
         assert!(!stale.exists(), "stale contents must not survive");
         let mode = fs::metadata(&realm_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, RUNTIME_DIR_MODE, "the mode is stated, not inherited");
@@ -1581,9 +2078,10 @@ mod tests {
         fs::create_dir_all(&victim).unwrap();
         fs::write(victim.join("keepme"), b"not yours to delete").unwrap();
         fs::create_dir_all(base.join("vitrin-0")).unwrap();
-        std::os::unix::fs::symlink(&victim, base.join("vitrin-0/realm-0")).unwrap();
+        let (realm_dir, lock) = dir_and_lock(&base);
+        std::os::unix::fs::symlink(&victim, &realm_dir).unwrap();
 
-        let err = RuntimeDirGuard::create(&base.join("vitrin-0/realm-0"))
+        let err = RuntimeDirGuard::create(&realm_dir, &lock, "realm-0")
             .expect_err("a symlink must be refused");
         assert!(matches!(err, SpawnError::RuntimeDir { .. }), "{err}");
         assert!(
@@ -1597,9 +2095,9 @@ mod tests {
     fn the_guard_removes_the_directory_unless_it_is_kept() {
         let _fd = fd_lock();
         let base = scratch();
-        let realm_dir = base.join("vitrin-0/realm-0");
+        let (realm_dir, lock) = dir_and_lock(&base);
 
-        let guard = RuntimeDirGuard::create(&realm_dir).unwrap();
+        let guard = RuntimeDirGuard::create(&realm_dir, &lock, "realm-0").unwrap();
         assert!(realm_dir.is_dir());
         drop(guard);
         assert!(
@@ -1607,10 +2105,126 @@ mod tests {
             "an unkept guard unwinds the directory it created"
         );
 
-        let guard = RuntimeDirGuard::create(&realm_dir).unwrap();
-        guard.keep();
+        let guard = RuntimeDirGuard::create(&realm_dir, &lock, "realm-0").unwrap();
+        let held = guard.keep();
         assert!(realm_dir.is_dir(), "a kept directory survives");
+        drop(held);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_second_core_is_refused_rather_than_purging_a_live_realms_directory() {
+        // The purge is a recursive delete licensed by "this realm belongs to
+        // a run that is gone". Nothing used to establish that: the module
+        // cited the listener's flock, but the core constructs no listener,
+        // so two vitrind processes against one $XDG_RUNTIME_DIR would have
+        // had the second delete the first's live socket directory. The lock
+        // is what makes the claim true, so this asserts the collision is
+        // refused *and* that the live directory survives the refusal.
+        let _fd = fd_lock();
+        let base = scratch();
+        let (realm_dir, lock) = dir_and_lock(&base);
+
+        let first = RuntimeDirGuard::create(&realm_dir, &lock, "realm-0")
+            .expect("the first core prepares the realm");
+        let live_socket = realm_dir.join("wayland-0");
+        fs::write(&live_socket, b"a running realm's socket").unwrap();
+
+        let err = RuntimeDirGuard::create(&realm_dir, &lock, "realm-0")
+            .expect_err("a second core must not take over a live realm");
+        assert!(matches!(err, SpawnError::RealmBusy { .. }), "{err}");
+        assert_eq!(err.cause_class(), "realm_busy");
+        assert!(
+            live_socket.exists(),
+            "the live realm's socket must survive a second core's spawn attempt"
+        );
+
+        // Once the first core is gone the kernel drops the lock, and the
+        // next run self-heals exactly as the module promises.
+        drop(first);
+        fs::create_dir_all(&realm_dir).unwrap();
+        fs::write(&live_socket, b"left by a run that crashed").unwrap();
+        let third = RuntimeDirGuard::create(&realm_dir, &lock, "realm-0")
+            .expect("a genuinely stale realm is purged");
+        assert!(
+            !live_socket.exists(),
+            "a stale directory's contents must not survive into the new run"
+        );
+        drop(third);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_symlinked_runtime_tree_is_refused_never_chmodded_through() {
+        // One level up from the realm directory, and the same rule: the
+        // path-based create_dir_all + set_permissions this replaced would
+        // both follow the link, chmod the *target* to 0700, and put every
+        // realm directory inside a tree the core never chose.
+        let _fd = fd_lock();
+        let base = scratch();
+        let victim = base.join("someone-elses");
+        fs::create_dir_all(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&victim, base.join("vitrin-0")).unwrap();
+
+        let (realm_dir, lock) = dir_and_lock(&base);
+        let err = RuntimeDirGuard::create(&realm_dir, &lock, "realm-0")
+            .expect_err("a symlinked runtime tree must be refused");
+        assert!(matches!(err, SpawnError::RuntimeDir { .. }), "{err}");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the symlink target's mode must be untouched"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // -- the spawn-time audit is the load-time audit, not a weaker one -----
+
+    #[test]
+    fn a_relative_command_is_refused_before_anything_is_created() {
+        // The alarm half of the same doctrine `ReservedEnv` serves: the
+        // loader refuses a relative `command` already, so reaching here
+        // means validation was bypassed. It matters more than the env case
+        // because `launch` chdirs the child into the realm's runtime
+        // directory -- writable by the confined app -- so a relative
+        // program would let the audit describe one file and `execve`
+        // another.
+        let _fd = fd_lock();
+        let realm = realm_with_spawn("realm-0", Path::new("./app"), &[], &[]);
+        let (err, entry) = refused_spawn("spawn-relative-command", &realm);
+        assert!(matches!(err, SpawnError::RelativeCommand { .. }), "{err}");
+        assert_eq!(err.cause_class(), "relative_command");
+        assert_eq!(entry.str("cause_class"), "relative_command");
+    }
+
+    #[test]
+    fn a_group_writable_ancestor_is_refused_at_spawn_time() {
+        // The load-time audit walks every ancestor of the resolved program,
+        // because whoever can write a directory on the path can swap the
+        // program. The spawn-time re-audit claimed to re-apply "exactly this
+        // rule" while checking only the program's own inode -- so in the one
+        // window the re-audit exists to cover, half the policy went
+        // unenforced.
+        let _fd = fd_lock();
+        let dir = scratch();
+        let vendor = dir.join("vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        let program = vendor.join("app");
+        fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        // The program itself is beyond reproach; its directory is not.
+        fs::set_permissions(&vendor, fs::Permissions::from_mode(0o775)).unwrap();
+
+        let realm = realm_with_spawn("realm-0", &program, &[], &[]);
+        let (err, _) = refused_spawn("spawn-writable-ancestor", &realm);
+        assert!(matches!(err, SpawnError::ProgramAudit { .. }), "{err}");
+        assert!(
+            err.to_string().contains("directory") && err.to_string().contains("swap"),
+            "the refusal must name the directory as the fault: {err}"
+        );
+        fs::set_permissions(&vendor, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

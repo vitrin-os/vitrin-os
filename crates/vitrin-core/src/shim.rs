@@ -2519,4 +2519,178 @@ mod tests {
             "no fd may leak on shim teardown"
         );
     }
+
+    /// Cross-track conformance: the **real C shim** (E6, P1.6.2) driven by
+    /// the **real core**, over a socketpair the real spawn manager placed.
+    ///
+    /// Everything else in this module tests the core against
+    /// `vitrin-mock-shim` -- a compliant peer written by the same hand, in
+    /// the same language, from the same understanding of the spec. That is
+    /// exactly the shape of test that agrees with itself: if both sides
+    /// misread the IDL identically, it passes. This test is the one that
+    /// cannot, because the peer is a separately built C program that
+    /// consumes only the generated wire header and the prose.
+    ///
+    /// It is opt-in: `shim/` is outside the Cargo workspace (Meson, C), so
+    /// `cargo test` cannot build the binary and must not fail for its
+    /// absence. Point `VITRIN_C_SHIM_BIN` at it to run the check:
+    ///
+    /// ```text
+    /// meson setup shim/build shim && meson compile -C shim/build
+    /// VITRIN_C_SHIM_BIN=$PWD/shim/build/vitrin-shim cargo test -p vitrin-core c_shim
+    /// ```
+    ///
+    /// Opt-in, but NOT silently so under CI. A test that skips itself
+    /// reports green while proving nothing, and that is not a hypothetical
+    /// here: this check shipped wired to no job at all, passing on every
+    /// run without ever spawning a shim. So CI must say which it means --
+    /// point `VITRIN_C_SHIM_BIN` at a built shim (the `conformance` job) or
+    /// declare the skip with `VITRIN_C_SHIM_CONFORMANCE_SKIP` (the `rust`
+    /// job, which has no C toolchain). A job that does neither fails here,
+    /// which is the only way an unwired cross-track check cannot masquerade
+    /// as a passing one.
+    ///
+    /// What passing proves, none of which the C-side harness can establish
+    /// on its own: the C shim's frames survive THIS server's validation --
+    /// the `F_GET_SEALS` shmem probe, the 128-bit geometry-versus-fd-size
+    /// arithmetic, the watermark rule on its two minted ids, the
+    /// `bad_order` razor, and the copy-in that actually reads its memfd.
+    #[test]
+    fn c_shim_conforms_to_the_real_core() {
+        let Some(shim_bin) = std::env::var_os("VITRIN_C_SHIM_BIN") else {
+            assert!(
+                std::env::var_os("CI").is_none()
+                    || std::env::var_os("VITRIN_C_SHIM_CONFORMANCE_SKIP").is_some(),
+                "VITRIN_C_SHIM_BIN is unset in CI, so the C shim was never built and this \
+                 cross-track check proved nothing. Build the shim and point the variable at \
+                 it (see the `conformance` job in .github/workflows/ci.yml), or set \
+                 VITRIN_C_SHIM_CONFORMANCE_SKIP=1 in a job that cannot build C."
+            );
+            eprintln!("skipping: set VITRIN_C_SHIM_BIN to the built shim/build/vitrin-shim");
+            return;
+        };
+        let shim_bin = std::path::PathBuf::from(shim_bin);
+        assert!(
+            shim_bin.is_file(),
+            "VITRIN_C_SHIM_BIN does not name a file: {}",
+            shim_bin.display()
+        );
+
+        let _fd = crate::capture::tests::fd_lock();
+        let base = crate::spawn::tests::scratch();
+        let paths = crate::spawn::SpawnPaths::under(&base);
+        let (mut recorder, _log) = crate::recorder::tests::scratch_recorder("c-shim-conformance");
+
+        // The shim must run headless on the software renderer: this test is
+        // the CI path, and CI has no GPU. Those names are passed through the
+        // spawn manager's own allowlist rather than set on the child
+        // directly, because the allowlist is the only route a realm's app
+        // environment is allowed to grow by.
+        let env_allow: Vec<String> = [
+            "WLR_BACKENDS",
+            "WLR_RENDERER",
+            "WLR_RENDERER_ALLOW_SOFTWARE",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let realm = crate::realm::tests::realm_with_spawn("realm-0", &shim_bin, &[], &env_allow);
+        let mut spawned =
+            crate::spawn::spawn_realm_with_env(&realm, &paths, &mut recorder, |name| match name {
+                "WLR_BACKENDS" => Some("headless".into()),
+                "WLR_RENDERER" => Some("pixman".into()),
+                "WLR_RENDERER_ALLOW_SOFTWARE" => Some("1".into()),
+                _ => None,
+            })
+            .expect("the C shim must spawn");
+
+        let mut server = ShimServer::new(ShimConfig {
+            realm: "realm-0".into(),
+            width: VIEW_W,
+            height: VIEW_H,
+        });
+        let mut scene = Scene::new();
+        server
+            .send_configure(&mut |frame| spawned.connection_mut().send_message(frame, None))
+            .expect("configure is the core's first message");
+
+        // A watchdog, because the receive below is blocking: a shim that
+        // says nothing must fail this test as a closed connection, not hang
+        // the suite forever. Killing it produces EOF, which the loop reports.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let done = std::sync::Arc::clone(&done);
+            let pid = spawned.pid();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + crate::spawn::tests::DEADLINE;
+                while std::time::Instant::now() < deadline {
+                    if done.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+            })
+        };
+
+        // Drive the server until the shim's first commit latches. With no
+        // app connected the shim still composites its (empty) realm view,
+        // which is the frame under test: what matters here is that the
+        // wire, the fd and the geometry are the ones this server accepts.
+        let mut committed = false;
+        let mut saw_surface_mint = false;
+        while !committed {
+            let Some(msg) = spawned
+                .connection_mut()
+                .recv_message()
+                .expect("the C shim's framing must be readable")
+            else {
+                panic!("the C shim closed the connection before committing");
+            };
+            if msg.header.object_id == SHIM_SESSION_ID
+                && msg.header.opcode == session::requests::CreateSurface::OPCODE
+            {
+                saw_surface_mint = true;
+            }
+            // The real dispatch, with the real validation. A violation --
+            // a stride lie, a non-shmem fd, an id at or below the watermark,
+            // a commit before any attach -- surfaces here as a ShimFault,
+            // which is precisely the failure this test exists to catch.
+            let conn = spawned.connection_mut();
+            committed = server
+                .handle_message(msg, &mut scene, None, &mut |frame| {
+                    conn.send_message(frame, None)
+                })
+                .expect("the C shim must not violate the shim protocol");
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        watchdog.join().expect("watchdog thread");
+        assert!(saw_surface_mint, "the shim must mint its surface");
+
+        // The commit really reached the scene: the realm view now has the
+        // shim's composed content at the geometry the core configured.
+        assert_eq!(
+            scene.compose(VIEW_W, VIEW_H).len(),
+            VIEW_W as usize * VIEW_H as usize * BYTES_PER_PIXEL,
+            "the committed frame must compose at the configured realm-view size"
+        );
+        assert!(
+            server.wants_presentation(),
+            "a commit owes exactly one frame_done"
+        );
+        server
+            .presented(1234, &mut |frame| {
+                spawned.connection_mut().send_message(frame, None)
+            })
+            .expect("frame_done goes out");
+
+        // Orderly teardown: hanging up is the first rung of the core's own
+        // shutdown ladder, and the shim must take it rather than needing a
+        // signal.
+        let _ = spawned.child_mut().kill();
+        let _ = spawned.child_mut().wait();
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

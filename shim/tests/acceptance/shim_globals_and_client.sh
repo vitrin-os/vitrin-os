@@ -3,9 +3,15 @@
 #
 #   (a) `wayland-info` against the shim's socket lists EXACTLY the expected
 #       v0 globals (a superset or subset both fail).
-#   (b) `weston-terminal` runs against the shim "blind" -- there is no upstream
-#       link to the core yet (P1.6.2), so the terminal has nothing to display,
-#       but it must connect, bind globals, and neither crash nor hang the shim.
+#   (b) `weston-terminal` runs against the shim "blind" -- nothing here
+#       connects the shim to a core, so the terminal's frames go nowhere, but
+#       it must connect, bind globals, and neither crash nor hang the shim.
+#
+# Both checks run the shim with `--no-upstream`. Since P1.6.2 the shim
+# REFUSES to start without the core connection at fd 3 -- holding that
+# descriptor is what makes a process a realm's shim -- so standalone
+# operation is an explicit opt-in. The upstream link has its own proof in
+# upstream_frame_path.sh, which spawns the shim the way the core does.
 #
 # Requires: vitrin-shim (built), wayland-info (Arch: wayland-utils / Debian:
 # wayland-utils), weston-terminal (Arch/Debian: weston). Runs fully headless
@@ -63,7 +69,7 @@ dmabuf_arg=()
 [[ "$WANT_DMABUF" == "1" ]] && dmabuf_arg=(--dmabuf)
 
 # Launch the shim in its own process group so cleanup can reap any children.
-setsid "$SHIM_BIN" --socket "$SOCKET_NAME" "${dmabuf_arg[@]}" >"$SHIM_LOG" 2>&1 &
+setsid "$SHIM_BIN" --socket "$SOCKET_NAME" --no-upstream "${dmabuf_arg[@]}" >"$SHIM_LOG" 2>&1 &
 SHIM_PID=$!
 
 # Poll for the socket (never a fixed sleep); bail fast if the shim dies first.

@@ -175,19 +175,23 @@ fn run_inner(
     let mut event_loop: EventLoop<'static, HeadlessState> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
-    // Signal source first (same posture as the nested backend): the process is
-    // single-threaded, so the signal mask is installed before anything else
-    // runs. SIGINT/SIGTERM stop the loop cleanly.
-    //
-    // `lifecycle::child_signal_source()` (SIGCHLD) belongs beside this one and
-    // for the same reason — `signalfd` only sees signals blocked on *every*
-    // thread — and is the realm-lifecycle half of issue #77, arriving with the
-    // spawn.
+    // Signal sources first (same posture as the nested backend): the process
+    // is single-threaded here, so both masks are installed before anything
+    // else runs. `signalfd` only ever sees a signal that is blocked on
+    // **every** thread, so installing either of these after a backend has
+    // spawned a thread would silently deliver the signal the old way instead
+    // — and for SIGCHLD that means a realm's exit is never noticed.
     let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM])?;
     loop_handle.insert_source(signals, |event, _, state: &mut HeadlessState| {
         info!(signal = ?event.signal(), "shutdown signal received");
         state.view.loop_signal.stop();
     })?;
+    // SIGCHLD: the realm's shim exiting. A hint only — it says some child
+    // changed state, never which — so the handler asks `waitpid`.
+    loop_handle.insert_source(
+        crate::lifecycle::child_signal_source()?,
+        |_event, _, state: &mut HeadlessState| session::reap_realm(state),
+    )?;
 
     let physical_size: Size<i32, Physical> = (width as i32, height as i32).into();
     info!(
@@ -226,6 +230,19 @@ fn run_inner(
         return Err(err);
     }
 
+    // The realm, only now. `install` has put the listener and the sweeps on
+    // the loop, so the loop is ready to service the shim's socketpair the
+    // moment the child has one — and that ordering is the whole of trap T1:
+    // the shim blocks on `configure` and then on every reply, with no timeout
+    // anywhere on its side, so spawning before the reader exists wedges it
+    // permanently rather than slowly. `event_loop.run` is the very next
+    // statement.
+    if let Err(err) = session::start_realm(&mut state) {
+        tracing::error!("fatal: cannot start the session's realm: {err}");
+        *recovered = Some(state.runtime.into_recorder());
+        return Err(err);
+    }
+
     let outcome = event_loop
         .run(None, &mut state, session::post_dispatch)
         .map_err(|err| Box::new(err) as Box<dyn Error>)
@@ -233,6 +250,15 @@ fn run_inner(
             Some(err) => Err(err),
             None => Ok(()),
         });
+    // The shutdown ladder, here and not in `run_session`: it blocks
+    // deliberately (hang up, wait, SIGTERM, wait, SIGKILL) so it must run
+    // after the loop has stopped and never inside a dispatch, and it must run
+    // before the recorder is handed back so the realm's `realm_died` /
+    // `realm_exited` entries land in the run they belong to. The event loop
+    // is still alive in this scope, which is what lets rung 0 retire the shim
+    // connection's registration.
+    session::shutdown_realm(&mut state);
+
     // Recovered before the early return below, so a fatal run still returns
     // the recorder that must write the footer naming it.
     *recovered = Some(state.runtime.into_recorder());
@@ -281,7 +307,8 @@ impl session::Presenter for HeadlessView {
     }
 
     fn view_size(&self) -> (u32, u32) {
-        (self.size.w.max(0) as u32, self.size.h.max(0) as u32)
+        let size = self.output.size;
+        (size.w.max(0) as u32, size.h.max(0) as u32)
     }
 
     fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
@@ -299,18 +326,56 @@ impl session::Presenter for HeadlessView {
     fn view_rgba(&mut self) -> Option<Vec<u8>> {
         self.latest_frame_rgba().ok()
     }
+
+    /// Both halves, from the two fields the struct was split into for
+    /// exactly this call (see [`HeadlessView::output`]).
+    fn teardown_view(
+        &mut self,
+    ) -> (
+        &mut Scene,
+        Option<&mut dyn crate::lifecycle::RetainedOutput>,
+    ) {
+        (&mut self.scene, Some(&mut self.output))
+    }
 }
 
 /// Per-run state of the headless backend: the software renderer, the realm's
 /// [`Scene`], the consent surface, and the two retained images the module
 /// docs describe.
 pub(crate) struct HeadlessView {
-    renderer: PixmanRenderer,
     /// The realm's scene (P1.3.3): the single-maximized client surface, or
     /// the deterministic background when none is committed. The shim-facing
     /// protocol server (P1.3.4) commits into it and calls
     /// [`redraw`](Self::redraw); the realm object (P1.5.1) hangs off it.
     scene: Scene,
+    /// The renderer and the two retained images, in their own struct.
+    ///
+    /// **The split is load-bearing, not tidiness.** A realm's death borrows
+    /// the scene and the retained output *at the same time*:
+    /// `RealmTeardown` holds `scene: &mut Scene` and
+    /// `retained: Option<&mut dyn RetainedOutput>` together, because
+    /// `RealmLifecycle::die` clears the surface and scrubs the framebuffer
+    /// inside one latched transition. With `scrub_retained_frame`
+    /// implemented on the whole view, those would be two `&mut` borrows of
+    /// one struct and the teardown funnel would be unbuildable — which is
+    /// exactly the pressure that would push someone toward a second,
+    /// unlatched scrub path outside the funnel.
+    ///
+    /// The split is honest as well as convenient: the scrub already
+    /// deliberately does not touch the scene (see
+    /// [`RetainedOutput::scrub_retained_frame`]'s implementation below), so
+    /// these really are disjoint concerns — the scene is what a frame is
+    /// composed *from*, and this is where composed frames are *kept*.
+    ///
+    /// [`RetainedOutput::scrub_retained_frame`]: crate::lifecycle::RetainedOutput::scrub_retained_frame
+    output: HeadlessOutput,
+    loop_signal: LoopSignal,
+}
+
+/// The headless backend's renderer and its two retained images — everything
+/// a composed frame lands in, and nothing a frame is composed from.
+pub(crate) struct HeadlessOutput {
+    renderer: PixmanRenderer,
     /// The consent surface (P1.7.1): the prompt composited above the realm
     /// view on the human-visible side of the output stage only. Always
     /// present, empty until P1.7.2 puts a petition up.
@@ -318,13 +383,12 @@ pub(crate) struct HeadlessView {
     /// The composed **realm view**, retained across the process lifetime
     /// (PRD Doc 2 §9) so an internal capture reads composited pixels, not a
     /// freshly cleared buffer. Overlay-free by construction — this is what
-    /// [`Self::latest_frame_rgba`] serves to agents.
+    /// [`HeadlessView::latest_frame_rgba`] serves to agents.
     view_framebuffer: Image<'static, 'static>,
     /// The virtual display's **human-visible output**: the realm view with
     /// the consent overlay on top. Never read by the capture path.
     output_framebuffer: Image<'static, 'static>,
     size: Size<i32, Physical>,
-    loop_signal: LoopSignal,
 }
 
 impl HeadlessView {
@@ -337,12 +401,14 @@ impl HeadlessView {
         let view_framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
         let output_framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
         Ok(Self {
-            renderer,
             scene: Scene::new(),
-            consent: ConsentSurface::new(),
-            view_framebuffer,
-            output_framebuffer,
-            size,
+            output: HeadlessOutput {
+                renderer,
+                consent: ConsentSurface::new(),
+                view_framebuffer,
+                output_framebuffer,
+                size,
+            },
             loop_signal,
         })
     }
@@ -371,25 +437,7 @@ impl HeadlessView {
     /// uploads once per (size, scene, consent) change rather than once per
     /// frame.
     fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
-        let (w, h) = (self.size.w.max(0) as u32, self.size.h.max(0) as u32);
-        let view = self.scene.compose(w, h);
-        composite(
-            &mut self.renderer,
-            &mut self.view_framebuffer,
-            self.size,
-            &view,
-        )?;
-        // The human-visible half, through the shared overlay step both
-        // backends call. `view` is moved in rather than recomposed, so "the
-        // two images differ only by the overlay" is a property of the code
-        // and not of a comment.
-        let output = super::human_visible_from_view(view, &mut self.consent, w, h);
-        composite(
-            &mut self.renderer,
-            &mut self.output_framebuffer,
-            self.size,
-            &output,
-        )
+        self.output.present(&self.scene)
     }
 
     /// The capture service's pixel source (P1.3.6): the **latest completed
@@ -413,7 +461,8 @@ impl HeadlessView {
     /// is what keeps the "pure read" claim above true of the wired code and
     /// not only of this function.
     fn latest_frame_rgba(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
-        readback(&mut self.renderer, &mut self.view_framebuffer, self.size)
+        let out = &mut self.output;
+        readback(&mut out.renderer, &mut out.view_framebuffer, out.size)
     }
 
     /// The virtual display's latest human-visible output — realm view plus
@@ -439,11 +488,47 @@ impl HeadlessView {
     /// overlay's design takes.
     #[cfg(test)]
     fn latest_output_rgba(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
-        readback(&mut self.renderer, &mut self.output_framebuffer, self.size)
+        let out = &mut self.output;
+        readback(&mut out.renderer, &mut out.output_framebuffer, out.size)
     }
 }
 
-impl crate::lifecycle::RetainedOutput for HeadlessView {
+impl HeadlessOutput {
+    /// (Re)composite both retained images from `scene`.
+    ///
+    /// The single composition path: [`HeadlessView::redraw`] calls it with
+    /// the live scene and [`Self::scrub_retained_frame`] calls it with an
+    /// empty one, so "a scrubbed frame is what an unpainted realm looks
+    /// like" is a property of the code rather than of two implementations
+    /// that agree today.
+    ///
+    /// One [`Scene::compose`] call feeds both images, so the realm view an
+    /// agent may capture and the output a human sees are the same
+    /// composition, differing only by the overlay (module docs).
+    fn present(&mut self, scene: &Scene) -> Result<(), Box<dyn Error>> {
+        let (w, h) = (self.size.w.max(0) as u32, self.size.h.max(0) as u32);
+        let view = scene.compose(w, h);
+        composite(
+            &mut self.renderer,
+            &mut self.view_framebuffer,
+            self.size,
+            &view,
+        )?;
+        // The human-visible half, through the shared overlay step both
+        // backends call. `view` is moved in rather than recomposed, so "the
+        // two images differ only by the overlay" is a property of the code
+        // and not of a comment.
+        let output = super::human_visible_from_view(view, &mut self.consent, w, h);
+        composite(
+            &mut self.renderer,
+            &mut self.output_framebuffer,
+            self.size,
+            &output,
+        )
+    }
+}
+
+impl crate::lifecycle::RetainedOutput for HeadlessOutput {
     /// Composite an **empty** [`Scene`] into the retained framebuffer, so
     /// the last frame the dead realm painted is gone from the one buffer
     /// [`Self::latest_frame_rgba`] reads back.
@@ -487,21 +572,7 @@ impl crate::lifecycle::RetainedOutput for HeadlessView {
     /// become a second place a realm's death is decided (above). The scrub
     /// removes the dead realm's *pixels*, which is all it is for.
     fn scrub_retained_frame(&mut self) -> Result<(), Box<dyn Error>> {
-        let (w, h) = (self.size.w.max(0) as u32, self.size.h.max(0) as u32);
-        let empty = Scene::new().compose(w, h);
-        composite(
-            &mut self.renderer,
-            &mut self.view_framebuffer,
-            self.size,
-            &empty,
-        )?;
-        let output = super::human_visible_from_view(empty, &mut self.consent, w, h);
-        composite(
-            &mut self.renderer,
-            &mut self.output_framebuffer,
-            self.size,
-            &output,
-        )
+        self.present(&Scene::new())
     }
 }
 
@@ -719,7 +790,7 @@ mod tests {
         );
 
         // ...and the funnel scrubs the retained frame.
-        state.scrub_retained_frame().expect("scrub");
+        state.output.scrub_retained_frame().expect("scrub");
         let scrubbed = state.latest_frame_rgba().expect("readback");
         assert_eq!(
             scrubbed, background,
@@ -892,7 +963,7 @@ mod tests {
 
         // The prompt goes up. This is the moment P1.7.2 will pair with
         // `mark_prompt_shown` + `vitrin_consent.state(shown)`.
-        state.consent.show_for_test(prompt_fixture());
+        state.output.consent.show_for_test(prompt_fixture());
         state.redraw().expect("recomposite with the prompt up");
 
         // --- Human-visible side: the prompt is really on the display. ---
@@ -900,6 +971,7 @@ mod tests {
         assert_ne!(output, clean_output, "the prompt must change the output");
         let card = crate::consent::render::rasterize(&prompt_fixture());
         let (cx, cy) = state
+            .output
             .consent
             .card_origin(VW, VH)
             .expect("a prompt is up, so the card has an origin");
@@ -976,7 +1048,7 @@ mod tests {
         );
 
         // Taking the prompt down restores the human-visible output exactly.
-        state.consent.dismiss_for_test();
+        state.output.consent.dismiss_for_test();
         state.redraw().expect("recomposite with the prompt down");
         assert_eq!(
             state.latest_output_rgba().expect("readback"),
@@ -1011,7 +1083,7 @@ mod tests {
 
         for prompt_up in [false, true] {
             if prompt_up {
-                state.consent.show_for_test(prompt_fixture());
+                state.output.consent.show_for_test(prompt_fixture());
             }
             state.redraw().expect("redraw");
             let mut expected = crate::consent::ConsentSurface::new();
@@ -1059,7 +1131,7 @@ mod tests {
         state.scene.commit(
             SurfaceContent::from_rgba(painted.clone(), 300, 200).expect("well-formed content"),
         );
-        state.consent.show_for_test(prompt_fixture());
+        state.output.consent.show_for_test(prompt_fixture());
         state
             .redraw()
             .expect("redraw with a prompt over a live realm");
@@ -1067,7 +1139,7 @@ mod tests {
         // The realm dies: the scene loses its surface (the death funnel), and
         // the funnel scrubs the retained images.
         state.scene.clear_surface();
-        state.scrub_retained_frame().expect("scrub");
+        state.output.scrub_retained_frame().expect("scrub");
 
         // The capture source is the empty-scene background, byte for byte...
         let view = state.latest_frame_rgba().expect("readback");
@@ -1085,7 +1157,7 @@ mod tests {
 
         // ...and the human can still see and answer the prompt.
         assert!(
-            state.consent.prompt().is_some(),
+            state.output.consent.prompt().is_some(),
             "the scrub must not silently take the prompt down"
         );
         let mut expected = crate::consent::ConsentSurface::new();
@@ -1099,7 +1171,11 @@ mod tests {
         // Belt and braces: the card really is painted, so the assertion above
         // cannot be satisfied by both sides having lost the overlay.
         let card = crate::consent::render::rasterize(&prompt_fixture());
-        let (cx, cy) = state.consent.card_origin(VW, VH).expect("a prompt is up");
+        let (cx, cy) = state
+            .output
+            .consent
+            .card_origin(VW, VH)
+            .expect("a prompt is up");
         let output = state.latest_output_rgba().expect("readback");
         let row = (cy as u32 + card.height / 2) as usize;
         let d = (row * VW as usize + cx as usize) * test_pattern::BYTES_PER_PIXEL;

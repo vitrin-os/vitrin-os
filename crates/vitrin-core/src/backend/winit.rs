@@ -301,13 +301,24 @@ fn run_inner(
     let mut event_loop: EventLoop<'static, NestedState> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
-    // Signal source first (single-threaded process, so the mask is set
-    // before anything else runs): SIGINT/SIGTERM stop the loop cleanly.
+    // Signal sources first, and this is the backend the ordering was written
+    // for: the process is still single-threaded here, but Smithay's winit/EGL
+    // stack below really does spawn threads, and `signalfd` only sees a
+    // signal that is blocked on **every** thread. Install either of these
+    // after `init_from_attributes_with_gl_attr` and the mask misses those
+    // threads — for SIGCHLD that means a realm's exit is never noticed, with
+    // nothing logged to say so.
     let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM])?;
     loop_handle.insert_source(signals, |event, _, state| {
         info!(signal = ?event.signal(), "shutdown signal received");
         state.loop_signal.stop();
     })?;
+    // SIGCHLD: the realm's shim exiting. A hint only — it says some child
+    // changed state, never which — so the handler asks `waitpid`.
+    loop_handle.insert_source(
+        crate::lifecycle::child_signal_source()?,
+        |_event, _, state: &mut NestedState| session::reap_realm(state),
+    )?;
 
     // vsync on (Smithay's default is off): each frame chains the next via
     // `request_redraw`, and the blocking swap paces that chain to the
@@ -397,6 +408,17 @@ fn run_inner(
         return Err(err);
     }
 
+    // The realm, only now: `install` has put the listener and the sweeps on
+    // the loop, so it is ready to service the shim's socketpair, and
+    // `event_loop.run` is the very next statement. Spawning before the reader
+    // exists wedges the shim permanently rather than slowly — it blocks on
+    // `configure` with no timeout on its side (trap T1).
+    if let Err(err) = session::start_realm(&mut state) {
+        error!("fatal: cannot start the session's realm: {err}");
+        *recovered = Some(state.runtime.into_recorder());
+        return Err(err);
+    }
+
     let outcome = event_loop
         .run(None, &mut state, session::post_dispatch)
         .map_err(|err| Box::new(err) as Box<dyn Error>)
@@ -404,6 +426,13 @@ fn run_inner(
             Some(err) => Err(err),
             None => Ok(()),
         });
+    // The shutdown ladder, after the loop has stopped and before the recorder
+    // is handed back: it blocks by design, so it must not run inside a live
+    // compositor loop, and its `realm_died` / `realm_exited` entries belong to
+    // this run. The event loop is still alive in this scope, which is what
+    // lets rung 0 retire the shim connection's registration.
+    session::shutdown_realm(&mut state);
+
     // Recovered before the early return below, so a fatal run still returns
     // the recorder that must write the footer naming it.
     *recovered = Some(state.runtime.into_recorder());
@@ -877,6 +906,24 @@ impl session::Presenter for NestedView {
 
     fn request_present(&mut self) {
         self.backend.window().request_redraw();
+    }
+
+    /// The scene, and `None` for the retained half.
+    ///
+    /// Nested composites straight into the host compositor's surface and
+    /// keeps no readable image of its own, so there is nothing to scrub — a
+    /// dead realm leaves no stale pixels here for the same reason
+    /// [`Self::view_rgba`] can serve none. Worth stating rather than
+    /// leaving as an absence: it means nested has no stale-frame defense in
+    /// depth, which costs nothing only because nested refuses captures
+    /// outright.
+    fn teardown_view(
+        &mut self,
+    ) -> (
+        &mut Scene,
+        Option<&mut dyn crate::lifecycle::RetainedOutput>,
+    ) {
+        (&mut self.scene, None)
     }
 }
 

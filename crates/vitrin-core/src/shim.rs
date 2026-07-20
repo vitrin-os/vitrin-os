@@ -133,15 +133,14 @@
 //!
 //! # Wiring
 //!
-//! The runtime loop is real: [`crate::session::attach_realm`] registers a
-//! shim connection as a `vitrin_ipc::ConnectionSource` and
-//! `session::dispatch_shim` drives [`ShimServer::handle_message`] against the
-//! backend's scene. What is still missing is only the *caller* — nothing
-//! forks a shim until `spawn::spawn_realm` is wired — so at runtime that
-//! seam has no connection to attach. The full path is exercised end to end
-//! by `session`'s own tests, with a real mock shim (`vitrin-mock-shim`, the
-//! permanent fixture) on the other end of the socketpair completing a whole
-//! paced session.
+//! Fully wired. [`crate::session::start_realm`] forks the realm's shim,
+//! sends `configure` on the still-blocking socketpair, and registers the
+//! connection as a `vitrin_ipc::ConnectionSource`; `session::dispatch_shim`
+//! then drives [`ShimServer::handle_message`] against the backend's scene,
+//! and `RealmLifecycle` owns the process from fork to grave. The path is
+//! exercised end to end by `session`'s own tests, which really fork
+//! `vitrin-mock-shim` (the permanent fixture) and run a whole paced session
+//! over the real event loop.
 //!
 //! **The runtime loop coalesces; the reference wiring in
 //! [`crate::backend::headless`]'s test does not, and must not be copied.**
@@ -431,6 +430,11 @@ impl ShimServer {
     /// The client-pixel copy instrumentation (P1.3.5): tests assert the shm
     /// path copies exactly once per commit and the dmabuf path never; the
     /// M1.5 perf report reads the same numbers.
+    ///
+    /// Test-only today, and narrowly so: the meter itself is maintained on
+    /// every commit the runtime handles: only this *reader* has no runtime
+    /// caller, until the M1.5 perf report grows one.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn copy_meter(&self) -> &CopyMeter {
         &self.copy_meter
     }

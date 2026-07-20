@@ -506,6 +506,88 @@ pub(crate) trait RetainedOutput {
     fn scrub_retained_frame(&mut self) -> Result<(), Box<dyn std::error::Error>>;
 }
 
+/// **How the core hangs up on a shim.** Whatever holds the core's end of
+/// the identity socketpair, reduced to the one operation the shutdown
+/// ladder needs from it: release it, so the shim's `read` returns EOF.
+///
+/// # Why this is not just a `Connection`
+///
+/// It was, and for a core with no event loop that was the right shape:
+/// `self.connection = None` in [`RealmLifecycle::die`] dropped the last
+/// descriptor and *that drop* was rung 0/1 of the ladder -- the hangup a
+/// compliant shim exits on, and the reason rungs 2 and 3 are rare.
+///
+/// The runtime loop cannot hold the connection that way. `ConnectionSource`
+/// takes a `Connection` **by value** and calloop never gives it back, and
+/// the alternative -- a borrowed-fd source -- throws away `vitrin-ipc`'s
+/// `DisconnectReason` classification, which is the single funnel every
+/// realm death is classified through. So at runtime the calloop
+/// registration *is* the ownership, and hanging up means removing the
+/// source.
+///
+/// Duplicating the descriptor to keep a second handle here would look like
+/// the easy answer and is the one genuinely wrong one: two live core-side
+/// fds means the shim never sees EOF, so rung 0 silently stops working and
+/// every clean shutdown degrades to waiting out `hangup_grace` and then
+/// `SIGTERM` -- slower, less polite, and invisible, because nothing fails
+/// and nothing is logged.
+///
+/// Making this an enum rather than leaving the embedder to remember a
+/// second call is deliberate for the same reason: a `RealmLifecycle`
+/// holding neither the connection nor a way to close it would be a ladder
+/// whose first rung is a no-op, and that is not a failure any test can see.
+pub(crate) enum Hangup {
+    /// The core still holds the socketpair end itself. Dropping the
+    /// `Connection` closes it.
+    Owned(Connection),
+    /// The connection lives inside an event source; the action retires that
+    /// registration, which drops the source and with it the `Connection`.
+    ///
+    /// Idempotent by construction on calloop: `LoopHandle::remove` of a
+    /// token whose source has already removed itself is a no-op, because
+    /// registration tokens are versioned slotmap keys and a retired one
+    /// never matches a later occupant of the same slot. That is what lets
+    /// [`RealmLifecycle::die`] fire this unconditionally without having to
+    /// know which side of the socketpair closed first -- a question the
+    /// death latch deliberately does not answer.
+    Registered(Box<dyn FnOnce()>),
+}
+
+impl Hangup {
+    /// The core holds the connection directly.
+    pub fn owned(connection: Connection) -> Self {
+        Hangup::Owned(connection)
+    }
+
+    /// An event-source registration owns the connection; `release` retires
+    /// it.
+    pub fn registered(release: impl FnOnce() + 'static) -> Self {
+        Hangup::Registered(Box::new(release))
+    }
+
+    /// Release the core's end. Consumes `self` because a hangup happens
+    /// once: the death latch in [`RealmLifecycle::die`] is what guarantees
+    /// that, and taking by value is what makes the guarantee visible here.
+    fn hang_up(self) {
+        match self {
+            // The drop *is* the hangup. Named rather than left implicit so
+            // this does not read as a discarded value someone could tidy
+            // into a `_`.
+            Hangup::Owned(connection) => drop(connection),
+            Hangup::Registered(release) => release(),
+        }
+    }
+}
+
+impl fmt::Debug for Hangup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Hangup::Owned(_) => f.write_str("Hangup::Owned"),
+            Hangup::Registered(_) => f.write_str("Hangup::Registered"),
+        }
+    }
+}
+
 /// One live realm, from the moment [`crate::spawn`] hands it over until
 /// nothing of it is left: the core's end of the identity socketpair, the
 /// shim process, the private runtime directory, and the realm `flock`.
@@ -524,9 +606,11 @@ pub(crate) struct RealmLifecycle {
     /// its presence is what makes signalling `pid` free of the pid-reuse
     /// race.
     child: Option<Child>,
-    /// The core's end of the identity socketpair; `None` once the realm is
-    /// dead. Dropping it is what gives a still-running shim its own EOF.
-    connection: Option<Connection>,
+    /// How this realm's core-side socketpair end gets released; `None` once
+    /// the realm is dead, because releasing it is precisely what dying
+    /// does. See [`Hangup`] for why this is an abstraction rather than the
+    /// `Connection` it used to be.
+    hangup: Option<Hangup>,
     runtime_dir: PathBuf,
     /// Held until the realm is fully torn down, and released *after* the
     /// runtime directory is removed (module docs). Never read: its
@@ -571,22 +655,41 @@ pub(crate) struct RealmLifecycle {
 }
 
 impl RealmLifecycle {
-    /// Adopt a freshly spawned realm. The realm is alive from here; nothing
-    /// in this constructor can fail, because a realm that exists is a realm
-    /// that has to be torn down.
-    pub fn adopt(parts: SpawnedParts) -> Self {
-        Self {
+    /// Adopt a freshly spawned realm. The realm is alive from here.
+    ///
+    /// `place` is handed the core's end of the identity socketpair and must
+    /// answer with the [`Hangup`] that releases it again -- either
+    /// [`Hangup::owned`], keeping it here, or [`Hangup::registered`] after
+    /// moving it into an event source. Passing the connection *through* a
+    /// closure rather than taking it as a field is the whole point: there is
+    /// no way to construct a `RealmLifecycle` without saying how it hangs
+    /// up, so the ladder's first rung cannot become a silent no-op (see
+    /// [`Hangup`]).
+    ///
+    /// Fallible because placing the connection generally is -- registering
+    /// an event source can fail. On `Err` the closure has already consumed
+    /// the connection, so the shim gets its EOF and the caller is left with
+    /// a realm it must tear down by process signal alone; the `SpawnedParts`
+    /// are dropped here, which kills and reaps the child (`GuardedChild` has
+    /// already been disarmed, so this is `Child`'s own drop -- the caller
+    /// owns the refusal path).
+    pub fn adopt<E>(
+        parts: SpawnedParts,
+        place: impl FnOnce(Connection) -> Result<Hangup, E>,
+    ) -> Result<Self, E> {
+        let hangup = place(parts.connection)?;
+        Ok(Self {
             realm_id: parts.realm_id,
             pid: parts.child.id(),
             child: Some(parts.child),
-            connection: Some(parts.connection),
+            hangup: Some(hangup),
             runtime_dir: parts.runtime_dir,
             _realm_lock: parts.realm_lock,
             death: None,
             exit: None,
             core_signals: Vec::new(),
             runtime_dir_removed: false,
-        }
+        })
     }
 
     pub fn realm_id(&self) -> &RealmId {
@@ -651,11 +754,22 @@ impl RealmLifecycle {
         &self.runtime_dir
     }
 
-    /// The core's end of the identity socketpair, for the event loop to
-    /// register and dispatch. `None` once the realm is dead -- which is
-    /// also how an event source learns to remove itself.
+    /// The core's end of the identity socketpair, for an embedder that kept
+    /// it here ([`Hangup::Owned`]) to read and write directly. `None` once
+    /// the realm is dead -- which is also how such an embedder learns to
+    /// stop servicing it.
+    ///
+    /// Also `None`, while perfectly alive, for a realm whose connection was
+    /// placed in an event source ([`Hangup::Registered`]): there the source
+    /// owns it and reaching it outside a dispatch callback is precisely what
+    /// must not be possible. Callers that service the socketpair by hand --
+    /// this module's own tests -- are the ones this exists for; the runtime
+    /// loop never calls it.
     pub fn connection_mut(&mut self) -> Option<&mut Connection> {
-        self.connection.as_mut()
+        match self.hangup.as_mut() {
+            Some(Hangup::Owned(connection)) => Some(connection),
+            Some(Hangup::Registered(_)) | None => None,
+        }
     }
 
     /// **Does this realm have a live view?** The single place the embedder
@@ -912,7 +1026,15 @@ impl RealmLifecycle {
         //    shim that is still running this is *its* EOF -- exit
         //    propagation downward -- and for one that is already gone it
         //    is simply the last reference.
-        self.connection = None;
+        //
+        //    Unconditional, whichever side closed first and whichever
+        //    variant holds it: dropping an already-EOF'd `Connection` is a
+        //    no-op, and so is removing a calloop registration a source has
+        //    already retired (see [`Hangup::Registered`]). The death latch
+        //    above is what makes it happen exactly once.
+        if let Some(hangup) = self.hangup.take() {
+            hangup.hang_up();
+        }
         true
     }
 
@@ -1366,7 +1488,14 @@ mod tests {
             }
             self.shim = Some(server);
 
-            let mut life = RealmLifecycle::adopt(spawned.into_parts());
+            // These tests service the socketpair by hand rather than
+            // through an event loop, so the lifecycle keeps the connection
+            // itself: `Hangup::Owned` is the variant `connection_mut` can
+            // answer for, and dropping it is still rung 0.
+            let mut life = RealmLifecycle::adopt(spawned.into_parts(), |conn| {
+                Ok::<_, std::convert::Infallible>(Hangup::owned(conn))
+            })
+            .expect("placing an owned connection cannot fail");
             set_nonblocking(
                 life.connection_mut()
                     .expect("a fresh realm has a connection"),
@@ -1399,7 +1528,14 @@ mod tests {
             let spawned = spawn_realm_with_env(&realm, &paths, &mut self.recorder, |_| None)
                 .expect("spawn must succeed against a scratch runtime tree");
             assert!(self.realms.mark_running(spawned.realm_id(), spawned.pid()));
-            let mut life = RealmLifecycle::adopt(spawned.into_parts());
+            // These tests service the socketpair by hand rather than
+            // through an event loop, so the lifecycle keeps the connection
+            // itself: `Hangup::Owned` is the variant `connection_mut` can
+            // answer for, and dropping it is still rung 0.
+            let mut life = RealmLifecycle::adopt(spawned.into_parts(), |conn| {
+                Ok::<_, std::convert::Infallible>(Hangup::owned(conn))
+            })
+            .expect("placing an owned connection cannot fail");
             set_nonblocking(
                 life.connection_mut()
                     .expect("a fresh realm has a connection"),

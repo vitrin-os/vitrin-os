@@ -183,8 +183,8 @@
 //! [`crate::consent::grab::ConsentGrab::raise`] calls `mark_prompt_shown`
 //! in the same statement sequence that puts the pixels up and seizes the
 //! input grab, and **nothing in the chokepoint changed**. The flag is still
-//! only reachable at runtime once something raises a prompt, which needs
-//! the M1.1 registry wiring; tests drive it today.
+//! only reachable at runtime once something raises a prompt, and nothing
+//! calls `ConsentGrab::raise` yet; tests drive it today.
 //!
 //! **Prompt selection is FIFO by admission** ([`PetitionRegistry::front_pending`]).
 //! Up to [`PetitionConfig::max_pending_global`] petitions can pend at once,
@@ -294,8 +294,14 @@ pub(crate) enum ConsentPolicy {
 }
 
 /// Deployment-tunable petition policy. Defaults are the settled values in
-/// the module docs; the M1.1 runtime wiring may override from
-/// configuration.
+/// the module docs.
+///
+/// `run_session` constructs the registry with [`Self::default`]: no CLI
+/// surface overrides these yet, so `consent_timeout` is 120 s in every
+/// shipped session. A `--consent-timeout` flag is the obvious next step and
+/// is what an *integration* test of the timeout against the shipped binary
+/// would need; the in-process tests inject a short one by building the
+/// registry directly.
 #[derive(Debug, Clone)]
 pub(crate) struct PetitionConfig {
     /// How long a pending petition may wait for consent before resolving

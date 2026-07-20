@@ -39,7 +39,7 @@
 //!
 //! The last hop is closed by build configuration rather than by naming
 //! discipline: the headless backend's human-visible readback is `#[cfg(test)]`,
-//! so the capture service being wired up in M1.1 cannot reach for it by
+//! so the wired capture service cannot reach for it by
 //! mistake — it does not exist in a non-test build. See
 //! [`crate::backend::headless`].
 //!
@@ -130,9 +130,9 @@
 //!   otherwise, and [`grab`] notes the one partial mitigation (a replica
 //!   gets no input grab).
 //!
-//! Nothing at runtime shows a prompt yet. The petition registry that names a
-//! petition now exists -- the M1.1 runtime wiring constructs it from the
-//! parsed `--consent` policy and a real agent's petition really does enter
+//! Nothing at runtime shows a prompt yet. Everything around it is now
+//! wired -- the registry is built from the parsed `--consent` policy, a real
+//! agent's petition really does enter it, and the sweep really does resolve
 //! it -- but **no code calls [`grab::ConsentGrab::raise`]**, so, stated
 //! plainly rather than implied: **a running `vitrind` renders no consent
 //! prompt, and therefore never grabs input.** Under

@@ -55,12 +55,15 @@
 //! The runtime wiring (`session`, P1.M1.1) is what makes all of that
 //! reachable: a running `vitrind` binds the core socket, accepts principal
 //! connections, drives a `PrincipalServer` per connection against the shared
-//! capability kernel, services the realm's shim socketpair, and sweeps
-//! expired petitions and grants on an armed timer. What is still *not* wired
-//! is the other half of issue #77 — nothing calls `spawn::spawn_realm`, so a
-//! running `vitrind` still forks nothing, and nothing calls
-//! `ConsentGrab::raise`, so an interactive petition pends until it times out
-//! rather than putting a prompt on screen.
+//! capability kernel, forks the configured realm's shim and services its
+//! socketpair, and sweeps expired petitions and grants on an armed timer. A
+//! realm's whole life — spawn, crash, orderly shutdown — runs through
+//! `RealmLifecycle`.
+//!
+//! One gap remains in this picture: nothing calls `ConsentGrab::raise`, so
+//! under `--consent=interactive` a petition pends until the sweep times it
+//! out rather than putting a prompt on screen. Auto-approve is therefore the
+//! only policy that resolves a petition today.
 
 mod backend;
 /// Capture-frame mechanics (P1.3.6): the sealed-memfd pixel path behind
@@ -133,13 +136,14 @@ mod input;
 /// that makes the chokepoint's existing `no_surface` refusal true, and the
 /// orderly shutdown ladder (hang up → `SIGTERM` → `SIGKILL`) that removes
 /// the realm's runtime tree on the way out. Dead-code-allowed outside tests
-/// for the same reason as `spawn`, whose other half it is: exercised
-/// end-to-end by its tests today (they really fork a shim, really `kill -9`
-/// it mid-capture, and really assert the next capture refuses), and **still
-/// not wired**: it arrives with `spawn_realm`, the other half of issue #77.
-/// Its three plug-in sites are named in `run_session`'s docs, and
-/// `session::close_realm` is the interim shim-death path it must *replace*
-/// rather than sit beside.
+/// Wired at all three of its plug-in sites: `child_signal_source` sits
+/// beside each backend's `SIGINT`/`SIGTERM` source (both installed while the
+/// process is still single-threaded — see `block_loop_signals`),
+/// `note_connection_closed` is the *only* shim-death path
+/// (`session::close_realm` routes into it rather than doing its own
+/// teardown), and `shutdown` runs the ladder at the end of each backend's
+/// `run_inner`, after the loop has stopped and before the recorder is handed
+/// back.
 #[cfg_attr(not(test), allow(dead_code))]
 mod lifecycle;
 /// The grant table v0 (P1.4.2): the in-memory PRD Doc 2 §5.2 grant store of
@@ -227,7 +231,8 @@ mod realm;
 /// backend inside the session state (calloop fixes one state type per loop,
 /// so the kernel -- recorder included -- must live in it), and comes back
 /// here to be closed. Every per-connection emission site is runtime-reachable
-/// since the M1.1 wiring.///
+/// since the M1.1 wiring.
+///
 /// Still dead-code-allowed outside tests, but for a *different and much
 /// smaller* reason than before: not "no runtime caller exists" -- one does
 /// now -- but that a handful of accessors and variants in it are exercised
@@ -245,14 +250,11 @@ mod scene;
 /// running server.
 mod session;
 /// The shim-facing protocol server (P1.3.4): `vitrin_shim_session` +
-/// `vitrin_shim_surface`, feeding `Scene::commit`. The runtime half is wired:
-/// `session::attach_realm` registers a shim connection on the loop and
+/// `vitrin_shim_surface`, feeding `Scene::commit`. Fully wired:
+/// `session::start_realm` forks the realm and registers its connection, and
 /// `session::dispatch_shim` drives this server against the backend's scene,
 /// coalescing composites so a repaint flood cannot buy one per 12-byte
-/// message. What is still missing is the *caller*: nothing forks a shim until
-/// `spawn::spawn_realm` is wired, so at runtime that seam has no connection
-/// to attach.
-#[cfg_attr(not(test), allow(dead_code))]
+/// message.
 mod shim;
 /// The realm spawn model (P1.5.2): the core's only process-creating code —
 /// `fork`/`exec` of the realm's shim with its end of the identity socketpair
@@ -261,14 +263,10 @@ mod shim;
 /// that names only that realm's own socket. Read its module docs before
 /// believing any confinement claim: the D9 sandboxing deferral (no
 /// namespaces, no seccomp, no Landlock) and the session-D-Bus hole are
-/// stated there in full. Dead-code-allowed outside tests for the same reason
-/// as `shim`: exercised end-to-end by its tests today (it really forks the
-/// mock shim, which really forks an app), and **still not called at
-/// runtime** -- the other half of issue #77. The blocker it was waiting on is
-/// gone: the event loop now services a shim connection before anything else
-/// happens (`session::install`, then `session::attach_realm`), which is
-/// exactly the ordering a spawn needs in order not to wedge.
-#[cfg_attr(not(test), allow(dead_code))]
+/// stated there in full. Called at runtime by `session::start_realm`, which
+/// runs it only after `session::install` has put the loop's sources in
+/// place: a shim spawned into a loop that is not yet servicing its
+/// socketpair blocks on `configure` forever, with no timeout on its side.
 mod spawn;
 mod test_pattern;
 /// The strict TOML subset every core configuration file is written in
@@ -705,6 +703,61 @@ fn main() -> ExitCode {
     }
 }
 
+/// Block, **process-wide and before any thread exists**, every signal this
+/// session will read through a `signalfd`.
+///
+/// # Why this cannot live in the backend
+///
+/// A `signalfd` receives a signal only if that signal is blocked in *every*
+/// thread of the process; a thread that has not blocked it can be chosen by
+/// the kernel for delivery instead, and then the signal takes its default
+/// disposition. `calloop::signals::Signals::new` blocks only in the thread
+/// that calls it, and the backends call it from the main thread — which is
+/// correct only if no other thread exists yet.
+///
+/// One does. [`announce_consent_policy`] spawns the R6 auto-approve banner
+/// thread before any backend starts, and Smithay's winit/EGL stack spawns
+/// more. The observable result, measured against the shipped binary before
+/// this existed: under `--consent=auto-approve`, `SIGTERM` was delivered to
+/// the banner thread, took its default action, and killed the core outright
+/// — no shutdown ladder, an orphaned shim, a realm runtime tree left on
+/// disk, and no `run_ended` footer. Under `--consent=interactive`, with no
+/// banner thread, the identical build shut down cleanly. A bug that depends
+/// on an unrelated flag is exactly the kind this ordering rule exists to
+/// prevent.
+///
+/// `SIGCHLD` is the quieter half and the reason this is load-bearing rather
+/// than tidy: its default disposition is *ignore*, so a `SIGCHLD` delivered
+/// to any thread that has not blocked it is simply lost — and with it the
+/// core's only notification that its realm's shim exited. Nothing fails,
+/// nothing is logged, and the realm stays `Running` in the registry forever.
+///
+/// Blocking here rather than at each `Signals::new` also means every thread
+/// spawned later inherits the mask, since a new thread starts with a copy of
+/// its creator's. The backends' `Signals::new` calls then re-block what is
+/// already blocked (a no-op) and create the descriptor that actually reads
+/// them.
+fn block_loop_signals() -> std::io::Result<()> {
+    // SAFETY: `sigset_t` is a plain bitset that `sigemptyset` initializes
+    // before any read; the zeroed value is never observed. This runs on the
+    // main thread before the process has spawned any other, so there is no
+    // concurrent signal-mask mutation to race. Every argument is a valid
+    // pointer to a live local, and the null third argument means "do not
+    // report the previous mask", which we do not need.
+    let rc = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGCHLD);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut())
+    };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
+}
+
 /// Load the session's realm, bind the core socket, open the run's flight
 /// recorder, build the capability kernel, run the backend around it, and
 /// close the log.
@@ -748,26 +801,30 @@ fn main() -> ExitCode {
 /// [`Verifier`]: identity::Verifier
 /// [`Listener`]: vitrin_ipc::Listener
 ///
-/// # What is still not wired here (the other half of issue #77)
+/// # Where the realm's life happens, and why not here
 ///
-/// `spawn::spawn_realm` and the realm lifecycle. The seam they plug into now
-/// exists and is real: [`session::install`] puts the listener and the sweeps
-/// on the loop *before* the loop starts, and [`session::attach_realm`] takes
-/// the spawned shim's core-side connection and its `ShimServer` and registers
-/// them. The ordering that matters is written down there — `configure` goes
-/// out on the still-blocking fd before the connection is handed to calloop,
-/// and the spawn must not happen before the loop can service the socketpair,
-/// or the shim wedges forever with no timeout on its side.
+/// The spawn is deliberately **not** in this function, even though the
+/// realm's `realm_spawned` entry wants to be early in the log. A shim
+/// blocks on `configure` and then on every reply, with no timeout anywhere
+/// on its side, so it must not exist until something is servicing its
+/// socketpair — and that something is the backend's event loop, which does
+/// not exist until `backend()` below has built it. So `session::start_realm`
+/// runs inside each backend's `run_inner`, immediately after
+/// `session::install` and immediately before `event_loop.run`, which is the
+/// earliest point at which the spawn is safe rather than a permanent wedge.
 ///
-/// Lifecycle has three named plug-in sites, all still open:
-/// `lifecycle::child_signal_source()` beside each backend's existing
-/// `SIGINT`/`SIGTERM` source (the mask must be installed before the backend
-/// spawns any thread); `RealmLifecycle::note_connection_closed` in place of
-/// `session`'s interim `close_realm`; and `RealmLifecycle::shutdown` between
-/// the backend returning and `recorder.finish()` below — after the loop has
-/// stopped, because the ladder blocks deliberately and must not do so inside
-/// a live compositor loop, and before the log closes, so the realm's
-/// `realm_died` / `realm_exited` entries land in the run they belong to.
+/// The shutdown ladder is in the backend for the mirror-image reason: it
+/// blocks by design, so it must run after the loop has stopped, and it must
+/// run before the recorder is handed back here so that the realm's
+/// `realm_died` / `realm_exited` entries land in this run rather than after
+/// its footer.
+///
+/// # What is still not wired
+///
+/// `ConsentGrab::raise` has no caller, so `--consent=interactive` never puts
+/// a prompt on screen: a petition pends until the armed sweep times it out.
+/// The petition registry it needs now exists, so this is the last gap
+/// between the consent surface and the wire.
 fn run_session<R>(
     consent: ConsentPolicy,
     principals_path: Option<PathBuf>,
@@ -797,6 +854,17 @@ where
     // evaporate, and the state is dropped when the loop ends — possibly
     // before `recorder.finish()` — which would silently shorten the warning's
     // lifetime to less than the policy's.
+    // Before the R6 guard, because the guard spawns the banner thread and
+    // this must run while the process is still single-threaded. See
+    // `block_loop_signals` for what silently breaks otherwise.
+    if let Err(err) = block_loop_signals() {
+        tracing::error!(
+            "fatal: cannot block the session's signals: {err}; without this the shutdown \
+             ladder and realm-exit detection are both unreliable"
+        );
+        return ExitCode::FAILURE;
+    }
+
     let Ok((banner, guard_verifier)) = announce_consent_policy(consent, principals_path.as_deref())
     else {
         return ExitCode::FAILURE;
@@ -1041,8 +1109,8 @@ fn announce_realms(realms: &RealmRegistry) {
             command = %realm.spawn().command().display(),
             args = realm.spawn().args().len(),
             env_allow = ?realm.spawn().env_allow(),
-            "realm configured (not started: `spawn::spawn_realm` is the other half of \
-             issue #77; `session::attach_realm` is the seam it plugs into)"
+            "realm configured (spawned once the event loop can service its shim; see \
+             session::start_realm)"
         );
     }
 }

@@ -144,7 +144,36 @@ blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
 #    (`crate::consent::PromptContent` holds typed core values, never client
 #    text). So the usual "font parsers are a CVE farm" objection does not
 #    apply here: nothing an agent or app sends reaches this parser.
-fontdue = { version = "0.9.3", default-features = false }
+# 5. **fontdue itself contains `unsafe` -- four blocks -- and that must be
+#    stated here, not inferred.** Point 1 cites ttf-parser's
+#    `#![forbid(unsafe_code)]`, which is true of the transitive crate and says
+#    nothing about the direct one. In fontdue 0.9.3: `font.rs:269`
+#    `mem::transmute::<u32, char>(codepoint)` over values read out of the
+#    font's cmap table (UB for surrogates or anything above 0x10FFFF) is the
+#    sharpest; also `font.rs:636` `transmute::<Option<NonZeroU16>, u16>`,
+#    `layout.rs:532` `set_len(0)`, and `raster.rs:43`, in a module whose own
+#    header reads "Fontdue's raster is very unsafe, with nuanced invariants".
+#    None of it is attacker-reachable *here*, and the reason is narrow and
+#    worth naming: the only bytes that rasterizer ever parses are
+#    `FONT_BYTES`, a compile-time constant pinned by the `const` length assert
+#    in `src/consent/text.rs` and by the SHA-256 recorded in
+#    `assets/fonts/README.md`. That argument is what makes the cmap transmute
+#    unreachable, and it is exactly what a second face, a user-selectable
+#    face, or an OpenType feature would invalidate -- widening what this
+#    rasterizer parses means re-auditing these four blocks, not just adding a
+#    file. The point of these comments is that a reviewer can audit the TCB's
+#    memory-safety posture from this file without reading the dependency, and
+#    citing only the safe transitive crate would read as stronger than the
+#    truth.
+#
+# Pinned exactly, on the smithay precedent above (issue #17): every
+# anti-aliased pixel in `tests/golden/consent_prompt.txt` is fontdue output,
+# and a glyph rasterizer is precisely the kind of code whose patch releases
+# move pixels (bezier flattening, coverage accumulation, metrics rounding).
+# fontdue feeds a pixel golden more directly than smithay does, so it gets the
+# same treatment: a caret requirement would let an unrelated `cargo update`
+# turn the consent golden red on a PR that never touched the renderer.
+fontdue = { version = "=0.9.3", default-features = false }
 
 [features]
 # Compile the real-GPU dmabuf tests (P1.3.5). Requires a machine with a DRM

@@ -114,13 +114,56 @@ const BUTTON_FG: [u8; 3] = [0xf1, 0xf4, 0xf9];
 // ---------------------------------------------------------------------------
 
 const TITLE: &str = "Grant request";
-/// The anti-spoofing line. It is true by construction, which is the only
-/// reason it is allowed on the card: the overlay is composited at the backend
-/// output stage above the realm view, and never inside
-/// [`crate::scene::Scene::compose`] — so no app, shim, or agent can produce
-/// these pixels, and no capture can even observe them (`crate::consent`
-/// module docs).
-const SUBTITLE: &str = "Shown by vitrind. No application or agent can draw this prompt.";
+/// What the decision below means. Deliberately **not** a provenance or
+/// anti-spoofing claim — see the note below for why this build may not make
+/// one.
+///
+/// # No trusted indicator exists yet, so the card must not imply one
+///
+/// This line used to read "Shown by vitrind. No application or agent can draw
+/// this prompt," justified as true by construction. It is not true, and the
+/// construction argument does not reach it.
+///
+/// What the architecture establishes is that no client can draw *into the
+/// overlay layer*: the overlay composites at the backend output stage, above
+/// [`crate::scene::Scene::compose`], so client content cannot get on top of a
+/// real prompt and no capture can observe one. That is a real and load-bearing
+/// property — but it says nothing about a client drawing *the same picture*
+/// into its own surface, which the scene then presents full-view. A confined
+/// app can commit a view-sized surface containing a pixel-perfect replica of
+/// this card, scrim and accent border included, and a human looking at the
+/// screen has nothing to distinguish it from the genuine article: no
+/// per-session secret image, no reserved region of the output client content
+/// cannot reach, no trusted border outside the client's own rectangle.
+///
+/// PRD line 294 grounds unspoofability in the Qubes/Nitpicker trusted-labeling
+/// principle, and that principle works precisely because the GUI server draws
+/// a label the VM provably cannot reproduce. Here the label sits inside the
+/// same pixel rectangle the client owns, so it labels nothing.
+///
+/// Printing the claim anyway is worse than silence: it is the TCB asserting a
+/// safety property to a human at the exact moment of an authority decision,
+/// and a human trained to read that sentence as proof is a human who will
+/// trust a forged dialog *more*. That is the honest-UI rule (PRD P2) applied
+/// to the prompt's own copy rather than only to its buttons — the card must
+/// not suggest a capability the system does not have, and unspoofability is a
+/// capability the system does not yet have.
+///
+/// So the line states only what is true of the decision, and the card makes no
+/// authenticity claim at all. Closing the gap for real needs a trusted
+/// indicator the human can check — a per-session secret image or color
+/// established at core startup, or a strip of the output the scene compositor
+/// refuses to let client content into — which is a change to the realm view's
+/// layout and to startup ceremony, not a change to this string. It is out of
+/// scope for the renderer (P1.7.1) and belongs with the input grab that makes
+/// the prompt authoritative (P1.7.2, issue #38); until it lands, no wording
+/// here may imply it.
+///
+/// Deliberately not doing the reverse either: the card does not warn "this
+/// dialog may be forged". A warning the human has no means to act on buys no
+/// safety and would train them to click through a scare line, which is the
+/// same failure in the other direction.
+const SUBTITLE: &str = "Approving grants the authority listed below.";
 const LABEL_PRINCIPAL: &str = "Principal";
 const LABEL_REALM: &str = "Realm";
 const LABEL_REQUESTS: &str = "Requests";
@@ -504,7 +547,10 @@ mod tests {
             ]
         );
         let labels: Vec<&str> = choices.iter().map(|c| c.label()).collect();
-        assert_eq!(labels, ["Allow once", "Allow while running", "Deny"]);
+        assert_eq!(
+            labels,
+            ["Allow once (single use)", "Allow while running", "Deny"]
+        );
         for label in labels {
             assert!(
                 !label.to_ascii_lowercase().contains("always")
@@ -686,5 +732,34 @@ mod tests {
         // And the fixture's own values are the ones being drawn.
         assert_eq!(prompt_fixture().principal.to_string(), PROMPT_IDENTITY);
         assert_eq!(prompt_fixture().realm.to_string(), PROMPT_REALM);
+    }
+
+    /// Every caption must fit inside its own button.
+    ///
+    /// Captions are centered by measuring, and a caption wider than its box is
+    /// clipped by the canvas rather than rejected — so an over-long one degrades
+    /// into a truncated word on a security decision. The row's width is derived
+    /// from [`CONTENT_W`] and the choice count, so this is a real constraint a
+    /// future caption (or a fourth rung) could quietly violate; `Allow once
+    /// (single use)` already spends 134 of the 162 available pixels.
+    #[test]
+    fn every_button_caption_fits_inside_its_button() {
+        let mut text = Text::new();
+        for requested in PersistenceRung::ALL {
+            let mut prompt = prompt_fixture();
+            prompt.persistence = requested;
+            let card = rasterize(&prompt);
+            for b in &card.buttons {
+                let w = text.width(b.choice.label(), BUTTON_PX);
+                assert!(
+                    w <= b.rect.w,
+                    "caption {:?} is {}px wide in a {}px button -- it would be \
+                     clipped on screen",
+                    b.choice.label(),
+                    w,
+                    b.rect.w
+                );
+            }
+        }
     }
 }

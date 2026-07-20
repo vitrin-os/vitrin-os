@@ -277,8 +277,30 @@ impl Text {
             if lines.len() == max_lines {
                 return Self::truncate_last(self, lines, px, max_width);
             }
+            // Seed the next line with the post-break remainder — and measure
+            // it, because `carry` plus `ch` can already be over budget. `ch`
+            // is by definition the character that just overflowed, and `carry`
+            // can be nearly a full line's worth when the break opportunity sat
+            // early in it, so this is the one path into `current` that could
+            // otherwise reach `lines` wider than `max_width`. Every other path
+            // is gated by the fit check above; this one is now gated the same
+            // way, which is what makes "no returned line exceeds `max_width`"
+            // an invariant of the function rather than of the inputs it
+            // happens to be given.
             current = carry;
-            current.push(ch);
+            let mut seeded = current.clone();
+            seeded.push(ch);
+            if self.width(&seeded, px) <= max_width || current.is_empty() {
+                current = seeded;
+            } else {
+                // The remainder is a full line on its own: flush it and start
+                // the next line at the overflowing character.
+                lines.push(current.trim_end().to_string());
+                if lines.len() == max_lines {
+                    return Self::truncate_last(self, lines, px, max_width);
+                }
+                current = String::from(ch);
+            }
         }
         if !current.is_empty() || lines.is_empty() {
             lines.push(current);
@@ -389,6 +411,61 @@ mod tests {
         // A space advances the pen without inking anything.
         assert!(text.width(" ", 14.0) > 0);
         assert_eq!(ink(&mut text, " ", 14.0), 0);
+    }
+
+    /// No line `wrap` returns may exceed the box, whatever it is given.
+    ///
+    /// A sweep rather than a fixed input, because the bug this replaces was
+    /// invisible to a hand-picked identity: seeding a new line with the
+    /// post-break remainder plus the overflowing character skipped the fit
+    /// check, so a line could come back a glyph too wide. Real identities are
+    /// dense with `/` and `-` and never landed in that shape — the defect was
+    /// latent, not live — but the guarantee the card's layout leans on is the
+    /// unconditional one, so it is tested unconditionally.
+    ///
+    /// Deterministic (a fixed-seed LCG, no `rand` dependency in the TCB): the
+    /// same 400 strings on every run, so a failure is reproducible from the
+    /// seed alone.
+    #[test]
+    fn no_wrapped_line_ever_exceeds_the_box() {
+        let mut text = Text::new();
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            seed >> 33
+        };
+        for case in 0..400 {
+            // Mix arbitrary ASCII printables with identity-charset runs, so
+            // both the hostile shape (a separator opening a continuation line
+            // before a long unbroken token) and realistic content are covered.
+            let alphabet: &[u8] = if case % 2 == 0 {
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-"
+            } else {
+                b" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+            };
+            let len = 1 + (next() % 80) as usize;
+            let s: String = (0..len)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()] as char)
+                .collect();
+            for (max_w, max_l) in [(100u32, 3usize), (200, 4), (508, 2)] {
+                for line in text.wrap(&s, 14.0, max_w, max_l) {
+                    assert!(
+                        text.width(&line, 14.0) <= max_w,
+                        "wrap({s:?}, max_width={max_w}) returned {line:?} at \
+                         {}px, over the {max_w}px box",
+                        text.width(&line, 14.0)
+                    );
+                }
+            }
+        }
+        // The specific shape that used to fail: a lone break character opening
+        // a line, followed by an unbroken run wider than the box.
+        let hostile = format!("_{}", "W".repeat(40));
+        for line in text.wrap(&hostile, 14.0, 100, 3) {
+            assert!(text.width(&line, 14.0) <= 100, "{line:?} overflows");
+        }
     }
 
     #[test]

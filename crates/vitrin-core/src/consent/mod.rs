@@ -30,10 +30,18 @@
 //! this module — grep it and there is no consent import to remove. The
 //! capture path ([`crate::capture::render_frame`]) is fed those realm-view
 //! pixels. The overlay is applied *after* that fork, inside
-//! [`crate::backend::compose_human_visible`], which both backends call and
-//! neither capture path does. An agent therefore cannot observe a prompt
-//! because there is no code path from the prompt to a capture, rather than
-//! because a flag was checked correctly.
+//! [`crate::backend::human_visible_from_view`] — the single overlay-application
+//! step, which both backends really do call (the nested one through
+//! [`crate::backend::compose_human_visible`], which is that step with a compose
+//! in front of it) and neither capture path does. An agent therefore cannot
+//! observe a prompt because there is no code path from the prompt to a capture,
+//! rather than because a flag was checked correctly.
+//!
+//! The last hop is closed by build configuration rather than by naming
+//! discipline: the headless backend's human-visible readback is `#[cfg(test)]`,
+//! so the capture service being wired up in M1.1 cannot reach for it by
+//! mistake — it does not exist in a non-test build. See
+//! [`crate::backend::headless`].
 //!
 //! The headless backend makes the fork concrete by retaining **two** images:
 //! `view_framebuffer` (the realm view, what `capture_frame` reads back) and
@@ -58,9 +66,18 @@
 //! [`render`]. There is no free-text field to smuggle a glyph through,
 //! because there is no free-text field.
 //!
-//! Its only non-test constructor is
-//! [`crate::petitions::PetitionRegistry::prompt_content`], so the renderer
-//! cannot even be handed content that did not come from a pending petition.
+//! Where those values come from is **convention**, not structure, and the
+//! difference is worth stating precisely in a claim of this kind. The only
+//! production constructor is
+//! [`crate::petitions::PetitionRegistry::prompt_content`], which reads the
+//! pending table and returns `None` once a petition is resolved — but the
+//! fields are `pub` within the crate, and Rust cannot express "only that one
+//! function may build this". A future caller could assemble a
+//! [`PromptContent`] from somewhere else and it would compile. What survives
+//! that mistake is the guarantee that matters: every field would still be a
+//! core-validated typed value, so an agent still could not put a glyph on
+//! screen.
+//!
 //! [`text`] then adds a last-moment defense: anything outside ASCII
 //! printables is substituted before glyph selection, so no bidi override or
 //! combining-mark stack could make one string render as another even if a
@@ -205,9 +222,36 @@ impl Choice {
     /// purpose: a rung added to the ladder fails to *compile* here, so a new
     /// rung can never reach the screen without someone deciding what to call
     /// it in front of a human.
+    ///
+    /// # A caption must say what its rung actually confers
+    ///
+    /// [`PersistenceRung::Once`] reads "(single use)" because it is *not a
+    /// time bound*: it is consumed by its first allowed use and refuses
+    /// `expired` thereafter ([`crate::grants::GrantTable::check_use`]). The
+    /// card's `Expires` field describes the **petition's request** — it is the
+    /// same for every button, because that is what was asked for — so a
+    /// `while_running` petition for one hour renders "1 h after approval"
+    /// beside both allow-choices. A human reading "1 h" and picking a caption
+    /// that said only "Allow once" would reasonably parse it as "allow this,
+    /// for the next hour, without asking again", and would in fact be
+    /// authorizing exactly one use: a mismatch of three orders of magnitude in
+    /// the one UI whose entire purpose is keeping the authority a human
+    /// believes they granted and the authority that exists in sync.
+    ///
+    /// So the rung names its own bound, and `Expires` keeps describing the
+    /// request. The alternative — making the expiry text rung-aware — would
+    /// mean the field changes meaning depending on which button the human is
+    /// hovering, which is worse: the fields describe the petition, the buttons
+    /// describe the decision, and mixing the two is how a prompt starts
+    /// lying about one to explain the other.
+    ///
+    /// The direction of the old error was fail-safe (the human over-estimated
+    /// what they gave), which is why this is a correctness fix rather than a
+    /// vulnerability — but a consent prompt that is only accidentally
+    /// conservative is not a consent prompt that is honest.
     pub fn label(self) -> &'static str {
         match self {
-            Choice::Allow(PersistenceRung::Once) => "Allow once",
+            Choice::Allow(PersistenceRung::Once) => "Allow once (single use)",
             Choice::Allow(PersistenceRung::WhileRunning) => "Allow while running",
             Choice::Deny => "Deny",
         }
@@ -778,5 +822,37 @@ pub(crate) mod tests {
             labels.dedup();
             assert_eq!(labels.len(), before, "two choices share a caption");
         }
+    }
+
+    #[test]
+    fn the_single_use_rung_says_so_on_its_own_button() {
+        // `Once` is consumed by its first use, not bounded by the clock, and
+        // the `Expires` field describes the petition's request rather than the
+        // rung -- so a `while_running` petition for an hour renders "1 h after
+        // approval" beside both allow-choices. The caption is the only place
+        // that can tell the human the difference, and it must
+        // (`Choice::label`'s docs carry the full argument).
+        let caption = Choice::Allow(PersistenceRung::Once).label().to_lowercase();
+        assert!(
+            caption.contains("single use") || caption.contains("one use"),
+            "the Once caption must say it grants a single use, got {:?}",
+            Choice::Allow(PersistenceRung::Once).label()
+        );
+        assert!(
+            !Choice::Allow(PersistenceRung::WhileRunning)
+                .label()
+                .to_lowercase()
+                .contains("single use"),
+            "only the single-use rung may claim to be single use"
+        );
+
+        // And the mismatch that motivated it is really reachable: an hour-long
+        // petition offers a single-use choice under a "1 h" expiry.
+        let mut prompt = prompt_fixture();
+        prompt.persistence = PersistenceRung::WhileRunning;
+        prompt.expiry_ms = 3_600_000;
+        assert!(prompt
+            .choices()
+            .contains(&Choice::Allow(PersistenceRung::Once)));
     }
 }

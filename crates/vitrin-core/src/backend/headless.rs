@@ -26,7 +26,7 @@
 //! # Two retained images, because two audiences see different pixels (P1.7.1)
 //!
 //! [`HeadlessState`] retains **both** sides of the output-stage fork
-//! ([`super::compose_human_visible`]):
+//! ([`super::human_visible_from_view`]):
 //!
 //! - [`view_framebuffer`] — the composed **realm view**. This is the capture
 //!   service's pixel source ([`HeadlessState::latest_frame_rgba`]) and it is
@@ -222,6 +222,21 @@ impl HeadlessState {
     /// One [`Scene::compose`] call feeds both images, so the realm view an
     /// agent may capture and the output a human sees are the same
     /// composition, differing only by the overlay (module docs).
+    ///
+    /// # Why two full composites per frame are accepted
+    ///
+    /// Both retained images are rewritten every redraw, even with no prompt up
+    /// — when the two are byte-identical and the second blit writes pixels the
+    /// first just wrote. That cost is deliberate. The alternative is tracking
+    /// when `output_framebuffer` is a stale alias of `view_framebuffer`, which
+    /// reintroduces exactly the class of cache-invalidation bug this backend
+    /// exists to be free of: the invariant `output_framebuffer ==
+    /// human_visible_from_view(view, consent)` is what the P1.7.1 golden and
+    /// [`Self::scrub_retained_frame`] both rest on, and it is worth more here
+    /// than the CPU. Headless is the deterministic backend CI runs, not the
+    /// one a human watches; the nested backend, which *is* watched, already
+    /// uploads once per (size, scene, consent) change rather than once per
+    /// frame.
     fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
         let (w, h) = (self.size.w.max(0) as u32, self.size.h.max(0) as u32);
         let view = self.scene.compose(w, h);
@@ -231,11 +246,11 @@ impl HeadlessState {
             self.size,
             &view,
         )?;
-        // The human-visible half: the same bytes, plus the prompt. Cloning
-        // the view rather than recomposing is what makes "differ only by the
-        // overlay" a property of the code and not a comment.
-        let mut output = view;
-        self.consent.composite_over(&mut output, w, h);
+        // The human-visible half, through the shared overlay step both
+        // backends call. `view` is moved in rather than recomposed, so "the
+        // two images differ only by the overlay" is a property of the code
+        // and not of a comment.
+        let output = super::human_visible_from_view(view, &mut self.consent, w, h);
         composite(
             &mut self.renderer,
             &mut self.output_framebuffer,
@@ -275,7 +290,20 @@ impl HeadlessState {
     /// prompt golden-testable on a GPU-less CI runner at all. It has no wire
     /// path and never will: no protocol message delivers human-visible
     /// output.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// **`#[cfg(test)]`, not merely `allow(dead_code)`.** This and
+    /// [`Self::latest_frame_rgba`] have the same signature and differ only by
+    /// name, and `capture::RealmViewFrame.rgba` is a plain `&[u8]` that either
+    /// one satisfies. The M1.1 listener wiring (issue #77) has yet to pick a
+    /// pixel source for the capture service, and "the output" is the more
+    /// natural-sounding name for a getter that would deliver the consent
+    /// overlay to every `vitrin_view.frame_ready` — the one thing
+    /// `docs/protocol/05-vitrin_consent.md` forbids, with no test to catch it
+    /// because no test yet exercises the wired path. Compiling this out of
+    /// non-test builds makes that mistake fail to *build* rather than merely
+    /// be discouraged by a doc comment, which is the posture the rest of this
+    /// overlay's design takes.
+    #[cfg(test)]
     fn latest_output_rgba(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
         readback(&mut self.renderer, &mut self.output_framebuffer, self.size)
     }
@@ -304,6 +332,26 @@ impl crate::lifecycle::RetainedOutput for HeadlessState {
     /// virtual display would be the same staleness bug with a different
     /// audience, and a scrub that covered only one image would be a trap for
     /// whoever next reaches for the other.
+    /// # A realm dying must not take a live prompt off the screen
+    ///
+    /// The human-visible image is scrubbed to
+    /// `human_visible_from_view(empty_scene, consent)` — **not** to the empty
+    /// scene — so a prompt that is up survives the death of a realm.
+    ///
+    /// Scrubbing it to the bare empty scene (as this first did) is
+    /// unrecoverable rather than merely wrong: this backend recomposites only
+    /// on a scene commit, which a dead realm never sends again, and a scrub
+    /// does not bump [`ConsentSurface::generation`], so nothing downstream
+    /// ever learns the display needs repainting. The prompt would be gone from
+    /// the screen while the core still believed it was up — and under P1.7.2,
+    /// where "on screen", "input grabbed" and "`consent_held` holds" become
+    /// one moment, that is a session wedged behind an invisible dialog until
+    /// the consent timeout fires.
+    ///
+    /// The petition being prompted need not belong to the realm that died;
+    /// deciding that is [`crate::petitions`]' job, and this type must not
+    /// become a second place a realm's death is decided (above). The scrub
+    /// removes the dead realm's *pixels*, which is all it is for.
     fn scrub_retained_frame(&mut self) -> Result<(), Box<dyn Error>> {
         let (w, h) = (self.size.w.max(0) as u32, self.size.h.max(0) as u32);
         let empty = Scene::new().compose(w, h);
@@ -313,11 +361,12 @@ impl crate::lifecycle::RetainedOutput for HeadlessState {
             self.size,
             &empty,
         )?;
+        let output = super::human_visible_from_view(empty, &mut self.consent, w, h);
         composite(
             &mut self.renderer,
             &mut self.output_framebuffer,
             self.size,
-            &empty,
+            &output,
         )
     }
 }
@@ -841,6 +890,92 @@ mod tests {
                 "retained output must be the shared compose (prompt_up = {prompt_up})"
             );
         }
+    }
+
+    /// A realm dying scrubs its pixels — and must not take a live consent
+    /// prompt off the screen with them.
+    ///
+    /// The scrub exists because this backend recomposites only on a scene
+    /// commit, which a dead realm never sends again. That is exactly why
+    /// scrubbing the human-visible image to the bare empty scene would be
+    /// unrecoverable: nothing would ever redraw the prompt, and the scrub does
+    /// not bump [`ConsentSurface::generation`], so nothing downstream would
+    /// learn that it needs to. The core would still believe the prompt was up.
+    ///
+    /// So this pins both halves after a scrub: the dead realm's pixels are
+    /// gone from the capture source, and the human-visible image is still the
+    /// shared composition *with the prompt on it*.
+    #[test]
+    fn a_scrub_clears_the_dead_realms_pixels_but_keeps_a_live_prompt_on_screen() {
+        use crate::consent::tests::prompt_fixture;
+        use crate::lifecycle::RetainedOutput;
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+
+        let _fd = crate::capture::tests::fd_lock();
+        const VW: u32 = 800;
+        const VH: u32 = 600;
+
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessState> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state =
+            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+
+        let painted = client_pixels(300, 200);
+        state.scene.commit(
+            SurfaceContent::from_rgba(painted.clone(), 300, 200).expect("well-formed content"),
+        );
+        state.consent.show(prompt_fixture());
+        state
+            .redraw()
+            .expect("redraw with a prompt over a live realm");
+
+        // The realm dies: the scene loses its surface (the death funnel), and
+        // the funnel scrubs the retained images.
+        state.scene.clear_surface();
+        state.scrub_retained_frame().expect("scrub");
+
+        // The capture source is the empty-scene background, byte for byte...
+        let view = state.latest_frame_rgba().expect("readback");
+        assert_eq!(
+            view,
+            test_pattern::render(VW, VH),
+            "a scrubbed realm view is the empty-scene background"
+        );
+        assert!(
+            !view
+                .windows(painted.len().min(view.len()))
+                .any(|w| w == &painted[..w.len()]),
+            "no run of the dead realm's pixels may survive in the capture source"
+        );
+
+        // ...and the human can still see and answer the prompt.
+        assert!(
+            state.consent.prompt().is_some(),
+            "the scrub must not silently take the prompt down"
+        );
+        let mut expected = crate::consent::ConsentSurface::new();
+        expected.show(prompt_fixture());
+        assert_eq!(
+            state.latest_output_rgba().expect("readback"),
+            super::super::compose_human_visible(&crate::scene::Scene::new(), &mut expected, VW, VH),
+            "after a scrub the human-visible image must still be the shared \
+             composition with the prompt on it"
+        );
+        // Belt and braces: the card really is painted, so the assertion above
+        // cannot be satisfied by both sides having lost the overlay.
+        let card = crate::consent::render::rasterize(&prompt_fixture());
+        let (cx, cy) = state.consent.card_origin(VW, VH).expect("a prompt is up");
+        let output = state.latest_output_rgba().expect("readback");
+        let row = (cy as u32 + card.height / 2) as usize;
+        let d = (row * VW as usize + cx as usize) * test_pattern::BYTES_PER_PIXEL;
+        let s = (card.height / 2) as usize * card.width as usize * test_pattern::BYTES_PER_PIXEL;
+        let run = card.width as usize * test_pattern::BYTES_PER_PIXEL;
+        assert_eq!(
+            &output[d..d + run],
+            &card.rgba[s..s + run],
+            "a card row must appear verbatim in the post-scrub output"
+        );
     }
 
     /// The P1.3.4 acceptance criteria, end to end over the real calloop

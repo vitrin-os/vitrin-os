@@ -228,7 +228,7 @@ use crate::grants::{GrantId, GrantTable, InsertError};
 use crate::identity::{PresentedCredential, PrincipalIdentity, Verifier, VerifyOutcome};
 use crate::input::{PhysicalPresence, SeatInput, SeatInputKind};
 use crate::petitions::{
-    Admission, ConnectionId, PetitionRegistry, PetitionRequest, Resolution, Verdict,
+    Admission, ConnectionId, PetitionRegistry, PetitionRequest, PromptRoute, Resolution, Verdict,
 };
 use crate::realm::RealmRegistry;
 use crate::recorder::{
@@ -508,6 +508,57 @@ impl From<PrincipalViolation> for PrincipalFault {
 impl From<TransportError> for PrincipalFault {
     fn from(e: TransportError) -> Self {
         PrincipalFault::Transport(e)
+    }
+}
+
+/// Why [`PrincipalServer::emit_consent_shown`] refused or failed to
+/// announce a raised prompt (P1.7.2).
+///
+/// Deliberately separate from [`DeliveryError`]: that type's variants are
+/// about a *grant terminal* -- minting a row, the exactly-once handle flip
+/// -- and none of them apply to an advisory `state` event. Folding the two
+/// would mean a caller handling `AlreadyResolved` for a message that
+/// resolves nothing.
+///
+/// Every variant means **nothing was sent**. The consequence of a refusal
+/// is bounded by the protocol itself: `vitrin_consent` is advisory ("a
+/// threadless blocking client MAY ignore consent events entirely"), so a
+/// prompt whose `shown` announcement could not be delivered is still a
+/// prompt the human answers, and the authoritative terminal still arrives
+/// on the grant.
+#[derive(Debug)]
+pub(crate) enum PromptEmitError {
+    /// The prompt belongs to a different connection (embedder routing bug).
+    WrongConnection {
+        expected: ConnectionId,
+        got: ConnectionId,
+    },
+    /// The connection is no longer in its bound steady state -- the fatal
+    /// goodbye is its terminal event, and teardown ends it just as finally.
+    /// An expected race (the petitioner dies as its prompt goes up), not a
+    /// bug.
+    ConnectionDead,
+    /// No `vitrin_consent` object with this wire id exists on this
+    /// connection (routing bug).
+    UnknownConsentObject { wire_id: u32 },
+    /// Sending failed; the connection is dying.
+    Transport(TransportError),
+}
+
+impl fmt::Display for PromptEmitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PromptEmitError::WrongConnection { expected, got } => {
+                write!(f, "consent prompt for {got} routed to {expected}")
+            }
+            PromptEmitError::ConnectionDead => {
+                write!(f, "connection dead or torn down; prompt not announced")
+            }
+            PromptEmitError::UnknownConsentObject { wire_id } => {
+                write!(f, "no consent object with wire id {wire_id}")
+            }
+            PromptEmitError::Transport(e) => write!(f, "transport failure: {e}"),
+        }
     }
 }
 
@@ -1402,6 +1453,80 @@ impl PrincipalServer {
         true
     }
 
+    /// Announce that this petition's consent prompt is now on screen:
+    /// `vitrin_consent.state(shown)` (P1.7.2).
+    ///
+    /// Called by the embedder immediately after
+    /// [`crate::consent::grab::ConsentGrab::raise`] returns the
+    /// [`PromptRoute`] naming this connection -- that call is what put the
+    /// pixels up, set the registry's `prompt_shown` flag (making the
+    /// chokepoint's `consent_held` refusal true), seized the input grab,
+    /// and wrote the `consent_transition{shown}` entry to the flight
+    /// recorder. This method is the last part of the same moment, and the
+    /// only one that has to travel the wire.
+    ///
+    /// # Why the recorder entry is not written here
+    ///
+    /// It used to be, and that inverted the discipline
+    /// [`Self::deliver_resolution`] argues for and this comment used to
+    /// restate: the log's subject is the moment core state changed, and a
+    /// failure to *tell the client* must not erase the fact that a human
+    /// was asked. All three guards below return before any recording could
+    /// happen, and one of them -- `ConnectionDead` -- is a documented,
+    /// expected race (the petitioner dies as its prompt goes up), not a
+    /// bug. On that path the card was on screen, the human's input was
+    /// grabbed and the chokepoint was refusing `consent_held`, while the
+    /// log contained nothing to say a prompt had ever been shown. Recording
+    /// in `raise`, where the state changes, makes that unrepresentable.
+    ///
+    /// # The ordering guarantee, and why it holds structurally
+    ///
+    /// `docs/protocol/05-vitrin_consent.md`: "all of them are delivered
+    /// **before** that petition's `resolved`". Nothing here checks that.
+    /// It holds because `raise` refuses a petition that is not pending, and
+    /// a petition stops being pending in exactly the step that produces its
+    /// [`Resolution`] ([`PetitionRegistry::finish`]) -- so a `shown` event
+    /// can only be produced while the terminal has not been decided yet,
+    /// let alone sent. The closing `state(closed)` is likewise emitted
+    /// inside [`Self::deliver_resolution_inner`], on the line before the
+    /// `resolved` send. The ordering is a property of when the events can
+    /// be *constructed*, not of the order someone remembered to write them
+    /// in.
+    ///
+    pub fn emit_consent_shown<F>(
+        &mut self,
+        route: PromptRoute,
+        send: &mut F,
+    ) -> Result<(), PromptEmitError>
+    where
+        F: FnMut(&[u8], Option<BorrowedFd<'_>>) -> Result<(), TransportError>,
+    {
+        // Addressing before the phase gate, the `deliver_resolution`
+        // precedent: a misrouted prompt must surface as the routing bug it
+        // is rather than vanish as this connection's dead-drop.
+        if route.connection != self.connection {
+            return Err(PromptEmitError::WrongConnection {
+                expected: self.connection,
+                got: route.connection,
+            });
+        }
+        if self.phase != Phase::Bound {
+            return Err(PromptEmitError::ConnectionDead);
+        }
+        if !matches!(
+            self.objects.get(&route.consent_wire_id),
+            Some(ObjectKind::Consent)
+        ) {
+            return Err(PromptEmitError::UnknownConsentObject {
+                wire_id: route.consent_wire_id,
+            });
+        }
+        let shown = consent::events::State {
+            state: ConsentState::Shown,
+        };
+        send(&shown.encode(route.consent_wire_id), None).map_err(PromptEmitError::Transport)
+    }
+
     /// Deliver one petition resolution on this connection: the **single
     /// emission path** for the petition terminal (module docs), shared by
     /// immediate resolutions (admission refusals, auto-approve) and
@@ -1722,6 +1847,7 @@ pub(crate) mod tests {
         BoundPrincipal, RejectionCause, StaticPrincipal, StaticVerifier, STATIC_TOKEN_SCHEME,
     };
     use crate::input::PHYSICAL_HOLD_WINDOW;
+    use crate::petitions::PetitionId;
     use crate::petitions::{ConsentPolicy, PetitionConfig, ScriptedDecision, ScriptedError};
     use vitrin_protocol::generated::vitrin_actuator_pointer::{Axis, ButtonState};
 
@@ -2676,6 +2802,432 @@ pub(crate) mod tests {
             &mut shared,
             2,
         );
+    }
+
+    // -- acceptance: human consent decisions (P1.7.2) ----------------------
+
+    /// Raise `petition`'s prompt the way the M1.1 embedder will: arm the
+    /// grab against a real consent surface, then announce `shown` on the
+    /// petitioner's connection. Returns the surface so the caller can lower
+    /// it, mirroring the real ownership (the backend owns the surface).
+    fn raise_prompt(
+        server: &mut PrincipalServer,
+        core: &mut Connection,
+        shared: &mut Shared,
+        grab: &mut crate::consent::grab::ConsentGrab,
+        surface: &mut crate::consent::ConsentSurface,
+        petition: PetitionId,
+    ) {
+        let route = grab
+            .raise(
+                petition,
+                std::time::Instant::now(),
+                &mut shared.petitions,
+                surface,
+                &mut shared.recorder,
+            )
+            .expect("the petition is pending");
+        server
+            .emit_consent_shown(route, &mut |frame, fd| core.send_message(frame, fd))
+            .expect("announce the prompt");
+    }
+
+    #[test]
+    fn allowing_a_prompt_activates_the_grant_the_agent_then_uses() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The P1.7.2 acceptance criterion "Allow activates the grant; the
+        // agent's next request under it succeeds", closed end to end over
+        // the real wire: queued -> shown -> (human clicks Allow) -> closed
+        // -> resolved(granted), and the very next actuation is admitted.
+        use crate::consent::grab::ConsentGrab;
+        use crate::consent::{Choice, ConsentSurface};
+
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        let petition = shared.petitions.pending_ids()[0];
+        let mut grab = ConsentGrab::new();
+        let mut surface = ConsentSurface::new();
+        grab.set_view((VIEW_W, VIEW_H));
+        raise_prompt(
+            &mut server,
+            &mut core,
+            &mut shared,
+            &mut grab,
+            &mut surface,
+            petition,
+        );
+        expect_consent_state(&mut client, 5, ConsentState::Shown);
+
+        // Mid-prompt actuation reaches nothing. On *this* facet the
+        // refusal is `not_granted` rather than `consent_held`, and that is
+        // the chokepoint being honest rather than a gap: the facet's own
+        // grant has not resolved, so it confers nothing yet, and the chain
+        // answers the authority question before the use-context one
+        // (`enforcement`, step 3 before step 5b). `consent_held` is the
+        // refusal for a principal holding an *already live* grant while a
+        // new petition's prompt is up -- proved end to end, all the way to
+        // a mock shim's seat, in `crate::input`'s
+        // `an_actuation_sent_mid_prompt_never_reaches_the_app`. Either way
+        // the property that matters here holds: the sink is the only route
+        // to the app, and nothing entered it.
+        client.send_message(&move_to(5, 5), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_refused(&mut client, 4, Verb::ACTUATE_POINTER, Refusal::NotGranted);
+        assert!(
+            shared.actuations.is_empty(),
+            "no actuation may reach the app while the prompt is up"
+        );
+
+        // The human clicks "Allow while running".
+        let choice = Choice::Allow(crate::grants::PersistenceRung::WhileRunning);
+        let resolution = shared
+            .petitions
+            .resolve_human(petition, choice)
+            .expect("still pending");
+        grab.lower(&mut shared.petitions, &mut surface);
+        deliver(&mut server, &mut core, &mut shared, resolution);
+
+        expect_consent_state(&mut client, 5, ConsentState::Closed);
+        let resolved = expect_resolved(&mut client, 4);
+        assert_eq!(resolved.outcome, Outcome::Granted);
+        assert_eq!(
+            resolved.verbs,
+            all_verbs(),
+            "the petitioned verbs, verbatim"
+        );
+        assert_eq!(resolved.persistence, WirePersistence::WhileRunning);
+
+        // The grant is live and the agent's next request under it succeeds
+        // -- the criterion, asserted through the real facet arm rather than
+        // by inspecting the table.
+        let row = server.grant_row_id(4).expect("wire handle maps to a row");
+        assert_eq!(
+            shared.grants.get(row, shared.now).unwrap().0.issuer,
+            Issuer::HumanConsent
+        );
+        client.send_message(&move_to(7, 8), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        assert_eq!(
+            shared.actuations.len(),
+            1,
+            "the prompt is closed: the agent's next actuation is admitted"
+        );
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            1,
+        );
+    }
+
+    #[test]
+    fn denying_a_prompt_returns_a_clean_denial_event() {
+        let _fd = crate::capture::tests::fd_lock();
+        // "Deny returns a denial event (a clean protocol event, not a hang
+        // or a disconnect)": the terminal arrives with zeroed effective
+        // arguments, no authority exists, and the connection is still
+        // serving requests afterwards.
+        use crate::consent::grab::ConsentGrab;
+        use crate::consent::{Choice, ConsentSurface};
+
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        let petition = shared.petitions.pending_ids()[0];
+        let mut grab = ConsentGrab::new();
+        let mut surface = ConsentSurface::new();
+        grab.set_view((VIEW_W, VIEW_H));
+        raise_prompt(
+            &mut server,
+            &mut core,
+            &mut shared,
+            &mut grab,
+            &mut surface,
+            petition,
+        );
+        expect_consent_state(&mut client, 5, ConsentState::Shown);
+
+        let resolution = shared
+            .petitions
+            .resolve_human(petition, Choice::Deny)
+            .expect("still pending");
+        grab.lower(&mut shared.petitions, &mut surface);
+        deliver(&mut server, &mut core, &mut shared, resolution);
+
+        expect_consent_state(&mut client, 5, ConsentState::Closed);
+        let resolved = expect_resolved(&mut client, 4);
+        assert_eq!(resolved.outcome, Outcome::Denied);
+        assert_eq!(resolved.verbs, Verb::default(), "trailing arguments zeroed");
+        assert_eq!(resolved.expiry_ms, 0);
+        assert_eq!(server.grant_row_id(4), None);
+        assert_eq!(shared.grants.rows(shared.now).count(), 0);
+
+        // Not a hang and not a disconnect: the connection still answers.
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            2,
+        );
+    }
+
+    #[test]
+    fn every_consent_state_is_delivered_before_the_grant_terminal() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The IDL's ordering guarantee, asserted over the *whole* event
+        // stream rather than event by event: every `state` this petition
+        // produced precedes its `resolved`, on the wire and in the log.
+        use crate::consent::grab::ConsentGrab;
+        use crate::consent::{Choice, ConsentSurface};
+
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+
+        let petition = shared.petitions.pending_ids()[0];
+        let mut grab = ConsentGrab::new();
+        let mut surface = ConsentSurface::new();
+        grab.set_view((VIEW_W, VIEW_H));
+        raise_prompt(
+            &mut server,
+            &mut core,
+            &mut shared,
+            &mut grab,
+            &mut surface,
+            petition,
+        );
+        let resolution = shared
+            .petitions
+            .resolve_human(petition, Choice::Deny)
+            .expect("still pending");
+        grab.lower(&mut shared.petitions, &mut surface);
+        deliver(&mut server, &mut core, &mut shared, resolution);
+
+        // The wire: three states in lifecycle order, then the terminal.
+        for want in [
+            ConsentState::Queued,
+            ConsentState::Shown,
+            ConsentState::Closed,
+        ] {
+            expect_consent_state(&mut client, 5, want);
+        }
+        assert_eq!(expect_resolved(&mut client, 4).outcome, Outcome::Denied);
+
+        // The log preserves the same order (the recorder's subject is the
+        // moment core state changed, and it writes before it sends).
+        let log = shared.log();
+        let order: Vec<&str> = log
+            .iter()
+            .filter(|e| matches!(e.str("kind"), "consent_transition" | "petition_resolved"))
+            .map(|e| {
+                if e.str("kind") == "petition_resolved" {
+                    "resolved"
+                } else {
+                    e.str("state")
+                }
+            })
+            .collect();
+        assert_eq!(order, ["queued", "shown", "closed", "resolved"]);
+    }
+
+    #[test]
+    fn every_consent_decision_lands_in_the_flight_recorder_with_its_cause() {
+        let _fd = crate::capture::tests::fd_lock();
+        // "Every consent decision -- including auto-approvals -- lands in
+        // the recorder with its cause." One run per cause, each asserting
+        // the outcome and the issuer the log states.
+        use crate::consent::grab::ConsentGrab;
+        use crate::consent::{Choice, ConsentSurface};
+
+        // 1. Human allow -> granted, issuer human_consent.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        let petition = shared.petitions.pending_ids()[0];
+        let mut grab = ConsentGrab::new();
+        let mut surface = ConsentSurface::new();
+        grab.set_view((VIEW_W, VIEW_H));
+        raise_prompt(
+            &mut server,
+            &mut core,
+            &mut shared,
+            &mut grab,
+            &mut surface,
+            petition,
+        );
+        let resolution = shared
+            .petitions
+            .resolve_human(
+                petition,
+                Choice::Allow(crate::grants::PersistenceRung::WhileRunning),
+            )
+            .expect("pending");
+        grab.lower(&mut shared.petitions, &mut surface);
+        deliver(&mut server, &mut core, &mut shared, resolution);
+        let entry = last_resolution(&shared);
+        assert_eq!(entry.str("outcome"), "granted");
+        assert_eq!(entry.str("issuer"), "human_consent");
+        // The `shown` transition is recorded too, naming its petition --
+        // without it the log could not say a human was ever asked.
+        let shown = shared
+            .log()
+            .into_iter()
+            .find(|e| e.str("kind") == "consent_transition" && e.str("state") == "shown")
+            .expect("the raised prompt is recorded");
+        assert!(!shown.is_null("petition"));
+
+        // 2. Human deny -> denied, no issuer (nothing was granted).
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        let petition = shared.petitions.pending_ids()[0];
+        let resolution = shared
+            .petitions
+            .resolve_human(petition, Choice::Deny)
+            .expect("pending");
+        deliver(&mut server, &mut core, &mut shared, resolution);
+        let entry = last_resolution(&shared);
+        assert_eq!(entry.str("outcome"), "denied");
+        assert!(entry.is_null("issuer"));
+
+        // 3. Timeout -> timed_out (a decision by default, and the one a
+        //    human never made -- so the log must say it happened).
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        shared.now += Duration::from_secs(120);
+        let due = shared.petitions.expire_due(shared.now);
+        assert_eq!(due.len(), 1);
+        deliver(
+            &mut server,
+            &mut core,
+            &mut shared,
+            due.into_iter().next().unwrap(),
+        );
+        assert_eq!(last_resolution(&shared).str("outcome"), "timed_out");
+
+        // 4. Auto-approve -> granted, issuer auto_approve_policy. The
+        //    loudest case: a grant no human ever saw must be as legible in
+        //    the log as one they clicked.
+        let mut shared = Shared::new(ConsentPolicy::AutoApprove);
+        let (mut server, mut core, mut client) = connect(&mut shared);
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        let entry = last_resolution(&shared);
+        assert_eq!(entry.str("outcome"), "granted");
+        assert_eq!(entry.str("issuer"), "auto_approve_policy");
+    }
+
+    /// The most recent `petition_resolved` entry in this rig's log.
+    fn last_resolution(shared: &Shared) -> crate::recorder::tests::Json {
+        shared
+            .log()
+            .into_iter()
+            .rfind(|e| e.str("kind") == "petition_resolved")
+            .expect("a resolution was recorded")
+    }
+
+    #[test]
+    fn a_prompt_cannot_be_announced_for_another_connection_or_a_dead_one() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The emission guards: a misrouted prompt surfaces as the routing
+        // bug it is rather than vanishing, and a connection past its
+        // terminal never receives another event.
+        use crate::consent::grab::ConsentGrab;
+        use crate::consent::ConsentSurface;
+
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+        let petition = shared.petitions.pending_ids()[0];
+
+        let mut grab = ConsentGrab::new();
+        let mut surface = ConsentSurface::new();
+        grab.set_view((VIEW_W, VIEW_H));
+        let route = grab
+            .raise(
+                petition,
+                std::time::Instant::now(),
+                &mut shared.petitions,
+                &mut surface,
+                &mut shared.recorder,
+            )
+            .expect("pending");
+
+        // Wrong connection: refused, nothing sent.
+        let stranger = crate::petitions::PromptRoute {
+            connection: shared.petitions.register_connection(),
+            consent_wire_id: route.consent_wire_id,
+        };
+        assert!(matches!(
+            server.emit_consent_shown(stranger, &mut |f, fd| core.send_message(f, fd)),
+            Err(PromptEmitError::WrongConnection { .. })
+        ));
+
+        // An id that is not a consent object on this connection: refused.
+        let bogus = crate::petitions::PromptRoute {
+            connection: route.connection,
+            consent_wire_id: 4, // the grant handle, not the consent object
+        };
+        assert!(matches!(
+            server.emit_consent_shown(bogus, &mut |f, fd| core.send_message(f, fd)),
+            Err(PromptEmitError::UnknownConsentObject { wire_id: 4 })
+        ));
+
+        // The real route works, and after teardown nothing more is sent --
+        // an expected race (the petitioner dies as its prompt goes up).
+        assert!(server
+            .emit_consent_shown(route, &mut |f, fd| core.send_message(f, fd))
+            .is_ok());
+        expect_consent_state(&mut client, 5, ConsentState::Shown);
+        server.teardown(
+            &mut shared.petitions,
+            &mut shared.grants,
+            &mut shared.recorder,
+        );
+        assert!(matches!(
+            server.emit_consent_shown(route, &mut |f, fd| core.send_message(f, fd)),
+            Err(PromptEmitError::ConnectionDead)
+        ));
     }
 
     #[test]

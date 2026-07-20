@@ -98,29 +98,39 @@
 //! up across a thousand frames is rasterized once — an important property
 //! given the nested backend redraws at the host's frame cadence.
 //!
-//! # What this task deliberately does not do
+//! # The two halves, and what is still missing
 //!
-//! This is the renderer only. Two seams are left clean and unattached:
+//! This module is the renderer (P1.7.1). Its sibling [`grab`] is the trust
+//! half (P1.7.2): the input grab that makes a shown prompt exclusive, and
+//! the routing of a click into a petition resolution. The seam between them
+//! is small and deliberate — [`Card::buttons`] reports every choice's
+//! rectangle in card-local pixels, [`centered`] places the card in the view,
+//! and [`grab::ConsentGrab::raise`] is the single call that shows the
+//! prompt, marks it shown in the petition registry (making the enforcement
+//! chokepoint's `consent_held` refusal true), and seizes physical input, so
+//! those three cannot drift apart.
 //!
-//! - **P1.7.2 (issue #38) — input grab and decisions.** [`Card::buttons`]
-//!   reports every choice's rectangle and [`ConsentSurface::card_origin`]
-//!   reports where the card sits in the view, which is everything a hit test
-//!   needs; [`crate::input::InputRouter`]'s existing preemption hook is where
-//!   the grab attaches. That task also calls
-//!   [`crate::petitions::PetitionRegistry::mark_prompt_shown`] and emits
-//!   `vitrin_consent.state(shown)` when it puts a prompt up — the flag the
-//!   enforcement chokepoint already reads for its `consent_held` refusal, so
-//!   nothing in the chokepoint changes when it lands.
-//! - **P1.7.3 (issue #39) — hold-Esc revocation.** Nothing here.
+//! Still unattached:
 //!
-//! Consequently nothing at runtime shows a prompt yet: no code calls
-//! [`ConsentSurface::show`], because the petition registry that would name a
-//! petition is itself only constructed by the M1.1 listener wiring (issue
-//! #77). Stated plainly rather than implied: **a running `vitrind` renders no
-//! consent prompt.** Both backends carry a live, empty [`ConsentSurface`] and
-//! composite through it every frame, and the acceptance criteria are held by
-//! the tests below and in [`crate::backend::headless`], which drive the same
-//! surface through the same backend paths.
+//! - **P1.7.3 (issue #39) — hold-Esc revocation.** Nothing here. The grab
+//!   deliberately gives Escape no meaning so that chord arrives
+//!   unencumbered; see [`grab`]'s keyboard section.
+//! - **Issue #85 — no trusted indicator.** A confined app can draw a
+//!   byte-identical replica of this card, and nothing yet lets a human tell
+//!   the difference. Tracked separately; [`render`] refuses to *claim*
+//!   otherwise, and [`grab`] notes the one partial mitigation (a replica
+//!   gets no input grab).
+//!
+//! Nothing at runtime shows a prompt yet, because the petition registry that
+//! would name a petition is only constructed by the M1.1 listener wiring
+//! (issue #77). Stated plainly rather than implied: **a running `vitrind`
+//! renders no consent prompt, and therefore never grabs input.** Both
+//! backends carry a live, empty [`ConsentSurface`] and composite through it
+//! every frame; the nested backend additionally carries a live, idle
+//! [`grab::ConsentGrab`] in its input router, so the grab is armed the
+//! instant something raises a prompt. The acceptance criteria are held by
+//! the tests in these modules, in [`crate::input`] (through the real router
+//! and the real wire to a mock shim), and in [`crate::backend::headless`].
 //!
 //! [`Scene::generation`]: crate::scene::Scene::generation
 //! [`PrincipalIdentity`]: crate::identity::PrincipalIdentity
@@ -129,6 +139,7 @@
 //! [`Card::buttons`]: render::Card::buttons
 
 pub(crate) mod canvas;
+pub(crate) mod grab;
 pub(crate) mod render;
 mod text;
 
@@ -289,30 +300,61 @@ impl ConsentSurface {
         }
     }
 
-    /// Put a prompt up. The P1.7.2 seam: that task calls this in the same
-    /// step it calls [`crate::petitions::PetitionRegistry::mark_prompt_shown`]
-    /// and emits `vitrin_consent.state(shown)`, so "on screen", "input
-    /// grabbed", and "`consent_held` holds" become one moment rather than
-    /// three that can drift.
+    /// Put a prompt up.
     ///
-    /// Replacing a prompt is legal and is how a queue advances; the caller
-    /// owns which petition is at the front.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn show(&mut self, prompt: PromptContent) {
+    /// **Visible only inside `crate::consent`**, so that
+    /// [`grab::ConsentGrab::raise`] is the only way the rest of the core can
+    /// show a prompt. That is the P1.7.2 seam made structural rather than
+    /// requested: `raise` calls this, then
+    /// [`crate::petitions::PetitionRegistry::mark_prompt_shown`], then arms
+    /// the input grab, then records it — so "on screen", "input grabbed",
+    /// "`consent_held` holds" and "the log says so" are one moment rather
+    /// than four that can drift. A prompt shown without the grab is a prompt
+    /// an agent can act around, and a `show` *while* a prompt is raised
+    /// would leave the grab hit-testing the previous card's geometry — the
+    /// human clicking one button and the core reading another. Neither is
+    /// reachable while this is private.
+    ///
+    /// Replacing a prompt is legal at this level and is how a queue
+    /// advances; `raise`/`lower` own which petition is at the front.
+    pub(in crate::consent) fn show(&mut self, prompt: PromptContent) {
         self.prompt = Some(prompt);
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Take the prompt down (a decision, a timeout, or the petitioner
-    /// disconnecting — every path that removes the petition from the pending
-    /// table). Drops the cached raster: a prompt that is down must not keep
-    /// a rendered copy of a decided petition's contents alive.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn dismiss(&mut self) {
+    /// Take the prompt down (a decision, a timeout, the petitioner
+    /// disconnecting, or a queue advancing). Drops the cached raster: a
+    /// prompt that is down must not keep a rendered copy of a decided
+    /// petition's contents alive.
+    ///
+    /// Private to `crate::consent` for the reason [`Self::show`] is: the
+    /// only caller is [`grab::ConsentGrab::lower`], which pairs this with
+    /// releasing the input grab and clearing the registry's `prompt_shown`
+    /// flag.
+    pub(in crate::consent) fn dismiss(&mut self) {
         if self.prompt.take().is_some() {
             self.card = None;
             self.generation = self.generation.wrapping_add(1);
         }
+    }
+
+    /// Test-only `show`, for the two backends' compositing tests.
+    ///
+    /// They render a fixture card to assert the *pixels* — scrim, placement,
+    /// texture-cache invalidation — and have no petition, no registry and no
+    /// grab to raise one with. Keeping the production door closed and
+    /// opening a named test one is the honest split: it costs a rename in
+    /// tests and buys "nothing outside `crate::consent` can put a prompt on
+    /// screen" as a compile-time fact.
+    #[cfg(test)]
+    pub(crate) fn show_for_test(&mut self, prompt: PromptContent) {
+        self.show(prompt);
+    }
+
+    /// Test-only `dismiss` — see [`Self::show_for_test`].
+    #[cfg(test)]
+    pub(crate) fn dismiss_for_test(&mut self) {
+        self.dismiss();
     }
 
     /// The prompt currently up, if any.
@@ -341,9 +383,20 @@ impl ConsentSurface {
     /// Where the card's top-left corner sits in a `view_width x view_height`
     /// view: exactly centered.
     ///
-    /// Public because P1.7.2 needs it: card-local button rectangles
-    /// ([`render::Card::buttons`]) plus this origin is the whole coordinate
-    /// mapping for a hit test.
+    /// Card-local button rectangles ([`render::Card::buttons`]) plus this
+    /// origin is the whole coordinate mapping for a hit test.
+    ///
+    /// P1.7.2 ended up **not** calling this, and the reason is worth
+    /// recording rather than leaving as a puzzle: hit-testing happens inside
+    /// the input router's preemption hook, which does not hold the backend's
+    /// [`ConsentSurface`] (and could not take the `&mut` this needs for its
+    /// lazy raster while a frame is being composed). [`grab::ConsentGrab`]
+    /// therefore snapshots the card's *size* when it raises a prompt and
+    /// derives the origin itself — through [`centered`], the same function
+    /// this and [`Self::composite_over`] use, so all three agree by
+    /// construction rather than by coincidence. This accessor stays as the
+    /// readable statement of that placement, and as the thing the tests
+    /// assert the composite against.
     ///
     /// # A view smaller than the card
     ///

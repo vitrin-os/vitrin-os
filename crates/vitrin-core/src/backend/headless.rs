@@ -758,7 +758,7 @@ mod tests {
 
         // The prompt goes up. This is the moment P1.7.2 will pair with
         // `mark_prompt_shown` + `vitrin_consent.state(shown)`.
-        state.consent.show(prompt_fixture());
+        state.consent.show_for_test(prompt_fixture());
         state.redraw().expect("recomposite with the prompt up");
 
         // --- Human-visible side: the prompt is really on the display. ---
@@ -842,7 +842,7 @@ mod tests {
         );
 
         // Taking the prompt down restores the human-visible output exactly.
-        state.consent.dismiss();
+        state.consent.dismiss_for_test();
         state.redraw().expect("recomposite with the prompt down");
         assert_eq!(
             state.latest_output_rgba().expect("readback"),
@@ -877,12 +877,12 @@ mod tests {
 
         for prompt_up in [false, true] {
             if prompt_up {
-                state.consent.show(prompt_fixture());
+                state.consent.show_for_test(prompt_fixture());
             }
             state.redraw().expect("redraw");
             let mut expected = crate::consent::ConsentSurface::new();
             if prompt_up {
-                expected.show(prompt_fixture());
+                expected.show_for_test(prompt_fixture());
             }
             assert_eq!(
                 state.latest_output_rgba().expect("readback"),
@@ -925,7 +925,7 @@ mod tests {
         state.scene.commit(
             SurfaceContent::from_rgba(painted.clone(), 300, 200).expect("well-formed content"),
         );
-        state.consent.show(prompt_fixture());
+        state.consent.show_for_test(prompt_fixture());
         state
             .redraw()
             .expect("redraw with a prompt over a live realm");
@@ -955,7 +955,7 @@ mod tests {
             "the scrub must not silently take the prompt down"
         );
         let mut expected = crate::consent::ConsentSurface::new();
-        expected.show(prompt_fixture());
+        expected.show_for_test(prompt_fixture());
         assert_eq!(
             state.latest_output_rgba().expect("readback"),
             super::super::compose_human_visible(&crate::scene::Scene::new(), &mut expected, VW, VH),

@@ -623,9 +623,20 @@ pub(crate) fn default_config_path() -> Result<PathBuf, ConfigPathError> {
     Ok(config_dir()?.join(CONFIG_FILE_NAME))
 }
 
+/// `$XDG_CONFIG_HOME/vitrin/principals.toml` -- the default the
+/// `--principals` flag falls back to.
+///
+/// Lives here rather than in [`crate::identity`] so that **one** function
+/// resolves the core's configuration directory: two resolvers would be two
+/// chances to disagree about where an operator's files are, and a session
+/// that read its realm from one directory and its principal registry from
+/// another would be a security surprise, not a convenience.
+pub(crate) fn default_principals_path() -> Result<PathBuf, ConfigPathError> {
+    Ok(config_dir()?.join(crate::identity::REGISTRY_FILE_NAME))
+}
+
 /// `$XDG_CONFIG_HOME/vitrin` (or `$HOME/.config/vitrin`) -- also where
-/// `principals.toml` conventionally lives, so the `--principals` flag can
-/// reuse this when the M1.1 listener wiring lands.
+/// `principals.toml` lives ([`default_principals_path`]).
 fn config_dir() -> Result<PathBuf, ConfigPathError> {
     // Per the XDG spec, a relative $XDG_CONFIG_HOME must be ignored:
     // honoring one would make the config location depend on the cwd

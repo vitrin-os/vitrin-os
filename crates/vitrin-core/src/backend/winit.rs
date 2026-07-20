@@ -18,7 +18,9 @@
 //! GPU-less CI) arrives with the headless backend in P1.3.2, where no host
 //! GL surface exists.
 
+use std::cell::{Cell, RefCell};
 use std::error::Error;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use calloop::signals::{Signal, Signals};
@@ -36,6 +38,7 @@ use smithay::reexports::winit::window::Window as WinitWindow;
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use tracing::{debug, error, info, trace};
 
+use crate::consent::grab::{ConsentGate, ConsentGrab};
 use crate::consent::ConsentSurface;
 use crate::input;
 use crate::scene::Scene;
@@ -129,14 +132,35 @@ struct NestedState {
     /// (P1.3.4) commits into it and requests a redraw.
     scene: Scene,
     /// The consent surface (P1.7.1): the prompt composited above the realm
-    /// view in the host window. Always present, empty until P1.7.2 puts a
-    /// petition up.
+    /// view in the host window. Always present; empty until something
+    /// raises a petition through [`ConsentGrab::raise`], which needs the
+    /// petition registry the M1.1 listener wiring constructs.
     consent: ConsentSurface,
     /// The input router (P1.3.7): host input tagged `physical` at intake
-    /// flows through it toward the realm's shim seat. Carries the MVP
-    /// no-op preemption hook, where the P1.7.2 consent grab and P1.7.3
-    /// revocation watcher later attach.
-    router: input::InputRouter<input::NoopHook>,
+    /// flows through it toward the realm's shim seat. Its preemption hook
+    /// is P1.7.2's consent grab, wrapping the MVP no-op hook that P1.7.3's
+    /// revocation watcher replaces — the stacking the hook point was
+    /// designed for, with no restructuring of the router.
+    router: input::InputRouter<ConsentGate<input::NoopHook>>,
+    /// The consent input grab (P1.7.2), shared with the router's gate:
+    /// while a prompt is up it owns physical input, and a click on one of
+    /// the card's buttons becomes a petition decision here.
+    ///
+    /// Live but idle. Nothing raises a prompt at runtime yet — that needs
+    /// the petition registry the M1.1 listener wiring constructs (issue
+    /// #77) — so this grab consumes nothing and produces no decisions in a
+    /// running `vitrind`. It is carried anyway, rather than attached later,
+    /// because the alternative is a window in which a prompt could be shown
+    /// with no grab behind it.
+    grab: Rc<RefCell<ConsentGrab>>,
+    /// The dispatch turn's instant, shared with the router's
+    /// [`ConsentGate`]. The hook trait carries no clock by design, so the
+    /// embedder that drives `route` advances this cell first — the same
+    /// arrangement `input::PresenceHook` uses. The grab reads it for its
+    /// guard interval (a press must not decide before the human could have
+    /// read the card) and its deadline backstop (a grab must not outlive
+    /// its petition).
+    now: Rc<Cell<Instant>>,
     view: Option<SceneTexture>,
     loop_signal: LoopSignal,
     loop_handle: LoopHandle<'static, NestedState>,
@@ -198,11 +222,19 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         WinitEvent::Focus(_) => {}
     })?;
 
+    let grab = Rc::new(RefCell::new(ConsentGrab::new()));
+    let now = Rc::new(Cell::new(Instant::now()));
     let mut state = NestedState {
         backend,
         scene: Scene::new(),
         consent: ConsentSurface::new(),
-        router: input::InputRouter::new(input::NoopHook),
+        router: input::InputRouter::new(ConsentGate::new(
+            Rc::clone(&grab),
+            Rc::clone(&now),
+            input::NoopHook,
+        )),
+        grab,
+        now,
         view: None,
         loop_signal: event_loop.get_signal(),
         loop_handle: event_loop.handle(),
@@ -240,6 +272,17 @@ impl NestedState {
     fn handle_input(&mut self, event: &smithay::backend::input::InputEvent<WinitInput>) {
         let size = self.backend.window_size();
         let view = (size.w.max(0) as u32, size.h.max(0) as u32);
+        // The consent grab hit-tests in this same view space, so it is fed
+        // from this same local, on the line before the route that uses it.
+        // A view sourced anywhere else could drift from the one the router
+        // maps with, and a drifted hit test can turn a click aimed at Deny
+        // into an Allow (see `consent::grab`).
+        self.grab.borrow_mut().set_view(view);
+        // One clock sample for the whole dispatch turn, taken before any
+        // event of it is judged, so every event in this batch is judged
+        // against the same instant (the clock discipline the rest of the
+        // core follows). The grab reads it through the gate.
+        self.now.set(Instant::now());
         for tagged in input::intake_physical(event, (size.w, size.h)) {
             if let Some(delivery) = self.router.route(tagged, view, self.scene.surface_size()) {
                 // P1.5.2 hands this to ShimServer::deliver_seat_event on
@@ -384,14 +427,14 @@ mod tests {
         );
 
         // Prompt up: the window shows the shared human-visible composition.
-        consent.show(prompt_fixture());
+        consent.show_for_test(prompt_fixture());
         let with_prompt = window_pixels(&scene, &mut consent, size);
         assert_ne!(
             with_prompt, plain,
             "the prompt must change what is uploaded"
         );
         let mut expected = ConsentSurface::new();
-        expected.show(prompt_fixture());
+        expected.show_for_test(prompt_fixture());
         assert_eq!(
             with_prompt,
             super::super::compose_human_visible(&scene, &mut expected, W as u32, H as u32),
@@ -438,21 +481,21 @@ mod tests {
         );
 
         // A prompt going up, and coming back down, both re-upload.
-        consent.show(prompt_fixture());
+        consent.show_for_test(prompt_fixture());
         let shown = TextureKey::current(size, &scene, &consent);
         assert_ne!(base, shown, "a prompt appearing must re-upload");
-        consent.dismiss();
+        consent.dismiss_for_test();
         let dismissed = TextureKey::current(size, &scene, &consent);
         assert_ne!(shown, dismissed, "a prompt going away must re-upload");
 
         // The queue advancing to a different petition re-uploads too, so the
         // window cannot keep showing a decided petition's card.
-        consent.show(prompt_fixture());
+        consent.show_for_test(prompt_fixture());
         let first = TextureKey::current(size, &scene, &consent);
         let mut next = prompt_fixture();
         next.principal =
             crate::identity::PrincipalIdentity::parse("vitrin://local/agent/other").unwrap();
-        consent.show(next);
+        consent.show_for_test(next);
         assert_ne!(
             first,
             TextureKey::current(size, &scene, &consent),

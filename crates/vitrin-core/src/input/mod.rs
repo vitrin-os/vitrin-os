@@ -82,6 +82,22 @@
 //! the app never saw pressed, and no delivered press is ever left
 //! stranded by someone else's release.
 //!
+//! **Keys pair the same way, per keysym.** Keys carry no geometry, so they
+//! never route on position — but the razor above is not about geometry, it
+//! is about the app's press/release accounting, and a keyboard has exactly
+//! the same accounting. Without pairing, any policy that stops a key
+//! *release* (P1.7.2's consent grab is the first, and [`Gate::Consume`]
+//! promises to reconcile what it stops) would leave the app believing a
+//! key is still held: a latched `Ctrl`/`Alt`/`Super` silently rewrites the
+//! meaning of every keystroke the app receives afterwards, and a latched
+//! letter autorepeats. So the router tracks the keysyms whose press it
+//! delivered and drops any release that does not pair with one, exactly as
+//! it does for button codes. Pairing by keysym rather than by scancode is
+//! sound here because [`invariant_keysym`] is a fixed scancode→keysym
+//! table with no modifier resolution — the same physical key yields the
+//! same keysym on press and on release, by construction. If the core ever
+//! grows a real keymap, pairing must move to the scancode.
+//!
 //! # The preemption hook (defined now, consumed by P1.7.x)
 //!
 //! [`PreemptionHook`] is **the single point** in the router where policy
@@ -114,9 +130,14 @@
 //!    — so a consuming gate can never wedge the router's grab (see
 //!    [`Gate::Consume`] and the pairing contract on [`PreemptionHook`]).
 //!
-//! The MVP implementation is [`NoopHook`] (observe nothing, deliver
-//! everything) — the shape, placement, and ordering are the deliverable;
-//! both P1.7.x consumers attach without restructuring the router.
+//! The gate side is now taken: [`crate::consent::grab::ConsentGate`]
+//! (P1.7.2) attached without restructuring anything, as promised — the
+//! nested backend's router is `InputRouter<ConsentGate<NoopHook>>`, and
+//! P1.7.3's watcher replaces that innermost [`NoopHook`]. Its policy lives
+//! entirely in that module; what matters here is that it honours the pairing
+//! contract below by never consuming a release, and that it judges by the
+//! origin tag intake bound rather than by any authority question — the
+//! router still holds no authority check, and must not grow one.
 //!
 //! The first real observe-side consumer is [`PresenceHook`] (P1.4.4): it
 //! feeds [`PhysicalPresence`], the physical-activity state behind the
@@ -320,14 +341,15 @@ pub(crate) enum Gate {
     Deliver,
     /// Consume: the event stops here — no mapping, no wire. A consumed
     /// press starts no implicit grab. A consumed **release** whose press
-    /// the router delivered still clears that press's grab bookkeeping
-    /// (delivered-state reconciliation, nothing on the wire): the
-    /// router's grab can never wedge on a consuming gate, but the app is
-    /// left holding the press — the gate implementor's debt. A grab that
-    /// wants clean app-side pairing simply never consumes releases: the
-    /// router's per-button-code pairing already drops unpaired ones, so
-    /// answering [`Gate::Deliver`] for a release can never leak input
-    /// the app should not see.
+    /// the router delivered still clears that press's bookkeeping
+    /// (delivered-state reconciliation, nothing on the wire) — for button
+    /// codes *and* keysyms alike: the router's grab can never wedge on a
+    /// consuming gate, but the app is left holding the press — the gate
+    /// implementor's debt. A grab that wants clean app-side pairing simply
+    /// never consumes releases of either kind: the router's per-button-code
+    /// and per-keysym pairing already drops unpaired ones, so answering
+    /// [`Gate::Deliver`] for a release can never leak input the app should
+    /// not see.
     Consume,
 }
 
@@ -338,14 +360,16 @@ pub(crate) enum Gate {
 ///
 /// **Pairing contract for gate implementors.** A gate that begins
 /// consuming while router-delivered presses are outstanding (a consent
-/// grab seizing input mid-drag) should keep answering [`Gate::Deliver`]
-/// for button *releases* — hold-until-release. That is always safe: the
-/// router's per-button-code pairing drops any release whose press was
-/// not delivered, so a blanket-delivered release can never leak input
-/// the app should not see, and the app's press/release accounting stays
-/// intact. A gate that consumes such a release instead does not wedge
-/// the router (the grab bookkeeping is reconciled; see [`Gate::Consume`])
-/// but strands the press app-side — its debt to settle.
+/// grab seizing input mid-drag, or mid-keystroke) should keep answering
+/// [`Gate::Deliver`] for *every* release — pointer button and key alike —
+/// hold-until-release. That is always safe: the router's per-button-code
+/// and per-keysym pairing drops any release whose press was not
+/// delivered, so a blanket-delivered release can never leak input the app
+/// should not see, and the app's press/release accounting stays intact. A
+/// gate that consumes such a release instead does not wedge the router
+/// (the bookkeeping is reconciled; see [`Gate::Consume`]) but strands the
+/// press app-side — its debt to settle, and on the keyboard that debt is
+/// a latched modifier that changes the meaning of everything typed after.
 ///
 /// [`observe`]: PreemptionHook::observe
 /// [`gate`]: PreemptionHook::gate
@@ -545,6 +569,13 @@ pub(crate) struct InputRouter<H: PreemptionHook> {
     /// the surface; a release is delivered iff its code is present here —
     /// per-button pairing, Wayland-style, never a bare count.
     pressed: Vec<u32>,
+    /// Keysyms of delivered-and-unreleased key presses, same multiset
+    /// discipline as [`Self::pressed`] and for the same razor: a key
+    /// release is delivered iff its own press was (module docs). Keys hold
+    /// no implicit grab — they carry no geometry — so this is *only*
+    /// pairing, and it is what lets a consuming gate stop a key release
+    /// without leaving a latched modifier in the app.
+    pressed_keys: Vec<u32>,
 }
 
 impl<H: PreemptionHook> InputRouter<H> {
@@ -553,21 +584,23 @@ impl<H: PreemptionHook> InputRouter<H> {
             hook,
             pointer: None,
             pressed: Vec::new(),
+            pressed_keys: Vec::new(),
         }
     }
 
     /// Forget all per-shim-generation seat state: the implicit-grab
-    /// bookkeeping and the last known pointer position. Invoked by the
-    /// realm teardown funnel
+    /// bookkeeping, the key pairing, and the last known pointer position.
+    /// Invoked by the realm teardown funnel
     /// ([`ShimServer::connection_closed`](crate::shim::ShimServer::connection_closed)),
     /// so no state can survive into the next shim generation: a stale
     /// grab would route off-surface input to an app that never saw the
-    /// press, a stale release would arrive unpaired at the fresh seat,
-    /// and a stale pointer position would let a press hit-test geometry
-    /// the new shim never produced. First motion re-establishes the
-    /// pointer.
+    /// press, a stale release (button or key) would arrive unpaired at the
+    /// fresh seat, and a stale pointer position would let a press hit-test
+    /// geometry the new shim never produced. First motion re-establishes
+    /// the pointer.
     pub fn reset(&mut self) {
         self.pressed.clear();
+        self.pressed_keys.clear();
         self.pointer = None;
     }
 
@@ -597,16 +630,25 @@ impl<H: PreemptionHook> InputRouter<H> {
         if self.hook.gate(&input) == Gate::Consume {
             // Delivered-state reconciliation: a consumed release still
             // physically ended a hold the app saw begin. Clear the
-            // press's grab bookkeeping — nothing is delivered — so a
-            // consuming gate can never wedge the implicit grab; the
-            // app-side pairing debt belongs to the gate implementor
-            // (`Gate::Consume` docs).
-            if let SeatInputKind::Button {
-                button,
-                state: ButtonState::Released,
-            } = &input.kind
-            {
-                self.release_pressed(*button);
+            // press's bookkeeping — nothing is delivered — so a consuming
+            // gate can never wedge the implicit grab or strand a keysym in
+            // the pairing table; the app-side pairing debt belongs to the
+            // gate implementor (`Gate::Consume` docs). Both release kinds
+            // are reconciled, because both are paired.
+            match &input.kind {
+                SeatInputKind::Button {
+                    button,
+                    state: ButtonState::Released,
+                } => {
+                    self.release_pressed(*button);
+                }
+                SeatInputKind::Key {
+                    keysym,
+                    state: KeyState::Released,
+                } => {
+                    self.release_pressed_key(*keysym);
+                }
+                _ => {}
             }
             return None;
         }
@@ -614,9 +656,23 @@ impl<H: PreemptionHook> InputRouter<H> {
         let SeatInput { origin, kind } = input;
         let kind = match kind {
             // Keyboard focus is held on the app shim-side (IDL: focus is
-            // synthesized in the shim in v1), so keys and text route
-            // unconditionally — no geometry involved.
-            SeatInputKind::Key { keysym, state } => SeatDeliveryKind::Key { keysym, state },
+            // synthesized in the shim in v1), so keys route without
+            // geometry — but not without pairing: a release is delivered
+            // iff its own press was, per keysym, so no policy that stops a
+            // key release can leave a latched modifier behind in the app
+            // (module docs).
+            SeatInputKind::Key { keysym, state } => match state {
+                KeyState::Pressed => {
+                    self.pressed_keys.push(keysym);
+                    SeatDeliveryKind::Key { keysym, state }
+                }
+                KeyState::Released => {
+                    if !self.release_pressed_key(keysym) {
+                        return None;
+                    }
+                    SeatDeliveryKind::Key { keysym, state }
+                }
+            },
             SeatInputKind::Text { text } => SeatDeliveryKind::Text { text },
 
             SeatInputKind::Motion { x, y } => {
@@ -673,6 +729,20 @@ impl<H: PreemptionHook> InputRouter<H> {
         match self.pressed.iter().position(|&b| b == button) {
             Some(i) => {
                 self.pressed.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove one delivered-press entry for `keysym`, if any; returns
+    /// whether one existed (i.e. whether a release of this keysym pairs
+    /// with a delivered press). The keyboard twin of
+    /// [`Self::release_pressed`].
+    fn release_pressed_key(&mut self, keysym: u32) -> bool {
+        match self.pressed_keys.iter().position(|&k| k == keysym) {
+            Some(i) => {
+                self.pressed_keys.remove(i);
                 true
             }
             None => false,
@@ -1902,6 +1972,559 @@ mod tests {
             Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             other => panic!("expected a silent wire, got: {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The consent grab through the real router (P1.7.2)
+    //
+    // These live here rather than in `crate::consent::grab` because
+    // `SeatInput::physical` is private to this module by design (B2), so
+    // this is the only place a physical-origin event can be minted and
+    // pushed through the router the way nested intake does.
+    // ------------------------------------------------------------------
+
+    /// What the *innermost* hook saw, counted separately for each half of
+    /// the trait.
+    ///
+    /// The observe tap is P1.7.3's attachment point, and its whole reason
+    /// to exist is that it keeps seeing raw physical events while a consent
+    /// grab consumes every one of them — the moment revocation matters most
+    /// is the moment a prompt is on screen. That property was asserted in
+    /// three doc comments and tested nowhere: the only wrapper test fed an
+    /// emulated event, which the grab passes through anyway, so it never
+    /// exercised the short-circuit path at all.
+    #[derive(Default)]
+    struct HookSpy {
+        observed: std::cell::Cell<usize>,
+        gated: std::cell::Cell<usize>,
+    }
+
+    struct SpyHook(Rc<HookSpy>);
+
+    impl PreemptionHook for SpyHook {
+        fn observe(&mut self, _input: &SeatInput) {
+            self.0.observed.set(self.0.observed.get() + 1);
+        }
+
+        fn gate(&mut self, _input: &SeatInput) -> Gate {
+            self.0.gated.set(self.0.gated.get() + 1);
+            Gate::Deliver
+        }
+    }
+
+    /// A router carrying the consent grab over a spy hook, plus everything
+    /// a test needs to raise a prompt, advance the clock, and read
+    /// decisions back.
+    struct Grabbed {
+        router: InputRouter<crate::consent::grab::ConsentGate<SpyHook>>,
+        grab: Rc<RefCell<crate::consent::grab::ConsentGrab>>,
+        surface: crate::consent::ConsentSurface,
+        /// The clock cell the embedder owns; `raise_at` and the tests
+        /// advance it exactly as the nested backend's `handle_input` does.
+        now: Rc<std::cell::Cell<std::time::Instant>>,
+        spy: Rc<HookSpy>,
+        /// Kept alive for the length of a test: `raise` records to it, and
+        /// dropping it removes the scratch log.
+        recorder: crate::recorder::Recorder,
+        log_path: std::path::PathBuf,
+    }
+
+    impl Grabbed {
+        fn new() -> Self {
+            let grab = Rc::new(RefCell::new(crate::consent::grab::ConsentGrab::new()));
+            let now = Rc::new(std::cell::Cell::new(std::time::Instant::now()));
+            let spy = Rc::new(HookSpy::default());
+            let router = InputRouter::new(crate::consent::grab::ConsentGate::new(
+                Rc::clone(&grab),
+                Rc::clone(&now),
+                SpyHook(Rc::clone(&spy)),
+            ));
+            let (recorder, log_path) = crate::recorder::tests::scratch_recorder("input-grab");
+            Self {
+                router,
+                grab,
+                surface: crate::consent::ConsentSurface::new(),
+                now,
+                spy,
+                recorder,
+                log_path,
+            }
+        }
+
+        /// Raise `petition`'s prompt and step the clock past the guard
+        /// interval, which is what all but the guard's own test want: they
+        /// are asserting routing, not the anti-tapjacking delay.
+        fn raise_awake(
+            &mut self,
+            petition: crate::petitions::PetitionId,
+            registry: &mut crate::petitions::PetitionRegistry,
+        ) {
+            let raised_at = self.now.get();
+            self.grab
+                .borrow_mut()
+                .raise(
+                    petition,
+                    raised_at,
+                    registry,
+                    &mut self.surface,
+                    &mut self.recorder,
+                )
+                .expect("pending");
+            self.now
+                .set(raised_at + crate::consent::grab::GUARD_INTERVAL);
+        }
+
+        fn lower(&mut self, registry: &mut crate::petitions::PetitionRegistry) {
+            self.grab.borrow_mut().lower(registry, &mut self.surface);
+        }
+    }
+
+    impl Drop for Grabbed {
+        fn drop(&mut self) {
+            crate::recorder::tests::cleanup(&self.log_path);
+        }
+    }
+
+    /// One pending petition in a fresh interactive registry, wired to the
+    /// realm `wire_setup` serves.
+    fn pending_petition() -> (
+        crate::petitions::PetitionRegistry,
+        crate::petitions::PetitionId,
+    ) {
+        use crate::petitions::{
+            Admission, ConsentPolicy, PetitionConfig, PetitionRegistry, PetitionRequest,
+        };
+        use vitrin_protocol::generated::vitrin_grant::{Persistence as WirePersistence, Verb};
+
+        let mut registry =
+            PetitionRegistry::new(ConsentPolicy::Interactive, PetitionConfig::default());
+        let connection = registry.register_connection();
+        let realms = crate::realm::tests::registry_with(&["realm-0"]);
+        let Admission::Pending { petition } = registry.admit(
+            PetitionRequest {
+                connection,
+                identity: crate::identity::PrincipalIdentity::parse(
+                    crate::consent::tests::PROMPT_IDENTITY,
+                )
+                .expect("fixture identity"),
+                realm_name: "realm-0".into(),
+                grant_wire_id: 10,
+                consent_wire_id: 11,
+                resource: String::new(),
+                verbs: Verb::OBSERVE | Verb::ACTUATE_POINTER | Verb::ACTUATE_TEXT,
+                expiry_ms: 60_000,
+                max_event_rate: 0,
+                persistence: WirePersistence::WhileRunning,
+                flags: 0,
+            },
+            std::time::Instant::now(),
+            &realms,
+        ) else {
+            panic!("an interactive petition must pend");
+        };
+        (registry, petition)
+    }
+
+    #[test]
+    fn a_raised_prompt_stops_human_input_at_the_router() {
+        // The acceptance criterion "all human input routes exclusively to
+        // the prompt", asserted where it actually has to hold: the router,
+        // whose output is the only thing that can reach a shim seat.
+        let mut rig = Grabbed::new();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface_size = Some(view);
+        rig.grab.borrow_mut().set_view(view);
+
+        // Before the prompt: ordinary routing.
+        assert!(rig
+            .router
+            .route(phys(motion(10.0, 10.0)), view, surface_size)
+            .is_some());
+
+        rig.raise_awake(petition, &mut registry);
+
+        // Motion, presses, scroll, and key presses all stop here. Keys are
+        // the sharpest case: they route without geometry otherwise (focus
+        // is held shim-side), so only the grab can stop them.
+        for kind in [
+            motion(20.0, 20.0),
+            press(),
+            scroll(),
+            SeatInputKind::Key {
+                keysym: 0xff0d,
+                state: KeyState::Pressed,
+            },
+            SeatInputKind::Key {
+                keysym: 0xff1b, // Escape, reserved for P1.7.3
+                state: KeyState::Pressed,
+            },
+        ] {
+            assert!(
+                rig.router
+                    .route(phys(kind.clone()), view, surface_size)
+                    .is_none(),
+                "{kind:?} reached the app while a prompt was up"
+            );
+        }
+
+        // Lowering the prompt restores routing.
+        rig.lower(&mut registry);
+        assert!(rig
+            .router
+            .route(phys(motion(30.0, 30.0)), view, surface_size)
+            .is_some());
+    }
+
+    #[test]
+    fn the_observe_tap_still_sees_everything_a_consent_grab_swallows() {
+        // P1.7.3's revocation watcher rides `observe`, and the one moment
+        // it must not go deaf is the one moment a consent prompt is up.
+        // Asserted through the real router with a real grab: for each
+        // consumed event the tap's count rises and the inner *gate*'s does
+        // not, which is the short-circuit the wrapper documents.
+        let mut rig = Grabbed::new();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface_size = Some(view);
+        rig.grab.borrow_mut().set_view(view);
+        rig.raise_awake(petition, &mut registry);
+
+        let gated_before = rig.spy.gated.get();
+        let consumed = [
+            motion(20.0, 20.0),
+            press(),
+            scroll(),
+            SeatInputKind::Key {
+                keysym: 0xff1b, // Escape: the revocation chord itself
+                state: KeyState::Pressed,
+            },
+        ];
+        let observed_before = rig.spy.observed.get();
+        for kind in consumed.iter() {
+            assert!(
+                rig.router
+                    .route(phys(kind.clone()), view, surface_size)
+                    .is_none(),
+                "fixture check: {kind:?} must be consumed here"
+            );
+        }
+        assert_eq!(
+            rig.spy.observed.get() - observed_before,
+            consumed.len(),
+            "the tap must see every event the grab swallowed"
+        );
+        assert_eq!(
+            rig.spy.gated.get(),
+            gated_before,
+            "a consumed event must not reach the inner gate"
+        );
+    }
+
+    #[test]
+    fn a_prompt_raised_mid_drag_leaves_no_stuck_button_in_the_app() {
+        // The pairing contract (`PreemptionHook`), exercised against the
+        // real grab: a prompt that appears mid-drag must not strand the
+        // press the app already saw. The release is delivered; the press
+        // that answers the prompt is not.
+        let mut rig = Grabbed::new();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface_size = Some(view);
+        rig.grab.borrow_mut().set_view(view);
+
+        // A drag begins in the app.
+        assert!(rig
+            .router
+            .route(phys(motion(40.0, 40.0)), view, surface_size)
+            .is_some());
+        assert!(rig
+            .router
+            .route(phys(press()), view, surface_size)
+            .is_some());
+
+        rig.raise_awake(petition, &mut registry);
+
+        // Mid-drag motion is consumed (the app must not track the pointer
+        // across a security decision) ...
+        assert!(rig
+            .router
+            .route(phys(motion(50.0, 50.0)), view, surface_size)
+            .is_none());
+        // ... but the release still reaches the app: no stuck button.
+        assert!(
+            rig.router
+                .route(phys(release()), view, surface_size)
+                .is_some(),
+            "hold-until-release: the drag's own release must land"
+        );
+        // A fresh press aimed at the prompt is consumed, and its release
+        // is dropped unpaired by the router rather than leaking.
+        assert!(rig
+            .router
+            .route(phys(press()), view, surface_size)
+            .is_none());
+        assert!(rig
+            .router
+            .route(phys(release()), view, surface_size)
+            .is_none());
+    }
+
+    #[test]
+    fn a_prompt_raised_mid_keystroke_leaves_no_latched_modifier_in_the_app() {
+        // The keyboard twin of the test above, and the sharper of the two.
+        // A prompt appearing while the human holds Shift must not strand
+        // that key down in the confined app: everything the human typed
+        // afterwards would silently arrive shifted. The grab never
+        // consumes a release, and the router's per-keysym pairing is what
+        // makes that safe -- a release whose press the grab DID consume is
+        // dropped here, not leaked.
+        const SHIFT_L: u32 = 0xffe1;
+        const CTRL_L: u32 = 0xffe3;
+        let key = |keysym, state| SeatInputKind::Key { keysym, state };
+
+        let mut rig = Grabbed::new();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface_size = Some(view);
+        rig.grab.borrow_mut().set_view(view);
+
+        // The human is holding Shift when the prompt appears.
+        assert!(rig
+            .router
+            .route(phys(key(SHIFT_L, KeyState::Pressed)), view, surface_size)
+            .is_some());
+        rig.raise_awake(petition, &mut registry);
+
+        // Key presses during the prompt are consumed ...
+        assert!(rig
+            .router
+            .route(phys(key(CTRL_L, KeyState::Pressed)), view, surface_size)
+            .is_none());
+        // ... and that press's own release is dropped by the router's
+        // pairing rather than arriving unpaired at the app.
+        assert!(
+            rig.router
+                .route(phys(key(CTRL_L, KeyState::Released)), view, surface_size)
+                .is_none(),
+            "a release whose press the grab consumed must not reach the app"
+        );
+        // But the Shift the app already saw go down must come back up.
+        assert!(
+            rig.router
+                .route(phys(key(SHIFT_L, KeyState::Released)), view, surface_size)
+                .is_some(),
+            "hold-until-release: a modifier held from before the prompt must be released"
+        );
+
+        // With the prompt down, typing is unmodified again -- and a second
+        // Shift release, now unpaired, is dropped rather than doubled.
+        rig.lower(&mut registry);
+        assert!(rig
+            .router
+            .route(phys(key(SHIFT_L, KeyState::Released)), view, surface_size)
+            .is_none());
+    }
+
+    #[test]
+    fn clicking_a_prompt_button_produces_a_decision_and_no_app_input() {
+        // The whole grab, end to end through the router: the click that
+        // answers the prompt yields a decision and delivers nothing to the
+        // app -- not the press, not the release, not the motion.
+        use crate::consent::Choice;
+
+        let mut rig = Grabbed::new();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface_size = Some(view);
+        rig.grab.borrow_mut().set_view(view);
+        rig.raise_awake(petition, &mut registry);
+
+        // Aim at Deny, using the same placement the compositor draws with.
+        let card = rig
+            .surface
+            .card_origin(view.0, view.1)
+            .expect("a prompt is up");
+        let rendered = crate::consent::render::rasterize(
+            registry.prompt_content(petition).as_ref().expect("pending"),
+        );
+        let deny = rendered
+            .buttons
+            .iter()
+            .find(|b| b.choice == Choice::Deny)
+            .expect("Deny is always offered");
+        let target = (
+            f64::from(card.0 + deny.rect.x) + f64::from(deny.rect.w) / 2.0,
+            f64::from(card.1 + deny.rect.y) + f64::from(deny.rect.h) / 2.0,
+        );
+
+        for kind in [motion(target.0, target.1), press(), release()] {
+            assert!(
+                rig.router.route(phys(kind), view, surface_size).is_none(),
+                "answering the prompt must deliver nothing to the app"
+            );
+        }
+        assert_eq!(
+            rig.grab.borrow_mut().take_decision().map(|d| d.choice),
+            Some(Choice::Deny)
+        );
+
+        // And the decision resolves the petition through the production
+        // path, with the protocol's clean denial.
+        let resolution = registry
+            .resolve_human(petition, Choice::Deny)
+            .expect("the petition is still pending");
+        assert!(matches!(
+            resolution.verdict,
+            crate::petitions::Verdict::Declined {
+                outcome: vitrin_protocol::generated::vitrin_grant::Outcome::Denied
+            }
+        ));
+    }
+
+    #[test]
+    fn an_actuation_sent_mid_prompt_never_reaches_the_app() {
+        // The M1.4 input-echo acceptance criterion, closed end to end: a
+        // real chokepoint decision, a real router, a real wire, and a real
+        // mock shim reading its seat. While the agent's own prompt is up
+        // the chokepoint refuses `consent_held` and the sink is never
+        // called, so nothing rides the wire; once the prompt closes the
+        // same actuation arrives at the shim, origin-tagged.
+        use crate::enforcement::{Chokepoint, UseEnv, UseKind, UseOutcome, UseRequest};
+        use crate::grants::{GrantSpec, GrantTable, Issuer, PersistenceRung, RealmId, ResourceRef};
+        use vitrin_protocol::generated::vitrin_grant::Refusal;
+        use vitrin_protocol::generated::vitrin_grant::Verb;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let (server, _scene, mut core, mut mock) = wire_setup();
+        let mut rig = Grabbed::new();
+        let (mut registry, petition) = pending_petition();
+        let view = (VIEW_W, VIEW_H);
+        let surface_size = Some(view);
+        rig.grab.borrow_mut().set_view(view);
+
+        let now = std::time::Instant::now();
+        let identity =
+            crate::identity::PrincipalIdentity::parse(crate::consent::tests::PROMPT_IDENTITY)
+                .expect("fixture identity");
+        let mut grants = GrantTable::new();
+        let row = grants
+            .insert(
+                GrantSpec {
+                    principal_id: identity.clone(),
+                    realm_id: RealmId::new("realm-0"),
+                    resource_ref: ResourceRef::WholeRealm,
+                    verbs: Verb::ACTUATE_POINTER,
+                    expiry: None,
+                    max_event_rate: std::num::NonZeroU32::new(20).unwrap(),
+                    persistence: PersistenceRung::WhileRunning,
+                    issuer: Issuer::HumanConsent,
+                },
+                now,
+            )
+            .expect("a valid row");
+
+        let rgba = vec![0u8; VIEW_W as usize * VIEW_H as usize * 4];
+        let frame = crate::capture::RealmViewFrame {
+            rgba: &rgba,
+            width: VIEW_W,
+            height: VIEW_H,
+        };
+        let presence = PhysicalPresence::new();
+        let mut chokepoint = Chokepoint::new();
+
+        // One actuation attempt: chokepoint, then -- only if it admitted
+        // -- the router, then the shim wire. The M1.1 shape in miniature.
+        //
+        // The chokepoint's own `send` is discarded: it addresses the
+        // *principal* connection (this is where `refused` would go), which
+        // is a different socket from the shim's. Routing it into `core`
+        // would put principal-protocol bytes on the shim wire and prove
+        // nothing about the seat. What this test asserts is what the app
+        // sees, and `UseOutcome` already reports the refusal.
+        let actuate = |chokepoint: &mut Chokepoint,
+                       grants: &mut GrantTable,
+                       registry: &crate::petitions::PetitionRegistry,
+                       router: &mut InputRouter<crate::consent::grab::ConsentGate<SpyHook>>,
+                       core: &mut Connection| {
+            let mut routed: Vec<SeatInput> = Vec::new();
+            let outcome = chokepoint
+                .enforce_use(
+                    UseRequest {
+                        facet_id: 20,
+                        grant_wire_id: 10,
+                        grant_row: Some(row),
+                        principal: &identity,
+                        kind: UseKind::Pointer(SeatInputKind::Motion { x: 5.0, y: 6.0 }),
+                    },
+                    grants,
+                    registry,
+                    UseEnv {
+                        realm_view: Some(&frame),
+                        presence: &presence,
+                        actuations: &mut |input| routed.push(input),
+                    },
+                    now,
+                    &mut |_principal_frame, _fd| Ok(()),
+                )
+                .expect("transport is healthy");
+            for input in routed {
+                if let Some(delivery) = router.route(input, view, surface_size) {
+                    server
+                        .deliver_seat_event(&delivery, &mut |frame| core.send_message(frame, None))
+                        .expect("send");
+                }
+            }
+            outcome
+        };
+
+        // Prompt up: refused `consent_held`, nothing routed, nothing sent.
+        rig.raise_awake(petition, &mut registry);
+        let outcome = actuate(
+            &mut chokepoint,
+            &mut grants,
+            &registry,
+            &mut rig.router,
+            &mut core,
+        );
+        assert!(
+            matches!(
+                outcome,
+                UseOutcome::Refused {
+                    code: Refusal::ConsentHeld,
+                    ..
+                }
+            ),
+            "expected consent_held, got {outcome:?}"
+        );
+
+        // The refusal rode the wire; the seat did not. Drain the refusal
+        // the chokepoint voiced, then assert the next thing the shim sees
+        // is the post-prompt actuation and not a mid-prompt one.
+        rig.lower(&mut registry);
+        registry
+            .resolve_human(petition, crate::consent::Choice::Deny)
+            .expect("still pending");
+        let outcome = actuate(
+            &mut chokepoint,
+            &mut grants,
+            &registry,
+            &mut rig.router,
+            &mut core,
+        );
+        assert!(
+            matches!(outcome, UseOutcome::Admitted { .. }),
+            "the prompt is down: the same actuation must now be admitted"
+        );
+        assert_eq!(
+            mock.next_seat_event().unwrap(),
+            SeatEvent::Motion {
+                x: Fixed::from_f64(5.0),
+                y: Fixed::from_f64(6.0),
+                origin: Origin::Emulated,
+            },
+            "the FIRST seat event the app ever sees is the post-prompt one"
+        );
     }
 
     // ------------------------------------------------------------------

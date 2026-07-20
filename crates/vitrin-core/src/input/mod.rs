@@ -114,9 +114,14 @@
 //!    — so a consuming gate can never wedge the router's grab (see
 //!    [`Gate::Consume`] and the pairing contract on [`PreemptionHook`]).
 //!
-//! The MVP implementation is [`NoopHook`] (observe nothing, deliver
-//! everything) — the shape, placement, and ordering are the deliverable;
-//! both P1.7.x consumers attach without restructuring the router.
+//! The gate side is now taken: [`crate::consent::grab::ConsentGate`]
+//! (P1.7.2) attached without restructuring anything, as promised — the
+//! nested backend's router is `InputRouter<ConsentGate<NoopHook>>`, and
+//! P1.7.3's watcher replaces that innermost [`NoopHook`]. Its policy lives
+//! entirely in that module; what matters here is that it honours the pairing
+//! contract below by never consuming a release, and that it judges by the
+//! origin tag intake bound rather than by any authority question — the
+//! router still holds no authority check, and must not grow one.
 //!
 //! The first real observe-side consumer is [`PresenceHook`] (P1.4.4): it
 //! feeds [`PhysicalPresence`], the physical-activity state behind the
@@ -1902,6 +1907,361 @@ mod tests {
             Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             other => panic!("expected a silent wire, got: {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The consent grab through the real router (P1.7.2)
+    //
+    // These live here rather than in `crate::consent::grab` because
+    // `SeatInput::physical` is private to this module by design (B2), so
+    // this is the only place a physical-origin event can be minted and
+    // pushed through the router the way nested intake does.
+    // ------------------------------------------------------------------
+
+    /// A router carrying the consent grab, plus the shared handles a test
+    /// uses to raise a prompt and read decisions back.
+    fn grabbed_router() -> (
+        InputRouter<crate::consent::grab::ConsentGate<NoopHook>>,
+        Rc<RefCell<crate::consent::grab::ConsentGrab>>,
+        crate::consent::ConsentSurface,
+    ) {
+        let grab = Rc::new(RefCell::new(crate::consent::grab::ConsentGrab::new()));
+        let router = InputRouter::new(crate::consent::grab::ConsentGate::new(
+            Rc::clone(&grab),
+            NoopHook,
+        ));
+        (router, grab, crate::consent::ConsentSurface::new())
+    }
+
+    /// One pending petition in a fresh interactive registry, wired to the
+    /// realm `wire_setup` serves.
+    fn pending_petition() -> (
+        crate::petitions::PetitionRegistry,
+        crate::petitions::PetitionId,
+    ) {
+        use crate::petitions::{
+            Admission, ConsentPolicy, PetitionConfig, PetitionRegistry, PetitionRequest,
+        };
+        use vitrin_protocol::generated::vitrin_grant::{Persistence as WirePersistence, Verb};
+
+        let mut registry =
+            PetitionRegistry::new(ConsentPolicy::Interactive, PetitionConfig::default());
+        let connection = registry.register_connection();
+        let realms = crate::realm::tests::registry_with(&["realm-0"]);
+        let Admission::Pending { petition } = registry.admit(
+            PetitionRequest {
+                connection,
+                identity: crate::identity::PrincipalIdentity::parse(
+                    crate::consent::tests::PROMPT_IDENTITY,
+                )
+                .expect("fixture identity"),
+                realm_name: "realm-0".into(),
+                grant_wire_id: 10,
+                consent_wire_id: 11,
+                resource: String::new(),
+                verbs: Verb::OBSERVE | Verb::ACTUATE_POINTER | Verb::ACTUATE_TEXT,
+                expiry_ms: 60_000,
+                max_event_rate: 0,
+                persistence: WirePersistence::WhileRunning,
+                flags: 0,
+            },
+            std::time::Instant::now(),
+            &realms,
+        ) else {
+            panic!("an interactive petition must pend");
+        };
+        (registry, petition)
+    }
+
+    #[test]
+    fn a_raised_prompt_stops_human_input_at_the_router() {
+        // The acceptance criterion "all human input routes exclusively to
+        // the prompt", asserted where it actually has to hold: the router,
+        // whose output is the only thing that can reach a shim seat.
+        let (mut router, grab, mut surface) = grabbed_router();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface_size = Some(view);
+        grab.borrow_mut().set_view(view);
+
+        // Before the prompt: ordinary routing.
+        assert!(router
+            .route(phys(motion(10.0, 10.0)), view, surface_size)
+            .is_some());
+
+        grab.borrow_mut()
+            .raise(petition, &mut registry, &mut surface)
+            .expect("pending");
+
+        // Motion, presses, scroll, and keys all stop here. Keys are the
+        // sharpest case: they route unconditionally otherwise (focus is
+        // held shim-side), so only the grab can stop them.
+        for kind in [
+            motion(20.0, 20.0),
+            press(),
+            scroll(),
+            SeatInputKind::Key {
+                keysym: 0xff0d,
+                state: KeyState::Pressed,
+            },
+            SeatInputKind::Key {
+                keysym: 0xff1b, // Escape, reserved for P1.7.3
+                state: KeyState::Pressed,
+            },
+        ] {
+            assert!(
+                router
+                    .route(phys(kind.clone()), view, surface_size)
+                    .is_none(),
+                "{kind:?} reached the app while a prompt was up"
+            );
+        }
+
+        // Lowering the prompt restores routing.
+        grab.borrow_mut().lower(&mut surface);
+        assert!(router
+            .route(phys(motion(30.0, 30.0)), view, surface_size)
+            .is_some());
+    }
+
+    #[test]
+    fn a_prompt_raised_mid_drag_leaves_no_stuck_button_in_the_app() {
+        // The pairing contract (`PreemptionHook`), exercised against the
+        // real grab: a prompt that appears mid-drag must not strand the
+        // press the app already saw. The release is delivered; the press
+        // that answers the prompt is not.
+        let (mut router, grab, mut surface) = grabbed_router();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface_size = Some(view);
+        grab.borrow_mut().set_view(view);
+
+        // A drag begins in the app.
+        assert!(router
+            .route(phys(motion(40.0, 40.0)), view, surface_size)
+            .is_some());
+        assert!(router.route(phys(press()), view, surface_size).is_some());
+
+        grab.borrow_mut()
+            .raise(petition, &mut registry, &mut surface)
+            .expect("pending");
+
+        // Mid-drag motion is consumed (the app must not track the pointer
+        // across a security decision) ...
+        assert!(router
+            .route(phys(motion(50.0, 50.0)), view, surface_size)
+            .is_none());
+        // ... but the release still reaches the app: no stuck button.
+        assert!(
+            router.route(phys(release()), view, surface_size).is_some(),
+            "hold-until-release: the drag's own release must land"
+        );
+        // A fresh press aimed at the prompt is consumed, and its release
+        // is dropped unpaired by the router rather than leaking.
+        assert!(router.route(phys(press()), view, surface_size).is_none());
+        assert!(router.route(phys(release()), view, surface_size).is_none());
+    }
+
+    #[test]
+    fn clicking_a_prompt_button_produces_a_decision_and_no_app_input() {
+        // The whole grab, end to end through the router: the click that
+        // answers the prompt yields a decision and delivers nothing to the
+        // app -- not the press, not the release, not the motion.
+        use crate::consent::Choice;
+
+        let (mut router, grab, mut surface) = grabbed_router();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface_size = Some(view);
+        grab.borrow_mut().set_view(view);
+        grab.borrow_mut()
+            .raise(petition, &mut registry, &mut surface)
+            .expect("pending");
+
+        // Aim at Deny, using the same placement the compositor draws with.
+        let card = surface.card_origin(view.0, view.1).expect("a prompt is up");
+        let rendered = crate::consent::render::rasterize(
+            registry.prompt_content(petition).as_ref().expect("pending"),
+        );
+        let deny = rendered
+            .buttons
+            .iter()
+            .find(|b| b.choice == Choice::Deny)
+            .expect("Deny is always offered");
+        let target = (
+            f64::from(card.0 + deny.rect.x) + f64::from(deny.rect.w) / 2.0,
+            f64::from(card.1 + deny.rect.y) + f64::from(deny.rect.h) / 2.0,
+        );
+
+        for kind in [motion(target.0, target.1), press(), release()] {
+            assert!(
+                router.route(phys(kind), view, surface_size).is_none(),
+                "answering the prompt must deliver nothing to the app"
+            );
+        }
+        assert_eq!(
+            grab.borrow_mut().take_decision().map(|d| d.choice),
+            Some(Choice::Deny)
+        );
+
+        // And the decision resolves the petition through the production
+        // path, with the protocol's clean denial.
+        let resolution = registry
+            .resolve_human(petition, Choice::Deny)
+            .expect("the petition is still pending");
+        assert!(matches!(
+            resolution.verdict,
+            crate::petitions::Verdict::Declined {
+                outcome: vitrin_protocol::generated::vitrin_grant::Outcome::Denied
+            }
+        ));
+    }
+
+    #[test]
+    fn an_actuation_sent_mid_prompt_never_reaches_the_app() {
+        // The M1.4 input-echo acceptance criterion, closed end to end: a
+        // real chokepoint decision, a real router, a real wire, and a real
+        // mock shim reading its seat. While the agent's own prompt is up
+        // the chokepoint refuses `consent_held` and the sink is never
+        // called, so nothing rides the wire; once the prompt closes the
+        // same actuation arrives at the shim, origin-tagged.
+        use crate::enforcement::{Chokepoint, UseEnv, UseKind, UseOutcome, UseRequest};
+        use crate::grants::{GrantSpec, GrantTable, Issuer, PersistenceRung, RealmId, ResourceRef};
+        use vitrin_protocol::generated::vitrin_grant::Refusal;
+        use vitrin_protocol::generated::vitrin_grant::Verb;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let (server, _scene, mut core, mut mock) = wire_setup();
+        let (mut router, grab, mut surface) = grabbed_router();
+        let (mut registry, petition) = pending_petition();
+        let view = (VIEW_W, VIEW_H);
+        let surface_size = Some(view);
+        grab.borrow_mut().set_view(view);
+
+        let now = std::time::Instant::now();
+        let identity =
+            crate::identity::PrincipalIdentity::parse(crate::consent::tests::PROMPT_IDENTITY)
+                .expect("fixture identity");
+        let mut grants = GrantTable::new();
+        let row = grants
+            .insert(
+                GrantSpec {
+                    principal_id: identity.clone(),
+                    realm_id: RealmId::new("realm-0"),
+                    resource_ref: ResourceRef::WholeRealm,
+                    verbs: Verb::ACTUATE_POINTER,
+                    expiry: None,
+                    max_event_rate: std::num::NonZeroU32::new(20).unwrap(),
+                    persistence: PersistenceRung::WhileRunning,
+                    issuer: Issuer::HumanConsent,
+                },
+                now,
+            )
+            .expect("a valid row");
+
+        let rgba = vec![0u8; VIEW_W as usize * VIEW_H as usize * 4];
+        let frame = crate::capture::RealmViewFrame {
+            rgba: &rgba,
+            width: VIEW_W,
+            height: VIEW_H,
+        };
+        let presence = PhysicalPresence::new();
+        let mut chokepoint = Chokepoint::new();
+
+        // One actuation attempt: chokepoint, then -- only if it admitted
+        // -- the router, then the shim wire. The M1.1 shape in miniature.
+        //
+        // The chokepoint's own `send` is discarded: it addresses the
+        // *principal* connection (this is where `refused` would go), which
+        // is a different socket from the shim's. Routing it into `core`
+        // would put principal-protocol bytes on the shim wire and prove
+        // nothing about the seat. What this test asserts is what the app
+        // sees, and `UseOutcome` already reports the refusal.
+        let actuate = |chokepoint: &mut Chokepoint,
+                       grants: &mut GrantTable,
+                       registry: &crate::petitions::PetitionRegistry,
+                       router: &mut InputRouter<crate::consent::grab::ConsentGate<NoopHook>>,
+                       core: &mut Connection| {
+            let mut routed: Vec<SeatInput> = Vec::new();
+            let outcome = chokepoint
+                .enforce_use(
+                    UseRequest {
+                        facet_id: 20,
+                        grant_wire_id: 10,
+                        grant_row: Some(row),
+                        principal: &identity,
+                        kind: UseKind::Pointer(SeatInputKind::Motion { x: 5.0, y: 6.0 }),
+                    },
+                    grants,
+                    registry,
+                    UseEnv {
+                        realm_view: Some(&frame),
+                        presence: &presence,
+                        actuations: &mut |input| routed.push(input),
+                    },
+                    now,
+                    &mut |_principal_frame, _fd| Ok(()),
+                )
+                .expect("transport is healthy");
+            for input in routed {
+                if let Some(delivery) = router.route(input, view, surface_size) {
+                    server
+                        .deliver_seat_event(&delivery, &mut |frame| core.send_message(frame, None))
+                        .expect("send");
+                }
+            }
+            outcome
+        };
+
+        // Prompt up: refused `consent_held`, nothing routed, nothing sent.
+        grab.borrow_mut()
+            .raise(petition, &mut registry, &mut surface)
+            .expect("pending");
+        let outcome = actuate(
+            &mut chokepoint,
+            &mut grants,
+            &registry,
+            &mut router,
+            &mut core,
+        );
+        assert!(
+            matches!(
+                outcome,
+                UseOutcome::Refused {
+                    code: Refusal::ConsentHeld,
+                    ..
+                }
+            ),
+            "expected consent_held, got {outcome:?}"
+        );
+
+        // The refusal rode the wire; the seat did not. Drain the refusal
+        // the chokepoint voiced, then assert the next thing the shim sees
+        // is the post-prompt actuation and not a mid-prompt one.
+        grab.borrow_mut().lower(&mut surface);
+        registry
+            .resolve_human(petition, crate::consent::Choice::Deny)
+            .expect("still pending");
+        let outcome = actuate(
+            &mut chokepoint,
+            &mut grants,
+            &registry,
+            &mut router,
+            &mut core,
+        );
+        assert!(
+            matches!(outcome, UseOutcome::Admitted { .. }),
+            "the prompt is down: the same actuation must now be admitted"
+        );
+        assert_eq!(
+            mock.next_seat_event().unwrap(),
+            SeatEvent::Motion {
+                x: Fixed::from_f64(5.0),
+                y: Fixed::from_f64(6.0),
+                origin: Origin::Emulated,
+            },
+            "the FIRST seat event the app ever sees is the post-prompt one"
+        );
     }
 
     // ------------------------------------------------------------------

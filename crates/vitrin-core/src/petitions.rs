@@ -91,14 +91,21 @@
 //! "granted" is announced by `resolved`, and any facet use before that
 //! refuses `not_granted` at the chokepoint either way.
 //!
-//! **Interactive policy pends; this build resolves it only by timeout.**
+//! **Interactive policy pends for a human decision.**
 //! [`ConsentPolicy::Interactive`] admits the petition into the pending
-//! table and emits `vitrin_consent.state(queued)` -- honest wording: the
-//! prompt is "waiting behind ... a policy decision", because the consent
-//! renderer is E7 (issues #37-#39) and does not exist in this build. Until
-//! it lands, an interactive petition resolves `timed_out` when the consent
-//! timeout passes. Fail-closed by construction: absent a consent surface,
-//! nothing is ever granted.
+//! table and emits `vitrin_consent.state(queued)` -- "waiting behind ... a
+//! policy decision" -- and it leaves the table by exactly one of three
+//! doors: [`PetitionRegistry::resolve_human`] (P1.7.2's consent prompt, the
+//! production path), [`PetitionRegistry::expire_due`] (the consent
+//! timeout), or [`PetitionRegistry::withdraw_connection`] (the petitioner
+//! disconnected). Fail-closed by construction in every direction: a
+//! petition nobody answers resolves `timed_out`, and nothing but an
+//! affirmative human decision produces a grant.
+//!
+//! What is still missing is the *embedder* that raises prompts, not the
+//! mechanism: no [`PetitionRegistry`] is constructed at runtime until the
+//! M1.1 listener wiring (issue #77), so a running `vitrind` still shows no
+//! prompt and grants nothing under this policy.
 //!
 //! **The scripted-consent injector is a build-gated hook, not a policy and
 //! not a wire message.** The IDL is explicit that consent decisions are not
@@ -149,15 +156,15 @@
 //! and the prompt is *down* when the petition leaves the pending table
 //! (resolution or withdrawal -- the moments that emit/imply `closed`).
 //! The chokepoint asks [`PetitionRegistry::prompt_up_for`], keyed by
-//! verified **identity** (the IDL says "the principal's own", and a
-//! principal spanning several connections is one principal -- the same
-//! keying as the admission cap), so P1.7.2 inherits the enforcement
-//! semantics for free by calling `mark_prompt_shown`: nothing in the
-//! chokepoint changes when the renderer lands. In this build no renderer
-//! exists, so at runtime no prompt is ever `shown` and `consent_held`
-//! never fires -- honest: under `Interactive` nothing is on screen, and
-//! under `AutoApprove` the IDL itself allows "no transitions at all";
-//! tests (and later the renderer) drive the flag.
+//! verified **identity** (the IDL says "the principal's own ... other
+//! principals' grants are unaffected", and a principal spanning several
+//! connections is one principal -- the same keying as the admission cap).
+//! P1.7.2 inherited those semantics for free, exactly as predicted:
+//! [`crate::consent::grab::ConsentGrab::raise`] calls `mark_prompt_shown`
+//! in the same statement sequence that puts the pixels up and seizes the
+//! input grab, and **nothing in the chokepoint changed**. The flag is still
+//! only reachable at runtime once something raises a prompt, which needs
+//! the M1.1 registry wiring; tests drive it today.
 //!
 //! **Realm knowledge is the realm registry's, not this module's** (P1.5.1,
 //! issue #30). Admission asks [`RealmRegistry::resolve_for_petition`]
@@ -189,7 +196,7 @@ use std::time::{Duration, Instant};
 
 use vitrin_protocol::generated::vitrin_grant::{Outcome, Persistence as WirePersistence, Verb};
 
-use crate::consent::PromptContent;
+use crate::consent::{Choice, PromptContent};
 use crate::grants::{
     GrantId, GrantSpec, GrantTable, InsertError, Issuer, PersistenceRung, RealmId, ResourceRef,
 };
@@ -455,6 +462,49 @@ pub(crate) struct Resolution {
 pub(crate) enum Admission {
     Resolved(Resolution),
     Pending { petition: PetitionId },
+}
+
+/// Where one pending petition's consent-prompt events must be sent: the
+/// petitioner's connection and the `vitrin_consent` object it minted.
+///
+/// Returned by [`PetitionRegistry::pending_route`] so the consent surface
+/// (P1.7.2) can emit `vitrin_consent.state(shown)` when it raises a prompt
+/// without holding a reference to the petition table's private rows. The
+/// registry decides; `PrincipalServer` speaks -- the same division every
+/// other petition event already follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PromptRoute {
+    pub connection: ConnectionId,
+    pub consent_wire_id: u32,
+}
+
+/// Why [`PetitionRegistry::resolve_human`] refused a decision taken on the
+/// consent prompt. Both cases leave the petition exactly as it was --
+/// fail-closed, the same posture the scripted injector takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HumanDecisionError {
+    /// No pending petition with this id: it timed out, was withdrawn with
+    /// its connection, or was already decided. The exactly-once guard,
+    /// typed -- and the reason a decision drained from the grab carries its
+    /// petition id rather than being applied to whatever is pending now.
+    NotPending,
+    /// The chosen rung would outlive the petitioned one. Unreachable
+    /// through the prompt (it only draws rungs that
+    /// [`PersistenceRung::narrows`] admits, the same predicate checked
+    /// here), so this is the fail-closed backstop against a UI bug rather
+    /// than a reachable outcome.
+    WouldWiden,
+}
+
+impl fmt::Display for HumanDecisionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HumanDecisionError::NotPending => f.write_str("no such pending petition"),
+            HumanDecisionError::WouldWiden => {
+                f.write_str("the chosen rung outlives the petitioned one")
+            }
+        }
+    }
 }
 
 /// A decision injected through the build-gated scripted-consent hook: what
@@ -760,6 +810,20 @@ impl PetitionRegistry {
         })
     }
 
+    /// Where `petition`'s consent-prompt events go: its petitioner's
+    /// connection and consent object (P1.7.2). `None` once the petition is
+    /// no longer pending -- a `state` event for a resolved petition would
+    /// violate the IDL's "every `state` is delivered before `resolved`",
+    /// and this returning `None` is what makes that unrepresentable rather
+    /// than merely avoided.
+    pub fn pending_route(&self, petition: PetitionId) -> Option<PromptRoute> {
+        let pending = self.pending.get(&petition)?;
+        Some(PromptRoute {
+            connection: pending.connection,
+            consent_wire_id: pending.consent_wire_id,
+        })
+    }
+
     /// Whether this verified identity currently has a consent prompt **on
     /// screen** for any of its pending petitions, across all of its
     /// connections -- the `consent_held` judgement the enforcement
@@ -770,6 +834,127 @@ impl PetitionRegistry {
         self.pending
             .values()
             .any(|p| p.prompt_shown && p.identity == *identity)
+    }
+
+    /// **The production consent path** (P1.7.2): resolve one pending
+    /// petition with the decision a human took on the core-rendered prompt.
+    ///
+    /// This is the sibling of [`resolve_scripted`](Self::resolve_scripted),
+    /// not a caller of it: that injector is compiled only under `cfg(test)`
+    /// or the `scripted-consent` feature precisely so a deployment build
+    /// cannot represent it, and routing real human decisions through it
+    /// would defeat that -- as well as recording every human approval under
+    /// [`Issuer::ScriptedConsent`], a lie in exactly the log a session is
+    /// reconstructed from. Both paths share [`Self::finish`], so the
+    /// pending-entry removal, the exactly-once property, and the
+    /// [`Resolution`] shape cannot fork between them.
+    ///
+    /// # Why the human decision cannot widen anything
+    ///
+    /// A [`Choice`] carries a persistence rung and nothing else, and the
+    /// effective authority is assembled here from the **petition's own**
+    /// stored request: the verb set, the expiry, and the resolved rate
+    /// ceiling are copied verbatim from what was petitioned. There is no
+    /// argument through which a caller could ask for more, so the only
+    /// dimension a decision can move is the rung -- and that is checked
+    /// against [`PersistenceRung::narrows`], the same predicate
+    /// [`crate::consent::PromptContent::choices`] filters the buttons with.
+    /// The prompt therefore cannot draw a button this refuses, and this
+    /// cannot accept a rung the prompt would not draw.
+    ///
+    /// Narrowing the *verbs* is not offered in the MVP: the card lists the
+    /// requested verbs and the buttons choose a rung. Per-verb approval is
+    /// a real want, and the machinery already carries it (the effective
+    /// authority is a full [`EffectiveAuthority`], and `resolved` echoes
+    /// it) -- it needs prompt affordances, not a state-machine change.
+    ///
+    /// `Deny` resolves `denied` with zeroed effective arguments: a clean
+    /// protocol terminal on the petitioner's grant handle, which is what
+    /// makes refusal a *decision the agent observes* rather than a hang.
+    pub fn resolve_human(
+        &mut self,
+        petition: PetitionId,
+        choice: Choice,
+    ) -> Result<Resolution, HumanDecisionError> {
+        let pending = self
+            .pending
+            .get(&petition)
+            .ok_or(HumanDecisionError::NotPending)?;
+        let approved = match choice {
+            Choice::Deny => None,
+            Choice::Allow(rung) => {
+                let requested = pending.requested;
+                if !rung.narrows(requested.persistence) {
+                    return Err(HumanDecisionError::WouldWiden);
+                }
+                Some(EffectiveAuthority {
+                    // Verbatim from the petition: the decision chooses a
+                    // rung, never a wider authority (doc comment above).
+                    verbs: requested.verbs,
+                    persistence: rung,
+                    expiry_ms: requested.expiry_ms,
+                    max_event_rate: requested.max_event_rate,
+                })
+            }
+        };
+        // Loud by policy, like every other authority-changing decision: a
+        // human's yes or no is the most consequential event in a session,
+        // and the flight-recorder entry follows at delivery.
+        tracing::info!(
+            identity = %pending.identity,
+            realm = %pending.realm,
+            granted = approved.is_some(),
+            "consent decision taken on the prompt"
+        );
+        Ok(self.finish(petition, approved, Issuer::HumanConsent))
+    }
+
+    /// Consume `petition` from the pending table and build its
+    /// [`Resolution`] -- the one place a decided petition stops being
+    /// pending, shared by every decision path that is not admission itself.
+    ///
+    /// Removal is what makes "resolved fires exactly once ever" structural
+    /// on this side: a petition cannot resolve twice any more than a moved
+    /// value can be moved twice. Callers validate *first* and call this
+    /// last, so a refused decision leaves the petition pending.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `petition` is not pending. Callers reach this only after
+    /// a successful lookup in the same `&mut self` borrow, so the entry
+    /// cannot have gone away in between.
+    fn finish(
+        &mut self,
+        petition: PetitionId,
+        approved: Option<EffectiveAuthority>,
+        issuer: Issuer,
+    ) -> Resolution {
+        let p = self
+            .pending
+            .remove(&petition)
+            .expect("caller validated the entry in this same borrow");
+        let verdict = match approved {
+            Some(effective) => Verdict::Granted {
+                grant: ApprovedGrant {
+                    identity: p.identity,
+                    realm: p.realm,
+                    effective,
+                    issuer,
+                },
+            },
+            None => Verdict::Declined {
+                outcome: Outcome::Denied,
+            },
+        };
+        Resolution {
+            connection: p.connection,
+            grant_wire_id: p.grant_wire_id,
+            consent_wire_id: p.consent_wire_id,
+            // A consent lifecycle existed (the petition pended), so its
+            // close is announced before the terminal.
+            emit_closed: true,
+            verdict,
+        }
     }
 
     /// This identity's pending-petition count across all its connections.
@@ -852,32 +1037,11 @@ impl PetitionRegistry {
             }
         };
         // Only now consume the entry: a refused decision above left the
-        // petition pending, and removal here is what makes a second
-        // resolution structurally impossible.
-        let p = self
-            .pending
-            .remove(&petition)
-            .expect("entry was just observed in the map");
-        let verdict = match approved {
-            Some(effective) => Verdict::Granted {
-                grant: ApprovedGrant {
-                    identity: p.identity,
-                    realm: p.realm,
-                    effective,
-                    issuer: Issuer::ScriptedConsent,
-                },
-            },
-            None => Verdict::Declined {
-                outcome: Outcome::Denied,
-            },
-        };
-        Ok(Resolution {
-            connection: p.connection,
-            grant_wire_id: p.grant_wire_id,
-            consent_wire_id: p.consent_wire_id,
-            emit_closed: true,
-            verdict,
-        })
+        // petition pending, and removal there is what makes a second
+        // resolution structurally impossible. Shared with the production
+        // human path (`resolve_human`) so the two cannot fork -- only the
+        // issuer differs, and it differs honestly.
+        Ok(self.finish(petition, approved, Issuer::ScriptedConsent))
     }
 }
 
@@ -1277,6 +1441,159 @@ mod tests {
             grant_row.constraints.expiry,
             Some(Duration::from_millis(30_000))
         );
+    }
+
+    #[test]
+    fn a_human_approval_grants_exactly_the_petitioned_authority_at_the_chosen_rung() {
+        // The production consent path (P1.7.2): a `Choice` carries only a
+        // rung, and everything else on the resulting row is the petition's
+        // own request, verbatim. Recorded as `human_consent`, never as the
+        // scripted stand-in.
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::Interactive);
+        let conn = reg.register_connection();
+        let mut req = request(DEMO, conn, 10);
+        req.expiry_ms = 60_000;
+        req.max_event_rate = 7;
+        let Admission::Pending { petition } = reg.admit(req, t0, &realms()) else {
+            panic!("interactive petition must pend");
+        };
+
+        let res = reg
+            .resolve_human(petition, Choice::Allow(PersistenceRung::Once))
+            .expect("the petition is pending");
+        assert_eq!(res.connection, conn);
+        assert!(res.emit_closed, "a prompt lifecycle existed");
+        let Verdict::Granted { grant } = res.verdict else {
+            panic!("Allow grants");
+        };
+        assert_eq!(grant.effective.verbs, Verb::OBSERVE | Verb::ACTUATE_TEXT);
+        assert_eq!(grant.effective.persistence, PersistenceRung::Once);
+        assert_eq!(grant.effective.expiry_ms, 60_000);
+        assert_eq!(grant.effective.max_event_rate.get(), 7);
+        assert_eq!(grant.issuer, Issuer::HumanConsent);
+
+        // The row the delivery step mints states the same shape.
+        let mut grants = GrantTable::new();
+        let row = grant.insert_row(&mut grants, t0).unwrap();
+        let (grant_row, _) = grants.get(row, t0).unwrap();
+        assert_eq!(grant_row.persistence, PersistenceRung::Once);
+        assert_eq!(grant_row.issuer, Issuer::HumanConsent);
+    }
+
+    #[test]
+    fn a_human_denial_is_a_clean_declined_resolution() {
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::Interactive);
+        let conn = reg.register_connection();
+        let Admission::Pending { petition } = reg.admit(request(DEMO, conn, 10), t0, &realms())
+        else {
+            panic!("interactive petition must pend");
+        };
+        let res = reg
+            .resolve_human(petition, Choice::Deny)
+            .expect("the petition is pending");
+        assert!(matches!(
+            res.verdict,
+            Verdict::Declined {
+                outcome: Outcome::Denied
+            }
+        ));
+        assert!(res.emit_closed);
+        assert_eq!(reg.pending_total(), 0, "the decision consumed the petition");
+    }
+
+    #[test]
+    fn a_human_decision_resolves_exactly_once_and_cannot_widen() {
+        // Two fail-closed guards on the production path. The widening one
+        // is unreachable through the prompt (it only draws rungs that
+        // narrow) and exists precisely so a UI bug cannot become an
+        // authority bug.
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::Interactive);
+        let conn = reg.register_connection();
+        let mut once = request(DEMO, conn, 10);
+        once.persistence = WirePersistence::Once;
+        let Admission::Pending { petition } = reg.admit(once, t0, &realms()) else {
+            panic!("interactive petition must pend");
+        };
+
+        // A `once` petition cannot be approved `while_running`...
+        assert_eq!(
+            reg.resolve_human(petition, Choice::Allow(PersistenceRung::WhileRunning))
+                .err(),
+            Some(HumanDecisionError::WouldWiden)
+        );
+        // ...and the refusal left it pending, so the human can still answer.
+        assert_eq!(reg.pending_ids(), vec![petition]);
+        assert!(reg
+            .resolve_human(petition, Choice::Allow(PersistenceRung::Once))
+            .is_ok());
+
+        // Exactly once: a second decision on the same petition -- a click
+        // that raced a timeout, a decision drained twice -- finds nothing.
+        assert_eq!(
+            reg.resolve_human(petition, Choice::Deny).err(),
+            Some(HumanDecisionError::NotPending)
+        );
+        assert_eq!(
+            reg.resolve_human(PetitionId(u64::MAX), Choice::Deny).err(),
+            Some(HumanDecisionError::NotPending)
+        );
+    }
+
+    #[test]
+    fn the_prompt_can_only_offer_rungs_the_human_path_accepts() {
+        // The shared-predicate property, stated across the two modules that
+        // must agree: every button `PromptContent::choices` draws is a
+        // decision `resolve_human` accepts, for every representable rung.
+        let t0 = t0();
+        for requested in PersistenceRung::ALL {
+            let mut reg = registry(ConsentPolicy::Interactive);
+            let conn = reg.register_connection();
+            for choice in {
+                let mut req = request(DEMO, conn, 10);
+                req.persistence = WirePersistence::from(requested);
+                let Admission::Pending { petition } = reg.admit(req, t0, &realms()) else {
+                    panic!("interactive petition must pend");
+                };
+                reg.prompt_content(petition).expect("pending").choices()
+            } {
+                let mut req = request(DEMO, conn, 20);
+                req.persistence = WirePersistence::from(requested);
+                let Admission::Pending { petition } = reg.admit(req, t0, &realms()) else {
+                    panic!("interactive petition must pend");
+                };
+                assert!(
+                    reg.resolve_human(petition, choice).is_ok(),
+                    "the prompt offered {choice:?} on a {requested:?} petition, \
+                     which the consent path refuses"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_route_names_the_petitioner_and_dies_with_the_petition() {
+        // Where `vitrin_consent.state(shown)` is sent -- and the reason the
+        // IDL's "every state precedes resolved" holds structurally: once a
+        // petition is resolved there is no route to send a state on.
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::Interactive);
+        let conn = reg.register_connection();
+        let Admission::Pending { petition } = reg.admit(request(DEMO, conn, 10), t0, &realms())
+        else {
+            panic!("interactive petition must pend");
+        };
+        assert_eq!(
+            reg.pending_route(petition),
+            Some(PromptRoute {
+                connection: conn,
+                consent_wire_id: 11,
+            })
+        );
+        reg.resolve_human(petition, Choice::Deny).unwrap();
+        assert_eq!(reg.pending_route(petition), None);
     }
 
     #[test]

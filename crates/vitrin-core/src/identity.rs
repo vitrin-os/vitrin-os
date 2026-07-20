@@ -149,6 +149,19 @@ pub(crate) const MAX_IDENTITY_BYTES: usize = 2048;
 /// (`spiffe-jwt-svid`, `oidc`, `ssh-cert`).
 pub(crate) const STATIC_TOKEN_SCHEME: &str = "static-token";
 
+/// The registry file's conventional name inside the core's configuration
+/// directory ([`crate::realm::default_principals_path`]).
+pub(crate) const REGISTRY_FILE_NAME: &str = "principals.toml";
+
+/// The one identity `examples/principals.toml` ships, and the only one an
+/// `--consent=auto-approve` session tolerates in its registry (plan risk
+/// R6; the guard and its full reasoning live in `main.rs`).
+///
+/// Defined here, beside the registry it describes, so the guard cannot
+/// drift from the shipped example: a change to the example that forgets
+/// this constant fails the test that reads the file.
+pub(crate) const DEMO_PRINCIPAL: &str = "vitrin://local/agent/demo";
+
 /// Minimum registry token length in bytes, enforced at load. A static
 /// bearer token with trivial entropy would quietly rot the security story
 /// (the plan's R6 honesty posture); 16 bytes of text is still far below the
@@ -467,6 +480,18 @@ impl StaticVerifier {
             }
         }
         Ok(Self { rows, required_uid })
+    }
+
+    /// Every canonical identity this registry can bind, in file order.
+    ///
+    /// The registry's *auditable* surface: which principals a session will
+    /// accept, with no way to reach the tokens beside them (the rows stay
+    /// private, and [`StaticPrincipal`]'s `Debug` redacts the token even if
+    /// they did not). The R6 auto-approve guard in `main.rs` is the caller
+    /// -- it must answer "is this registry only the demo principal?", which
+    /// is a question about identities and never about credentials.
+    pub fn identities(&self) -> impl ExactSizeIterator<Item = &PrincipalIdentity> {
+        self.rows.iter().map(|row| &row.identity)
     }
 }
 

@@ -46,8 +46,14 @@
 //! realm spawn manager provides the inherited socketpair (P1.5.2). The
 //! consent prompt the core draws for a pending petition exists too
 //! (`consent`, P1.7.1) and composites above the realm view at the backend
-//! output stage — human-visible output only, never a capture — but nothing
-//! puts a prompt up yet: the input grab and decision wiring is P1.7.2.
+//! output stage — human-visible output only, never a capture — together with
+//! its input grab and decision routing (`consent::grab`, P1.7.2): a shown
+//! prompt owns physical input exclusively, and a click on one of its buttons
+//! resolves the petition through the same state machine every other consent
+//! path uses. Nothing *raises* a prompt at runtime yet, because nothing
+//! constructs the petition registry until the M1.1 listener wiring (issue
+//! #77) — so a running `vitrind` still shows no prompt and grabs no input,
+//! though the nested backend already carries the grab in its router.
 
 mod backend;
 /// Capture-frame mechanics (P1.3.6): the sealed-memfd pixel path behind
@@ -66,12 +72,16 @@ mod capture;
 /// construction, never a `vitrin_view.frame_ready` capture. Read its module
 /// docs before believing that last claim: it rests on where the code runs
 /// (`backend::compose_human_visible`, and the headless backend's two retained
-/// images), not on a check. Renderer only — the input grab and decision
-/// wiring is P1.7.2, hold-Esc revocation is P1.7.3 — so nothing at runtime
-/// shows a prompt yet: `ConsentSurface::show`'s caller arrives with the M1.1
-/// listener wiring that constructs the petition registry. Dead-code-allowed
-/// outside tests for the same reason as its siblings; both backends already
-/// own a live surface and composite through it every frame.
+/// images), not on a check. Also the input grab and decision routing
+/// (`consent::grab`, P1.7.2): while a prompt is shown all physical input
+/// routes exclusively to it, and a click on a button becomes a petition
+/// resolution — hold-Esc revocation (P1.7.3) and a trusted indicator
+/// (issue #85) are what remain. Nothing at runtime raises a prompt yet:
+/// `ConsentGrab::raise`'s caller arrives with the M1.1 listener wiring that
+/// constructs the petition registry. Dead-code-allowed outside tests for the
+/// same reason as its siblings; both backends already own a live surface and
+/// composite through it every frame, and the nested backend carries a live
+/// grab in its input router.
 #[cfg_attr(not(test), allow(dead_code))]
 mod consent;
 /// The enforcement chokepoint (P1.4.4): THE single function every capture
@@ -204,7 +214,10 @@ mod toml_subset;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
+use crate::identity::{StaticVerifier, DEMO_PRINCIPAL};
 use crate::petitions::ConsentPolicy;
 use crate::realm::RealmRegistry;
 use crate::recorder::{Event, Recorder};
@@ -223,7 +236,16 @@ USAGE:
                                 `interactive` (default; petitions await the
                                 consent surface) or `auto-approve` (every
                                 petition granted as requested — headless CI
-                                and demos ONLY; loudly logged).
+                                and demos ONLY; loudly and repeatedly logged,
+                                and REFUSED unless principals.toml holds
+                                nothing but the demo principal).
+    vitrind [--principals PATH] Principal registry for this session (bearer
+                                tokens; mode 0600, owned by the core's uid).
+                                Default: $XDG_CONFIG_HOME/vitrin/principals.toml
+                                Read at startup ONLY under
+                                `--consent=auto-approve`, whose safety guard
+                                audits it; the listener that verifies against
+                                it lands with M1.1.
     vitrind [--recorder PATH]   Flight-recorder log for this run (JSON
                                 lines, appended). Default:
                                 $XDG_RUNTIME_DIR/vitrin-0/flight-recorder-<pid>.jsonl
@@ -246,17 +268,30 @@ const RECORDER_FILE_PREFIX: &str = "flight-recorder";
 /// on the same content by default.
 const DEFAULT_HEADLESS_SIZE: (u32, u32) = (1280, 800);
 
+/// How often the auto-approve banner repeats for as long as the policy is
+/// active (plan risk R6: the warning must be *persistent*, not a line that
+/// scrolls off before the first agent connects).
+///
+/// One minute is chosen against the failure it guards: an operator who left
+/// auto-approve on by accident — a CI flag pasted into a desktop session, a
+/// shell alias — must meet the warning again on any glance at the log, not
+/// only in its first screenful. Shorter would be noise an operator learns to
+/// filter, which is how a warning stops working.
+const AUTO_APPROVE_BANNER_INTERVAL: Duration = Duration::from_secs(60);
+
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     RunNested {
         consent: ConsentPolicy,
+        principals: Option<PathBuf>,
         recorder: Option<PathBuf>,
         realm: Option<PathBuf>,
     },
     RunHeadless {
         size: (u32, u32),
         consent: ConsentPolicy,
+        principals: Option<PathBuf>,
         recorder: Option<PathBuf>,
         realm: Option<PathBuf>,
     },
@@ -285,6 +320,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut mode: Option<Mode> = None;
     let mut size: Option<(u32, u32)> = None;
     let mut consent: Option<ConsentPolicy> = None;
+    let mut principals: Option<PathBuf> = None;
     let mut recorder: Option<PathBuf> = None;
     let mut realm: Option<PathBuf> = None;
     let mut args = args.into_iter();
@@ -307,6 +343,13 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     .ok_or("`--consent` requires a mode (`interactive` or `auto-approve`)")?;
                 set_consent(&mut consent, parse_consent(value)?)?;
             }
+            "--principals" => {
+                let value = args.next().ok_or(
+                    "`--principals` requires a registry path \
+                     (e.g. `--principals ~/.config/vitrin/principals.toml`)",
+                )?;
+                set_path(&mut principals, "--principals", "registry path", value)?;
+            }
             "--recorder" => {
                 let value = args
                     .next()
@@ -324,6 +367,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             other => {
                 if let Some(value) = other.strip_prefix("--consent=") {
                     set_consent(&mut consent, parse_consent(value)?)?;
+                } else if let Some(value) = other.strip_prefix("--principals=") {
+                    set_path(&mut principals, "--principals", "registry path", value)?;
                 } else if let Some(value) = other.strip_prefix("--recorder=") {
                     set_path(&mut recorder, "--recorder", "log path", value)?;
                 } else if let Some(value) = other.strip_prefix("--realm=") {
@@ -344,6 +389,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     match (mode, size) {
         (Some(Mode::Nested), None) => Ok(Action::RunNested {
             consent,
+            principals,
             recorder,
             realm,
         }),
@@ -351,6 +397,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         (Some(Mode::Headless), size) => Ok(Action::RunHeadless {
             size: size.unwrap_or(DEFAULT_HEADLESS_SIZE),
             consent,
+            principals,
             recorder,
             realm,
         }),
@@ -462,22 +509,24 @@ fn main() -> ExitCode {
         }
         Action::RunNested {
             consent,
+            principals,
             recorder,
             realm,
         } => {
             init_tracing();
-            announce_consent_policy(consent);
-            run_session(consent, recorder, realm, backend::winit::run)
+            run_session(consent, principals, recorder, realm, backend::winit::run)
         }
         Action::RunHeadless {
             size,
             consent,
+            principals,
             recorder,
             realm,
         } => {
             init_tracing();
-            announce_consent_policy(consent);
-            run_session(consent, recorder, realm, || backend::headless::run(size))
+            run_session(consent, principals, recorder, realm, || {
+                backend::headless::run(size)
+            })
         }
     }
 }
@@ -563,6 +612,7 @@ fn main() -> ExitCode {
 /// is why a mistake in the first cannot serve the dead realm's last frame.
 fn run_session<R>(
     consent: ConsentPolicy,
+    principals_path: Option<PathBuf>,
     recorder_path: Option<PathBuf>,
     realm_path: Option<PathBuf>,
     backend: R,
@@ -570,6 +620,20 @@ fn run_session<R>(
 where
     R: FnOnce() -> Result<(), Box<dyn std::error::Error>>,
 {
+    // The R6 guard runs before anything at all, including the realm: a
+    // session that must not start should abort at the earliest point where
+    // that is knowable, leaving nothing behind and doing nothing first.
+    //
+    // `_banner` is a *named* binding on purpose. A bare `_` would drop the
+    // guard immediately, stopping the repeating auto-approve warning before
+    // the session even begins -- silently turning the persistent warning
+    // back into the single startup line R6 says is not enough. Bound here,
+    // it lives until this function returns, which is exactly the span
+    // during which the policy is active.
+    let Ok(_banner) = announce_consent_policy(consent, principals_path.as_deref()) else {
+        return ExitCode::FAILURE;
+    };
+
     // The realm is resolved before anything else this run creates: a
     // session whose realm configuration is missing or malformed has
     // nothing to serve, and aborting here means no log file, no socket,
@@ -701,22 +765,211 @@ fn announce_realms(realms: &RealmRegistry) {
     }
 }
 
-/// The loud startup announcement the consent policy owes (plan risk R6):
-/// auto-approve must never run silently. The parsed policy is consumed by
-/// the M1.1 listener wiring (which constructs the `PetitionRegistry` from
-/// it); until that wiring lands, nothing at runtime accepts principal
-/// connections, so the announcement is the flag's only runtime effect.
-fn announce_consent_policy(policy: ConsentPolicy) {
+/// Announce the consent policy and, under auto-approve, **refuse to start**
+/// unless the principal registry is safe to grant blindly (plan risk R6).
+///
+/// Returns the live banner guard: dropping it stops the repeating warning,
+/// so the warning's lifetime is the session's lifetime by construction. An
+/// `Err` means the session must not start; the diagnostics have already
+/// been emitted.
+///
+/// # Why auto-approve needs a startup guard at all
+///
+/// `--consent=auto-approve` grants every petition as requested with no
+/// human in the loop. That is defensible for the walking skeleton and
+/// headless CI, where the only principal is a demo agent whose token is in
+/// the same repository. It is indefensible for any registry an operator
+/// actually deployed: the flag would silently convert every principal in
+/// that file into an unattended holder of observe-and-actuate authority
+/// over the realm. The flag is a CI convenience that composes into a
+/// backdoor, which is exactly the shape plan risk R6 names.
+///
+/// # What "more than the demo principal" means, precisely
+///
+/// The registry must contain **exactly one row, and its canonical identity
+/// must be exactly [`DEMO_PRINCIPAL`]**. Both halves are load-bearing, and
+/// the reason the obvious cheaper check is wrong is worth stating:
+///
+/// - A pure count (`rows > 1`) is satisfied by a registry holding one
+///   principal named `vitrin://prod/agent/fleet-controller` — a real
+///   deployed identity with a real token, now auto-granted whatever it
+///   asks for, on a configuration the guard called safe. The dangerous
+///   registry is not "demo plus others"; it is "any row that is not the
+///   demo". A single production principal is exactly as dangerous as ten.
+/// - Requiring the exact demo identity makes the guard a whitelist of one
+///   known-throwaway name rather than a headcount. An operator who renamed
+///   that row has, definitionally, stopped running the demo.
+///
+/// Three checks it deliberately does **not** make, each of which looks
+/// stricter and is worse:
+///
+/// - **The token is not inspected.** `examples/principals.toml` ships a
+///   placeholder and tells operators to replace it; demanding the
+///   placeholder would make this guard require a weaker configuration to
+///   pass. A demo with a real random token is still a demo.
+/// - **A missing registry is refused, not waved through.** "No file, so no
+///   principals, so nothing to grant" is true today and is a trapdoor
+///   tomorrow: it would let any operator satisfy the guard by pointing
+///   `--principals` at a path that does not exist, and then have the M1.1
+///   listener load a registry this guard never saw. The guard's job is to
+///   *prove* the registry is the demo registry; absence proves nothing.
+/// - **The registry is loaded through [`StaticVerifier::load`]**, not a
+///   bespoke parse — so the permission checks, the token-length minimum,
+///   the duplicate-identity rule, and the uid-pin rule all apply exactly as
+///   they will at verification time. A file this guard accepts and the
+///   runtime rejects (or vice versa) would be a guard auditing a document
+///   nobody reads.
+///
+/// Under `interactive` the registry is **not** read here at all. Nothing at
+/// runtime accepts principal connections yet, and interactive is the
+/// fail-closed default that needs no permission to run; the M1.1 listener
+/// wiring is what will load the registry for verification.
+fn announce_consent_policy(
+    policy: ConsentPolicy,
+    principals_path: Option<&Path>,
+) -> Result<Option<AutoApproveBanner>, ()> {
     match policy {
-        ConsentPolicy::AutoApprove => tracing::warn!(
-            "CONSENT POLICY: AUTO-APPROVE -- every grant petition will be granted \
-             as requested with NO human decision. Headless CI and demos only."
-        ),
-        ConsentPolicy::Interactive => tracing::info!(
-            "consent policy: interactive (the consent renderer lands with E7; \
-             until then petitions pend and resolve timed_out)"
-        ),
+        ConsentPolicy::Interactive => {
+            tracing::info!(
+                "consent policy: interactive (petitions pend for a human decision on the \
+                 core-rendered consent prompt; unanswered petitions resolve timed_out)"
+            );
+            Ok(None)
+        }
+        ConsentPolicy::AutoApprove => {
+            let path = match principals_path {
+                Some(path) => path.to_path_buf(),
+                None => match realm::default_principals_path() {
+                    Ok(path) => path,
+                    Err(err) => {
+                        tracing::error!(
+                            "fatal: `--consent=auto-approve` must audit the principal registry, \
+                             and this core cannot locate it: {err}; pass an explicit \
+                             `--principals PATH`"
+                        );
+                        return Err(());
+                    }
+                },
+            };
+            let verifier = match StaticVerifier::load(&path) {
+                Ok(verifier) => verifier,
+                Err(err) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        "fatal: `--consent=auto-approve` REFUSED: the principal registry could \
+                         not be read, so it cannot be audited: {err}. Auto-approve grants every \
+                         petition with no human decision and is only permitted when the registry \
+                         holds nothing but the demo principal `{DEMO_PRINCIPAL}`; \
+                         run without `--consent=auto-approve` to start."
+                    );
+                    return Err(());
+                }
+            };
+            let identities: Vec<&str> = verifier.identities().map(|id| id.as_str()).collect();
+            if identities != [DEMO_PRINCIPAL] {
+                tracing::error!(
+                    path = %path.display(),
+                    principals = ?identities,
+                    "fatal: `--consent=auto-approve` REFUSED: this registry holds more than the \
+                     demo principal. Auto-approve would grant EVERY petition from EVERY listed \
+                     principal, as requested, with no human decision -- so it is permitted only \
+                     for a registry of exactly one row whose identity is `{DEMO_PRINCIPAL}`. \
+                     Remove `--consent=auto-approve` (interactive consent is the default), or \
+                     point `--principals` at a demo-only registry."
+                );
+                return Err(());
+            }
+            Ok(Some(AutoApproveBanner::start(&path)))
+        }
     }
+}
+
+/// The repeating auto-approve warning, alive for exactly as long as the
+/// session is (plan risk R6: the warning must be persistent, not a startup
+/// line that scrolls away).
+///
+/// # Why this is a thread in an otherwise single-threaded core
+///
+/// The core's decision paths are single-threaded on purpose, and this does
+/// not change that: the thread **shares no core state** — it holds one
+/// stop-flag and calls `tracing`, which is `Sync` — and it takes no part in
+/// any authority decision, composition, or protocol step. The alternative
+/// would be a timer in each backend's event loop, which means the warning's
+/// correctness depends on two loops (and every future backend) remembering
+/// to arm it; a policy this loud should not be a thing three call sites can
+/// forget.
+///
+/// Shutdown is prompt rather than "within one interval": [`Drop`] sets the
+/// flag and notifies the condvar, so the sleeping thread wakes immediately
+/// and joins. A one-minute hang on exit would be its own bug report.
+struct AutoApproveBanner {
+    /// `(stop requested, waker)`.
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    /// `None` only after [`Drop`] has taken it, or if the thread could not
+    /// be spawned (in which case the startup warning was still emitted --
+    /// a missing repeat must never be a reason not to start).
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AutoApproveBanner {
+    /// Emit the warning now and every [`AUTO_APPROVE_BANNER_INTERVAL`]
+    /// until dropped.
+    fn start(registry: &Path) -> Self {
+        warn_auto_approve(registry);
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker = Arc::clone(&stop);
+        let registry = registry.to_path_buf();
+        let thread = std::thread::Builder::new()
+            .name("auto-approve-banner".into())
+            .spawn(move || {
+                let (lock, cvar) = &*worker;
+                let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while !*stopped {
+                    let (guard, _timeout) = cvar
+                        .wait_timeout(stopped, AUTO_APPROVE_BANNER_INTERVAL)
+                        .unwrap_or_else(|e| e.into_inner());
+                    stopped = guard;
+                    if !*stopped {
+                        warn_auto_approve(&registry);
+                    }
+                }
+            })
+            .inspect_err(|err| {
+                tracing::error!(
+                    "auto-approve is ACTIVE but its repeating warning could not be started \
+                     ({err}); this line and the startup banner are the only warnings this run \
+                     will emit outside the per-approval log"
+                );
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for AutoApproveBanner {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.stop;
+        {
+            let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *stopped = true;
+        }
+        cvar.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The auto-approve warning text, in one place so the startup emission and
+/// every repeat are literally the same message.
+fn warn_auto_approve(registry: &Path) {
+    tracing::warn!(
+        principals = %registry.display(),
+        "CONSENT POLICY: AUTO-APPROVE IS ACTIVE -- every grant petition is granted as \
+         requested, with NO human decision and no consent prompt. Permitted only because \
+         the principal registry holds nothing but the demo principal. Headless CI and \
+         demos ONLY; never a deployed session."
+    );
 }
 
 /// Route Smithay's (and our own) `tracing` diagnostics to stderr.
@@ -741,6 +994,7 @@ mod tests {
             parse_args(["--nested"]),
             Ok(Action::RunNested {
                 consent: ConsentPolicy::Interactive,
+                principals: None,
                 recorder: None,
                 realm: None
             })
@@ -754,6 +1008,7 @@ mod tests {
             Ok(Action::RunHeadless {
                 size: (1280, 800),
                 consent: ConsentPolicy::Interactive,
+                principals: None,
                 recorder: None,
                 realm: None
             })
@@ -767,6 +1022,7 @@ mod tests {
             Ok(Action::RunHeadless {
                 size: (1280, 800),
                 consent: ConsentPolicy::Interactive,
+                principals: None,
                 recorder: None,
                 realm: None
             })
@@ -776,6 +1032,7 @@ mod tests {
             Ok(Action::RunHeadless {
                 size: (640, 480),
                 consent: ConsentPolicy::Interactive,
+                principals: None,
                 recorder: None,
                 realm: None
             })
@@ -795,6 +1052,7 @@ mod tests {
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
                     consent: ConsentPolicy::AutoApprove,
+                    principals: None,
                     recorder: None,
                     realm: None
                 })
@@ -804,6 +1062,7 @@ mod tests {
             parse_args(["--nested", "--consent=interactive"]),
             Ok(Action::RunNested {
                 consent: ConsentPolicy::Interactive,
+                principals: None,
                 recorder: None,
                 realm: None
             })
@@ -820,6 +1079,7 @@ mod tests {
             Ok(Action::RunHeadless {
                 size: (1280, 800),
                 consent: ConsentPolicy::Interactive,
+                principals: None,
                 recorder: None,
                 realm: None
             })
@@ -833,6 +1093,7 @@ mod tests {
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
                     consent: ConsentPolicy::Interactive,
+                    principals: None,
                     recorder: Some(PathBuf::from("/tmp/run.jsonl")),
                     realm: None
                 })
@@ -847,6 +1108,7 @@ mod tests {
             ]),
             Ok(Action::RunNested {
                 consent: ConsentPolicy::AutoApprove,
+                principals: None,
                 recorder: Some(PathBuf::from("/tmp/n.jsonl")),
                 realm: None
             })
@@ -867,6 +1129,7 @@ mod tests {
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
                     consent: ConsentPolicy::Interactive,
+                    principals: None,
                     recorder: None,
                     realm: Some(PathBuf::from("/etc/vitrin/realm.toml"))
                 })
@@ -882,6 +1145,7 @@ mod tests {
             ]),
             Ok(Action::RunNested {
                 consent: ConsentPolicy::AutoApprove,
+                principals: None,
                 recorder: Some(PathBuf::from("/tmp/n.jsonl")),
                 realm: Some(PathBuf::from("/tmp/realm.toml"))
             })
@@ -950,6 +1214,188 @@ mod tests {
         }
     }
 
+    // -- the R6 auto-approve guard (P1.7.2) --------------------------------
+
+    /// A scratch `principals.toml` holding exactly `identities`, mode 0600
+    /// in a 0700 directory (what [`StaticVerifier::load`] demands). Returns
+    /// the directory so the caller can remove it.
+    fn scratch_registry(identities: &[&str]) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vitrin-r6-guard-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("principals.toml");
+        let body: String = identities
+            .iter()
+            .map(|id| {
+                format!(
+                    "[[principal]]\nidentity = \"{id}\"\n\
+                     token = \"0123456789abcdef0123456789abcdef\"\n\n"
+                )
+            })
+            .collect();
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn auto_approve_starts_only_for_a_demo_only_registry() {
+        // The risk-R6 acceptance criterion. The guard is a whitelist of one
+        // exact identity, not a headcount -- see `announce_consent_policy`
+        // for why a count alone is satisfied by a registry that is
+        // dangerous in practice.
+        let (dir, path) = scratch_registry(&[DEMO_PRINCIPAL]);
+        let banner = announce_consent_policy(ConsentPolicy::AutoApprove, Some(&path))
+            .expect("a demo-only registry is exactly what auto-approve is for");
+        assert!(banner.is_some(), "auto-approve must start its warning");
+        drop(banner);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn auto_approve_refuses_a_registry_holding_more_than_the_demo_principal() {
+        // Every shape of "more than the demo principal", including the one
+        // a pure `rows > 1` check would wave through.
+        let cases: [(&str, Vec<&str>); 4] = [
+            (
+                "the demo principal plus a second agent",
+                vec![DEMO_PRINCIPAL, "vitrin://local/agent/second"],
+            ),
+            (
+                // The case that motivates checking the name, not the count:
+                // one row, and it is a production identity.
+                "a single non-demo principal",
+                vec!["vitrin://prod/agent/fleet-controller"],
+            ),
+            (
+                // A near-miss name is not the demo principal.
+                "a look-alike identity",
+                vec!["vitrin://local/agent/demo2"],
+            ),
+            (
+                "several non-demo principals",
+                vec!["vitrin://local/agent/a", "vitrin://local/agent/b"],
+            ),
+        ];
+        for (label, identities) in cases {
+            let (dir, path) = scratch_registry(&identities);
+            assert!(
+                announce_consent_policy(ConsentPolicy::AutoApprove, Some(&path)).is_err(),
+                "{label}: auto-approve must refuse to start"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn auto_approve_refuses_a_registry_it_cannot_audit() {
+        // Absence proves nothing (a missing file would otherwise be a
+        // trapdoor: point `--principals` at nothing and the guard passes),
+        // and neither does a file the runtime verifier itself would reject
+        // -- the guard loads through `StaticVerifier::load` precisely so
+        // the two can never disagree about the same file.
+        use std::os::unix::fs::PermissionsExt;
+
+        let absent = std::env::temp_dir().join(format!(
+            "vitrin-r6-absent-{}/principals.toml",
+            std::process::id()
+        ));
+        assert!(announce_consent_policy(ConsentPolicy::AutoApprove, Some(&absent)).is_err());
+
+        // World-readable: a registry of bearer tokens anyone can steal.
+        let (dir, path) = scratch_registry(&[DEMO_PRINCIPAL]);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(announce_consent_policy(ConsentPolicy::AutoApprove, Some(&path)).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn interactive_never_reads_the_principal_registry() {
+        // The fail-closed default needs no permission to run, and nothing
+        // at runtime verifies against the registry yet (M1.1). Pointing
+        // `--principals` at a path that could not possibly load must not
+        // stop an interactive session.
+        let absent = std::env::temp_dir().join("vitrin-r6-never-read/principals.toml");
+        let banner = announce_consent_policy(ConsentPolicy::Interactive, Some(&absent))
+            .expect("interactive starts regardless of the registry");
+        assert!(banner.is_none(), "no auto-approve banner under interactive");
+    }
+
+    #[test]
+    fn the_demo_principal_constant_is_the_one_the_example_registry_ships() {
+        // The guard's whitelist and the shipped example must name the same
+        // identity: an example an operator copies verbatim has to be the
+        // configuration the guard accepts, or the demo cannot run.
+        let example = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/principals.toml"
+        ))
+        .expect("the example registry is committed");
+        assert!(
+            example.contains(&format!("identity = \"{DEMO_PRINCIPAL}\"")),
+            "examples/principals.toml no longer names {DEMO_PRINCIPAL}"
+        );
+        // Table headers only -- the file's prose mentions `[[principal]]`
+        // several times while defining exactly one table.
+        assert_eq!(
+            example
+                .lines()
+                .filter(|line| line.trim() == "[[principal]]")
+                .count(),
+            1,
+            "the example registry must stay demo-only, or copying it fails the R6 guard"
+        );
+    }
+
+    #[test]
+    fn the_auto_approve_banner_stops_promptly_when_dropped() {
+        // The repeat is a background thread; dropping the guard must wake
+        // it immediately rather than waiting out the interval. A minute-long
+        // hang on shutdown would be its own bug.
+        let (dir, path) = scratch_registry(&[DEMO_PRINCIPAL]);
+        let start = std::time::Instant::now();
+        {
+            let _banner = AutoApproveBanner::start(&path);
+        }
+        assert!(
+            start.elapsed() < AUTO_APPROVE_BANNER_INTERVAL,
+            "dropping the banner must not wait out the repeat interval"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn principals_path_parses_both_spellings_and_defaults_to_none() {
+        for args in [
+            vec!["--headless", "--principals", "/etc/vitrin/principals.toml"],
+            vec!["--headless", "--principals=/etc/vitrin/principals.toml"],
+        ] {
+            assert_eq!(
+                parse_args(args),
+                Ok(Action::RunHeadless {
+                    size: (1280, 800),
+                    consent: ConsentPolicy::Interactive,
+                    principals: Some(PathBuf::from("/etc/vitrin/principals.toml")),
+                    recorder: None,
+                    realm: None
+                })
+            );
+        }
+        // The `--recorder` precedent, flag for flag.
+        assert!(parse_args(["--headless", "--principals"]).is_err());
+        assert!(parse_args(["--headless", "--principals="]).is_err());
+        assert!(parse_args(["--headless", "--principals", ""]).is_err());
+        assert!(parse_args(["--headless", "--principals=/a", "--principals=/b"]).is_err());
+    }
+
     #[test]
     fn malformed_or_repeated_consent_is_an_error() {
         assert!(parse_args(["--headless", "--consent", "yolo"]).is_err());
@@ -990,6 +1436,7 @@ mod tests {
             Ok(Action::RunHeadless {
                 size: (2147483647, 1),
                 consent: ConsentPolicy::Interactive,
+                principals: None,
                 recorder: None,
                 realm: None
             })

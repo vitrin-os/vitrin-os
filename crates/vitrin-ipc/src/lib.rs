@@ -159,6 +159,7 @@ pub use error::{LocalMisuse, PeerViolation, TransportError};
 #[cfg(feature = "server")]
 pub use event_loop::{
     reply, ConnectionEvent, ConnectionSource, DisconnectReason, ListenerEvent, ListenerSource,
+    Outbox, MAX_OUTBOX_FRAMES,
 };
 #[cfg(feature = "client")]
 pub use listener::Listener;

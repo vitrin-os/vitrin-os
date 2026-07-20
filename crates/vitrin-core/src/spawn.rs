@@ -206,10 +206,25 @@
 //!   this realm, so anything at the path belongs to a run that is gone.
 //!   Losing it means a second `vitrind` is serving this realm right now, and
 //!   the spawn is refused ([`SpawnError::RealmBusy`]) instead of deleting a
-//!   live run's socket directory out from under it -- which is precisely
-//!   what the previous "the listener's `flock` guard enforces one core per
-//!   tree" justification permitted, because **nothing in the core
-//!   constructs a `Listener`**, so that lock was never held by anybody.
+//!   live run's socket directory out from under it.
+//!
+//!   **There are now two locks, and this one is not redundant.** Since the
+//!   M1.1 runtime wiring the core really does bind a `Listener`, so the
+//!   tree-level `core.sock.lock` is finally held by somebody -- which
+//!   retires the old note that it was a justification resting on a lock
+//!   nobody took. The tempting inverse conclusion is wrong: the tree lock
+//!   cannot replace this one. Their **lifetimes differ** (the listener dies
+//!   with the event loop, while realm teardown -- the shutdown ladder's
+//!   hangup, `SIGTERM`, `SIGKILL`, directory removal -- runs *after* the
+//!   loop stops, so there is a real window where the tree lock is released
+//!   and a realm directory is still being torn down; only this lock covers
+//!   it, which is why `into_parts` releases it last of all). Their
+//!   **objects differ**: the tree lock guards a socket path and its worst
+//!   unlicensed act is unlinking one socket, whereas this one licenses a
+//!   *recursive delete*, and a lock should never be coarser than the
+//!   destruction it authorizes. And their **granularity differs**: one core
+//!   with N realms is the intended shape, which a per-realm lock survives
+//!   and a per-tree lock does not.
 //!   Reusing a stale directory instead of purging is not an option either:
 //!   it would carry a dead run's socket file and scratch into a new run's
 //!   confinement.

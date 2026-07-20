@@ -145,15 +145,17 @@
 //!
 //! # Scope seams (marked, not smuggled)
 //!
-//! - The **unauthenticated deadline** (conventions 7.1 SHOULD) is a wall
-//!   clock owned by the runtime wiring: nothing at runtime accepts
-//!   principal connections yet (the listener wiring lands with M1.1
-//!   integration), and the deadline is a calloop timer armed at accept and
-//!   disarmed on [`is_bound`](PrincipalServer::is_bound) -- flagged in the
-//!   task summary rather than half-built here.
-//! - The **consent-timeout timer** is likewise M1.1 wiring: the embedder
-//!   polls [`PetitionRegistry::expire_due`] (petitions' module docs) and
-//!   routes each returned resolution to its connection's
+//! Both are now filled, by [`crate::session`], and both stay *seams* rather
+//! than becoming this module's business -- the server still reads no clock
+//! and owns no timer.
+//!
+//! - The **unauthenticated deadline** (conventions 7.1 SHOULD) is a calloop
+//!   timer the runtime arms at accept and disarms the first time
+//!   [`is_bound`](PrincipalServer::is_bound) returns true; on elapse the
+//!   runtime closes the connection and tears it down.
+//! - The **consent-timeout timer** is the runtime's advisory sweep: it polls
+//!   [`PetitionRegistry::expire_due`] (petitions' module docs) and routes
+//!   each returned resolution to its connection's
 //!   [`deliver_resolution`](PrincipalServer::deliver_resolution).
 //!
 //! # The flight recorder's emission sites (P1.4.5, issue #29)

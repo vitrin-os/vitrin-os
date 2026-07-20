@@ -72,11 +72,15 @@
 //!   wire-format change belonging to `track:protocol` (see the crate docs).
 //!   Any parked replies to the dying peer are dropped with it.
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
+use std::rc::Rc;
 
 use calloop::generic::{Generic, NoIoDrop};
+use calloop::ping::{make_ping, Ping, PingSource};
 use calloop::{EventSource, Interest, Mode, Poll, PostAction, Readiness, Token, TokenFactory};
 
 use crate::error::PeerViolation;
@@ -234,6 +238,117 @@ pub enum ConnectionEvent {
 /// invariant is not weakened to a prose contract.
 pub struct ConnectionSource {
     inner: Generic<Connection>,
+    /// The out-of-dispatch send path, when one was requested at
+    /// construction ([`ConnectionSource::with_outbox`]). `None` for a
+    /// connection whose every reply is issued from inside its own dispatch
+    /// callback, which is the ordinary principal-connection shape.
+    outbox: Option<OutboxSink>,
+}
+
+/// The source-side half of an [`Outbox`]: the queue itself plus the
+/// [`PingSource`] whose readiness is what gets this source dispatched when
+/// the queue gains a frame.
+struct OutboxSink {
+    /// Woken by [`Outbox::send`]; drained (and the queue with it) inside
+    /// [`ConnectionSource::process_events`].
+    ping: PingSource,
+    queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
+}
+
+/// How many frames may sit in an [`Outbox`] before the producer is told the
+/// peer is not keeping up.
+///
+/// This is a *second* bound in front of [`crate::MAX_SEND_QUEUE_BYTES`],
+/// not a replacement for it: the connection's own send queue only starts
+/// filling once the loop has actually dispatched this source, and an
+/// enqueue-side flood (a runaway actuation stream, a compositor ticking
+/// faster than the peer reads) would otherwise grow unbounded in the gap.
+/// The number is deliberately small — the frames that ride an outbox are
+/// input events and frame callbacks, both of which are worthless stale, so
+/// a deep queue would buy latency instead of resilience.
+pub const MAX_OUTBOX_FRAMES: usize = 64;
+
+/// A send handle for a [`Connection`] that a [`ConnectionSource`] owns.
+///
+/// # Why this exists
+///
+/// Once a [`Connection`] is registered, the only sanctioned way to write to
+/// it is [`reply`], which needs the [`NoIoDrop<Connection>`](NoIoDrop) the
+/// dispatch callback is handed — so *by construction* the core can only
+/// speak to a peer while that peer is speaking to it. For a request/response
+/// peer (a principal connection) that is exactly right and no more is
+/// wanted.
+///
+/// It is wrong for the two things the compositor must push at a peer that is
+/// sitting silent in a blocking `recv`: **seat events** (the human or an
+/// authorized agent actuated; the shim is by definition quiet, that is what
+/// waiting for input *is*) and **`frame_done`** (presentation completed on
+/// the compositor's cadence, not on the shim's). Neither has any inbound
+/// message to ride, and a design that deferred them to the peer's next
+/// readiness would deliver input only to peers that did not need any.
+///
+/// So an outbox is a queue plus a wakeup. [`Outbox::send`] appends and pings;
+/// the ping is a second fd registered by the same [`ConnectionSource`], so
+/// the loop dispatches that source, which drains the queue through
+/// [`Connection::send_or_queue`] — the same call [`reply`] makes, subject to
+/// the same backpressure, poisoning, and [`DisconnectReason::SlowReader`]
+/// policy. Nothing bypasses the transport's own rules; the outbox only
+/// supplies the *occasion* to write.
+///
+/// # Frames only, never fds
+///
+/// [`Outbox::send`] takes no fd. Everything version 1 pushes this way is
+/// pure wire bytes, and the one event that carries an fd
+/// (`vitrin_view.frame_ready`'s memfd) is a reply on a principal
+/// connection, which already has [`reply`]. Refusing fds here keeps the
+/// queue plain `Vec<u8>` and means a parked outbox can never pin a
+/// descriptor open.
+#[derive(Clone)]
+pub struct Outbox {
+    queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
+    ping: Ping,
+}
+
+impl Outbox {
+    /// Queue one complete encoded frame and wake the loop so the owning
+    /// [`ConnectionSource`] drains it.
+    ///
+    /// `Err(TransportError::SendQueueFull)` means the queue hit
+    /// [`MAX_OUTBOX_FRAMES`]: the peer is not reading. The frame is **not**
+    /// queued. Treat it exactly as a full send queue — stop producing for
+    /// this peer and let the connection die on the transport's own
+    /// slow-reader policy, which the drain below will trip on the next
+    /// dispatch.
+    pub fn send(&self, frame: &[u8]) -> Result<(), TransportError> {
+        let mut queue = self.queue.borrow_mut();
+        if queue.len() >= MAX_OUTBOX_FRAMES {
+            return Err(TransportError::SendQueueFull {
+                queued: queue.iter().map(Vec::len).sum(),
+            });
+        }
+        queue.push_back(frame.to_vec());
+        drop(queue);
+        // After the push, never before: a wakeup that arrives ahead of the
+        // frame would drain nothing and the frame would then wait for an
+        // unrelated readiness.
+        self.ping.ping();
+        Ok(())
+    }
+
+    /// Frames queued but not yet handed to the connection. Zero on any
+    /// quiescent loop; non-zero only between a [`send`](Self::send) and the
+    /// dispatch it woke.
+    pub fn pending(&self) -> usize {
+        self.queue.borrow().len()
+    }
+}
+
+impl fmt::Debug for Outbox {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Outbox")
+            .field("pending", &self.pending())
+            .finish()
+    }
 }
 
 impl ConnectionSource {
@@ -243,7 +358,37 @@ impl ConnectionSource {
         set_nonblocking(conn.as_fd())?;
         Ok(Self {
             inner: Generic::new(conn, Interest::READ, Mode::Level),
+            outbox: None,
         })
+    }
+
+    /// [`ConnectionSource::new`] plus an [`Outbox`]: a handle the core keeps
+    /// outside the loop for pushing frames at a peer that is not talking.
+    ///
+    /// Read [`Outbox`]'s docs before reaching for this. A connection whose
+    /// traffic is entirely request/response wants [`new`](Self::new); an
+    /// outbox on such a connection is a second write path with no second
+    /// purpose, and every write path is somewhere ordering can go wrong.
+    ///
+    /// The [`Outbox`] is `Clone` and neither half keeps the other alive: drop
+    /// every clone and the source simply stops being woken (the drained
+    /// queue is empty, so nothing is lost); drop the source — which is how a
+    /// connection is closed here — and [`Outbox::send`] keeps succeeding into
+    /// a queue nobody reads. That asymmetry is deliberate and is why the
+    /// core must forget its outbox at the same moment it forgets the
+    /// connection.
+    pub fn with_outbox(conn: Connection) -> io::Result<(Self, Outbox)> {
+        set_nonblocking(conn.as_fd())?;
+        let (ping, ping_source) = make_ping()?;
+        let queue = Rc::new(RefCell::new(VecDeque::new()));
+        let source = Self {
+            inner: Generic::new(conn, Interest::READ, Mode::Level),
+            outbox: Some(OutboxSink {
+                ping: ping_source,
+                queue: Rc::clone(&queue),
+            }),
+        };
+        Ok((source, Outbox { queue, ping }))
     }
 
     /// The peer credentials captured when the connection was created --
@@ -274,92 +419,144 @@ impl EventSource for ConnectionSource {
     where
         F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
     {
-        let mut post = self
-            .inner
-            .process_events(readiness, token, |_readiness, conn_nodrop| {
-                // Flush parked replies first: write-readiness may be why this
-                // dispatch fired, and freeing queue space gives replies issued
-                // by the callback below the best chance of going out inline.
-                if conn_nodrop.queued_send_bytes() > 0 {
-                    // SAFETY: `get_mut` yields `&mut Connection` for exactly
-                    // one `flush_send_queue`, which mutates only the
-                    // connection's own send queue and writes its fd -- it
-                    // never drops or moves the Connection, which stays owned
-                    // by `inner` (and so registered with the poller) across
-                    // the call.
-                    if let Err(e) = unsafe { conn_nodrop.get_mut() }.flush_send_queue() {
+        // Split the borrow so the outbox drain can hold the queue and the
+        // connection at once; `self` is reassembled implicitly at the end.
+        let Self { inner, outbox } = self;
+
+        // The outbox half of this source, if any. Its ping is a *second*
+        // registered fd, so this dispatch may be for the ping alone, with
+        // the connection's own fd not ready at all — hence the drain runs
+        // before, and independently of, the read path below.
+        //
+        // Nothing here reports send failures: it does not have to. A frame
+        // that could not be handed over leaves the connection's sticky
+        // overflow/poison state set, and the interest recomputation at the
+        // bottom of this function then adds write-interest, so the *inner*
+        // source dispatches on write-readiness and runs the one
+        // fault-reporting path there is. Duplicating that reporting here
+        // would be a second place a connection can be declared dead.
+        let mut outbox_closed = false;
+        if let Some(sink) = outbox.as_mut() {
+            let mut pinged = false;
+            let action = sink
+                .ping
+                .process_events(readiness, token, |(), &mut ()| pinged = true)
+                .map_err(io::Error::other)?;
+            outbox_closed = matches!(action, PostAction::Remove);
+            if pinged {
+                // SAFETY: as in the read path below -- `get_mut` yields
+                // `&mut Connection` for `send_or_queue` calls that mutate
+                // only the connection's own send queue and write its fd;
+                // the Connection stays owned by `inner` (and registered
+                // with the poller) across them.
+                let conn = unsafe { inner.get_mut() };
+                let mut queued = sink.queue.borrow_mut();
+                while let Some(frame) = queued.pop_front() {
+                    // No fd rides an outbox frame, by construction
+                    // ([`Outbox`]).
+                    if conn.send_or_queue(&frame, None).is_err() {
+                        // Sticky on the Connection; the write-readiness
+                        // dispatch will classify and report it. Everything
+                        // still queued is dropped with the connection, so
+                        // hanging on to it would only pin memory for a peer
+                        // that is already dying.
+                        queued.clear();
+                        break;
+                    }
+                }
+            }
+        }
+        // Every `Ping` handle was dropped: nothing can wake this source
+        // through the outbox again, so retire its registration rather than
+        // polling a permanently-quiet fd for the connection's whole life.
+        if outbox_closed {
+            *outbox = None;
+        }
+
+        let mut post = inner.process_events(readiness, token, |_readiness, conn_nodrop| {
+            // Flush parked replies first: write-readiness may be why this
+            // dispatch fired, and freeing queue space gives replies issued
+            // by the callback below the best chance of going out inline.
+            if conn_nodrop.queued_send_bytes() > 0 {
+                // SAFETY: `get_mut` yields `&mut Connection` for exactly
+                // one `flush_send_queue`, which mutates only the
+                // connection's own send queue and writes its fd -- it
+                // never drops or moves the Connection, which stays owned
+                // by `inner` (and so registered with the poller) across
+                // the call.
+                if let Err(e) = unsafe { conn_nodrop.get_mut() }.flush_send_queue() {
+                    let reason = DisconnectReason::from(e);
+                    log_disconnect(conn_nodrop, &reason);
+                    callback(ConnectionEvent::Fault(reason), conn_nodrop);
+                    return Ok(PostAction::Remove);
+                }
+            }
+            let mut action = PostAction::Continue;
+            loop {
+                // SAFETY: as above -- `get_mut` yields `&mut Connection`
+                // for exactly one `recv_message`, which mutates only the
+                // connection's own reassembly buffers and reads its fd;
+                // it never drops or moves the Connection. The borrow ends
+                // with the expression, before `conn_nodrop` is handed to
+                // the callback.
+                let received = unsafe { conn_nodrop.get_mut() }.recv_message();
+                match received {
+                    Ok(Some(msg)) => callback(ConnectionEvent::Message(msg), conn_nodrop),
+                    Ok(None) => {
+                        callback(ConnectionEvent::Disconnected, conn_nodrop);
+                        action = PostAction::Remove;
+                        break;
+                    }
+                    // Drained: the kernel has no more bytes right now.
+                    // Any partial frame stays buffered for next readiness.
+                    Err(TransportError::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                        break
+                    }
+                    Err(e) => {
                         let reason = DisconnectReason::from(e);
                         log_disconnect(conn_nodrop, &reason);
                         callback(ConnectionEvent::Fault(reason), conn_nodrop);
-                        return Ok(PostAction::Remove);
-                    }
-                }
-                let mut action = PostAction::Continue;
-                loop {
-                    // SAFETY: as above -- `get_mut` yields `&mut Connection`
-                    // for exactly one `recv_message`, which mutates only the
-                    // connection's own reassembly buffers and reads its fd;
-                    // it never drops or moves the Connection. The borrow ends
-                    // with the expression, before `conn_nodrop` is handed to
-                    // the callback.
-                    let received = unsafe { conn_nodrop.get_mut() }.recv_message();
-                    match received {
-                        Ok(Some(msg)) => callback(ConnectionEvent::Message(msg), conn_nodrop),
-                        Ok(None) => {
-                            callback(ConnectionEvent::Disconnected, conn_nodrop);
-                            action = PostAction::Remove;
-                            break;
-                        }
-                        // Drained: the kernel has no more bytes right now.
-                        // Any partial frame stays buffered for next readiness.
-                        Err(TransportError::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                            break
-                        }
-                        Err(e) => {
-                            let reason = DisconnectReason::from(e);
-                            log_disconnect(conn_nodrop, &reason);
-                            callback(ConnectionEvent::Fault(reason), conn_nodrop);
-                            action = PostAction::Remove;
-                            break;
-                        }
-                    }
-                }
-                // Replies issued by the callback above may have hit the
-                // send-queue cap or a fatal send I/O error. Both are sticky
-                // on the Connection, so neither can be missed here, and the
-                // connection dies in the same dispatch that hit it. The
-                // overflow check makes the slow-reader policy *prompt* (the
-                // loop never parks past-cap data); the poison check is the
-                // *only* observation point for a send error with an empty
-                // queue (e.g. EPIPE from a peer that shut down its read side
-                // but keeps writing) -- without it such a connection would
-                // live forever with every reply silently failing, and a
-                // partial write followed by an error would leave a torn
-                // frame on a still-registered connection.
-                if matches!(action, PostAction::Continue) {
-                    if conn_nodrop.send_queue_overflowed() {
-                        let reason = DisconnectReason::SlowReader {
-                            queued: conn_nodrop.queued_send_bytes(),
-                        };
-                        log_disconnect(conn_nodrop, &reason);
-                        callback(ConnectionEvent::Fault(reason), conn_nodrop);
                         action = PostAction::Remove;
-                    } else if let Some(kind) = conn_nodrop.send_poisoned() {
-                        let reason = DisconnectReason::from(TransportError::Io(kind.into()));
-                        log_disconnect(conn_nodrop, &reason);
-                        callback(ConnectionEvent::Fault(reason), conn_nodrop);
-                        action = PostAction::Remove;
+                        break;
                     }
                 }
-                Ok(action)
-            })?;
+            }
+            // Replies issued by the callback above may have hit the
+            // send-queue cap or a fatal send I/O error. Both are sticky
+            // on the Connection, so neither can be missed here, and the
+            // connection dies in the same dispatch that hit it. The
+            // overflow check makes the slow-reader policy *prompt* (the
+            // loop never parks past-cap data); the poison check is the
+            // *only* observation point for a send error with an empty
+            // queue (e.g. EPIPE from a peer that shut down its read side
+            // but keeps writing) -- without it such a connection would
+            // live forever with every reply silently failing, and a
+            // partial write followed by an error would leave a torn
+            // frame on a still-registered connection.
+            if matches!(action, PostAction::Continue) {
+                if conn_nodrop.send_queue_overflowed() {
+                    let reason = DisconnectReason::SlowReader {
+                        queued: conn_nodrop.queued_send_bytes(),
+                    };
+                    log_disconnect(conn_nodrop, &reason);
+                    callback(ConnectionEvent::Fault(reason), conn_nodrop);
+                    action = PostAction::Remove;
+                } else if let Some(kind) = conn_nodrop.send_poisoned() {
+                    let reason = DisconnectReason::from(TransportError::Io(kind.into()));
+                    log_disconnect(conn_nodrop, &reason);
+                    callback(ConnectionEvent::Fault(reason), conn_nodrop);
+                    action = PostAction::Remove;
+                }
+            }
+            Ok(action)
+        })?;
         // Interest management: watch for write-readiness exactly while
         // replies are parked. `Reregister` makes calloop call `reregister`,
         // which re-registers with the updated `interest` field.
         if matches!(post, PostAction::Continue) {
-            let want_write = self.inner.get_ref().queued_send_bytes() > 0;
-            if self.inner.interest.writable != want_write {
-                self.inner.interest = if want_write {
+            let want_write = inner.get_ref().queued_send_bytes() > 0;
+            if inner.interest.writable != want_write {
+                inner.interest = if want_write {
                     Interest::BOTH
                 } else {
                     Interest::READ
@@ -370,12 +567,20 @@ impl EventSource for ConnectionSource {
         Ok(post)
     }
 
+    // Both fds go through the same `TokenFactory`, so each child mints its
+    // own token and each child's `process_events` ignores readiness that is
+    // not its own -- which is what makes the compound source above safe to
+    // drive by calling both children unconditionally.
     fn register(
         &mut self,
         poll: &mut Poll,
         token_factory: &mut TokenFactory,
     ) -> calloop::Result<()> {
-        self.inner.register(poll, token_factory)
+        self.inner.register(poll, token_factory)?;
+        if let Some(sink) = self.outbox.as_mut() {
+            sink.ping.register(poll, token_factory)?;
+        }
+        Ok(())
     }
 
     fn reregister(
@@ -383,11 +588,19 @@ impl EventSource for ConnectionSource {
         poll: &mut Poll,
         token_factory: &mut TokenFactory,
     ) -> calloop::Result<()> {
-        self.inner.reregister(poll, token_factory)
+        self.inner.reregister(poll, token_factory)?;
+        if let Some(sink) = self.outbox.as_mut() {
+            sink.ping.reregister(poll, token_factory)?;
+        }
+        Ok(())
     }
 
     fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
-        self.inner.unregister(poll)
+        self.inner.unregister(poll)?;
+        if let Some(sink) = self.outbox.as_mut() {
+            sink.ping.unregister(poll)?;
+        }
+        Ok(())
     }
 }
 

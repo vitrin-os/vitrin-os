@@ -425,8 +425,10 @@ impl StaticVerifier {
     /// Load and validate `principals.toml` at `path`, refusing insecure
     /// file permissions (module docs). The conventional location is
     /// `$XDG_CONFIG_HOME/vitrin/principals.toml`; the path is the caller's
-    /// because the runtime wiring (and its `--principals` flag) lands with
-    /// M1.1 integration.
+    /// because `--principals` may override it. Called exactly once per
+    /// session, by `run_session`, whose result serves every connection --
+    /// two loads of one registry are two documents, and the R6 auto-approve
+    /// guard must audit the one the runtime verifies against.
     pub fn load(path: &Path) -> Result<Self, RegistryError> {
         let mut file = fs::File::open(path).map_err(RegistryError::Io)?;
         check_registry_security(&file)?;

@@ -130,10 +130,15 @@
 //!   otherwise, and [`grab`] notes the one partial mitigation (a replica
 //!   gets no input grab).
 //!
-//! Nothing at runtime shows a prompt yet, because the petition registry that
-//! would name a petition is only constructed by the M1.1 listener wiring
-//! (issue #77). Stated plainly rather than implied: **a running `vitrind`
-//! renders no consent prompt, and therefore never grabs input.** Both
+//! Nothing at runtime shows a prompt yet. The petition registry that names a
+//! petition now exists -- the M1.1 runtime wiring constructs it from the
+//! parsed `--consent` policy and a real agent's petition really does enter
+//! it -- but **no code calls [`grab::ConsentGrab::raise`]**, so, stated
+//! plainly rather than implied: **a running `vitrind` renders no consent
+//! prompt, and therefore never grabs input.** Under
+//! `--consent=interactive` a petition therefore pends until the armed
+//! expiry sweep resolves it `timed_out`, which is fail-closed and correct
+//! but is not consent. Both
 //! backends carry a live, empty [`ConsentSurface`] and composite through it
 //! every frame; the nested backend additionally carries a live, idle
 //! [`grab::ConsentGrab`] in its input router, so the grab is armed the

@@ -106,8 +106,8 @@
 //! a dead grant does not *report* itself alive between uses.
 //! [`GrantTable::expire_due`] follows the exact pattern of
 //! [`petitions::expire_due`](crate::petitions::PetitionRegistry::expire_due)
-//! -- injected `now`, embedder-polled (a calloop timer at M1.1; tests call
-//! it directly) -- and flips still-`Active` rows whose deadline passed to
+//! -- injected `now`, embedder-polled (the runtime's armed calloop timer,
+//! `session::sweep`; tests reach the registry's own entry point) -- and flips still-`Active` rows whose deadline passed to
 //! a *stored* expired state, returning the newly dead ids (the flight
 //! recorder's "grant expired without a use" feed, P1.4.5). It is
 //! deliberately **never load-bearing for enforcement**: every read surface
@@ -988,7 +988,8 @@ impl GrantTable {
     /// stored expired state and return the newly dead ids, ascending.
     /// Embedder-polled on the same cadence as
     /// [`PetitionRegistry::expire_due`](crate::petitions::PetitionRegistry::expire_due)
-    /// (a calloop timer at M1.1); idempotent -- a second poll reports
+    /// (the runtime's armed calloop timer, `session::sweep`); idempotent --
+    /// a second poll reports
     /// nothing new -- and advisory: every query already folds the deadline
     /// in, so enforcement never depends on this having run. Revoked and
     /// spent rows are already dead and are not reported.

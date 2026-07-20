@@ -260,9 +260,11 @@
 //!
 //! # What is mechanism-only
 //!
-//! Nothing raises a prompt at runtime, because nothing constructs a
-//! [`PetitionRegistry`] at runtime: the M1.1 listener wiring (issue #77)
-//! owns that. The nested backend really does carry this gate in its router
+//! Nothing raises a prompt at runtime. The registry is no longer the reason
+//! -- the runtime wiring constructs a [`PetitionRegistry`] and real
+//! petitions enter it -- but [`ConsentGrab::raise`] still has no caller
+//! outside tests. The nested backend really does carry this gate in its
+//! router
 //! (so the grab is live the instant a prompt is raised) and really does feed
 //! it the view size on every input event — but with no petition registry
 //! there is no petition, so [`ConsentGrab::raise`] has no caller outside

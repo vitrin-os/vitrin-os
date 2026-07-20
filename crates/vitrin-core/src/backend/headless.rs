@@ -25,11 +25,11 @@
 //!
 //! # Two retained images, because two audiences see different pixels (P1.7.1)
 //!
-//! [`HeadlessState`] retains **both** sides of the output-stage fork
+//! [`HeadlessView`] retains **both** sides of the output-stage fork
 //! ([`super::human_visible_from_view`]):
 //!
 //! - [`view_framebuffer`] — the composed **realm view**. This is the capture
-//!   service's pixel source ([`HeadlessState::latest_frame_rgba`]) and it is
+//!   service's pixel source ([`HeadlessView::latest_frame_rgba`]) and it is
 //!   overlay-free *structurally*: nothing composites a consent prompt into
 //!   it, here or anywhere.
 //! - [`output_framebuffer`] — the virtual display's **human-visible output**:
@@ -44,13 +44,13 @@
 //! the consent prompt into `vitrin_view.frame_ready` and hand agents the
 //! prompt-watching ability `docs/protocol/05-vitrin_consent.md` forbids.
 //!
-//! [`view_framebuffer`]: HeadlessState::view_framebuffer
-//! [`output_framebuffer`]: HeadlessState::output_framebuffer
+//! [`view_framebuffer`]: HeadlessView::view_framebuffer
+//! [`output_framebuffer`]: HeadlessView::output_framebuffer
 
 use std::error::Error;
 
 use calloop::signals::{Signal, Signals};
-use calloop::{EventLoop, LoopSignal};
+use calloop::{EventLoop, LoopHandle, LoopSignal};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::pixman::PixmanRenderer;
 use smithay::backend::renderer::{Bind, ExportMem, Frame, ImportMem, Offscreen, Renderer};
@@ -59,7 +59,10 @@ use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use tracing::info;
 
 use crate::consent::ConsentSurface;
+use crate::input::{InputRouter, NoopHook};
+use crate::recorder::Recorder;
 use crate::scene::Scene;
+use crate::session::{self, Runtime, RuntimeSeed};
 use crate::test_pattern;
 
 /// Composite an **empty scene** (the deterministic test-pattern background)
@@ -96,7 +99,7 @@ pub(crate) fn render_once(size: Size<i32, Physical>) -> Result<Vec<u8>, Box<dyn 
 /// the stride is `width * 4`, so the slice is tightly packed and needs no
 /// de-striding.
 ///
-/// Shared by [`render_once`] and [`HeadlessState::latest_frame_rgba`] (the
+/// Shared by [`render_once`] and [`HeadlessView::latest_frame_rgba`] (the
 /// capture service's pixel source, P1.3.6), so readback has one definition
 /// and one byte layout.
 fn readback(
@@ -130,10 +133,44 @@ fn readback(
 /// for nothing; a damage-driven loop degenerates to exactly this single
 /// initial frame, because nothing ever reports damage. So we composite once
 /// into the retained framebuffer and let the event loop block on signals.
-/// [`HeadlessState::redraw`] is the re-entrant entry point P1.3.4 calls
+/// [`HeadlessView::redraw`] is the re-entrant entry point P1.3.4 calls
 /// again on client damage (a scene commit), without reworking this control
 /// flow.
-pub fn run(size: (u32, u32)) -> Result<(), Box<dyn Error>> {
+///
+/// # What the M1.1 runtime wiring changed about "then idle"
+///
+/// The idle is no longer the whole session. The loop now also carries the
+/// core socket's listener, every accepted principal connection, the realm's
+/// shim socketpair and the expiry sweep ([`crate::session`]), so a headless
+/// core wakes on protocol traffic and recomposites on latched commits — but
+/// only ever **once per dispatch round**, in [`session::post_dispatch`],
+/// never once per commit. The single initial composite below is still what
+/// makes the retained images readable before the first agent connects.
+///
+/// The recorder travels through here rather than staying in `run_session`
+/// because calloop fixes one state type per loop and the whole kernel — the
+/// recorder with it — has to live in that state. It is handed straight back,
+/// so the run's footer is still written by the code that opened the log.
+pub fn run(size: (u32, u32), seed: RuntimeSeed) -> (Recorder, Result<(), Box<dyn Error>>) {
+    // The seed is consumed the moment the state is built; until then it is
+    // still ours, and either way the recorder must come back so `run_session`
+    // can write the footer it owes. Threading it through two slots keeps `?`
+    // usable for every startup step below instead of turning each into a
+    // four-line `match` (the nested backend does exactly the same).
+    let mut seed = Some(seed);
+    let mut recovered = None;
+    let result = run_inner(size, &mut seed, &mut recovered);
+    let recorder = recovered
+        .or_else(|| seed.take().map(|seed| seed.recorder))
+        .expect("the seed is either still unconsumed or its recorder was recovered");
+    (recorder, result)
+}
+
+fn run_inner(
+    size: (u32, u32),
+    seed: &mut Option<RuntimeSeed>,
+    recovered: &mut Option<Recorder>,
+) -> Result<(), Box<dyn Error>> {
     let (width, height) = size;
     let mut event_loop: EventLoop<'static, HeadlessState> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
@@ -141,10 +178,15 @@ pub fn run(size: (u32, u32)) -> Result<(), Box<dyn Error>> {
     // Signal source first (same posture as the nested backend): the process is
     // single-threaded, so the signal mask is installed before anything else
     // runs. SIGINT/SIGTERM stop the loop cleanly.
+    //
+    // `lifecycle::child_signal_source()` (SIGCHLD) belongs beside this one and
+    // for the same reason — `signalfd` only sees signals blocked on *every*
+    // thread — and is the realm-lifecycle half of issue #77, arriving with the
+    // spawn.
     let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM])?;
     loop_handle.insert_source(signals, |event, _, state: &mut HeadlessState| {
         info!(signal = ?event.signal(), "shutdown signal received");
-        state.loop_signal.stop();
+        state.view.loop_signal.stop();
     })?;
 
     let physical_size: Size<i32, Physical> = (width as i32, height as i32).into();
@@ -154,24 +196,115 @@ pub fn run(size: (u32, u32)) -> Result<(), Box<dyn Error>> {
         "headless backend starting: virtual output, software pixman renderer (no EGL/DRM/GPU)"
     );
 
-    let mut state = HeadlessState::new(physical_size, event_loop.get_signal())?;
+    let view = HeadlessView::new(physical_size, event_loop.get_signal())?;
+    let mut state = HeadlessState {
+        view,
+        // Headless has no physical input device — structurally, not by a
+        // runtime check — so its router stacks no preemption hook: there is
+        // no chord to hold and no prompt for a human to click.
+        runtime: Runtime::new(
+            seed.take().expect("the seed is consumed exactly once"),
+            InputRouter::new(NoopHook),
+        ),
+        loop_handle: event_loop.handle(),
+        fatal: None,
+    };
+
     // Composite once so the retained images are ready before we start idling
     // (see this function's doc comment for why exactly once).
-    state.redraw()?;
+    if let Err(err) = state.view.redraw() {
+        *recovered = Some(state.runtime.into_recorder());
+        return Err(err);
+    }
     info!(
         "virtual-output framebuffers composited and retained in memory: realm view \
          (capture-ready) + human-visible output (consent overlay)"
     );
 
-    event_loop.run(None, &mut state, |_| {})?;
+    if let Err(err) = session::install(&loop_handle, &mut state.runtime) {
+        *recovered = Some(state.runtime.into_recorder());
+        return Err(err);
+    }
+
+    let outcome = event_loop
+        .run(None, &mut state, session::post_dispatch)
+        .map_err(|err| Box::new(err) as Box<dyn Error>)
+        .and_then(|()| match state.fatal.take() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        });
+    // Recovered before the early return below, so a fatal run still returns
+    // the recorder that must write the footer naming it.
+    *recovered = Some(state.runtime.into_recorder());
+    outcome?;
     info!("event loop stopped, shutting down");
     Ok(())
+}
+
+/// The headless backend's calloop state: the presentation half and the
+/// runtime half, as two disjoint fields.
+///
+/// The disjointness is not incidental — see [`session::RuntimeHost`]. Merging
+/// these two into one flat struct would make [`session::RuntimeHost::split`]
+/// unimplementable and force a `RefCell` into the compositor's dispatch path.
+pub(crate) struct HeadlessState {
+    view: HeadlessView,
+    runtime: Runtime<NoopHook>,
+    loop_handle: LoopHandle<'static, HeadlessState>,
+    /// Set when a composite failure stops the loop, so [`run`] propagates it
+    /// as an error (and `main` as a non-zero exit) instead of masking a
+    /// mid-run fatal as a clean shutdown.
+    fatal: Option<Box<dyn Error>>,
+}
+
+impl session::RuntimeHost for HeadlessState {
+    type Hook = NoopHook;
+    type View = HeadlessView;
+
+    fn split(&mut self) -> (&mut Runtime<NoopHook>, &mut HeadlessView) {
+        (&mut self.runtime, &mut self.view)
+    }
+
+    fn loop_handle(&self) -> LoopHandle<'static, Self> {
+        self.loop_handle.clone()
+    }
+
+    fn stop(&mut self, fatal: Option<Box<dyn Error>>) {
+        self.fatal = fatal;
+        self.view.loop_signal.stop();
+    }
+}
+
+impl session::Presenter for HeadlessView {
+    fn scene(&mut self) -> &mut Scene {
+        &mut self.scene
+    }
+
+    fn view_size(&self) -> (u32, u32) {
+        (self.size.w.max(0) as u32, self.size.h.max(0) as u32)
+    }
+
+    fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
+        HeadlessView::redraw(self)
+    }
+
+    /// The retained realm view, read back tightly packed.
+    ///
+    /// A readback failure yields `None` rather than an error: this is called
+    /// on the redraw path, where the alternative is tearing down a session
+    /// over a transient mapping failure, and `None` degrades to the
+    /// chokepoint's `no_surface` refusal — the same answer a capture gets
+    /// before any surface exists. Never the *output* image: that one carries
+    /// the consent overlay, which no capture may ever contain.
+    fn view_rgba(&mut self) -> Option<Vec<u8>> {
+        self.latest_frame_rgba().ok()
+    }
 }
 
 /// Per-run state of the headless backend: the software renderer, the realm's
 /// [`Scene`], the consent surface, and the two retained images the module
 /// docs describe.
-struct HeadlessState {
+pub(crate) struct HeadlessView {
     renderer: PixmanRenderer,
     /// The realm's scene (P1.3.3): the single-maximized client surface, or
     /// the deterministic background when none is committed. The shim-facing
@@ -194,7 +327,7 @@ struct HeadlessState {
     loop_signal: LoopSignal,
 }
 
-impl HeadlessState {
+impl HeadlessView {
     fn new(size: Size<i32, Physical>, loop_signal: LoopSignal) -> Result<Self, Box<dyn Error>> {
         let mut renderer = PixmanRenderer::new()?;
         // `.max(0)` is defensive only: `run` always passes a positive size
@@ -274,10 +407,11 @@ impl HeadlessState {
     /// (`docs/protocol/05-vitrin_consent.md`;
     /// `a_capture_taken_while_a_prompt_is_up_contains_no_overlay` pins it).
     ///
-    /// Compiled in every build so the path stays type-checked; called from
-    /// the golden test today and wired to protocol dispatch when the
-    /// enforcement chokepoint lands (P1.4.4, M1.1 integration).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Reached at runtime through [`session::Presenter::view_rgba`], which
+    /// the runtime calls on the **redraw** path to refresh the cache the
+    /// chokepoint's capture reads -- never on the agent-request path, which
+    /// is what keeps the "pure read" claim above true of the wired code and
+    /// not only of this function.
     fn latest_frame_rgba(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
         readback(&mut self.renderer, &mut self.view_framebuffer, self.size)
     }
@@ -294,8 +428,8 @@ impl HeadlessState {
     /// **`#[cfg(test)]`, not merely `allow(dead_code)`.** This and
     /// [`Self::latest_frame_rgba`] have the same signature and differ only by
     /// name, and `capture::RealmViewFrame.rgba` is a plain `&[u8]` that either
-    /// one satisfies. The M1.1 listener wiring (issue #77) has yet to pick a
-    /// pixel source for the capture service, and "the output" is the more
+    /// one satisfies. The runtime wiring picked the realm view, as it must,
+    /// and "the output" is the more
     /// natural-sounding name for a getter that would deliver the consent
     /// overlay to every `vitrin_view.frame_ready` — the one thing
     /// `docs/protocol/05-vitrin_consent.md` forbids, with no test to catch it
@@ -309,7 +443,7 @@ impl HeadlessState {
     }
 }
 
-impl crate::lifecycle::RetainedOutput for HeadlessState {
+impl crate::lifecycle::RetainedOutput for HeadlessView {
     /// Composite an **empty** [`Scene`] into the retained framebuffer, so
     /// the last frame the dead realm painted is gone from the one buffer
     /// [`Self::latest_frame_rgba`] reads back.
@@ -375,7 +509,7 @@ impl crate::lifecycle::RetainedOutput for HeadlessState {
 /// upright.
 ///
 /// Takes bytes rather than a [`Scene`] because it has two callers with two
-/// different sources: [`HeadlessState::redraw`] fills the realm-view image
+/// different sources: [`HeadlessView::redraw`] fills the realm-view image
 /// from [`Scene::compose`] and the output image from that same buffer with
 /// the consent overlay applied. Passing a scene instead would mean composing
 /// twice, and two composes are two chances for the capture path and the
@@ -427,7 +561,7 @@ fn composite(
 
 #[cfg(test)]
 mod tests {
-    use super::{render_once, HeadlessState};
+    use super::{render_once, HeadlessView};
     use crate::test_pattern;
     use calloop::EventLoop;
     use smithay::utils::{Physical, Size};
@@ -493,7 +627,7 @@ mod tests {
     /// The capture service's actual pixel source: after `redraw`, the
     /// *retained* framebuffer reads back as the exact synthetic pattern —
     /// the latest-completed-frame seam the P1.3.6 capture path consumes,
-    /// exercised on real [`HeadlessState`], not just the `render_once`
+    /// exercised on real [`HeadlessView`], not just the `render_once`
     /// shortcut. Reading again without recompositing yields the same
     /// bytes: capture is a pure read of completed output.
     ///
@@ -505,10 +639,10 @@ mod tests {
         let _fd = crate::capture::tests::fd_lock();
         let (w, h) = (640, 400);
         let size: Size<i32, Physical> = (w as i32, h as i32).into();
-        let event_loop: EventLoop<'static, HeadlessState> =
+        let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
         let mut state =
-            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
         state
             .redraw()
             .expect("composite into the retained framebuffer");
@@ -557,10 +691,10 @@ mod tests {
         const SH: u32 = 32;
 
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
-        let event_loop: EventLoop<'static, HeadlessState> =
+        let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
         let mut state =
-            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
 
         let pixels = client_pixels(SW, SH);
         state.scene.commit(
@@ -640,10 +774,10 @@ mod tests {
         drop(file);
 
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
-        let event_loop: EventLoop<'static, HeadlessState> =
+        let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
         let mut state =
-            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
         state
             .scene
             .commit(SurfaceContent::from_rgba(from_fd, SW, SH).expect("well-formed content"));
@@ -738,10 +872,10 @@ mod tests {
         const SH: u32 = 300;
 
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
-        let event_loop: EventLoop<'static, HeadlessState> =
+        let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
         let mut state =
-            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
 
         // A realm that has painted, so the test distinguishes "the overlay is
         // absent" from "nothing was ever drawn".
@@ -867,10 +1001,10 @@ mod tests {
         const VH: u32 = 560;
 
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
-        let event_loop: EventLoop<'static, HeadlessState> =
+        let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
         let mut state =
-            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
         state
             .scene
             .commit(SurfaceContent::from_rgba(client_pixels(200, 150), 200, 150).expect("content"));
@@ -916,10 +1050,10 @@ mod tests {
         const VH: u32 = 600;
 
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
-        let event_loop: EventLoop<'static, HeadlessState> =
+        let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
         let mut state =
-            HeadlessState::new(size, event_loop.get_signal()).expect("headless state under pixman");
+            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
 
         let painted = client_pixels(300, 200);
         state.scene.commit(
@@ -1020,7 +1154,7 @@ mod tests {
         });
 
         struct LoopState {
-            headless: HeadlessState,
+            headless: HeadlessView,
             server: Option<ShimServer>,
             /// The realm's input router: no intake feeds it headless (no
             /// physical source exists, structurally), but the teardown
@@ -1035,7 +1169,7 @@ mod tests {
         let size: Size<i32, Physical> = (W as i32, H as i32).into();
         let mut event_loop: EventLoop<LoopState> = EventLoop::try_new().expect("event loop");
         let mut state = LoopState {
-            headless: HeadlessState::new(size, event_loop.get_signal())
+            headless: HeadlessView::new(size, event_loop.get_signal())
                 .expect("headless state under pixman"),
             server: Some(ShimServer::new(ShimConfig {
                 realm: "realm-0".into(),
@@ -1076,18 +1210,21 @@ mod tests {
                             // headless, after it would have been").
                             //
                             // TEST-ONLY SHAPE — do not copy into the
-                            // runtime loop (P1.5.2). Compositing
+                            // runtime loop. The runtime coalescer now
+                            // exists and is the thing to copy instead:
+                            // `session::dispatch_shim` marks the scene
+                            // dirty here and `session::post_dispatch` does
+                            // the one redraw + `presented` per dispatch
+                            // round. Compositing
                             // synchronously per commit is what this pacing
                             // test needs (one readback per presented
                             // frame), but at runtime it would let a
                             // hostile shim buy a full-output composite per
                             // 12-byte repaint commit. The runtime wiring
-                            // must coalesce: mark the scene dirty here and
-                            // schedule at most one redraw + `presented`
-                            // per loop iteration or output-cadence tick
-                            // (see the "Wiring" section of `crate::shim`'s
-                            // module docs; `wants_presentation`/`presented`
-                            // already batch all owed frame_dones).
+                            // does coalesce (see the "Wiring" section of
+                            // `crate::shim`'s module docs;
+                            // `wants_presentation`/`presented` batch all
+                            // owed frame_dones).
                             state.headless.redraw().expect("redraw on commit");
                             let time_ms = state.start.elapsed().as_millis() as u32;
                             server.presented(time_ms, &mut send).expect("frame_done");

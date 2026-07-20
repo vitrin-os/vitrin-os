@@ -242,8 +242,8 @@ pub(crate) struct UseEnv<'a> {
     /// the `preempted` judgement.
     pub presence: &'a PhysicalPresence,
     /// Where admitted actuations go, already origin-tagged `emulated`
-    /// (M1.1 wiring: the realm's input router toward the shim seat;
-    /// tests: a capture buffer). Delivery beyond this sink -- including
+    /// (at runtime: the realm's input router toward the shim seat, reached
+    /// through `session::route_seat`; tests: a capture buffer). Delivery beyond this sink -- including
     /// dropping events for a seatless realm -- is the delivery edge's
     /// business, never an authority question.
     pub actuations: &'a mut dyn FnMut(SeatInput),

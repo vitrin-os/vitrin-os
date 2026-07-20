@@ -50,20 +50,26 @@
 //! its input grab and decision routing (`consent::grab`, P1.7.2): a shown
 //! prompt owns physical input exclusively, and a click on one of its buttons
 //! resolves the petition through the same state machine every other consent
-//! path uses. Nothing *raises* a prompt at runtime yet, because nothing
-//! constructs the petition registry until the M1.1 listener wiring (issue
-//! #77) — so a running `vitrind` still shows no prompt and grabs no input,
-//! though the nested backend already carries the grab in its router.
+//! path uses.
+//!
+//! The runtime wiring (`session`, P1.M1.1) is what makes all of that
+//! reachable: a running `vitrind` binds the core socket, accepts principal
+//! connections, drives a `PrincipalServer` per connection against the shared
+//! capability kernel, services the realm's shim socketpair, and sweeps
+//! expired petitions and grants on an armed timer. What is still *not* wired
+//! is the other half of issue #77 — nothing calls `spawn::spawn_realm`, so a
+//! running `vitrind` still forks nothing, and nothing calls
+//! `ConsentGrab::raise`, so an interactive petition pends until it times out
+//! rather than putting a prompt on screen.
 
 mod backend;
 /// Capture-frame mechanics (P1.3.6): the sealed-memfd pixel path behind
 /// `vitrin_view.frame_ready`. Pure mechanics — the authority decision on
 /// every capture lives in `enforcement` (P1.4.4), whose single-path test
-/// pins that this module's entry has no other caller. Dead-code-allowed
-/// outside tests for the same reason as `headless::render_once`: fully
-/// exercised by its tests today, runtime-reachable when the M1.1 listener
-/// wiring lands.
-#[cfg_attr(not(test), allow(dead_code))]
+/// pins that this module's entry has no other caller. Runtime-reachable
+/// since the M1.1 wiring: `session` feeds the chokepoint the backend's
+/// cached realm-view readback, refreshed at redraw time so capture stays the
+/// pure read of "what the compositor last finished".
 mod capture;
 /// The consent surface's renderer (P1.7.1): the prompt the trusted core draws
 /// itself — requesting principal, realm, verbs, expiry, and the MVP consent
@@ -76,23 +82,24 @@ mod capture;
 /// (`consent::grab`, P1.7.2): while a prompt is shown all physical input
 /// routes exclusively to it, and a click on a button becomes a petition
 /// resolution — hold-Esc revocation (P1.7.3) and a trusted indicator
-/// (issue #85) are what remain. Nothing at runtime raises a prompt yet:
-/// `ConsentGrab::raise`'s caller arrives with the M1.1 listener wiring that
-/// constructs the petition registry. Dead-code-allowed outside tests for the
-/// same reason as its siblings; both backends already own a live surface and
-/// composite through it every frame, and the nested backend carries a live
-/// grab in its input router.
+/// (issue #85) are what remain. **Still nothing raises a prompt at runtime.**
+/// The petition registry `ConsentGrab::raise` needs now exists (`session`
+/// builds it from the parsed `--consent` policy), but no code calls `raise`,
+/// so under `--consent=interactive` a petition pends until the armed sweep
+/// resolves it `timed_out` and no prompt is ever drawn. That is the remaining
+/// gap between "consent is implemented" and "consent is reachable", named
+/// here rather than left to be discovered from a session that silently never
+/// asks.
 #[cfg_attr(not(test), allow(dead_code))]
 mod consent;
 /// The enforcement chokepoint (P1.4.4): THE single function every capture
 /// and actuation passes through — `connection → principal → grant → verbs
 /// → constraints` — with the per-grant token bucket, the one
 /// `vitrin_grant.refused` emission site, and the admitted-operation
-/// dispatch (frame delivery / origin-tagged actuation intake).
-/// Dead-code-allowed outside tests for the same reason as `principal`,
-/// which drives it end-to-end over socketpairs today; the M1.1 listener
-/// wiring makes it runtime-reachable.
-#[cfg_attr(not(test), allow(dead_code))]
+/// dispatch (frame delivery / origin-tagged actuation intake). Runtime-
+/// reachable since the M1.1 wiring: every message a real agent sends over the
+/// core socket passes through it, and its admitted actuations leave through
+/// `session`'s seat routing toward the realm's shim.
 mod enforcement;
 /// The dmabuf import path (P1.3.5): the zero-copy mechanics behind the shim
 /// server's `kind=dmabuf` commits — importer seam, hostile-fd probe, GLES
@@ -103,15 +110,21 @@ mod enforcement;
 #[cfg_attr(not(test), allow(dead_code))]
 mod dmabuf;
 /// The dead-man switch (P1.7.3): holding the configured chord revokes every
-/// grant in the session, effective on the very next enforcement check. Its
-/// watcher really rides the nested backend's router and its timer really
-/// fires; applying a completed chord to a grant table waits on the M1.1
-/// listener wiring (issue #77), which is what constructs one.
+/// grant in the session, effective on the very next enforcement check. Whole
+/// and live in nested mode since the M1.1 wiring: the watcher rides the
+/// backend's router, the timer fires, and a completed chord now reaches
+/// `deadman::apply` against the session's real grant table and petition
+/// registry (`session::Runtime::apply_dead_man`) instead of being logged and
+/// dropped. Headless has no physical input device, structurally, so it has no
+/// chord to hold -- see `Action::RunHeadless::dead_man`.
 mod deadman;
 /// Input intake & routing (P1.3.7): origin tagging at intake (backward
 /// requirement B2), view→surface coordinate mapping, and the preemption
-/// hook point. The nested backend feeds it host input at runtime; seat
-/// delivery to a live shim connection arrives with P1.5.2.
+/// hook point. The nested backend feeds it host input at runtime, and the
+/// runtime wiring feeds it chokepoint-admitted agent actuations through the
+/// **same** router, so a human's implicit grab and an agent's share one
+/// state. Seat delivery to a live shim connection is wired
+/// (`session::route_seat`) and waits only on something spawning a realm.
 mod input;
 /// Realm lifecycle (P1.5.3): the realm's death paths — crash detection over
 /// two independent signals (socketpair EOF and `SIGCHLD`, either of which
@@ -122,47 +135,70 @@ mod input;
 /// the realm's runtime tree on the way out. Dead-code-allowed outside tests
 /// for the same reason as `spawn`, whose other half it is: exercised
 /// end-to-end by its tests today (they really fork a shim, really `kill -9`
-/// it mid-capture, and really assert the next capture refuses), and wired
-/// into the session by the same M1.1 integration that calls `spawn_realm` —
-/// see `run_session`.
+/// it mid-capture, and really assert the next capture refuses), and **still
+/// not wired**: it arrives with `spawn_realm`, the other half of issue #77.
+/// Its three plug-in sites are named in `run_session`'s docs, and
+/// `session::close_realm` is the interim shim-death path it must *replace*
+/// rather than sit beside.
 #[cfg_attr(not(test), allow(dead_code))]
 mod lifecycle;
 /// The grant table v0 (P1.4.2): the in-memory PRD Doc 2 §5.2 grant store of
 /// the capability kernel — rows keyed by `identity`'s verifier-canonical
 /// principal, answering the enforcement chokepoint's grant-scoped use query
 /// and admission commit (the P1.4.4 chain: connection → principal → grant →
-/// verbs → constraints), plus the embedder-polled proactive expiry sweep.
-/// Dead-code-allowed outside tests for the same reason as `capture`: fully
-/// exercised by its tests today, consumed by the petition flow (P1.4.3) and
-/// the enforcement chokepoint (P1.4.4).
+/// verbs → constraints), plus the embedder-polled proactive expiry sweep --
+/// whose embedder is now real: `session` arms a calloop timer that polls it,
+/// advisory as designed, since the chokepoint re-checks expiry at use time.///
+/// Still dead-code-allowed outside tests, but for a *different and much
+/// smaller* reason than before: not "no runtime caller exists" -- one does
+/// now -- but that a handful of accessors and variants in it are exercised
+/// only by tests. Narrow the attribute to those items, or give them callers,
+/// rather than reading this as the module still being unreachable.
 #[cfg_attr(not(test), allow(dead_code))]
 mod grants;
 /// The identity layer of the capability kernel (P1.4.1): the pluggable
 /// `Verifier` trait, the `principals.toml`-backed `StaticVerifier`, and the
 /// principal-identity model every grant and enforcement decision keys on.
-/// Dead-code-allowed outside tests for the same reason as `capture`: fully
-/// exercised by its tests (and `principal`'s) today, consulted at runtime
-/// when the principal listener wiring lands (M1.1 integration).
+/// Loaded once at startup by `run_session` and handed to every connection's
+/// `ServerCtx` as the session's one verifier -- once, because two loads of
+/// the same registry are two documents, and the R6 guard must audit the one
+/// the runtime verifies against.///
+/// Still dead-code-allowed outside tests, but for a *different and much
+/// smaller* reason than before: not "no runtime caller exists" -- one does
+/// now -- but that a handful of accessors and variants in it are exercised
+/// only by tests. Narrow the attribute to those items, or give them callers,
+/// rather than reading this as the module still being unreachable.
 #[cfg_attr(not(test), allow(dead_code))]
 mod identity;
 /// The grant request flow (P1.4.3): the petition lifecycle state machine of
 /// the capability kernel -- pending-petition registry, admission policy
 /// (caps, `busy`, `unsupported`, `unavailable`), the consent-policy seam
 /// (`--consent`), the consent timeout, and the build-gated scripted-consent
-/// injector. Dead-code-allowed outside tests for the same reason as
-/// `principal`, which drives it end-to-end over socketpairs today; the M1.1
-/// listener wiring constructs the registry from the parsed consent policy
-/// and polls its timeout.
+/// injector. `run_session` constructs the registry from the parsed consent
+/// policy and `session` arms the timer that polls its timeout, so an
+/// unanswered petition really does resolve `timed_out` on the wire.///
+/// Still dead-code-allowed outside tests, but for a *different and much
+/// smaller* reason than before: not "no runtime caller exists" -- one does
+/// now -- but that a handful of accessors and variants in it are exercised
+/// only by tests. Narrow the attribute to those items, or give them callers,
+/// rather than reading this as the module still being unreachable.
 #[cfg_attr(not(test), allow(dead_code))]
 mod petitions;
 /// The principal-connection protocol server (P1.4.1) and the wire half of
 /// the petition flow (P1.4.3): the server side of the
 /// P1.1.3 handshake state machine (`vitrin_handshake` + `vitrin_principal`),
 /// where `identity` binds and where the per-connection object table enforces
-/// sender-constrained handles. Dead-code-allowed outside tests for the same
-/// reason as `shim`: exercised end-to-end by its tests over socketpairs
-/// today, wired to the live listener (`ListenerSource`) at M1.1 integration
-/// -- nothing at runtime accepts principal connections before then.
+/// sender-constrained handles. Wired to the live listener since the M1.1
+/// integration: `session` accepts on the core socket, mints one server per
+/// connection, dispatches every frame against the shared kernel, and calls
+/// `teardown` on all three close paths -- EOF, transport fault, and the
+/// core-detected protocol violation that structurally cannot tear itself
+/// down.///
+/// Still dead-code-allowed outside tests, but for a *different and much
+/// smaller* reason than before: not "no runtime caller exists" -- one does
+/// now -- but that a handful of accessors and variants in it are exercised
+/// only by tests. Narrow the attribute to those items, or give them callers,
+/// rather than reading this as the module still being unreachable.
 #[cfg_attr(not(test), allow(dead_code))]
 mod principal;
 /// The realm object and realm registry (P1.5.1): exactly one realm,
@@ -171,9 +207,14 @@ mod principal;
 /// and the owner of the app's spawn configuration (which P1.5.2 executes;
 /// nothing here forks). Also the single source of realm existence, which
 /// petition admission consults for its `unavailable` judgement. Loaded at
-/// startup below; dead-code-allowed outside tests for the same reason as
-/// its siblings -- the registry becomes a `ServerCtx` field at the M1.1
-/// listener wiring.
+/// startup below and carried into the session as a `ServerCtx` field, so a
+/// petition naming a realm this file never described is refused
+/// `unavailable` by the one registry the operator configured.///
+/// Still dead-code-allowed outside tests, but for a *different and much
+/// smaller* reason than before: not "no runtime caller exists" -- one does
+/// now -- but that a handful of accessors and variants in it are exercised
+/// only by tests. Narrow the attribute to those items, or give them callers,
+/// rather than reading this as the module still being unreachable.
 #[cfg_attr(not(test), allow(dead_code))]
 mod realm;
 /// The flight-recorder log v0 (P1.4.5): the journal seed — a JSON-lines
@@ -182,19 +223,35 @@ mod realm;
 /// delivered capture and null-versioned epoch-reference fields (backward
 /// requirement B1). Explicitly NOT the signed P6 journal: no signatures, no
 /// tamper evidence, never consulted by an authority decision. The run's
-/// single handle is created below in `main`; the per-connection emission
-/// sites are exercised end-to-end by `principal`'s tests today and become
-/// runtime-reachable with the M1.1 listener wiring, so the module is
-/// dead-code-allowed outside tests like its siblings.
+/// single handle is created below in `run_session`, travels through the
+/// backend inside the session state (calloop fixes one state type per loop,
+/// so the kernel -- recorder included -- must live in it), and comes back
+/// here to be closed. Every per-connection emission site is runtime-reachable
+/// since the M1.1 wiring.///
+/// Still dead-code-allowed outside tests, but for a *different and much
+/// smaller* reason than before: not "no runtime caller exists" -- one does
+/// now -- but that a handful of accessors and variants in it are exercised
+/// only by tests. Narrow the attribute to those items, or give them callers,
+/// rather than reading this as the module still being unreachable.
 #[cfg_attr(not(test), allow(dead_code))]
 mod recorder;
 mod scene;
+/// The runtime wiring (P1.M1.1, issue #77): the session state the backends'
+/// event loops carry, and the sources that make the capability kernel
+/// reachable from the wire -- the core socket's listener, one
+/// `PrincipalServer` per accepted connection, the realm's shim socketpair
+/// with its coalesced redraw, and the advisory expiry sweeps. This is the
+/// module that turned a pile of tested-but-uncalled subsystems into a
+/// running server.
+mod session;
 /// The shim-facing protocol server (P1.3.4): `vitrin_shim_session` +
-/// `vitrin_shim_surface`, feeding `Scene::commit`. Dead-code-allowed outside
-/// tests for the same reason as `capture`: fully exercised by its tests (and
-/// the mock shim, `vitrin-mock-shim`) today, wired to a live shim connection
-/// when the realm spawn manager inherits the socketpair at fork (P1.5.2) —
-/// nothing at runtime creates a shim connection before then.
+/// `vitrin_shim_surface`, feeding `Scene::commit`. The runtime half is wired:
+/// `session::attach_realm` registers a shim connection on the loop and
+/// `session::dispatch_shim` drives this server against the backend's scene,
+/// coalescing composites so a repaint flood cannot buy one per 12-byte
+/// message. What is still missing is the *caller*: nothing forks a shim until
+/// `spawn::spawn_realm` is wired, so at runtime that seam has no connection
+/// to attach.
 #[cfg_attr(not(test), allow(dead_code))]
 mod shim;
 /// The realm spawn model (P1.5.2): the core's only process-creating code —
@@ -206,8 +263,11 @@ mod shim;
 /// namespaces, no seccomp, no Landlock) and the session-D-Bus hole are
 /// stated there in full. Dead-code-allowed outside tests for the same reason
 /// as `shim`: exercised end-to-end by its tests today (it really forks the
-/// mock shim, which really forks an app), and wired into the session when
-/// the event loop can service the connection — see `run_session`.
+/// mock shim, which really forks an app), and **still not called at
+/// runtime** -- the other half of issue #77. The blocker it was waiting on is
+/// gone: the event loop now services a shim connection before anything else
+/// happens (`session::install`, then `session::attach_realm`), which is
+/// exactly the ordering a spawn needs in order not to wedge.
 #[cfg_attr(not(test), allow(dead_code))]
 mod spawn;
 mod test_pattern;
@@ -249,10 +309,12 @@ USAGE:
     vitrind [--principals PATH] Principal registry for this session (bearer
                                 tokens; mode 0600, owned by the core's uid).
                                 Default: $XDG_CONFIG_HOME/vitrin/principals.toml
-                                Read at startup ONLY under
-                                `--consent=auto-approve`, whose safety guard
-                                audits it; the listener that verifies against
-                                it lands with M1.1.
+                                Read at startup in both consent modes: the
+                                listener verifies every principal against it,
+                                so a registry that cannot be read is a startup
+                                failure. Under `--consent=auto-approve` the
+                                same load is also audited by that flag's
+                                safety guard.
     vitrind [--recorder PATH]   Flight-recorder log for this run (JSON
                                 lines, appended). Default:
                                 $XDG_RUNTIME_DIR/vitrin-0/flight-recorder-<pid>.jsonl
@@ -620,8 +682,8 @@ fn main() -> ExitCode {
             dead_man,
         } => {
             init_tracing();
-            run_session(consent, principals, recorder, realm, move || {
-                backend::winit::run(dead_man)
+            run_session(consent, principals, recorder, realm, move |seed| {
+                backend::winit::run(dead_man, seed)
             })
         }
         Action::RunHeadless {
@@ -636,92 +698,76 @@ fn main() -> ExitCode {
             dead_man: _,
         } => {
             init_tracing();
-            run_session(consent, principals, recorder, realm, || {
-                backend::headless::run(size)
+            run_session(consent, principals, recorder, realm, move |seed| {
+                backend::headless::run(size, seed)
             })
         }
     }
 }
 
-/// Load the session's realm, open the run's flight recorder, run the
-/// backend inside it, and close the log.
+/// Load the session's realm, bind the core socket, open the run's flight
+/// recorder, build the capability kernel, run the backend around it, and
+/// close the log.
 ///
-/// The realm goes first (P1.5.1): it is the only startup input whose
-/// absence means the session has nothing to serve at all, so failing on it
-/// before anything is created leaves no log file and no window behind from
-/// a run that could never have worked.
+/// # Startup order, and the two steps that bite if moved
 ///
-/// The recorder brackets the whole session: creation failure is fatal
-/// *before* the backend starts (P1.4.5 — an operator who asked for a flight
-/// recorder and cannot have one must learn it before the session, not after
-/// it is unreconstructable), and the closing entry reports how many entries
-/// a mid-run write failure cost, since that is the one thing a truncated
-/// log cannot say about itself. Closing goes through `Recorder::finish`,
-/// which spends one forced recovery attempt first — a run that degraded
-/// transiently can then still write its footer, and only a run that never
-/// recovered ends with no file-only evidence at all (which the operator
-/// message below says outright rather than implying otherwise).
+/// 1. **The R6 auto-approve guard**, before anything at all — including the
+///    realm, the socket, and the log. A session that must not start should
+///    abort at the earliest point where that is knowable, leaving nothing
+///    behind and doing nothing first.
+/// 2. **The realm** (P1.5.1): the only startup input whose absence means the
+///    session has nothing to serve.
+/// 3. **The principal registry**, loaded exactly once, here, and handed to
+///    every connection's `ServerCtx` as the session's one [`Verifier`]. Under
+///    auto-approve this is the *same* load the R6 guard already performed,
+///    reused rather than repeated: two loads would be a TOCTOU window against
+///    the very file the guard audited, which is the fault
+///    [`announce_consent_policy`] exists to prevent.
+/// 4. **The core socket's [`Listener`]**, before the recorder. Binding takes
+///    an exclusive `flock` on `core.sock.lock` and fails `AddrInUse` if
+///    another live core holds it, so binding early means a second core
+///    refuses *before* it has created a stray flight-recorder log in the
+///    runtime directory the first core is using.
+/// 5. **The recorder**, bracketing the session: creation failure is fatal
+///    before the backend starts (P1.4.5 — an operator who asked for a flight
+///    recorder and cannot have one must learn it before the session, not
+///    after it is unreconstructable), and the closing entry reports how many
+///    entries a mid-run write failure cost, since that is the one thing a
+///    truncated log cannot say about itself.
 ///
-/// Both the recorder handle and the realm registry stay here for now:
-/// nothing at runtime accepts principal connections yet (the listener
-/// wiring is M1.1 integration), and that wiring hands this same single
-/// recorder handle and this same registry to each connection's
-/// `ServerCtx`. The registry is also what the spawn manager launches from —
-/// it is already the only place the realm's command lives.
+/// # Why the backend takes the kernel rather than the other way round
 ///
-/// # Where the spawn goes, and why it is not called here yet (P1.5.2)
+/// calloop fixes one state type per event loop, and every runtime source —
+/// the listener, each principal connection, the realm's shim socketpair, the
+/// expiry sweep — must be inserted into the same loop the backend already
+/// drives. So the capability kernel has to live in the backend's state, which
+/// is why the backend is no longer a `FnOnce() -> Result<()>` that owns its
+/// loop and tells nobody: it is handed a [`session::RuntimeSeed`] and hands
+/// the [`Recorder`] back, so the run's footer is still written here.
 ///
-/// `spawn::spawn_realm` belongs immediately after the recorder opens and
-/// before `backend()` takes the thread: the realm must exist for the
-/// session's whole life, and the spawn is a `realm_spawned` entry the log
-/// wants before anything else happens.
+/// [`Verifier`]: identity::Verifier
+/// [`Listener`]: vitrin_ipc::Listener
 ///
-/// It is deliberately not called at this commit, because a spawned shim
-/// needs **an event loop that services its connection**: the shim blocks on
-/// `configure` and then on the core's replies, so a backend that never
-/// reads the socketpair would leave it wedged at startup forever. That is
-/// the M1.1 integration gap (issue #77) that already leaves `shim` and the
-/// listener unwired.
+/// # What is still not wired here (the other half of issue #77)
 ///
-/// The other blocker P1.5.2 named is gone: `SIGCHLD` reaping and the whole
-/// lifecycle are now `lifecycle` (P1.5.3, issue #32), which adopts the
-/// `SpawnedRealm`'s unreaped `Child` and owns it to the end.
+/// `spawn::spawn_realm` and the realm lifecycle. The seam they plug into now
+/// exists and is real: [`session::install`] puts the listener and the sweeps
+/// on the loop *before* the loop starts, and [`session::attach_realm`] takes
+/// the spawned shim's core-side connection and its `ShimServer` and registers
+/// them. The ordering that matters is written down there — `configure` goes
+/// out on the still-blocking fd before the connection is handed to calloop,
+/// and the spawn must not happen before the loop can service the socketpair,
+/// or the shim wedges forever with no timeout on its side.
 ///
-/// Until the wiring lands, both halves are exercised end-to-end by their
-/// own tests, which really fork the mock shim, really place the socketpair
-/// at fd 3, really `kill -9` it mid-capture, and really assert the next
-/// capture refuses `no_surface` through the chokepoint.
-///
-/// Consequence worth stating plainly rather than discovering later:
-/// **issue #31's "`pstree` shows core → shim → app" is satisfied by tests,
-/// not by the shipped binary.** A running `vitrind` forks nothing.
-///
-/// # Where lifecycle plugs in (P1.5.3)
-///
-/// Three call sites, all in the same wiring:
-///
-/// - **`lifecycle::child_signal_source()` next to the backend's existing
-///   `SIGINT`/`SIGTERM` source**, and for the same reason it sits there:
-///   `signalfd` only sees signals blocked on *every* thread, and a mask
-///   installed before the backend spawns any is inherited by all of them.
-///   Its callback polls each realm's `RealmLifecycle::poll_exit`.
-/// - **`RealmLifecycle::note_connection_closed` at the shim connection's
-///   removal point**, where `vitrin-ipc`'s event source already funnels
-///   EOF, transport faults, and protocol violations into one
-///   `DisconnectReason`.
-/// - **`RealmLifecycle::shutdown` here**, between `backend()` returning and
-///   `recorder.finish()` below — after the loop has stopped (the ladder
-///   blocks, deliberately, and must not do so inside a live compositor
-///   loop) and before the log closes, so the realm's `realm_died` /
-///   `realm_exited` entries land in the run they belong to rather than
-///   after its footer.
-///
-/// The embedder that owns realms also derives `ServerCtx::realm_view` from
-/// `RealmLifecycle::view_is_live` — the one seam that makes the
-/// chokepoint's `no_surface` refusal true after a shim dies — and passes
-/// its backend as `RealmTeardown::retained`, so the death funnel scrubs the
-/// framebuffer a capture reads back. The first is the refusal; the second
-/// is why a mistake in the first cannot serve the dead realm's last frame.
+/// Lifecycle has three named plug-in sites, all still open:
+/// `lifecycle::child_signal_source()` beside each backend's existing
+/// `SIGINT`/`SIGTERM` source (the mask must be installed before the backend
+/// spawns any thread); `RealmLifecycle::note_connection_closed` in place of
+/// `session`'s interim `close_realm`; and `RealmLifecycle::shutdown` between
+/// the backend returning and `recorder.finish()` below — after the loop has
+/// stopped, because the ladder blocks deliberately and must not do so inside
+/// a live compositor loop, and before the log closes, so the realm's
+/// `realm_died` / `realm_exited` entries land in the run they belong to.
 fn run_session<R>(
     consent: ConsentPolicy,
     principals_path: Option<PathBuf>,
@@ -730,21 +776,29 @@ fn run_session<R>(
     backend: R,
 ) -> ExitCode
 where
-    R: FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+    R: FnOnce(session::RuntimeSeed) -> (Recorder, Result<(), Box<dyn std::error::Error>>),
 {
     // The R6 guard runs before anything at all, including the realm: a
     // session that must not start should abort at the earliest point where
     // that is knowable, leaving nothing behind and doing nothing first.
     //
     // `banner` is held across the entire session and retired by the
-    // explicit `banner.stop()` after `backend()` returns. Both halves are
+    // explicit `banner.stop()` after the backend returns. Both halves are
     // load-bearing and neither is a style preference: dropping it early
     // would stop R6's repeating auto-approve warning while auto-approve was
     // still granting petitions, and the `stop()` downstream is what makes
     // "tidy the unused binding to `_`" a compile error rather than a silent
     // downgrade of a security warning. The early-return paths below drop it
     // instead, which is correct: no session runs on those.
-    let Ok(banner) = announce_consent_policy(consent, principals_path.as_deref()) else {
+    //
+    // It is deliberately **not** moved into the session state struct the
+    // runtime wiring introduced, tempting though that is: a struct field
+    // always reads as "used", so the compile-time tripwire above would
+    // evaporate, and the state is dropped when the loop ends — possibly
+    // before `recorder.finish()` — which would silently shorten the warning's
+    // lifetime to less than the policy's.
+    let Ok((banner, guard_verifier)) = announce_consent_policy(consent, principals_path.as_deref())
+    else {
         return ExitCode::FAILURE;
     };
 
@@ -757,6 +811,27 @@ where
         Err(()) => return ExitCode::FAILURE,
     };
     announce_realms(&realms);
+
+    // One verifier for the whole session. Under auto-approve this is the
+    // registry the R6 guard already loaded and audited, moved here rather
+    // than re-read: see this function's startup-order note.
+    let verifier = match guard_verifier {
+        Some(verifier) => verifier,
+        None => match load_verifier(principals_path.as_deref()) {
+            Ok(verifier) => verifier,
+            Err(()) => return ExitCode::FAILURE,
+        },
+    };
+
+    // The single-core gate. `Listener::bind` takes a non-blocking exclusive
+    // `flock` on `<socket>.lock` and only then removes whatever is at the
+    // socket path, so a second core against the same `$XDG_RUNTIME_DIR`
+    // refuses here instead of unlinking a live core's socket out from under
+    // it. Before the recorder, so that refusal leaves no stray log behind.
+    let listener = match bind_core_socket() {
+        Ok(listener) => listener,
+        Err(()) => return ExitCode::FAILURE,
+    };
 
     let path = match recorder_path {
         Some(path) => path,
@@ -788,7 +863,21 @@ where
         },
     });
 
-    let result = backend();
+    // `PetitionConfig::default()` rather than new flags: issue #77 asks for
+    // the registry to be *constructed from the parsed consent policy*, and
+    // the defaults are the settled values in `petitions`' module docs. A
+    // deployment-tunable surface for them (notably `consent_timeout`) is a
+    // separate, deliberate CLI change.
+    let seed = session::RuntimeSeed {
+        listener,
+        verifier,
+        petitions: petitions::PetitionRegistry::new(consent, petitions::PetitionConfig::default()),
+        grants: grants::GrantTable::new(),
+        realms,
+        recorder,
+    };
+
+    let (mut recorder, result) = backend(seed);
 
     // The session is over: the consent policy is no longer in force, so its
     // standing warning stops here rather than at an arbitrary scope end.
@@ -827,6 +916,80 @@ where
             ExitCode::FAILURE
         }
     }
+}
+
+/// Bind the core socket, refusing to start if another core already holds the
+/// runtime tree.
+///
+/// This is the whole of the single-core invariant, and the mechanism is
+/// `Listener::bind`'s, not a second one invented here: it takes a
+/// non-blocking exclusive `flock` on `core.sock.lock`, re-verifies the locked
+/// inode against the path to close the unlink race, and only then unlinks a
+/// stale socket. The kernel releases that lock on process death including
+/// `SIGKILL`, so there is no stale state to heuristically clean up — which is
+/// exactly why it is an `flock` and not an `O_EXCL` pidfile.
+///
+/// What it prevents is worth naming, because "two cores is unsupported" reads
+/// as a nicety until you follow it: a second core against the same
+/// `$XDG_RUNTIME_DIR` would purge realm runtime directories the first core's
+/// live shim is bound to, then bind `core.sock` itself so new agents
+/// transparently reach *it* while the first core still holds the grant table
+/// those agents' authority lives in — and on its own exit unlink `core.sock`,
+/// leaving the first core running, healthy-looking, and unreachable.
+fn bind_core_socket() -> Result<vitrin_ipc::Listener, ()> {
+    let path = match vitrin_ipc::paths::core_socket_path() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::error!("fatal: cannot locate the core socket: {err}");
+            return Err(());
+        }
+    };
+    vitrin_ipc::Listener::bind(&path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::AddrInUse {
+            tracing::error!(
+                socket = %path.display(),
+                "fatal: another vitrind already holds this runtime tree (its lock on \
+                 `{}.lock` is live). Refusing to start rather than unlinking a running \
+                 core's socket and purging realm directories it is still serving; point \
+                 `XDG_RUNTIME_DIR` somewhere else to run a second core.",
+                path.display()
+            );
+        } else {
+            tracing::error!(socket = %path.display(), "fatal: cannot bind the core socket: {err}");
+        }
+    })
+}
+
+/// Load the session's principal registry (P1.4.1) for the interactive path,
+/// failing fatally if it cannot be read.
+///
+/// Fail-fast rather than fail-at-first-connect, matching the realm and
+/// recorder posture: a core running with an unreadable registry can verify
+/// nobody, so every agent that connects would be refused with an error naming
+/// a file the operator never learned was broken. Note that this *changes*
+/// interactive's old behaviour, where the registry was never read at startup
+/// because nothing at runtime verified against it.
+fn load_verifier(principals_path: Option<&Path>) -> Result<StaticVerifier, ()> {
+    let path = match principals_path {
+        Some(path) => path.to_path_buf(),
+        None => match realm::default_principals_path() {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!(
+                    "fatal: cannot locate the principal registry: {err}; \
+                     pass an explicit `--principals PATH`"
+                );
+                return Err(());
+            }
+        },
+    };
+    StaticVerifier::load(&path).map_err(|err| {
+        tracing::error!(
+            path = %path.display(),
+            "fatal: the principal registry could not be read, so this core could verify \
+             nobody: {err}"
+        );
+    })
 }
 
 /// `$XDG_RUNTIME_DIR/vitrin-0/flight-recorder-<pid>.jsonl` — the run's log
@@ -878,7 +1041,8 @@ fn announce_realms(realms: &RealmRegistry) {
             command = %realm.spawn().command().display(),
             args = realm.spawn().args().len(),
             env_allow = ?realm.spawn().env_allow(),
-            "realm configured (not started: see run_session for where the spawn is wired)"
+            "realm configured (not started: `spawn::spawn_realm` is the other half of \
+             issue #77; `session::attach_realm` is the seam it plugs into)"
         );
     }
 }
@@ -890,6 +1054,15 @@ fn announce_realms(realms: &RealmRegistry) {
 /// so the warning's lifetime is the session's lifetime by construction. An
 /// `Err` means the session must not start; the diagnostics have already
 /// been emitted.
+///
+/// It also returns the [`StaticVerifier`] it loaded, when it loaded one, so
+/// [`run_session`] can use *that* registry rather than reading the file a
+/// second time. This is not an optimization. Two reads are two documents:
+/// the file can change between them, and a guard that audited the first
+/// while the runtime verified against the second would be precisely the
+/// "guard auditing a document nobody reads" fault the third bullet below
+/// exists to close. Under interactive the guard loads nothing and this is
+/// `None`; `run_session` loads the registry itself, once.
 ///
 /// The guard is a plain struct rather than an `Option`, and it is retired by
 /// an explicit [`PolicyBanner::stop`] at the end of [`run_session`] rather
@@ -948,21 +1121,26 @@ fn announce_realms(realms: &RealmRegistry) {
 ///   runtime rejects (or vice versa) would be a guard auditing a document
 ///   nobody reads.
 ///
-/// Under `interactive` the registry is **not** read here at all. Nothing at
-/// runtime accepts principal connections yet, and interactive is the
-/// fail-closed default that needs no permission to run; the M1.1 listener
-/// wiring is what will load the registry for verification.
+/// Under `interactive` the registry is **not** read *here*: interactive is
+/// the fail-closed default and needs no permission to run, so this guard has
+/// nothing to decide. It is still read at startup — [`run_session`] loads it
+/// through [`load_verifier`] on that path, because the listener now really
+/// does verify against it and a core that cannot read its registry can
+/// verify nobody. The division is deliberate: this function is a *policy
+/// guard*, and making it also the interactive path's loader would put a
+/// refusal to start into a function whose refusals are all about
+/// auto-approve.
 fn announce_consent_policy(
     policy: ConsentPolicy,
     principals_path: Option<&Path>,
-) -> Result<PolicyBanner, ()> {
+) -> Result<(PolicyBanner, Option<StaticVerifier>), ()> {
     match policy {
         ConsentPolicy::Interactive => {
             tracing::info!(
                 "consent policy: interactive (petitions pend for a human decision on the \
                  core-rendered consent prompt; unanswered petitions resolve timed_out)"
             );
-            Ok(PolicyBanner(None))
+            Ok((PolicyBanner(None), None))
         }
         ConsentPolicy::AutoApprove => {
             let path = match principals_path {
@@ -1007,10 +1185,13 @@ fn announce_consent_policy(
                 );
                 return Err(());
             }
-            Ok(PolicyBanner(Some(AutoApproveBanner::start(
-                &path,
-                AUTO_APPROVE_BANNER_INTERVAL,
-            ))))
+            Ok((
+                PolicyBanner(Some(AutoApproveBanner::start(
+                    &path,
+                    AUTO_APPROVE_BANNER_INTERVAL,
+                ))),
+                Some(verifier),
+            ))
         }
     }
 }
@@ -1419,9 +1600,16 @@ mod tests {
         // for why a count alone is satisfied by a registry that is
         // dangerous in practice.
         let (dir, path) = scratch_registry(&[DEMO_PRINCIPAL]);
-        let banner = announce_consent_policy(ConsentPolicy::AutoApprove, Some(&path))
+        let (banner, verifier) = announce_consent_policy(ConsentPolicy::AutoApprove, Some(&path))
             .expect("a demo-only registry is exactly what auto-approve is for");
         assert!(banner.0.is_some(), "auto-approve must start its warning");
+        // The audited registry is handed on, so `run_session` verifies
+        // against the same document this guard just approved rather than
+        // re-reading a file that could have changed in between.
+        assert!(
+            verifier.is_some(),
+            "the guard must hand its loaded registry to the session"
+        );
         drop(banner);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1484,18 +1672,23 @@ mod tests {
     }
 
     #[test]
-    fn interactive_never_reads_the_principal_registry() {
-        // The fail-closed default needs no permission to run, and nothing
-        // at runtime verifies against the registry yet (M1.1). Pointing
-        // `--principals` at a path that could not possibly load must not
-        // stop an interactive session.
+    fn the_r6_guard_never_reads_the_registry_under_interactive() {
+        // The fail-closed default needs no permission to run, so the R6
+        // guard has nothing to decide and reads nothing. This is about the
+        // guard alone: the listener does verify against the registry, so
+        // `run_session` loads it on this path too -- see `load_verifier`,
+        // whose refusal is a separate, differently-worded startup error.
         let absent = std::env::temp_dir().join("vitrin-r6-never-read/principals.toml");
-        let banner = announce_consent_policy(ConsentPolicy::Interactive, Some(&absent))
+        let (banner, verifier) = announce_consent_policy(ConsentPolicy::Interactive, Some(&absent))
             .expect("interactive starts regardless of the registry");
         assert!(
             banner.0.is_none(),
             "no auto-approve banner under interactive"
         );
+        // ...and this *guard* still loads nothing. `run_session` loads the
+        // registry for the interactive path itself (`load_verifier`), which
+        // is a different refusal with a different message.
+        assert!(verifier.is_none());
     }
 
     #[test]
@@ -1567,9 +1760,9 @@ mod tests {
             Some(registry.clone()),
             Some(log.clone()),
             Some(realm.clone()),
-            || {
+            |seed| {
                 ran.set(true);
-                Ok(())
+                (seed.recorder, Ok(()))
             },
         );
 
@@ -1587,17 +1780,29 @@ mod tests {
         // so the assertion above is about the registry, not about
         // `run_session` being broken in this fixture.
         let (demo_dir, demo_registry) = scratch_registry(&[DEMO_PRINCIPAL]);
+        // The happy path binds the core socket for real, so it runs against
+        // a scratch `XDG_RUNTIME_DIR`: the single-core lock is a live
+        // `flock`, and a test that took it in the operator's real runtime
+        // directory would refuse to run beside a real `vitrind`.
+        let runtime_dir = dir.join("xdg");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let previous = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
         let ran = std::cell::Cell::new(false);
         let code = run_session(
             ConsentPolicy::AutoApprove,
             Some(demo_registry),
             Some(log.clone()),
             Some(realm),
-            || {
+            |seed| {
                 ran.set(true);
-                Ok(())
+                (seed.recorder, Ok(()))
             },
         );
+        match previous {
+            Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
         assert!(!is_failure(code), "the demo registry starts cleanly");
         assert!(ran.get(), "the demo registry is what auto-approve is for");
 

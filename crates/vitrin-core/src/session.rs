@@ -177,8 +177,13 @@ pub(crate) struct Runtime<H: PreemptionHook> {
     /// minted at accept — which is also how a deferred [`Resolution`] finds
     /// its way back to the connection that petitioned.
     conns: BTreeMap<ConnectionId, PrincipalConn>,
-    /// The realm's shim session, once something attaches one.
-    /// [`attach_realm`] is the seam; nothing in this module spawns.
+    /// The realm's shim session, once [`start_realm_in`] has forked one.
+    ///
+    /// `None` until then, and the ordering behind that is the module's
+    /// central invariant rather than an initialization detail: [`install`]
+    /// must have registered the shim socketpair's source *before* the fork,
+    /// because a shim whose connection nothing services blocks on `configure`
+    /// forever. Spawning first and wiring after is a permanent, silent hang.
     pub realm: Option<RealmRuntime>,
     /// The realm's input router: chokepoint-admitted agent actuations and
     /// (nested) physical input converge here before delivery to the shim.
@@ -257,6 +262,30 @@ struct PrincipalConn {
 /// renderer, and a backend must not be able to reach into the grant table.
 /// Everything here is either "what the shim commits into" or "what an
 /// authorized capture reads back".
+/// Whether a [`Presenter::redraw`] actually put a frame on the output, or
+/// merely asked an external frame clock to do so later.
+///
+/// This distinction exists because the two backends own their cadence
+/// differently, and the realm's `frame_done` must follow the *composite*
+/// rather than the request for one. Headless composites synchronously — the
+/// completed composite is the output cadence. Nested hands the request to
+/// the host compositor and is told later, via `WinitEvent::Redraw`.
+///
+/// Collapsing the two (emitting `frame_done` as soon as a redraw was
+/// *requested*) is silently wrong rather than loudly wrong: a shim that
+/// paces itself on `frame_done` — which is the whole point of the callback —
+/// is handed a fresh permit per dispatch round with no composite in between,
+/// so it stops throttling and spins as fast as the loop will dispatch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Presentation {
+    /// The composite finished inside this `redraw` call. Any owed
+    /// `frame_done` is due now.
+    Completed,
+    /// The composite was requested on an external frame clock and has not
+    /// happened yet. The backend owes [`emit_presented`] when it does.
+    Scheduled,
+}
+
 pub(crate) trait Presenter {
     /// The realm's scene — what [`ShimServer::handle_message`] commits into.
     fn scene(&mut self) -> &mut Scene;
@@ -266,7 +295,15 @@ pub(crate) trait Presenter {
     fn view_size(&self) -> (u32, u32);
     /// Recomposite. Called at most once per dispatch round, from
     /// [`post_dispatch`] and never from a message callback.
-    fn redraw(&mut self) -> Result<(), Box<dyn Error>>;
+    ///
+    /// The returned [`Presentation`] is what gates the realm's `frame_done`,
+    /// and it is not decoration: a backend whose frame clock is external
+    /// returns [`Presentation::Scheduled`] and owes the runtime an
+    /// [`emit_presented`] call when the composite actually lands. Answering
+    /// [`Presentation::Completed`] without having composited tells a paced
+    /// shim its frame reached a display that never drew it, which is how a
+    /// throttled client becomes an unthrottled one.
+    fn redraw(&mut self) -> Result<Presentation, Box<dyn Error>>;
     /// The latest completed realm view as tightly packed RGBA8888, or `None`
     /// on a backend that has no readback path.
     ///
@@ -297,7 +334,6 @@ pub(crate) trait Presenter {
     /// clock is external (nested: the host compositor's redraw request). The
     /// default is the headless posture, where a completed composite *is* the
     /// output cadence and nothing further needs scheduling.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn request_present(&mut self) {}
 }
 
@@ -367,8 +403,55 @@ impl<H: PreemptionHook> Runtime<H> {
     /// Consuming `self` is what puts "the runtime is over" before "the log is
     /// closed": the connections, the shim server and the grant table all drop
     /// here, so nothing can still be recording when `run_ended` is written.
-    pub fn into_recorder(self) -> Recorder {
+    ///
+    /// # Shutdown is the fourth close path, and it tears down like the others
+    ///
+    /// [`close_principal`] handles the three close paths a *running* loop
+    /// sees (peer EOF, transport fault, core-initiated close after a
+    /// protocol violation). A core that stops with connections still open —
+    /// `SIGTERM` on a live session, which is the ordinary way a session ends
+    /// — is the fourth, and it used to be the one that skipped teardown
+    /// entirely: `self.conns` was dropped silently, so an agent holding a
+    /// grant at shutdown left no `grant_removed` and no `connection_teardown`
+    /// in the log.
+    ///
+    /// That mattered for the record rather than for the authority. The grant
+    /// table dies with the process either way, so nothing survived to be
+    /// exercised — but the flight recorder is the artifact that has to
+    /// reconstruct the session afterwards, and a log whose last word on a
+    /// grant is `petition_resolved` says that grant was still live when the
+    /// log ended. It could not say whether the core released it or lost track
+    /// of it. Tearing down here makes every grant's end explicit in the one
+    /// place that outlives the process.
+    ///
+    /// Ordering: this runs while the recorder is still open and before
+    /// `run_session` writes `run_ended`, which is the only window where these
+    /// entries can land in the run they belong to. Source removal is
+    /// deliberately not attempted — the loop has already stopped, and there
+    /// is no registration left to leak.
+    pub fn into_recorder(mut self) -> Recorder {
+        self.teardown_open_connections();
         self.kernel.recorder
+    }
+
+    /// Run [`PrincipalServer::teardown`] for every connection still open,
+    /// emptying the table.
+    ///
+    /// Split out of [`into_recorder`](Self::into_recorder) rather than
+    /// inlined so the shutdown close path is reachable from a test without
+    /// consuming the runtime — the same reason it is a named path and not a
+    /// `Drop` impl. A `Drop` could not record anything anyway: it would run
+    /// after `run_session` had taken the recorder back.
+    fn teardown_open_connections(&mut self) {
+        let open = std::mem::take(&mut self.conns);
+        for (id, mut conn) in open {
+            tracing::debug!(%id, "tearing down principal connection at shutdown");
+            conn.server.teardown(
+                &mut self.kernel.petitions,
+                &mut self.kernel.grants,
+                &mut self.kernel.recorder,
+            );
+        }
     }
 
     /// Apply one completed dead-man chord to this session's authority
@@ -408,6 +491,13 @@ impl<H: PreemptionHook> Runtime<H> {
     }
 
     /// Live principal connections — for tests and for shutdown accounting.
+    /// Test-only, and genuinely so: no production path asks how many
+    /// connections are open — the runtime acts on connections by id, never in
+    /// aggregate. It exists because the teardown tests assert the map empties,
+    /// which is the observable that distinguishes "the grant rows went" from
+    /// "the connection went and took its rows with it".
+    ///
+    /// The attribute is verified rather than assumed: deleting it warns.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn connection_count(&self) -> usize {
         self.conns.len()
@@ -988,7 +1078,6 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
 }
 
 /// Dispatch one event from the realm's shim connection.
-#[cfg_attr(not(test), allow(dead_code))]
 fn dispatch_shim<H: RuntimeHost>(
     host: &mut H,
     event: ConnectionEvent,
@@ -1077,6 +1166,43 @@ fn close_realm<H: RuntimeHost>(host: &mut H, cause: DeathCause) {
 /// readback, and one [`ShimServer::presented`] — which still emits one
 /// `frame_done` per commit, in commit order, so the shim's pacing sees the
 /// true output cadence and only the *composites* are coalesced.
+/// Discharge the realm's owed frame callbacks against a composite that has
+/// **actually happened**.
+///
+/// Two callers, one per frame-clock posture, and the split is the whole
+/// reason this is a free function rather than inline in [`post_dispatch`]:
+///
+/// - [`post_dispatch`], when [`Presenter::redraw`] answered
+///   [`Presentation::Completed`] — the headless posture, where the composite
+///   is synchronous.
+/// - The nested backend, from its own `WinitEvent::Redraw` handler, once the
+///   host compositor has actually drawn — the posture where `redraw` answers
+///   [`Presentation::Scheduled`] and the real composite arrives later.
+///
+/// It emits one `frame_done` per owed commit, in commit order, so a dispatch
+/// round that latched a hundred commits still pays one composite while every
+/// commit gets the callback it is owed. Coalescing the composites is the
+/// anti-amplification defense; coalescing the *callbacks* would break pacing,
+/// which is why `ShimServer::presented` batches rather than collapses.
+pub(crate) fn emit_presented<H: PreemptionHook>(runtime: &mut Runtime<H>) {
+    let Runtime { realm, epoch, .. } = runtime;
+    let Some(realm) = realm.as_mut() else {
+        return;
+    };
+    let Some(server) = realm.server.as_mut() else {
+        return;
+    };
+    if !server.wants_presentation() {
+        return;
+    }
+    let time_ms = epoch.elapsed().as_millis() as u32;
+    let outbox = &realm.outbox;
+    let mut send = |frame: &[u8]| outbox.send(frame);
+    if let Err(err) = server.presented(time_ms, &mut send) {
+        tracing::warn!(%err, "frame_done delivery to the realm failed");
+    }
+}
+
 pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
     let fatal = {
         let (runtime, view) = host.split();
@@ -1085,24 +1211,18 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
         }
         runtime.dirty = false;
         match view.redraw() {
-            Ok(()) => {
+            Ok(presentation) => {
                 // Refreshed here and nowhere else: capture reads this cache,
                 // so a refresh on the request path would make an agent's
                 // capture trigger a composite and make goldens depend on
                 // request timing.
                 runtime.view_cache = view.view_rgba();
-                let Runtime { realm, epoch, .. } = runtime;
-                if let Some(realm) = realm.as_mut() {
-                    if let Some(server) = realm.server.as_mut() {
-                        if server.wants_presentation() {
-                            let time_ms = epoch.elapsed().as_millis() as u32;
-                            let outbox = &realm.outbox;
-                            let mut send = |frame: &[u8]| outbox.send(frame);
-                            if let Err(err) = server.presented(time_ms, &mut send) {
-                                tracing::warn!(%err, "frame_done delivery to the realm failed");
-                            }
-                        }
-                    }
+                // Only a composite that actually happened discharges the
+                // realm's owed `frame_done`. On a backend whose clock is
+                // external this is `Scheduled`, and the frame callbacks stay
+                // owed until that backend calls `emit_presented` itself.
+                if presentation == Presentation::Completed {
+                    emit_presented(runtime);
                 }
                 None
             }
@@ -1154,6 +1274,9 @@ mod tests {
     struct TestView {
         scene: Scene,
         redraws: usize,
+        /// Which frame-clock posture to answer with. Defaults to the
+        /// headless one; the pacing test flips it to the nested one.
+        posture: Presentation,
     }
 
     impl Presenter for TestView {
@@ -1163,9 +1286,12 @@ mod tests {
         fn view_size(&self) -> (u32, u32) {
             VIEW
         }
-        fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
+        /// Counts composites and reports whichever posture the test asked
+        /// for: `Completed` (headless, the default) or `Scheduled` (nested,
+        /// where the host compositor draws later).
+        fn redraw(&mut self) -> Result<Presentation, Box<dyn Error>> {
             self.redraws += 1;
-            Ok(())
+            Ok(self.posture)
         }
         fn view_rgba(&mut self) -> Option<Vec<u8>> {
             Some(crate::test_pattern::render(VIEW.0, VIEW.1))
@@ -1259,6 +1385,7 @@ mod tests {
                 view: TestView {
                     scene: Scene::new(),
                     redraws: 0,
+                    posture: Presentation::Completed,
                 },
                 handle: handle.clone(),
                 signal: event_loop.get_signal(),
@@ -1879,5 +2006,130 @@ mod tests {
         // an idle shim burns no CPU.
         post_dispatch(&mut rig.host);
         assert_eq!(rig.host.view.redraws, 1);
+    }
+
+    /// **A scheduled composite is not a completed one, and must not
+    /// discharge the realm's frame callbacks.**
+    ///
+    /// The nested backend does not own its frame clock: `Presenter::redraw`
+    /// composites nothing and answers [`Presentation::Scheduled`], while the
+    /// host compositor draws later and `NestedState::redraw` then calls
+    /// [`emit_presented`]. If `post_dispatch` emitted `frame_done` at
+    /// *request* time instead, a shim that paces itself on the callback —
+    /// which is what the callback is for — would collect a fresh permit every
+    /// dispatch round with no composite in between, and stop throttling.
+    ///
+    /// The bug this pins is silent rather than loud: nothing errors, the
+    /// frames still arrive, and the only symptom is a nested session where a
+    /// paced client spins as fast as the loop will dispatch it. Asserted on
+    /// the owed-callback count, because that is the observable the shim's
+    /// pacing actually reads.
+    #[test]
+    fn a_scheduled_composite_does_not_discharge_the_frame_callbacks() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "pacing",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        // The deferred posture goes on *before* the loop runs: with it set,
+        // no amount of pumping may ever discharge a callback, which is the
+        // whole claim. (Set afterwards, `post_dispatch` would have paid them
+        // during the pump and the assertion below would race.)
+        rig.host.view.posture = Presentation::Scheduled;
+        rig.start_realm(&["--serve", "--animate", "1"]);
+        rig.pump_until(Duration::from_secs(10), |host| {
+            host.runtime
+                .realm
+                .as_ref()
+                .and_then(|realm| realm.server.as_ref())
+                .is_some_and(|server| server.wants_presentation())
+        });
+
+        assert!(
+            rig.host.view.redraws > 0,
+            "the rounds still cost their composite requests"
+        );
+        assert!(
+            rig.host
+                .runtime
+                .realm
+                .as_ref()
+                .and_then(|realm| realm.server.as_ref())
+                .is_some_and(|server| server.wants_presentation()),
+            "a scheduled composite leaves the frame callbacks owed -- emitting them here \
+             is the silent pacing bug: the shim would be told a frame it never saw was presented"
+        );
+
+        // And the debt is discharged the moment a composite really lands,
+        // which is the other half of the contract: the callbacks are delayed,
+        // never dropped.
+        emit_presented(&mut rig.host.runtime);
+        assert!(
+            !rig.host
+                .runtime
+                .realm
+                .as_ref()
+                .and_then(|realm| realm.server.as_ref())
+                .is_some_and(|server| server.wants_presentation()),
+            "a real composite must pay every owed callback"
+        );
+    }
+
+    /// **Shutdown is the fourth close path, and it tears down too.**
+    ///
+    /// `close_principal` covers the three a running loop sees; a core stopped
+    /// by `SIGTERM` with an agent still connected is the fourth, and it used
+    /// to drop the connection table silently. The grant table dies with the
+    /// process either way, so nothing survived to be misused — but the flight
+    /// recorder is what has to reconstruct the session afterwards, and a log
+    /// whose last word on a grant is `petition_resolved` cannot say whether
+    /// the core released it or simply lost track of it.
+    #[test]
+    fn shutdown_tears_down_a_connection_that_still_holds_a_grant() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "shutdown-teardown",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let mut client = agent(&rig.socket);
+        send_preamble(&mut client);
+        send_petition(&mut client);
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(await_resolution(&mut client), Outcome::Granted);
+
+        let now = Instant::now();
+        assert_eq!(rig.host.runtime.kernel.grants.rows(now).count(), 1);
+
+        // The agent never disconnects: the core stops underneath it, which is
+        // what `SIGTERM` on a live session does.
+        rig.host.runtime.teardown_open_connections();
+
+        assert_eq!(
+            rig.host.runtime.connection_count(),
+            0,
+            "shutdown must forget the connection"
+        );
+        assert_eq!(
+            rig.host.runtime.kernel.grants.rows(now).count(),
+            0,
+            "shutdown must remove the grant rows, not drop the table and leave the log \
+             claiming the grant was still live"
+        );
+
+        let entries = rig.entries();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.str("kind") == "grant_removed"),
+            "the run's log must record the grant's end; without it a reader cannot tell a \
+             released grant from one the core lost track of. entries: {entries:#?}"
+        );
+        drop(client);
     }
 }

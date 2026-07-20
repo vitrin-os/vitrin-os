@@ -928,9 +928,14 @@ impl DeadManSwitch {
 /// Called at runtime through `session::Runtime::apply_dead_man`, which is
 /// what owns a [`GrantTable`], a [`PetitionRegistry`] and the run's
 /// [`Recorder`] together; the nested backend's trigger disposal reaches it
-/// from there. Exercised end to end here against all three. Dead-code-allowed
-/// outside tests because headless compiles no caller: it has no physical
-/// input device to hold a chord on.
+/// from there. Exercised end to end here against all three.
+///
+/// No `allow(dead_code)`: `backend::winit` is compiled unconditionally, so
+/// the production caller exists in every build — including the
+/// `--headless`-only one, which simply never reaches it for want of a
+/// physical input device to hold a chord on. An attribute here would silence
+/// the warning that a future refactor dropping that caller is meant to
+/// produce.
 pub(crate) fn apply(
     trigger: &Trigger,
     grants: &mut GrantTable,

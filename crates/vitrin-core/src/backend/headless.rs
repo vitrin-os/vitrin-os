@@ -311,8 +311,12 @@ impl session::Presenter for HeadlessView {
         (size.w.max(0) as u32, size.h.max(0) as u32)
     }
 
-    fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
-        HeadlessView::redraw(self)
+    /// Always [`Presentation::Completed`]: this backend composites
+    /// synchronously into its retained framebuffer, so the composite finishing
+    /// *is* the output cadence and any owed `frame_done` is due on return.
+    fn redraw(&mut self) -> Result<session::Presentation, Box<dyn Error>> {
+        HeadlessView::redraw(self)?;
+        Ok(session::Presentation::Completed)
     }
 
     /// The retained realm view, read back tightly packed.

@@ -747,19 +747,41 @@ impl NestedState {
         if self.deadman.borrow().deadline().is_some() {
             self.deadman_tick();
         }
-        if let Err(err) = self.try_redraw() {
-            error!("render failed, shutting down: {err}");
-            self.fatal = Some(err);
-            self.loop_signal.stop();
+        match self.try_redraw() {
+            // The composite landed, so the realm's owed frame callbacks are
+            // due now. This is the other half of `Presenter::redraw`'s
+            // `Scheduled` answer: the runtime deliberately did not emit them
+            // at request time, because on this backend a requested redraw is
+            // not a drawn one, and telling a paced shim otherwise would let it
+            // run unthrottled.
+            Ok(session::Presentation::Completed) => session::emit_presented(&mut self.runtime),
+            // A zero-sized (minimized) window draws nothing. The callbacks
+            // stay owed — which is the point of distinguishing the two: this
+            // path returns `Ok` and must still not tell the shim a frame was
+            // presented. `schedule_next_frame` is not reached either, so the
+            // next composite comes from the resize, and it discharges them.
+            Ok(session::Presentation::Scheduled) => {}
+            Err(err) => {
+                error!("render failed, shutting down: {err}");
+                self.fatal = Some(err);
+                self.loop_signal.stop();
+            }
         }
     }
 
-    fn try_redraw(&mut self) -> Result<(), Box<dyn Error>> {
+    /// Draw one frame, reporting whether a composite actually happened.
+    ///
+    /// The return is load-bearing rather than informational: [`Self::redraw`]
+    /// discharges the realm's owed `frame_done` on
+    /// [`session::Presentation::Completed`] only, so a path that returns `Ok`
+    /// without drawing must say so. Today that is the minimized window.
+    fn try_redraw(&mut self) -> Result<session::Presentation, Box<dyn Error>> {
         let frame_start = Instant::now();
         let size = self.view.backend.window_size();
         if size.w <= 0 || size.h <= 0 {
             // Zero-sized (e.g. minimized) window: skip, resize will redraw.
-            return Ok(());
+            // Nothing was composited, so the frame callbacks stay owed.
+            return Ok(session::Presentation::Scheduled);
         }
 
         // Re-upload when the window size, the scene content, or the consent
@@ -818,7 +840,7 @@ impl NestedState {
         self.view.backend.submit(None)?;
         trace!(?size, "frame submitted");
         self.schedule_next_frame(frame_start)?;
-        Ok(())
+        Ok(session::Presentation::Completed)
     }
 
     /// Chain the next redraw. If the swap blocked for at least
@@ -871,17 +893,25 @@ impl session::Presenter for NestedView {
         (size.w.max(0) as u32, size.h.max(0) as u32)
     }
 
-    /// A no-op, and deliberately so: this backend does not own its frame
-    /// clock.
+    /// Composites nothing, and deliberately so: this backend does not own its
+    /// frame clock — so it answers [`session::Presentation::Scheduled`] and
+    /// the realm's `frame_done` stays owed.
     ///
-    /// The host compositor does. A composite here would present a frame the
-    /// host never asked for, outside `FRAME_BUDGET`, and would race the
-    /// redraw chain `schedule_next_frame` maintains. The runtime's
+    /// The host compositor owns the clock. A composite here would present a
+    /// frame the host never asked for, outside `FRAME_BUDGET`, and would race
+    /// the redraw chain `schedule_next_frame` maintains. The runtime's
     /// once-per-round dirty flag instead becomes a `request_redraw` in
     /// [`session::Presenter::request_present`], and the host drives the
     /// actual composite through `WinitEvent::Redraw` as it always has.
-    fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
-        Ok(())
+    ///
+    /// **The debt this creates is discharged in [`NestedState::redraw`]**,
+    /// which calls [`session::emit_presented`] after `try_redraw` has actually
+    /// drawn. Returning `Completed` here instead would be the silent pacing
+    /// bug [`session::Presentation`] documents: the shim would be handed a
+    /// frame callback per dispatch round with no composite between them, and a
+    /// client that paces on `frame_done` would stop pacing.
+    fn redraw(&mut self) -> Result<session::Presentation, Box<dyn Error>> {
+        Ok(session::Presentation::Scheduled)
     }
 
     /// Always `None`: the nested backend has no readback path.

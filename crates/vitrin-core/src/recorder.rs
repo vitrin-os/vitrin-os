@@ -382,6 +382,23 @@ pub(crate) const REVOKE_SCOPE_GRANT: &str = "grant";
 /// hold-Esc dead-man switch, P1.7.3).
 pub(crate) const REVOKE_SCOPE_PRINCIPAL: &str = "principal";
 
+/// [`Event::GrantRevoked::cause`] for the hold-chord dead-man switch
+/// (P1.7.3): a human ended this authority with their own hands.
+///
+/// Separate from `scope` because the two are genuinely orthogonal, not two
+/// spellings of one fact: `scope` says how *wide* the revocation was (one
+/// row, or every row of a principal), `cause` says *who or what* decided.
+/// A future panel that revokes all of a principal's rows is
+/// `scope=principal, cause=panel`, and a replay that had to infer the cause
+/// from an adjacent entry would be reading a coincidence of write order.
+pub(crate) const REVOKE_CAUSE_DEAD_MAN: &str = "dead_man_chord";
+
+/// [`Event::GrantRevoked::cause`] for a revocation taken through a
+/// deliberate single-grant act (the P2 panel; policy). Not yet reachable at
+/// runtime -- the panel is a later phase -- but named here so the vocabulary
+/// is closed from the start rather than growing a default.
+pub(crate) const REVOKE_CAUSE_OPERATOR: &str = "operator";
+
 /// How many times one run may try to reopen its log after a write failure
 /// latched it degraded. Small and fixed: enough that a *transient* failure
 /// (a full filesystem the operator cleared, an `EIO` blip) resumes
@@ -741,6 +758,38 @@ pub(crate) enum Event<'a> {
         /// `grant` for a single revoke, `principal` for the sweep over one
         /// principal's rows.
         scope: &'static str,
+        /// What decided ([`REVOKE_CAUSE_DEAD_MAN`] /
+        /// [`REVOKE_CAUSE_OPERATOR`]) -- so each line says why on its own
+        /// rather than by adjacency to another entry.
+        cause: &'static str,
+    },
+    /// The human held the dead-man chord to completion (P1.7.3): every
+    /// delegated authority in the session was revoked and every pending
+    /// petition denied, on a physical gesture nothing can veto.
+    ///
+    /// Written **before** the `grant_revoked` lines it explains, and written
+    /// **even when it revoked nothing**. The second half is the load-bearing
+    /// one: a session where the human hit the off-switch and it had no
+    /// authority to destroy would otherwise be indistinguishable, from the
+    /// log alone, from one where they never touched it -- so "the switch
+    /// works" would be unverifiable exactly when it mattered most.
+    DeadManTriggered {
+        /// The configured chord's name (`esc`), from a closed vocabulary
+        /// ([`crate::deadman::Chord`]) -- never free-form text.
+        chord: &'static str,
+        /// How long the key was **measured** to be held when the switch
+        /// fired, not how long it was configured to need. A late elapse
+        /// check (a coalesced timer, a stalled frame) reports the real
+        /// number; a replay reading the configured one would be reading a
+        /// value nobody observed.
+        held_ms: u64,
+        /// Rows this gesture newly revoked; each also gets its own
+        /// `grant_revoked` line.
+        revoked_grants: usize,
+        /// Pending petitions this gesture denied. They resolve through the
+        /// ordinary human-decision path, so each appears in its own
+        /// `petition_resolved` entry at delivery.
+        denied_petitions: usize,
     },
     /// One grant row deleted outright by connection teardown -- the way a
     /// version-1 grant most commonly dies (they die with their
@@ -891,6 +940,7 @@ impl Event<'_> {
             Event::GrantSpent { .. } => "grant_spent",
             Event::GrantExpired { .. } => "grant_expired",
             Event::GrantRevoked { .. } => "grant_revoked",
+            Event::DeadManTriggered { .. } => "dead_man_triggered",
             Event::GrantRemoved { .. } => "grant_removed",
             Event::RealmSpawned { .. } => "realm_spawned",
             Event::RealmSpawnFailed { .. } => "realm_spawn_failed",
@@ -1125,10 +1175,26 @@ impl Event<'_> {
                 field_str(out, "transition", "active_to_expired");
                 field_str(out, "source", "proactive_sweep");
             }
-            Event::GrantRevoked { grant_id, scope } => {
+            Event::GrantRevoked {
+                grant_id,
+                scope,
+                cause,
+            } => {
                 field_display(out, "grant_id", grant_id);
                 field_str(out, "transition", "active_to_revoked");
                 field_str(out, "scope", scope);
+                field_str(out, "cause", cause);
+            }
+            Event::DeadManTriggered {
+                chord,
+                held_ms,
+                revoked_grants,
+                denied_petitions,
+            } => {
+                field_str(out, "chord", chord);
+                field_u64(out, "held_ms", held_ms);
+                field_u64(out, "revoked_grants", revoked_grants as u64);
+                field_u64(out, "denied_petitions", denied_petitions as u64);
             }
             Event::GrantRemoved {
                 connection,
@@ -1737,11 +1803,25 @@ impl Recorder {
     /// Record one revocation's result: the ids
     /// [`GrantTable::revoke`](crate::grants::GrantTable::revoke) or
     /// [`GrantTable::revoke_principal`](crate::grants::GrantTable::revoke_principal)
-    /// newly revoked, tagged with which of the two acts it was
-    /// ([`REVOKE_SCOPE_GRANT`] / [`REVOKE_SCOPE_PRINCIPAL`]).
-    pub fn record_revocations(&mut self, revoked: &[GrantId], scope: &'static str) {
+    /// newly revoked, tagged with how wide the act was
+    /// ([`REVOKE_SCOPE_GRANT`] / [`REVOKE_SCOPE_PRINCIPAL`]) and what
+    /// decided it ([`REVOKE_CAUSE_DEAD_MAN`] / [`REVOKE_CAUSE_OPERATOR`]).
+    ///
+    /// An empty slice writes nothing, which is why the dead-man switch
+    /// records its own [`Event::DeadManTriggered`] separately: a gesture
+    /// that revoked nothing still happened.
+    pub fn record_revocations(
+        &mut self,
+        revoked: &[GrantId],
+        scope: &'static str,
+        cause: &'static str,
+    ) {
         for &grant_id in revoked {
-            self.record(Event::GrantRevoked { grant_id, scope });
+            self.record(Event::GrantRevoked {
+                grant_id,
+                scope,
+                cause,
+            });
         }
     }
 

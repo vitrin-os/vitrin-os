@@ -110,11 +110,20 @@
 //! chokepoint's `consent_held` refusal true), and seizes physical input, so
 //! those three cannot drift apart.
 //!
+//! **P1.7.3 (issue #39) — hold-Esc revocation — has since attached**, and
+//! it needed nothing here: the grab deliberately gave Escape no meaning, so
+//! the chord arrived unencumbered exactly as [`grab`]'s keyboard section
+//! promised. Two seams this module already had turned out to carry it. The
+//! non-consuming `observe` tap keeps the switch alive while a prompt owns
+//! every physical event — the case that matters most — and
+//! [`grab::ConsentGrab::retire_stale`] takes the card down by itself once a
+//! trigger denies the pending petitions, so revocation needs no new coupling
+//! to the consent surface at all. The hold indicator [`crate::deadman`]
+//! paints is composited *above* this card, and inherits the same
+//! never-in-a-capture property by the same structural argument.
+//!
 //! Still unattached:
 //!
-//! - **P1.7.3 (issue #39) — hold-Esc revocation.** Nothing here. The grab
-//!   deliberately gives Escape no meaning so that chord arrives
-//!   unencumbered; see [`grab`]'s keyboard section.
 //! - **Issue #85 — no trusted indicator.** A confined app can draw a
 //!   byte-identical replica of this card, and nothing yet lets a human tell
 //!   the difference. Tracked separately; [`render`] refuses to *claim*

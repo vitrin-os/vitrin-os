@@ -102,6 +102,12 @@ mod enforcement;
 /// `GlesRenderer` when the realm/backend wiring lands (P1.5.2).
 #[cfg_attr(not(test), allow(dead_code))]
 mod dmabuf;
+/// The dead-man switch (P1.7.3): holding the configured chord revokes every
+/// grant in the session, effective on the very next enforcement check. Its
+/// watcher really rides the nested backend's router and its timer really
+/// fires; applying a completed chord to a grant table waits on the M1.1
+/// listener wiring (issue #77), which is what constructs one.
+mod deadman;
 /// Input intake & routing (P1.3.7): origin tagging at intake (backward
 /// requirement B2), view→surface coordinate mapping, and the preemption
 /// hook point. The nested backend feeds it host input at runtime; seat
@@ -217,6 +223,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::deadman::DeadManConfig;
 use crate::identity::{StaticVerifier, DEMO_PRINCIPAL};
 use crate::petitions::ConsentPolicy;
 use crate::realm::RealmRegistry;
@@ -254,6 +261,19 @@ USAGE:
                                 [[realm]] table: command, args, env_allow).
                                 Default: $XDG_CONFIG_HOME/vitrin/realm.toml
                                 Startup FAILS if it is missing or malformed.
+    vitrind [--dead-man-chord KEY]
+                                Key for the dead-man switch: holding it
+                                revokes every grant in the session at once.
+                                Default: esc. Must be a layout-invariant,
+                                non-modifier key this build's input intake
+                                can deliver; startup FAILS otherwise, rather
+                                than running with an off-switch that cannot
+                                fire.
+    vitrind [--dead-man-hold MS]
+                                How long that key must be held, in
+                                milliseconds. Default: 1000 (accepted range
+                                250..=10000). Nested mode only: headless has
+                                no physical input device, structurally.
     vitrind --help              Show this help.
     vitrind --version           Show the version.
 ";
@@ -287,6 +307,7 @@ enum Action {
         principals: Option<PathBuf>,
         recorder: Option<PathBuf>,
         realm: Option<PathBuf>,
+        dead_man: DeadManConfig,
     },
     RunHeadless {
         size: (u32, u32),
@@ -294,6 +315,13 @@ enum Action {
         principals: Option<PathBuf>,
         recorder: Option<PathBuf>,
         realm: Option<PathBuf>,
+        /// Parsed and validated even here, so the same command line is
+        /// accepted or refused identically in both modes -- the `--consent`
+        /// precedent, which headless also accepts although it can prompt
+        /// nobody. Headless then ignores it: it has no physical input
+        /// device, and that absence is structural rather than a runtime
+        /// check ([`crate::input`]), so there is no chord for it to watch.
+        dead_man: DeadManConfig,
     },
     Help,
     Version,
@@ -316,6 +344,12 @@ enum Mode {
 /// `--recorder` follows the same two spellings (the `--consent` precedent)
 /// and takes the run's flight-recorder log path (P1.4.5); omitted, the
 /// default under the core's runtime directory is used.
+/// `--dead-man-chord` / `--dead-man-hold` configure the P1.7.3 off-switch,
+/// same two spellings again, and are **validated here rather than at first
+/// use**: a chord this build's intake cannot deliver, or a hold outside the
+/// defensible range, is a startup error. A session that came up with an
+/// off-switch which silently never fires is the fail-open trap this
+/// codebase refuses everywhere configuration is read.
 fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, String> {
     let mut mode: Option<Mode> = None;
     let mut size: Option<(u32, u32)> = None;
@@ -323,6 +357,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut principals: Option<PathBuf> = None;
     let mut recorder: Option<PathBuf> = None;
     let mut realm: Option<PathBuf> = None;
+    let mut chord: Option<deadman::Chord> = None;
+    let mut hold_ms: Option<u64> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg {
@@ -362,6 +398,18 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 )?;
                 set_path(&mut realm, "--realm", "config path", value)?;
             }
+            "--dead-man-chord" => {
+                let value = args
+                    .next()
+                    .ok_or("`--dead-man-chord` requires a key (e.g. `--dead-man-chord esc`)")?;
+                set_chord(&mut chord, value)?;
+            }
+            "--dead-man-hold" => {
+                let value = args.next().ok_or(
+                    "`--dead-man-hold` requires a duration in ms (e.g. `--dead-man-hold 1000`)",
+                )?;
+                set_hold(&mut hold_ms, value)?;
+            }
             "--help" | "-h" => return Ok(Action::Help),
             "--version" | "-V" => return Ok(Action::Version),
             other => {
@@ -373,6 +421,10 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_path(&mut recorder, "--recorder", "log path", value)?;
                 } else if let Some(value) = other.strip_prefix("--realm=") {
                     set_path(&mut realm, "--realm", "config path", value)?;
+                } else if let Some(value) = other.strip_prefix("--dead-man-chord=") {
+                    set_chord(&mut chord, value)?;
+                } else if let Some(value) = other.strip_prefix("--dead-man-hold=") {
+                    set_hold(&mut hold_ms, value)?;
                 } else {
                     return Err(format!("unknown argument `{other}`"));
                 }
@@ -384,6 +436,18 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     // surface unless auto-approve was explicitly flagged.
     let consent = consent.unwrap_or(ConsentPolicy::Interactive);
 
+    // Both halves default independently, so `--dead-man-hold 400` keeps the
+    // default chord and vice versa.
+    let mut dead_man = DeadManConfig::default();
+    if let Some(chord) = chord {
+        dead_man.chord = chord;
+    }
+    if let Some(ms) = hold_ms {
+        dead_man = dead_man
+            .with_hold_ms(ms)
+            .map_err(|err| format!("`--dead-man-hold`: {err}"))?;
+    }
+
     // `--help`/`--version` already returned above, so only the run modes
     // remain to resolve; `--size` is meaningless without `--headless`.
     match (mode, size) {
@@ -392,6 +456,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             principals,
             recorder,
             realm,
+            dead_man,
         }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
         (Some(Mode::Headless), size) => Ok(Action::RunHeadless {
@@ -400,6 +465,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             principals,
             recorder,
             realm,
+            dead_man,
         }),
         (None, Some(_)) => Err("`--size` requires `--headless`".into()),
         (None, None) => Err("no mode given (expected `--nested` or `--headless`)".into()),
@@ -417,6 +483,45 @@ fn set_path(slot: &mut Option<PathBuf>, flag: &str, what: &str, value: &str) -> 
         return Err(format!("`{flag}` requires a non-empty {what}"));
     }
     *slot = Some(PathBuf::from(value));
+    Ok(())
+}
+
+/// Record the `--dead-man-chord` key, rejecting a repeat flag and any key
+/// this build's input intake could not deliver.
+///
+/// The error names every accepted key rather than saying "unknown": the
+/// vocabulary is short, deliberately excludes modifiers, and an operator who
+/// guessed `escape` or `ESC` should be told what to write instead of being
+/// left to read the source.
+fn set_chord(slot: &mut Option<deadman::Chord>, value: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--dead-man-chord` given more than once".into());
+    }
+    let chord = deadman::Chord::parse(value).map_err(|err| {
+        let accepted: Vec<&str> = deadman::Chord::vocabulary().collect();
+        format!(
+            "`--dead-man-chord` `{value}`: {err} (accepted: {})",
+            accepted.join(", ")
+        )
+    })?;
+    *slot = Some(chord);
+    Ok(())
+}
+
+/// Record the `--dead-man-hold` duration in milliseconds, rejecting a repeat
+/// flag and a value that is not a plain non-negative integer. The *range* is
+/// checked once both halves are resolved, by
+/// [`DeadManConfig::with_hold_ms`](deadman::DeadManConfig::with_hold_ms), so
+/// the bounds and their justification live next to each other rather than
+/// being restated here.
+fn set_hold(slot: &mut Option<u64>, value: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--dead-man-hold` given more than once".into());
+    }
+    let ms: u64 = value.parse().map_err(|_| {
+        format!("`--dead-man-hold` `{value}` is not a whole number of milliseconds")
+    })?;
+    *slot = Some(ms);
     Ok(())
 }
 
@@ -512,9 +617,12 @@ fn main() -> ExitCode {
             principals,
             recorder,
             realm,
+            dead_man,
         } => {
             init_tracing();
-            run_session(consent, principals, recorder, realm, backend::winit::run)
+            run_session(consent, principals, recorder, realm, move || {
+                backend::winit::run(dead_man)
+            })
         }
         Action::RunHeadless {
             size,
@@ -522,6 +630,10 @@ fn main() -> ExitCode {
             principals,
             recorder,
             realm,
+            // Validated at parse time so both modes accept the same command
+            // line, then unused: headless has no physical input device to
+            // hold a chord on (`Action::RunHeadless::dead_man`).
+            dead_man: _,
         } => {
             init_tracing();
             run_session(consent, principals, recorder, realm, || {
@@ -1039,7 +1151,8 @@ mod tests {
                 consent: ConsentPolicy::Interactive,
                 principals: None,
                 recorder: None,
-                realm: None
+                realm: None,
+                dead_man: DeadManConfig::default()
             })
         );
     }
@@ -1053,7 +1166,8 @@ mod tests {
                 consent: ConsentPolicy::Interactive,
                 principals: None,
                 recorder: None,
-                realm: None
+                realm: None,
+                dead_man: DeadManConfig::default()
             })
         );
     }
@@ -1067,7 +1181,8 @@ mod tests {
                 consent: ConsentPolicy::Interactive,
                 principals: None,
                 recorder: None,
-                realm: None
+                realm: None,
+                dead_man: DeadManConfig::default()
             })
         );
         assert_eq!(
@@ -1077,7 +1192,8 @@ mod tests {
                 consent: ConsentPolicy::Interactive,
                 principals: None,
                 recorder: None,
-                realm: None
+                realm: None,
+                dead_man: DeadManConfig::default()
             })
         );
     }
@@ -1097,7 +1213,8 @@ mod tests {
                     consent: ConsentPolicy::AutoApprove,
                     principals: None,
                     recorder: None,
-                    realm: None
+                    realm: None,
+                    dead_man: DeadManConfig::default()
                 })
             );
         }
@@ -1107,7 +1224,8 @@ mod tests {
                 consent: ConsentPolicy::Interactive,
                 principals: None,
                 recorder: None,
-                realm: None
+                realm: None,
+                dead_man: DeadManConfig::default()
             })
         );
     }
@@ -1124,7 +1242,8 @@ mod tests {
                 consent: ConsentPolicy::Interactive,
                 principals: None,
                 recorder: None,
-                realm: None
+                realm: None,
+                dead_man: DeadManConfig::default()
             })
         );
         for args in [
@@ -1138,7 +1257,8 @@ mod tests {
                     consent: ConsentPolicy::Interactive,
                     principals: None,
                     recorder: Some(PathBuf::from("/tmp/run.jsonl")),
-                    realm: None
+                    realm: None,
+                    dead_man: DeadManConfig::default()
                 })
             );
         }
@@ -1153,7 +1273,8 @@ mod tests {
                 consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: Some(PathBuf::from("/tmp/n.jsonl")),
-                realm: None
+                realm: None,
+                dead_man: DeadManConfig::default()
             })
         );
     }
@@ -1174,7 +1295,8 @@ mod tests {
                     consent: ConsentPolicy::Interactive,
                     principals: None,
                     recorder: None,
-                    realm: Some(PathBuf::from("/etc/vitrin/realm.toml"))
+                    realm: Some(PathBuf::from("/etc/vitrin/realm.toml")),
+                    dead_man: DeadManConfig::default()
                 })
             );
         }
@@ -1190,7 +1312,8 @@ mod tests {
                 consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: Some(PathBuf::from("/tmp/n.jsonl")),
-                realm: Some(PathBuf::from("/tmp/realm.toml"))
+                realm: Some(PathBuf::from("/tmp/realm.toml")),
+                dead_man: DeadManConfig::default()
             })
         );
     }
@@ -1630,7 +1753,8 @@ mod tests {
                     consent: ConsentPolicy::Interactive,
                     principals: Some(PathBuf::from("/etc/vitrin/principals.toml")),
                     recorder: None,
-                    realm: None
+                    realm: None,
+                    dead_man: DeadManConfig::default()
                 })
             );
         }
@@ -1683,7 +1807,8 @@ mod tests {
                 consent: ConsentPolicy::Interactive,
                 principals: None,
                 recorder: None,
-                realm: None
+                realm: None,
+                dead_man: DeadManConfig::default()
             })
         );
     }
@@ -1710,6 +1835,96 @@ mod tests {
     fn unknown_argument_is_an_error() {
         assert!(parse_args(["--frobnicate"]).is_err());
         assert!(parse_args(["--nested", "extra"]).is_err());
+    }
+
+    /// The dead-man configuration this run resolved, whichever mode it named.
+    fn dead_man_of(action: &Action) -> DeadManConfig {
+        match action {
+            Action::RunNested { dead_man, .. } | Action::RunHeadless { dead_man, .. } => *dead_man,
+            other => panic!("not a run action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_dead_man_switch_defaults_to_hold_esc_for_one_second() {
+        // The plan default, pinned: a session that came up with a different
+        // off-switch than the one documented would be a surprise exactly
+        // when a human most needs there not to be one.
+        let action = parse_args(["--nested"]).expect("defaults parse");
+        let config = dead_man_of(&action);
+        assert_eq!(config.chord.name(), "esc");
+        assert_eq!(config.hold, std::time::Duration::from_millis(1000));
+        // Headless resolves the same policy from the same command line, so a
+        // shared alias behaves identically in both modes (it then ignores
+        // it: no physical input device exists there).
+        assert_eq!(
+            dead_man_of(&parse_args(["--headless"]).expect("defaults parse")),
+            config
+        );
+    }
+
+    #[test]
+    fn dead_man_flags_parse_both_spellings_and_default_independently() {
+        for args in [
+            vec!["--nested", "--dead-man-chord", "f12"],
+            vec!["--nested", "--dead-man-chord=f12"],
+        ] {
+            let config =
+                dead_man_of(&parse_args(args.clone()).unwrap_or_else(|e| panic!("{args:?}: {e}")));
+            assert_eq!(config.chord.name(), "f12");
+            // The other half keeps its default rather than being reset.
+            assert_eq!(config.hold, std::time::Duration::from_millis(1000));
+        }
+        for args in [
+            vec!["--nested", "--dead-man-hold", "400"],
+            vec!["--nested", "--dead-man-hold=400"],
+        ] {
+            let config =
+                dead_man_of(&parse_args(args.clone()).unwrap_or_else(|e| panic!("{args:?}: {e}")));
+            assert_eq!(config.hold, std::time::Duration::from_millis(400));
+            assert_eq!(config.chord.name(), "esc");
+        }
+        // Both together.
+        let config = dead_man_of(
+            &parse_args([
+                "--nested",
+                "--dead-man-chord=delete",
+                "--dead-man-hold=2500",
+            ])
+            .expect("both parse"),
+        );
+        assert_eq!(config.chord.name(), "delete");
+        assert_eq!(config.hold, std::time::Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn an_unusable_dead_man_configuration_is_a_startup_error() {
+        // The fail-open trap this closes: a session that starts with an
+        // off-switch which silently never fires. Every refusal here is a
+        // startup error, never a default quietly substituted.
+        //
+        // A key this build's intake cannot deliver...
+        let err = parse_args(["--nested", "--dead-man-chord", "f13"]).unwrap_err();
+        assert!(err.contains("--dead-man-chord"), "{err}");
+        assert!(
+            err.contains("accepted:"),
+            "the error must list the vocabulary: {err}"
+        );
+        assert!(err.contains("esc"), "{err}");
+        // ...a modifier, which would fire during ordinary text selection...
+        assert!(parse_args(["--nested", "--dead-man-chord", "shift"]).is_err());
+        // ...a hold short enough to trip on an ordinary keypress...
+        assert!(parse_args(["--nested", "--dead-man-hold", "10"]).is_err());
+        // ...one nobody could complete...
+        assert!(parse_args(["--nested", "--dead-man-hold", "600000"]).is_err());
+        // ...and values that are not durations at all.
+        assert!(parse_args(["--nested", "--dead-man-hold", "1s"]).is_err());
+        assert!(parse_args(["--nested", "--dead-man-hold", "-1"]).is_err());
+        assert!(parse_args(["--nested", "--dead-man-hold"]).is_err());
+        assert!(parse_args(["--nested", "--dead-man-chord"]).is_err());
+        // Repeats are refused like every other flag here.
+        assert!(parse_args(["--nested", "--dead-man-chord=esc", "--dead-man-chord=f12"]).is_err());
+        assert!(parse_args(["--nested", "--dead-man-hold=300", "--dead-man-hold=400"]).is_err());
     }
 
     #[test]

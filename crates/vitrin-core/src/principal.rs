@@ -5585,9 +5585,11 @@ pub(crate) mod tests {
         assert_eq!(expect_resolved(&mut client, 30).outcome, Outcome::Granted);
         let third_row = server.grant_row_id(30).unwrap();
         assert!(shared.grants.revoke(third_row));
-        shared
-            .recorder
-            .record_revocations(&[third_row], crate::recorder::REVOKE_SCOPE_GRANT);
+        shared.recorder.record_revocations(
+            &[third_row],
+            crate::recorder::REVOKE_SCOPE_GRANT,
+            crate::recorder::REVOKE_CAUSE_OPERATOR,
+        );
         // The dead-man switch names every row it newly revoked -- the
         // spent `once` and the swept-expired one included (the table's
         // documented "revoking an expired or spent grant is permitted"),
@@ -5596,9 +5598,11 @@ pub(crate) mod tests {
             .grants
             .revoke_principal(&PrincipalIdentity::parse(DEMO_IDENTITY).unwrap());
         assert_eq!(by_principal, vec![once_row, timed_row]);
-        shared
-            .recorder
-            .record_revocations(&by_principal, crate::recorder::REVOKE_SCOPE_PRINCIPAL);
+        shared.recorder.record_revocations(
+            &by_principal,
+            crate::recorder::REVOKE_SCOPE_PRINCIPAL,
+            crate::recorder::REVOKE_CAUSE_DEAD_MAN,
+        );
 
         let entries = shared.log();
         let sweep = crate::recorder::tests::of_kind(&entries, "grant_expired");

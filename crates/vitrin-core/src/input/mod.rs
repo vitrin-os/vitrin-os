@@ -118,8 +118,8 @@
 //! every event:
 //!
 //! 1. [`PreemptionHook::observe`] — an unconditional, non-consuming tap.
-//!    P1.7.3's hold-Esc revocation watcher attaches here: it must see raw
-//!    physical events (Escape press/release — covered by the
+//!    P1.7.3's hold-chord revocation watcher **detects** here: it must see
+//!    raw physical events (Escape press/release — covered by the
 //!    layout-invariant key table below) *even while a consent grab is
 //!    consuming all delivery*.
 //! 2. [`PreemptionHook::gate`] — the consuming gate. P1.7.2's consent
@@ -130,21 +130,34 @@
 //!    — so a consuming gate can never wedge the router's grab (see
 //!    [`Gate::Consume`] and the pairing contract on [`PreemptionHook`]).
 //!
-//! The gate side is now taken: [`crate::consent::grab::ConsentGate`]
-//! (P1.7.2) attached without restructuring anything, as promised — the
-//! nested backend's router is `InputRouter<ConsentGate<NoopHook>>`, and
-//! P1.7.3's watcher replaces that innermost [`NoopHook`]. Its policy lives
-//! entirely in that module; what matters here is that it honours the pairing
-//! contract below by never consuming a release, and that it judges by the
-//! origin tag intake bound rather than by any authority question — the
+//! Both sides are now taken, and the nested backend's router is
+//! `InputRouter<ConsentGate<DeadManHook<NoopHook>>>` — the stacking this
+//! hook point was designed for, reached without restructuring anything.
+//!
+//! [`crate::consent::grab::ConsentGate`] (P1.7.2) is the gate. Its policy
+//! lives entirely in that module; what matters here is that it honours the
+//! pairing contract below by never consuming a release, and that it judges by
+//! the origin tag intake bound rather than by any authority question — the
 //! router still holds no authority check, and must not grow one.
 //!
-//! The first real observe-side consumer is [`PresenceHook`] (P1.4.4): it
+//! [`crate::deadman::DeadManHook`] (P1.7.3) is innermost, and it implements
+//! **both** halves — which is the resolution of a real tension rather than an
+//! oversight, argued in full in [`crate::deadman`]. The two halves do two
+//! different jobs: `observe` detects the chord and owns every piece of switch
+//! state, so no other policy can stop the human's off-switch from firing;
+//! `gate` only decides what the confined app sees, withholding the chord key's
+//! press until a tap can be told from a hold. It therefore *does* consume a
+//! release — the one place in this core that does — and that is sound only
+//! because it consumed that release's press too, so the pair is atomic and the
+//! app's accounting is never split. The router's per-keysym pairing is what
+//! proves it: the reconciliation finds no delivered press and does nothing.
+//!
+//! The first real observe-side consumer was [`PresenceHook`] (P1.4.4): it
 //! feeds [`PhysicalPresence`], the physical-activity state behind the
-//! enforcement chokepoint's `preempted` refusal — attached exactly like
-//! P1.7.3's watcher will be (non-consuming, wraps an inner hook), so the
-//! chokepoint's "does physical input own the target" judgement rides the
-//! same single tap point as every other preemption policy.
+//! enforcement chokepoint's `preempted` refusal — attached in the same shape
+//! (non-consuming, wraps an inner hook), so the chokepoint's "does physical
+//! input own the target" judgement rides the same single tap point as every
+//! other preemption policy.
 //!
 //! # What arrives later (deliberately not here)
 //!
@@ -355,8 +368,13 @@ pub(crate) enum Gate {
 
 /// The single preemption hook point of the input router (module docs lay
 /// out the placement rationale). For every event, [`observe`] is called
-/// first and unconditionally (P1.7.3's revocation watcher — cannot
-/// consume), then [`gate`] may consume it (P1.7.2's consent grab).
+/// first and unconditionally, then [`gate`] may consume it.
+///
+/// A hook may implement both halves, and P1.7.3's dead-man watcher does:
+/// `observe` is where it detects the chord (unconditional, so no other
+/// policy can blind the human's off-switch) and `gate` is where it keeps
+/// that chord from reaching the confined app. What `observe` can never do
+/// is *stop* an event — that is the gate's job, and the split is the point.
 ///
 /// **Pairing contract for gate implementors.** A gate that begins
 /// consuming while router-delivered presses are outstanding (a consent
@@ -371,6 +389,13 @@ pub(crate) enum Gate {
 /// press app-side — its debt to settle, and on the keyboard that debt is
 /// a latched modifier that changes the meaning of everything typed after.
 ///
+/// **The one sound exception**, and the only one in this core: a gate that
+/// consumed a press may consume that press's release, because then nothing
+/// is stranded — the app never saw the press begin, so it is not left
+/// holding anything. [`crate::deadman`] takes exactly this exception for
+/// the chord key and nothing else. The rule above is otherwise absolute:
+/// a gate must not consume a release whose press the *router* delivered.
+///
 /// [`observe`]: PreemptionHook::observe
 /// [`gate`]: PreemptionHook::gate
 pub(crate) trait PreemptionHook {
@@ -383,8 +408,11 @@ pub(crate) trait PreemptionHook {
     fn gate(&mut self, input: &SeatInput) -> Gate;
 }
 
-/// The MVP hook: observes nothing, consumes nothing. Replaced (wrapped) by
-/// the P1.7.x consent grab + revocation watcher.
+/// The terminal hook: observes nothing, consumes nothing.
+///
+/// No longer "the MVP placeholder" — the P1.7.x policies (the consent grab
+/// and the dead-man watcher) each *wrap* an inner hook, so this is what the
+/// stack bottoms out in, and the nested backend really carries it under both.
 pub(crate) struct NoopHook;
 
 impl PreemptionHook for NoopHook {
@@ -511,9 +539,10 @@ impl PhysicalPresence {
 }
 
 /// The [`PhysicalPresence`] tracker attached at THE preemption hook point:
-/// an observe-side tap (the P1.7.3 attachment shape -- non-consuming, sees
-/// every event even while a future consent grab consumes delivery),
-/// wrapping an inner hook so the P1.7.x consumers stack beside it. Because
+/// an observe-side tap -- non-consuming, sees every event even while the
+/// consent grab consumes delivery, the same shape P1.7.3's dead-man watcher
+/// detects with -- wrapping an inner hook so the P1.7.x consumers stack
+/// beside it rather than displacing one another. Because
 /// the hook trait deliberately carries no clock (the router never reads
 /// one), the embedder that drives `route` shares a clock cell with this
 /// hook and advances it to the dispatch turn's injected `now` -- the same
@@ -914,8 +943,27 @@ fn invariant_keysym(evdev_code: u32) -> Option<u32> {
     })
 }
 
+/// Whether nested intake can ever produce `keysym` — i.e. whether some evdev
+/// scancode maps to it through [`invariant_keysym`].
+///
+/// Exists for one caller and one hazard: [`crate::deadman::Chord::parse`]
+/// validates the configured dead-man chord against it, so a session can
+/// never come up with an off-switch whose key intake silently drops. Asking
+/// the real table rather than restating it is the whole point — a
+/// hand-maintained copy of the mapping would be free to drift, and the
+/// symptom of that drift is a dead-man switch that never fires, which is the
+/// worst possible thing to discover late.
+///
+/// The scan is over the byte-wide evdev keycode space the kernel defines
+/// (`input-event-codes.h` keeps `KEY_*` under 256, and [`invariant_keysym`]'s
+/// table is entirely within it); it runs once per process, at argument
+/// parsing.
+pub(crate) fn keysym_is_intakeable(keysym: u32) -> bool {
+    (0u32..256).any(|code| invariant_keysym(code) == Some(keysym))
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
     use std::os::fd::AsFd;
     use std::rc::Rc;
@@ -1114,6 +1162,77 @@ mod tests {
     }
 
     const VIEW: (i32, i32) = (100, 80);
+
+    // ------------------------------------------------------------------
+    // Chord fixtures for `crate::deadman`'s tests
+    //
+    // These live here, not there, for the reason the P1.7.2 section below
+    // already records: [`SeatInput::physical`] is private to this module by
+    // design (B2), so this is the only place in the crate where a
+    // physical-origin event can be minted at all. A module that needs to
+    // model "the human pressed a key" borrows it from here rather than
+    // gaining the ability to forge an origin tag.
+    // ------------------------------------------------------------------
+
+    /// XK_Escape — the default dead-man chord.
+    pub(crate) const CHORD_KEYSYM: u32 = 0xff1b;
+    /// XK_Return — a layout-invariant key that is *not* the chord.
+    const NON_CHORD_KEYSYM: u32 = 0xff0d;
+
+    /// The human pressing the dead-man chord key.
+    pub(crate) fn chord_press() -> SeatInput {
+        SeatInput::physical(SeatInputKind::Key {
+            keysym: CHORD_KEYSYM,
+            state: KeyState::Pressed,
+        })
+    }
+
+    /// The human releasing it.
+    pub(crate) fn chord_release() -> SeatInput {
+        SeatInput::physical(SeatInputKind::Key {
+            keysym: CHORD_KEYSYM,
+            state: KeyState::Released,
+        })
+    }
+
+    /// An **agent** actuating the chord key: must never arm the human's
+    /// switch.
+    pub(crate) fn emulated_chord_press() -> SeatInput {
+        SeatInput::emulated(SeatInputKind::Key {
+            keysym: CHORD_KEYSYM,
+            state: KeyState::Pressed,
+        })
+    }
+
+    /// An agent actuating the chord key's release: must never disarm a hold
+    /// the human has in progress.
+    pub(crate) fn emulated_chord_release() -> SeatInput {
+        SeatInput::emulated(SeatInputKind::Key {
+            keysym: CHORD_KEYSYM,
+            state: KeyState::Released,
+        })
+    }
+
+    /// Agent pointer traffic, for flooding an armed hold.
+    pub(crate) fn emulated_motion() -> SeatInput {
+        SeatInput::emulated(SeatInputKind::Motion { x: 1.0, y: 2.0 })
+    }
+
+    /// A physical key that is not the chord.
+    pub(crate) fn other_key_press() -> SeatInput {
+        SeatInput::physical(SeatInputKind::Key {
+            keysym: NON_CHORD_KEYSYM,
+            state: KeyState::Pressed,
+        })
+    }
+
+    /// Its release.
+    pub(crate) fn other_key_release() -> SeatInput {
+        SeatInput::physical(SeatInputKind::Key {
+            keysym: NON_CHORD_KEYSYM,
+            state: KeyState::Released,
+        })
+    }
 
     fn motion_ev(x: f64, y: f64) -> InputEvent<SyntheticHost> {
         InputEvent::PointerMotionAbsolute {
@@ -2524,6 +2643,431 @@ mod tests {
                 origin: Origin::Emulated,
             },
             "the FIRST seat event the app ever sees is the post-prompt one"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The dead-man switch through the real router (P1.7.3)
+    //
+    // Here for the same reason the P1.7.2 block above is: this is the only
+    // module that can mint a physical-origin event, so it is the only place
+    // the human's off-switch can be driven the way nested intake drives it.
+    // ------------------------------------------------------------------
+
+    /// A router carrying the production hook stack — P1.7.2's consent grab
+    /// over P1.7.3's dead-man watcher over a spy — plus everything needed to
+    /// raise a prompt and inspect the switch. This is exactly what
+    /// `backend::winit` builds, with a spy in place of the `NoopHook`.
+    struct Guarded {
+        router:
+            InputRouter<crate::consent::grab::ConsentGate<crate::deadman::DeadManHook<SpyHook>>>,
+        grab: Rc<RefCell<crate::consent::grab::ConsentGrab>>,
+        deadman: Rc<RefCell<crate::deadman::DeadManSwitch>>,
+        surface: crate::consent::ConsentSurface,
+        now: Rc<Cell<std::time::Instant>>,
+        spy: Rc<HookSpy>,
+        recorder: crate::recorder::Recorder,
+        log_path: std::path::PathBuf,
+    }
+
+    impl Guarded {
+        fn new() -> Self {
+            let grab = Rc::new(RefCell::new(crate::consent::grab::ConsentGrab::new()));
+            let deadman = Rc::new(RefCell::new(crate::deadman::DeadManSwitch::new(
+                crate::deadman::DeadManConfig::default(),
+            )));
+            let now = Rc::new(Cell::new(std::time::Instant::now()));
+            let spy = Rc::new(HookSpy::default());
+            let router = InputRouter::new(crate::consent::grab::ConsentGate::new(
+                Rc::clone(&grab),
+                Rc::clone(&now),
+                crate::deadman::DeadManHook::new(
+                    Rc::clone(&deadman),
+                    Rc::clone(&now),
+                    SpyHook(Rc::clone(&spy)),
+                ),
+            ));
+            let (recorder, log_path) = crate::recorder::tests::scratch_recorder("input-deadman");
+            Self {
+                router,
+                grab,
+                deadman,
+                surface: crate::consent::ConsentSurface::new(),
+                now,
+                spy,
+                recorder,
+                log_path,
+            }
+        }
+    }
+
+    impl Drop for Guarded {
+        fn drop(&mut self) {
+            crate::recorder::tests::cleanup(&self.log_path);
+        }
+    }
+
+    #[test]
+    fn the_dead_man_chord_completes_while_a_consent_prompt_owns_all_input() {
+        // The whole reason the watcher rides `observe` rather than `gate`.
+        // A consent prompt consumes every physical event before the inner
+        // gate is even consulted -- and the moment a prompt is on screen is
+        // exactly the moment a human might most want to end everything. The
+        // off-switch must survive it, and it must survive it *through the
+        // real grab*, not a stand-in.
+        let mut rig = Guarded::new();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface = Some(view);
+        rig.grab.borrow_mut().set_view(view);
+
+        let t0 = rig.now.get();
+        rig.grab
+            .borrow_mut()
+            .raise(
+                petition,
+                t0,
+                &mut registry,
+                &mut rig.surface,
+                &mut rig.recorder,
+            )
+            .expect("the petition is pending");
+        rig.now.set(t0 + crate::consent::grab::GUARD_INTERVAL);
+
+        // The human presses the chord while the prompt owns input. Nothing
+        // is delivered -- the grab consumed it, and the inner gate was never
+        // even reached.
+        let gated_before = rig.spy.gated.get();
+        assert!(rig
+            .router
+            .route(phys(chord_press().kind().clone()), view, surface)
+            .is_none());
+        assert_eq!(
+            rig.spy.gated.get(),
+            gated_before,
+            "fixture check: the grab must short-circuit the inner gate here"
+        );
+
+        // ... and the switch armed anyway, because `observe` is forwarded
+        // unconditionally.
+        let armed_at = rig.now.get();
+        assert_eq!(
+            rig.deadman.borrow().deadline(),
+            Some(armed_at + crate::deadman::DEFAULT_HOLD),
+            "the chord did not arm under a consent grab"
+        );
+
+        // The hold elapses with no further input of any kind.
+        rig.deadman
+            .borrow_mut()
+            .fire_if_due(armed_at + crate::deadman::DEFAULT_HOLD);
+        let trigger = rig
+            .deadman
+            .borrow_mut()
+            .take_trigger()
+            .expect("a consent prompt must not be able to veto the off-switch");
+        assert_eq!(trigger.chord, "esc");
+    }
+
+    #[test]
+    fn an_agent_flooding_the_router_cannot_defeat_a_hold_in_progress() {
+        // The adversary with an actuation grant: it cannot arm the switch,
+        // and -- the sharper direction -- it cannot disarm one the human has
+        // armed by flooding the router with emulated input, including a
+        // forged chord release. Driven through `route`, so the flood takes
+        // the real path an admitted actuation takes.
+        let mut rig = Guarded::new();
+        let view = (900, 700);
+        let surface = Some(view);
+        let t0 = rig.now.get();
+
+        assert!(rig
+            .router
+            .route(phys(chord_press().kind().clone()), view, surface)
+            .is_none());
+        for step in 0..200 {
+            rig.now.set(t0 + std::time::Duration::from_millis(step * 5));
+            let _ = rig.router.route(emulated_chord_press(), view, surface);
+            let _ = rig.router.route(emulated_chord_release(), view, surface);
+            let _ = rig.router.route(emulated_motion(), view, surface);
+        }
+        rig.deadman
+            .borrow_mut()
+            .fire_if_due(t0 + crate::deadman::DEFAULT_HOLD);
+        assert!(
+            rig.deadman.borrow_mut().take_trigger().is_some(),
+            "an agent flooding the router defeated the human's off-switch"
+        );
+    }
+
+    #[test]
+    fn a_prompt_between_a_taps_press_and_release_never_splits_a_later_chord() {
+        // The replay-accounting bug this rig exists to catch, driven through
+        // the exact production hook stack (`ConsentGate<DeadManHook<..>>`)
+        // with a real grab and a real petition.
+        //
+        // The sequence is ordinary, and the agent chooses its timing (it
+        // decides when to petition, hence when the prompt goes up):
+        //
+        //   1. the human taps Esc with no prompt up -- the press is withheld;
+        //   2. a petition raises a prompt before the release arrives;
+        //   3. the tap is classified and its pair drained and re-routed. The
+        //      grab CONSUMES the replayed press but DELIVERS the replayed
+        //      release (its documented hold-until-release exception), so only
+        //      one half of the pair ever reaches the dead-man gate.
+        //
+        // With suppression modelled as a bare counter, step 3 left an odd
+        // credit, and the human's next real chord was split down the middle:
+        // press delivered to the app, release consumed -- Escape latched down
+        // in the confined app immediately after the panic button. That breaks
+        // both "the shim never sees the held chord" and `PreemptionHook`'s
+        // pairing exception at once.
+        let mut rig = Guarded::new();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface = Some(view);
+        rig.grab.borrow_mut().set_view(view);
+        let t0 = rig.now.get();
+
+        // 1. The tap's press, no prompt up: withheld.
+        assert!(rig
+            .router
+            .route(phys(chord_press().kind().clone()), view, surface)
+            .is_none());
+
+        // 2. A prompt goes up mid-tap.
+        rig.grab
+            .borrow_mut()
+            .raise(
+                petition,
+                t0,
+                &mut registry,
+                &mut rig.surface,
+                &mut rig.recorder,
+            )
+            .expect("the petition is pending");
+
+        // 3. The release lands, classifying the tap; drain and re-route the
+        //    pair exactly as the backend does.
+        rig.now.set(t0 + std::time::Duration::from_millis(80));
+        assert!(rig
+            .router
+            .route(phys(chord_release().kind().clone()), view, surface)
+            .is_none());
+        let replay = rig.deadman.borrow_mut().take_replay();
+        assert_eq!(replay.len(), 2, "fixture check: a tap replays a pair");
+        for input in replay {
+            let _ = rig.router.route(input, view, surface);
+        }
+
+        // The prompt is answered and lowered; input is ordinary again.
+        rig.grab.borrow_mut().lower(&mut registry, &mut rig.surface);
+
+        // Now the human holds the chord for real. The app must see NEITHER
+        // half -- not the press on a stale pass, and so never a release
+        // without it.
+        let t1 = t0 + std::time::Duration::from_secs(5);
+        rig.now.set(t1);
+        assert!(
+            rig.router
+                .route(phys(chord_press().kind().clone()), view, surface)
+                .is_none(),
+            "the held chord's press reached the app on a stale replay pass"
+        );
+        rig.deadman
+            .borrow_mut()
+            .fire_if_due(t1 + crate::deadman::DEFAULT_HOLD);
+        assert!(
+            rig.deadman.borrow_mut().take_trigger().is_some(),
+            "fixture check: the hold must have completed"
+        );
+        rig.now
+            .set(t1 + crate::deadman::DEFAULT_HOLD + std::time::Duration::from_millis(10));
+        assert!(
+            rig.router
+                .route(phys(chord_release().kind().clone()), view, surface)
+                .is_none(),
+            "the chord's release reached the app"
+        );
+        // And nothing is latched: the router holds no key it delivered a
+        // press for, which is the property a split pair violates.
+        assert!(
+            rig.router.pressed_keys.is_empty(),
+            "a chord left a key latched down in the confined app: {:?}",
+            rig.router.pressed_keys
+        );
+    }
+
+    #[test]
+    fn the_held_chord_never_reaches_the_shim_but_a_tap_does() {
+        // Design tension 1, end to end over the real wire: the app must keep
+        // its Escape key (Firefox closes dialogs with it) and must never see
+        // the chord that revoked the session's authority.
+        //
+        // Both halves are asserted against one mock shim in one sequence, so
+        // "the chord was suppressed" cannot pass by the seat being broken:
+        // a sentinel key proves the chord's silence positively -- see the
+        // comment at the sentinel below for why the earlier version of this
+        // test could not tell the chord and the tap apart at all.
+        let _fd = crate::capture::tests::fd_lock();
+        let (server, _scene, mut core, mut mock) = wire_setup();
+        let view = (VIEW_W, VIEW_H);
+        let surface = Some(view);
+        let host_view = (VIEW_W as i32, VIEW_H as i32);
+
+        let deadman = Rc::new(RefCell::new(crate::deadman::DeadManSwitch::new(
+            crate::deadman::DeadManConfig::default(),
+        )));
+        let now = Rc::new(Cell::new(std::time::Instant::now()));
+        let mut router = InputRouter::new(crate::deadman::DeadManHook::new(
+            Rc::clone(&deadman),
+            Rc::clone(&now),
+            NoopHook,
+        ));
+
+        // The embedder's loop, condensed: route each intake event, then
+        // drain whatever the watcher decided the app is owed.
+        let pump = |router: &mut InputRouter<crate::deadman::DeadManHook<NoopHook>>,
+                    core: &mut Connection,
+                    inputs: Vec<SeatInput>| {
+            let send = |router: &mut InputRouter<crate::deadman::DeadManHook<NoopHook>>,
+                        core: &mut Connection,
+                        input| {
+                if let Some(delivery) = router.route(input, view, surface) {
+                    server
+                        .deliver_seat_event(&delivery, &mut |frame| core.send_message(frame, None))
+                        .expect("send");
+                }
+            };
+            for input in inputs {
+                send(router, core, input);
+            }
+            let replay = deadman.borrow_mut().take_replay();
+            for input in replay {
+                send(router, core, input);
+            }
+        };
+
+        // --- A held chord: press, hold past the deadline, release. ---
+        let t0 = now.get();
+        pump(
+            &mut router,
+            &mut core,
+            intake_physical(&key_ev(1, host::KeyState::Pressed), host_view),
+        );
+        deadman
+            .borrow_mut()
+            .fire_if_due(t0 + crate::deadman::DEFAULT_HOLD);
+        assert!(
+            deadman.borrow_mut().take_trigger().is_some(),
+            "fixture check: the chord must have completed"
+        );
+        let released_at = t0 + crate::deadman::DEFAULT_HOLD + std::time::Duration::from_millis(300);
+        now.set(released_at);
+        pump(
+            &mut router,
+            &mut core,
+            intake_physical(&key_ev(1, host::KeyState::Released), host_view),
+        );
+
+        // --- A sentinel the chord cannot be mistaken for. ---
+        //
+        // Without this the test proved nothing. The chord's pair and the tap's
+        // pair are byte-identical on the wire (same keysym, same states, same
+        // origin), and the assertions below cannot tell which pair they are
+        // reading -- so gutting `gate_event` to deliver everything left this
+        // test green while the app received the whole revocation gesture. A
+        // key the chord path never touches makes the two discriminable: if the
+        // chord leaked, the first event the app sees is Escape, not Return.
+        now.set(released_at + std::time::Duration::from_millis(1));
+        pump(
+            &mut router,
+            &mut core,
+            intake_physical(&key_ev(28, host::KeyState::Pressed), host_view),
+        );
+
+        // --- Then an ordinary tap of the same key. ---
+        let tapped_at = released_at + std::time::Duration::from_secs(1);
+        now.set(tapped_at);
+        pump(
+            &mut router,
+            &mut core,
+            intake_physical(&key_ev(1, host::KeyState::Pressed), host_view),
+        );
+        now.set(tapped_at + std::time::Duration::from_millis(80));
+        pump(
+            &mut router,
+            &mut core,
+            intake_physical(&key_ev(1, host::KeyState::Released), host_view),
+        );
+
+        // The app's whole view of the session, in order. The FIRST event is
+        // the sentinel, which is only possible if the chord's press and its
+        // release both produced nothing -- so this asserts the chord's silence
+        // positively, without a non-blocking read, and fails if `gate_event`
+        // ever stops withholding.
+        assert_eq!(
+            mock.next_seat_event().unwrap(),
+            SeatEvent::Key {
+                keysym: 0xff0d,
+                state: KeyState::Pressed,
+                origin: Origin::Physical,
+            },
+            "the FIRST thing the app ever sees must be the sentinel: the chord left no trace"
+        );
+        assert_eq!(
+            mock.next_seat_event().unwrap(),
+            SeatEvent::Key {
+                keysym: 0xff1b,
+                state: KeyState::Pressed,
+                origin: Origin::Physical,
+            },
+            "then the tap's press, replayed after the gate classified it as a tap"
+        );
+        assert_eq!(
+            mock.next_seat_event().unwrap(),
+            SeatEvent::Key {
+                keysym: 0xff1b,
+                state: KeyState::Released,
+                origin: Origin::Physical,
+            },
+            "a tap must arrive as a complete pair: a press with no release latches Escape"
+        );
+    }
+
+    #[test]
+    fn a_chord_press_leaves_no_latched_key_in_the_router() {
+        // The harm this design exists to avoid, checked at the router's own
+        // pairing table: the chord's press is never delivered, so its
+        // release cannot strand anything -- and a later, ordinary tap still
+        // pairs normally rather than being eaten as a stale release.
+        let deadman = Rc::new(RefCell::new(crate::deadman::DeadManSwitch::new(
+            crate::deadman::DeadManConfig::default(),
+        )));
+        let now = Rc::new(Cell::new(std::time::Instant::now()));
+        let mut router = InputRouter::new(crate::deadman::DeadManHook::new(
+            Rc::clone(&deadman),
+            Rc::clone(&now),
+            NoopHook,
+        ));
+        let view = (64, 48);
+        let surface = Some(view);
+        let t0 = now.get();
+
+        assert!(router.route(chord_press(), view, surface).is_none());
+        deadman
+            .borrow_mut()
+            .fire_if_due(t0 + crate::deadman::DEFAULT_HOLD);
+        assert!(deadman.borrow_mut().take_trigger().is_some());
+        assert!(router.route(chord_release(), view, surface).is_none());
+        assert!(
+            router.pressed_keys.is_empty(),
+            "the chord latched a key in the router's pairing table: {:?}",
+            router.pressed_keys
+        );
+        assert!(
+            deadman.borrow_mut().take_replay().is_empty(),
+            "a completed chord owes the app nothing"
         );
     }
 

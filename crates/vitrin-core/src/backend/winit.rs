@@ -13,6 +13,20 @@
 //! goes: no capture path reads a GL texture (see [`super`] and
 //! [`crate::consent`] for the fork).
 //!
+//! # This backend is where the human physically *is*
+//!
+//! Two consequences, both P1.7.3's ([`crate::deadman`]). Nested mode is the
+//! only place a physical input device exists — `intake_physical` has exactly
+//! one caller and it is here — so this is the only backend that can watch a
+//! dead-man chord, and the only one that ever paints the hold indicator.
+//! Headless is not missing a feature; it has no human at a keyboard to serve,
+//! structurally rather than by omission.
+//!
+//! And because a held key produces **no** further events (Smithay 0.7.0's
+//! winit backend filters autorepeat), this backend owes the switch a clock:
+//! it arms a `calloop` timer at the hold's deadline and re-checks on every
+//! input turn and every frame. See [`NestedState::deadman_tick`].
+//!
 //! The winit backend is EGL/GLES-bound by construction, so this path always
 //! renders with [`GlesRenderer`]. The pixman software path (mandatory for
 //! GPU-less CI) arrives with the headless backend in P1.3.2, where no host
@@ -40,6 +54,7 @@ use tracing::{debug, error, info, trace};
 
 use crate::consent::grab::{ConsentGate, ConsentGrab};
 use crate::consent::ConsentSurface;
+use crate::deadman::{DeadManConfig, DeadManHook, DeadManSwitch, Trigger};
 use crate::input;
 use crate::scene::Scene;
 
@@ -81,15 +96,36 @@ struct TextureKey {
     /// rather than a merged one because the two changes have different
     /// consumers — see [`crate::consent`]'s redraw section.
     consent_generation: u64,
+    /// The dead-man hold indicator's fill, quantized to
+    /// [`HOLD_STEPS`] buckets, or `None` when no indicator is shown
+    /// (P1.7.3).
+    ///
+    /// Quantized rather than carried as a float for two reasons that point
+    /// the same way: an `f64` in a `PartialEq` cache key is a bug waiting
+    /// for a rounding change, and bucketing bounds the re-uploads a hold
+    /// costs to [`HOLD_STEPS`] over its whole duration instead of one per
+    /// frame. The visible result is identical at this bar's size.
+    hold_bucket: Option<u8>,
 }
+
+/// How many distinct fill levels the hold indicator has. Twenty steps across
+/// a ~1 s hold is finer than a human can perceive as stepping, and caps the
+/// texture re-uploads one hold can cost.
+const HOLD_STEPS: f64 = 20.0;
 
 impl TextureKey {
     /// The key describing what a texture composed *right now* would contain.
-    fn current(size: Size<i32, Physical>, scene: &Scene, consent: &ConsentSurface) -> Self {
+    fn current(
+        size: Size<i32, Physical>,
+        scene: &Scene,
+        consent: &ConsentSurface,
+        hold: Option<f64>,
+    ) -> Self {
         Self {
             size,
             scene_generation: scene.generation(),
             consent_generation: consent.generation(),
+            hold_bucket: hold.map(|p| (p.clamp(0.0, 1.0) * HOLD_STEPS) as u8),
         }
     }
 }
@@ -104,7 +140,8 @@ struct SceneTexture {
 
 /// The pixels this backend uploads as its window texture: the shared
 /// human-visible composition ([`super::compose_human_visible`]) — realm view
-/// plus the consent prompt, if one is up.
+/// plus the consent prompt, if one is up — and, above everything, the
+/// dead-man hold indicator (P1.7.3) while the human is mid-gesture.
 ///
 /// Split out of [`NestedState::try_redraw`] so it can be tested without a
 /// display. Presenting those pixels needs an EGL/GLES context and a host
@@ -114,12 +151,31 @@ struct SceneTexture {
 /// itself uncovered. Before this split nothing constrained nested-mode
 /// presentation at all: deleting the overlay from the upload left the whole
 /// suite green.
+///
+/// **The hold indicator is applied here rather than in
+/// [`super::human_visible_from_view`]**, which stays the one shared
+/// consent-overlay step both backends reach. That is not a drift in "both
+/// backends present the same output": the indicator reflects *physical input
+/// state*, and headless has no physical input device at all — structurally,
+/// since `SeatInput::physical` can only come from the intake this backend
+/// alone calls ([`crate::input`]). There is no hold for headless to draw. It
+/// inherits P1.7.1's fork either way: this is downstream of the point where
+/// capture takes the bare realm view, so the indicator can no more reach
+/// `vitrin_view.frame_ready` than the consent card can.
 fn window_pixels(
     scene: &Scene,
     consent: &mut ConsentSurface,
+    hold: Option<f64>,
     size: Size<i32, Physical>,
 ) -> Vec<u8> {
-    super::compose_human_visible(scene, consent, size.w.max(0) as u32, size.h.max(0) as u32)
+    let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
+    let mut pixels = super::compose_human_visible(scene, consent, w, h);
+    if let Some(progress) = hold {
+        // Last, so a consent card can never hide the fact that the human is
+        // mid-gesture on the off-switch.
+        crate::deadman::composite_hold_indicator(&mut pixels, w, h, progress);
+    }
+    pixels
 }
 
 /// Per-run state of the nested backend: the winit window + GLES renderer
@@ -137,11 +193,17 @@ struct NestedState {
     /// petition registry the M1.1 listener wiring constructs.
     consent: ConsentSurface,
     /// The input router (P1.3.7): host input tagged `physical` at intake
-    /// flows through it toward the realm's shim seat. Its preemption hook
-    /// is P1.7.2's consent grab, wrapping the MVP no-op hook that P1.7.3's
-    /// revocation watcher replaces — the stacking the hook point was
-    /// designed for, with no restructuring of the router.
-    router: input::InputRouter<ConsentGate<input::NoopHook>>,
+    /// flows through it toward the realm's shim seat. Its preemption hook is
+    /// P1.7.2's consent grab wrapping P1.7.3's dead-man watcher — the
+    /// stacking the hook point was designed for, with no restructuring of
+    /// the router, and the exact shape [`crate::input`]'s docs predicted
+    /// (`ConsentGate<NoopHook>` became `ConsentGate<DeadManHook>`).
+    ///
+    /// Order matters and is deliberate: the watcher is **innermost**, so its
+    /// detection half rides `observe`, which `ConsentGate` forwards
+    /// unconditionally even for events it swallows whole. The off-switch
+    /// therefore keeps working while a consent prompt owns the screen.
+    router: input::InputRouter<ConsentGate<DeadManHook<input::NoopHook>>>,
     /// The consent input grab (P1.7.2), shared with the router's gate:
     /// while a prompt is up it owns physical input, and a click on one of
     /// the card's buttons becomes a petition decision here.
@@ -161,6 +223,21 @@ struct NestedState {
     /// read the card) and its deadline backstop (a grab must not outlive
     /// its petition).
     now: Rc<Cell<Instant>>,
+    /// The dead-man switch (P1.7.3), shared with the router's innermost
+    /// hook: the chord's hold state, the completed-chord trigger, and the
+    /// hold indicator's progress.
+    ///
+    /// Live and really running — the chord is watched, the timer is armed,
+    /// and a completed hold fires. What a completed hold cannot yet *do* is
+    /// revoke anything: nothing constructs a grant table or a petition
+    /// registry until the M1.1 listener wiring (issue #77), so
+    /// [`NestedState::deadman_tick`] logs the trigger and drops it. See
+    /// [`crate::deadman`]'s "what is mechanism-only" section, including why
+    /// the flight recorder is not threaded in here to close the gap early.
+    deadman: Rc<RefCell<DeadManSwitch>>,
+    /// Whether a one-shot timer is outstanding for the armed hold, so an
+    /// arming keypress does not insert a fresh calloop source per event.
+    deadman_timer_armed: bool,
     view: Option<SceneTexture>,
     loop_signal: LoopSignal,
     loop_handle: LoopHandle<'static, NestedState>,
@@ -172,7 +249,11 @@ struct NestedState {
 
 /// Run the nested compositor loop until the host window is closed or a
 /// SIGINT/SIGTERM arrives.
-pub fn run() -> Result<(), Box<dyn Error>> {
+///
+/// `dead_man` is the session's off-switch policy, already validated by
+/// argument parsing (an unusable chord is a startup error, never a switch
+/// that quietly cannot fire).
+pub fn run(dead_man: DeadManConfig) -> Result<(), Box<dyn Error>> {
     let mut event_loop: EventLoop<'static, NestedState> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
@@ -219,11 +300,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         // principal's input, origin-tagged `physical` at this single point
         // of entry (B2) — see `crate::input`.
         WinitEvent::Input(event) => state.handle_input(&event),
-        WinitEvent::Focus(_) => {}
+        // Not ignorable: a key held when focus leaves produces no release
+        // event on either backend, so the dead-man switch must be told the
+        // hold is no longer verifiable (see `handle_focus`).
+        WinitEvent::Focus(focused) => state.handle_focus(focused),
     })?;
 
     let grab = Rc::new(RefCell::new(ConsentGrab::new()));
     let now = Rc::new(Cell::new(Instant::now()));
+    let deadman = Rc::new(RefCell::new(DeadManSwitch::new(dead_man)));
+    info!(
+        chord = dead_man.chord.name(),
+        hold_ms = dead_man.hold.as_millis(),
+        "dead-man switch armed: holding this key revokes every grant in the session"
+    );
     let mut state = NestedState {
         backend,
         scene: Scene::new(),
@@ -231,10 +321,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         router: input::InputRouter::new(ConsentGate::new(
             Rc::clone(&grab),
             Rc::clone(&now),
-            input::NoopHook,
+            DeadManHook::new(Rc::clone(&deadman), Rc::clone(&now), input::NoopHook),
         )),
         grab,
         now,
+        deadman,
+        deadman_timer_armed: false,
         view: None,
         loop_signal: event_loop.get_signal(),
         loop_handle: event_loop.handle(),
@@ -253,6 +345,169 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
     info!("event loop stopped, shutting down");
     Ok(())
+}
+
+/// What the dead-man wiring needs from whoever owns the switch.
+///
+/// Exists so the timer path, its rescheduling, its bookkeeping and the
+/// trigger disposal are **one implementation shared with production** rather
+/// than a pattern the test re-types. The previous shape had all of it inline
+/// in [`NestedState`], which no test could construct (it owns a GL context and
+/// a host window); a review mutated every path here — the timer, both
+/// backstops, the replay drain, and the sharing of the `Rc` between the router
+/// hook and the backend — and the full workspace suite stayed green for all
+/// five. This is the same treatment [`window_pixels`] was given for the same
+/// reason.
+pub(crate) trait DeadManHost {
+    /// The switch, shared with the router's innermost hook. Sharing is the
+    /// point: a host that hands out a *different* switch than its router
+    /// watches is wired wrong, and `the_backends_hook_and_timer_share_one_switch`
+    /// exists to catch exactly that.
+    fn switch(&self) -> &Rc<RefCell<DeadManSwitch>>;
+    /// Whether a one-shot timer is already outstanding, so an arming keypress
+    /// does not insert a fresh calloop source per event.
+    fn timer_armed(&mut self) -> &mut bool;
+    /// Dispose of one completed chord. The nested backend logs it (there is
+    /// no grant table in this process yet, issue #77); the M1.1 embedder will
+    /// call [`crate::deadman::apply`].
+    fn on_trigger(&mut self, trigger: Trigger);
+}
+
+/// Complete the chord if due, dispose of any trigger, and keep the timer
+/// armed. Idempotent and level-triggered; safe to call from anywhere.
+pub(crate) fn deadman_tick<D: DeadManHost + 'static>(
+    host: &mut D,
+    handle: &LoopHandle<'static, D>,
+    now: Instant,
+) {
+    let trigger = {
+        let mut switch = host.switch().borrow_mut();
+        switch.fire_if_due(now);
+        switch.take_trigger()
+    };
+    if let Some(trigger) = trigger {
+        host.on_trigger(trigger);
+    }
+    arm_deadman_timer(host, handle);
+}
+
+/// Arm a one-shot timer at the hold's deadline, if a hold is armed and no
+/// timer is outstanding.
+///
+/// The callback reschedules itself rather than dropping when the hold is
+/// still pending, which closes the gap an early or coarse wakeup would
+/// otherwise leave: calloop is free to fire a timer marginally early, and a
+/// `Drop` on a not-yet-due check would leave the switch with no timer at all
+/// until the human pressed something else.
+pub(crate) fn arm_deadman_timer<D: DeadManHost + 'static>(
+    host: &mut D,
+    handle: &LoopHandle<'static, D>,
+) {
+    if *host.timer_armed() {
+        return;
+    }
+    let Some(deadline) = host.switch().borrow().deadline() else {
+        return;
+    };
+    let armed = handle.insert_source(
+        Timer::from_deadline(deadline),
+        |_deadline, _, host: &mut D| {
+            let trigger = {
+                let mut switch = host.switch().borrow_mut();
+                switch.fire_if_due(Instant::now());
+                switch.take_trigger()
+            };
+            if let Some(trigger) = trigger {
+                host.on_trigger(trigger);
+            }
+            // Read out into a local first: the `Ref` must be dropped before
+            // `timer_armed` takes `&mut host`.
+            let next = host.switch().borrow().deadline();
+            match next {
+                // Still held and not yet due: this wakeup was early.
+                Some(next) => TimeoutAction::ToInstant(next),
+                None => {
+                    *host.timer_armed() = false;
+                    TimeoutAction::Drop
+                }
+            }
+        },
+    );
+    match armed {
+        Ok(_token) => *host.timer_armed() = true,
+        Err(err) => {
+            // Not fatal, and deliberately not silent: the frame-cadence
+            // backstop still completes the chord, so the switch degrades
+            // from "fires at the deadline" to "fires within a frame".
+            error!(
+                "could not arm the dead-man timer ({}); the off-switch now depends on the \
+                 frame-cadence backstop",
+                err.error
+            );
+        }
+    }
+}
+
+/// Route one turn's intake events, then re-route whatever the dead-man
+/// watcher decided the app is owed.
+///
+/// The drain must run **after** the loop, never before it and never inside
+/// it: the gate withholds a chord press until it knows whether the human is
+/// tapping or holding, and a tap owes the app the press *and* its release, in
+/// that order ([`crate::deadman`]). Re-routing rather than injecting is what
+/// keeps every downstream policy applying to the replay — a prompt raised
+/// between the press and the release consumes the replayed press exactly as
+/// it would a fresh one, with no carve-out anywhere.
+///
+/// Free-standing and generic over the hook so a test can drive it with a spy
+/// sink and assert the drain really happens: deleting it costs the confined
+/// app its Escape key permanently, which is the exact harm tap-through
+/// exists to prevent, and nothing else in the suite notices.
+pub(crate) fn route_turn<H: input::PreemptionHook>(
+    router: &mut input::InputRouter<H>,
+    switch: &RefCell<DeadManSwitch>,
+    inputs: impl IntoIterator<Item = input::SeatInput>,
+    view: (u32, u32),
+    surface: Option<(u32, u32)>,
+    deliver: &mut dyn FnMut(input::SeatDelivery),
+) {
+    for input in inputs {
+        if let Some(delivery) = router.route(input, view, surface) {
+            deliver(delivery);
+        }
+    }
+    // A separate statement from the loop so the switch's borrow ends before
+    // routing re-enters the hook that holds it.
+    let replay = switch.borrow_mut().take_replay();
+    for replayed in replay {
+        if let Some(delivery) = router.route(replayed, view, surface) {
+            deliver(delivery);
+        }
+    }
+}
+
+impl DeadManHost for NestedState {
+    fn switch(&self) -> &Rc<RefCell<DeadManSwitch>> {
+        &self.deadman
+    }
+
+    fn timer_armed(&mut self) -> &mut bool {
+        &mut self.deadman_timer_armed
+    }
+
+    fn on_trigger(&mut self, trigger: Trigger) {
+        // Honest gap, stated where it happens: `crate::deadman::apply` wants
+        // the session's grant table and petition registry, and nothing
+        // constructs either until issue #77. The switch really completed --
+        // it is `warn!`-logged by `fire_if_due` itself -- there is simply no
+        // authority in this process to revoke.
+        error!(
+            chord = trigger.chord,
+            held_ms = trigger.held.as_millis(),
+            "dead-man chord completed, but this build has no grant table to revoke: the \
+             M1.1 listener wiring (issue #77) is what constructs one. NOTHING WAS REVOKED."
+        );
+    }
 }
 
 impl NestedState {
@@ -281,24 +536,112 @@ impl NestedState {
         // One clock sample for the whole dispatch turn, taken before any
         // event of it is judged, so every event in this batch is judged
         // against the same instant (the clock discipline the rest of the
-        // core follows). The grab reads it through the gate.
+        // core follows). The grab and the dead-man watcher read it through
+        // their hooks.
         self.now.set(Instant::now());
-        for tagged in input::intake_physical(event, (size.w, size.h)) {
-            if let Some(delivery) = self.router.route(tagged, view, self.scene.surface_size()) {
+        // Route this turn's events, then drain the dead-man watcher's replay
+        // (see `route_turn`, which owns both halves so they can be tested).
+        route_turn(
+            &mut self.router,
+            &self.deadman,
+            input::intake_physical(event, (size.w, size.h)),
+            view,
+            self.scene.surface_size(),
+            &mut |delivery| {
                 // P1.5.2 hands this to ShimServer::deliver_seat_event on
                 // the realm's live connection.
                 trace!(
                     origin = ?delivery.origin(),
                     "routed input dropped: no shim connection yet (P1.5.2)"
                 );
-            }
+            },
+        );
+        // Backstop 2 of 3 for the elapse check (`crate::deadman`): the
+        // switch is already being asked about this turn's events, so ask it
+        // about the clock too.
+        self.deadman_tick();
+    }
+
+    /// The host window lost or gained keyboard focus.
+    ///
+    /// On loss the dead-man hold is forgotten. This is the one cause of a
+    /// lost key release that the core can actually see: the release will be
+    /// delivered to whatever window took focus, and neither backend reports
+    /// it (Smithay 0.7.0 filters `is_synthetic` key events, and winit's
+    /// Wayland `wl_keyboard.leave` emits no key events at all — both verified
+    /// in the pinned sources). Without this, an ordinary alt-tab with Esc
+    /// down either revokes the whole session a second later with no gesture
+    /// behind it, or — after such a fire — leaves the switch in a state only
+    /// a release can exit, silently dead with no indicator to say so.
+    ///
+    /// [`DeadManSwitch::forget_hold`] carries the argument for cancelling
+    /// rather than firing, and for why an agent cannot reach this path.
+    ///
+    /// The tick afterwards is not decoration: it lets the outstanding timer's
+    /// callback see `deadline() == None` on its next wakeup and drop itself,
+    /// and it repaints nothing, so a disarmed indicator disappears at the
+    /// host's ordinary frame cadence.
+    fn handle_focus(&mut self, focused: bool) {
+        if focused {
+            return;
         }
+        debug!("host window lost keyboard focus; forgetting any dead-man hold in progress");
+        self.deadman.borrow_mut().forget_hold();
+        self.deadman_tick();
+    }
+
+    /// Complete the dead-man chord if its hold has elapsed, apply whatever
+    /// that produced, and keep the timer armed while a hold is in progress.
+    ///
+    /// Called from three places on purpose ([`crate::deadman`], design
+    /// tension 2): the timer, every input dispatch turn, and every frame.
+    /// [`DeadManSwitch::fire_if_due`] is idempotent and level-triggered, so
+    /// calling it more often only shortens latency -- and a timer that never
+    /// fires costs at most one frame rather than the whole switch.
+    ///
+    /// The body is [`deadman_tick`], a free function over [`DeadManHost`],
+    /// so the whole time-driven path can be driven by a test with a real
+    /// `EventLoop` and no display. That split is not cosmetic: with the logic
+    /// inline here, deleting every time-driven path left the entire workspace
+    /// suite green, which for a dead-man switch is the one regression nothing
+    /// may be allowed to hide.
+    fn deadman_tick(&mut self) {
+        let handle = self.loop_handle.clone();
+        deadman_tick(self, &handle, Instant::now());
+        // Deliberately no `request_redraw` here. The redraw chain is already
+        // self-sustaining (`schedule_next_frame`), so the indicator animates
+        // and disappears at the host's frame cadence for free — and adding a
+        // request on a path the frame loop itself calls would chain a redraw
+        // per frame *outside* `FRAME_BUDGET`, turning a held key into a
+        // busy-spin.
     }
 
     /// Draw one frame. Rendering failure is fatal to the skeleton: log it,
     /// record it for [`run`] to propagate (non-zero exit), and stop the
     /// loop rather than spinning on a broken GL context.
     fn redraw(&mut self) {
+        // Backstop 3 of 3 for the elapse check (`crate::deadman`), and the
+        // one that survives a lost timer: at the host's frame cadence this
+        // bounds the switch's latency to ~16.7 ms with no timer at all.
+        // Guarded on an armed hold so an idle window pays nothing per frame.
+        //
+        // **Its exact reach, because overstating it would be worse than not
+        // having it.** Placed before `try_redraw` so the frame that discovers
+        // a zero-sized (minimized) window still counts — but `try_redraw`
+        // returns early on that path *without* reaching `schedule_next_frame`,
+        // which is the only thing that chains the next redraw. So a minimized
+        // window gets this one last tick and then no more, and while it stays
+        // minimized the switch is covered by the calloop timer alone. That is
+        // acceptable (the timer is the primary path; this is the backstop),
+        // and it is written down because a maintainer who weakened the timer
+        // on the strength of a three-way redundancy that does not hold there
+        // would leave the off-switch with nothing.
+        //
+        // In practice a minimized window is also an unfocused one, and
+        // `handle_focus` has already forgotten the hold by then.
+        if self.deadman.borrow().deadline().is_some() {
+            self.deadman_tick();
+        }
         if let Err(err) = self.try_redraw() {
             error!("render failed, shutting down: {err}");
             self.fatal = Some(err);
@@ -320,9 +663,16 @@ impl NestedState {
         // texture. Keying on both generations is what makes a prompt appear
         // and disappear at the host's very next frame instead of whenever the
         // scene happens to change next.
-        let key = TextureKey::current(size, &self.scene, &self.consent);
+        // The hold indicator is sampled once per frame, from the same clock
+        // reading nothing else in this frame contends for, and folded into
+        // the cache key — so the bar really animates instead of appearing
+        // whenever the scene next happens to change (the trap
+        // `the_texture_key_changes_on_every_visible_transition` was written
+        // for, now with a third input).
+        let hold = self.deadman.borrow().hold_progress(Instant::now());
+        let key = TextureKey::current(size, &self.scene, &self.consent, hold);
         if self.view.as_ref().map(|v| v.key) != Some(key) {
-            let pixels = window_pixels(&self.scene, &mut self.consent, size);
+            let pixels = window_pixels(&self.scene, &mut self.consent, hold, size);
             let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
             let texture = self.backend.renderer().import_memory(
                 &pixels,
@@ -419,7 +769,7 @@ mod tests {
         let mut consent = ConsentSurface::new();
 
         // No prompt: the window shows the realm view, byte for byte.
-        let plain = window_pixels(&scene, &mut consent, size);
+        let plain = window_pixels(&scene, &mut consent, None, size);
         assert_eq!(
             plain,
             scene.compose(W as u32, H as u32),
@@ -428,7 +778,7 @@ mod tests {
 
         // Prompt up: the window shows the shared human-visible composition.
         consent.show_for_test(prompt_fixture());
-        let with_prompt = window_pixels(&scene, &mut consent, size);
+        let with_prompt = window_pixels(&scene, &mut consent, None, size);
         assert_ne!(
             with_prompt, plain,
             "the prompt must change what is uploaded"
@@ -473,47 +823,431 @@ mod tests {
         let mut scene = Scene::new();
         let mut consent = ConsentSurface::new();
 
-        let base = TextureKey::current(size, &scene, &consent);
+        let base = TextureKey::current(size, &scene, &consent, None);
         assert_eq!(
             base,
-            TextureKey::current(size, &scene, &consent),
+            TextureKey::current(size, &scene, &consent, None),
             "an unchanged output must not force a re-upload"
         );
 
         // A prompt going up, and coming back down, both re-upload.
         consent.show_for_test(prompt_fixture());
-        let shown = TextureKey::current(size, &scene, &consent);
+        let shown = TextureKey::current(size, &scene, &consent, None);
         assert_ne!(base, shown, "a prompt appearing must re-upload");
         consent.dismiss_for_test();
-        let dismissed = TextureKey::current(size, &scene, &consent);
+        let dismissed = TextureKey::current(size, &scene, &consent, None);
         assert_ne!(shown, dismissed, "a prompt going away must re-upload");
 
         // The queue advancing to a different petition re-uploads too, so the
         // window cannot keep showing a decided petition's card.
         consent.show_for_test(prompt_fixture());
-        let first = TextureKey::current(size, &scene, &consent);
+        let first = TextureKey::current(size, &scene, &consent, None);
         let mut next = prompt_fixture();
         next.principal =
             crate::identity::PrincipalIdentity::parse("vitrin://local/agent/other").unwrap();
         consent.show_for_test(next);
         assert_ne!(
             first,
-            TextureKey::current(size, &scene, &consent),
+            TextureKey::current(size, &scene, &consent, None),
             "a different petition must re-upload"
         );
 
         // And the two pre-existing inputs still matter.
-        let held = TextureKey::current(size, &scene, &consent);
+        let held = TextureKey::current(size, &scene, &consent, None);
         scene.commit(SurfaceContent::from_rgba(client_pixels(64, 48), 64, 48).expect("content"));
         assert_ne!(
             held,
-            TextureKey::current(size, &scene, &consent),
+            TextureKey::current(size, &scene, &consent, None),
             "a scene commit must re-upload"
         );
         assert_ne!(
-            TextureKey::current(size, &scene, &consent),
-            TextureKey::current(size_of(640, 480), &scene, &consent),
+            TextureKey::current(size, &scene, &consent, None),
+            TextureKey::current(size_of(640, 480), &scene, &consent, None),
             "a resize must re-upload"
+        );
+    }
+
+    /// The dead-man hold indicator must actually reach the host window, and
+    /// must re-upload as it fills.
+    ///
+    /// Same trap as the consent generation, one step further out: an
+    /// indicator left out of the cache key would appear only when the scene
+    /// or a prompt next happened to change — which, during a hold on a static
+    /// realm, is never. The human would then hold the off-switch and see
+    /// nothing at all, which is exactly the "cannot tell it is working"
+    /// failure the indicator exists to prevent.
+    #[test]
+    fn the_hold_indicator_reaches_the_window_and_animates() {
+        const W: i32 = 320;
+        const H: i32 = 200;
+        let size = size_of(W, H);
+        let mut scene = Scene::new();
+        scene.commit(SurfaceContent::from_rgba(client_pixels(64, 48), 64, 48).expect("content"));
+        let mut consent = ConsentSurface::new();
+
+        // No hold: the window is the ordinary human-visible composition,
+        // byte for byte. The indicator costs an idle session nothing.
+        let idle = window_pixels(&scene, &mut consent, None, size);
+        assert_eq!(
+            idle,
+            super::super::compose_human_visible(&scene, &mut consent, W as u32, H as u32)
+        );
+
+        // Mid-hold: the top edge changes, and nothing below the bar does.
+        let holding = window_pixels(&scene, &mut consent, Some(0.5), size);
+        assert_ne!(holding, idle, "a hold in progress must be visible");
+        let below = (8 * W * 4) as usize;
+        assert_eq!(
+            &holding[below..],
+            &idle[below..],
+            "the indicator must not disturb the realm view underneath it"
+        );
+
+        // It is drawn above a consent card, so a prompt cannot hide the fact
+        // that the human is mid-gesture on the off-switch.
+        consent.show_for_test(prompt_fixture());
+        let prompt_only = window_pixels(&scene, &mut consent, None, size);
+        let prompt_and_hold = window_pixels(&scene, &mut consent, Some(0.9), size);
+        assert_ne!(prompt_and_hold, prompt_only);
+
+        // And every visible step of the fill re-uploads.
+        let mut keys: Vec<TextureKey> = Vec::new();
+        for step in 0..=10 {
+            keys.push(TextureKey::current(
+                size,
+                &scene,
+                &consent,
+                Some(f64::from(step) / 10.0),
+            ));
+        }
+        keys.dedup();
+        assert!(
+            keys.len() > 5,
+            "the fill must re-upload as it grows, got {} distinct keys",
+            keys.len()
+        );
+        assert_ne!(
+            TextureKey::current(size, &scene, &consent, Some(1.0)),
+            TextureKey::current(size, &scene, &consent, None),
+            "the indicator disappearing must re-upload too"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The dead-man wiring: the timer, its backstops, and the replay drain
+    // ------------------------------------------------------------------
+    //
+    // These exist because a review mutated every one of these paths --
+    // `arm_deadman_timer` early-returning, both backstops removed, the
+    // replay drain removed, and the router's hook given a *different*
+    // switch than the backend holds -- and the entire workspace suite
+    // stayed green for all five. For a dead-man switch that is the one
+    // class of regression nothing may hide: the failure is a human holding
+    // the panic button in a live session and nothing happening.
+    //
+    // `NestedState` owns a GL context and a host window, so it cannot be
+    // built on a display-free runner. The wiring is therefore reached
+    // through [`DeadManHost`], which `NestedState` implements and this
+    // fixture implements identically -- so these drive the *same* code
+    // production does, not a re-typed copy of it.
+
+    /// A minimal [`DeadManHost`]: what `NestedState` contributes to the
+    /// dead-man wiring, with nothing that needs a display.
+    struct TestHost {
+        switch: Rc<RefCell<DeadManSwitch>>,
+        timer_armed: bool,
+        triggers: Vec<Trigger>,
+    }
+
+    impl TestHost {
+        fn new(hold_ms: u64) -> Self {
+            let config = DeadManConfig::default()
+                .with_hold_ms(hold_ms)
+                .expect("within range");
+            Self {
+                switch: Rc::new(RefCell::new(DeadManSwitch::new(config))),
+                timer_armed: false,
+                triggers: Vec::new(),
+            }
+        }
+    }
+
+    impl DeadManHost for TestHost {
+        fn switch(&self) -> &Rc<RefCell<DeadManSwitch>> {
+            &self.switch
+        }
+        fn timer_armed(&mut self) -> &mut bool {
+            &mut self.timer_armed
+        }
+        fn on_trigger(&mut self, trigger: Trigger) {
+            self.triggers.push(trigger);
+        }
+    }
+
+    #[test]
+    fn the_backends_timer_completes_a_held_chord_with_no_further_input() {
+        // Design tension 2 through the machinery the nested backend really
+        // runs. Smithay's winit backend filters key repeats, so a held key
+        // produces exactly one press and then silence: if `arm_deadman_timer`
+        // inserted no source -- or `deadman_tick` never called it -- this
+        // loop would sit idle until the timeout and the chord would never
+        // complete. Nothing here advances the switch by hand.
+        // `EventLoop::try_new` opens epoll/eventfd descriptors, and
+        // `capture`'s `fd_count_returns_to_baseline` asserts an exact
+        // process-wide fd count. Take the same quiesce lock so the two never
+        // run concurrently -- otherwise this test intermittently fails that
+        // one, from a different module, for no reason a reader could find.
+        let _fd = crate::capture::tests::fd_lock();
+        let mut event_loop: EventLoop<'static, TestHost> = EventLoop::try_new().expect("loop");
+        let handle = event_loop.handle();
+        // A short hold so the test is quick; the mechanism is duration-blind.
+        let mut host = TestHost::new(250);
+
+        let pressed_at = Instant::now();
+        host.switch
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_press(), pressed_at);
+
+        // The input turn's tick: this is what arms the timer in production.
+        deadman_tick(&mut host, &handle, pressed_at);
+        assert!(
+            host.timer_armed,
+            "the input turn did not arm a timer for an armed hold"
+        );
+        assert!(
+            host.triggers.is_empty(),
+            "the chord completed before its hold elapsed"
+        );
+
+        // Now run the loop with NO input source at all. Only the timer can
+        // make anything happen.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while host.triggers.is_empty() && Instant::now() < deadline {
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut host)
+                .expect("dispatch");
+        }
+
+        assert_eq!(
+            host.triggers.len(),
+            1,
+            "the backend's timer never completed the chord: the off-switch is a no-op in \
+             nested mode"
+        );
+        assert!(host.triggers[0].held >= Duration::from_millis(250));
+        // The hold is over, so the source dropped itself and the bookkeeping
+        // says so -- otherwise the next hold would never arm a timer at all.
+        assert!(
+            !host.timer_armed,
+            "the timer did not clear its armed flag when the hold ended"
+        );
+        assert_eq!(host.switch.borrow().deadline(), None);
+    }
+
+    #[test]
+    fn an_early_timer_wakeup_reschedules_instead_of_dropping() {
+        // calloop is free to fire a timer marginally early. A callback that
+        // dropped on a not-yet-due check would leave the switch with no timer
+        // at all until the human pressed something else -- which, for a held
+        // key that produces no further events, means never.
+        // `EventLoop::try_new` opens epoll/eventfd descriptors, and
+        // `capture`'s `fd_count_returns_to_baseline` asserts an exact
+        // process-wide fd count. Take the same quiesce lock so the two never
+        // run concurrently -- otherwise this test intermittently fails that
+        // one, from a different module, for no reason a reader could find.
+        let _fd = crate::capture::tests::fd_lock();
+        let mut event_loop: EventLoop<'static, TestHost> = EventLoop::try_new().expect("loop");
+        let handle = event_loop.handle();
+        let mut host = TestHost::new(300);
+
+        // Arm the timer against a hold that started 250 ms in the FUTURE, so
+        // every wakeup for the next half-second is "early".
+        let future = Instant::now() + Duration::from_millis(250);
+        host.switch
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_press(), future);
+        arm_deadman_timer(&mut host, &handle);
+        assert!(host.timer_armed);
+
+        // Dispatch across the early window. The timer must survive it.
+        let stop = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < stop {
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut host)
+                .expect("dispatch");
+        }
+        assert!(
+            host.triggers.is_empty(),
+            "the chord fired before its hold elapsed"
+        );
+        assert!(
+            host.timer_armed,
+            "an early wakeup dropped the timer instead of rescheduling it"
+        );
+
+        // And it still fires when the hold genuinely elapses.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while host.triggers.is_empty() && Instant::now() < deadline {
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut host)
+                .expect("dispatch");
+        }
+        assert_eq!(host.triggers.len(), 1, "the rescheduled timer never fired");
+    }
+
+    #[test]
+    fn arming_twice_inserts_one_timer_source() {
+        // The `deadman_timer_armed` bookkeeping. `deadman_tick` runs on every
+        // input turn and every frame, so without it a held key would insert a
+        // fresh calloop source per event -- an agent flooding input would
+        // grow the loop without bound.
+        // `EventLoop::try_new` opens epoll/eventfd descriptors, and
+        // `capture`'s `fd_count_returns_to_baseline` asserts an exact
+        // process-wide fd count. Take the same quiesce lock so the two never
+        // run concurrently -- otherwise this test intermittently fails that
+        // one, from a different module, for no reason a reader could find.
+        let _fd = crate::capture::tests::fd_lock();
+        let event_loop: EventLoop<'static, TestHost> = EventLoop::try_new().expect("loop");
+        let handle = event_loop.handle();
+        let mut host = TestHost::new(1000);
+        host.switch
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_press(), Instant::now());
+
+        arm_deadman_timer(&mut host, &handle);
+        assert!(host.timer_armed);
+        for _ in 0..50 {
+            arm_deadman_timer(&mut host, &handle);
+        }
+        // One source: the second and later calls returned on the flag. If
+        // they had not, the loop would now hold 51 timers for one hold.
+        assert!(host.timer_armed);
+    }
+
+    #[test]
+    fn a_disarmed_hold_arms_no_timer() {
+        // What `handle_focus` relies on: after `forget_hold` there is no
+        // deadline, so nothing is armed and nothing can fire.
+        // `EventLoop::try_new` opens epoll/eventfd descriptors, and
+        // `capture`'s `fd_count_returns_to_baseline` asserts an exact
+        // process-wide fd count. Take the same quiesce lock so the two never
+        // run concurrently -- otherwise this test intermittently fails that
+        // one, from a different module, for no reason a reader could find.
+        let _fd = crate::capture::tests::fd_lock();
+        let event_loop: EventLoop<'static, TestHost> = EventLoop::try_new().expect("loop");
+        let handle = event_loop.handle();
+        let mut host = TestHost::new(250);
+        let t0 = Instant::now();
+        host.switch
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_press(), t0);
+        host.switch.borrow_mut().forget_hold();
+
+        deadman_tick(&mut host, &handle, t0 + Duration::from_secs(5));
+        assert!(!host.timer_armed, "a forgotten hold armed a timer anyway");
+        assert!(
+            host.triggers.is_empty(),
+            "a forgotten hold completed the chord"
+        );
+    }
+
+    #[test]
+    fn a_tap_is_replayed_to_the_app_by_the_routing_turn() {
+        // The drain, which is what gives the confined app its Escape key
+        // back. Removing it is invisible in every other test and costs
+        // Firefox the Escape key permanently -- every tap swallowed, none
+        // ever replayed.
+        let deadman = Rc::new(RefCell::new(DeadManSwitch::new(DeadManConfig::default())));
+        let now = Rc::new(Cell::new(Instant::now()));
+        let mut router = input::InputRouter::new(DeadManHook::new(
+            Rc::clone(&deadman),
+            Rc::clone(&now),
+            input::NoopHook,
+        ));
+        let view = (640u32, 480u32);
+        let surface = Some(view);
+        let mut delivered: Vec<input::SeatDeliveryKind> = Vec::new();
+
+        // The press alone reaches nobody: it is withheld pending the
+        // tap-or-chord question.
+        route_turn(
+            &mut router,
+            &deadman,
+            [crate::input::tests::chord_press()],
+            view,
+            surface,
+            &mut |d| delivered.push(d.kind().clone()),
+        );
+        assert!(delivered.is_empty(), "a withheld press reached the app");
+
+        // The release classifies it as a tap, and the SAME turn drains and
+        // re-routes the pair: press first, then release.
+        now.set(now.get() + Duration::from_millis(80));
+        deadman
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_release(), now.get());
+        route_turn(
+            &mut router,
+            &deadman,
+            [crate::input::tests::chord_release()],
+            view,
+            surface,
+            &mut |d| delivered.push(d.kind().clone()),
+        );
+
+        assert_eq!(
+            delivered.len(),
+            2,
+            "the tap was not replayed to the app: {delivered:?}"
+        );
+        use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+        assert!(
+            matches!(
+                delivered[0],
+                input::SeatDeliveryKind::Key {
+                    keysym: 0xff1b,
+                    state: KeyState::Pressed,
+                }
+            ),
+            "the replay must start with the withheld press: {delivered:?}"
+        );
+        assert!(
+            matches!(
+                delivered[1],
+                input::SeatDeliveryKind::Key {
+                    keysym: 0xff1b,
+                    state: KeyState::Released,
+                }
+            ),
+            "a press with no release latches Escape in the app: {delivered:?}"
+        );
+    }
+
+    #[test]
+    fn the_routers_hook_and_the_backends_handle_are_one_switch() {
+        // The wiring itself. `run` builds the router's `DeadManHook` and the
+        // backend's own handle from one `Rc::clone`; a refactor that handed
+        // the hook a *different* switch would leave the chord watched by a
+        // switch nothing ever ticks, and the timer armed on a switch nothing
+        // ever presses. Both halves look fine in isolation.
+        //
+        // Asserted by observing through the router and reading through the
+        // handle, which is only possible if they are the same cell.
+        let deadman = Rc::new(RefCell::new(DeadManSwitch::new(DeadManConfig::default())));
+        let now = Rc::new(Cell::new(Instant::now()));
+        let mut router = input::InputRouter::new(DeadManHook::new(
+            Rc::clone(&deadman),
+            Rc::clone(&now),
+            input::NoopHook,
+        ));
+        let view = (640u32, 480u32);
+
+        assert_eq!(deadman.borrow().deadline(), None);
+        let _ = router.route(crate::input::tests::chord_press(), view, Some(view));
+        assert_eq!(
+            deadman.borrow().deadline(),
+            Some(now.get() + crate::deadman::DEFAULT_HOLD),
+            "the router's hook and the backend's handle are not the same switch"
         );
     }
 }

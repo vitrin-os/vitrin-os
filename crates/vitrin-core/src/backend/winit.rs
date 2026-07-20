@@ -18,7 +18,7 @@
 //! GPU-less CI) arrives with the headless backend in P1.3.2, where no host
 //! GL surface exists.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -153,6 +153,14 @@ struct NestedState {
     /// because the alternative is a window in which a prompt could be shown
     /// with no grab behind it.
     grab: Rc<RefCell<ConsentGrab>>,
+    /// The dispatch turn's instant, shared with the router's
+    /// [`ConsentGate`]. The hook trait carries no clock by design, so the
+    /// embedder that drives `route` advances this cell first — the same
+    /// arrangement `input::PresenceHook` uses. The grab reads it for its
+    /// guard interval (a press must not decide before the human could have
+    /// read the card) and its deadline backstop (a grab must not outlive
+    /// its petition).
+    now: Rc<Cell<Instant>>,
     view: Option<SceneTexture>,
     loop_signal: LoopSignal,
     loop_handle: LoopHandle<'static, NestedState>,
@@ -215,12 +223,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     })?;
 
     let grab = Rc::new(RefCell::new(ConsentGrab::new()));
+    let now = Rc::new(Cell::new(Instant::now()));
     let mut state = NestedState {
         backend,
         scene: Scene::new(),
         consent: ConsentSurface::new(),
-        router: input::InputRouter::new(ConsentGate::new(Rc::clone(&grab), input::NoopHook)),
+        router: input::InputRouter::new(ConsentGate::new(
+            Rc::clone(&grab),
+            Rc::clone(&now),
+            input::NoopHook,
+        )),
         grab,
+        now,
         view: None,
         loop_signal: event_loop.get_signal(),
         loop_handle: event_loop.handle(),
@@ -264,6 +278,11 @@ impl NestedState {
         // maps with, and a drifted hit test can turn a click aimed at Deny
         // into an Allow (see `consent::grab`).
         self.grab.borrow_mut().set_view(view);
+        // One clock sample for the whole dispatch turn, taken before any
+        // event of it is judged, so every event in this batch is judged
+        // against the same instant (the clock discipline the rest of the
+        // core follows). The grab reads it through the gate.
+        self.now.set(Instant::now());
         for tagged in input::intake_physical(event, (size.w, size.h)) {
             if let Some(delivery) = self.router.route(tagged, view, self.scene.surface_size()) {
                 // P1.5.2 hands this to ShimServer::deliver_seat_event on
@@ -408,14 +427,14 @@ mod tests {
         );
 
         // Prompt up: the window shows the shared human-visible composition.
-        consent.show(prompt_fixture());
+        consent.show_for_test(prompt_fixture());
         let with_prompt = window_pixels(&scene, &mut consent, size);
         assert_ne!(
             with_prompt, plain,
             "the prompt must change what is uploaded"
         );
         let mut expected = ConsentSurface::new();
-        expected.show(prompt_fixture());
+        expected.show_for_test(prompt_fixture());
         assert_eq!(
             with_prompt,
             super::super::compose_human_visible(&scene, &mut expected, W as u32, H as u32),
@@ -462,21 +481,21 @@ mod tests {
         );
 
         // A prompt going up, and coming back down, both re-upload.
-        consent.show(prompt_fixture());
+        consent.show_for_test(prompt_fixture());
         let shown = TextureKey::current(size, &scene, &consent);
         assert_ne!(base, shown, "a prompt appearing must re-upload");
-        consent.dismiss();
+        consent.dismiss_for_test();
         let dismissed = TextureKey::current(size, &scene, &consent);
         assert_ne!(shown, dismissed, "a prompt going away must re-upload");
 
         // The queue advancing to a different petition re-uploads too, so the
         // window cannot keep showing a decided petition's card.
-        consent.show(prompt_fixture());
+        consent.show_for_test(prompt_fixture());
         let first = TextureKey::current(size, &scene, &consent);
         let mut next = prompt_fixture();
         next.principal =
             crate::identity::PrincipalIdentity::parse("vitrin://local/agent/other").unwrap();
-        consent.show(next);
+        consent.show_for_test(next);
         assert_ne!(
             first,
             TextureKey::current(size, &scene, &consent),

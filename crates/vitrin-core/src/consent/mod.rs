@@ -302,34 +302,59 @@ impl ConsentSurface {
 
     /// Put a prompt up.
     ///
-    /// The only non-test caller is [`grab::ConsentGrab::raise`], which is
-    /// where the P1.7.2 seam was taken: it calls this, then
+    /// **Visible only inside `crate::consent`**, so that
+    /// [`grab::ConsentGrab::raise`] is the only way the rest of the core can
+    /// show a prompt. That is the P1.7.2 seam made structural rather than
+    /// requested: `raise` calls this, then
     /// [`crate::petitions::PetitionRegistry::mark_prompt_shown`], then arms
-    /// the input grab, in one statement sequence — so "on screen", "input
-    /// grabbed", and "`consent_held` holds" are one moment rather than three
-    /// that can drift. Prefer `raise` over calling this directly; a prompt
-    /// shown without the grab is a prompt an agent can act around.
+    /// the input grab, then records it — so "on screen", "input grabbed",
+    /// "`consent_held` holds" and "the log says so" are one moment rather
+    /// than four that can drift. A prompt shown without the grab is a prompt
+    /// an agent can act around, and a `show` *while* a prompt is raised
+    /// would leave the grab hit-testing the previous card's geometry — the
+    /// human clicking one button and the core reading another. Neither is
+    /// reachable while this is private.
     ///
-    /// Replacing a prompt is legal and is how a queue advances; the caller
-    /// owns which petition is at the front.
-    pub fn show(&mut self, prompt: PromptContent) {
+    /// Replacing a prompt is legal at this level and is how a queue
+    /// advances; `raise`/`lower` own which petition is at the front.
+    pub(in crate::consent) fn show(&mut self, prompt: PromptContent) {
         self.prompt = Some(prompt);
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Take the prompt down (a decision, a timeout, or the petitioner
-    /// disconnecting — every path that removes the petition from the pending
-    /// table). Drops the cached raster: a prompt that is down must not keep
-    /// a rendered copy of a decided petition's contents alive.
+    /// Take the prompt down (a decision, a timeout, the petitioner
+    /// disconnecting, or a queue advancing). Drops the cached raster: a
+    /// prompt that is down must not keep a rendered copy of a decided
+    /// petition's contents alive.
     ///
-    /// The only non-test caller is [`grab::ConsentGrab::lower`], which pairs
-    /// this with releasing the input grab for the same reason `show` is
-    /// paired with taking it.
-    pub fn dismiss(&mut self) {
+    /// Private to `crate::consent` for the reason [`Self::show`] is: the
+    /// only caller is [`grab::ConsentGrab::lower`], which pairs this with
+    /// releasing the input grab and clearing the registry's `prompt_shown`
+    /// flag.
+    pub(in crate::consent) fn dismiss(&mut self) {
         if self.prompt.take().is_some() {
             self.card = None;
             self.generation = self.generation.wrapping_add(1);
         }
+    }
+
+    /// Test-only `show`, for the two backends' compositing tests.
+    ///
+    /// They render a fixture card to assert the *pixels* — scrim, placement,
+    /// texture-cache invalidation — and have no petition, no registry and no
+    /// grab to raise one with. Keeping the production door closed and
+    /// opening a named test one is the honest split: it costs a rename in
+    /// tests and buys "nothing outside `crate::consent` can put a prompt on
+    /// screen" as a compile-time fact.
+    #[cfg(test)]
+    pub(crate) fn show_for_test(&mut self, prompt: PromptContent) {
+        self.show(prompt);
+    }
+
+    /// Test-only `dismiss` — see [`Self::show_for_test`].
+    #[cfg(test)]
+    pub(crate) fn dismiss_for_test(&mut self) {
+        self.dismiss();
     }
 
     /// The prompt currently up, if any.

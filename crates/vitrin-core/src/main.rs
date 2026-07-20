@@ -624,13 +624,15 @@ where
     // session that must not start should abort at the earliest point where
     // that is knowable, leaving nothing behind and doing nothing first.
     //
-    // `_banner` is a *named* binding on purpose. A bare `_` would drop the
-    // guard immediately, stopping the repeating auto-approve warning before
-    // the session even begins -- silently turning the persistent warning
-    // back into the single startup line R6 says is not enough. Bound here,
-    // it lives until this function returns, which is exactly the span
-    // during which the policy is active.
-    let Ok(_banner) = announce_consent_policy(consent, principals_path.as_deref()) else {
+    // `banner` is held across the entire session and retired by the
+    // explicit `banner.stop()` after `backend()` returns. Both halves are
+    // load-bearing and neither is a style preference: dropping it early
+    // would stop R6's repeating auto-approve warning while auto-approve was
+    // still granting petitions, and the `stop()` downstream is what makes
+    // "tidy the unused binding to `_`" a compile error rather than a silent
+    // downgrade of a security warning. The early-return paths below drop it
+    // instead, which is correct: no session runs on those.
+    let Ok(banner) = announce_consent_policy(consent, principals_path.as_deref()) else {
         return ExitCode::FAILURE;
     };
 
@@ -675,6 +677,10 @@ where
     });
 
     let result = backend();
+
+    // The session is over: the consent policy is no longer in force, so its
+    // standing warning stops here rather than at an arbitrary scope end.
+    banner.stop();
 
     // `finish` forces one last recovery attempt before writing the footer,
     // so a run that degraded transiently still closes with a `run_ended`
@@ -773,6 +779,16 @@ fn announce_realms(realms: &RealmRegistry) {
 /// `Err` means the session must not start; the diagnostics have already
 /// been emitted.
 ///
+/// The guard is a plain struct rather than an `Option`, and it is retired by
+/// an explicit [`PolicyBanner::stop`] at the end of [`run_session`] rather
+/// than by falling out of scope. That is deliberate and is the only defence
+/// that survives a refactor: with a `let Ok(_banner) = ...` binding, an
+/// editor tidying an "unused" variable to `_` drops the guard immediately
+/// and silently converts R6's persistent warning back into the single
+/// startup line R6 says is not enough — no test can see the difference
+/// without waiting out a banner interval. With a `stop()` call downstream,
+/// the same edit does not compile.
+///
 /// # Why auto-approve needs a startup guard at all
 ///
 /// `--consent=auto-approve` grants every petition as requested with no
@@ -827,14 +843,14 @@ fn announce_realms(realms: &RealmRegistry) {
 fn announce_consent_policy(
     policy: ConsentPolicy,
     principals_path: Option<&Path>,
-) -> Result<Option<AutoApproveBanner>, ()> {
+) -> Result<PolicyBanner, ()> {
     match policy {
         ConsentPolicy::Interactive => {
             tracing::info!(
                 "consent policy: interactive (petitions pend for a human decision on the \
                  core-rendered consent prompt; unanswered petitions resolve timed_out)"
             );
-            Ok(None)
+            Ok(PolicyBanner(None))
         }
         ConsentPolicy::AutoApprove => {
             let path = match principals_path {
@@ -879,8 +895,29 @@ fn announce_consent_policy(
                 );
                 return Err(());
             }
-            Ok(Some(AutoApproveBanner::start(&path)))
+            Ok(PolicyBanner(Some(AutoApproveBanner::start(
+                &path,
+                AUTO_APPROVE_BANNER_INTERVAL,
+            ))))
         }
+    }
+}
+
+/// The consent policy's live warning state for one session: an
+/// [`AutoApproveBanner`] under auto-approve, nothing under interactive
+/// (which needs no standing warning — it is the fail-closed default).
+///
+/// A struct rather than a bare `Option` so [`run_session`] has something it
+/// must consume: see [`announce_consent_policy`]'s doc for why the guard's
+/// lifetime is pinned by a call rather than by a binding.
+struct PolicyBanner(Option<AutoApproveBanner>);
+
+impl PolicyBanner {
+    /// End the session's warning. Consuming `self`, so the compiler — not a
+    /// reviewer — is what notices if the guard stops being held for the
+    /// session's whole duration.
+    fn stop(self) {
+        drop(self.0);
     }
 }
 
@@ -912,9 +949,13 @@ struct AutoApproveBanner {
 }
 
 impl AutoApproveBanner {
-    /// Emit the warning now and every [`AUTO_APPROVE_BANNER_INTERVAL`]
-    /// until dropped.
-    fn start(registry: &Path) -> Self {
+    /// Emit the warning now and every `interval` until dropped.
+    ///
+    /// The interval is a parameter, not the constant read directly, purely
+    /// so tests can observe the *repeat* — the property R6 actually asks
+    /// for — without a 60-second sleep in CI. The one production caller
+    /// passes [`AUTO_APPROVE_BANNER_INTERVAL`].
+    fn start(registry: &Path, interval: Duration) -> Self {
         warn_auto_approve(registry);
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let worker = Arc::clone(&stop);
@@ -926,7 +967,7 @@ impl AutoApproveBanner {
                 let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
                 while !*stopped {
                     let (guard, _timeout) = cvar
-                        .wait_timeout(stopped, AUTO_APPROVE_BANNER_INTERVAL)
+                        .wait_timeout(stopped, interval)
                         .unwrap_or_else(|e| e.into_inner());
                     stopped = guard;
                     if !*stopped {
@@ -986,6 +1027,8 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -1255,7 +1298,7 @@ mod tests {
         let (dir, path) = scratch_registry(&[DEMO_PRINCIPAL]);
         let banner = announce_consent_policy(ConsentPolicy::AutoApprove, Some(&path))
             .expect("a demo-only registry is exactly what auto-approve is for");
-        assert!(banner.is_some(), "auto-approve must start its warning");
+        assert!(banner.0.is_some(), "auto-approve must start its warning");
         drop(banner);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1326,7 +1369,10 @@ mod tests {
         let absent = std::env::temp_dir().join("vitrin-r6-never-read/principals.toml");
         let banner = announce_consent_policy(ConsentPolicy::Interactive, Some(&absent))
             .expect("interactive starts regardless of the registry");
-        assert!(banner.is_none(), "no auto-approve banner under interactive");
+        assert!(
+            banner.0.is_none(),
+            "no auto-approve banner under interactive"
+        );
     }
 
     #[test]
@@ -1355,6 +1401,205 @@ mod tests {
         );
     }
 
+    /// A scratch directory holding a minimal `realm.toml` and a path for
+    /// this run's flight-recorder log, so a test can drive [`run_session`]
+    /// end to end without touching the operator's real configuration.
+    fn scratch_session(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vitrin-run-session-{label}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let realm = dir.join("realm.toml");
+        std::fs::write(&realm, "[[realm]]\ncommand = \"/usr/bin/true\"\n").unwrap();
+        (dir.clone(), realm, dir.join("run.jsonl"))
+    }
+
+    /// [`ExitCode`] implements neither `PartialEq` nor any accessor, so its
+    /// `Debug` rendering is the only thing a test can compare. Wrapped once
+    /// rather than repeated, so the awkwardness is named in one place.
+    fn is_failure(code: ExitCode) -> bool {
+        format!("{code:?}") == format!("{:?}", ExitCode::FAILURE)
+    }
+
+    #[test]
+    fn run_session_refuses_auto_approve_against_a_registry_it_may_not_grant_for() {
+        // `announce_consent_policy` is thoroughly tested on its own; what
+        // was not tested is that anything CALLS it. Deleting the guard from
+        // `run_session` -- the only path a session starts by -- left the
+        // whole suite green, which means R6 was pinned on a helper rather
+        // than on the behaviour. This asserts the startup path itself:
+        // the session refuses, and nothing of it runs.
+        let _fd = crate::capture::tests::fd_lock();
+        let (dir, realm, log) = scratch_session("refuse");
+        let (registry_dir, registry) = scratch_registry(&["vitrin://prod/agent/fleet-controller"]);
+        let ran = std::cell::Cell::new(false);
+
+        let code = run_session(
+            ConsentPolicy::AutoApprove,
+            Some(registry.clone()),
+            Some(log.clone()),
+            Some(realm.clone()),
+            || {
+                ran.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(
+            is_failure(code),
+            "a production registry under auto-approve must not start a session"
+        );
+        assert!(!ran.get(), "the backend must never run");
+        assert!(
+            !log.exists(),
+            "a refused session must leave no flight-recorder log behind"
+        );
+
+        // And the same session with the demo-only registry does start --
+        // so the assertion above is about the registry, not about
+        // `run_session` being broken in this fixture.
+        let (demo_dir, demo_registry) = scratch_registry(&[DEMO_PRINCIPAL]);
+        let ran = std::cell::Cell::new(false);
+        let code = run_session(
+            ConsentPolicy::AutoApprove,
+            Some(demo_registry),
+            Some(log.clone()),
+            Some(realm),
+            || {
+                ran.set(true);
+                Ok(())
+            },
+        );
+        assert!(!is_failure(code), "the demo registry starts cleanly");
+        assert!(ran.get(), "the demo registry is what auto-approve is for");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&registry_dir).ok();
+        std::fs::remove_dir_all(&demo_dir).ok();
+    }
+
+    #[test]
+    fn the_auto_approve_warning_repeats_for_the_whole_session() {
+        // R6 asks for a *persistent* warning, and "persistent" is the half
+        // that a startup line also satisfies. What distinguishes them is
+        // whether the warning is still being emitted while the policy is
+        // still granting -- so that is what is asserted, by counting
+        // emissions across a session that outlives one banner interval.
+        //
+        // The banner's interval is a parameter for exactly this: the
+        // production caller passes 60 s, which no test may sit through.
+        //
+        // The subscriber has to be the GLOBAL one, not a thread-local
+        // `set_default`: the repeats are emitted from the banner's own
+        // thread, and a thread-local subscriber would see only the startup
+        // line -- which is precisely the regression this test exists to
+        // catch, so getting that wrong would make it vacuous. Counts are
+        // keyed by the registry path each banner names, so this stays
+        // exact even though other tests emit the same warning in parallel.
+        let (dir, registry) = scratch_registry(&[DEMO_PRINCIPAL]);
+        let interval = Duration::from_millis(20);
+        install_warning_counter();
+
+        let banner = AutoApproveBanner::start(&registry, interval);
+        // A "session" several intervals long.
+        std::thread::sleep(interval * 8);
+        drop(banner);
+
+        let seen = warnings_for(&registry);
+        assert!(
+            seen >= 3,
+            "the warning must keep repeating while auto-approve is active, saw {seen}"
+        );
+
+        // ...and it stops when the policy does, rather than outliving it.
+        std::thread::sleep(interval * 4);
+        assert_eq!(
+            warnings_for(&registry),
+            seen,
+            "a dropped banner must emit nothing further"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Auto-approve warnings seen so far, keyed by the registry path the
+    /// warning named. A global map because the emitting thread is the
+    /// banner's own (see the test above).
+    static BANNER_WARNINGS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    fn warnings_for(registry: &Path) -> usize {
+        let map = BANNER_WARNINGS.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref()
+            .and_then(|m| m.get(&registry.display().to_string()).copied())
+            .unwrap_or(0)
+    }
+
+    /// Install the global counting subscriber, once per test process.
+    ///
+    /// This is the only global subscriber the test binary installs; if a
+    /// second test ever wants one, they must share this layer rather than
+    /// race to `set_global_default`.
+    fn install_warning_counter() {
+        use std::sync::Once;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            BANNER_WARNINGS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replace(HashMap::new());
+            let subscriber = tracing_subscriber::registry().with(BannerCounter);
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber in the test binary");
+        });
+    }
+
+    struct BannerCounter;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BannerCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = PrincipalsField(None);
+            event.record(&mut visitor);
+            let Some(path) = visitor.0 else {
+                return;
+            };
+            let mut map = BANNER_WARNINGS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(map) = map.as_mut() {
+                *map.entry(path).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// Pulls the `principals` field out of one warning event: the registry
+    /// path identifies which banner emitted it.
+    struct PrincipalsField(Option<String>);
+
+    impl tracing::field::Visit for PrincipalsField {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "principals" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "principals" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+    }
+
     #[test]
     fn the_auto_approve_banner_stops_promptly_when_dropped() {
         // The repeat is a background thread; dropping the guard must wake
@@ -1363,7 +1608,7 @@ mod tests {
         let (dir, path) = scratch_registry(&[DEMO_PRINCIPAL]);
         let start = std::time::Instant::now();
         {
-            let _banner = AutoApproveBanner::start(&path);
+            let _banner = AutoApproveBanner::start(&path, AUTO_APPROVE_BANNER_INTERVAL);
         }
         assert!(
             start.elapsed() < AUTO_APPROVE_BANNER_INTERVAL,

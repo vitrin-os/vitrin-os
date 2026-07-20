@@ -154,7 +154,23 @@
 //! composites the prompt (the same moment it emits
 //! `vitrin_consent.state(shown)` through the connection's emission path),
 //! and the prompt is *down* when the petition leaves the pending table
-//! (resolution or withdrawal -- the moments that emit/imply `closed`).
+//! (resolution or withdrawal -- the moments that emit/imply `closed`) **or
+//! when the prompt is taken off screen with the petition still pending**,
+//! which is [`PetitionRegistry::mark_prompt_hidden`].
+//!
+//! That second clearing path was missing when P1.7.2 first landed, and its
+//! absence was a live defect rather than a tidiness one: the only way to
+//! advance a prompt queue is `lower` then `raise`
+//! ([`crate::consent::grab::ConsentGrab`]), and with no way to clear the
+//! flag the *lowered* petition stayed marked `shown` while a different
+//! petition's card was on screen. `prompt_up_for` then kept answering
+//! `true` for the first principal, so the chokepoint refused its
+//! actuations `consent_held` -- citing a prompt no human could see -- for
+//! up to the full [`PetitionConfig::consent_timeout`]. Fail-closed, so
+//! never an authority leak, but a silent two-minute denial of authority the
+//! core had already granted. `shown` and `hidden` are therefore a matched
+//! pair, and `lower` calls the second exactly as `raise` calls the first.
+//!
 //! The chokepoint asks [`PetitionRegistry::prompt_up_for`], keyed by
 //! verified **identity** (the IDL says "the principal's own ... other
 //! principals' grants are unaffected", and a principal spanning several
@@ -165,6 +181,19 @@
 //! input grab, and **nothing in the chokepoint changed**. The flag is still
 //! only reachable at runtime once something raises a prompt, which needs
 //! the M1.1 registry wiring; tests drive it today.
+//!
+//! **Prompt selection is FIFO by admission** ([`PetitionRegistry::front_pending`]).
+//! Up to [`PetitionConfig::max_pending_global`] petitions can pend at once,
+//! and something has to decide which one the human is looking at. The
+//! pending table is a `BTreeMap` keyed by a monotonically increasing
+//! [`PetitionId`], so "lowest id" is "admitted earliest" is a total,
+//! deterministic order that needs no extra bookkeeping -- and the oldest
+//! petition is also the one closest to its consent deadline, so serving it
+//! first is what keeps a queue from timing out from the back. The embedder
+//! raises `front_pending`, and advances by `lower` then `raise` again.
+//! Deliberately **not** `pending_ids`: that one is build-gated to tests and
+//! the `scripted-consent` feature, so a deployment build could not have
+//! enumerated the table at all.
 //!
 //! **Realm knowledge is the realm registry's, not this module's** (P1.5.1,
 //! issue #30). Admission asks [`RealmRegistry::resolve_for_petition`]
@@ -780,6 +809,65 @@ impl PetitionRegistry {
         }
     }
 
+    /// Record that `petition`'s prompt is no longer on screen **while the
+    /// petition is still pending** -- the matched counterpart of
+    /// [`Self::mark_prompt_shown`], called by
+    /// [`crate::consent::grab::ConsentGrab::lower`].
+    ///
+    /// Needed because `shown` is not only ended by resolution. A prompt
+    /// queue advances by lowering one card and raising the next, and the
+    /// lowered petition goes back to being merely `queued` -- nothing on
+    /// screen, no input grab, so by the IDL's own definition no prompt is
+    /// "up" for it and `consent_held` must stop holding. Without this the
+    /// flag was write-once and the first petition of any queue kept
+    /// refusing its principal's actuations until it timed out (module
+    /// docs).
+    ///
+    /// Returns whether the petition was pending. `false` -- a petition that
+    /// already left the table -- is the ordinary resolution path and not an
+    /// error: the entry that carried the flag is gone, so there is nothing
+    /// left to clear.
+    pub fn mark_prompt_hidden(&mut self, petition: PetitionId) -> bool {
+        match self.pending.get_mut(&petition) {
+            Some(pending) => {
+                pending.prompt_shown = false;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// When `petition` resolves `timed_out` if no human answers it
+    /// (`admitted_at + consent_timeout`), or `None` once it is no longer
+    /// pending.
+    ///
+    /// Read by [`crate::consent::grab::ConsentGrab::raise`] so the grab
+    /// carries its own prompt's expiry: a grab that outlived its petition
+    /// would hold the human's physical input hostage with nothing behind
+    /// it, and the grab must be able to let go on its own rather than
+    /// trusting every embedder to notice. The deadline travels *into* the
+    /// grab rather than the grab asking the registry per event, because the
+    /// router's hook point holds no registry borrow.
+    pub fn pending_deadline(&self, petition: PetitionId) -> Option<Instant> {
+        Some(self.pending.get(&petition)?.deadline)
+    }
+
+    /// The petition whose prompt should be shown next: the lowest pending
+    /// id, i.e. the earliest admitted (module docs: prompt selection is
+    /// FIFO by admission, and `PetitionId`s are handed out monotonically
+    /// into a `BTreeMap`, so this is a total deterministic order).
+    ///
+    /// Ungated on purpose, unlike `pending_ids` (build-gated to tests and
+    /// the `scripted-consent` feature): without this a deployment build
+    /// could learn a `PetitionId` only from [`Admission::Pending`] at admit
+    /// time and would have to keep a shadow queue with its own ordering --
+    /// an invitation for the order the human sees to diverge from the order
+    /// the core admitted. It exposes nothing [`Self::pending_total`] and
+    /// [`Self::prompt_content`] do not.
+    pub fn front_pending(&self) -> Option<PetitionId> {
+        self.pending.keys().next().copied()
+    }
+
     /// What the consent prompt for `petition` may say (P1.7.1, E7).
     ///
     /// **The only non-test constructor of [`PromptContent`]**, which is what
@@ -972,7 +1060,8 @@ impl PetitionRegistry {
     }
 
     /// Build-gated: pending petition ids in admission order, so a harness
-    /// can name the petition it is about to decide.
+    /// can name the petition it is about to decide. Deployment builds have
+    /// [`Self::front_pending`] instead, which is all a prompt queue needs.
     #[cfg(any(test, feature = "scripted-consent"))]
     pub fn pending_ids(&self) -> Vec<PetitionId> {
         self.pending.keys().copied().collect()
@@ -1262,6 +1351,87 @@ mod tests {
         assert_eq!(reg.withdraw_connection(conn_b), 1);
         assert!(!reg.prompt_up_for(&identity(DEMO)));
         assert!(!reg.mark_prompt_shown(petition));
+    }
+
+    #[test]
+    fn hiding_a_prompt_ends_the_hold_without_resolving_the_petition() {
+        // The matched counterpart of `mark_prompt_shown` (module docs).
+        // Taking a card off screen while its petition is still pending
+        // returns that petition to `queued`, so `consent_held` must stop
+        // holding -- otherwise the queue-advance path (`lower` then
+        // `raise`) refuses the first principal's actuations for a prompt
+        // nobody can see, until the consent timeout.
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::Interactive);
+        let conn = reg.register_connection();
+        let Admission::Pending { petition } = reg.admit(request(DEMO, conn, 10), t0, &realms())
+        else {
+            panic!("interactive petition must pend");
+        };
+
+        assert!(reg.mark_prompt_shown(petition));
+        assert!(reg.prompt_up_for(&identity(DEMO)));
+        assert!(reg.mark_prompt_hidden(petition));
+        assert!(
+            !reg.prompt_up_for(&identity(DEMO)),
+            "a hidden prompt is not up"
+        );
+        // The petition itself is untouched: still pending, still
+        // answerable, still on its original deadline.
+        assert_eq!(reg.pending_total(), 1);
+        assert!(reg.prompt_content(petition).is_some());
+        assert_eq!(
+            reg.pending_deadline(petition),
+            Some(t0 + PetitionConfig::default().consent_timeout)
+        );
+
+        // Re-raising the same petition holds again -- the flag is a state,
+        // not a one-shot.
+        assert!(reg.mark_prompt_shown(petition));
+        assert!(reg.prompt_up_for(&identity(DEMO)));
+
+        // And a petition that already left the table reports `false`
+        // rather than pretending: the entry that carried the flag is gone.
+        reg.resolve_scripted(petition, ScriptedDecision::Deny)
+            .unwrap();
+        assert!(!reg.mark_prompt_hidden(petition));
+        assert_eq!(reg.pending_deadline(petition), None);
+    }
+
+    #[test]
+    fn the_front_of_the_queue_is_the_earliest_admitted_petition() {
+        // Prompt selection is FIFO by admission (module docs). Pinned
+        // because the alternative -- an embedder-side shadow queue -- is
+        // how the order the human sees drifts from the order the core
+        // admitted, and because `front_pending` must stay ungated: it is
+        // the ONLY way a deployment build can enumerate the table.
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::Interactive);
+        let conn = reg.register_connection();
+        assert_eq!(reg.front_pending(), None);
+
+        let mut admitted = Vec::new();
+        for i in 0..3 {
+            let Admission::Pending { petition } =
+                reg.admit(request(DEMO, conn, 10 + i), t0, &realms())
+            else {
+                panic!("interactive petition must pend");
+            };
+            admitted.push(petition);
+        }
+        assert_eq!(reg.front_pending(), Some(admitted[0]));
+
+        // Serving the front advances the queue in admission order, and the
+        // order does not depend on which petition was shown.
+        reg.resolve_scripted(admitted[0], ScriptedDecision::Deny)
+            .unwrap();
+        assert_eq!(reg.front_pending(), Some(admitted[1]));
+        reg.resolve_scripted(admitted[1], ScriptedDecision::Deny)
+            .unwrap();
+        assert_eq!(reg.front_pending(), Some(admitted[2]));
+        reg.resolve_scripted(admitted[2], ScriptedDecision::Deny)
+            .unwrap();
+        assert_eq!(reg.front_pending(), None);
     }
 
     #[test]

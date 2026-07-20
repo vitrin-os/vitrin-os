@@ -228,8 +228,7 @@ use crate::grants::{GrantId, GrantTable, InsertError};
 use crate::identity::{PresentedCredential, PrincipalIdentity, Verifier, VerifyOutcome};
 use crate::input::{PhysicalPresence, SeatInput, SeatInputKind};
 use crate::petitions::{
-    Admission, ConnectionId, PetitionId, PetitionRegistry, PetitionRequest, PromptRoute,
-    Resolution, Verdict,
+    Admission, ConnectionId, PetitionRegistry, PetitionRequest, PromptRoute, Resolution, Verdict,
 };
 use crate::realm::RealmRegistry;
 use crate::recorder::{
@@ -1461,9 +1460,24 @@ impl PrincipalServer {
     /// [`crate::consent::grab::ConsentGrab::raise`] returns the
     /// [`PromptRoute`] naming this connection -- that call is what put the
     /// pixels up, set the registry's `prompt_shown` flag (making the
-    /// chokepoint's `consent_held` refusal true), and seized the input
-    /// grab. This method is the fourth part of the same moment, and the
+    /// chokepoint's `consent_held` refusal true), seized the input grab,
+    /// and wrote the `consent_transition{shown}` entry to the flight
+    /// recorder. This method is the last part of the same moment, and the
     /// only one that has to travel the wire.
+    ///
+    /// # Why the recorder entry is not written here
+    ///
+    /// It used to be, and that inverted the discipline
+    /// [`Self::deliver_resolution`] argues for and this comment used to
+    /// restate: the log's subject is the moment core state changed, and a
+    /// failure to *tell the client* must not erase the fact that a human
+    /// was asked. All three guards below return before any recording could
+    /// happen, and one of them -- `ConnectionDead` -- is a documented,
+    /// expected race (the petitioner dies as its prompt goes up), not a
+    /// bug. On that path the card was on screen, the human's input was
+    /// grabbed and the chokepoint was refusing `consent_held`, while the
+    /// log contained nothing to say a prompt had ever been shown. Recording
+    /// in `raise`, where the state changes, makes that unrepresentable.
     ///
     /// # The ordering guarantee, and why it holds structurally
     ///
@@ -1479,15 +1493,9 @@ impl PrincipalServer {
     /// be *constructed*, not of the order someone remembered to write them
     /// in.
     ///
-    /// Recorded before sending, for the reason `deliver_resolution`
-    /// documents at length: the log's subject is the moment core state
-    /// changed, and a transport failure must not erase the fact that a
-    /// human was asked.
     pub fn emit_consent_shown<F>(
         &mut self,
         route: PromptRoute,
-        petition: PetitionId,
-        recorder: &mut Recorder,
         send: &mut F,
     ) -> Result<(), PromptEmitError>
     where
@@ -1513,12 +1521,6 @@ impl PrincipalServer {
                 wire_id: route.consent_wire_id,
             });
         }
-        recorder.record(Event::ConsentTransition {
-            connection: self.connection,
-            consent_wire_id: route.consent_wire_id,
-            state: ConsentState::Shown,
-            petition: Some(petition),
-        });
         let shown = consent::events::State {
             state: ConsentState::Shown,
         };
@@ -1845,6 +1847,7 @@ pub(crate) mod tests {
         BoundPrincipal, RejectionCause, StaticPrincipal, StaticVerifier, STATIC_TOKEN_SCHEME,
     };
     use crate::input::PHYSICAL_HOLD_WINDOW;
+    use crate::petitions::PetitionId;
     use crate::petitions::{ConsentPolicy, PetitionConfig, ScriptedDecision, ScriptedError};
     use vitrin_protocol::generated::vitrin_actuator_pointer::{Axis, ButtonState};
 
@@ -2816,12 +2819,16 @@ pub(crate) mod tests {
         petition: PetitionId,
     ) {
         let route = grab
-            .raise(petition, &mut shared.petitions, surface)
+            .raise(
+                petition,
+                std::time::Instant::now(),
+                &mut shared.petitions,
+                surface,
+                &mut shared.recorder,
+            )
             .expect("the petition is pending");
         server
-            .emit_consent_shown(route, petition, &mut shared.recorder, &mut |frame, fd| {
-                core.send_message(frame, fd)
-            })
+            .emit_consent_shown(route, &mut |frame, fd| core.send_message(frame, fd))
             .expect("announce the prompt");
     }
 
@@ -2884,7 +2891,7 @@ pub(crate) mod tests {
             .petitions
             .resolve_human(petition, choice)
             .expect("still pending");
-        grab.lower(&mut surface);
+        grab.lower(&mut shared.petitions, &mut surface);
         deliver(&mut server, &mut core, &mut shared, resolution);
 
         expect_consent_state(&mut client, 5, ConsentState::Closed);
@@ -2959,7 +2966,7 @@ pub(crate) mod tests {
             .petitions
             .resolve_human(petition, Choice::Deny)
             .expect("still pending");
-        grab.lower(&mut surface);
+        grab.lower(&mut shared.petitions, &mut surface);
         deliver(&mut server, &mut core, &mut shared, resolution);
 
         expect_consent_state(&mut client, 5, ConsentState::Closed);
@@ -3014,7 +3021,7 @@ pub(crate) mod tests {
             .petitions
             .resolve_human(petition, Choice::Deny)
             .expect("still pending");
-        grab.lower(&mut surface);
+        grab.lower(&mut shared.petitions, &mut surface);
         deliver(&mut server, &mut core, &mut shared, resolution);
 
         // The wire: three states in lifecycle order, then the terminal.
@@ -3080,7 +3087,7 @@ pub(crate) mod tests {
                 Choice::Allow(crate::grants::PersistenceRung::WhileRunning),
             )
             .expect("pending");
-        grab.lower(&mut surface);
+        grab.lower(&mut shared.petitions, &mut surface);
         deliver(&mut server, &mut core, &mut shared, resolution);
         let entry = last_resolution(&shared);
         assert_eq!(entry.str("outcome"), "granted");
@@ -3177,7 +3184,13 @@ pub(crate) mod tests {
         let mut surface = ConsentSurface::new();
         grab.set_view((VIEW_W, VIEW_H));
         let route = grab
-            .raise(petition, &mut shared.petitions, &mut surface)
+            .raise(
+                petition,
+                std::time::Instant::now(),
+                &mut shared.petitions,
+                &mut surface,
+                &mut shared.recorder,
+            )
             .expect("pending");
 
         // Wrong connection: refused, nothing sent.
@@ -3186,9 +3199,7 @@ pub(crate) mod tests {
             consent_wire_id: route.consent_wire_id,
         };
         assert!(matches!(
-            server.emit_consent_shown(stranger, petition, &mut shared.recorder, &mut |f, fd| {
-                core.send_message(f, fd)
-            }),
+            server.emit_consent_shown(stranger, &mut |f, fd| core.send_message(f, fd)),
             Err(PromptEmitError::WrongConnection { .. })
         ));
 
@@ -3198,18 +3209,14 @@ pub(crate) mod tests {
             consent_wire_id: 4, // the grant handle, not the consent object
         };
         assert!(matches!(
-            server.emit_consent_shown(bogus, petition, &mut shared.recorder, &mut |f, fd| {
-                core.send_message(f, fd)
-            }),
+            server.emit_consent_shown(bogus, &mut |f, fd| core.send_message(f, fd)),
             Err(PromptEmitError::UnknownConsentObject { wire_id: 4 })
         ));
 
         // The real route works, and after teardown nothing more is sent --
         // an expected race (the petitioner dies as its prompt goes up).
         assert!(server
-            .emit_consent_shown(route, petition, &mut shared.recorder, &mut |f, fd| {
-                core.send_message(f, fd)
-            })
+            .emit_consent_shown(route, &mut |f, fd| core.send_message(f, fd))
             .is_ok());
         expect_consent_state(&mut client, 5, ConsentState::Shown);
         server.teardown(
@@ -3218,9 +3225,7 @@ pub(crate) mod tests {
             &mut shared.recorder,
         );
         assert!(matches!(
-            server.emit_consent_shown(route, petition, &mut shared.recorder, &mut |f, fd| {
-                core.send_message(f, fd)
-            }),
+            server.emit_consent_shown(route, &mut |f, fd| core.send_message(f, fd)),
             Err(PromptEmitError::ConnectionDead)
         ));
     }

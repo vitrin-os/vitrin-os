@@ -284,6 +284,43 @@ pub(crate) enum PersistenceRung {
     WhileRunning,
 }
 
+impl PersistenceRung {
+    /// Every representable rung, shortest-lived first.
+    ///
+    /// The one enumeration of the ladder. The consent renderer generates its
+    /// allow-choices from this (`crate::consent::PromptContent::choices`), so
+    /// a rung that becomes representable gains a button without anyone
+    /// remembering to add one -- and a durable rung, which cannot be
+    /// represented at all, cannot appear on a prompt. Kept beside the type so
+    /// adding a variant without extending it is a visible omission rather
+    /// than an invisible one.
+    pub const ALL: [PersistenceRung; 2] = [PersistenceRung::Once, PersistenceRung::WhileRunning];
+
+    /// Lifetime order: how long this rung's authority can outlive the
+    /// decision that granted it.
+    fn rank(self) -> u8 {
+        match self {
+            PersistenceRung::Once => 0,
+            PersistenceRung::WhileRunning => 1,
+        }
+    }
+
+    /// Whether granting `self` **narrows** (or exactly matches) a petition
+    /// that asked for `requested` -- i.e. whether a consent decision may
+    /// legally choose this rung.
+    ///
+    /// The single definition of that rule, because it has two consumers that
+    /// must not disagree: the petition registry refuses a widening decision
+    /// with it ([`crate::petitions::PetitionRegistry::resolve_scripted`]),
+    /// and the consent prompt decides which allow-buttons to draw with it.
+    /// Two copies would eventually mean a prompt offering a choice the
+    /// registry rejects -- a button that does nothing, which on a consent
+    /// surface is worse than a missing one.
+    pub fn narrows(self, requested: PersistenceRung) -> bool {
+        self.rank() <= requested.rank()
+    }
+}
+
 /// A wire persistence rung the table cannot represent: the typed refusal
 /// behind "durable rungs absent, not hidden".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -18,13 +18,19 @@
 //!   grant table. No second authority-checking code path.
 //! - **Budgeted dependencies** (plan risk R7): the core links Smithay (its
 //!   winit and pixman-software-renderer backends), calloop, a tracing
-//!   subscriber, and — since P1.4.5 — one pure-Rust hash crate for the
-//!   flight recorder's observation digests. Nothing else, at runtime or in
-//!   tests. The headless capture golden asserts against the deterministic
-//!   test pattern in-process, so it needs no image codec; PNG serialization
-//!   is the SDK's job (P1.8.2), never the core. There is deliberately no
-//!   serialization framework: the recorder's JSON-lines emitter is
-//!   hand-rolled over a closed set of entry shapes.
+//!   subscriber, one pure-Rust hash crate for the flight recorder's
+//!   observation digests (P1.4.5), and one pure-Rust glyph rasterizer for the
+//!   consent prompt (P1.7.1 — fontdue, `default-features = false`, whose only
+//!   transitive dependency is ttf-parser). Nothing else, at runtime or in
+//!   tests, and each of those five carries its justification against R7 in
+//!   `Cargo.toml`. Note what is *not* there: no GUI toolkit and no vector
+//!   rasterizer — the consent surface composites its own shapes with integer
+//!   byte assembly (`consent::canvas`), exactly as `scene` does. The headless
+//!   capture golden asserts against the deterministic test pattern
+//!   in-process, so it needs no image codec; PNG serialization is the SDK's
+//!   job (P1.8.2), never the core. There is deliberately no serialization
+//!   framework: the recorder's JSON-lines emitter is hand-rolled over a
+//!   closed set of entry shapes.
 //!
 //! Scope so far: two presentation backends presenting the same composed
 //! realm view (`scene`, P1.3.3 — single maximized surface, layout policy
@@ -37,7 +43,11 @@
 //! GPU (P1.3.2) — the path CI runs on. The shim-facing protocol server that
 //! feeds the scene real client buffers exists (`shim`, P1.3.4, exercised
 //! end-to-end by the `vitrin-mock-shim` fixture) and goes live when the
-//! realm spawn manager provides the inherited socketpair (P1.5.2).
+//! realm spawn manager provides the inherited socketpair (P1.5.2). The
+//! consent prompt the core draws for a pending petition exists too
+//! (`consent`, P1.7.1) and composites above the realm view at the backend
+//! output stage — human-visible output only, never a capture — but nothing
+//! puts a prompt up yet: the input grab and decision wiring is P1.7.2.
 
 mod backend;
 /// Capture-frame mechanics (P1.3.6): the sealed-memfd pixel path behind
@@ -49,6 +59,21 @@ mod backend;
 /// wiring lands.
 #[cfg_attr(not(test), allow(dead_code))]
 mod capture;
+/// The consent surface's renderer (P1.7.1): the prompt the trusted core draws
+/// itself — requesting principal, realm, verbs, expiry, and the MVP consent
+/// ladder's only three choices — composited above the realm view at the
+/// **backend output stage**, so it reaches the human's display and, by
+/// construction, never a `vitrin_view.frame_ready` capture. Read its module
+/// docs before believing that last claim: it rests on where the code runs
+/// (`backend::compose_human_visible`, and the headless backend's two retained
+/// images), not on a check. Renderer only — the input grab and decision
+/// wiring is P1.7.2, hold-Esc revocation is P1.7.3 — so nothing at runtime
+/// shows a prompt yet: `ConsentSurface::show`'s caller arrives with the M1.1
+/// listener wiring that constructs the petition registry. Dead-code-allowed
+/// outside tests for the same reason as its siblings; both backends already
+/// own a live surface and composite through it every frame.
+#[cfg_attr(not(test), allow(dead_code))]
+mod consent;
 /// The enforcement chokepoint (P1.4.4): THE single function every capture
 /// and actuation passes through — `connection → principal → grant → verbs
 /// → constraints` — with the per-grant token bucket, the one

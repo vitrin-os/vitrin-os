@@ -909,24 +909,6 @@ pub(crate) fn intake_physical<B: InputBackend>(
 /// forbidden workaround). The subset below is chosen so the consent /
 /// revocation paths never depend on the gap: Escape — P1.7.3's hold-Esc
 /// chord — is layout-invariant and always translates.
-/// Whether nested intake can ever produce `keysym` — i.e. whether some evdev
-/// scancode maps to it through [`invariant_keysym`].
-///
-/// Exists for one caller and one hazard: [`crate::deadman::Chord::parse`]
-/// validates the configured dead-man chord against it, so a session can
-/// never come up with an off-switch whose key intake silently drops. Asking
-/// the real table rather than restating it is the whole point — a
-/// hand-maintained copy of the mapping would be free to drift, and the
-/// symptom of that drift is a dead-man switch that never fires, which is the
-/// worst possible thing to discover late.
-///
-/// The scan is over the byte-wide evdev keycode space the kernel defines
-/// (`input-event-codes.h` keeps `KEY_*` under 256, and the table above is
-/// entirely within it); it runs once per process, at argument parsing.
-pub(crate) fn keysym_is_intakeable(keysym: u32) -> bool {
-    (0u32..256).any(|code| invariant_keysym(code) == Some(keysym))
-}
-
 fn invariant_keysym(evdev_code: u32) -> Option<u32> {
     Some(match evdev_code {
         1 => 0xff1b,                           // KEY_ESC        -> XK_Escape
@@ -959,6 +941,25 @@ fn invariant_keysym(evdev_code: u32) -> Option<u32> {
         126 => 0xffec,                         // KEY_RIGHTMETA  -> XK_Super_R
         _ => return None,
     })
+}
+
+/// Whether nested intake can ever produce `keysym` — i.e. whether some evdev
+/// scancode maps to it through [`invariant_keysym`].
+///
+/// Exists for one caller and one hazard: [`crate::deadman::Chord::parse`]
+/// validates the configured dead-man chord against it, so a session can
+/// never come up with an off-switch whose key intake silently drops. Asking
+/// the real table rather than restating it is the whole point — a
+/// hand-maintained copy of the mapping would be free to drift, and the
+/// symptom of that drift is a dead-man switch that never fires, which is the
+/// worst possible thing to discover late.
+///
+/// The scan is over the byte-wide evdev keycode space the kernel defines
+/// (`input-event-codes.h` keeps `KEY_*` under 256, and [`invariant_keysym`]'s
+/// table is entirely within it); it runs once per process, at argument
+/// parsing.
+pub(crate) fn keysym_is_intakeable(keysym: u32) -> bool {
+    (0u32..256).any(|code| invariant_keysym(code) == Some(keysym))
 }
 
 #[cfg(test)]
@@ -2800,6 +2801,104 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_prompt_between_a_taps_press_and_release_never_splits_a_later_chord() {
+        // The replay-accounting bug this rig exists to catch, driven through
+        // the exact production hook stack (`ConsentGate<DeadManHook<..>>`)
+        // with a real grab and a real petition.
+        //
+        // The sequence is ordinary, and the agent chooses its timing (it
+        // decides when to petition, hence when the prompt goes up):
+        //
+        //   1. the human taps Esc with no prompt up -- the press is withheld;
+        //   2. a petition raises a prompt before the release arrives;
+        //   3. the tap is classified and its pair drained and re-routed. The
+        //      grab CONSUMES the replayed press but DELIVERS the replayed
+        //      release (its documented hold-until-release exception), so only
+        //      one half of the pair ever reaches the dead-man gate.
+        //
+        // With suppression modelled as a bare counter, step 3 left an odd
+        // credit, and the human's next real chord was split down the middle:
+        // press delivered to the app, release consumed -- Escape latched down
+        // in the confined app immediately after the panic button. That breaks
+        // both "the shim never sees the held chord" and `PreemptionHook`'s
+        // pairing exception at once.
+        let mut rig = Guarded::new();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface = Some(view);
+        rig.grab.borrow_mut().set_view(view);
+        let t0 = rig.now.get();
+
+        // 1. The tap's press, no prompt up: withheld.
+        assert!(rig
+            .router
+            .route(phys(chord_press().kind().clone()), view, surface)
+            .is_none());
+
+        // 2. A prompt goes up mid-tap.
+        rig.grab
+            .borrow_mut()
+            .raise(
+                petition,
+                t0,
+                &mut registry,
+                &mut rig.surface,
+                &mut rig.recorder,
+            )
+            .expect("the petition is pending");
+
+        // 3. The release lands, classifying the tap; drain and re-route the
+        //    pair exactly as the backend does.
+        rig.now.set(t0 + std::time::Duration::from_millis(80));
+        assert!(rig
+            .router
+            .route(phys(chord_release().kind().clone()), view, surface)
+            .is_none());
+        let replay = rig.deadman.borrow_mut().take_replay();
+        assert_eq!(replay.len(), 2, "fixture check: a tap replays a pair");
+        for input in replay {
+            let _ = rig.router.route(input, view, surface);
+        }
+
+        // The prompt is answered and lowered; input is ordinary again.
+        rig.grab.borrow_mut().lower(&mut registry, &mut rig.surface);
+
+        // Now the human holds the chord for real. The app must see NEITHER
+        // half -- not the press on a stale pass, and so never a release
+        // without it.
+        let t1 = t0 + std::time::Duration::from_secs(5);
+        rig.now.set(t1);
+        assert!(
+            rig.router
+                .route(phys(chord_press().kind().clone()), view, surface)
+                .is_none(),
+            "the held chord's press reached the app on a stale replay pass"
+        );
+        rig.deadman
+            .borrow_mut()
+            .fire_if_due(t1 + crate::deadman::DEFAULT_HOLD);
+        assert!(
+            rig.deadman.borrow_mut().take_trigger().is_some(),
+            "fixture check: the hold must have completed"
+        );
+        rig.now
+            .set(t1 + crate::deadman::DEFAULT_HOLD + std::time::Duration::from_millis(10));
+        assert!(
+            rig.router
+                .route(phys(chord_release().kind().clone()), view, surface)
+                .is_none(),
+            "the chord's release reached the app"
+        );
+        // And nothing is latched: the router holds no key it delivered a
+        // press for, which is the property a split pair violates.
+        assert!(
+            rig.router.pressed_keys.is_empty(),
+            "a chord left a key latched down in the confined app: {:?}",
+            rig.router.pressed_keys
+        );
+    }
+
+    #[test]
     fn the_held_chord_never_reaches_the_shim_but_a_tap_does() {
         // Design tension 1, end to end over the real wire: the app must keep
         // its Escape key (Firefox closes dialogs with it) and must never see
@@ -2807,9 +2906,9 @@ pub(crate) mod tests {
         //
         // Both halves are asserted against one mock shim in one sequence, so
         // "the chord was suppressed" cannot pass by the seat being broken:
-        // the FIRST seat event the app ever receives is the tap's press --
-        // the same technique `an_actuation_sent_mid_prompt_never_reaches_the_app`
-        // uses, and stronger than probing for silence.
+        // a sentinel key proves the chord's silence positively -- see the
+        // comment at the sentinel below for why the earlier version of this
+        // test could not tell the chord and the tap apart at all.
         let _fd = crate::capture::tests::fd_lock();
         let (server, _scene, mut core, mut mock) = wire_setup();
         let view = (VIEW_W, VIEW_H);
@@ -2871,6 +2970,22 @@ pub(crate) mod tests {
             intake_physical(&key_ev(1, host::KeyState::Released), host_view),
         );
 
+        // --- A sentinel the chord cannot be mistaken for. ---
+        //
+        // Without this the test proved nothing. The chord's pair and the tap's
+        // pair are byte-identical on the wire (same keysym, same states, same
+        // origin), and the assertions below cannot tell which pair they are
+        // reading -- so gutting `gate_event` to deliver everything left this
+        // test green while the app received the whole revocation gesture. A
+        // key the chord path never touches makes the two discriminable: if the
+        // chord leaked, the first event the app sees is Escape, not Return.
+        now.set(released_at + std::time::Duration::from_millis(1));
+        pump(
+            &mut router,
+            &mut core,
+            intake_physical(&key_ev(28, host::KeyState::Pressed), host_view),
+        );
+
         // --- Then an ordinary tap of the same key. ---
         let tapped_at = released_at + std::time::Duration::from_secs(1);
         now.set(tapped_at);
@@ -2886,8 +3001,20 @@ pub(crate) mod tests {
             intake_physical(&key_ev(1, host::KeyState::Released), host_view),
         );
 
-        // The app's whole view of the session: the tap, in order, and
-        // nothing before it. The chord left no trace on the wire at all.
+        // The app's whole view of the session, in order. The FIRST event is
+        // the sentinel, which is only possible if the chord's press and its
+        // release both produced nothing -- so this asserts the chord's silence
+        // positively, without a non-blocking read, and fails if `gate_event`
+        // ever stops withholding.
+        assert_eq!(
+            mock.next_seat_event().unwrap(),
+            SeatEvent::Key {
+                keysym: 0xff0d,
+                state: KeyState::Pressed,
+                origin: Origin::Physical,
+            },
+            "the FIRST thing the app ever sees must be the sentinel: the chord left no trace"
+        );
         assert_eq!(
             mock.next_seat_event().unwrap(),
             SeatEvent::Key {
@@ -2895,7 +3022,7 @@ pub(crate) mod tests {
                 state: KeyState::Pressed,
                 origin: Origin::Physical,
             },
-            "the FIRST thing the app ever sees must be the tap's press, not the chord's"
+            "then the tap's press, replayed after the gate classified it as a tap"
         );
         assert_eq!(
             mock.next_seat_event().unwrap(),

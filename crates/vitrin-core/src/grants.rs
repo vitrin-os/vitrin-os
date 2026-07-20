@@ -680,6 +680,11 @@ pub(crate) struct GrantTable {
     /// Next id to assign; ids start at 1 and are never reused, so an id
     /// outlives its row unambiguously in logs.
     next_id: u64,
+    /// Set once a human has completed the dead-man chord
+    /// ([`Self::seal_dead_man`]). Rows minted afterwards are born
+    /// [`Liveness::Revoked`] — see that method for why the table, and not the
+    /// caller, is where this belongs.
+    dead_man_sealed: bool,
 }
 
 /// Same as [`GrantTable::new`]. Hand-written because a derived `Default`
@@ -697,7 +702,56 @@ impl GrantTable {
         Self {
             entries: BTreeMap::new(),
             next_id: 1,
+            dead_man_sealed: false,
         }
+    }
+
+    /// Seal the table: a human completed the dead-man chord, and no row
+    /// minted from here on is live.
+    ///
+    /// **Why the switch needs more than a sweep.** [`crate::deadman::apply`]
+    /// revokes every row *present* at the moment the chord completes. Two
+    /// kinds of authority slip past a point-in-time sweep:
+    ///
+    /// - **Decided but not yet delivered.** A granted consent decision becomes
+    ///   a row only at `PrincipalServer::deliver_resolution` (module docs of
+    ///   [`crate::petitions`] give the full reason — authority exists iff its
+    ///   wire handle resolved). A `Verdict::Granted` decided *before* the
+    ///   chord and delivered *after* it is neither a pending petition nor an
+    ///   existing row, so the sweep sees neither, and delivery then mints
+    ///   live authority that outlived the human's off-switch.
+    /// - **Granted with no human in the loop.** Under
+    ///   `ConsentPolicy::AutoApprove` the agent's very next petition is
+    ///   approved by policy, restoring the identical authority within one
+    ///   round-trip of the panic button.
+    ///
+    /// **Why here, rather than a check at each caller.** This is the same
+    /// razor the rest of the crate applies: authority questions get exactly
+    /// one home. A fence the delivery path had to remember to consult is a
+    /// fence a future delivery path forgets. The table is what mints rows, so
+    /// the table is what refuses to mint live ones.
+    ///
+    /// **Why born-revoked rather than a refused insert.** `insert` failing is
+    /// `DeliveryError::Insert`, which the delivery path treats as
+    /// unreachable-and-fatal and answers with a fatal `internal` goodbye —
+    /// the wrong thing to say to a client whose petition was decided legally
+    /// and whose only sin is being late. Minting the row `Revoked` keeps every
+    /// existing invariant intact (the handle resolves, the exactly-once guard
+    /// holds, the teardown scan still finds the row to remove) while making
+    /// the authority dead on arrival: the chokepoint's very next
+    /// `check_use_grant` refuses [`RefusalReason::Revoked`], which is the same
+    /// answer, through the same path, that the sweep produces for every other
+    /// row. The wire cannot tell the two apart, and should not.
+    ///
+    /// **This does not disarm the human.** `resolve_human(Allow)` still works
+    /// — its row is minted revoked like any other, so re-authorising after a
+    /// panic button is a restart, not a click. That is the intended reading of
+    /// the gesture: it ends the session's delegated authority, and it is not
+    /// undoable from inside the session it just ended.
+    ///
+    /// Idempotent; a second chord seals nothing new.
+    pub fn seal_dead_man(&mut self) {
+        self.dead_man_sealed = true;
     }
 
     /// Create a row from effective, consent-resolved values, at
@@ -739,12 +793,27 @@ impl GrantTable {
             issued_at,
             issuer: spec.issuer,
         };
+        // Born revoked once the human has hit the off-switch
+        // ([`Self::seal_dead_man`]): a decision made before the chord must not
+        // become live authority after it, and no policy may re-grant without a
+        // human. Loud, because a client that believes it holds a grant and is
+        // refused `revoked` on first use deserves an explanation in the log.
+        let liveness = if self.dead_man_sealed {
+            tracing::warn!(
+                %grant_id,
+                principal = %row.principal_id,
+                "grant minted into a dead-man-sealed table: born revoked, never usable"
+            );
+            Liveness::Revoked
+        } else {
+            Liveness::Active
+        };
         self.entries.insert(
             grant_id,
             Entry {
                 row,
                 deadline,
-                liveness: Liveness::Active,
+                liveness,
             },
         );
         Ok(grant_id)

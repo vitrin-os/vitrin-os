@@ -99,15 +99,47 @@
 //!
 //! ## What a dropped replay costs (the failure mode, named)
 //!
-//! `take_replay` hands out `replay_credit`, which `gate` spends to let the
-//! replayed events past its own withholding. An embedder that drains the
-//! queue and then fails to route it leaves that credit stale, and the next
-//! genuine chord press is delivered to the app instead of being withheld.
-//! **The switch still arms and still fires**, because arming lives in
-//! `observe`, which never reads the credit. So the cost of the worst
-//! suppression bug available here is "Firefox also saw an Esc" — and the
-//! credit self-heals after two chord events. This is asserted, not assumed:
-//! see `a_dropped_replay_never_stops_the_switch_from_firing`.
+//! `take_replay` hands the pair to the embedder and records **those exact
+//! events** in `replay_pending`, which `gate` matches against by value so the
+//! replayed events pass its own withholding. An embedder that drains the
+//! queue and then fails to route it — or a downstream policy that swallows
+//! part of the drain, which `ConsentGate` really does — leaves entries
+//! outstanding. The next chord event that does not match the front of that
+//! queue clears it whole, so the *worst* case is one swallowed Esc tap.
+//! **The switch still arms and still fires** either way, because arming lives
+//! in `observe`, which never reads suppression state at all.
+//!
+//! Matching by value rather than by a count is load-bearing and was a real
+//! bug: a bare credit granted in pairs but spent one per event desynchronises
+//! the moment one half of a replayed pair is filtered outside this hook, and
+//! the next genuine chord is then split — press delivered, release consumed,
+//! Escape latched down in the confined app. See `replay_pending`'s own
+//! comment for the full path, and
+//! `a_prompt_between_a_taps_press_and_release_never_splits_a_later_chord`.
+//!
+//! ## What the core cannot see: a release that never arrives
+//!
+//! An armed hold is disarmed by exactly one thing — the chord key coming back
+//! up — and that event can be lost. Verified in the pinned dependencies, not
+//! assumed: Smithay 0.7.0's winit backend admits key events only under
+//! `!is_synthetic && !event.repeat` (the same guard that filters autorepeat,
+//! tension 2 below), which drops the synthetic releases winit emits on X11
+//! focus loss; and winit 0.30.13's Wayland `wl_keyboard.leave` handler emits
+//! `ModifiersChanged` and `Focused(false)` and no key events whatsoever.
+//! An ordinary alt-tab with the key down therefore leaves the core believing
+//! it is still held.
+//!
+//! Two answers, deliberately independent, because the second must hold even
+//! where the first does not exist (a future backend with no focus concept):
+//!
+//! 1. [`DeadManSwitch::forget_hold`], called on host-window focus loss:
+//!    without focus the hold is *unverifiable*, so it is cancelled. That doc
+//!    comment carries the full argument for cancelling rather than firing,
+//!    and for why it is not a defeat vector.
+//! 2. `observe_event`'s press arm re-arms unconditionally, so no lost release
+//!    can strand the switch in the `held_since = Some(_), fired = true` state
+//!    — which is a state only a release can leave, and in which the switch is
+//!    silently dead: no timer, no indicator, no firing.
 //!
 //! # Design tension 2: a hold needs a clock, and there is no autorepeat
 //!
@@ -174,6 +206,34 @@
 //! [`ConsentGrab::retire_stale`](crate::consent::grab::ConsentGrab::retire_stale)
 //! lowers the prompt and releases the input grab on its next turn.
 //!
+//! # The switch does not just sweep, it seals
+//!
+//! Revoking the rows that exist at the instant the chord completes is not the
+//! same as ending the session's authority, and the difference is a full
+//! round-trip wide:
+//!
+//! - A consent decision made *before* the chord and delivered *after* it mints
+//!   its row at delivery ([`crate::petitions`]' module docs: authority exists
+//!   if and only if its wire handle resolved). At the moment [`apply`] runs it
+//!   is neither a pending petition nor an existing row, so **both** halves of
+//!   the sweep miss it.
+//! - Under `ConsentPolicy::AutoApprove` the agent's next petition is granted
+//!   by policy with no human involved — so the panic button would hold for
+//!   exactly one round-trip.
+//!
+//! So [`apply`] also calls [`GrantTable::seal_dead_man`], after which every
+//! row the table mints is born revoked and the chokepoint refuses it `revoked`
+//! on first use, by the same path and with the same code as a swept row. The
+//! wire cannot distinguish them, and there is still no side channel: the seal
+//! is a property of the grant table, which is the one place authority is
+//! created.
+//!
+//! This is what makes the gesture mean "stop, and stay stopped" rather than
+//! "stop until the next petition". It is deliberately **not** undoable from
+//! inside the session: a human who wants authority back after hitting the
+//! off-switch restarts, which is the honest cost of a switch whose whole value
+//! is that nothing inside can defeat it.
+//!
 //! # Configuration lives on the command line
 //!
 //! `--dead-man-chord` and `--dead-man-hold`, alongside `--consent`. That is
@@ -198,12 +258,15 @@
 //! so a running `vitrind` has no authority to revoke. What *is* live in the
 //! nested backend today, and really runs: the chord is watched at the router's
 //! hook point, the timer is armed and fires, [`DeadManSwitch::fire_if_due`]
-//! completes the chord, and the hold indicator is painted. What is not: the
-//! [`apply`] call that turns a completed chord into revoked rows and denied
-//! petitions, because there is nothing yet for it to act on — a trigger with
-//! no table logs loudly and does nothing else. [`apply`] is exercised end to
-//! end by this module's tests against a real table, a real registry, and a
-//! real flight recorder.
+//! completes the chord, and the hold indicator is painted — and each of those
+//! is driven **through the backend's own code** by
+//! [`crate::backend::winit`]'s tests, not through a re-typed copy of it, so
+//! deleting any of them fails the suite. What is not live: the [`apply`] call
+//! that turns a completed chord into revoked rows, denied petitions and a
+//! sealed table, because there is nothing yet for it to act on — a trigger
+//! with no table logs loudly and does nothing else. [`apply`] is exercised end
+//! to end by this module's tests against a real table, a real registry, a real
+//! chokepoint and a real flight recorder.
 //!
 //! The recorder is deliberately *not* threaded into the backend to close
 //! that gap early. It cannot be: `NestedState` is the `Data` type of a
@@ -214,6 +277,7 @@
 //! which is issue #77's, and the two arrive together or not at all.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -475,11 +539,19 @@ pub(crate) struct DeadManEffect {
 /// the shape [`crate::input::PresenceHook`] established and
 /// [`crate::consent::grab::ConsentGrab`] followed.
 ///
-/// **Field ownership is the safety invariant** (module docs, tension 1):
-/// `held_since`, `fired` and `trigger` are written only by the detection path
-/// (`observe`, and the time-driven [`Self::fire_if_due`]); `withheld` and
-/// `replay_credit` only by the suppression path (`gate`). Detection never
-/// reads suppression state, so no suppression bug can stop a revocation.
+/// **Field ownership is the safety invariant** (module docs, tension 1), and
+/// it is a *read* invariant, which is the half that matters: the hold state
+/// (`held_since`, `fired`, `trigger`) is written only by the detection path
+/// ([`Self::observe_event`], the time-driven [`Self::fire_if_due`], and
+/// [`Self::forget_hold`]), and **detection never reads suppression state at
+/// all** — so no bug in `gate`, in the replay accounting, or in an embedder's
+/// drain can stop the switch from firing.
+///
+/// The converse is deliberately *not* symmetric: detection clears the
+/// suppression fields (`withheld`, `replay_pending`) when it decides a press
+/// became a chord, or when a hold is forgotten. That direction is safe
+/// because it can only ever result in the app being shown *less*, which is
+/// the failure this side is allowed to have.
 #[derive(Debug)]
 pub(crate) struct DeadManSwitch {
     config: DeadManConfig,
@@ -497,10 +569,35 @@ pub(crate) struct DeadManSwitch {
     /// Events handed to the embedder to re-route: a classified tap's press
     /// and its release, in that order.
     replay: Vec<SeatInput>,
-    /// How many chord events `gate` must let past untouched, so the replayed
-    /// pair is not withheld a second time. Spent by `gate` only; a stale
-    /// credit costs an app-visible Esc and nothing else (module docs).
-    replay_credit: usize,
+    /// The exact events `gate` must let past untouched, in the order they
+    /// were handed out, so a replayed pair is not withheld a second time.
+    ///
+    /// **This is a queue of identities, not a count, and that is a fix rather
+    /// than a preference.** It was a `usize` credit, granted two at a time
+    /// (the queue always holds a press/release pair) and spent one per event.
+    /// That is only sound if *both* halves of every replayed pair reach this
+    /// gate — and they do not. [`crate::consent::grab::ConsentGate`] sits
+    /// **outside** this hook and its hold-until-release exception *delivers*
+    /// physical key releases while *consuming* physical key presses. So a
+    /// replay drained while a consent prompt is up loses its press to the
+    /// grab (this gate never sees it, so no credit is spent) while its
+    /// release falls through and spends one. The credit lands on an **odd**
+    /// number, and the next genuine chord is split down the middle: its press
+    /// delivered on the stale credit, its release consumed — a latched Escape
+    /// in the confined app, which is precisely the harm P1.7.2 fixed for
+    /// modifiers and precisely what [`crate::input::PreemptionHook`]'s
+    /// pairing exception forbids ("a gate that consumed a press may consume
+    /// that press's release, *because then nothing is stranded*").
+    ///
+    /// Matching on the event value cannot drift that way: an event that never
+    /// reached this gate cannot spend another event's pass, because the pass
+    /// names the event it belongs to. Any mismatch clears the whole queue
+    /// rather than trying to resynchronise — a replay that did not arrive in
+    /// the order it was handed out is evidence the drain was filtered, and
+    /// the fail-safe reading of a filtered drain is "the app is owed
+    /// nothing", which costs at most a swallowed Esc tap and never a split
+    /// pair.
+    replay_pending: VecDeque<SeatInput>,
 }
 
 impl DeadManSwitch {
@@ -512,7 +609,7 @@ impl DeadManSwitch {
             trigger: None,
             withheld: None,
             replay: Vec::new(),
-            replay_credit: 0,
+            replay_pending: VecDeque::new(),
         }
     }
 
@@ -559,10 +656,43 @@ impl DeadManSwitch {
         match state {
             KeyState::Pressed => {
                 // A second press with no intervening release is not
-                // physically possible; if a feeder ever produces one, keeping
-                // the earlier arm time is the fail-safe reading (it fires
-                // sooner, never later).
-                if self.held_since.is_none() {
+                // physically possible at the keyboard, so reaching here with
+                // `held_since` already set means **the release was lost** --
+                // and a lost release is not hypothetical. Smithay 0.7.0's
+                // winit backend admits key events only under `!is_synthetic
+                // && !event.repeat`, which drops the synthetic releases winit
+                // emits on X11 focus loss; on Wayland winit's
+                // `wl_keyboard.leave` handler emits `ModifiersChanged` and
+                // `Focused(false)` and no key events at all. Either way the
+                // core can be left believing a key is still down.
+                //
+                // Two readings, and the choice between them is not a matter
+                // of taste:
+                //
+                // - *Keep the earlier arm time* (the previous behaviour) is
+                //   fail-safe only while `fired` is false -- it fires sooner,
+                //   never later. Once a lost release has let a hold fire,
+                //   `held_since` stays `Some` and `fired` stays `true`, and
+                //   that pair is a state **only a release can leave**:
+                //   `deadline` returns `None` (no timer is ever armed),
+                //   `hold_progress` returns `None` (the indicator never
+                //   appears), and `fire_if_due` returns early forever. The
+                //   human's off-switch is then silently dead until they
+                //   happen to complete one full press+release -- which this
+                //   gate also swallows, so it is invisible to them and to the
+                //   app.
+                // - *Re-arm from this press* costs nothing real: within one
+                //   genuine hold there is exactly one press event (repeats
+                //   are filtered upstream, module docs, tension 2), so a
+                //   press arriving while armed is evidence of a lost release
+                //   and never of a hold in progress.
+                //
+                // So the arming path is made unable to reach a state only a
+                // release can exit. This is deliberately independent of the
+                // focus-loss disarm in `crate::backend::winit` -- that
+                // handles the known cause, this makes *any* lost release cost
+                // at most the gesture it happened during.
+                if self.held_since.is_none() || self.fired {
                     self.held_since = Some(now);
                     self.fired = false;
                 }
@@ -638,6 +768,55 @@ impl DeadManSwitch {
         );
     }
 
+    /// **Detection.** Forget any hold in progress: the core can no longer
+    /// verify that the human is holding the key.
+    ///
+    /// Called when the host window loses keyboard focus
+    /// ([`crate::backend::winit`]). Focus loss is the one event that makes an
+    /// armed hold *unverifiable* rather than merely unobserved: the release
+    /// will be delivered to whatever window took focus, and — verified in the
+    /// pinned dependencies rather than assumed — neither backend tells us
+    /// about it. Smithay 0.7.0 filters `is_synthetic` key events, which is
+    /// how X11's focus-loss releases are lost; winit 0.30.13's Wayland
+    /// `wl_keyboard.leave` handler emits no key events at all.
+    ///
+    /// **Cancelling is the fail-safe direction here, and the reasoning is
+    /// asymmetric rather than obvious.** Firing looks like the cautious
+    /// choice — this is a safety switch, and safety switches fail on. It is
+    /// not, for three reasons:
+    ///
+    /// 1. The switch's entire premise is *a human is physically holding this
+    ///    key right now*. Without focus there is no evidence of that, and
+    ///    firing on absent evidence makes the most destructive operation the
+    ///    system offers reachable by a plain alt-tab mid-tap.
+    /// 2. The consequence would be journaled as a completed human gesture —
+    ///    `dead_man_triggered` with a measured `held_ms` indistinguishable
+    ///    from a real hold — which corrupts the one surface the acceptance
+    ///    criteria name for auditing exactly this.
+    /// 3. The failure is *recoverable in the direction that matters*: a
+    ///    cancelled hold costs the human one repeated gesture, which they can
+    ///    perform immediately and which the indicator shows them. A spurious
+    ///    revocation costs the session's authority and cannot be undone from
+    ///    the keyboard at all.
+    ///
+    /// **It is not a defeat vector.** A confined agent cannot move host-window
+    /// focus: in nested mode the app renders *into* this window through the
+    /// shim and has no host surface of its own, and emulated input is refused
+    /// by [`Self::observe_event`]'s origin check before it can touch any state
+    /// here. The only principal who can unfocus this window is the human at
+    /// the host compositor — the same human whose gesture this is.
+    ///
+    /// Clears the suppression state too, not only the hold. The withheld
+    /// press belongs to a gesture the core can no longer classify, and
+    /// delivering it later — on a keyboard focus the app no longer has —
+    /// would be a stray Escape arriving out of nowhere.
+    pub fn forget_hold(&mut self) {
+        self.held_since = None;
+        self.fired = false;
+        self.withheld = None;
+        self.replay_pending.clear();
+    }
+
     /// When the armed hold will elapse, for the embedder's timer. `None` when
     /// the key is up or the chord already fired — which is what lets the
     /// timer callback decide to stop rescheduling itself.
@@ -660,7 +839,11 @@ impl DeadManSwitch {
             return Vec::new();
         }
         let out = std::mem::take(&mut self.replay);
-        self.replay_credit = self.replay_credit.saturating_add(out.len());
+        // Replaces whatever was outstanding rather than appending to it: if a
+        // previous drain never came back through the gate, its passes are
+        // stale, and carrying them forward is exactly how a stale pass ends up
+        // spent by a *later* gesture's press.
+        self.replay_pending = out.iter().cloned().collect();
         out
     }
 
@@ -699,14 +882,27 @@ impl DeadManSwitch {
             return Gate::Deliver;
         }
         // A replayed event: this gate already judged its original and is
-        // handing the pair back to the app on purpose.
-        if self.replay_credit > 0 {
-            self.replay_credit -= 1;
-            return Gate::Deliver;
+        // handing the pair back to the app on purpose. Matched by value and
+        // in order (see `replay_pending`): a pass names the event it belongs
+        // to, so an event the outer consent gate swallowed cannot leave a
+        // pass behind for some later event to spend.
+        if let Some(front) = self.replay_pending.front() {
+            if front == input {
+                self.replay_pending.pop_front();
+                return Gate::Deliver;
+            }
+            // Out of order, or an event that was never replayed at all: the
+            // drain was filtered somewhere outside this hook. Drop the whole
+            // queue rather than resynchronising -- see `replay_pending`.
+            self.replay_pending.clear();
         }
         match state {
             // Withheld until the tap/chord question is answered (module docs).
             KeyState::Pressed => {
+                // Newly withholding: nothing outstanding can still be owed to
+                // the app, and a leftover pass here is the one thing that
+                // could split *this* gesture's pair.
+                self.replay_pending.clear();
                 self.withheld = Some(input.clone());
                 Gate::Consume
             }
@@ -759,6 +955,17 @@ pub(crate) fn apply(
         revoked.extend(grants.revoke_principal(principal));
     }
     revoked.sort();
+
+    // Sealing is what makes this a *revocation of the session's authority*
+    // rather than a sweep of one instant. The sweep above cannot reach a
+    // consent decision that was made before the chord and is delivered after
+    // it -- the row is minted at delivery, so at this moment it is neither
+    // pending nor present -- nor can it stop `ConsentPolicy::AutoApprove` from
+    // handing the identical authority back on the agent's next petition, one
+    // round-trip later. `seal_dead_man` closes both by making every row minted
+    // from here on born revoked; see its doc comment for why that lives on the
+    // table rather than at each caller.
+    grants.seal_dead_man();
 
     // Every pending petition is denied through the ordinary human-decision
     // path. `front_pending` rather than the build-gated `pending_ids`, so this
@@ -1204,6 +1411,122 @@ mod tests {
         }
         s.fire_if_due(t0 + DEFAULT_HOLD);
         assert!(s.take_trigger().is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // A release that never arrives
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_lost_release_cannot_leave_the_switch_unable_to_fire_again() {
+        // The critical failure this guards, in the order it happens in the
+        // field: the human presses the chord, host-window focus moves away
+        // before they let go, and the release is delivered to another window.
+        // Neither backend reports it (Smithay filters `is_synthetic`; winit's
+        // Wayland `leave` emits no key events), so the core still believes
+        // the key is down. The hold then completes on the timer.
+        //
+        // Before the fix that left `held_since = Some(_)` with `fired = true`
+        // -- a state ONLY a release can leave. Every subsequent hold was
+        // silently inert: no deadline, so no timer was ever armed; no
+        // progress, so the indicator never appeared; and `fire_if_due`
+        // returned early forever. The human's unconditional last resort was
+        // dead with nothing on screen to say so.
+        let t0 = Instant::now();
+        let mut s = switch();
+        s.observe_event(&crate::input::tests::chord_press(), t0);
+        s.fire_if_due(t0 + DEFAULT_HOLD);
+        assert!(
+            s.take_trigger().is_some(),
+            "fixture check: the first hold fired"
+        );
+
+        // ... and the release never arrives. A minute later the human comes
+        // back and deliberately holds the off-switch again.
+        let t1 = t0 + Duration::from_secs(60);
+        s.observe_event(&crate::input::tests::chord_press(), t1);
+
+        // Everything a held chord owes the human is present again.
+        assert_eq!(
+            s.deadline(),
+            Some(t1 + DEFAULT_HOLD),
+            "no timer would be armed: the switch is inert"
+        );
+        assert!(
+            s.hold_progress(t1 + DEFAULT_HOLD.mul_f64(0.9)).is_some(),
+            "the human gets no indicator that the off-switch is working"
+        );
+        s.fire_if_due(t1 + DEFAULT_HOLD);
+        let trigger = s
+            .take_trigger()
+            .expect("a lost release permanently disabled the human's off-switch");
+        // Measured from THIS press, not the stale one: a re-arm that kept the
+        // old instant would report a 61-second hold in the journal.
+        assert_eq!(trigger.held, DEFAULT_HOLD);
+    }
+
+    #[test]
+    fn forgetting_a_hold_cancels_it_rather_than_completing_it() {
+        // The mirror image, and the reason `forget_hold` cancels instead of
+        // firing: a human who taps Esc and immediately clicks another host
+        // window must not have every grant in the session revoked one second
+        // later, with the journal recording it as a completed human gesture
+        // that never happened. See `forget_hold`'s doc comment for the full
+        // asymmetry argument.
+        let t0 = Instant::now();
+        let mut s = switch();
+        s.observe_event(&crate::input::tests::chord_press(), t0);
+        assert!(s.deadline().is_some(), "fixture check: the hold armed");
+
+        // Focus leaves 50 ms in; the release will go to the other window.
+        s.forget_hold();
+
+        assert_eq!(s.deadline(), None, "a forgotten hold still has a deadline");
+        assert_eq!(s.hold_progress(t0 + DEFAULT_HOLD.mul_f64(0.9)), None);
+        // Well past the deadline, from every driver of the elapse check.
+        s.fire_if_due(t0 + DEFAULT_HOLD);
+        s.fire_if_due(t0 + Duration::from_secs(30));
+        assert!(
+            s.take_trigger().is_none(),
+            "an alt-tab mid-tap revoked the whole session"
+        );
+
+        // And the switch is immediately usable again -- cancelling costs the
+        // human one repeated gesture and nothing more.
+        let t1 = t0 + Duration::from_secs(30);
+        s.observe_event(&crate::input::tests::chord_press(), t1);
+        s.fire_if_due(t1 + DEFAULT_HOLD);
+        assert!(
+            s.take_trigger().is_some(),
+            "the switch did not recover after a forgotten hold"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_hold_drops_the_withheld_press_instead_of_leaking_it() {
+        // `forget_hold` clears suppression state too. The withheld press
+        // belongs to a gesture the core can no longer classify, and the app
+        // has just lost keyboard focus -- replaying it later would be a stray
+        // Escape arriving out of nowhere.
+        let t0 = Instant::now();
+        let mut s = switch();
+        let press = crate::input::tests::chord_press();
+        s.observe_event(&press, t0);
+        assert_eq!(s.gate_event(&press), Gate::Consume);
+
+        s.forget_hold();
+        assert!(s.take_replay().is_empty());
+
+        // The release arrives late (focus came back, or the app re-focused):
+        // there is no press to pair it with, so nothing is replayed and
+        // nothing is stranded.
+        let release = crate::input::tests::chord_release();
+        s.observe_event(&release, t0 + Duration::from_millis(200));
+        assert_eq!(s.gate_event(&release), Gate::Consume);
+        assert!(
+            s.take_replay().is_empty(),
+            "a forgotten press was replayed into the app after focus loss"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1817,16 +2140,150 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_minted_after_the_chord_is_born_revoked() {
+        // The window a point-in-time sweep cannot close. A consent decision
+        // becomes a grant-table row only at `deliver_resolution`, so a
+        // `Verdict::Granted` decided BEFORE the chord and delivered AFTER it
+        // is neither a pending petition nor an existing row when `apply`
+        // runs -- both halves of the sweep miss it, and delivery then mints
+        // live authority that outlived the human's off-switch.
+        //
+        // The same hole hands `ConsentPolicy::AutoApprove` the agent's whole
+        // authority back on its next petition, one round-trip after the panic
+        // button, with no human involved at all.
+        //
+        // `apply` seals the table, so a row minted afterwards is born revoked
+        // and refused through the ordinary path with the ordinary code.
+        // `RefusalReason` is already imported by this test module.
+
+        let now = Instant::now();
+        let who = identity(PROMPT_IDENTITY);
+        let mut grants = GrantTable::new();
+        let mut registry =
+            PetitionRegistry::new(ConsentPolicy::Interactive, PetitionConfig::default());
+        let mut scratch = Scratch::new();
+
+        // The human hits the off-switch on an empty table -- nothing to
+        // sweep, so ONLY the seal can be doing the work below.
+        apply(
+            &Trigger {
+                chord: "esc",
+                held: DEFAULT_HOLD,
+            },
+            &mut grants,
+            &mut registry,
+            &mut scratch.recorder,
+            now,
+        );
+
+        // Now the in-flight resolution is delivered, minting its row.
+        let late = grant_for(&mut grants, &who, now);
+        assert_eq!(
+            grants.get(late, now).map(|(_row, state)| state),
+            Some(crate::grants::GrantState::Revoked),
+            "a grant minted after the chord went live"
+        );
+        // And it is refused through the same query the chokepoint uses, with
+        // the same code a swept row produces -- the wire cannot tell them
+        // apart, and should not.
+        assert_eq!(
+            grants.check_use_grant(late, &who, Verb::ACTUATE_POINTER, now),
+            Err(RefusalReason::Revoked),
+            "authority decided before the chord survived it"
+        );
+        assert_eq!(
+            grants.check_use_grant(late, &who, Verb::OBSERVE, now),
+            Err(RefusalReason::Revoked),
+            "capture survived the chord"
+        );
+    }
+
+    #[test]
+    fn the_seal_outlives_the_sweep_and_is_idempotent() {
+        // The property that makes this a revocation of the session's
+        // authority rather than of one instant: the seal is not a one-shot
+        // that the next insert clears. Every row minted from here on is dead,
+        // however many arrive and however much later.
+        let now = Instant::now();
+        let who = identity(PROMPT_IDENTITY);
+        let other = identity(OTHER_IDENTITY);
+        let mut grants = GrantTable::new();
+        let live = grant_for(&mut grants, &who, now);
+        let mut registry =
+            PetitionRegistry::new(ConsentPolicy::AutoApprove, PetitionConfig::default());
+        let mut scratch = Scratch::new();
+
+        let trigger = Trigger {
+            chord: "esc",
+            held: DEFAULT_HOLD,
+        };
+        let effect = apply(
+            &trigger,
+            &mut grants,
+            &mut registry,
+            &mut scratch.recorder,
+            now,
+        );
+        assert_eq!(effect.revoked, vec![live], "the sweep missed the live row");
+
+        // Three petitions later, for two different principals, an hour on.
+        let much_later = now + Duration::from_secs(3600);
+        for who in [&who, &other, &who] {
+            let row = grant_for(&mut grants, who, much_later);
+            assert_eq!(
+                grants.get(row, much_later).map(|(_r, state)| state),
+                Some(crate::grants::GrantState::Revoked),
+                "the seal wore off"
+            );
+        }
+
+        // A second chord is harmless: nothing new to revoke, and the seal
+        // stays sealed.
+        let effect = apply(
+            &trigger,
+            &mut grants,
+            &mut registry,
+            &mut scratch.recorder,
+            much_later,
+        );
+        assert!(
+            effect.revoked.is_empty(),
+            "born-revoked rows were revoked a second time: {:?}",
+            effect.revoked
+        );
+        let after = grant_for(&mut grants, &who, much_later);
+        assert_eq!(
+            grants.get(after, much_later).map(|(_r, state)| state),
+            Some(crate::grants::GrantState::Revoked)
+        );
+    }
+
+    #[test]
     fn a_real_calloop_timer_completes_the_chord_with_no_further_input() {
         // Design tension 2 through the machinery the backend actually uses.
         // Smithay's winit backend filters key repeats, so a held key
         // produces one press and then silence -- if the timing path were
         // wrong, this loop would sit idle forever rather than firing. The
-        // timer is armed and rescheduled exactly as
-        // `NestedState::arm_deadman_timer` does, including the
-        // `TimeoutAction::ToInstant` retry that covers an early wakeup.
+        // This pins the SWITCH's half of the contract -- that `fire_if_due`
+        // driven only by a timer completes a hold -- independently of any
+        // embedder. The nested backend's own wiring (the source insert, the
+        // early-wakeup reschedule, the `deadman_timer_armed` bookkeeping) is
+        // a separate matter and is driven directly, through the code
+        // production runs, by `backend::winit`'s
+        // `the_backends_timer_completes_a_held_chord_with_no_further_input`
+        // and `an_early_timer_wakeup_reschedules_instead_of_dropping`. This
+        // test deliberately does NOT stand in for those: a hand-copy of the
+        // backend's pattern would keep passing while the backend regressed,
+        // which is exactly how the wiring came to be untested.
         use calloop::timer::{TimeoutAction, Timer};
         use calloop::EventLoop;
+
+        // `EventLoop::try_new` opens epoll/eventfd descriptors, and
+        // `capture`'s `fd_count_returns_to_baseline` asserts an exact
+        // process-wide fd count. Take the same quiesce lock so the two never
+        // run concurrently -- otherwise this test intermittently fails that
+        // one, from a different module, for no reason a reader could find.
+        let _fd = crate::capture::tests::fd_lock();
 
         // A short hold so the test is quick; the mechanism is duration-blind.
         let config = DeadManConfig::default()

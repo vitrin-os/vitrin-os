@@ -54,7 +54,7 @@ use tracing::{debug, error, info, trace};
 
 use crate::consent::grab::{ConsentGate, ConsentGrab};
 use crate::consent::ConsentSurface;
-use crate::deadman::{DeadManConfig, DeadManHook, DeadManSwitch};
+use crate::deadman::{DeadManConfig, DeadManHook, DeadManSwitch, Trigger};
 use crate::input;
 use crate::scene::Scene;
 
@@ -300,7 +300,10 @@ pub fn run(dead_man: DeadManConfig) -> Result<(), Box<dyn Error>> {
         // principal's input, origin-tagged `physical` at this single point
         // of entry (B2) — see `crate::input`.
         WinitEvent::Input(event) => state.handle_input(&event),
-        WinitEvent::Focus(_) => {}
+        // Not ignorable: a key held when focus leaves produces no release
+        // event on either backend, so the dead-man switch must be told the
+        // hold is no longer verifiable (see `handle_focus`).
+        WinitEvent::Focus(focused) => state.handle_focus(focused),
     })?;
 
     let grab = Rc::new(RefCell::new(ConsentGrab::new()));
@@ -344,6 +347,169 @@ pub fn run(dead_man: DeadManConfig) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// What the dead-man wiring needs from whoever owns the switch.
+///
+/// Exists so the timer path, its rescheduling, its bookkeeping and the
+/// trigger disposal are **one implementation shared with production** rather
+/// than a pattern the test re-types. The previous shape had all of it inline
+/// in [`NestedState`], which no test could construct (it owns a GL context and
+/// a host window); a review mutated every path here — the timer, both
+/// backstops, the replay drain, and the sharing of the `Rc` between the router
+/// hook and the backend — and the full workspace suite stayed green for all
+/// five. This is the same treatment [`window_pixels`] was given for the same
+/// reason.
+pub(crate) trait DeadManHost {
+    /// The switch, shared with the router's innermost hook. Sharing is the
+    /// point: a host that hands out a *different* switch than its router
+    /// watches is wired wrong, and `the_backends_hook_and_timer_share_one_switch`
+    /// exists to catch exactly that.
+    fn switch(&self) -> &Rc<RefCell<DeadManSwitch>>;
+    /// Whether a one-shot timer is already outstanding, so an arming keypress
+    /// does not insert a fresh calloop source per event.
+    fn timer_armed(&mut self) -> &mut bool;
+    /// Dispose of one completed chord. The nested backend logs it (there is
+    /// no grant table in this process yet, issue #77); the M1.1 embedder will
+    /// call [`crate::deadman::apply`].
+    fn on_trigger(&mut self, trigger: Trigger);
+}
+
+/// Complete the chord if due, dispose of any trigger, and keep the timer
+/// armed. Idempotent and level-triggered; safe to call from anywhere.
+pub(crate) fn deadman_tick<D: DeadManHost + 'static>(
+    host: &mut D,
+    handle: &LoopHandle<'static, D>,
+    now: Instant,
+) {
+    let trigger = {
+        let mut switch = host.switch().borrow_mut();
+        switch.fire_if_due(now);
+        switch.take_trigger()
+    };
+    if let Some(trigger) = trigger {
+        host.on_trigger(trigger);
+    }
+    arm_deadman_timer(host, handle);
+}
+
+/// Arm a one-shot timer at the hold's deadline, if a hold is armed and no
+/// timer is outstanding.
+///
+/// The callback reschedules itself rather than dropping when the hold is
+/// still pending, which closes the gap an early or coarse wakeup would
+/// otherwise leave: calloop is free to fire a timer marginally early, and a
+/// `Drop` on a not-yet-due check would leave the switch with no timer at all
+/// until the human pressed something else.
+pub(crate) fn arm_deadman_timer<D: DeadManHost + 'static>(
+    host: &mut D,
+    handle: &LoopHandle<'static, D>,
+) {
+    if *host.timer_armed() {
+        return;
+    }
+    let Some(deadline) = host.switch().borrow().deadline() else {
+        return;
+    };
+    let armed = handle.insert_source(
+        Timer::from_deadline(deadline),
+        |_deadline, _, host: &mut D| {
+            let trigger = {
+                let mut switch = host.switch().borrow_mut();
+                switch.fire_if_due(Instant::now());
+                switch.take_trigger()
+            };
+            if let Some(trigger) = trigger {
+                host.on_trigger(trigger);
+            }
+            // Read out into a local first: the `Ref` must be dropped before
+            // `timer_armed` takes `&mut host`.
+            let next = host.switch().borrow().deadline();
+            match next {
+                // Still held and not yet due: this wakeup was early.
+                Some(next) => TimeoutAction::ToInstant(next),
+                None => {
+                    *host.timer_armed() = false;
+                    TimeoutAction::Drop
+                }
+            }
+        },
+    );
+    match armed {
+        Ok(_token) => *host.timer_armed() = true,
+        Err(err) => {
+            // Not fatal, and deliberately not silent: the frame-cadence
+            // backstop still completes the chord, so the switch degrades
+            // from "fires at the deadline" to "fires within a frame".
+            error!(
+                "could not arm the dead-man timer ({}); the off-switch now depends on the \
+                 frame-cadence backstop",
+                err.error
+            );
+        }
+    }
+}
+
+/// Route one turn's intake events, then re-route whatever the dead-man
+/// watcher decided the app is owed.
+///
+/// The drain must run **after** the loop, never before it and never inside
+/// it: the gate withholds a chord press until it knows whether the human is
+/// tapping or holding, and a tap owes the app the press *and* its release, in
+/// that order ([`crate::deadman`]). Re-routing rather than injecting is what
+/// keeps every downstream policy applying to the replay — a prompt raised
+/// between the press and the release consumes the replayed press exactly as
+/// it would a fresh one, with no carve-out anywhere.
+///
+/// Free-standing and generic over the hook so a test can drive it with a spy
+/// sink and assert the drain really happens: deleting it costs the confined
+/// app its Escape key permanently, which is the exact harm tap-through
+/// exists to prevent, and nothing else in the suite notices.
+pub(crate) fn route_turn<H: input::PreemptionHook>(
+    router: &mut input::InputRouter<H>,
+    switch: &RefCell<DeadManSwitch>,
+    inputs: impl IntoIterator<Item = input::SeatInput>,
+    view: (u32, u32),
+    surface: Option<(u32, u32)>,
+    deliver: &mut dyn FnMut(input::SeatDelivery),
+) {
+    for input in inputs {
+        if let Some(delivery) = router.route(input, view, surface) {
+            deliver(delivery);
+        }
+    }
+    // A separate statement from the loop so the switch's borrow ends before
+    // routing re-enters the hook that holds it.
+    let replay = switch.borrow_mut().take_replay();
+    for replayed in replay {
+        if let Some(delivery) = router.route(replayed, view, surface) {
+            deliver(delivery);
+        }
+    }
+}
+
+impl DeadManHost for NestedState {
+    fn switch(&self) -> &Rc<RefCell<DeadManSwitch>> {
+        &self.deadman
+    }
+
+    fn timer_armed(&mut self) -> &mut bool {
+        &mut self.deadman_timer_armed
+    }
+
+    fn on_trigger(&mut self, trigger: Trigger) {
+        // Honest gap, stated where it happens: `crate::deadman::apply` wants
+        // the session's grant table and petition registry, and nothing
+        // constructs either until issue #77. The switch really completed --
+        // it is `warn!`-logged by `fire_if_due` itself -- there is simply no
+        // authority in this process to revoke.
+        error!(
+            chord = trigger.chord,
+            held_ms = trigger.held.as_millis(),
+            "dead-man chord completed, but this build has no grant table to revoke: the \
+             M1.1 listener wiring (issue #77) is what constructs one. NOTHING WAS REVOKED."
+        );
+    }
+}
+
 impl NestedState {
     /// P1.3.7 input intake, nested mode. The host compositor delivered
     /// this event to the core's window, so it is the human principal's
@@ -373,136 +539,81 @@ impl NestedState {
         // core follows). The grab and the dead-man watcher read it through
         // their hooks.
         self.now.set(Instant::now());
-        for tagged in input::intake_physical(event, (size.w, size.h)) {
-            self.route_one(tagged, view);
-        }
-        // A tap on the chord key is handed back here to be routed as if it
-        // had arrived normally: the dead-man gate withholds the chord's
-        // press until it knows whether the human is tapping or holding, and
-        // a tap owes the app the press *and* its release, in that order
-        // (see `crate::deadman`). Draining after the loop, never before it,
-        // is what keeps this a drain rather than a second policy hook.
-        //
-        // Re-routing rather than injecting means every downstream policy
-        // still applies -- a prompt that went up between the press and the
-        // release consumes the replayed press exactly as it would a fresh
-        // one, with no carve-out anywhere.
-        // The drain is a separate statement from the loop so the switch's
-        // borrow ends before routing re-enters the hook that holds it.
-        let replay = self.deadman.borrow_mut().take_replay();
-        for replayed in replay {
-            self.route_one(replayed, view);
-        }
+        // Route this turn's events, then drain the dead-man watcher's replay
+        // (see `route_turn`, which owns both halves so they can be tested).
+        route_turn(
+            &mut self.router,
+            &self.deadman,
+            input::intake_physical(event, (size.w, size.h)),
+            view,
+            self.scene.surface_size(),
+            &mut |delivery| {
+                // P1.5.2 hands this to ShimServer::deliver_seat_event on
+                // the realm's live connection.
+                trace!(
+                    origin = ?delivery.origin(),
+                    "routed input dropped: no shim connection yet (P1.5.2)"
+                );
+            },
+        );
         // Backstop 2 of 3 for the elapse check (`crate::deadman`): the
         // switch is already being asked about this turn's events, so ask it
         // about the clock too.
         self.deadman_tick();
     }
 
-    /// Route one tagged event and dispose of the delivery.
-    fn route_one(&mut self, tagged: input::SeatInput, view: (u32, u32)) {
-        if let Some(delivery) = self.router.route(tagged, view, self.scene.surface_size()) {
-            // P1.5.2 hands this to ShimServer::deliver_seat_event on
-            // the realm's live connection.
-            trace!(
-                origin = ?delivery.origin(),
-                "routed input dropped: no shim connection yet (P1.5.2)"
-            );
+    /// The host window lost or gained keyboard focus.
+    ///
+    /// On loss the dead-man hold is forgotten. This is the one cause of a
+    /// lost key release that the core can actually see: the release will be
+    /// delivered to whatever window took focus, and neither backend reports
+    /// it (Smithay 0.7.0 filters `is_synthetic` key events, and winit's
+    /// Wayland `wl_keyboard.leave` emits no key events at all — both verified
+    /// in the pinned sources). Without this, an ordinary alt-tab with Esc
+    /// down either revokes the whole session a second later with no gesture
+    /// behind it, or — after such a fire — leaves the switch in a state only
+    /// a release can exit, silently dead with no indicator to say so.
+    ///
+    /// [`DeadManSwitch::forget_hold`] carries the argument for cancelling
+    /// rather than firing, and for why an agent cannot reach this path.
+    ///
+    /// The tick afterwards is not decoration: it lets the outstanding timer's
+    /// callback see `deadline() == None` on its next wakeup and drop itself,
+    /// and it repaints nothing, so a disarmed indicator disappears at the
+    /// host's ordinary frame cadence.
+    fn handle_focus(&mut self, focused: bool) {
+        if focused {
+            return;
         }
+        debug!("host window lost keyboard focus; forgetting any dead-man hold in progress");
+        self.deadman.borrow_mut().forget_hold();
+        self.deadman_tick();
     }
 
     /// Complete the dead-man chord if its hold has elapsed, apply whatever
     /// that produced, and keep the timer armed while a hold is in progress.
     ///
     /// Called from three places on purpose ([`crate::deadman`], design
-    /// tension 2): the timer below, every input dispatch turn, and every
-    /// frame. [`DeadManSwitch::fire_if_due`] is idempotent and
-    /// level-triggered, so calling it more often only shortens latency --
-    /// and a timer that never fires costs at most one frame rather than the
-    /// whole switch.
+    /// tension 2): the timer, every input dispatch turn, and every frame.
+    /// [`DeadManSwitch::fire_if_due`] is idempotent and level-triggered, so
+    /// calling it more often only shortens latency -- and a timer that never
+    /// fires costs at most one frame rather than the whole switch.
+    ///
+    /// The body is [`deadman_tick`], a free function over [`DeadManHost`],
+    /// so the whole time-driven path can be driven by a test with a real
+    /// `EventLoop` and no display. That split is not cosmetic: with the logic
+    /// inline here, deleting every time-driven path left the entire workspace
+    /// suite green, which for a dead-man switch is the one regression nothing
+    /// may be allowed to hide.
     fn deadman_tick(&mut self) {
-        let trigger = {
-            let mut switch = self.deadman.borrow_mut();
-            switch.fire_if_due(Instant::now());
-            switch.take_trigger()
-        };
-        if let Some(trigger) = trigger {
-            // Honest gap, stated where it happens: `crate::deadman::apply`
-            // wants the session's grant table and petition registry, and
-            // nothing constructs either until issue #77. The switch really
-            // completed -- it is `warn!`-logged by `fire_if_due` itself --
-            // there is simply no authority in this process to revoke.
-            error!(
-                chord = trigger.chord,
-                held_ms = trigger.held.as_millis(),
-                "dead-man chord completed, but this build has no grant table to revoke: the \
-                 M1.1 listener wiring (issue #77) is what constructs one. NOTHING WAS REVOKED."
-            );
-        }
-        self.arm_deadman_timer();
+        let handle = self.loop_handle.clone();
+        deadman_tick(self, &handle, Instant::now());
         // Deliberately no `request_redraw` here. The redraw chain is already
         // self-sustaining (`schedule_next_frame`), so the indicator animates
         // and disappears at the host's frame cadence for free — and adding a
         // request on a path the frame loop itself calls would chain a redraw
         // per frame *outside* `FRAME_BUDGET`, turning a held key into a
         // busy-spin.
-    }
-
-    /// Arm a one-shot timer at the hold's deadline, if one is armed and no
-    /// timer is outstanding.
-    ///
-    /// The callback reschedules itself rather than dropping when the hold is
-    /// still pending, which closes the gap an early or coarse wakeup would
-    /// otherwise leave: calloop is free to fire a timer marginally early,
-    /// and a `Drop` on a not-yet-due check would leave the switch with no
-    /// timer at all until the human pressed something else.
-    fn arm_deadman_timer(&mut self) {
-        if self.deadman_timer_armed {
-            return;
-        }
-        let Some(deadline) = self.deadman.borrow().deadline() else {
-            return;
-        };
-        let armed = self.loop_handle.insert_source(
-            Timer::from_deadline(deadline),
-            |_deadline, _, state: &mut NestedState| {
-                let trigger = {
-                    let mut switch = state.deadman.borrow_mut();
-                    switch.fire_if_due(Instant::now());
-                    switch.take_trigger()
-                };
-                if let Some(trigger) = trigger {
-                    error!(
-                        chord = trigger.chord,
-                        held_ms = trigger.held.as_millis(),
-                        "dead-man chord completed, but this build has no grant table to revoke: \
-                         the M1.1 listener wiring (issue #77) is what constructs one. NOTHING \
-                         WAS REVOKED."
-                    );
-                }
-                match state.deadman.borrow().deadline() {
-                    // Still held and not yet due: this wakeup was early.
-                    Some(next) => TimeoutAction::ToInstant(next),
-                    None => {
-                        state.deadman_timer_armed = false;
-                        TimeoutAction::Drop
-                    }
-                }
-            },
-        );
-        match armed {
-            Ok(_token) => self.deadman_timer_armed = true,
-            Err(err) => {
-                // Not fatal, and deliberately not silent: the frame-cadence
-                // backstop still completes the chord, so the switch degrades
-                // from "fires at the deadline" to "fires within a frame".
-                error!(
-                    "could not arm the dead-man timer ({}); the off-switch now depends on the \
-                     frame-cadence backstop",
-                    err.error
-                );
-            }
-        }
     }
 
     /// Draw one frame. Rendering failure is fatal to the skeleton: log it,
@@ -512,10 +623,22 @@ impl NestedState {
         // Backstop 3 of 3 for the elapse check (`crate::deadman`), and the
         // one that survives a lost timer: at the host's frame cadence this
         // bounds the switch's latency to ~16.7 ms with no timer at all.
-        // Placed before `try_redraw`, which returns early for a zero-sized
-        // (minimized) window, so a minimized window does not silently drop
-        // the backstop with it. Guarded on an armed hold so an idle window
-        // pays nothing per frame.
+        // Guarded on an armed hold so an idle window pays nothing per frame.
+        //
+        // **Its exact reach, because overstating it would be worse than not
+        // having it.** Placed before `try_redraw` so the frame that discovers
+        // a zero-sized (minimized) window still counts — but `try_redraw`
+        // returns early on that path *without* reaching `schedule_next_frame`,
+        // which is the only thing that chains the next redraw. So a minimized
+        // window gets this one last tick and then no more, and while it stays
+        // minimized the switch is covered by the calloop timer alone. That is
+        // acceptable (the timer is the primary path; this is the backstop),
+        // and it is written down because a maintainer who weakened the timer
+        // on the strength of a three-way redundancy that does not hold there
+        // would leave the off-switch with nothing.
+        //
+        // In practice a minimized window is also an unfocused one, and
+        // `handle_focus` has already forgotten the hold by then.
         if self.deadman.borrow().deadline().is_some() {
             self.deadman_tick();
         }
@@ -807,6 +930,324 @@ mod tests {
             TextureKey::current(size, &scene, &consent, Some(1.0)),
             TextureKey::current(size, &scene, &consent, None),
             "the indicator disappearing must re-upload too"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The dead-man wiring: the timer, its backstops, and the replay drain
+    // ------------------------------------------------------------------
+    //
+    // These exist because a review mutated every one of these paths --
+    // `arm_deadman_timer` early-returning, both backstops removed, the
+    // replay drain removed, and the router's hook given a *different*
+    // switch than the backend holds -- and the entire workspace suite
+    // stayed green for all five. For a dead-man switch that is the one
+    // class of regression nothing may hide: the failure is a human holding
+    // the panic button in a live session and nothing happening.
+    //
+    // `NestedState` owns a GL context and a host window, so it cannot be
+    // built on a display-free runner. The wiring is therefore reached
+    // through [`DeadManHost`], which `NestedState` implements and this
+    // fixture implements identically -- so these drive the *same* code
+    // production does, not a re-typed copy of it.
+
+    /// A minimal [`DeadManHost`]: what `NestedState` contributes to the
+    /// dead-man wiring, with nothing that needs a display.
+    struct TestHost {
+        switch: Rc<RefCell<DeadManSwitch>>,
+        timer_armed: bool,
+        triggers: Vec<Trigger>,
+    }
+
+    impl TestHost {
+        fn new(hold_ms: u64) -> Self {
+            let config = DeadManConfig::default()
+                .with_hold_ms(hold_ms)
+                .expect("within range");
+            Self {
+                switch: Rc::new(RefCell::new(DeadManSwitch::new(config))),
+                timer_armed: false,
+                triggers: Vec::new(),
+            }
+        }
+    }
+
+    impl DeadManHost for TestHost {
+        fn switch(&self) -> &Rc<RefCell<DeadManSwitch>> {
+            &self.switch
+        }
+        fn timer_armed(&mut self) -> &mut bool {
+            &mut self.timer_armed
+        }
+        fn on_trigger(&mut self, trigger: Trigger) {
+            self.triggers.push(trigger);
+        }
+    }
+
+    #[test]
+    fn the_backends_timer_completes_a_held_chord_with_no_further_input() {
+        // Design tension 2 through the machinery the nested backend really
+        // runs. Smithay's winit backend filters key repeats, so a held key
+        // produces exactly one press and then silence: if `arm_deadman_timer`
+        // inserted no source -- or `deadman_tick` never called it -- this
+        // loop would sit idle until the timeout and the chord would never
+        // complete. Nothing here advances the switch by hand.
+        // `EventLoop::try_new` opens epoll/eventfd descriptors, and
+        // `capture`'s `fd_count_returns_to_baseline` asserts an exact
+        // process-wide fd count. Take the same quiesce lock so the two never
+        // run concurrently -- otherwise this test intermittently fails that
+        // one, from a different module, for no reason a reader could find.
+        let _fd = crate::capture::tests::fd_lock();
+        let mut event_loop: EventLoop<'static, TestHost> = EventLoop::try_new().expect("loop");
+        let handle = event_loop.handle();
+        // A short hold so the test is quick; the mechanism is duration-blind.
+        let mut host = TestHost::new(250);
+
+        let pressed_at = Instant::now();
+        host.switch
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_press(), pressed_at);
+
+        // The input turn's tick: this is what arms the timer in production.
+        deadman_tick(&mut host, &handle, pressed_at);
+        assert!(
+            host.timer_armed,
+            "the input turn did not arm a timer for an armed hold"
+        );
+        assert!(
+            host.triggers.is_empty(),
+            "the chord completed before its hold elapsed"
+        );
+
+        // Now run the loop with NO input source at all. Only the timer can
+        // make anything happen.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while host.triggers.is_empty() && Instant::now() < deadline {
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut host)
+                .expect("dispatch");
+        }
+
+        assert_eq!(
+            host.triggers.len(),
+            1,
+            "the backend's timer never completed the chord: the off-switch is a no-op in \
+             nested mode"
+        );
+        assert!(host.triggers[0].held >= Duration::from_millis(250));
+        // The hold is over, so the source dropped itself and the bookkeeping
+        // says so -- otherwise the next hold would never arm a timer at all.
+        assert!(
+            !host.timer_armed,
+            "the timer did not clear its armed flag when the hold ended"
+        );
+        assert_eq!(host.switch.borrow().deadline(), None);
+    }
+
+    #[test]
+    fn an_early_timer_wakeup_reschedules_instead_of_dropping() {
+        // calloop is free to fire a timer marginally early. A callback that
+        // dropped on a not-yet-due check would leave the switch with no timer
+        // at all until the human pressed something else -- which, for a held
+        // key that produces no further events, means never.
+        // `EventLoop::try_new` opens epoll/eventfd descriptors, and
+        // `capture`'s `fd_count_returns_to_baseline` asserts an exact
+        // process-wide fd count. Take the same quiesce lock so the two never
+        // run concurrently -- otherwise this test intermittently fails that
+        // one, from a different module, for no reason a reader could find.
+        let _fd = crate::capture::tests::fd_lock();
+        let mut event_loop: EventLoop<'static, TestHost> = EventLoop::try_new().expect("loop");
+        let handle = event_loop.handle();
+        let mut host = TestHost::new(300);
+
+        // Arm the timer against a hold that started 250 ms in the FUTURE, so
+        // every wakeup for the next half-second is "early".
+        let future = Instant::now() + Duration::from_millis(250);
+        host.switch
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_press(), future);
+        arm_deadman_timer(&mut host, &handle);
+        assert!(host.timer_armed);
+
+        // Dispatch across the early window. The timer must survive it.
+        let stop = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < stop {
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut host)
+                .expect("dispatch");
+        }
+        assert!(
+            host.triggers.is_empty(),
+            "the chord fired before its hold elapsed"
+        );
+        assert!(
+            host.timer_armed,
+            "an early wakeup dropped the timer instead of rescheduling it"
+        );
+
+        // And it still fires when the hold genuinely elapses.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while host.triggers.is_empty() && Instant::now() < deadline {
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut host)
+                .expect("dispatch");
+        }
+        assert_eq!(host.triggers.len(), 1, "the rescheduled timer never fired");
+    }
+
+    #[test]
+    fn arming_twice_inserts_one_timer_source() {
+        // The `deadman_timer_armed` bookkeeping. `deadman_tick` runs on every
+        // input turn and every frame, so without it a held key would insert a
+        // fresh calloop source per event -- an agent flooding input would
+        // grow the loop without bound.
+        // `EventLoop::try_new` opens epoll/eventfd descriptors, and
+        // `capture`'s `fd_count_returns_to_baseline` asserts an exact
+        // process-wide fd count. Take the same quiesce lock so the two never
+        // run concurrently -- otherwise this test intermittently fails that
+        // one, from a different module, for no reason a reader could find.
+        let _fd = crate::capture::tests::fd_lock();
+        let event_loop: EventLoop<'static, TestHost> = EventLoop::try_new().expect("loop");
+        let handle = event_loop.handle();
+        let mut host = TestHost::new(1000);
+        host.switch
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_press(), Instant::now());
+
+        arm_deadman_timer(&mut host, &handle);
+        assert!(host.timer_armed);
+        for _ in 0..50 {
+            arm_deadman_timer(&mut host, &handle);
+        }
+        // One source: the second and later calls returned on the flag. If
+        // they had not, the loop would now hold 51 timers for one hold.
+        assert!(host.timer_armed);
+    }
+
+    #[test]
+    fn a_disarmed_hold_arms_no_timer() {
+        // What `handle_focus` relies on: after `forget_hold` there is no
+        // deadline, so nothing is armed and nothing can fire.
+        // `EventLoop::try_new` opens epoll/eventfd descriptors, and
+        // `capture`'s `fd_count_returns_to_baseline` asserts an exact
+        // process-wide fd count. Take the same quiesce lock so the two never
+        // run concurrently -- otherwise this test intermittently fails that
+        // one, from a different module, for no reason a reader could find.
+        let _fd = crate::capture::tests::fd_lock();
+        let event_loop: EventLoop<'static, TestHost> = EventLoop::try_new().expect("loop");
+        let handle = event_loop.handle();
+        let mut host = TestHost::new(250);
+        let t0 = Instant::now();
+        host.switch
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_press(), t0);
+        host.switch.borrow_mut().forget_hold();
+
+        deadman_tick(&mut host, &handle, t0 + Duration::from_secs(5));
+        assert!(!host.timer_armed, "a forgotten hold armed a timer anyway");
+        assert!(
+            host.triggers.is_empty(),
+            "a forgotten hold completed the chord"
+        );
+    }
+
+    #[test]
+    fn a_tap_is_replayed_to_the_app_by_the_routing_turn() {
+        // The drain, which is what gives the confined app its Escape key
+        // back. Removing it is invisible in every other test and costs
+        // Firefox the Escape key permanently -- every tap swallowed, none
+        // ever replayed.
+        let deadman = Rc::new(RefCell::new(DeadManSwitch::new(DeadManConfig::default())));
+        let now = Rc::new(Cell::new(Instant::now()));
+        let mut router = input::InputRouter::new(DeadManHook::new(
+            Rc::clone(&deadman),
+            Rc::clone(&now),
+            input::NoopHook,
+        ));
+        let view = (640u32, 480u32);
+        let surface = Some(view);
+        let mut delivered: Vec<input::SeatDeliveryKind> = Vec::new();
+
+        // The press alone reaches nobody: it is withheld pending the
+        // tap-or-chord question.
+        route_turn(
+            &mut router,
+            &deadman,
+            [crate::input::tests::chord_press()],
+            view,
+            surface,
+            &mut |d| delivered.push(d.kind().clone()),
+        );
+        assert!(delivered.is_empty(), "a withheld press reached the app");
+
+        // The release classifies it as a tap, and the SAME turn drains and
+        // re-routes the pair: press first, then release.
+        now.set(now.get() + Duration::from_millis(80));
+        deadman
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_release(), now.get());
+        route_turn(
+            &mut router,
+            &deadman,
+            [crate::input::tests::chord_release()],
+            view,
+            surface,
+            &mut |d| delivered.push(d.kind().clone()),
+        );
+
+        assert_eq!(
+            delivered.len(),
+            2,
+            "the tap was not replayed to the app: {delivered:?}"
+        );
+        use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+        assert!(
+            matches!(
+                delivered[0],
+                input::SeatDeliveryKind::Key {
+                    keysym: 0xff1b,
+                    state: KeyState::Pressed,
+                }
+            ),
+            "the replay must start with the withheld press: {delivered:?}"
+        );
+        assert!(
+            matches!(
+                delivered[1],
+                input::SeatDeliveryKind::Key {
+                    keysym: 0xff1b,
+                    state: KeyState::Released,
+                }
+            ),
+            "a press with no release latches Escape in the app: {delivered:?}"
+        );
+    }
+
+    #[test]
+    fn the_routers_hook_and_the_backends_handle_are_one_switch() {
+        // The wiring itself. `run` builds the router's `DeadManHook` and the
+        // backend's own handle from one `Rc::clone`; a refactor that handed
+        // the hook a *different* switch would leave the chord watched by a
+        // switch nothing ever ticks, and the timer armed on a switch nothing
+        // ever presses. Both halves look fine in isolation.
+        //
+        // Asserted by observing through the router and reading through the
+        // handle, which is only possible if they are the same cell.
+        let deadman = Rc::new(RefCell::new(DeadManSwitch::new(DeadManConfig::default())));
+        let now = Rc::new(Cell::new(Instant::now()));
+        let mut router = input::InputRouter::new(DeadManHook::new(
+            Rc::clone(&deadman),
+            Rc::clone(&now),
+            input::NoopHook,
+        ));
+        let view = (640u32, 480u32);
+
+        assert_eq!(deadman.borrow().deadline(), None);
+        let _ = router.route(crate::input::tests::chord_press(), view, Some(view));
+        assert_eq!(
+            deadman.borrow().deadline(),
+            Some(now.get() + crate::deadman::DEFAULT_HOLD),
+            "the router's hook and the backend's handle are not the same switch"
         );
     }
 }

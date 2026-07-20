@@ -507,19 +507,21 @@ jobs:
           # warm build below even across a red first run.
           cache-on-failure: true
 
+      - name: Install native build deps
+        # Discharges the TODO this job carried while dormant: vitrind links
+        # libxkbcommon (winit backend) and libpixman-1 (headless backend,
+        # P1.3.2), so `cargo build --workspace` below cannot link without
+        # them ("unable to find library -lxkbcommon" / "-lpixman-1").
+        # Mirrors the rust job's step; wayland and libinput are dlopen'd at
+        # runtime and need no -dev package here.
+        if: hashFiles('tests/integration/run.sh') != ''
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxkbcommon-dev libpixman-1-dev
+
       - name: Warm build (workspace)
         # Separates compile time from the suite's 10-minute budget: vitrind
         # is a workspace crate (crates/vitrin-core per the plan layout), so
         # this builds -- and, via the cache step above, banks -- the heavy
         # dependency tree before the timed suite step runs.
-        #
-        # TODO(P1.8.x activation): this job installs no native -dev packages,
-        # but vitrind links libxkbcommon (winit backend) and libpixman-1
-        # (headless backend, P1.3.2). The activating PR that lands
-        # tests/integration/run.sh must add an apt step installing
-        # `libxkbcommon-dev libpixman-1-dev` (mirroring the rust job) or this
-        # `cargo build --workspace` will fail to link. Left to that PR per this
-        # repo's "the activating PR owns its deps" convention.
         if: hashFiles('tests/integration/run.sh') != ''
         run: cargo build --workspace
 

@@ -96,13 +96,15 @@ use vitrin_ipc::{
 };
 
 use crate::capture::RealmViewFrame;
+use crate::consent::grab::ConsentGrab;
+use crate::consent::ConsentSurface;
 use crate::grants::GrantTable;
 use crate::identity::StaticVerifier;
 use crate::input::{InputRouter, PhysicalPresence, PreemptionHook, SeatInput};
 use crate::lifecycle::{
     DeathCause, Hangup, RealmLifecycle, RealmTeardown, RetainedOutput, ShutdownTiming,
 };
-use crate::petitions::{ConnectionId, PetitionRegistry, Resolution};
+use crate::petitions::{ConnectionId, PetitionRegistry, PromptRoute, Resolution};
 use crate::principal::{PrincipalServer, ServerCtx};
 use crate::realm::RealmRegistry;
 use crate::recorder::Recorder;
@@ -364,6 +366,20 @@ pub(crate) trait RuntimeHost: Sized + 'static {
     /// anything a peer can cause: a misbehaving peer kills its own connection
     /// and nothing else.
     fn stop(&mut self, fatal: Option<Box<dyn Error>>);
+
+    /// Service one turn of interactive consent (issue #90): retire stale
+    /// prompts, apply the input grab's human decisions, and raise the next
+    /// pending petition's prompt. Called once per dispatch round from
+    /// [`post_dispatch`], before the dirty gate.
+    ///
+    /// The default is a **no-op**, which is correct for any backend that
+    /// cannot host a prompt: headless has no display to draw a consent card
+    /// on and no physical input device to answer it, and the test host has no
+    /// grab. Only the nested backend — where the human physically is —
+    /// overrides it. `main` refuses `--headless --consent=interactive` at
+    /// startup (issue #90 scope 4), so no petition can silently pend under a
+    /// backend that could never raise a prompt to answer it.
+    fn service_consent(&mut self, _now: Instant) {}
 }
 
 impl<H: PreemptionHook> Runtime<H> {
@@ -772,7 +788,11 @@ fn sweep<H: RuntimeHost>(host: &mut H) {
 /// `PetitionUndelivered` itself, from the one funnel that covers every
 /// refusal reason. A second check here would be a second place a human's
 /// decision can be quietly destroyed.
-fn deliver<H: PreemptionHook>(runtime: &mut Runtime<H>, resolution: Resolution, now: Instant) {
+pub(crate) fn deliver<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    resolution: Resolution,
+    now: Instant,
+) {
     let Runtime { kernel, conns, .. } = runtime;
     let Some(conn) = conns.get_mut(&resolution.connection) else {
         // Teardown already withdrew this connection's pending petitions, so a
@@ -800,6 +820,138 @@ fn deliver<H: PreemptionHook>(runtime: &mut Runtime<H>, resolution: Resolution, 
         // because a routing failure is an embedder fault worth an operator's
         // attention, not merely a reconstruction detail.
         tracing::warn!(%err, "petition resolution could not be delivered");
+    }
+}
+
+/// Service one turn of interactive consent: retire a prompt whose petition
+/// already left the table, apply every human decision the input grab produced,
+/// then raise the front-of-queue petition's prompt if none is up. Reports
+/// whether anything changed, so the caller can mark the frame dirty and
+/// present the transition.
+///
+/// This is the call that closes issue #90's gap: [`ConsentGrab::raise`] had no
+/// caller outside tests, so under `--consent=interactive` every petition
+/// pended until the armed sweep timed it out. The renderer (P1.7.1), the input
+/// grab (P1.7.2) and revocation (P1.7.3) all landed unwired; this is the one
+/// site that drives them from the running loop, and the nested backend's
+/// [`RuntimeHost::service_consent`] override is its only production caller (the
+/// backends that cannot host a prompt inherit the trait's no-op default).
+///
+/// # Why the four steps are in this order
+///
+/// The three grab helpers each borrow two disjoint fields of
+/// `runtime.kernel` (the petition registry and the recorder) plus the `consent`
+/// surface, which is why `grab`, `consent` and `runtime` are distinct
+/// parameters rather than reached through one `&mut self`: it is what lets the
+/// borrow checker see the registry borrow inside a grab call as disjoint from
+/// the `recorder` borrow beside it. [`deliver`] borrows `runtime` wholesale, so
+/// each `resolve_human` borrow must end before its `deliver` call — the match
+/// arm below is what closes it.
+///
+/// 1. [`ConsentGrab::retire_stale`] first, so a prompt whose petition died via
+///    the sweep (timeout), a withdrawal, or a dead-man denial is taken down and
+///    the queue is freed *before* a decision or a fresh raise is considered.
+/// 2. Drain decisions. [`PetitionRegistry::resolve_human`] fails closed
+///    (`NotPending`) on a petition that raced a timeout or a withdrawal, so a
+///    stale decision can never land on the wrong petition — the exactly-once
+///    guard, typed, and the reason a [`Decision`](crate::consent::grab::Decision)
+///    carries its own petition id rather than being applied to whatever is
+///    pending now.
+/// 3. `retire_stale` again: a just-decided petition has left the pending table,
+///    so its card comes down *this* round and the queue advances immediately
+///    rather than one turn late.
+/// 4. Raise the front prompt **only when none is up**. That makes
+///    one-prompt-at-a-time structural, and it is also what stops a busy-spin:
+///    re-raising an already-shown petition returns `Some(route)`, which would
+///    otherwise set `changed = true` on every idle round and keep the frame
+///    perpetually dirty.
+pub(crate) fn service_consent_round<H: PreemptionHook>(
+    grab: &mut ConsentGrab,
+    runtime: &mut Runtime<H>,
+    consent: &mut ConsentSurface,
+    now: Instant,
+) -> bool {
+    // Take down a prompt whose petition already left the table (timed out via
+    // the sweep, withdrawn with its connection, or dead-man-denied), freeing
+    // the queue for the next petition before anything else runs.
+    let mut changed = grab.retire_stale(&mut runtime.kernel.petitions, consent);
+
+    while let Some(decision) = grab.take_decision() {
+        // `resolve_human` fails closed on a petition that raced a timeout or a
+        // withdrawal, so a stale decision drained here can never land on the
+        // wrong petition; the `Err` arm's borrow ends before `deliver` takes
+        // `runtime` wholesale on the `Ok` arm.
+        match runtime
+            .kernel
+            .petitions
+            .resolve_human(decision.petition, decision.choice)
+        {
+            Ok(resolution) => {
+                deliver(runtime, resolution, now);
+                changed = true;
+            }
+            Err(err) => tracing::debug!(
+                ?err,
+                petition = %decision.petition,
+                "consent decision no longer applies to its petition"
+            ),
+        }
+    }
+
+    // A just-decided petition has left the table: take its card down so the
+    // queue advances on this same round rather than the next one.
+    changed |= grab.retire_stale(&mut runtime.kernel.petitions, consent);
+
+    // One prompt at a time, made structural — and the guard that keeps this
+    // from busy-spinning, since re-raising an already-armed petition would
+    // return `Some(route)` and set `changed` every round.
+    if grab.armed_petition().is_none() {
+        if let Some(front) = runtime.kernel.petitions.front_pending() {
+            // `raise` borrows two disjoint fields of `runtime.kernel` (the
+            // petition registry and the recorder) alongside the `consent`
+            // param — allowed because they are distinct fields, and the reason
+            // this is a free function over three params rather than a method.
+            if let Some(route) = grab.raise(
+                front,
+                now,
+                &mut runtime.kernel.petitions,
+                consent,
+                &mut runtime.kernel.recorder,
+            ) {
+                announce_prompt(runtime, route);
+                changed = true;
+            }
+        }
+    }
+
+    changed
+}
+
+/// Send the petitioner its `vitrin_consent.state(shown)`, the wire half of
+/// raising a prompt — the one part [`ConsentGrab::raise`] leaves to the caller
+/// because only the connection's own [`PrincipalServer`] may speak on the wire.
+///
+/// Mirrors [`deliver`]'s out-of-dispatch outbox pattern: the petitioner is by
+/// definition idle (an agent awaiting consent has nothing in flight), so the
+/// `shown` event has no inbound message to ride and goes through the outbox.
+///
+/// Failure is an **expected** race, not a fault: the petitioner can die in the
+/// instant its prompt goes up, and [`PrincipalServer::emit_consent_shown`]
+/// reports that as `ConnectionDead`. The flight-recorder `Shown` entry that
+/// `raise` already wrote is the source of truth for "a human was asked", so a
+/// lost wire event is logged at debug and nothing more — warning here would
+/// cry wolf on an ordinary disconnect.
+pub(crate) fn announce_prompt<H: PreemptionHook>(runtime: &mut Runtime<H>, route: PromptRoute) {
+    let Some(conn) = runtime.conns.get_mut(&route.connection) else {
+        return;
+    };
+    let outbox = conn.outbox.clone();
+    let mut send = |frame: &[u8], fd: Option<BorrowedFd<'_>>| {
+        debug_assert!(fd.is_none(), "no version-1 consent event carries an fd");
+        outbox.send(frame)
+    };
+    if let Err(err) = conn.server.emit_consent_shown(route, &mut send) {
+        tracing::debug!(%err, "consent prompt shown-event not delivered to its petitioner");
     }
 }
 
@@ -1204,6 +1356,11 @@ pub(crate) fn emit_presented<H: PreemptionHook>(runtime: &mut Runtime<H>) {
 }
 
 pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
+    // First, before the dirty gate: raising or lowering a consent prompt is
+    // exactly what makes the frame dirty, so it must run before the gate below
+    // reads `dirty`. Backends that cannot host a prompt inherit the trait's
+    // no-op and pay nothing here.
+    host.service_consent(Instant::now());
     let fatal = {
         let (runtime, view) = host.split();
         if !runtime.dirty {
@@ -1239,7 +1396,9 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::path::PathBuf;
+    use std::rc::Rc;
     use std::time::Duration;
 
     use calloop::{EventLoop, LoopSignal};
@@ -1250,6 +1409,9 @@ mod tests {
     };
     use vitrin_protocol::wire::HEADER_LEN;
 
+    use crate::consent::grab::Decision;
+    use crate::consent::Choice;
+    use crate::grants::PersistenceRung;
     use crate::identity::{
         PrincipalIdentity, StaticPrincipal, StaticVerifier, STATIC_TOKEN_SCHEME,
     };
@@ -1277,6 +1439,11 @@ mod tests {
         /// Which frame-clock posture to answer with. Defaults to the
         /// headless one; the pacing test flips it to the nested one.
         posture: Presentation,
+        /// The consent surface [`service_consent_round`] raises prompts on.
+        /// Present on every test host — the nested backend carries one too —
+        /// but only exercised when a grab is attached; the consent tests
+        /// assert a card was raised on it.
+        consent: ConsentSurface,
     }
 
     impl Presenter for TestView {
@@ -1309,6 +1476,13 @@ mod tests {
         handle: LoopHandle<'static, TestHost>,
         signal: LoopSignal,
         fatal: Option<Box<dyn Error>>,
+        /// The consent input grab, when a test attaches one. `None` by
+        /// default, so every existing test gets the trait's no-op
+        /// [`RuntimeHost::service_consent`] and is unaffected; a consent test
+        /// attaches one with [`Rig::attach_grab`] and the override below then
+        /// drives [`service_consent_round`] each dispatch round, exactly as
+        /// the nested backend does.
+        grab: Option<Rc<RefCell<ConsentGrab>>>,
     }
 
     impl RuntimeHost for TestHost {
@@ -1324,6 +1498,21 @@ mod tests {
         fn stop(&mut self, fatal: Option<Box<dyn Error>>) {
             self.fatal = fatal;
             self.signal.stop();
+        }
+
+        /// The nested backend's override in miniature: with a grab attached,
+        /// run [`service_consent_round`] and mark the frame dirty on a change.
+        /// The `Rc` is cloned first so the `RefMut` borrows nothing of `self`,
+        /// leaving `runtime` and `view.consent` as disjoint field borrows —
+        /// the same shape [`crate::backend::winit::NestedState`] uses.
+        fn service_consent(&mut self, now: Instant) {
+            let Some(grab) = self.grab.clone() else {
+                return;
+            };
+            let mut grab = grab.borrow_mut();
+            if service_consent_round(&mut grab, &mut self.runtime, &mut self.view.consent, now) {
+                self.runtime.dirty = true;
+            }
         }
     }
 
@@ -1386,10 +1575,12 @@ mod tests {
                     scene: Scene::new(),
                     redraws: 0,
                     posture: Presentation::Completed,
+                    consent: ConsentSurface::new(),
                 },
                 handle: handle.clone(),
                 signal: event_loop.get_signal(),
                 fatal: None,
+                grab: None,
             };
             install(&handle, &mut host.runtime).expect("install runtime sources");
             Rig {
@@ -1399,6 +1590,21 @@ mod tests {
                 dir,
                 log,
             }
+        }
+
+        /// Attach a consent input grab and return a shared handle to it.
+        ///
+        /// This is what turns [`TestHost::service_consent`] from the trait's
+        /// no-op into the driven path: with a grab attached, every
+        /// [`post_dispatch`] runs [`service_consent_round`] against it, so a
+        /// pending interactive petition really is raised over the shipped
+        /// wire. The returned `Rc` lets a test read the armed state and inject
+        /// a human decision through the grab's test seam, exactly where a
+        /// physical click would have deposited one.
+        fn attach_grab(&mut self) -> Rc<RefCell<ConsentGrab>> {
+            let grab = Rc::new(RefCell::new(ConsentGrab::new()));
+            self.host.grab = Some(Rc::clone(&grab));
+            grab
         }
 
         /// Fork the real mock-shim binary into this rig's scratch runtime
@@ -2129,6 +2335,220 @@ mod tests {
                 .any(|entry| entry.str("kind") == "grant_removed"),
             "the run's log must record the grant's end; without it a reader cannot tell a \
              released grant from one the core lost track of. entries: {entries:#?}"
+        );
+        drop(client);
+    }
+
+    // ------------------------------------------------------------------
+    // Interactive consent, end to end (issue #90)
+    // ------------------------------------------------------------------
+    //
+    // These drive the SHIPPED `post_dispatch` → `service_consent` path with a
+    // real grab attached, so the orchestration `service_consent_round` owns —
+    // raise the front petition, notify the petitioner, drain a human decision
+    // into `resolve_human`, deliver the resolution, lower the card — runs over
+    // the real wire to a real agent. The click-to-decision half is covered
+    // exhaustively by `consent::grab`'s own tests; here a decision is injected
+    // through the grab's test seam, exactly where a physical click would have
+    // deposited one.
+
+    /// Pump until the attached grab has a prompt up, or fail.
+    fn pump_until_armed(
+        rig: &mut Rig,
+        grab: &Rc<RefCell<ConsentGrab>>,
+    ) -> crate::petitions::PetitionId {
+        rig.pump_until(Duration::from_secs(5), |_| {
+            grab.borrow().armed_petition().is_some()
+        });
+        grab.borrow().armed_petition().expect("a prompt is up")
+    }
+
+    /// **Acceptance: an interactive petition puts a prompt on screen and tells
+    /// the agent.** Nothing here reaches `raise` directly — the running loop's
+    /// `service_consent` does, which is the wiring issue #90 was filed for.
+    #[test]
+    fn an_interactive_petition_raises_a_prompt_and_notifies_the_agent() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "consent-raise",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let grab = rig.attach_grab();
+        let mut client = agent(&rig.socket);
+        send_preamble(&mut client);
+        send_petition(&mut client);
+
+        let petition = pump_until_armed(&mut rig, &grab);
+
+        // The grab holds this petition's prompt, and the surface really has a
+        // card to draw (its origin resolves only when a prompt is up).
+        assert_eq!(grab.borrow().armed_petition(), Some(petition));
+        assert!(
+            rig.host.view.consent.card_origin(VIEW.0, VIEW.1).is_some(),
+            "raising a prompt must put a card on the consent surface"
+        );
+
+        // `shown` rides the outbox (an out-of-dispatch send), so it is only
+        // written once the connection source dispatches again after the raise.
+        // `pump_until_armed` stops the instant the prompt is up, before that
+        // flush — so pump once more to put the frame on the wire, else the
+        // blocking read below would wait for a frame still sitting in the
+        // outbox.
+        rig.pump(Duration::from_millis(200));
+
+        // The petitioner heard about it over the wire: `service_consent`
+        // called `emit_consent_shown`, which pushed `vitrin_consent.state`
+        // through the outbox. Read past the `queued` the admission already
+        // sent and confirm the `shown` this task wired lands too.
+        use vitrin_protocol::generated::vitrin_consent::{events::State, ConsentState};
+        let mut saw_shown = false;
+        for _ in 0..32 {
+            let msg = client
+                .recv_message()
+                .expect("client receive")
+                .expect("the core must not have hung up");
+            if msg.header.object_id == 5 && msg.header.opcode == State::OPCODE {
+                let (_, event) = State::decode(&msg.bytes, msg.fd).expect("decode consent state");
+                if event.state == ConsentState::Shown {
+                    saw_shown = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_shown,
+            "the agent must receive vitrin_consent.state(shown)"
+        );
+
+        // ...and the flight recorder — the source of truth for "a human was
+        // asked", written by `raise` itself — carries the transition.
+        let entries = rig.entries();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.str("kind") == "consent_transition" && e.str("state") == "shown"),
+            "the run must journal a consent_transition{{shown}}; got {:?}",
+            entries.iter().map(|e| e.str("kind")).collect::<Vec<_>>()
+        );
+    }
+
+    /// **A human Allow grants the petition, over the wire.** The decision is
+    /// injected as a click would deposit it; `service_consent` drains it,
+    /// `resolve_human` accepts it, `deliver` mints the grant and sends
+    /// `resolved(granted)`, and the card comes down the same round.
+    #[test]
+    fn a_human_allow_grants_the_petition_over_the_wire() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "consent-allow",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let grab = rig.attach_grab();
+        let mut client = agent(&rig.socket);
+        send_preamble(&mut client);
+        send_petition(&mut client);
+        let petition = pump_until_armed(&mut rig, &grab);
+
+        grab.borrow_mut().queue_decision(Decision {
+            petition,
+            choice: Choice::Allow(PersistenceRung::Once),
+        });
+        rig.pump(Duration::from_millis(400));
+
+        assert_eq!(
+            await_resolution(&mut client),
+            Outcome::Granted,
+            "a human Allow must grant the petition and tell the agent"
+        );
+        assert_eq!(
+            rig.host.runtime.kernel.grants.rows(Instant::now()).count(),
+            1,
+            "an approved petition mints exactly one grant row"
+        );
+        assert!(
+            grab.borrow().armed_petition().is_none(),
+            "the decided petition's card must be lowered, freeing the queue"
+        );
+    }
+
+    /// **A human Deny refuses the petition, over the wire, and mints nothing.**
+    #[test]
+    fn a_human_deny_refuses_the_petition_over_the_wire() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "consent-deny",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let grab = rig.attach_grab();
+        let mut client = agent(&rig.socket);
+        send_preamble(&mut client);
+        send_petition(&mut client);
+        let petition = pump_until_armed(&mut rig, &grab);
+
+        grab.borrow_mut().queue_decision(Decision {
+            petition,
+            choice: Choice::Deny,
+        });
+        rig.pump(Duration::from_millis(400));
+
+        assert_eq!(
+            await_resolution(&mut client),
+            Outcome::Denied,
+            "a human Deny must refuse the petition and tell the agent"
+        );
+        assert_eq!(
+            rig.host.runtime.kernel.grants.rows(Instant::now()).count(),
+            0,
+            "a denied petition must mint no grant row"
+        );
+        assert!(
+            grab.borrow().armed_petition().is_none(),
+            "the refused petition's card must be lowered too"
+        );
+    }
+
+    /// **A raised prompt does not keep the frame dirty.** Re-raising the
+    /// already-armed petition returns its route, which would set `changed` and
+    /// mark the frame dirty every idle round — a busy-spin. `service_consent`
+    /// must report no change when nothing happened, and leave the same prompt
+    /// up.
+    #[test]
+    fn a_raised_prompt_does_not_keep_the_frame_dirty() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "consent-idle",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let grab = rig.attach_grab();
+        let mut client = agent(&rig.socket);
+        send_preamble(&mut client);
+        send_petition(&mut client);
+        let petition = pump_until_armed(&mut rig, &grab);
+
+        // A fresh, quiet round with the prompt already up and no new decision.
+        rig.host.runtime.dirty = false;
+        rig.host.service_consent(Instant::now());
+
+        assert!(
+            !rig.host.runtime.dirty,
+            "an unchanged consent round must not dirty the frame (no busy-spin)"
+        );
+        assert_eq!(
+            grab.borrow().armed_petition(),
+            Some(petition),
+            "the same prompt must still be up"
         );
         drop(client);
     }

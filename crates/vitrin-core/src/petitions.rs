@@ -102,14 +102,15 @@
 //! petition nobody answers resolves `timed_out`, and nothing but an
 //! affirmative human decision produces a grant.
 //!
-//! What is still missing is the *embedder that raises prompts*, not the
-//! mechanism and no longer the registry: `run_session` constructs a
-//! [`PetitionRegistry`] from the parsed `--consent` policy and real
-//! petitions really do enter it, but nothing calls
-//! [`crate::consent::grab::ConsentGrab::raise`], so a running `vitrind`
-//! still shows no prompt. Under `interactive` a petition therefore pends
-//! until the armed sweep resolves it `timed_out` -- fail-closed and correct,
-//! but not consent.
+//! The embedder that raises those prompts is now wired (issue #90):
+//! [`crate::session::service_consent_round`] runs once per dispatch round on
+//! the nested backend, raising the front pending petition through
+//! [`crate::consent::grab::ConsentGrab::raise`] and routing a human's click
+//! into [`PetitionRegistry::resolve_human`]. Under `interactive` a petition a
+//! human never answers still resolves `timed_out` -- fail-closed -- but that
+//! is now the fallback rather than the only outcome. (`--headless` has no
+//! display and no physical input device, so it is refused with
+//! `--consent=interactive` at startup; auto-approve is the headless policy.)
 //!
 //! **The scripted-consent injector is a build-gated hook, not a policy and
 //! not a wire message.** The IDL is explicit that consent decisions are not
@@ -182,9 +183,9 @@
 //! P1.7.2 inherited those semantics for free, exactly as predicted:
 //! [`crate::consent::grab::ConsentGrab::raise`] calls `mark_prompt_shown`
 //! in the same statement sequence that puts the pixels up and seizes the
-//! input grab, and **nothing in the chokepoint changed**. The flag is still
-//! only reachable at runtime once something raises a prompt, and nothing
-//! calls `ConsentGrab::raise` yet; tests drive it today.
+//! input grab, and **nothing in the chokepoint changed**. The flag is
+//! reachable at runtime now that [`crate::session::service_consent_round`]
+//! raises a prompt each dispatch round (issue #90).
 //!
 //! **Prompt selection is FIFO by admission** ([`PetitionRegistry::front_pending`]).
 //! Up to [`PetitionConfig::max_pending_global`] petitions can pend at once,
@@ -803,12 +804,11 @@ impl PetitionRegistry {
     }
 
     /// Record that `petition`'s consent prompt is now on screen (module
-    /// docs: the `consent_held` mapping). The consent surface (P1.7.2)
-    /// calls this at the same moment it emits
-    /// `vitrin_consent.state(shown)`; tests drive it directly until the
-    /// renderer lands. Returns whether the petition was pending (a
-    /// resolved or withdrawn petition has no prompt to show -- `false`,
-    /// nothing recorded).
+    /// docs: the `consent_held` mapping). [`ConsentGrab::raise`] calls this
+    /// at the same moment it emits `vitrin_consent.state(shown)`, driven at
+    /// runtime by [`crate::session::service_consent_round`] (issue #90).
+    /// Returns whether the petition was pending (a resolved or withdrawn
+    /// petition has no prompt to show -- `false`, nothing recorded).
     pub fn mark_prompt_shown(&mut self, petition: PetitionId) -> bool {
         match self.pending.get_mut(&petition) {
             Some(pending) => {

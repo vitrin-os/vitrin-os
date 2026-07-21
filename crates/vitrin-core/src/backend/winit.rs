@@ -196,9 +196,11 @@ pub(crate) struct NestedView {
     /// (P1.3.4) commits into it and requests a redraw.
     scene: Scene,
     /// The consent surface (P1.7.1): the prompt composited above the realm
-    /// view in the host window. Always present, and still always empty at
-    /// runtime: the petition registry exists now, but nothing calls
-    /// [`ConsentGrab::raise`], so no prompt is ever raised.
+    /// view in the host window. Driven now (issue #90): once per dispatch
+    /// round [`session::RuntimeHost::service_consent`] calls
+    /// [`session::service_consent_round`], which raises the front pending
+    /// petition's card here and lowers it again when the petition is decided
+    /// or leaves the table. It is empty only while no petition is pending.
     consent: ConsentSurface,
     texture: Option<SceneTexture>,
 }
@@ -218,13 +220,14 @@ pub(crate) struct NestedState {
     /// while a prompt is up it owns physical input, and a click on one of
     /// the card's buttons becomes a petition decision here.
     ///
-    /// Live but idle. Nothing calls [`ConsentGrab::raise`] at runtime, so
-    /// this grab consumes nothing and produces no decisions in a running
-    /// `vitrind` — the last gap between a consent surface that is
-    /// implemented and one that is reachable. It is carried anyway, rather
-    /// than attached later,
-    /// because the alternative is a window in which a prompt could be shown
-    /// with no grab behind it.
+    /// Live and driven (issue #90). Every dispatch round
+    /// [`session::RuntimeHost::service_consent`] borrows this grab and runs
+    /// [`session::service_consent_round`]: it raises the front pending
+    /// petition's prompt (seizing physical input through the shared
+    /// [`ConsentGate`]), drains the decisions a physical click produced, and
+    /// lowers a card whose petition has left the table. Shared with the router
+    /// rather than attached later, because the alternative is a window in which
+    /// a prompt could be shown with no grab behind it.
     grab: Rc<RefCell<ConsentGrab>>,
     /// The dispatch turn's instant, shared with the router's
     /// [`ConsentGate`]. The hook trait carries no clock by design, so the
@@ -880,6 +883,28 @@ impl session::RuntimeHost for NestedState {
     fn stop(&mut self, fatal: Option<Box<dyn Error>>) {
         self.fatal = fatal;
         self.loop_signal.stop();
+    }
+
+    /// Drive interactive consent for this dispatch round (issue #90): the
+    /// nested backend is the only one that can, because it is the only place a
+    /// physical input device and a human-visible display both exist.
+    ///
+    /// The `Rc` is cloned first so the `RefMut` it yields borrows nothing of
+    /// `self` — that leaves `&mut self.runtime` and `&mut self.view.consent` as
+    /// two disjoint field borrows for [`session::service_consent_round`], which
+    /// raises the prompt, drains the grab's decisions and lowers stale cards.
+    /// A `true` return means the visible output changed (a card went up or came
+    /// down), so the frame is marked dirty and a redraw is requested — the host
+    /// compositor draws it on its next frame, the same path every other visible
+    /// transition takes here.
+    fn service_consent(&mut self, now: Instant) {
+        let grab = Rc::clone(&self.grab);
+        let mut grab = grab.borrow_mut();
+        if session::service_consent_round(&mut grab, &mut self.runtime, &mut self.view.consent, now)
+        {
+            self.runtime.dirty = true;
+            self.view.backend.window().request_redraw();
+        }
     }
 }
 

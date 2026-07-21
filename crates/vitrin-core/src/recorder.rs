@@ -743,6 +743,31 @@ pub(crate) enum Event<'a> {
         /// Refusals in the run so far, including the one written in full.
         total: u64,
     },
+    /// One routed seat event the core delivered to the realm's shim, tagged
+    /// with the origin intake bound (backward requirement B2). This is the
+    /// audit half of the input path: [`crate::input::SeatDelivery`] makes the
+    /// physical-vs-agent distinction unforgeable through the type system, and
+    /// this entry is what makes it *auditable after the fact* -- an unforgeable
+    /// tag nobody records is a guarantee you cannot investigate an incident
+    /// with.
+    ///
+    /// **Shape only, never payload**: the event *kind* and its origin, with no
+    /// coordinates, keysym, or typed bytes. An agent's own actuations are
+    /// already reproduced in full by [`Event::UseDecision`] at the chokepoint;
+    /// what this adds is the delivery-point record (post-routing -- what
+    /// actually went to the shim's seat) and, once physical input exists
+    /// (Phase 3), the origin of events that never cross a chokepoint at all.
+    /// Recording raw keysyms or typed bytes here would make the recorder a
+    /// keylogger, which the secrecy contract [`ActuationDetail`] documents
+    /// forbids.
+    SeatDelivered {
+        /// The seat event kind -- `motion`/`button`/`scroll`/`key`/`text`,
+        /// from [`crate::input::SeatDelivery::event_label`].
+        event: &'static str,
+        /// `physical` or `emulated`: the tag intake bound, never reconstructed
+        /// here (B2).
+        origin: &'static str,
+    },
     /// A `once` grant's single use was consumed by an admitted use: the
     /// active-to-spent lifecycle transition.
     GrantSpent {
@@ -937,6 +962,7 @@ impl Event<'_> {
             Event::PetitionUndelivered { .. } => "petition_undelivered",
             Event::UseDecision { .. } => "use_decision",
             Event::UseRefusalSummary { .. } => "use_refusal_summary",
+            Event::SeatDelivered { .. } => "seat_delivered",
             Event::GrantSpent { .. } => "grant_spent",
             Event::GrantExpired { .. } => "grant_expired",
             Event::GrantRevoked { .. } => "grant_revoked",
@@ -1161,6 +1187,10 @@ impl Event<'_> {
                 field_str(out, "refusal", refusal_label(code));
                 field_u64(out, "repeats", repeats);
                 field_u64(out, "total_in_run", total);
+            }
+            Event::SeatDelivered { event, origin } => {
+                field_str(out, "event", event);
+                field_str(out, "origin", origin);
             }
             Event::GrantSpent {
                 connection,
@@ -2634,6 +2664,43 @@ pub(crate) mod tests {
         // One run id across the run.
         assert_eq!(entries[0].str("run_id"), rec.run_id());
         assert_eq!(entries[2].str("run_id"), rec.run_id());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_seat_delivery_records_its_kind_and_origin_and_no_payload() {
+        let _fd = crate::capture::tests::fd_lock();
+        // Issue #83: the delivery-point audit entry carries the origin tag
+        // (B2) and the event kind -- and, deliberately, nothing else. A
+        // recorder that wrote keysyms or the typed string here would be a
+        // keylogger, so the entry has no field that could hold either.
+        let (mut rec, path) = scratch_recorder("seat-delivered");
+        rec.record(Event::SeatDelivered {
+            event: "text",
+            origin: "emulated",
+        });
+        rec.record(Event::SeatDelivered {
+            event: "button",
+            origin: "physical",
+        });
+
+        let entries = read_log(&path);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].str("kind"), "seat_delivered");
+        assert_eq!(entries[0].str("event"), "text");
+        assert_eq!(entries[0].str("origin"), "emulated");
+        assert_eq!(entries[1].str("event"), "button");
+        assert_eq!(entries[1].str("origin"), "physical");
+
+        // Shape only: no member that could carry a coordinate, keysym, scroll
+        // delta, or the typed string's bytes/digest.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        for forbidden in ["keysym", "chars", "digest", "value120"] {
+            assert!(
+                !raw.contains(forbidden),
+                "a seat-delivery entry must not carry payload; found {forbidden}"
+            );
+        }
         cleanup(&path);
     }
 

@@ -245,18 +245,21 @@
 //! backend's `handle_input`, where the two sit on adjacent lines and read one
 //! local. A view that could drift is a view that came from somewhere else.
 //!
-//! # Interaction with the unsolved replica problem (issue #85)
+//! # Interaction with the replica problem (issue #85)
 //!
-//! A confined app can draw a byte-identical copy of the consent card; there
-//! is no trusted indicator yet, and building one needs startup ceremony or a
-//! reserved output region (tracked in #85, explicitly not this task). One
-//! partial mitigation falls out of this module for free and is worth
-//! stating: **a replica gets no input grab.** Clicking a real prompt's
-//! buttons produces no app-visible input at all, while clicking a replica
-//! behaves like clicking an app — the app sees the press, the release, and
-//! every motion between. The behaviours differ; what is missing is any way
-//! for the human to *notice* the difference before deciding. This is a
-//! mitigation, not a fix, and it does not close #85.
+//! A confined app can still draw a byte-identical copy of the consent card,
+//! but issue #85 has since landed the trusted indicator that lets a human tell
+//! the two apart — a per-session secret colour, minted at startup and painted
+//! as a reserved band plus the genuine card's frame on a display path the app
+//! cannot observe (see [`crate::consent::indicator`]). This module contributes
+//! a *second*, independent line of defence, worth stating because it holds
+//! even if a human misses the frame: **a replica gets no input grab.** Clicking
+//! a real prompt's buttons produces no app-visible input at all, while clicking
+//! a replica behaves like clicking an app — the app sees the press, the
+//! release, and every motion between. So the app cannot both forge the pixels
+//! *and* silently harvest the human's clicks the way a real prompt's grab
+//! prevents; the indicator is what lets the human refuse before clicking at
+//! all.
 //!
 //! # Wired at runtime (issue #90)
 //!
@@ -952,7 +955,7 @@ mod tests {
         Instant,
     ) {
         let (mut registry, petition) = pending_petition(WirePersistence::WhileRunning);
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
         let mut grab = ConsentGrab::new();
         let t0 = t0();
         grab.set_view(VIEW);
@@ -1412,7 +1415,7 @@ mod tests {
         // raising: nothing is shown and nothing is grabbed. A prompt for a
         // dead petition must not hold a human's input hostage.
         let (mut registry, petition) = pending_petition(WirePersistence::WhileRunning);
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
         let mut grab = ConsentGrab::new();
         let t0 = t0();
         grab.set_view(VIEW);
@@ -1472,7 +1475,7 @@ mod tests {
             panic!("an interactive petition must pend");
         };
 
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
         let mut grab = ConsentGrab::new();
         let t0 = t0();
         grab.set_view(VIEW);
@@ -1717,7 +1720,7 @@ mod tests {
 
         let (mut registry, petition) = pending_petition(WirePersistence::WhileRunning);
         let identity = PrincipalIdentity::parse(PROMPT_IDENTITY).unwrap();
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
         let mut grab = ConsentGrab::new();
         let (mut recorder, log_path) = scratch_recorder("consent-grab-shown");
         grab.set_view(VIEW);
@@ -1799,7 +1802,7 @@ mod tests {
         // the geometry rather than the choice list, because the grab's
         // output is what the state machine sees.
         let (mut registry, petition) = pending_petition(WirePersistence::Once);
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
         let mut grab = ConsentGrab::new();
         grab.set_view(VIEW);
         grab.raise(

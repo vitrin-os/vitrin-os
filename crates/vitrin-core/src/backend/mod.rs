@@ -23,7 +23,9 @@
 //! everything a human sees comes from here. The overlay is applied only on
 //! this side, so `docs/protocol/05-vitrin_consent.md`'s "it never appears in
 //! captured frames" holds by construction rather than by a check (the full
-//! argument is in [`crate::consent`]'s module docs).
+//! argument is in [`crate::consent`]'s module docs). The trusted indicator
+//! (issue #85) — the always-present band and the per-prompt frame — lives on
+//! this side too, and is invisible to a capture for exactly the same reason.
 //!
 //! Both backends reach that one function: the nested backend through
 //! [`compose_human_visible`] (compose + overlay in one step) and the headless
@@ -56,15 +58,21 @@ use crate::scene::Scene;
 /// with the compose in front of it.
 ///
 /// `view` must be `width * height * 4` bytes of RGBA8888 — the layout
-/// [`Scene::compose`] returns. With no prompt up it is returned unchanged,
-/// byte for byte.
+/// [`Scene::compose`] returns. With no prompt up the realm view is unchanged
+/// *except* for the trusted band along the top edge (issue #85), which is
+/// present on every human-visible frame; a prompt adds the scrim, the framed
+/// card, and nothing the band does not already assert.
 pub(crate) fn human_visible_from_view(
     mut view: Vec<u8>,
     consent: &mut ConsentSurface,
     width: u32,
     height: u32,
 ) -> Vec<u8> {
+    // Prompt (scrim + frame + card) first; then the trusted band on top, so
+    // client content — and even the scrim — never sits over the one strip the
+    // human reads the session colour from.
     consent.composite_over(&mut view, width, height);
+    consent.composite_trust_band(&mut view, width, height);
     view
 }
 
@@ -74,8 +82,8 @@ pub(crate) fn human_visible_from_view(
 /// [`Scene::compose`] followed by [`human_visible_from_view`], for callers
 /// that do not separately need the bare realm view. It returns tightly packed
 /// RGBA8888, rows top-down, every pixel opaque — the same layout and the same
-/// contract as [`Scene::compose`], because with no prompt up it *is*
-/// [`Scene::compose`], byte for byte.
+/// contract as [`Scene::compose`], differing from it by the trusted band along
+/// the top edge (always) and the framed prompt (when one is up).
 ///
 /// **Not what capture serves.** [`crate::capture::render_frame`] is fed the
 /// realm view, never this. The headless backend keeps the two in separate

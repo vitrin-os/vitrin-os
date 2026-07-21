@@ -956,6 +956,30 @@ where
         },
     });
 
+    // Mint this session's trusted consent indicator (issue #85) before the
+    // backend below begins accepting connections: no client is running when
+    // the secret is chosen, so none can observe or derive it. Fail closed — a
+    // guessable trust colour would train a human to trust a forgeable frame,
+    // which is worse than no frame at all.
+    let indicator = match crate::consent::TrustedIndicator::generate() {
+        Ok(indicator) => indicator,
+        Err(err) => {
+            tracing::error!("fatal: cannot establish the consent trust indicator: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Deliberately logged WITHOUT its value. The confined realm runs as this
+    // core's uid (the SO_PEERCRED same-user policy), so anything written to
+    // stderr — or any file — is reachable by the app, directly or via
+    // `/proc/<pid>/fd`, and a trust colour the forger can read is no trust
+    // colour at all. The human learns it off the display vitrind owns: the
+    // reserved band and every genuine prompt's frame
+    // (`consent::ConsentSurface`), the one channel the app cannot follow.
+    tracing::info!(
+        "consent trust indicator established for this session; it is shown to \
+         the human only on vitrind's own display, never written to a log"
+    );
+
     // `PetitionConfig::default()` rather than new flags: issue #77 asks for
     // the registry to be *constructed from the parsed consent policy*, and
     // the defaults are the settled values in `petitions`' module docs. A
@@ -968,6 +992,7 @@ where
         grants: grants::GrantTable::new(),
         realms,
         recorder,
+        indicator,
     };
 
     let (mut recorder, result) = backend(seed);

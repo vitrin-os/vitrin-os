@@ -307,6 +307,28 @@ impl SeatDelivery {
         &self.kind
     }
 
+    /// The seat event kind as the stable label the flight recorder writes
+    /// ([`crate::recorder::Event::SeatDelivered`]): `motion`/`button`/
+    /// `scroll`/`key`/`text`. Shape only, deliberately no payload -- an audit
+    /// entry carrying keysyms or typed bytes would be a keylogger.
+    pub fn event_label(&self) -> &'static str {
+        match &self.kind {
+            SeatDeliveryKind::Motion { .. } => "motion",
+            SeatDeliveryKind::Button { .. } => "button",
+            SeatDeliveryKind::Scroll { .. } => "scroll",
+            SeatDeliveryKind::Key { .. } => "key",
+            SeatDeliveryKind::Text { .. } => "text",
+        }
+    }
+
+    /// The origin tag as the recorder's stable label: `physical` or
+    /// `emulated`. The tag is read straight off the delivery, never
+    /// recomputed (B2); the wire encoding keeps [`Origin`]'s own numbering
+    /// ([`Self::encode`]).
+    pub fn origin_label(&self) -> &'static str {
+        origin_label(self.origin)
+    }
+
     /// Encode as the corresponding `vitrin_shim_seat` event toward
     /// `seat_object_id`.
     ///
@@ -348,6 +370,45 @@ impl SeatDelivery {
             .encode(seat_object_id),
         }
     }
+}
+
+/// Project an [`Origin`] to the flight recorder's stable audit label. The one
+/// place the enum is mapped to the recorder vocabulary (`physical`/`emulated`),
+/// kept exhaustive with no catch-all so a future origin cannot be logged as an
+/// old one by default.
+pub(crate) fn origin_label(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Physical => "physical",
+        Origin::Emulated => "emulated",
+    }
+}
+
+/// Journal one delivered seat event with its origin (issue #83).
+///
+/// The **single funnel** both delivery paths call — `session::route_seat` for
+/// agent actuations and the nested backend's physical input — so the two
+/// cannot record the B2 audit differently, and one test (in this module)
+/// covers the code both run.
+///
+/// Pointer **motion is deliberately not journaled**. On the physical path it
+/// arrives at raw device rate with no chokepoint token bucket to bound it (an
+/// agent's actuations are rate-limited before they reach here; a human's are
+/// not), and a delivery's coordinates are never recorded anyway — only its kind
+/// and origin — so a per-event motion line would flood the recorder against its
+/// own bounded-write discipline while adding no auditable fact the surrounding
+/// button/scroll/key/text lines do not. The physical-vs-emulated distinction
+/// B2 exists for is carried in full by those discrete events.
+pub(crate) fn record_seat_delivery(
+    recorder: &mut crate::recorder::Recorder,
+    delivery: &SeatDelivery,
+) {
+    if matches!(delivery.kind(), SeatDeliveryKind::Motion { .. }) {
+        return;
+    }
+    recorder.record(crate::recorder::Event::SeatDelivered {
+        event: delivery.event_label(),
+        origin: delivery.origin_label(),
+    });
 }
 
 /// Verdict of [`PreemptionHook::gate`].
@@ -1900,6 +1961,87 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn every_delivery_labels_its_kind_and_origin_for_the_recorder() {
+        // The projection the flight recorder writes (issue #83,
+        // `recorder::Event::SeatDelivered`): every kind maps to its own
+        // stable label and every origin to its own. Over `Origin::ALL`, so an
+        // appended origin fails here loudly rather than being logged as an old
+        // one -- the same guard `every_delivery_kind_encodes_its_origin` puts
+        // on the wire, applied to the audit label.
+        for &origin in Origin::ALL {
+            let wrap = |kind: SeatInputKind| match origin {
+                Origin::Physical => SeatInput::physical(kind),
+                Origin::Emulated => SeatInput::emulated(kind),
+            };
+            let expected_origin = match origin {
+                Origin::Physical => "physical",
+                Origin::Emulated => "emulated",
+            };
+            let mut router = router();
+            let view = (64, 48);
+            let surface = Some((64, 48));
+            let mut deliver = |kind| {
+                router
+                    .route(wrap(kind), view, surface)
+                    .expect("routable by construction")
+            };
+
+            // Ordered as the router tolerates (a press leaves an implicit grab
+            // the rest ride), mirroring the encode test above.
+            for (kind, label) in [
+                (motion(1.0, 2.0), "motion"),
+                (press(), "button"),
+                (scroll(), "scroll"),
+                (
+                    SeatInputKind::Key {
+                        keysym: 0xff0d,
+                        state: KeyState::Pressed,
+                    },
+                    "key",
+                ),
+                (SeatInputKind::Text { text: "x".into() }, "text"),
+            ] {
+                let delivery = deliver(kind);
+                assert_eq!(delivery.event_label(), label);
+                assert_eq!(delivery.origin_label(), expected_origin);
+                // The free projection and the method agree, and neither leaks
+                // any payload -- label strings only.
+                assert_eq!(super::origin_label(delivery.origin()), expected_origin);
+            }
+        }
+    }
+
+    #[test]
+    fn recording_a_delivery_skips_motion_and_keeps_the_origin() {
+        // The funnel both delivery paths call (issue #83): a discrete event is
+        // journaled with its origin; pointer motion is not (raw device rate on
+        // the physical path, coordinates never recorded anyway — a per-event
+        // motion line would only flood the recorder). This is the code the
+        // nested backend's physical path runs, exercised here where routing is
+        // cheap.
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rec, path) = crate::recorder::tests::scratch_recorder("seat-delivery-funnel");
+        let mut router = router();
+        let view = (64, 48);
+        let surface = Some((64, 48));
+        let motion_delivery = router
+            .route(SeatInput::physical(motion(1.0, 2.0)), view, surface)
+            .expect("motion routes");
+        let button_delivery = router
+            .route(SeatInput::physical(press()), view, surface)
+            .expect("button routes");
+        super::record_seat_delivery(&mut rec, &motion_delivery);
+        super::record_seat_delivery(&mut rec, &button_delivery);
+
+        let entries = crate::recorder::tests::read_log(&path);
+        let delivered = crate::recorder::tests::of_kind(&entries, "seat_delivered");
+        assert_eq!(delivered.len(), 1, "motion is not journaled; the button is");
+        assert_eq!(delivered[0].str("event"), "button");
+        assert_eq!(delivered[0].str("origin"), "physical");
+        crate::recorder::tests::cleanup(&path);
+    }
+
     // ------------------------------------------------------------------
     // End-to-end: intake -> router -> ShimServer -> wire -> mock shim
     // ------------------------------------------------------------------
@@ -2165,7 +2307,9 @@ pub(crate) mod tests {
             Self {
                 router,
                 grab,
-                surface: crate::consent::ConsentSurface::new(),
+                surface: crate::consent::ConsentSurface::new(
+                    crate::consent::TrustedIndicator::for_test(),
+                ),
                 now,
                 spy,
                 recorder,
@@ -2695,7 +2839,9 @@ pub(crate) mod tests {
                 router,
                 grab,
                 deadman,
-                surface: crate::consent::ConsentSurface::new(),
+                surface: crate::consent::ConsentSurface::new(
+                    crate::consent::TrustedIndicator::for_test(),
+                ),
                 now,
                 spy,
                 recorder,

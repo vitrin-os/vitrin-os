@@ -159,6 +159,13 @@ pub(crate) struct RuntimeSeed {
     pub grants: GrantTable,
     pub realms: RealmRegistry,
     pub recorder: Recorder,
+    /// This session's trusted consent indicator (issue #85), minted at startup
+    /// before the listener accepts anyone. Carried here — the one thing
+    /// `run_session` hands the backend — so a single ceremony establishes it
+    /// and whichever backend runs frames its prompts in it. `Copy`, so reading
+    /// it out for the [`ConsentSurface`] takes nothing from the seed the
+    /// runtime consumes.
+    pub indicator: crate::consent::TrustedIndicator,
 }
 
 /// Everything one running session owns that is not presentation, living in
@@ -393,6 +400,10 @@ impl<H: PreemptionHook> Runtime<H> {
             grants,
             realms,
             recorder,
+            // Presentation state, not kernel state: the backend read it out of
+            // the seed (by `Copy`) into its `ConsentSurface` before handing the
+            // rest here, so the runtime deliberately drops it.
+            indicator: _,
         } = seed;
         Self {
             kernel: Kernel {
@@ -1199,6 +1210,13 @@ fn dispatch_principal<H: RuntimeHost>(
 /// and a human's — which is what makes the preemption hook meaningful. The
 /// origin tag rides the wire on every event and is never constructed or
 /// rewritten here (backward requirement B2): this path only addresses.
+///
+/// Every event that actually reaches the shim's seat is recorded, tagged with
+/// that origin ([`crate::recorder::Event::SeatDelivered`], issue #83): the
+/// unforgeable physical-vs-agent distinction the type system enforces is only
+/// investigable after an incident if the flight recorder wrote it down.
+/// Shape only — the kind and the tag, never coordinates, keysym, or typed
+/// bytes — so the audit entry can never become a keylogger.
 fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
     if seat.is_empty() {
         return;
@@ -1206,7 +1224,12 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
     let (runtime, view) = host.split();
     let view_size = view.view_size();
     let surface = view.scene().surface_size();
-    let Runtime { router, realm, .. } = runtime;
+    let Runtime {
+        router,
+        realm,
+        kernel,
+        ..
+    } = runtime;
     let Some(realm) = realm.as_mut() else {
         return;
     };
@@ -1219,12 +1242,23 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
             continue;
         };
         let mut send = |frame: &[u8]| outbox.send(frame);
-        if let Err(err) = server.deliver_seat_event(&delivery, &mut send) {
-            // The shim has stopped reading. Stop producing for it; the
-            // transport's own slow-reader policy kills the connection on the
-            // next dispatch, through the one funnel that classifies deaths.
-            tracing::warn!(%err, "seat delivery to the realm failed");
-            break;
+        match server.deliver_seat_event(&delivery, &mut send) {
+            // Recorded only when it went out (a seat the shim has not minted
+            // yet drops the event — nothing was delivered, so nothing is
+            // audited as delivered). One funnel with the physical path.
+            Ok(sent) => {
+                if sent {
+                    crate::input::record_seat_delivery(&mut kernel.recorder, &delivery);
+                }
+            }
+            Err(err) => {
+                // The shim has stopped reading. Stop producing for it; the
+                // transport's own slow-reader policy kills the connection on
+                // the next dispatch, through the one funnel that classifies
+                // deaths.
+                tracing::warn!(%err, "seat delivery to the realm failed");
+                break;
+            }
         }
     }
 }
@@ -1565,6 +1599,7 @@ mod tests {
                 grants: GrantTable::new(),
                 realms: crate::realm::tests::registry_with(&[crate::realm::WELL_KNOWN_REALM_ID]),
                 recorder,
+                indicator: crate::consent::TrustedIndicator::for_test(),
             };
             let event_loop: EventLoop<'static, TestHost> =
                 EventLoop::try_new().expect("event loop");
@@ -1575,7 +1610,7 @@ mod tests {
                     scene: Scene::new(),
                     redraws: 0,
                     posture: Presentation::Completed,
-                    consent: ConsentSurface::new(),
+                    consent: ConsentSurface::new(crate::consent::TrustedIndicator::for_test()),
                 },
                 handle: handle.clone(),
                 signal: event_loop.get_signal(),
@@ -2071,6 +2106,68 @@ mod tests {
                 entries.iter().map(|e| e.str("kind")).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// Issue #83: an event the core delivers to the shim's seat is journaled
+    /// with the origin intake bound (backward requirement B2). Until this
+    /// landed the flight recorder wrote nothing about seat delivery, so the
+    /// unforgeable physical-vs-agent tag was unauditable after the fact.
+    #[test]
+    fn a_delivered_seat_event_is_journaled_with_its_origin() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "seat-audit",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        // `--seat`: the shim mints its seat, so a routed event lands rather
+        // than dropping. Without a minted seat `deliver_seat_event` returns
+        // `Ok(false)` and nothing is journaled — the negative half of the
+        // contract, which is why the record sits behind `if sent`.
+        rig.start_realm(&["--serve", "--seat"]);
+        rig.pump_until(Duration::from_secs(10), |host| {
+            host.runtime
+                .realm
+                .as_ref()
+                .and_then(|r| r.server.as_ref())
+                .is_some_and(|s| s.seat_minted())
+        });
+
+        // Two agent-originated events through the production route. Text never
+        // needs a committed surface to route, so the seat mint is the only
+        // precondition; the origin travels unrewritten from `emulated` to the
+        // journal.
+        route_seat(
+            &mut rig.host,
+            vec![
+                SeatInput::emulated(crate::input::SeatInputKind::Text { text: "hi".into() }),
+                SeatInput::emulated(crate::input::SeatInputKind::Text {
+                    text: "there".into(),
+                }),
+            ],
+        );
+        shutdown_realm(&mut rig.host);
+
+        let entries = rig.entries();
+        let delivered = crate::recorder::tests::of_kind(&entries, "seat_delivered");
+        assert_eq!(
+            delivered.len(),
+            2,
+            "both delivered events must be journaled; got {:?}",
+            entries.iter().map(|e| e.str("kind")).collect::<Vec<_>>()
+        );
+        for e in delivered {
+            assert_eq!(e.str("event"), "text");
+            assert_eq!(e.str("origin"), "emulated", "the tag intake bound (B2)");
+        }
+        // The typed strings never reach the log: shape only, never a keylogger.
+        let raw = std::fs::read_to_string(&rig.log).unwrap();
+        assert!(
+            !raw.contains("there"),
+            "a delivery entry must not carry the typed text"
+        );
     }
 
     /// `pstree` in miniature, and the criterion it discharges: a spawned

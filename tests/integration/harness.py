@@ -325,3 +325,51 @@ def require_binaries() -> None:
             + ", ".join(missing)
             + "\nrun `cargo build --workspace` (run.sh does this for you)"
         )
+
+
+# -- shared agent-side helpers (used by more than one test module) ----------
+
+ALL_VERBS = ("observe", "actuate.pointer", "actuate.text")
+
+
+def whole_realm_grant(conn, verbs=ALL_VERBS):
+    """Petition for the MVP's one grant shape and wait it out.
+
+    `resource` is left empty deliberately: version 0 serves whole-realm grants
+    only and refuses any finer granularity as `Unsupported` — an honest refusal
+    rather than accepted-and-unenforced.
+    """
+    import vitrin_os
+
+    return conn.request_grant(
+        verbs=verbs, persistence=vitrin_os.Persistence.WHILE_RUNNING
+    ).await_consent()
+
+
+def capture_when_ready(grant, timeout=5.0, poll=0.02):
+    """The first capture of a freshly-served realm, tolerating the startup race.
+
+    A realm that has not yet committed and composited its first buffer has no
+    surface, and the core answers `observe` with `NoSurface` — the honest reply
+    the protocol prescribes, not a fault the agent could have prevented. So an
+    agent's *first* `observe()` can lose a race with the realm's first frame:
+    `await_consent()` returns the instant the grant resolves, which on a loaded
+    machine is before the shim has drawn (seen on CI as a `NoSurface`). The poll
+    model (D6, one fresh frame per call) is to retry, so this loops `observe()`
+    until a frame lands or the deadline passes.
+
+    A `NoSurface` refusal is judged *before* the token bucket (enforcement.rs),
+    so a retry costs no rate budget; only the one admitted capture that returns
+    consumes a token. That is why this doubles as the surface-ready barrier the
+    actuation tests warm the realm with before a rate-sensitive burst.
+    """
+    from vitrin_os import errors
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return grant.observe()
+        except errors.NoSurface:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(poll)

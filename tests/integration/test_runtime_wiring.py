@@ -15,51 +15,18 @@ import hashlib
 import time
 import unittest
 
-from harness import IntegrationTest, children_of, comm_of, require_binaries
+from harness import (
+    IntegrationTest,
+    capture_when_ready,
+    children_of,
+    comm_of,
+    require_binaries,
+    whole_realm_grant,
+)
 
 require_binaries()
 
-import vitrin_os  # noqa: E402  (needs PYTHONPATH, which run.sh sets)
-from vitrin_os import errors  # noqa: E402
-
-
-ALL_VERBS = ("observe", "actuate.pointer", "actuate.text")
-
-
-def whole_realm_grant(conn, verbs=ALL_VERBS):
-    """Petition for the MVP's one grant shape and wait it out.
-
-    `resource` is left empty deliberately: version 0 serves whole-realm
-    grants only and refuses any finer granularity as `Unsupported` — an
-    honest refusal rather than accepted-and-unenforced.
-    """
-    return conn.request_grant(
-        verbs=verbs, persistence=vitrin_os.Persistence.WHILE_RUNNING
-    ).await_consent()
-
-
-def capture_when_ready(grant, timeout=5.0, poll=0.02):
-    """The first capture of a freshly-served realm, tolerating the startup race.
-
-    A realm that has not yet committed and composited its first buffer has no
-    surface, and the core answers `observe` with `NoSurface` — the honest reply
-    the protocol prescribes (`docs/protocol/05`), not a fault the agent could
-    have prevented. So an agent's *first* `observe()` can lose a race with the
-    realm's first frame: `await_consent()` returns the instant the grant
-    resolves, which on a loaded machine is before the shim has drawn (seen on
-    CI as a `NoSurface` on this exact line). The poll model (D6, one fresh frame
-    per call) is to retry, so this loops `observe()` until a frame lands or the
-    deadline passes. A *later* capture — the realm is already composing — can
-    call `observe()` directly; this is only for the first one.
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            return grant.observe()
-        except errors.NoSurface:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(poll)
+from vitrin_os import errors  # noqa: E402  (needs PYTHONPATH, which run.sh sets)
 
 
 class EndToEnd(IntegrationTest):

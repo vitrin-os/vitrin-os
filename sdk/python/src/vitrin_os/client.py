@@ -417,8 +417,11 @@ class Grant(_Proxy):
         refusal = self._first_refusal(Verb.OBSERVE)
         if not view._frames and refusal is not None:
             self._refusals.remove(refusal)
+            # `self` is the grant the refused event was dispatched on, so
+            # self.id is its id — the same payload the actuation path carries
+            # (P1.8.3 criterion 3).
             raise refusal_error_by_code(
-                refusal.verb, refusal.code, refusal.retry_after_ms
+                refusal.verb, refusal.code, refusal.retry_after_ms, grant_id=self.id
             )
         return self._conn._verify_frame(view._frames.popleft())
 
@@ -607,7 +610,12 @@ class Connection:
         self._done_cookies.discard(cookie)
         if grant is not None and grant._refusals:
             first = grant._refusals.popleft()
-            exc = refusal_error_by_code(first.verb, first.code, first.retry_after_ms)
+            # The refused event is dispatched on the grant object, so grant.id
+            # is the id it names — carried into the exception for debugging
+            # (P1.8.3: "exceptions carry the protocol error payload").
+            exc = refusal_error_by_code(
+                first.verb, first.code, first.retry_after_ms, grant_id=grant.id
+            )
             while grant._refusals:
                 extra = grant._refusals.popleft()
                 exc.add_note(

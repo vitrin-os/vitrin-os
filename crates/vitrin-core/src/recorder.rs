@@ -1792,8 +1792,10 @@ impl Recorder {
     /// [`GrantTable::expire_due`](crate::grants::GrantTable::expire_due)
     /// just flipped, i.e. grants that died *without* a use and would
     /// otherwise appear in no entry at all. One call per sweep, so the
-    /// M1.1 calloop timer has exactly one recorder call shape and no loop
-    /// of its own; an empty sweep writes nothing.
+    /// runtime's armed calloop timer (`session::sweep`) has exactly one
+    /// recorder call shape and no loop of its own; an empty sweep writes
+    /// nothing, which is what lets that timer run every second without
+    /// turning a quiet session's log into a heartbeat file.
     pub fn record_expiry_sweep(&mut self, expired: &[GrantId]) {
         for &grant_id in expired {
             self.record(Event::GrantExpired { grant_id });

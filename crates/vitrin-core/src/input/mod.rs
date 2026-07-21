@@ -216,9 +216,12 @@ pub(crate) enum SeatInputKind {
     /// input-method text becomes its physical twin in a later phase).
     /// Constructed by the enforcement chokepoint's actuation intake
     /// (P1.4.4, [`crate::enforcement`]) — physical intake never produces
-    /// it. Dead-code-allowed outside tests until the M1.1 wiring makes
-    /// that intake runtime-reachable.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// it, and that asymmetry is the point: this variant is the wire's
+    /// text-actuation verb, so anything holding one is acting on an agent's
+    /// authority and must have passed the chokepoint to get it.
+    ///
+    /// Runtime-reachable since the M1.1 wiring: an agent's `actuate.text`
+    /// reaches `session::route_seat` and the shim's virtual seat.
     Text { text: String },
 }
 

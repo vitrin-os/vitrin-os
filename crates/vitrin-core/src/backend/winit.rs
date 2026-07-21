@@ -56,7 +56,9 @@ use crate::consent::grab::{ConsentGate, ConsentGrab};
 use crate::consent::ConsentSurface;
 use crate::deadman::{DeadManConfig, DeadManHook, DeadManSwitch, Trigger};
 use crate::input;
+use crate::recorder::Recorder;
 use crate::scene::Scene;
+use crate::session::{self, Runtime, RuntimeSeed};
 
 /// Initial logical window size; matches the planned headless default
 /// (`--headless --size 1280x800`, P1.3.2) so nested and headless views of
@@ -178,9 +180,15 @@ fn window_pixels(
     pixels
 }
 
-/// Per-run state of the nested backend: the winit window + GLES renderer
-/// pair, the realm's [`Scene`], and the currently uploaded view texture.
-struct NestedState {
+/// The nested backend's **presentation half**: the winit window + GLES
+/// renderer pair, the realm's [`Scene`], the consent surface, and the
+/// currently uploaded view texture.
+///
+/// Split out of [`NestedState`] for [`session::RuntimeHost::split`]: building
+/// a `ServerCtx` borrows the capability kernel mutably while the realm view
+/// borrows presentation state, so the two must be provably disjoint fields
+/// rather than one flat struct (see [`crate::session`]).
+pub(crate) struct NestedView {
     backend: WinitGraphicsBackend<GlesRenderer>,
     /// The realm's scene (P1.3.3) — the same composition implementation the
     /// headless backend retains for capture; this backend presents its
@@ -188,30 +196,33 @@ struct NestedState {
     /// (P1.3.4) commits into it and requests a redraw.
     scene: Scene,
     /// The consent surface (P1.7.1): the prompt composited above the realm
-    /// view in the host window. Always present; empty until something
-    /// raises a petition through [`ConsentGrab::raise`], which needs the
-    /// petition registry the M1.1 listener wiring constructs.
+    /// view in the host window. Always present, and still always empty at
+    /// runtime: the petition registry exists now, but nothing calls
+    /// [`ConsentGrab::raise`], so no prompt is ever raised.
     consent: ConsentSurface,
-    /// The input router (P1.3.7): host input tagged `physical` at intake
-    /// flows through it toward the realm's shim seat. Its preemption hook is
-    /// P1.7.2's consent grab wrapping P1.7.3's dead-man watcher — the
-    /// stacking the hook point was designed for, with no restructuring of
-    /// the router, and the exact shape [`crate::input`]'s docs predicted
-    /// (`ConsentGate<NoopHook>` became `ConsentGate<DeadManHook>`).
-    ///
-    /// Order matters and is deliberate: the watcher is **innermost**, so its
-    /// detection half rides `observe`, which `ConsentGate` forwards
-    /// unconditionally even for events it swallows whole. The off-switch
-    /// therefore keeps working while a consent prompt owns the screen.
-    router: input::InputRouter<ConsentGate<DeadManHook<input::NoopHook>>>,
+    texture: Option<SceneTexture>,
+}
+
+/// Per-run state of the nested backend: its presentation half, the session
+/// runtime, and the dead-man / consent wiring the host window feeds.
+pub(crate) struct NestedState {
+    view: NestedView,
+    /// The session runtime ([`crate::session`]): the core socket's listener,
+    /// every accepted principal connection, the capability kernel, and the
+    /// realm's shim session. It carries the router below rather than owning a
+    /// second one, so an agent's chokepoint-admitted actuations and a human's
+    /// physical input share one implicit-grab and pointer state — which is
+    /// what makes the preemption hook mean anything.
+    runtime: Runtime<ConsentGate<DeadManHook<input::NoopHook>>>,
     /// The consent input grab (P1.7.2), shared with the router's gate:
     /// while a prompt is up it owns physical input, and a click on one of
     /// the card's buttons becomes a petition decision here.
     ///
-    /// Live but idle. Nothing raises a prompt at runtime yet — that needs
-    /// the petition registry the M1.1 listener wiring constructs (issue
-    /// #77) — so this grab consumes nothing and produces no decisions in a
-    /// running `vitrind`. It is carried anyway, rather than attached later,
+    /// Live but idle. Nothing calls [`ConsentGrab::raise`] at runtime, so
+    /// this grab consumes nothing and produces no decisions in a running
+    /// `vitrind` — the last gap between a consent surface that is
+    /// implemented and one that is reachable. It is carried anyway, rather
+    /// than attached later,
     /// because the alternative is a window in which a prompt could be shown
     /// with no grab behind it.
     grab: Rc<RefCell<ConsentGrab>>,
@@ -227,18 +238,15 @@ struct NestedState {
     /// hook: the chord's hold state, the completed-chord trigger, and the
     /// hold indicator's progress.
     ///
-    /// Live and really running — the chord is watched, the timer is armed,
-    /// and a completed hold fires. What a completed hold cannot yet *do* is
-    /// revoke anything: nothing constructs a grant table or a petition
-    /// registry until the M1.1 listener wiring (issue #77), so
-    /// [`NestedState::deadman_tick`] logs the trigger and drops it. See
-    /// [`crate::deadman`]'s "what is mechanism-only" section, including why
-    /// the flight recorder is not threaded in here to close the gap early.
+    /// Live and whole — the chord is watched, the timer is armed, a
+    /// completed hold fires, and the trigger now reaches
+    /// [`crate::deadman::apply`] against this session's real grant table and
+    /// petition registry (see [`DeadManHost::on_trigger`]), rather than
+    /// being logged and dropped.
     deadman: Rc<RefCell<DeadManSwitch>>,
     /// Whether a one-shot timer is outstanding for the armed hold, so an
     /// arming keypress does not insert a fresh calloop source per event.
     deadman_timer_armed: bool,
-    view: Option<SceneTexture>,
     loop_signal: LoopSignal,
     loop_handle: LoopHandle<'static, NestedState>,
     /// Set when a render failure stops the loop, so [`run`] can propagate
@@ -253,17 +261,64 @@ struct NestedState {
 /// `dead_man` is the session's off-switch policy, already validated by
 /// argument parsing (an unusable chord is a startup error, never a switch
 /// that quietly cannot fire).
-pub fn run(dead_man: DeadManConfig) -> Result<(), Box<dyn Error>> {
+///
+/// # What the M1.1 runtime wiring added
+///
+/// The loop now also carries the core socket's listener, every accepted
+/// principal connection, the realm's shim socketpair, and the expiry sweep
+/// ([`crate::session`]). The recorder travels through here rather than
+/// staying in `run_session` because calloop fixes one state type per loop and
+/// the whole capability kernel — the recorder with it — has to live in that
+/// state; it is handed straight back so the run's footer is still written by
+/// the code that opened the log.
+///
+/// **Nested mode cannot serve captures.** This backend is EGL/GLES-bound and
+/// retains no readable image, so [`session::Presenter::view_rgba`] is `None`
+/// here and `vitrin_view.frame_ready` is refused rather than answered with
+/// invented pixels. Everything else — petitions, consent, actuation — works
+/// identically to headless. Stated here because it is a property of the
+/// backend, not a bug in the wiring.
+pub fn run(dead_man: DeadManConfig, seed: RuntimeSeed) -> (Recorder, Result<(), Box<dyn Error>>) {
+    // The seed is consumed the moment the state is built; until then it is
+    // still ours, and either way the recorder must come back so `run_session`
+    // can write the footer it owes. Threading it through two slots keeps `?`
+    // usable for every startup step below instead of turning each into a
+    // four-line `match`.
+    let mut seed = Some(seed);
+    let mut recovered = None;
+    let result = run_inner(dead_man, &mut seed, &mut recovered);
+    let recorder = recovered
+        .or_else(|| seed.take().map(|seed| seed.recorder))
+        .expect("the seed is either still unconsumed or its recorder was recovered");
+    (recorder, result)
+}
+
+fn run_inner(
+    dead_man: DeadManConfig,
+    seed: &mut Option<RuntimeSeed>,
+    recovered: &mut Option<Recorder>,
+) -> Result<(), Box<dyn Error>> {
     let mut event_loop: EventLoop<'static, NestedState> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
-    // Signal source first (single-threaded process, so the mask is set
-    // before anything else runs): SIGINT/SIGTERM stop the loop cleanly.
+    // Signal sources first, and this is the backend the ordering was written
+    // for: the process is still single-threaded here, but Smithay's winit/EGL
+    // stack below really does spawn threads, and `signalfd` only sees a
+    // signal that is blocked on **every** thread. Install either of these
+    // after `init_from_attributes_with_gl_attr` and the mask misses those
+    // threads — for SIGCHLD that means a realm's exit is never noticed, with
+    // nothing logged to say so.
     let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM])?;
     loop_handle.insert_source(signals, |event, _, state| {
         info!(signal = ?event.signal(), "shutdown signal received");
         state.loop_signal.stop();
     })?;
+    // SIGCHLD: the realm's shim exiting. A hint only — it says some child
+    // changed state, never which — so the handler asks `waitpid`.
+    loop_handle.insert_source(
+        crate::lifecycle::child_signal_source()?,
+        |_event, _, state: &mut NestedState| session::reap_realm(state),
+    )?;
 
     // vsync on (Smithay's default is off): each frame chains the next via
     // `request_redraw`, and the blocking swap paces that chain to the
@@ -289,8 +344,8 @@ pub fn run(dead_man: DeadManConfig) -> Result<(), Box<dyn Error>> {
             debug!(?size, "host window resized");
             // Drop the uploaded view; the next redraw recomposes it 1:1 at
             // the new size (kept pixel-exact for the P1.3.2/P1.3.6 goldens).
-            state.view = None;
-            state.backend.window().request_redraw();
+            state.view.texture = None;
+            state.view.backend.window().request_redraw();
         }
         WinitEvent::CloseRequested => {
             info!("host window close requested");
@@ -314,20 +369,26 @@ pub fn run(dead_man: DeadManConfig) -> Result<(), Box<dyn Error>> {
         hold_ms = dead_man.hold.as_millis(),
         "dead-man switch armed: holding this key revokes every grant in the session"
     );
+    let router = input::InputRouter::new(ConsentGate::new(
+        Rc::clone(&grab),
+        Rc::clone(&now),
+        DeadManHook::new(Rc::clone(&deadman), Rc::clone(&now), input::NoopHook),
+    ));
     let mut state = NestedState {
-        backend,
-        scene: Scene::new(),
-        consent: ConsentSurface::new(),
-        router: input::InputRouter::new(ConsentGate::new(
-            Rc::clone(&grab),
-            Rc::clone(&now),
-            DeadManHook::new(Rc::clone(&deadman), Rc::clone(&now), input::NoopHook),
-        )),
+        view: NestedView {
+            backend,
+            scene: Scene::new(),
+            consent: ConsentSurface::new(),
+            texture: None,
+        },
+        runtime: Runtime::new(
+            seed.take().expect("the seed is consumed exactly once"),
+            router,
+        ),
         grab,
         now,
         deadman,
         deadman_timer_armed: false,
-        view: None,
         loop_signal: event_loop.get_signal(),
         loop_handle: event_loop.handle(),
         fatal: None,
@@ -337,12 +398,45 @@ pub fn run(dead_man: DeadManConfig) -> Result<(), Box<dyn Error>> {
     // so presentation is paced by the host compositor (60 Hz on a 60 Hz
     // host — winit redraws on Wayland are frame-callback driven), with
     // FRAME_BUDGET as the floor when the host doesn't throttle swaps.
-    state.backend.window().request_redraw();
+    state.view.backend.window().request_redraw();
 
-    event_loop.run(None, &mut state, |_| {})?;
-    if let Some(err) = state.fatal.take() {
+    // Every runtime source goes in before the loop starts, and before
+    // anything spawns a realm: a shim whose socketpair is not being serviced
+    // wedges permanently (see `session::install`).
+    if let Err(err) = session::install(&loop_handle, &mut state.runtime) {
+        *recovered = Some(state.runtime.into_recorder());
         return Err(err);
     }
+
+    // The realm, only now: `install` has put the listener and the sweeps on
+    // the loop, so it is ready to service the shim's socketpair, and
+    // `event_loop.run` is the very next statement. Spawning before the reader
+    // exists wedges the shim permanently rather than slowly — it blocks on
+    // `configure` with no timeout on its side (trap T1).
+    if let Err(err) = session::start_realm(&mut state) {
+        error!("fatal: cannot start the session's realm: {err}");
+        *recovered = Some(state.runtime.into_recorder());
+        return Err(err);
+    }
+
+    let outcome = event_loop
+        .run(None, &mut state, session::post_dispatch)
+        .map_err(|err| Box::new(err) as Box<dyn Error>)
+        .and_then(|()| match state.fatal.take() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        });
+    // The shutdown ladder, after the loop has stopped and before the recorder
+    // is handed back: it blocks by design, so it must not run inside a live
+    // compositor loop, and its `realm_died` / `realm_exited` entries belong to
+    // this run. The event loop is still alive in this scope, which is what
+    // lets rung 0 retire the shim connection's registration.
+    session::shutdown_realm(&mut state);
+
+    // Recovered before the early return below, so a fatal run still returns
+    // the recorder that must write the footer naming it.
+    *recovered = Some(state.runtime.into_recorder());
+    outcome?;
     info!("event loop stopped, shutting down");
     Ok(())
 }
@@ -367,9 +461,9 @@ pub(crate) trait DeadManHost {
     /// Whether a one-shot timer is already outstanding, so an arming keypress
     /// does not insert a fresh calloop source per event.
     fn timer_armed(&mut self) -> &mut bool;
-    /// Dispose of one completed chord. The nested backend logs it (there is
-    /// no grant table in this process yet, issue #77); the M1.1 embedder will
-    /// call [`crate::deadman::apply`].
+    /// Dispose of one completed chord. The nested backend applies it to the
+    /// session's real authority through
+    /// [`crate::session::Runtime::apply_dead_man`]; a test host counts it.
     fn on_trigger(&mut self, trigger: Trigger);
 }
 
@@ -495,18 +589,15 @@ impl DeadManHost for NestedState {
         &mut self.deadman_timer_armed
     }
 
+    /// The off-switch really revokes now.
+    ///
+    /// Until the runtime wiring landed there was no grant table in this
+    /// process, so a completed chord could only be logged; that gap is closed
+    /// here, through [`Runtime::apply_dead_man`], which revokes every grant,
+    /// denies every pending petition, seals the table against a decision
+    /// already in flight, and delivers each denial to its petitioner.
     fn on_trigger(&mut self, trigger: Trigger) {
-        // Honest gap, stated where it happens: `crate::deadman::apply` wants
-        // the session's grant table and petition registry, and nothing
-        // constructs either until issue #77. The switch really completed --
-        // it is `warn!`-logged by `fire_if_due` itself -- there is simply no
-        // authority in this process to revoke.
-        error!(
-            chord = trigger.chord,
-            held_ms = trigger.held.as_millis(),
-            "dead-man chord completed, but this build has no grant table to revoke: the \
-             M1.1 listener wiring (issue #77) is what constructs one. NOTHING WAS REVOKED."
-        );
+        self.runtime.apply_dead_man(&trigger, Instant::now());
     }
 }
 
@@ -525,7 +616,7 @@ impl NestedState {
     /// `ShimServer::deliver_seat_event` → wire path is exercised
     /// end-to-end by `crate::input`'s tests against the mock shim.
     fn handle_input(&mut self, event: &smithay::backend::input::InputEvent<WinitInput>) {
-        let size = self.backend.window_size();
+        let size = self.view.backend.window_size();
         let view = (size.w.max(0) as u32, size.h.max(0) as u32);
         // The consent grab hit-tests in this same view space, so it is fed
         // from this same local, on the line before the route that uses it.
@@ -541,19 +632,33 @@ impl NestedState {
         self.now.set(Instant::now());
         // Route this turn's events, then drain the dead-man watcher's replay
         // (see `route_turn`, which owns both halves so they can be tested).
+        let surface = self.view.scene.surface_size();
+        // Disjoint field borrows: the router is handed to `route_turn` while
+        // the delivery sink below reaches the realm's shim session. Both are
+        // fields of the same `Runtime`, so they are split here rather than
+        // reached through `&mut self` twice.
+        let session::Runtime { router, realm, .. } = &mut self.runtime;
         route_turn(
-            &mut self.router,
+            router,
             &self.deadman,
             input::intake_physical(event, (size.w, size.h)),
             view,
-            self.scene.surface_size(),
+            surface,
             &mut |delivery| {
-                // P1.5.2 hands this to ShimServer::deliver_seat_event on
-                // the realm's live connection.
-                trace!(
-                    origin = ?delivery.origin(),
-                    "routed input dropped: no shim connection yet (P1.5.2)"
-                );
+                // Physical input reaches the realm's seat over the same
+                // outbox an agent's chokepoint-admitted actuation uses; the
+                // origin tag bound at intake rides the wire unchanged (B2).
+                let Some(realm) = realm.as_ref() else {
+                    trace!(origin = ?delivery.origin(), "routed input dropped: no realm attached");
+                    return;
+                };
+                let Some(server) = realm.server.as_ref() else {
+                    return;
+                };
+                let mut send = |frame: &[u8]| realm.outbox.send(frame);
+                if let Err(err) = server.deliver_seat_event(&delivery, &mut send) {
+                    tracing::warn!(%err, "seat delivery to the realm failed");
+                }
             },
         );
         // Backstop 2 of 3 for the elapse check (`crate::deadman`): the
@@ -642,19 +747,41 @@ impl NestedState {
         if self.deadman.borrow().deadline().is_some() {
             self.deadman_tick();
         }
-        if let Err(err) = self.try_redraw() {
-            error!("render failed, shutting down: {err}");
-            self.fatal = Some(err);
-            self.loop_signal.stop();
+        match self.try_redraw() {
+            // The composite landed, so the realm's owed frame callbacks are
+            // due now. This is the other half of `Presenter::redraw`'s
+            // `Scheduled` answer: the runtime deliberately did not emit them
+            // at request time, because on this backend a requested redraw is
+            // not a drawn one, and telling a paced shim otherwise would let it
+            // run unthrottled.
+            Ok(session::Presentation::Completed) => session::emit_presented(&mut self.runtime),
+            // A zero-sized (minimized) window draws nothing. The callbacks
+            // stay owed — which is the point of distinguishing the two: this
+            // path returns `Ok` and must still not tell the shim a frame was
+            // presented. `schedule_next_frame` is not reached either, so the
+            // next composite comes from the resize, and it discharges them.
+            Ok(session::Presentation::Scheduled) => {}
+            Err(err) => {
+                error!("render failed, shutting down: {err}");
+                self.fatal = Some(err);
+                self.loop_signal.stop();
+            }
         }
     }
 
-    fn try_redraw(&mut self) -> Result<(), Box<dyn Error>> {
+    /// Draw one frame, reporting whether a composite actually happened.
+    ///
+    /// The return is load-bearing rather than informational: [`Self::redraw`]
+    /// discharges the realm's owed `frame_done` on
+    /// [`session::Presentation::Completed`] only, so a path that returns `Ok`
+    /// without drawing must say so. Today that is the minimized window.
+    fn try_redraw(&mut self) -> Result<session::Presentation, Box<dyn Error>> {
         let frame_start = Instant::now();
-        let size = self.backend.window_size();
+        let size = self.view.backend.window_size();
         if size.w <= 0 || size.h <= 0 {
             // Zero-sized (e.g. minimized) window: skip, resize will redraw.
-            return Ok(());
+            // Nothing was composited, so the frame callbacks stay owed.
+            return Ok(session::Presentation::Scheduled);
         }
 
         // Re-upload when the window size, the scene content, or the consent
@@ -670,25 +797,25 @@ impl NestedState {
         // `the_texture_key_changes_on_every_visible_transition` was written
         // for, now with a third input).
         let hold = self.deadman.borrow().hold_progress(Instant::now());
-        let key = TextureKey::current(size, &self.scene, &self.consent, hold);
-        if self.view.as_ref().map(|v| v.key) != Some(key) {
-            let pixels = window_pixels(&self.scene, &mut self.consent, hold, size);
+        let key = TextureKey::current(size, &self.view.scene, &self.view.consent, hold);
+        if self.view.texture.as_ref().map(|v| v.key) != Some(key) {
+            let pixels = window_pixels(&self.view.scene, &mut self.view.consent, hold, size);
             let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
-            let texture = self.backend.renderer().import_memory(
+            let texture = self.view.backend.renderer().import_memory(
                 &pixels,
                 Fourcc::Abgr8888,
                 buffer_size,
                 false,
             )?;
-            self.view = Some(SceneTexture { texture, key });
+            self.view.texture = Some(SceneTexture { texture, key });
         }
 
         let full_window = Rectangle::from_size(size);
         {
-            // Field-level borrows: `bind` holds `self.backend` mutably while
-            // the view texture is read from `self.view`.
-            let view = self.view.as_ref().expect("view composed above");
-            let (renderer, mut framebuffer) = self.backend.bind()?;
+            // Field-level borrows: `bind` holds `self.view.backend` mutably while
+            // the view texture is read from `self.view.texture`.
+            let view = self.view.texture.as_ref().expect("view composed above");
+            let (renderer, mut framebuffer) = self.view.backend.bind()?;
             let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
             frame.clear(CLEAR_COLOR, &[full_window])?;
             // Qualified call: GlesFrame has an inherent method of the same
@@ -710,10 +837,10 @@ impl NestedState {
         }
         // Full-frame submit; damage tracking becomes worthwhile once client
         // damage arrives over the shim protocol (P1.3.4).
-        self.backend.submit(None)?;
+        self.view.backend.submit(None)?;
         trace!(?size, "frame submitted");
         self.schedule_next_frame(frame_start)?;
-        Ok(())
+        Ok(session::Presentation::Completed)
     }
 
     /// Chain the next redraw. If the swap blocked for at least
@@ -724,17 +851,109 @@ impl NestedState {
     fn schedule_next_frame(&mut self, frame_start: Instant) -> Result<(), Box<dyn Error>> {
         let elapsed = frame_start.elapsed();
         if elapsed >= FRAME_BUDGET {
-            self.backend.window().request_redraw();
+            self.view.backend.window().request_redraw();
         } else {
             let timer = Timer::from_duration(FRAME_BUDGET - elapsed);
             self.loop_handle
                 .insert_source(timer, |_deadline, _, state| {
-                    state.backend.window().request_redraw();
+                    state.view.backend.window().request_redraw();
                     TimeoutAction::Drop
                 })
                 .map_err(|err| err.error)?;
         }
         Ok(())
+    }
+}
+
+impl session::RuntimeHost for NestedState {
+    type Hook = ConsentGate<DeadManHook<input::NoopHook>>;
+    type View = NestedView;
+
+    fn split(&mut self) -> (&mut Runtime<Self::Hook>, &mut NestedView) {
+        (&mut self.runtime, &mut self.view)
+    }
+
+    fn loop_handle(&self) -> LoopHandle<'static, Self> {
+        self.loop_handle.clone()
+    }
+
+    fn stop(&mut self, fatal: Option<Box<dyn Error>>) {
+        self.fatal = fatal;
+        self.loop_signal.stop();
+    }
+}
+
+impl session::Presenter for NestedView {
+    fn scene(&mut self) -> &mut Scene {
+        &mut self.scene
+    }
+
+    fn view_size(&self) -> (u32, u32) {
+        let size = self.backend.window_size();
+        (size.w.max(0) as u32, size.h.max(0) as u32)
+    }
+
+    /// Composites nothing, and deliberately so: this backend does not own its
+    /// frame clock — so it answers [`session::Presentation::Scheduled`] and
+    /// the realm's `frame_done` stays owed.
+    ///
+    /// The host compositor owns the clock. A composite here would present a
+    /// frame the host never asked for, outside `FRAME_BUDGET`, and would race
+    /// the redraw chain `schedule_next_frame` maintains. The runtime's
+    /// once-per-round dirty flag instead becomes a `request_redraw` in
+    /// [`session::Presenter::request_present`], and the host drives the
+    /// actual composite through `WinitEvent::Redraw` as it always has.
+    ///
+    /// **The debt this creates is discharged in [`NestedState::redraw`]**,
+    /// which calls [`session::emit_presented`] after `try_redraw` has actually
+    /// drawn. Returning `Completed` here instead would be the silent pacing
+    /// bug [`session::Presentation`] documents: the shim would be handed a
+    /// frame callback per dispatch round with no composite between them, and a
+    /// client that paces on `frame_done` would stop pacing.
+    fn redraw(&mut self) -> Result<session::Presentation, Box<dyn Error>> {
+        Ok(session::Presentation::Scheduled)
+    }
+
+    /// Always `None`: the nested backend has no readback path.
+    ///
+    /// It renders through EGL/GLES straight into the host's window and
+    /// retains no readable image — there is no `ExportMem` bind, no
+    /// `copy_framebuffer`, nothing to map. So `vitrin_view.frame_ready` is
+    /// refused under `--nested` by the chokepoint's existing `no_surface`
+    /// judgement.
+    ///
+    /// That refusal is the right answer rather than a stopgap. The
+    /// alternatives are worse in the specific way this codebase refuses:
+    /// returning a zeroed buffer would hand an agent pixels it would read as
+    /// the realm's actual content, and reading back the *human-visible*
+    /// image would put the consent overlay into every capture — the one
+    /// thing `docs/protocol/05-vitrin_consent.md` forbids outright.
+    /// Nested mode is the mode a human watches; headless is the mode CI and
+    /// agents capture from.
+    fn view_rgba(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn request_present(&mut self) {
+        self.backend.window().request_redraw();
+    }
+
+    /// The scene, and `None` for the retained half.
+    ///
+    /// Nested composites straight into the host compositor's surface and
+    /// keeps no readable image of its own, so there is nothing to scrub — a
+    /// dead realm leaves no stale pixels here for the same reason
+    /// [`Self::view_rgba`] can serve none. Worth stating rather than
+    /// leaving as an absence: it means nested has no stale-frame defense in
+    /// depth, which costs nothing only because nested refuses captures
+    /// outright.
+    fn teardown_view(
+        &mut self,
+    ) -> (
+        &mut Scene,
+        Option<&mut dyn crate::lifecycle::RetainedOutput>,
+    ) {
+        (&mut self.scene, None)
     }
 }
 

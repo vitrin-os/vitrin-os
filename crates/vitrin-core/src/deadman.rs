@@ -252,29 +252,26 @@
 //! configuration trap, which is the class of bug [`crate::realm`]'s loader
 //! refuses for the same reason.
 //!
-//! # What is mechanism-only, pending the M1.1 listener wiring (issue #77)
+//! # The switch is whole in nested mode
 //!
-//! Nothing constructs a [`GrantTable`] or a [`PetitionRegistry`] at runtime,
-//! so a running `vitrind` has no authority to revoke. What *is* live in the
-//! nested backend today, and really runs: the chord is watched at the router's
-//! hook point, the timer is armed and fires, [`DeadManSwitch::fire_if_due`]
-//! completes the chord, and the hold indicator is painted — and each of those
-//! is driven **through the backend's own code** by
-//! [`crate::backend::winit`]'s tests, not through a re-typed copy of it, so
-//! deleting any of them fails the suite. What is not live: the [`apply`] call
-//! that turns a completed chord into revoked rows, denied petitions and a
-//! sealed table, because there is nothing yet for it to act on — a trigger
-//! with no table logs loudly and does nothing else. [`apply`] is exercised end
-//! to end by this module's tests against a real table, a real registry, a real
-//! chokepoint and a real flight recorder.
+//! It was mechanism-only until the runtime wiring: there was no
+//! [`GrantTable`] and no [`PetitionRegistry`] in the process, so a completed
+//! chord logged loudly and revoked nothing. Both now exist for the session's
+//! whole life, and a completed chord reaches [`apply`] through
+//! `session::Runtime::apply_dead_man` — revoking every grant, denying every
+//! pending petition, sealing the table against a decision already in flight,
+//! and delivering each denial to its petitioner over the wire.
 //!
-//! The recorder is deliberately *not* threaded into the backend to close
-//! that gap early. It cannot be: `NestedState` is the `Data` type of a
-//! `calloop::EventLoop<'static, _>` and stores a `LoopHandle<'static, Self>`,
-//! so it cannot borrow a `&mut Recorder` from the session. That is a real
-//! signal about ownership rather than an obstacle to work around — the
-//! recorder belongs to the session layer that will also own the grant table,
-//! which is issue #77's, and the two arrive together or not at all.
+//! The ownership argument the previous gap rested on is what made that
+//! possible rather than something worked around: the recorder was never
+//! threaded into the backend, precisely because it belongs to the session
+//! layer that also owns the grant table. That layer is `crate::session`, and
+//! the backend reaches all three through it, borrowing nothing.
+//!
+//! **Headless has no chord**, structurally: no physical input device exists
+//! there, so nothing can hold a key. The off-switch is a nested-mode
+//! guarantee, which is also why it cannot be covered on a GPU-less CI
+//! runner.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -514,9 +511,9 @@ pub(crate) struct Trigger {
 /// What one trigger actually did, returned by [`apply`] so the embedder can
 /// deliver the protocol terminals it owes.
 ///
-/// Dead-code-allowed outside tests for the reason the module docs give in
-/// full: the *switch* is live in the nested backend, but nothing constructs
-/// a grant table to apply a completed chord to until issue #77.
+/// Dead-code-allowed outside tests only because its two fields are read by
+/// tests and by the nested backend's trigger disposal, which headless never
+/// compiles a caller for.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default)]
 pub(crate) struct DeadManEffect {
@@ -928,11 +925,17 @@ impl DeadManSwitch {
 /// indistinguishable from one where they never hit it, and "the switch
 /// works" would be unverifiable from the log.
 ///
-/// Dead-code-allowed outside tests, and this is the whole of P1.7.3's
-/// mechanism-only surface: the caller is the M1.1 listener embedder (issue
-/// #77), which is what owns a [`GrantTable`], a [`PetitionRegistry`] and the
-/// run's [`Recorder`] together. Exercised end to end here against all three.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Called at runtime through `session::Runtime::apply_dead_man`, which is
+/// what owns a [`GrantTable`], a [`PetitionRegistry`] and the run's
+/// [`Recorder`] together; the nested backend's trigger disposal reaches it
+/// from there. Exercised end to end here against all three.
+///
+/// No `allow(dead_code)`: `backend::winit` is compiled unconditionally, so
+/// the production caller exists in every build — including the
+/// `--headless`-only one, which simply never reaches it for want of a
+/// physical input device to hold a chord on. An attribute here would silence
+/// the warning that a future refactor dropping that caller is meant to
+/// produce.
 pub(crate) fn apply(
     trigger: &Trigger,
     grants: &mut GrantTable,

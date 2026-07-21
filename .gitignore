@@ -1,6 +1,11 @@
 /target
 **/target
 
+# Python bytecode from the integration harness (tests/integration/) and any
+# other stray interpreter runs. The sdk/ tree has its own .gitignore for this.
+__pycache__/
+*.pyc
+
 # Meson build output for the C+wlroots shim (shim/, outside the Cargo workspace).
 /shim/build*/
 # Everything under subprojects/ is generated -- downloaded checkouts, the

@@ -206,10 +206,30 @@
 //!   this realm, so anything at the path belongs to a run that is gone.
 //!   Losing it means a second `vitrind` is serving this realm right now, and
 //!   the spawn is refused ([`SpawnError::RealmBusy`]) instead of deleting a
-//!   live run's socket directory out from under it -- which is precisely
-//!   what the previous "the listener's `flock` guard enforces one core per
-//!   tree" justification permitted, because **nothing in the core
-//!   constructs a `Listener`**, so that lock was never held by anybody.
+//!   live run's socket directory out from under it.
+//!
+//!   **There are now two locks, and this one is not redundant.** Since the
+//!   M1.1 runtime wiring the core really does bind a `Listener`, so the
+//!   tree-level `core.sock.lock` is finally held by somebody -- which
+//!   retires the old note that it was a justification resting on a lock
+//!   nobody took. The tempting inverse conclusion is wrong: the tree lock
+//!   cannot replace this one. Their **lifetimes are independent**: the
+//!   listener lives inside the event loop, and realm teardown -- the
+//!   shutdown ladder's hangup, `SIGTERM`, `SIGKILL`, directory removal --
+//!   is a separate step ordered against it only by where the calls happen
+//!   to sit. Today `session::shutdown_realm` runs after `event_loop.run`
+//!   returns but while the loop object is still alive, so the tree lock
+//!   does outlast the teardown -- by arrangement, not by construction, and
+//!   nothing would fail loudly if that arrangement changed. A realm
+//!   directory being recursively deleted must not depend on an unrelated
+//!   lock's scope for its safety, which is why this lock exists and why
+//!   `into_parts` releases it last of all. Their
+//!   **objects differ**: the tree lock guards a socket path and its worst
+//!   unlicensed act is unlinking one socket, whereas this one licenses a
+//!   *recursive delete*, and a lock should never be coarser than the
+//!   destruction it authorizes. And their **granularity differs**: one core
+//!   with N realms is the intended shape, which a per-realm lock survives
+//!   and a per-tree lock does not.
 //!   Reusing a stale directory instead of purging is not an option either:
 //!   it would carry a dead run's socket file and scratch into a new run's
 //!   confinement.
@@ -384,6 +404,11 @@ impl SpawnPaths {
 
     /// A runtime tree rooted at an explicit base (tests, and any future
     /// caller that must not depend on ambient environment).
+    ///
+    /// The runtime uses [`Self::from_env`]; this exists so a spawn can be
+    /// driven against a scratch tree without mutating the process
+    /// environment, which a single-process test suite cannot do safely.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn under(xdg_runtime_dir: impl Into<PathBuf>) -> Self {
         Self {
             xdg_runtime_dir: xdg_runtime_dir.into(),
@@ -447,6 +472,9 @@ impl GuardedChild {
             .expect("the child is present until released")
     }
 
+    /// Test-only: the runtime reaches the child through
+    /// [`SpawnedRealm::into_parts`] and `RealmLifecycle`, never directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn get_mut(&mut self) -> &mut Child {
         self.0
             .as_mut()
@@ -525,16 +553,23 @@ impl SpawnedRealm {
         &self.runtime_dir
     }
 
-    /// The core's end of the identity socketpair, for the event loop to
-    /// register (`AsFd`) and dispatch.
+    /// The core's end of the identity socketpair.
+    ///
+    /// Test-only: the runtime never touches the connection here. It sends
+    /// `configure` through [`Self::start_shim_session`] and then moves the
+    /// whole realm on with [`Self::into_parts`], so the connection reaches
+    /// the event loop by ownership rather than by borrow — which is what
+    /// keeps exactly one core-side descriptor in existence.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn connection_mut(&mut self) -> &mut Connection {
         &mut self.connection
     }
 
-    /// The process handle, unreaped. Exposed so [`crate::lifecycle`] --
-    /// and, today, this module's tests -- can terminate and wait
-    /// deterministically. This module implements no lifecycle policy of its
-    /// own.
+    /// The process handle, unreaped. Exposed so this module's tests can
+    /// terminate and wait deterministically; this module implements no
+    /// lifecycle policy of its own, and at runtime the handle goes to
+    /// `RealmLifecycle` through [`Self::into_parts`] instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn child_mut(&mut self) -> &mut Child {
         self.child.get_mut()
     }

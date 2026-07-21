@@ -1096,6 +1096,14 @@ pub(crate) mod tests {
     /// are testing addressing, not the version-0 cardinality rule (which
     /// [`RealmRegistry::from_specs`] enforces and this module's own tests
     /// cover).
+    /// A registry holding exactly these realms, however they were built.
+    /// [`registry_with`] is the id-only shorthand over it.
+    pub(crate) fn registry_of(realms: Vec<Realm>) -> RealmRegistry {
+        RealmRegistry {
+            realms: realms.into_iter().map(|r| (r.id.clone(), r)).collect(),
+        }
+    }
+
     pub(crate) fn registry_with(ids: &[&str]) -> RealmRegistry {
         RealmRegistry {
             realms: ids

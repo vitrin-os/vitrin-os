@@ -131,29 +131,30 @@
 //! (`buffer_done` with a failure status) still receives its `frame_done`,
 //! per the IDL — the app's pacing loop never stalls on a rejected buffer.
 //!
-//! # Wiring (today: the test harness; at runtime: P1.5.2)
+//! # Wiring
 //!
-//! Like [`crate::capture`], this module ships the protocol machine, not the
-//! live wiring: nothing at runtime hands `vitrind` a shim connection until
-//! the realm spawn manager (P1.5.2) inherits the socketpair at fork. The
-//! calloop wiring pattern is exercised end-to-end by the tests in
-//! [`crate::backend::headless`]: a [`ConnectionSource`]
-//! (vitrin_ipc::ConnectionSource) dispatch calls [`ShimServer::handle_message`],
-//! redraws on commit, then calls [`ShimServer::presented`] — with a real
-//! mock shim (`vitrin-mock-shim`, the permanent fixture) on the other end
-//! of the socketpair.
+//! Fully wired. [`crate::session::start_realm`] forks the realm's shim,
+//! sends `configure` on the still-blocking socketpair, and registers the
+//! connection as a `vitrin_ipc::ConnectionSource`; `session::dispatch_shim`
+//! then drives [`ShimServer::handle_message`] against the backend's scene,
+//! and `RealmLifecycle` owns the process from fork to grave. The path is
+//! exercised end to end by `session`'s own tests, which really fork
+//! `vitrin-mock-shim` (the permanent fixture) and run a whole paced session
+//! over the real event loop.
 //!
-//! One deliberate simplification in that harness must **not** be copied
-//! into the runtime loop: it composites synchronously inside the
-//! per-message dispatch (one redraw per commit), which is exactly what the
-//! pacing test needs but hands a hostile shim CPU amplification — after
-//! one legal attach, a repaint `commit` is a 12-byte message, so redrawing
-//! per commit buys a full-output composite per 12 wire bytes. The runtime
-//! wiring (P1.5.2) must instead *coalesce*: mark the scene dirty when a
-//! commit latches and schedule at most one redraw + [`presented`] per loop
-//! iteration (or per output-cadence tick). `ShimServer` is built for that
-//! shape — [`wants_presentation`] is the embedder's cue, and one
-//! [`presented`] call drains every owed `frame_done` at once.
+//! **The runtime loop coalesces; the reference wiring in
+//! [`crate::backend::headless`]'s test does not, and must not be copied.**
+//! That harness composites synchronously inside the per-message dispatch
+//! (one redraw per commit), which is exactly what the pacing test needs but
+//! would hand a hostile shim CPU amplification: after one legal attach, a
+//! repaint `commit` is a 12-byte message, so redrawing per commit buys a
+//! full-output composite per 12 wire bytes. The runtime instead marks the
+//! scene dirty when a commit latches and does at most one redraw +
+//! [`presented`] per loop iteration, in `session::post_dispatch`.
+//! `ShimServer` is built for that shape — [`wants_presentation`] is the
+//! embedder's cue, and one [`presented`] call drains every owed
+//! `frame_done` at once, so pacing is untouched and only the composites are
+//! coalesced.
 //!
 //! [`presented`]: ShimServer::presented
 //! [`wants_presentation`]: ShimServer::wants_presentation
@@ -429,6 +430,11 @@ impl ShimServer {
     /// The client-pixel copy instrumentation (P1.3.5): tests assert the shm
     /// path copies exactly once per commit and the dmabuf path never; the
     /// M1.5 perf report reads the same numbers.
+    ///
+    /// Test-only today, and narrowly so: the meter itself is maintained on
+    /// every commit the runtime handles: only this *reader* has no runtime
+    /// caller, until the M1.5 perf report grows one.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn copy_meter(&self) -> &CopyMeter {
         &self.copy_meter
     }

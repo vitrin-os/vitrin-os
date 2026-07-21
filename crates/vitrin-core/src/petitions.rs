@@ -102,10 +102,14 @@
 //! petition nobody answers resolves `timed_out`, and nothing but an
 //! affirmative human decision produces a grant.
 //!
-//! What is still missing is the *embedder* that raises prompts, not the
-//! mechanism: no [`PetitionRegistry`] is constructed at runtime until the
-//! M1.1 listener wiring (issue #77), so a running `vitrind` still shows no
-//! prompt and grants nothing under this policy.
+//! What is still missing is the *embedder that raises prompts*, not the
+//! mechanism and no longer the registry: `run_session` constructs a
+//! [`PetitionRegistry`] from the parsed `--consent` policy and real
+//! petitions really do enter it, but nothing calls
+//! [`crate::consent::grab::ConsentGrab::raise`], so a running `vitrind`
+//! still shows no prompt. Under `interactive` a petition therefore pends
+//! until the armed sweep resolves it `timed_out` -- fail-closed and correct,
+//! but not consent.
 //!
 //! **The scripted-consent injector is a build-gated hook, not a policy and
 //! not a wire message.** The IDL is explicit that consent decisions are not
@@ -120,11 +124,11 @@
 //!
 //! **Timeout driving: injected time, embedder-polled.** Like
 //! [`crate::grants`], this module never reads a clock; every operation
-//! takes `now`. Nothing in this build runs a live principal event loop yet
-//! (the listener wiring is M1.1 integration), so expiry is a poll:
+//! takes `now`, and expiry is a poll rather than a self-driven alarm:
 //! [`PetitionRegistry::expire_due`] returns the resolutions whose deadline
-//! passed and the embedder -- a calloop timer at M1.1; tests directly --
-//! routes each to its connection's `deliver_resolution`. The timer needs no
+//! passed and the embedder -- the runtime's armed calloop timer,
+//! `session::sweep` -- routes each to its connection's
+//! `deliver_resolution`. The timer needs no
 //! precision guarantee: a late poll only stretches a prompt's life, never
 //! resurrects a resolved petition.
 //!
@@ -179,8 +183,8 @@
 //! [`crate::consent::grab::ConsentGrab::raise`] calls `mark_prompt_shown`
 //! in the same statement sequence that puts the pixels up and seizes the
 //! input grab, and **nothing in the chokepoint changed**. The flag is still
-//! only reachable at runtime once something raises a prompt, which needs
-//! the M1.1 registry wiring; tests drive it today.
+//! only reachable at runtime once something raises a prompt, and nothing
+//! calls `ConsentGrab::raise` yet; tests drive it today.
 //!
 //! **Prompt selection is FIFO by admission** ([`PetitionRegistry::front_pending`]).
 //! Up to [`PetitionConfig::max_pending_global`] petitions can pend at once,
@@ -290,8 +294,14 @@ pub(crate) enum ConsentPolicy {
 }
 
 /// Deployment-tunable petition policy. Defaults are the settled values in
-/// the module docs; the M1.1 runtime wiring may override from
-/// configuration.
+/// the module docs.
+///
+/// `run_session` constructs the registry with [`Self::default`]: no CLI
+/// surface overrides these yet, so `consent_timeout` is 120 s in every
+/// shipped session. A `--consent-timeout` flag is the obvious next step and
+/// is what an *integration* test of the timeout against the shipped binary
+/// would need; the in-process tests inject a short one by building the
+/// registry directly.
 #[derive(Debug, Clone)]
 pub(crate) struct PetitionConfig {
     /// How long a pending petition may wait for consent before resolving

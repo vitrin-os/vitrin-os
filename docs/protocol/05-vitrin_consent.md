@@ -79,10 +79,11 @@ The three transitions carry these meanings:
 - `queued` — the prompt is waiting behind another prompt or a policy decision;
   the agent should keep waiting.
 - `shown` — the prompt is visible. All physical input now routes exclusively to
-  it (the input grab), and the agent knows to keep waiting. While a prompt is
-  shown, agent actuation under any grant is refused
+  it (the input grab), and the agent knows to keep waiting. While its own prompt
+  is shown, that principal's actuation is refused
   [`vitrin_grant.refused(_, consent_held)`](./04-vitrin_grant.md) and never
-  delivered to the app.
+  delivered to the app until the prompt closes; other principals' grants are
+  unaffected.
 - `closed` — the prompt is gone; the authoritative decision follows on the
   grant as `resolved`.
 
@@ -130,7 +131,7 @@ abbreviated.
 
 1. `A→C` `vitrin_realm.request_grant(grant, consent, view, pointer, text, resource=null, verbs=observe|actuate_pointer|actuate_text, …)` — mints all five objects; the grant is born pending and the facets inert.
 2. `C→A` `vitrin_consent.state(queued)` — *optional; may be skipped if no prompt is ahead.*
-3. `C→A` `vitrin_consent.state(shown)` — the prompt is visible; physical input is grabbed; agent actuation would now refuse `consent_held`.
+3. `C→A` `vitrin_consent.state(shown)` — the prompt is visible; physical input is grabbed; A's own actuation would now refuse `consent_held`.
 4. *(out of band)* the human clicks "Allow-while-running".
 5. `C→A` `vitrin_consent.state(closed)` — the prompt is gone.
 6. `C→A` `vitrin_grant.resolved(granted, verbs=…, persistence=while_running, expiry_ms=…)` — the authoritative decision, carrying the effective authority the human chose.

@@ -130,21 +130,22 @@
 //!   otherwise, and [`grab`] notes the one partial mitigation (a replica
 //!   gets no input grab).
 //!
-//! Nothing at runtime shows a prompt yet. Everything around it is now
-//! wired -- the registry is built from the parsed `--consent` policy, a real
-//! agent's petition really does enter it, and the sweep really does resolve
-//! it -- but **no code calls [`grab::ConsentGrab::raise`]**, so, stated
-//! plainly rather than implied: **a running `vitrind` renders no consent
-//! prompt, and therefore never grabs input.** Under
-//! `--consent=interactive` a petition therefore pends until the armed
-//! expiry sweep resolves it `timed_out`, which is fail-closed and correct
-//! but is not consent. Both
-//! backends carry a live, empty [`ConsentSurface`] and composite through it
-//! every frame; the nested backend additionally carries a live, idle
-//! [`grab::ConsentGrab`] in its input router, so the grab is armed the
-//! instant something raises a prompt. The acceptance criteria are held by
-//! the tests in these modules, in [`crate::input`] (through the real router
-//! and the real wire to a mock shim), and in [`crate::backend::headless`].
+//! The prompt is raised at runtime now (issue #90): once per dispatch round
+//! [`crate::session::service_consent_round`] calls
+//! [`grab::ConsentGrab::raise`] for the front pending petition and routes a
+//! human's click back through [`crate::petitions::PetitionRegistry::resolve_human`].
+//! Under `--consent=interactive` a petition a human never answers still
+//! resolves `timed_out` at the armed sweep -- fail-closed -- but that is now
+//! the fallback rather than the only outcome. This runs on the nested backend,
+//! which carries the [`grab::ConsentGrab`] in its input router (so the grab is
+//! armed the instant a prompt goes up); `--headless` has no display and no
+//! physical input device and so is refused with `--consent=interactive` at
+//! startup, leaving auto-approve as the headless policy. Both backends carry a
+//! [`ConsentSurface`] and composite through it every frame. The acceptance
+//! criteria are held by the tests in these modules, in [`crate::session`]
+//! (the raise → notify → decide → deliver path over the real wire), in
+//! [`crate::input`] (through the real router and the real wire to a mock
+//! shim), and in [`crate::backend::headless`].
 //!
 //! [`Scene::generation`]: crate::scene::Scene::generation
 //! [`PrincipalIdentity`]: crate::identity::PrincipalIdentity

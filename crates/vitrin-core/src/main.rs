@@ -60,10 +60,13 @@
 //! realm's whole life — spawn, crash, orderly shutdown — runs through
 //! `RealmLifecycle`.
 //!
-//! One gap remains in this picture: nothing calls `ConsentGrab::raise`, so
-//! under `--consent=interactive` a petition pends until the sweep times it
-//! out rather than putting a prompt on screen. Auto-approve is therefore the
-//! only policy that resolves a petition today.
+//! Interactive consent is wired end to end (issue #90): under
+//! `--consent=interactive` the nested backend's `service_consent` raises the
+//! front pending petition's prompt each dispatch round, a physical click
+//! becomes a petition resolution, and the sweep timeout is now only the
+//! fallback for a prompt a human never answers. `--headless` cannot host a
+//! prompt (no display, no physical input device) and so is refused with
+//! `--consent=interactive` at startup; auto-approve is the headless policy.
 
 mod backend;
 /// Capture-frame mechanics (P1.3.6): the sealed-memfd pixel path behind
@@ -84,15 +87,12 @@ mod capture;
 /// images), not on a check. Also the input grab and decision routing
 /// (`consent::grab`, P1.7.2): while a prompt is shown all physical input
 /// routes exclusively to it, and a click on a button becomes a petition
-/// resolution — hold-Esc revocation (P1.7.3) and a trusted indicator
-/// (issue #85) are what remain. **Still nothing raises a prompt at runtime.**
-/// The petition registry `ConsentGrab::raise` needs now exists (`session`
-/// builds it from the parsed `--consent` policy), but no code calls `raise`,
-/// so under `--consent=interactive` a petition pends until the armed sweep
-/// resolves it `timed_out` and no prompt is ever drawn. That is the remaining
-/// gap between "consent is implemented" and "consent is reachable", named
-/// here rather than left to be discovered from a session that silently never
-/// asks.
+/// resolution. Wired at runtime now (issue #90): the nested backend's
+/// `session::RuntimeHost::service_consent` runs `session::service_consent_round`
+/// once per dispatch round, which raises the front pending petition's prompt
+/// through `ConsentGrab::raise`, drains the human's decisions into the petition
+/// state machine, and lowers stale cards. Hold-Esc revocation (P1.7.3) is also
+/// wired; a trusted indicator (issue #85) is what remains.
 #[cfg_attr(not(test), allow(dead_code))]
 mod consent;
 /// The enforcement chokepoint (P1.4.4): THE single function every capture
@@ -299,11 +299,16 @@ USAGE:
                                 (pixman) and retained in memory for capture.
     vitrind [--consent MODE]    Consent policy for grant petitions:
                                 `interactive` (default; petitions await the
-                                consent surface) or `auto-approve` (every
+                                consent surface, which only `--nested` can
+                                draw and answer) or `auto-approve` (every
                                 petition granted as requested — headless CI
                                 and demos ONLY; loudly and repeatedly logged,
                                 and REFUSED unless principals.toml holds
                                 nothing but the demo principal).
+                                `--headless` REQUIRES `auto-approve`: it has
+                                no display for the prompt and no input device
+                                to answer it, so interactive is refused at
+                                startup.
     vitrind [--principals PATH] Principal registry for this session (bearer
                                 tokens; mode 0600, owned by the core's uid).
                                 Default: $XDG_CONFIG_HOME/vitrin/principals.toml
@@ -519,6 +524,22 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             dead_man,
         }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
+        (Some(Mode::Headless), _) if matches!(consent, ConsentPolicy::Interactive) => {
+            // A headless core has no display to draw the consent prompt on and
+            // no physical input device to answer it, so an interactive petition
+            // could only pend until it timed out — no human could ever say yes.
+            // Refuse at startup rather than run a session whose every petition
+            // silently fails closed. `matches!` rather than `==` so this does
+            // not lean on `ConsentPolicy: PartialEq`.
+            Err(
+                "`--headless` cannot serve `--consent=interactive`: a headless core has no \
+                 display to draw the consent prompt and no physical input device to answer it, \
+                 so every petition would pend until it timed out. Use \
+                 `--consent=auto-approve` for a headless run, or `--nested` to answer prompts \
+                 on screen."
+                    .into(),
+            )
+        }
         (Some(Mode::Headless), size) => Ok(Action::RunHeadless {
             size: size.unwrap_or(DEFAULT_HEADLESS_SIZE),
             consent,
@@ -819,12 +840,16 @@ fn block_loop_signals() -> std::io::Result<()> {
 /// `realm_died` / `realm_exited` entries land in this run rather than after
 /// its footer.
 ///
-/// # What is still not wired
+/// # Interactive consent is wired (issue #90)
 ///
-/// `ConsentGrab::raise` has no caller, so `--consent=interactive` never puts
-/// a prompt on screen: a petition pends until the armed sweep times it out.
-/// The petition registry it needs now exists, so this is the last gap
-/// between the consent surface and the wire.
+/// `ConsentGrab::raise` now has a production caller:
+/// `session::service_consent_round`, driven once per dispatch round by the
+/// nested backend's `session::RuntimeHost::service_consent`. Under
+/// `--consent=interactive` the front pending petition's prompt is raised, a
+/// physical decision resolves it, and the armed sweep's `timed_out` is only
+/// the fallback for a prompt a human never answers. `--headless` has no display
+/// or input device for a prompt and is refused with `--consent=interactive` at
+/// startup (above), so no petition pends unanswerably.
 fn run_session<R>(
     consent: ConsentPolicy,
     principals_path: Option<PathBuf>,
@@ -1408,11 +1433,14 @@ mod tests {
 
     #[test]
     fn headless_flag_defaults_to_1280x800() {
+        // Paired with `--consent=auto-approve`: bare `--headless` defaults to
+        // interactive consent, which headless cannot serve (issue #90), so it
+        // is refused at startup. Auto-approve is the headless policy.
         assert_eq!(
-            parse_args(["--headless"]),
+            parse_args(["--headless", "--consent=auto-approve"]),
             Ok(Action::RunHeadless {
                 size: (1280, 800),
-                consent: ConsentPolicy::Interactive,
+                consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: None,
                 realm: None,
@@ -1423,11 +1451,14 @@ mod tests {
 
     #[test]
     fn headless_size_is_parsed() {
+        // `--consent=auto-approve` throughout: headless refuses interactive
+        // consent (issue #90), so these size cases pair it with the policy a
+        // headless run can actually serve.
         assert_eq!(
-            parse_args(["--headless", "--size", "1280x800"]),
+            parse_args(["--headless", "--consent=auto-approve", "--size", "1280x800"]),
             Ok(Action::RunHeadless {
                 size: (1280, 800),
-                consent: ConsentPolicy::Interactive,
+                consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: None,
                 realm: None,
@@ -1435,10 +1466,10 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_args(["--headless", "--size", "640x480"]),
+            parse_args(["--headless", "--consent=auto-approve", "--size", "640x480"]),
             Ok(Action::RunHeadless {
                 size: (640, 480),
-                consent: ConsentPolicy::Interactive,
+                consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: None,
                 realm: None,
@@ -1480,15 +1511,43 @@ mod tests {
     }
 
     #[test]
+    fn headless_refuses_interactive_consent() {
+        // Issue #90 scope 4: a headless core has no display to draw the
+        // consent prompt on and no physical input device to answer it, so an
+        // interactive petition could only pend until it timed out. Both the
+        // explicit flag and the interactive *default* (bare `--headless`) must
+        // be refused at startup rather than run a session whose every petition
+        // silently fails closed.
+        for args in [
+            vec!["--headless"],
+            vec!["--headless", "--consent", "interactive"],
+            vec!["--headless", "--consent=interactive"],
+            vec!["--headless", "--size", "640x480", "--consent=interactive"],
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err(&format!("{args:?} must refuse interactive under headless"));
+            assert!(
+                err.contains("--headless") && err.contains("--consent=auto-approve"),
+                "the refusal must name the conflict and the way out: {err}"
+            );
+        }
+        // The two ways to make a headless run legal, and a bare nested run,
+        // still parse.
+        assert!(parse_args(["--headless", "--consent=auto-approve"]).is_ok());
+        assert!(parse_args(["--headless", "--consent", "auto-approve"]).is_ok());
+        assert!(parse_args(["--nested"]).is_ok());
+    }
+
+    #[test]
     fn recorder_path_parses_both_spellings_and_defaults_to_none() {
         // Omitted, the run uses the default path under the core's runtime
         // directory (resolved at startup, not here) -- `None` is "not
         // given", never "no recorder".
         assert_eq!(
-            parse_args(["--headless"]),
+            parse_args(["--headless", "--consent=auto-approve"]),
             Ok(Action::RunHeadless {
                 size: (1280, 800),
-                consent: ConsentPolicy::Interactive,
+                consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: None,
                 realm: None,
@@ -1496,14 +1555,23 @@ mod tests {
             })
         );
         for args in [
-            vec!["--headless", "--recorder", "/tmp/run.jsonl"],
-            vec!["--headless", "--recorder=/tmp/run.jsonl"],
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--recorder",
+                "/tmp/run.jsonl",
+            ],
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--recorder=/tmp/run.jsonl",
+            ],
         ] {
             assert_eq!(
                 parse_args(args),
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
-                    consent: ConsentPolicy::Interactive,
+                    consent: ConsentPolicy::AutoApprove,
                     principals: None,
                     recorder: Some(PathBuf::from("/tmp/run.jsonl")),
                     realm: None,
@@ -1534,14 +1602,23 @@ mod tests {
         // resolves the documented default path and still fails if nothing
         // is there.
         for args in [
-            vec!["--headless", "--realm", "/etc/vitrin/realm.toml"],
-            vec!["--headless", "--realm=/etc/vitrin/realm.toml"],
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--realm",
+                "/etc/vitrin/realm.toml",
+            ],
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--realm=/etc/vitrin/realm.toml",
+            ],
         ] {
             assert_eq!(
                 parse_args(args),
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
-                    consent: ConsentPolicy::Interactive,
+                    consent: ConsentPolicy::AutoApprove,
                     principals: None,
                     recorder: None,
                     realm: Some(PathBuf::from("/etc/vitrin/realm.toml")),
@@ -2016,14 +2093,23 @@ mod tests {
     #[test]
     fn principals_path_parses_both_spellings_and_defaults_to_none() {
         for args in [
-            vec!["--headless", "--principals", "/etc/vitrin/principals.toml"],
-            vec!["--headless", "--principals=/etc/vitrin/principals.toml"],
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--principals",
+                "/etc/vitrin/principals.toml",
+            ],
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--principals=/etc/vitrin/principals.toml",
+            ],
         ] {
             assert_eq!(
                 parse_args(args),
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
-                    consent: ConsentPolicy::Interactive,
+                    consent: ConsentPolicy::AutoApprove,
                     principals: Some(PathBuf::from("/etc/vitrin/principals.toml")),
                     recorder: None,
                     realm: None,
@@ -2074,10 +2160,15 @@ mod tests {
         assert!(parse_args(["--headless", "--size", "1280x4294967295"]).is_err());
         // The boundary value i32::MAX itself is in-domain and accepted.
         assert_eq!(
-            parse_args(["--headless", "--size", "2147483647x1"]),
+            parse_args([
+                "--headless",
+                "--consent=auto-approve",
+                "--size",
+                "2147483647x1"
+            ]),
             Ok(Action::RunHeadless {
                 size: (2147483647, 1),
-                consent: ConsentPolicy::Interactive,
+                consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: None,
                 realm: None,
@@ -2129,9 +2220,13 @@ mod tests {
         assert_eq!(config.hold, std::time::Duration::from_millis(1000));
         // Headless resolves the same policy from the same command line, so a
         // shared alias behaves identically in both modes (it then ignores
-        // it: no physical input device exists there).
+        // it: no physical input device exists there). Paired with
+        // `--consent=auto-approve` because headless refuses interactive
+        // consent (issue #90).
         assert_eq!(
-            dead_man_of(&parse_args(["--headless"]).expect("defaults parse")),
+            dead_man_of(
+                &parse_args(["--headless", "--consent=auto-approve"]).expect("defaults parse")
+            ),
             config
         );
     }

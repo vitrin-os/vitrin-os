@@ -258,20 +258,20 @@
 //! for the human to *notice* the difference before deciding. This is a
 //! mitigation, not a fix, and it does not close #85.
 //!
-//! # What is mechanism-only
+//! # Wired at runtime (issue #90)
 //!
-//! Nothing raises a prompt at runtime. The registry is no longer the reason
-//! -- the runtime wiring constructs a [`PetitionRegistry`] and real
-//! petitions enter it -- but [`ConsentGrab::raise`] still has no caller
-//! outside tests. The nested backend really does carry this gate in its
-//! router
-//! (so the grab is live the instant a prompt is raised) and really does feed
-//! it the view size on every input event — but with no petition registry
-//! there is no petition, so [`ConsentGrab::raise`] has no caller outside
-//! tests. Stated plainly, as P1.7.1 stated its own gap: **a running
-//! `vitrind` still shows no consent prompt, and therefore never grabs
-//! input.** The mechanism below is exercised end to end by tests, including
-//! through the real router and the real wire to a mock shim.
+//! This gate is now driven end to end. The nested backend carries it in its
+//! router (so the grab is live the instant a prompt is raised) and feeds it the
+//! view size on every input event, and once per dispatch round
+//! [`crate::session::service_consent_round`] calls [`ConsentGrab::raise`] for
+//! the front pending petition, drains the decisions this gate produced into
+//! [`PetitionRegistry::resolve_human`], and lowers a card whose petition has
+//! left the table. So under `--consent=interactive` a running `vitrind` really
+//! does show the prompt and grab physical input while it is up. (`--headless`
+//! has no display and no physical input device, so it is refused with
+//! `--consent=interactive` at startup.) The mechanism below is additionally
+//! exercised in isolation by this module's tests, through the real router and
+//! the real wire to a mock shim.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -619,6 +619,23 @@ impl ConsentGrab {
     /// Drain the next decision the human took, oldest first.
     pub fn take_decision(&mut self) -> Option<Decision> {
         self.decisions.pop_front()
+    }
+
+    /// **Test seam.** Push a decision into the queue as if a physical click
+    /// had produced it.
+    ///
+    /// The click-to-decision path — hit test, guard interval, press-arms /
+    /// release-commits, the origin check that stops an agent answering its own
+    /// prompt — is exhaustively covered by this module's own tests, which
+    /// drive [`Self::judge_parts`] with real events. This seam exists for the
+    /// *session*-level orchestration instead: it lets
+    /// [`crate::session::service_consent_round`]'s drive
+    /// (drain → `resolve_human` → `deliver` → lower → raise-next) be exercised
+    /// end to end over the wire without a display or an input device, which no
+    /// runner in CI has.
+    #[cfg(test)]
+    pub(crate) fn queue_decision(&mut self, decision: Decision) {
+        self.decisions.push_back(decision);
     }
 
     /// Judge one intake event: the whole grab policy, in one place.

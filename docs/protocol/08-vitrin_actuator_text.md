@@ -39,7 +39,7 @@ Delivers the UTF-8 `text` to the granted target. The string is injected as chara
 - a newline `U+000A` MUST be rendered as a **Return** keypress, and
 - a tab `U+0009` MUST be rendered as a **Tab** keypress.
 
-This is the mechanism by which an agent submits a form or presses Enter after typing a URL: the Enter travels as a trailing `\n` in the same `type` payload (see [Flow 1](#flow-1--type-a-url-and-press-enter)). **All other C0 and C1 control characters are fatal.** A correct client never emits them; a payload containing any control character other than `U+0009` or `U+000A` is a client bug, resolved as the fatal error `invalid_argument`.
+This is the mechanism by which an agent submits a form or presses Enter after typing a URL: the Enter travels as a trailing `\n` in the same `type` payload (see [Flow 1](#flow-1--type-a-url-and-press-enter)). **Every other control character is fatal** — the rest of C0 (`U+0000`–`U+001F`), DEL (`U+007F`), and C1 (`U+0080`–`U+009F`), i.e. the whole Unicode `Cc` category. A correct client never emits them; a payload containing any such control character is a client bug, resolved as the fatal error `invalid_argument`.
 
 **Failure modes.**
 

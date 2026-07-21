@@ -1569,6 +1569,47 @@ pub(crate) mod tests {
         found
     }
 
+    /// Bring a freshly-spawned shim's session up and return the server plus
+    /// the shim's first request. This is the **affirmative-liveness gate**
+    /// every `/proc/<pid>/{environ,fd}` read in these tests depends on, so it
+    /// lives in one place both [`Harness::spawn_mock`] and the ambient-env
+    /// test share — no future `spawn_realm`-based test can re-open the #97
+    /// gap by hand-rolling a weaker gate.
+    ///
+    /// [`wait_for_exec`] only proves the kernel installed the new program
+    /// image (`begin_new_exec` set `mm->exe_file`). At that instant the
+    /// dynamic loader is still running: `create_elf_tables` may not yet have
+    /// populated the child's `env_start..env_end` region, so
+    /// `/proc/<pid>/environ` can read empty; and nothing there proves the
+    /// child is still alive rather than already a zombie when the read
+    /// lands. A `create_surface` arriving is proof from the child's *own*
+    /// post-`execve` code that its env region is populated — and because the
+    /// caller still holds the core side of a **blocking** transport open
+    /// (vitrin-ipc constructors set no `O_NONBLOCK`, and these unit tests run
+    /// no event loop to toggle it), the child that sent it is parked in its
+    /// blocking `recv` and cannot have exited. Both empty-`environ`
+    /// preconditions — mid-`execve`, or dead — are thereby excluded by
+    /// construction, not merely made less likely.
+    fn bring_up_shim(spawned: &mut SpawnedRealm) -> (ShimServer, vitrin_ipc::Message) {
+        let server = spawned
+            .start_shim_session(1280, 800)
+            .expect("configure must reach the shim over the inherited socketpair");
+        let msg = spawned
+            .connection_mut()
+            .recv_message()
+            .expect("the shim's first request must arrive")
+            .expect("the shim must not hang up during bring-up");
+        // Round-trip on the shim's own create_surface, not a spurious byte:
+        // this makes the gate meaningful even for callers (the ambient-env
+        // test) that do not go on to dispatch the message.
+        assert_eq!(
+            msg.header.opcode,
+            vitrin_protocol::generated::vitrin_shim_session::requests::CreateSurface::OPCODE,
+            "bring-up must round-trip on the shim's create_surface"
+        );
+        (server, msg)
+    }
+
     /// One spawn test's world: the scratch runtime tree, the run's flight
     /// recorder (a required argument of every spawn), and the log path.
     struct Harness {
@@ -1603,14 +1644,9 @@ pub(crate) mod tests {
         /// its socketpair terminates in.
         ///
         /// Bring-up is part of the helper rather than each test's preamble
-        /// because it is also the **readiness gate** every `/proc`
-        /// assertion needs. `wait_for_exec` only proves the kernel has
-        /// installed the new program image; the dynamic loader is still
-        /// running at that instant, and a descriptor-table snapshot taken
-        /// then catches ld.so's transient `libc.so` handle. A `create_surface`
-        /// arriving from the child is proof it is executing its *own* code,
-        /// which is the earliest moment its `/proc` state means what the
-        /// tests read it to mean.
+        /// because it is also the readiness gate every `/proc` assertion
+        /// needs — see [`bring_up_shim`], which owns that gate and its
+        /// rationale.
         fn spawn_mock(
             &mut self,
             args: &[&str],
@@ -1639,15 +1675,9 @@ pub(crate) mod tests {
             // served shim session, and the shim's first request is
             // dispatched through the real `ShimServer` -- so this is an
             // end-to-end proof that identity-at-fork produces exactly the
-            // connection P1.3.4's server expects.
-            let mut server = spawned
-                .start_shim_session(1280, 800)
-                .expect("configure must reach the shim over the inherited socketpair");
-            let msg = spawned
-                .connection_mut()
-                .recv_message()
-                .expect("the shim's first request must arrive")
-                .expect("the shim must not hang up during bring-up");
+            // connection P1.3.4's server expects. `bring_up_shim` is also the
+            // readiness gate the `/proc` reads below depend on.
+            let (mut server, msg) = bring_up_shim(&mut spawned);
             let mut scene = crate::scene::Scene::new();
             let conn = spawned.connection_mut();
             server
@@ -1841,8 +1871,18 @@ pub(crate) mod tests {
             &["CARGO_PKG_NAME".to_string()],
         );
         let paths = h.paths();
-        let spawned = spawn_realm(&realm, &paths, &mut h.recorder).expect("spawn");
+        // `spawn_realm` (not `spawn_realm_with_env`/`spawn_mock`) is kept on
+        // purpose: this test exists to exercise the production
+        // `std::env::var` ambient path that the *_with_env variants bypass.
+        let mut spawned = spawn_realm(&realm, &paths, &mut h.recorder).expect("spawn");
         wait_for_exec(spawned.pid(), &bin);
+
+        // Affirmative-liveness gate before any /proc read: only after the
+        // child's own post-execve code has sent create_surface is its env
+        // region provably populated and the child provably still alive (see
+        // bring_up_shim). wait_for_exec alone leaves the #97 window where
+        // /proc/<pid>/environ can read empty.
+        let (_server, _msg) = bring_up_shim(&mut spawned);
 
         let env = child_env_of(spawned.pid());
         // Whatever the core's own environment holds for that name is what

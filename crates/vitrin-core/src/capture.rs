@@ -231,10 +231,23 @@ pub(crate) mod tests {
     use super::*;
     use crate::test_pattern;
 
-    /// Serializes every test that creates or counts file descriptors, so
-    /// the `/proc/self/fd` baseline assertions can never race another
-    /// test's socketpairs/memfds on the harness's thread pool. Shared with
-    /// the headless backend's event-loop test for the same reason.
+    /// Serializes the remaining *shared-process* fd tests, so their
+    /// socketpairs/memfds cannot race one another on the harness's thread
+    /// pool. Shared with the headless backend's event-loop test for the
+    /// same reason.
+    ///
+    /// The two `/proc/self/fd` **baseline** tests
+    /// ([`fd_count_returns_to_baseline`],
+    /// [`render_frame_fails_typed_never_fabricating_a_frame`]) deliberately
+    /// do *not* rely on this lock: their measured quantity is the
+    /// process-global open-fd count, which a *non-measuring* test on the
+    /// pool can perturb whether or not it holds `FD_QUIESCE` — and
+    /// `fd_lock` coverage across the ~14 fd-minting modules drifts silently
+    /// (`consent/grab.rs` already dropped it). Those two are instead
+    /// process-isolated via [`run_fd_isolated`], which re-execs the test
+    /// binary so the body is the sole fd mutator in its process. See
+    /// [`open_fd_count`] for the guard that keeps that invariant from
+    /// silently rotting.
     pub(crate) static FD_QUIESCE: Mutex<()> = Mutex::new(());
 
     /// Lock [`FD_QUIESCE`], surviving a poisoned mutex (a failed test must
@@ -245,13 +258,104 @@ pub(crate) mod tests {
 
     const VIEW_ID: u32 = 7;
 
+    /// Env sentinel distinguishing the outer (harness-pool) invocation of a
+    /// baseline test from the re-exec'd child that actually measures fds.
+    /// Set only by [`run_fd_isolated`], so it is a reliable "am I the lone
+    /// measuring process?" signal.
+    const FD_ISOLATED_SENTINEL: &str = "VITRIN_FD_BASELINE_ISOLATED";
+
+    /// Marker the isolated child prints once the real body has passed. Its
+    /// presence in the child's stdout is what closes libtest's "a filter
+    /// matching zero tests still exits 0" hole: an exit code of 0 alone
+    /// would pass even if a typo in `test_path` selected no test at all.
+    const FD_ISOLATED_MARKER: &str = "VITRIN_FD_BASELINE_RAN";
+
     /// Number of open fds in this process, via `/proc/self/fd`. The
     /// `read_dir` handle itself appears in the listing, but identically in
     /// every measurement, so equality comparisons are exact.
+    ///
+    /// The `debug_assert` is the regression guard: this reads a
+    /// **process-global** quantity, so it is only meaningful inside
+    /// [`run_fd_isolated`]'s re-exec'd child, where this test is the sole fd
+    /// mutator. Any future fd-leak test must call `open_fd_count` to take a
+    /// baseline; the moment it does so on the shared harness pool (sentinel
+    /// unset) it trips here in debug/CI, forcing the author to route through
+    /// `run_fd_isolated` rather than silently reintroducing the #74/#80
+    /// race. Because `run_fd_isolated` is the only setter of the sentinel,
+    /// the isolation cannot be bypassed by accident.
     fn open_fd_count() -> usize {
+        debug_assert!(
+            std::env::var_os(FD_ISOLATED_SENTINEL).is_some(),
+            "open_fd_count() measures the process-global /proc/self/fd and \
+             must run only inside run_fd_isolated's re-exec'd child; a \
+             baseline read on the shared harness pool is the #74/#80 race"
+        );
         std::fs::read_dir("/proc/self/fd")
             .expect("/proc/self/fd is readable on Linux")
             .count()
+    }
+
+    /// Run `body` in a private process where it is the *only* test
+    /// executing, so its `/proc/self/fd` baseline can be perturbed by
+    /// nothing but its own render/socketpair/drop.
+    ///
+    /// The quantity these tests measure — the process-global open-fd count
+    /// — is owned by whatever else runs in the process, and the fd-minting
+    /// tests are spread across ~14 modules whose `fd_lock` coverage drifts
+    /// silently. Serializing on `fd_lock` cannot fix it: the perturbation
+    /// comes from *non-measuring* tests, and no guard at the measurement
+    /// site can catch a future minter that forgets the lock — nor fds
+    /// minted directly by std/rustix/calloop. Isolation removes the race by
+    /// construction (#74 task 2 / #80 option 1): in the child there is no
+    /// concurrent test, no library-spawned backend thread (winit/Smithay
+    /// runs only from `main`, never a `#[test]`) and no async runtime, so
+    /// between the baseline snapshot and every assertion the only code that
+    /// can open or close an fd is the body itself.
+    ///
+    /// On the outer invocation (sentinel unset) this re-execs the test
+    /// binary with `--exact <test_path> --test-threads 1 --nocapture` and
+    /// the sentinel set, then requires the child both to exit 0 *and* to
+    /// have printed [`FD_ISOLATED_MARKER`] (proof the named test actually
+    /// ran). On the isolated invocation (sentinel set) it runs `body` for
+    /// real — this is `exec`, not `fork`, so there is no async-signal-safety
+    /// hazard, and no other test is selected, so no recursion occurs.
+    fn run_fd_isolated(test_path: &str, body: impl FnOnce()) {
+        if std::env::var_os(FD_ISOLATED_SENTINEL).is_some() {
+            body();
+            // Printed only on the true measurement path, after the body's
+            // own assertions have passed, so its presence in the child's
+            // stdout means "this exact test ran to completion", not
+            // "libtest matched nothing and exited 0".
+            println!("{FD_ISOLATED_MARKER}");
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "--nocapture",
+                "--quiet",
+                "--test-threads",
+                "1",
+                test_path,
+            ])
+            .env(FD_ISOLATED_SENTINEL, "1")
+            .output()
+            .expect("re-exec of the test binary must spawn");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated fd test `{test_path}` failed in its own process\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains(FD_ISOLATED_MARKER),
+            "isolated fd test `{test_path}` exited 0 but never ran (marker \
+             absent) — check the test path spelling\n--- stdout ---\n{stdout}"
+        );
     }
 
     /// Render one frame of `rgba` and ship it over a socketpair exactly as
@@ -453,27 +557,28 @@ pub(crate) mod tests {
     /// sending, receiver side on frame drop).
     #[test]
     fn fd_count_returns_to_baseline() {
-        let _fd = fd_lock();
-        const W: u32 = 64;
-        const H: u32 = 48;
-        let (mut server, mut client) = Connection::pair().unwrap();
-        let rgba = test_pattern::render(W, H);
+        run_fd_isolated("capture::tests::fd_count_returns_to_baseline", || {
+            const W: u32 = 64;
+            const H: u32 = 48;
+            let (mut server, mut client) = Connection::pair().unwrap();
+            let rgba = test_pattern::render(W, H);
 
-        let baseline = open_fd_count();
-        for _ in 0..8 {
-            let frame = decode_frame(ship_one(&mut server, &mut client, &rgba, W, H));
-            assert!(
-                open_fd_count() > baseline,
-                "a delivered frame holds exactly the fresh fd"
-            );
-            drop(frame);
-            assert_eq!(
-                open_fd_count(),
-                baseline,
-                "fd count must return to baseline"
-            );
-        }
-        assert_eq!(open_fd_count(), baseline);
+            let baseline = open_fd_count();
+            for _ in 0..8 {
+                let frame = decode_frame(ship_one(&mut server, &mut client, &rgba, W, H));
+                assert!(
+                    open_fd_count() > baseline,
+                    "a delivered frame holds exactly the fresh fd"
+                );
+                drop(frame);
+                assert_eq!(
+                    open_fd_count(),
+                    baseline,
+                    "fd count must return to baseline"
+                );
+            }
+            assert_eq!(open_fd_count(), baseline);
+        });
     }
 
     /// The typed mechanics failures: a mis-sized readback and a degenerate
@@ -483,36 +588,40 @@ pub(crate) mod tests {
     /// backstop, unreachable when the chokepoint did its job).
     #[test]
     fn render_frame_fails_typed_never_fabricating_a_frame() {
-        let _fd = fd_lock();
-        let rgba = test_pattern::render(16, 16);
-        let baseline = open_fd_count();
+        run_fd_isolated(
+            "capture::tests::render_frame_fails_typed_never_fabricating_a_frame",
+            || {
+                let rgba = test_pattern::render(16, 16);
+                let baseline = open_fd_count();
 
-        let mis_sized = render_frame(&RealmViewFrame {
-            rgba: &rgba,
-            width: 32, // claims more pixels than the buffer holds
-            height: 32,
-        });
-        assert!(matches!(
-            mis_sized,
-            Err(CaptureError::MisSizedReadback {
-                got,
-                expected
-            }) if got == rgba.len() && expected == 32 * 32 * 4
-        ));
+                let mis_sized = render_frame(&RealmViewFrame {
+                    rgba: &rgba,
+                    width: 32, // claims more pixels than the buffer holds
+                    height: 32,
+                });
+                assert!(matches!(
+                    mis_sized,
+                    Err(CaptureError::MisSizedReadback {
+                        got,
+                        expected
+                    }) if got == rgba.len() && expected == 32 * 32 * 4
+                ));
 
-        let degenerate = render_frame(&RealmViewFrame {
-            rgba: &[],
-            width: 0,
-            height: 0,
-        });
-        assert!(matches!(
-            degenerate,
-            Err(CaptureError::DegenerateView {
-                width: 0,
-                height: 0
-            })
-        ));
-        assert_eq!(open_fd_count(), baseline, "failures must not create fds");
+                let degenerate = render_frame(&RealmViewFrame {
+                    rgba: &[],
+                    width: 0,
+                    height: 0,
+                });
+                assert!(matches!(
+                    degenerate,
+                    Err(CaptureError::DegenerateView {
+                        width: 0,
+                        height: 0
+                    })
+                ));
+                assert_eq!(open_fd_count(), baseline, "failures must not create fds");
+            },
+        );
     }
 
     /// The swizzle: RGBA bytes → little-endian xrgb8888 bytes (B,G,R,X),

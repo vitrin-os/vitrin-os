@@ -38,6 +38,30 @@ def whole_realm_grant(conn, verbs=ALL_VERBS):
     ).await_consent()
 
 
+def capture_when_ready(grant, timeout=5.0, poll=0.02):
+    """The first capture of a freshly-served realm, tolerating the startup race.
+
+    A realm that has not yet committed and composited its first buffer has no
+    surface, and the core answers `observe` with `NoSurface` — the honest reply
+    the protocol prescribes (`docs/protocol/05`), not a fault the agent could
+    have prevented. So an agent's *first* `observe()` can lose a race with the
+    realm's first frame: `await_consent()` returns the instant the grant
+    resolves, which on a loaded machine is before the shim has drawn (seen on
+    CI as a `NoSurface` on this exact line). The poll model (D6, one fresh frame
+    per call) is to retry, so this loops `observe()` until a frame lands or the
+    deadline passes. A *later* capture — the realm is already composing — can
+    call `observe()` directly; this is only for the first one.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return grant.observe()
+        except errors.NoSurface:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(poll)
+
+
 class EndToEnd(IntegrationTest):
     """**AC1** — an agent drives the shipped binary, start to finish.
 
@@ -53,7 +77,7 @@ class EndToEnd(IntegrationTest):
         conn = core.connect()
         grant = whole_realm_grant(conn)
 
-        first = grant.observe()
+        first = capture_when_ready(grant)
         self.assertEqual((first.width, first.height), (320, 200))
         self.assertEqual(len(first.raw), first.stride * first.height)
 
@@ -123,7 +147,7 @@ class Enforcement(IntegrationTest):
         conn = core.connect()
         grant = whole_realm_grant(conn, verbs=("observe",))
 
-        grant.observe()  # granted, so this must work
+        capture_when_ready(grant)  # granted, so this must work
 
         with self.assertRaises(errors.GrantRefused) as caught:
             grant.pointer.click(100, 100)
@@ -220,7 +244,7 @@ class SingleCorePerRuntimeTree(IntegrationTest):
 
         # The strongest form of "undamaged": it is still serving.
         conn = first.connect()
-        whole_realm_grant(conn).observe()
+        capture_when_ready(whole_realm_grant(conn))
         conn.close()
 
 

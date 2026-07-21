@@ -846,8 +846,10 @@
         Normative control-character rule: a newline (U+000A) MUST be
         rendered as a Return keypress and a tab (U+0009) as Tab by the
         delivery path - this is how an agent submits a form or presses
-        Enter after a URL. All other C0 and C1 control characters are
-        fatal "invalid_argument": a correct client never emits them.
+        Enter after a URL. Every other control character - the rest of
+        C0 (U+0000-U+001F), DEL (U+007F), and C1 (U+0080-U+009F), i.e.
+        the whole Unicode Cc category - is fatal "invalid_argument": a
+        correct client never emits them.
       </description>
       <arg name="text" type="string" summary="UTF-8 text to deliver (max 4096 bytes)"/>
     </request>

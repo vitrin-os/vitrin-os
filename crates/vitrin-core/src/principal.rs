@@ -1036,17 +1036,22 @@ impl PrincipalServer {
                                     })?;
                                 // The IDL's normative control-character
                                 // rule: newline and tab are the two legal
-                                // control characters; any other C0
-                                // (U+0000..=U+001F) or C1 (U+0080..=U+009F)
-                                // control is fatal invalid_argument --
-                                // argument validation the generated
-                                // decoder cannot see, exactly like the
-                                // zero-verb rule. (DEL, U+007F, is in
-                                // neither set and deliberately passes: the
-                                // server must not be stricter than the
-                                // wire contract it serves.)
+                                // control characters; every other Unicode
+                                // Cc control -- C0 (U+0000..=U+001F), DEL
+                                // (U+007F), and C1 (U+0080..=U+009F) -- is
+                                // fatal invalid_argument, argument
+                                // validation the generated decoder cannot
+                                // see, exactly like the zero-verb rule. DEL
+                                // is forbidden alongside C0/C1 (issue #82,
+                                // and the IDL now names it): it is a
+                                // destructive editing keystroke that no
+                                // "deliver this Unicode string" ever means,
+                                // and the shim refuses it too -- the core
+                                // holds the line at the chokepoint rather
+                                // than leaning on an untrusted shim to catch
+                                // it.
                                 if let Some(c) = req.text.chars().find(|&c| {
-                                    matches!(c, '\u{0000}'..='\u{001f}' | '\u{0080}'..='\u{009f}')
+                                    matches!(c, '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}')
                                         && c != '\n'
                                         && c != '\t'
                                 }) {
@@ -4635,24 +4640,28 @@ pub(crate) mod tests {
     fn forbidden_control_characters_in_type_are_fatal_invalid_argument() {
         let _fd = crate::capture::tests::fd_lock();
         // IDL vitrin_actuator_text: newline and tab are the two legal
-        // control characters; any other C0/C1 control is fatal
-        // invalid_argument (a correct client never emits them). DEL
-        // (U+007F) is in neither set and passes -- the server is exactly
-        // as strict as the wire contract, no more.
+        // control characters; every other Unicode Cc control -- C0, DEL
+        // (U+007F), and C1 -- is fatal invalid_argument (a correct client
+        // never emits them). DEL is forbidden alongside C0/C1 (issue #82):
+        // it is a destructive Delete keystroke, never text.
         let verifier = demo_verifier();
         let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
         client
-            .send_message(&type_text("line\nwith\ttabs and del\u{7f} ok"), None)
+            .send_message(&type_text("line\nwith\ttabs ok"), None)
             .unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
         assert_eq!(
             shared.actuations[0].kind(),
             &SeatInputKind::Text {
-                text: "line\nwith\ttabs and del\u{7f} ok".into()
+                text: "line\nwith\ttabs ok".into()
             }
         );
 
-        for (label, bad) in [("C0 bell", "ring\u{7}"), ("C1 NEL", "next\u{85}line")] {
+        for (label, bad) in [
+            ("C0 bell", "ring\u{7}"),
+            ("DEL", "delete\u{7f}me"),
+            ("C1 NEL", "next\u{85}line"),
+        ] {
             let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
             client.send_message(&type_text(bad), None).unwrap();
             expect_violation(

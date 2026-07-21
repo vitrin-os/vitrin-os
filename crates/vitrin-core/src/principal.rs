@@ -2860,7 +2860,7 @@ pub(crate) mod tests {
 
         let petition = shared.petitions.pending_ids()[0];
         let mut grab = ConsentGrab::new();
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
         grab.set_view((VIEW_W, VIEW_H));
         raise_prompt(
             &mut server,
@@ -2957,7 +2957,7 @@ pub(crate) mod tests {
 
         let petition = shared.petitions.pending_ids()[0];
         let mut grab = ConsentGrab::new();
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
         grab.set_view((VIEW_W, VIEW_H));
         raise_prompt(
             &mut server,
@@ -3014,7 +3014,7 @@ pub(crate) mod tests {
 
         let petition = shared.petitions.pending_ids()[0];
         let mut grab = ConsentGrab::new();
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
         grab.set_view((VIEW_W, VIEW_H));
         raise_prompt(
             &mut server,
@@ -3077,7 +3077,7 @@ pub(crate) mod tests {
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
         let petition = shared.petitions.pending_ids()[0];
         let mut grab = ConsentGrab::new();
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
         grab.set_view((VIEW_W, VIEW_H));
         raise_prompt(
             &mut server,
@@ -3188,7 +3188,7 @@ pub(crate) mod tests {
         let petition = shared.petitions.pending_ids()[0];
 
         let mut grab = ConsentGrab::new();
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
         grab.set_view((VIEW_W, VIEW_H));
         let route = grab
             .raise(

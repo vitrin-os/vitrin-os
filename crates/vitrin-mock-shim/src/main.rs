@@ -41,6 +41,12 @@
 //!   "never a stale frame" is only meaningful if a real frame was there to
 //!   go stale. `N` is deliberately unbounded so a test can leave the shim
 //!   animating indefinitely and kill it at an arbitrary point.
+//! - `--seat` — with `--serve`, mint the input-delivery object
+//!   ([`MockShim::get_seat`]) during bring-up, so the core's `ShimServer`
+//!   has a seat to address. A real shim mints one; the fixture defaulted to
+//!   not, since its focus was surface bring-up. A harness that drives seat
+//!   delivery — and its flight-recorder audit (issue #83) — needs a shim
+//!   that has minted a seat, or every event drops undelivered.
 //! - `--app` — the leaf: block until stdin closes. Holds no core
 //!   connection, which is exactly what its descriptor table must show.
 
@@ -127,6 +133,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // `--seat`: mint the input-delivery object so the core has a seat to
+    // address. Without it every routed seat event drops undelivered, and the
+    // delivery-point audit entry (issue #83) never fires.
+    if flag("--seat") {
+        if let Err(err) = shim.get_seat() {
+            eprintln!("vitrin-mock-shim: get_seat failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     // Only after bring-up, so the topology a harness observes is the real
     // ordering: a shim launches its app once it has a realm to launch it

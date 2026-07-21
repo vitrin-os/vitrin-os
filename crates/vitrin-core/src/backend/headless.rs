@@ -58,7 +58,7 @@ use smithay::reexports::pixman::Image;
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use tracing::info;
 
-use crate::consent::ConsentSurface;
+use crate::consent::{ConsentSurface, TrustedIndicator};
 use crate::input::{InputRouter, NoopHook};
 use crate::recorder::Recorder;
 use crate::scene::Scene;
@@ -200,7 +200,14 @@ fn run_inner(
         "headless backend starting: virtual output, software pixman renderer (no EGL/DRM/GPU)"
     );
 
-    let view = HeadlessView::new(physical_size, event_loop.get_signal())?;
+    // The session's trusted indicator, minted in `run_session` before the
+    // listener accepted anyone (issue #85). Read by `Copy` before the seed is
+    // consumed below.
+    let indicator = seed
+        .as_ref()
+        .expect("the seed is present until the state is built")
+        .indicator;
+    let view = HeadlessView::new(physical_size, event_loop.get_signal(), indicator)?;
     let mut state = HeadlessState {
         view,
         // Headless has no physical input device — structurally, not by a
@@ -396,7 +403,11 @@ pub(crate) struct HeadlessOutput {
 }
 
 impl HeadlessView {
-    fn new(size: Size<i32, Physical>, loop_signal: LoopSignal) -> Result<Self, Box<dyn Error>> {
+    fn new(
+        size: Size<i32, Physical>,
+        loop_signal: LoopSignal,
+        indicator: TrustedIndicator,
+    ) -> Result<Self, Box<dyn Error>> {
         let mut renderer = PixmanRenderer::new()?;
         // `.max(0)` is defensive only: `run` always passes a positive size
         // (the CLI parser rejects zero/negative), but a degenerate size must
@@ -408,7 +419,7 @@ impl HeadlessView {
             scene: Scene::new(),
             output: HeadlessOutput {
                 renderer,
-                consent: ConsentSurface::new(),
+                consent: ConsentSurface::new(indicator),
                 view_framebuffer,
                 output_framebuffer,
                 size,
@@ -716,8 +727,12 @@ mod tests {
         let size: Size<i32, Physical> = (w as i32, h as i32).into();
         let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
-        let mut state =
-            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+        )
+        .expect("headless state under pixman");
         state
             .redraw()
             .expect("composite into the retained framebuffer");
@@ -768,8 +783,12 @@ mod tests {
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
         let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
-        let mut state =
-            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+        )
+        .expect("headless state under pixman");
 
         let pixels = client_pixels(SW, SH);
         state.scene.commit(
@@ -851,8 +870,12 @@ mod tests {
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
         let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
-        let mut state =
-            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+        )
+        .expect("headless state under pixman");
         state
             .scene
             .commit(SurfaceContent::from_rgba(from_fd, SW, SH).expect("well-formed content"));
@@ -949,8 +972,12 @@ mod tests {
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
         let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
-        let mut state =
-            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+        )
+        .expect("headless state under pixman");
 
         // A realm that has painted, so the test distinguishes "the overlay is
         // absent" from "nothing was ever drawn".
@@ -960,9 +987,27 @@ mod tests {
         state.redraw().expect("composite the committed surface");
         let clean_view = state.latest_frame_rgba().expect("readback");
         let clean_output = state.latest_output_rgba().expect("readback");
+        // With no prompt up the two retained images differ ONLY by the trusted
+        // band (issue #85): it is on the human-visible output and never the
+        // capture. Below the band, the two are the identical realm view.
+        let band_bytes = crate::consent::TRUST_BAND_HEIGHT as usize
+            * VW as usize
+            * test_pattern::BYTES_PER_PIXEL;
         assert_eq!(
-            clean_view, clean_output,
-            "with no prompt up the two retained images must be identical"
+            clean_view[band_bytes..],
+            clean_output[band_bytes..],
+            "below the band, no-prompt output is the realm view unchanged"
+        );
+        let band_color = crate::consent::TrustedIndicator::for_test().color();
+        assert_eq!(
+            clean_output[..test_pattern::BYTES_PER_PIXEL],
+            band_color,
+            "the trusted band is on the human-visible output"
+        );
+        assert_ne!(
+            clean_view[..test_pattern::BYTES_PER_PIXEL],
+            band_color,
+            "the trusted band is NEVER on the capture"
         );
 
         // The prompt goes up. This is the moment P1.7.2 will pair with
@@ -991,9 +1036,16 @@ mod tests {
                 "card row {row} must appear verbatim in the human-visible output"
             );
         }
-        // ...and the realm view around it is darkened, not erased.
-        assert_ne!(output[..4], clean_output[..4], "the scrim must apply");
-        assert!(output[0] > 0 || output[1] > 0 || output[2] > 0);
+        // ...and the realm view around it is darkened, not erased. Checked at
+        // the bottom-left — below the band (whose colour is identical prompt or
+        // not) and outside the centered card, so this isolates the scrim.
+        let bl = (VH as usize - 1) * VW as usize * test_pattern::BYTES_PER_PIXEL;
+        assert_ne!(
+            output[bl..bl + 4],
+            clean_output[bl..bl + 4],
+            "the scrim must apply"
+        );
+        assert!(output[bl] > 0 || output[bl + 1] > 0 || output[bl + 2] > 0);
 
         // --- Agent side: the capture is the realm view, unchanged. ---
         let view = state.latest_frame_rgba().expect("readback");
@@ -1079,8 +1131,12 @@ mod tests {
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
         let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
-        let mut state =
-            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+        )
+        .expect("headless state under pixman");
         state
             .scene
             .commit(SurfaceContent::from_rgba(client_pixels(200, 150), 200, 150).expect("content"));
@@ -1090,7 +1146,8 @@ mod tests {
                 state.output.consent.show_for_test(prompt_fixture());
             }
             state.redraw().expect("redraw");
-            let mut expected = crate::consent::ConsentSurface::new();
+            let mut expected =
+                crate::consent::ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
             if prompt_up {
                 expected.show_for_test(prompt_fixture());
             }
@@ -1128,8 +1185,12 @@ mod tests {
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
         let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
-        let mut state =
-            HeadlessView::new(size, event_loop.get_signal()).expect("headless state under pixman");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+        )
+        .expect("headless state under pixman");
 
         let painted = client_pixels(300, 200);
         state.scene.commit(
@@ -1164,7 +1225,8 @@ mod tests {
             state.output.consent.prompt().is_some(),
             "the scrub must not silently take the prompt down"
         );
-        let mut expected = crate::consent::ConsentSurface::new();
+        let mut expected =
+            crate::consent::ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
         expected.show_for_test(prompt_fixture());
         assert_eq!(
             state.latest_output_rgba().expect("readback"),
@@ -1249,8 +1311,12 @@ mod tests {
         let size: Size<i32, Physical> = (W as i32, H as i32).into();
         let mut event_loop: EventLoop<LoopState> = EventLoop::try_new().expect("event loop");
         let mut state = LoopState {
-            headless: HeadlessView::new(size, event_loop.get_signal())
-                .expect("headless state under pixman"),
+            headless: HeadlessView::new(
+                size,
+                event_loop.get_signal(),
+                crate::consent::TrustedIndicator::for_test(),
+            )
+            .expect("headless state under pixman"),
             server: Some(ShimServer::new(ShimConfig {
                 realm: "realm-0".into(),
                 width: W,

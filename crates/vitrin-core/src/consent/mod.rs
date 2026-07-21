@@ -122,13 +122,17 @@
 //! paints is composited *above* this card, and inherits the same
 //! never-in-a-capture property by the same structural argument.
 //!
-//! Still unattached:
-//!
-//! - **Issue #85 — no trusted indicator.** A confined app can draw a
-//!   byte-identical replica of this card, and nothing yet lets a human tell
-//!   the difference. Tracked separately; [`render`] refuses to *claim*
-//!   otherwise, and [`grab`] notes the one partial mitigation (a replica
-//!   gets no input grab).
+//! **Issue #85 — the trusted indicator — has since attached.** A confined app
+//! can still draw a byte-identical replica of this card into its own surface
+//! (the scene presents it full-view), but it can no longer make it pass:
+//! [`indicator`] mints a per-session secret colour at startup, and this module
+//! paints it where the app cannot — as the reserved band along the top of the
+//! human-visible output ([`ConsentSurface::composite_trust_band`]) and as the
+//! frame around a genuine card ([`ConsentSurface::composite_over`]), both on
+//! the output path that never reaches a capture. The human learns the colour
+//! off the band and checks a prompt's frame against it; a replica the app
+//! draws has neither the band nor the right frame. The no-input-grab mitigation
+//! [`grab`] notes is now a second line of defence rather than the only one.
 //!
 //! The prompt is raised at runtime now (issue #90): once per dispatch round
 //! [`crate::session::service_consent_round`] calls
@@ -155,6 +159,7 @@
 
 pub(crate) mod canvas;
 pub(crate) mod grab;
+mod indicator;
 pub(crate) mod render;
 mod text;
 
@@ -162,8 +167,23 @@ use vitrin_protocol::generated::vitrin_grant::Verb;
 
 use crate::grants::{PersistenceRung, RealmId};
 use crate::identity::PrincipalIdentity;
-use canvas::Canvas;
+use canvas::{Canvas, Rect};
+pub(crate) use indicator::TrustedIndicator;
 use render::Card;
+
+/// The trusted frame's width, in view pixels (issue #85). Wide enough to read
+/// as a deliberate coloured band around the card rather than a hairline a
+/// human would not think to check, and drawn as a ring hugging the card's
+/// outer edge so a forged card painted into a client surface has nowhere to
+/// put the matching colour.
+pub(crate) const TRUST_FRAME_THICKNESS: u32 = 12;
+
+/// The trusted band's height, in view pixels (issue #85). The reserved strip
+/// along the top of the human-visible output that teaches the human this
+/// session's colour — a persistent reference the per-prompt frame is checked
+/// against. Thin, because it is always on screen; tall enough to read as a
+/// deliberate band and not a rendering artifact.
+pub(crate) const TRUST_BAND_HEIGHT: u32 = 8;
 
 /// How far the realm view is darkened behind the prompt (0 = untouched,
 /// 255 = black). Strong enough that the card is unmistakably foreground and
@@ -302,16 +322,25 @@ pub(crate) struct ConsentSurface {
     /// so the view size is not part of the cache key.
     card: Option<Card>,
     card_generation: u64,
+    /// This session's trusted indicator (issue #85): the secret colour every
+    /// genuine prompt is framed in. Required at construction — a consent
+    /// surface *cannot* exist without one, so "a prompt is always framed in a
+    /// colour the app cannot reproduce" is a type-level fact, not a
+    /// convention a backend could forget. It does not change after startup, so
+    /// it is not part of `generation`.
+    indicator: TrustedIndicator,
 }
 
 impl ConsentSurface {
-    /// An empty surface: no prompt, nothing composited.
-    pub fn new() -> Self {
+    /// An empty surface: no prompt, nothing composited, framing prompts in
+    /// `indicator` once they appear.
+    pub fn new(indicator: TrustedIndicator) -> Self {
         Self {
             prompt: None,
             generation: 0,
             card: None,
             card_generation: 0,
+            indicator,
         }
     }
 
@@ -448,6 +477,9 @@ impl ConsentSurface {
     /// compositor mid-frame is worse, and the petition times out fail-closed
     /// either way.
     pub fn composite_over(&mut self, view: &mut [u8], width: u32, height: u32) {
+        // Read the secret before the `&mut self` borrow the lazy raster needs;
+        // `TrustedIndicator` is `Copy`, so this takes nothing away from `self`.
+        let indicator = self.indicator;
         let Some(card) = self.card() else {
             return;
         };
@@ -456,11 +488,60 @@ impl ConsentSurface {
         let Some(mut canvas) = Canvas::new(view, width, height) else {
             return;
         };
-        // Scrim first, then the card on top of it: the card is opaque, so
-        // darkening the whole view and then covering part of it costs one
-        // wasted pass over the card's footprint and keeps the order obvious.
+        // Scrim first, then the trusted frame, then the card on top: the card
+        // is opaque, so darkening the whole view and then covering part of it
+        // costs one wasted pass over the card's footprint and keeps the order
+        // obvious.
         canvas.darken(SCRIM_ALPHA);
+        // The trusted indicator (issue #85): a ring in this session's secret
+        // colour hugging the card's outer edge. It is *outside* the card
+        // footprint, so the opaque card blitted next never covers it, and it
+        // is drawn here — on the human-visible overlay path — never in
+        // `Scene::compose`, so an observe grant's `frame_ready` cannot carry
+        // it. A confined app can rasterize the identical card into its own
+        // surface, but it never saw this colour and so cannot frame its forgery
+        // in it; a human who learned the colour at startup sees an unframed (or
+        // wrong-framed) dialog and knows it is not vitrind's.
+        let t = TRUST_FRAME_THICKNESS;
+        let frame = Rect {
+            x: x - t as i32,
+            y: y - t as i32,
+            w: cw.saturating_add(2 * t),
+            h: ch.saturating_add(2 * t),
+        };
+        canvas.stroke_rect(frame, indicator.color(), t);
         canvas.blit_opaque(rgba, cw, ch, x, y);
+    }
+
+    /// Paint the trusted band — a reserved strip of this session's secret
+    /// colour along the top edge of the human-visible output (issue #85).
+    ///
+    /// **Always, prompt or not**, and composited *after* the client's surface
+    /// and after [`Self::composite_over`], so client content in the strip is
+    /// always overdrawn by the genuine colour. This is the channel that teaches
+    /// the human the colour: the secret is never written to any log or file (a
+    /// same-uid app could read those — see [`indicator`]), so the band on the
+    /// display vitrind owns is the one reference the app cannot forge or
+    /// observe. A prompt is trusted when its frame matches this band.
+    ///
+    /// Human-visible output only, the same as the frame: the one call site is
+    /// [`crate::backend::human_visible_from_view`], never the capture path, so
+    /// the band cannot leak through `vitrin_view.frame_ready` either. A
+    /// dimension mismatch is refused rather than panicking, as elsewhere.
+    pub fn composite_trust_band(&self, view: &mut [u8], width: u32, height: u32) {
+        let Some(mut canvas) = Canvas::new(view, width, height) else {
+            return;
+        };
+        let h = TRUST_BAND_HEIGHT.min(height);
+        canvas.fill_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                w: width,
+                h,
+            },
+            self.indicator.color(),
+        );
     }
 }
 
@@ -645,7 +726,7 @@ pub(crate) mod tests {
 
     #[test]
     fn an_empty_surface_leaves_the_view_untouched() {
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(TrustedIndicator::for_test());
         let mut view = flat_view(64, 48, [0x40, 0x50, 0x60]);
         let before = view.clone();
         surface.composite_over(&mut view, 64, 48);
@@ -659,7 +740,7 @@ pub(crate) mod tests {
         const W: u32 = 900;
         const H: u32 = 700;
         let bg = [0x40, 0x50, 0x60];
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(TrustedIndicator::for_test());
         surface.show(prompt_fixture());
         let mut view = flat_view(W, H, bg);
         surface.composite_over(&mut view, W, H);
@@ -704,7 +785,7 @@ pub(crate) mod tests {
         // The redraw contract: every visible transition changes the
         // generation, so a presentation cache keyed on it cannot show a
         // stale frame with (or without) a prompt on it.
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(TrustedIndicator::for_test());
         let g0 = surface.generation();
         surface.show(prompt_fixture());
         let g1 = surface.generation();
@@ -731,7 +812,7 @@ pub(crate) mod tests {
     fn showing_a_different_petition_re_rasterizes() {
         // The cache is keyed on the generation, so a queue advancing to the
         // next petition cannot present the previous petition's card.
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(TrustedIndicator::for_test());
         surface.show(prompt_fixture());
         let mut first = flat_view(700, 600, [0, 0, 0]);
         surface.composite_over(&mut first, 700, 600);
@@ -756,7 +837,7 @@ pub(crate) mod tests {
         // human is never asked to make.
         const W: u32 = 320;
         const H: u32 = 200;
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(TrustedIndicator::for_test());
         surface.show(prompt_fixture());
         let clean = flat_view(W, H, [0x40, 0x50, 0x60]);
         let mut view = clean.clone();
@@ -773,7 +854,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_mis_sized_or_degenerate_view_is_refused_not_panicked_on() {
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(TrustedIndicator::for_test());
         surface.show(prompt_fixture());
         // Buffer disagrees with the claimed dimensions.
         let mut wrong = vec![0u8; 10];
@@ -831,13 +912,13 @@ pub(crate) mod tests {
         assert_eq!(content.verbs, Verb::OBSERVE | Verb::ACTUATE_TEXT);
         assert_eq!(content.expiry_ms, 60_000);
 
-        let mut surface = ConsentSurface::new();
+        let mut surface = ConsentSurface::new(TrustedIndicator::for_test());
         surface.show(content.clone());
         let mut view = flat_view(800, 700, [0x20, 0x20, 0x20]);
         surface.composite_over(&mut view, 800, 700);
 
         // Identical to rendering that same content directly...
-        let mut reference = ConsentSurface::new();
+        let mut reference = ConsentSurface::new(TrustedIndicator::for_test());
         reference.show(content);
         let mut expected = flat_view(800, 700, [0x20, 0x20, 0x20]);
         reference.composite_over(&mut expected, 800, 700);
@@ -850,7 +931,7 @@ pub(crate) mod tests {
         else {
             panic!("interactive petition must pend");
         };
-        let mut other_surface = ConsentSurface::new();
+        let mut other_surface = ConsentSurface::new(TrustedIndicator::for_test());
         other_surface.show(reg.prompt_content(other).expect("pending"));
         let mut other_view = flat_view(800, 700, [0x20, 0x20, 0x20]);
         other_surface.composite_over(&mut other_view, 800, 700);
@@ -922,5 +1003,138 @@ pub(crate) mod tests {
         assert!(prompt
             .choices()
             .contains(&Choice::Allow(PersistenceRung::Once)));
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #85: the trusted indicator distinguishes a genuine prompt from
+    // a byte-perfect replica an app draws into its own surface.
+    // ------------------------------------------------------------------
+
+    /// The reproduction from the issue, now resolved: a confined app
+    /// rasterizes the identical card, scrims a client buffer, blits the card
+    /// centered, commits it, and `Scene::compose` presents it full-view. Until
+    /// the trusted frame landed that output was byte-identical to a genuine
+    /// prompt. It no longer is — and the difference is exactly the secret
+    /// colour the app never got to see.
+    #[test]
+    fn a_replica_the_app_can_draw_lacks_the_trusted_frame() {
+        const W: u32 = 700;
+        const H: u32 = 600;
+        let indicator = TrustedIndicator::for_test();
+
+        // Genuine: vitrind draws the prompt over the realm view, framing it in
+        // this session's secret, on the human-visible path.
+        let mut genuine = flat_view(W, H, [40, 40, 40]);
+        let mut surface = ConsentSurface::new(indicator);
+        surface.show_for_test(prompt_fixture());
+        surface.composite_over(&mut genuine, W, H);
+
+        // The forgery, built exactly as the issue describes.
+        let card = render::rasterize(&prompt_fixture());
+        let (cx, cy) = centered(card.width, card.height, W, H);
+        let mut client = flat_view(W, H, [40, 40, 40]);
+        {
+            let mut canvas = Canvas::new(&mut client, W, H).expect("client canvas");
+            canvas.darken(SCRIM_ALPHA);
+            canvas.blit_opaque(&card.rgba, card.width, card.height, cx, cy);
+        }
+        let mut scene = crate::scene::Scene::new();
+        scene
+            .commit(crate::scene::SurfaceContent::from_rgba(client, W, H).expect("client surface"));
+        let replica = scene.compose(W, H);
+
+        assert_ne!(
+            genuine, replica,
+            "a genuine prompt and an app-drawn replica must no longer be byte-identical"
+        );
+
+        // They differ *in the frame*: a pixel in the ring's top-left corner is
+        // the secret colour in the genuine prompt, and is the app's scrimmed
+        // background in the replica — the app could not have painted it there.
+        let rx = (cx - TRUST_FRAME_THICKNESS as i32 / 2) as u32;
+        let ry = (cy - TRUST_FRAME_THICKNESS as i32 / 2) as u32;
+        assert_eq!(
+            px(&genuine, W, rx, ry),
+            indicator.color(),
+            "the genuine prompt is framed in the session secret"
+        );
+        assert_ne!(
+            px(&replica, W, rx, ry),
+            indicator.color(),
+            "the app never observed the secret, so its replica cannot reproduce it"
+        );
+    }
+
+    /// The indicator must not be derivable from anything a client can observe,
+    /// including via an observe grant's `frame_ready`. The capture path is
+    /// `Scene::compose`, overlay-free by construction, so the secret colour is
+    /// in the human-visible output and *nowhere* in the frame a capture serves
+    /// — even with a prompt up.
+    #[test]
+    fn the_indicator_never_reaches_the_capture_path() {
+        const W: u32 = 700;
+        const H: u32 = 600;
+        let indicator = TrustedIndicator::for_test();
+        let mut consent = ConsentSurface::new(indicator);
+        consent.show_for_test(prompt_fixture());
+
+        let mut scene = crate::scene::Scene::new();
+        scene.commit(
+            crate::scene::SurfaceContent::from_rgba(flat_view(W, H, [90, 90, 90]), W, H)
+                .expect("client surface"),
+        );
+
+        // Capture path vs human-visible path off the same scene + prompt.
+        let capture = scene.compose(W, H);
+        let human = crate::backend::compose_human_visible(&scene, &mut consent, W, H);
+
+        // The frame is in the human output...
+        let card = render::rasterize(&prompt_fixture());
+        let (cx, cy) = centered(card.width, card.height, W, H);
+        let rx = (cx - TRUST_FRAME_THICKNESS as i32 / 2) as u32;
+        let ry = (cy - TRUST_FRAME_THICKNESS as i32 / 2) as u32;
+        assert_eq!(px(&human, W, rx, ry), indicator.color());
+
+        // ...and the secret colour appears on not one pixel of the capture.
+        let color = indicator.color();
+        assert!(
+            !capture.chunks_exact(BYTES_PER_PIXEL).any(|p| p == color),
+            "the trust indicator must never appear in a captured frame"
+        );
+    }
+
+    /// The trusted band is the learn channel: it teaches the human the session
+    /// colour whether or not a prompt is up, and it is composited *over* client
+    /// content, so an app that fills its whole surface — even with a guessed
+    /// band — cannot occupy the reserved strip; the genuine colour always wins
+    /// there (issue #85's "reserved strip the compositor refuses to let client
+    /// content reach").
+    #[test]
+    fn the_trusted_band_is_always_present_and_overdraws_client_content() {
+        const W: u32 = 400;
+        const H: u32 = 200;
+        let indicator = TrustedIndicator::for_test();
+        let consent = ConsentSurface::new(indicator);
+
+        // An app that fills its whole surface — no prompt is up, and the band
+        // is still drawn (that is what makes it a *learn* channel rather than a
+        // per-prompt one).
+        let mut view = flat_view(W, H, [10, 20, 30]);
+        consent.composite_trust_band(&mut view, W, H);
+
+        // The top strip is the genuine colour, edge to edge...
+        for x in 0..W {
+            assert_eq!(
+                px(&view, W, x, 0),
+                indicator.color(),
+                "the band spans the whole top edge"
+            );
+        }
+        // ...exactly TRUST_BAND_HEIGHT tall; below it the app's content stands.
+        assert_eq!(
+            px(&view, W, 0, TRUST_BAND_HEIGHT),
+            [10, 20, 30, 0xff],
+            "below the band the realm view is untouched"
+        );
     }
 }

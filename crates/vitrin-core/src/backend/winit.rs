@@ -53,7 +53,7 @@ use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use tracing::{debug, error, info, trace};
 
 use crate::consent::grab::{ConsentGate, ConsentGrab};
-use crate::consent::ConsentSurface;
+use crate::consent::{ConsentSurface, TrustedIndicator};
 use crate::deadman::{DeadManConfig, DeadManHook, DeadManSwitch, Trigger};
 use crate::input;
 use crate::recorder::Recorder;
@@ -377,11 +377,18 @@ fn run_inner(
         Rc::clone(&now),
         DeadManHook::new(Rc::clone(&deadman), Rc::clone(&now), input::NoopHook),
     ));
+    // The session's trusted indicator, minted in `run_session` before the
+    // listener accepted anyone (issue #85). Read by `Copy` before the seed is
+    // consumed into the runtime below.
+    let indicator: TrustedIndicator = seed
+        .as_ref()
+        .expect("the seed is present until the state is built")
+        .indicator;
     let mut state = NestedState {
         view: NestedView {
             backend,
             scene: Scene::new(),
-            consent: ConsentSurface::new(),
+            consent: ConsentSurface::new(indicator),
             texture: None,
         },
         runtime: Runtime::new(
@@ -640,7 +647,12 @@ impl NestedState {
         // the delivery sink below reaches the realm's shim session. Both are
         // fields of the same `Runtime`, so they are split here rather than
         // reached through `&mut self` twice.
-        let session::Runtime { router, realm, .. } = &mut self.runtime;
+        let session::Runtime {
+            router,
+            realm,
+            kernel,
+            ..
+        } = &mut self.runtime;
         route_turn(
             router,
             &self.deadman,
@@ -659,8 +671,24 @@ impl NestedState {
                     return;
                 };
                 let mut send = |frame: &[u8]| realm.outbox.send(frame);
-                if let Err(err) = server.deliver_seat_event(&delivery, &mut send) {
-                    tracing::warn!(%err, "seat delivery to the realm failed");
+                match server.deliver_seat_event(&delivery, &mut send) {
+                    // Journal the delivery with its origin through the same
+                    // funnel the agent path uses (issue #83). This is the
+                    // *only* site that produces `origin="physical"` at runtime
+                    // — a human's input reaching the app is the half of the
+                    // physical-vs-emulated audit that never crosses a
+                    // chokepoint — so sharing `record_seat_delivery` keeps it
+                    // from silently diverging from the tested agent copy (and
+                    // inherits the motion-flood guard the physical path needs
+                    // most).
+                    Ok(sent) => {
+                        if sent {
+                            crate::input::record_seat_delivery(&mut kernel.recorder, &delivery);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "seat delivery to the realm failed");
+                    }
                 }
             },
         );
@@ -1010,14 +1038,30 @@ mod tests {
         let mut scene = Scene::new();
         scene
             .commit(SurfaceContent::from_rgba(client_pixels(300, 200), 300, 200).expect("content"));
-        let mut consent = ConsentSurface::new();
+        let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
 
-        // No prompt: the window shows the realm view, byte for byte.
+        // No prompt: the window is the realm view plus the trusted band along
+        // the top (issue #85). Below the band it is the realm view byte for
+        // byte; the band itself is the session colour, present on the
+        // human-visible upload and never in the capture (Scene::compose).
         let plain = window_pixels(&scene, &mut consent, None, size);
+        let composed = scene.compose(W as u32, H as u32);
+        let band_bytes =
+            crate::consent::TRUST_BAND_HEIGHT as usize * W as usize * crate::scene::BYTES_PER_PIXEL;
         assert_eq!(
-            plain,
-            scene.compose(W as u32, H as u32),
-            "with no prompt up the host window is the realm view unchanged"
+            plain[band_bytes..],
+            composed[band_bytes..],
+            "below the band, the host window is the realm view unchanged"
+        );
+        assert_eq!(
+            plain[..crate::scene::BYTES_PER_PIXEL],
+            TrustedIndicator::for_test().color(),
+            "the trusted band is on the human-visible upload"
+        );
+        assert_ne!(
+            composed[..crate::scene::BYTES_PER_PIXEL],
+            TrustedIndicator::for_test().color(),
+            "...and never in the capture"
         );
 
         // Prompt up: the window shows the shared human-visible composition.
@@ -1027,7 +1071,7 @@ mod tests {
             with_prompt, plain,
             "the prompt must change what is uploaded"
         );
-        let mut expected = ConsentSurface::new();
+        let mut expected = ConsentSurface::new(TrustedIndicator::for_test());
         expected.show_for_test(prompt_fixture());
         assert_eq!(
             with_prompt,
@@ -1065,7 +1109,7 @@ mod tests {
     fn the_texture_key_changes_on_every_visible_transition() {
         let size = size_of(800, 600);
         let mut scene = Scene::new();
-        let mut consent = ConsentSurface::new();
+        let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
 
         let base = TextureKey::current(size, &scene, &consent, None);
         assert_eq!(
@@ -1127,7 +1171,7 @@ mod tests {
         let size = size_of(W, H);
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(client_pixels(64, 48), 64, 48).expect("content"));
-        let mut consent = ConsentSurface::new();
+        let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
 
         // No hold: the window is the ordinary human-visible composition,
         // byte for byte. The indicator costs an idle session nothing.

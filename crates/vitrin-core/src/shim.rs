@@ -566,6 +566,15 @@ impl ShimServer {
         Ok(())
     }
 
+    /// Whether the shim has minted its seat yet (`get_seat` processed). The
+    /// core can only deliver a seat event — and record its delivery-point
+    /// audit entry (issue #83) — once it has; a test predicate pumps the loop
+    /// until this is true before driving `route_seat`.
+    #[cfg(test)]
+    pub(crate) fn seat_minted(&self) -> bool {
+        self.seat_id.is_some()
+    }
+
     /// Deliver one routed, origin-tagged seat event to the shim (P1.3.7):
     /// the delivery half of the input path, encoding the
     /// [`SeatDelivery`](crate::input::SeatDelivery) toward the session's

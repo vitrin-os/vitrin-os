@@ -276,15 +276,25 @@ def resolution_error_by_outcome(outcome: int) -> GrantResolutionError:
 
 
 class GrantRefused(VitrinError):
-    """The enforcement chokepoint refused one use of a grant (recoverable)."""
+    """The enforcement chokepoint refused one use of a grant (recoverable).
+
+    Carries the protocol error payload so a caller — or a log the exception
+    propagated to, far from the call site — can act on it without parsing the
+    message: ``grant_id`` (the ``vitrin_grant`` object the ``refused`` event was
+    dispatched on), ``verb`` (which authority was exercised), ``code`` (the
+    numeric reason, mirrored 1:1 by this exception's *type* — the human-readable
+    reason), and ``retry_after_ms`` (nonzero only for :class:`RateLimited`).
+    """
 
     REFUSAL: int  # set on each subclass
 
-    def __init__(self, verb: int, retry_after_ms: int = 0) -> None:
+    def __init__(self, verb: int, retry_after_ms: int = 0, *, grant_id: int = 0) -> None:
         super().__init__(
-            f"use of verb {verb} refused: {self.__class__.__name__} "
-            f"(code {self.REFUSAL}, retry_after_ms {retry_after_ms})"
+            f"grant {grant_id}: use of verb {verb} refused: "
+            f"{self.__class__.__name__} (code {self.REFUSAL}, "
+            f"retry_after_ms {retry_after_ms})"
         )
+        self.grant_id = grant_id
         self.verb = verb
         self.code = self.REFUSAL
         self.retry_after_ms = retry_after_ms
@@ -353,12 +363,14 @@ _REFUSAL_BY_CODE: dict[int, type[GrantRefused]] = {
 }
 
 
-def refusal_error_by_code(verb: int, code: int, retry_after_ms: int) -> GrantRefused:
+def refusal_error_by_code(
+    verb: int, code: int, retry_after_ms: int, *, grant_id: int = 0
+) -> GrantRefused:
     """Build the typed error for one ``refused`` event."""
     cls = _REFUSAL_BY_CODE.get(code)
     if cls is None:
         raise ServerContractViolation(f"server sent unknown refusal code {code}")
-    return cls(verb, retry_after_ms)
+    return cls(verb, retry_after_ms, grant_id=grant_id)
 
 
 # ---------------------------------------------------------------------------

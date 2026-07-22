@@ -335,6 +335,15 @@ USAGE:
                                 `command` (regular file; it and every directory
                                 on its path owned by root or the core's uid and
                                 not writable by group or other).
+    vitrind [--capture-dump PATH]
+                                DIAGNOSTIC (P1.8.5): mirror every composited
+                                realm-view readback to PATH as raw RGBA8888
+                                (width*height*4, rows top-down) — the
+                                core-internal capture, taken before the wire and
+                                the SDK ever run. Used by the real-app fidelity
+                                test to prove the capture path adds no
+                                distortion; off by default, and not a wire
+                                feature. Written atomically each redraw.
     vitrind [--dead-man-chord KEY]
                                 Key for the dead-man switch: holding it
                                 revokes every grant in the session at once.
@@ -382,6 +391,7 @@ enum Action {
         recorder: Option<PathBuf>,
         realm: Option<PathBuf>,
         shim: Option<PathBuf>,
+        capture_dump: Option<PathBuf>,
         dead_man: DeadManConfig,
     },
     RunHeadless {
@@ -391,6 +401,11 @@ enum Action {
         recorder: Option<PathBuf>,
         realm: Option<PathBuf>,
         shim: Option<PathBuf>,
+        /// The `--capture-dump PATH` diagnostic target (P1.8.5, issue #107):
+        /// mirror every composited realm-view readback to a file, the
+        /// core-internal capture the fidelity test compares an agent's
+        /// `observe()` frame against. Valid in both modes; exercised headless.
+        capture_dump: Option<PathBuf>,
         /// Parsed and validated even here, so the same command line is
         /// accepted or refused identically in both modes -- the `--consent`
         /// precedent, which headless also accepts although it can prompt
@@ -434,6 +449,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut recorder: Option<PathBuf> = None;
     let mut realm: Option<PathBuf> = None;
     let mut shim: Option<PathBuf> = None;
+    let mut capture_dump: Option<PathBuf> = None;
     let mut chord: Option<deadman::Chord> = None;
     let mut hold_ms: Option<u64> = None;
     let mut args = args.into_iter();
@@ -481,6 +497,12 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 )?;
                 set_path(&mut shim, "--shim", "shim path", value)?;
             }
+            "--capture-dump" => {
+                let value = args.next().ok_or(
+                    "`--capture-dump` requires a file path (e.g. `--capture-dump /tmp/internal.rgba`)",
+                )?;
+                set_path(&mut capture_dump, "--capture-dump", "dump path", value)?;
+            }
             "--dead-man-chord" => {
                 let value = args
                     .next()
@@ -506,6 +528,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_path(&mut realm, "--realm", "config path", value)?;
                 } else if let Some(value) = other.strip_prefix("--shim=") {
                     set_path(&mut shim, "--shim", "shim path", value)?;
+                } else if let Some(value) = other.strip_prefix("--capture-dump=") {
+                    set_path(&mut capture_dump, "--capture-dump", "dump path", value)?;
                 } else if let Some(value) = other.strip_prefix("--dead-man-chord=") {
                     set_chord(&mut chord, value)?;
                 } else if let Some(value) = other.strip_prefix("--dead-man-hold=") {
@@ -542,6 +566,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             recorder,
             realm,
             shim,
+            capture_dump,
             dead_man,
         }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
@@ -568,6 +593,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             recorder,
             realm,
             shim,
+            capture_dump,
             dead_man,
         }),
         (None, Some(_)) => Err("`--size` requires `--headless`".into()),
@@ -721,12 +747,19 @@ fn main() -> ExitCode {
             recorder,
             realm,
             shim,
+            capture_dump,
             dead_man,
         } => {
             init_tracing();
-            run_session(consent, principals, recorder, realm, shim, move |seed| {
-                backend::winit::run(dead_man, seed)
-            })
+            run_session(
+                consent,
+                principals,
+                recorder,
+                realm,
+                shim,
+                capture_dump,
+                move |seed| backend::winit::run(dead_man, seed),
+            )
         }
         Action::RunHeadless {
             size,
@@ -735,15 +768,22 @@ fn main() -> ExitCode {
             recorder,
             realm,
             shim,
+            capture_dump,
             // Validated at parse time so both modes accept the same command
             // line, then unused: headless has no physical input device to
             // hold a chord on (`Action::RunHeadless::dead_man`).
             dead_man: _,
         } => {
             init_tracing();
-            run_session(consent, principals, recorder, realm, shim, move |seed| {
-                backend::headless::run(size, seed)
-            })
+            run_session(
+                consent,
+                principals,
+                recorder,
+                realm,
+                shim,
+                capture_dump,
+                move |seed| backend::headless::run(size, seed),
+            )
         }
     }
 }
@@ -880,6 +920,7 @@ fn run_session<R>(
     recorder_path: Option<PathBuf>,
     realm_path: Option<PathBuf>,
     shim_path: Option<PathBuf>,
+    capture_dump: Option<PathBuf>,
     backend: R,
 ) -> ExitCode
 where
@@ -1040,6 +1081,7 @@ where
         recorder,
         shim,
         indicator,
+        capture_dump,
     };
 
     let (mut recorder, result) = backend(seed);
@@ -1514,6 +1556,7 @@ mod tests {
                 recorder: None,
                 realm: None,
                 shim: None,
+                capture_dump: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1533,6 +1576,7 @@ mod tests {
                 recorder: None,
                 realm: None,
                 shim: None,
+                capture_dump: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1552,6 +1596,7 @@ mod tests {
                 recorder: None,
                 realm: None,
                 shim: None,
+                capture_dump: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1564,6 +1609,7 @@ mod tests {
                 recorder: None,
                 realm: None,
                 shim: None,
+                capture_dump: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1586,6 +1632,7 @@ mod tests {
                     recorder: None,
                     realm: None,
                     shim: None,
+                    capture_dump: None,
                     dead_man: DeadManConfig::default()
                 })
             );
@@ -1598,6 +1645,7 @@ mod tests {
                 recorder: None,
                 realm: None,
                 shim: None,
+                capture_dump: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1645,6 +1693,7 @@ mod tests {
                 recorder: None,
                 realm: None,
                 shim: None,
+                capture_dump: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1670,6 +1719,7 @@ mod tests {
                     recorder: Some(PathBuf::from("/tmp/run.jsonl")),
                     realm: None,
                     shim: None,
+                    capture_dump: None,
                     dead_man: DeadManConfig::default()
                 })
             );
@@ -1687,6 +1737,7 @@ mod tests {
                 recorder: Some(PathBuf::from("/tmp/n.jsonl")),
                 realm: None,
                 shim: None,
+                capture_dump: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1719,6 +1770,7 @@ mod tests {
                     recorder: None,
                     realm: Some(PathBuf::from("/etc/vitrin/realm.toml")),
                     shim: None,
+                    capture_dump: None,
                     dead_man: DeadManConfig::default()
                 })
             );
@@ -1737,6 +1789,7 @@ mod tests {
                 recorder: Some(PathBuf::from("/tmp/n.jsonl")),
                 realm: Some(PathBuf::from("/tmp/realm.toml")),
                 shim: None,
+                capture_dump: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1784,6 +1837,7 @@ mod tests {
                     recorder: None,
                     realm: None,
                     shim: Some(PathBuf::from("/usr/lib/vitrin/vitrin-shim")),
+                    capture_dump: None,
                     dead_man: DeadManConfig::default()
                 })
             );
@@ -1797,6 +1851,7 @@ mod tests {
                 recorder: None,
                 realm: None,
                 shim: Some(PathBuf::from("/opt/vitrin/vitrin-shim")),
+                capture_dump: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1812,6 +1867,68 @@ mod tests {
         assert!(parse_args(["--headless", "--shim=/a", "--shim=/b"])
             .unwrap_err()
             .contains("--shim"));
+    }
+
+    #[test]
+    fn capture_dump_parses_both_spellings_and_defaults_to_none() {
+        // The P1.8.5 diagnostic knob (issue #107): omitted, `None`; given, the
+        // path both spellings resolve to, in both run modes. `--headless`
+        // carries `--consent=auto-approve` because interactive is refused
+        // there (a headless core cannot draw a prompt).
+        for args in [
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--capture-dump",
+                "/tmp/internal.rgba",
+            ],
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--capture-dump=/tmp/internal.rgba",
+            ],
+        ] {
+            assert_eq!(
+                parse_args(args),
+                Ok(Action::RunHeadless {
+                    size: (1280, 800),
+                    consent: ConsentPolicy::AutoApprove,
+                    principals: None,
+                    recorder: None,
+                    realm: None,
+                    shim: None,
+                    capture_dump: Some(PathBuf::from("/tmp/internal.rgba")),
+                    dead_man: DeadManConfig::default()
+                })
+            );
+        }
+        // Valid nested too, and the default really is `None`.
+        assert_eq!(
+            parse_args(["--nested", "--capture-dump=/tmp/x.rgba"]),
+            Ok(Action::RunNested {
+                consent: ConsentPolicy::Interactive,
+                principals: None,
+                recorder: None,
+                realm: None,
+                shim: None,
+                capture_dump: Some(PathBuf::from("/tmp/x.rgba")),
+                dead_man: DeadManConfig::default()
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_or_repeated_capture_dump_is_an_error() {
+        // The `--shim` precedent: no value, an empty path, and a repeat that
+        // names the flag.
+        assert!(parse_args(["--headless", "--capture-dump"]).is_err());
+        assert!(parse_args(["--headless", "--capture-dump="]).is_err());
+        assert!(parse_args(["--headless", "--capture-dump", ""]).is_err());
+        assert!(
+            parse_args(["--headless", "--capture-dump=/a", "--capture-dump=/b"])
+                .unwrap_err()
+                .contains("--capture-dump")
+        );
     }
 
     #[test]
@@ -2060,6 +2177,7 @@ mod tests {
             Some(log.clone()),
             Some(realm.clone()),
             None,
+            None,
             |seed| {
                 ran.set(true);
                 (seed.recorder, Ok(()))
@@ -2094,6 +2212,7 @@ mod tests {
             Some(demo_registry),
             Some(log.clone()),
             Some(realm),
+            None,
             None,
             |seed| {
                 ran.set(true);
@@ -2270,6 +2389,7 @@ mod tests {
                     recorder: None,
                     realm: None,
                     shim: None,
+                    capture_dump: None,
                     dead_man: DeadManConfig::default()
                 })
             );
@@ -2330,6 +2450,7 @@ mod tests {
                 recorder: None,
                 realm: None,
                 shim: None,
+                capture_dump: None,
                 dead_man: DeadManConfig::default()
             })
         );

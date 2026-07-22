@@ -398,3 +398,69 @@ edges (input-model gaps, HiDPI oddities — R1); headless is the fallback venue
 and CI never depends on nested. What you are checking by eye here is the thing
 the headless gates cannot show: that a human and an agent can watch the *same*
 live Firefox in a confined nested surface at once.
+
+### The P1.8.5 agent-capture nested variant (issue #107, criterion 6)
+
+Section 7's gate proves the **agent** captures a real Firefox frame through the
+real chokepoint — headless. Its nested counterpart is the M1.3 exit gate's
+sixth criterion: run that same agent capture against a Firefox realm the human
+is *also* watching, in one host window, on a workstation. It is the visible
+proof of the whole thesis — a human and an AI agent observing one confined GUI
+concurrently — and it is **manual by construction**: nested mode is a Wayland
+client of your host compositor and needs a real display and (for a browser) a
+GPU, none of which a CI runner has (R1, and docs/plan §6 D3). So this is **never
+a CI test** — not skipped in CI, not present in CI. The headless gates
+(`test_real_firefox.py`, `test_real_capture_fidelity.py`) are what merges are
+held on; this is what a person runs to *see* it.
+
+Run it with the same core the headless gate uses, in `--nested` instead of
+`--headless`, and drive it with the agent-capture snippet the fidelity gate
+uses. Get a nesting host up (the table above — nested GNOME or Hyprland from a
+spare TTY), then, inside it:
+
+```bash
+# Prerequisites, same as every venue on this page.
+cargo build --workspace
+meson compile -C shim/build
+bash shim/tests/firefox/fetch-esr.sh
+
+# A realm whose command is the pinned Firefox on a solid #0000ff file:// page,
+# with the section-2 environment forwarded via env_allow. `--consent=interactive`
+# is available here (unlike headless): the nested backend draws the consent
+# surface, so you approve the agent's grant on screen, in the trusted indicator.
+cat > /tmp/ff-nested-realm.toml <<TOML
+[[realm]]
+id = "realm-0"
+command = "$(bash shim/tests/firefox/fetch-esr.sh --print)"
+args = ["--profile", "/tmp/ff-nested-profile", "--no-remote",
+        "file://$PWD/shim/tests/firefox/pages/solid.html"]
+env_allow = ["MOZ_ENABLE_WAYLAND", "GDK_BACKEND", "MOZ_ACCELERATED",
+             "LIBGL_ALWAYS_SOFTWARE", "MOZ_CRASHREPORTER_DISABLE",
+             "GTK_A11Y", "NO_AT_BRIDGE", "HOME"]
+TOML
+
+# The core, nested: it appears as one window in your host compositor, and
+# Firefox's realm composites inside it. You watch; the agent captures.
+MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland MOZ_ACCELERATED=0 \
+LIBGL_ALWAYS_SOFTWARE=1 MOZ_CRASHREPORTER_DISABLE=1 GTK_A11Y=none \
+NO_AT_BRIDGE=1 HOME=/tmp/ff-nested-profile \
+  target/debug/vitrind --nested --consent=interactive \
+    --shim "$PWD/shim/build/vitrin-shim" \
+    --realm /tmp/ff-nested-realm.toml \
+    --principals examples/principals.toml \
+    --recorder /tmp/ff-nested.jsonl
+```
+
+Then, from a second terminal, connect the demo agent (or a REPL over the SDK)
+to `$XDG_RUNTIME_DIR/vitrin-0/core.sock`, request the one whole-realm grant,
+approve it on the nested consent surface, and `observe()` — the dominant colour
+is `#0000ff`, exactly as the headless gate asserts, but now over a window you
+can see. Add `--capture-dump /tmp/ff-nested.rgba` to the core and compare an
+agent frame against it with `vitrin-golden-cmp` for the no-distortion proof on
+real GPU output — where a `tol:` policy earns its keep over `exact`, because a
+GPU composite and the agent's readback can differ by a hair of blending that a
+software pixman render never shows.
+
+Because it is manual, its "never a silent skip" guarantee is structural: there
+is no CI job to skip. The commands above either run and show you the window or
+fail loudly on a missing host/browser in your own terminal.

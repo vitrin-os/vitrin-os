@@ -176,6 +176,15 @@ pub(crate) struct RuntimeSeed {
     /// it out for the [`ConsentSurface`] takes nothing from the seed the
     /// runtime consumes.
     pub indicator: crate::consent::TrustedIndicator,
+    /// Optional `--capture-dump PATH` target (P1.8.5, issue #107): when set,
+    /// every redraw also writes the freshly composited realm-view readback —
+    /// the raw RGBA the capture cache is refreshed from — to this path. It is
+    /// the **core-internal capture**, taken before `render_frame`, the memfd,
+    /// the wire and the SDK decode ever run, so an agent's `observe()` frame
+    /// can be compared against it to prove the grant/capture path adds no
+    /// distortion against a real app. A diagnostic knob, not a wire feature;
+    /// `None` in every ordinary run.
+    pub capture_dump: Option<PathBuf>,
 }
 
 /// Everything one running session owns that is not presentation, living in
@@ -218,6 +227,10 @@ pub(crate) struct Runtime<H: PreemptionHook> {
     /// the capture path, so `capture` stays the pure read of "what the
     /// compositor last finished" that keeps goldens deterministic.
     view_cache: Option<Vec<u8>>,
+    /// The `--capture-dump PATH` diagnostic target from the seed (P1.8.5),
+    /// `None` in every ordinary run. When set, [`post_dispatch`] mirrors each
+    /// refreshed [`Self::view_cache`] to this file — see [`RuntimeSeed::capture_dump`].
+    capture_dump: Option<PathBuf>,
     /// This session's monotonic zero, for presentation timestamps.
     epoch: Instant,
 }
@@ -427,6 +440,7 @@ impl<H: PreemptionHook> Runtime<H> {
             // the seed (by `Copy`) into its `ConsentSurface` before handing the
             // rest here, so the runtime deliberately drops it.
             indicator: _,
+            capture_dump,
         } = seed;
         Self {
             kernel: Kernel {
@@ -444,6 +458,7 @@ impl<H: PreemptionHook> Runtime<H> {
             shim,
             dirty: false,
             view_cache: None,
+            capture_dump,
             epoch: Instant::now(),
         }
     }
@@ -1436,6 +1451,21 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
                 // capture trigger a composite and make goldens depend on
                 // request timing.
                 runtime.view_cache = view.view_rgba();
+                // The `--capture-dump` diagnostic (P1.8.5): mirror the same
+                // freshly refreshed readback to a file. Written here, off the
+                // redraw path and NOT on the capture request, so the dumped
+                // frame and the frame an `observe()` later serves come from one
+                // and the same `view_cache` — the two diverge only in the
+                // transport between them (`render_frame`, the memfd, the wire,
+                // the SDK decode), which is exactly the "adds no distortion"
+                // claim the SSIM comparison tests. A write failure is logged,
+                // never fatal: a broken diagnostic must not take a session down.
+                if let (Some(path), Some(rgba)) = (
+                    runtime.capture_dump.as_deref(),
+                    runtime.view_cache.as_deref(),
+                ) {
+                    write_capture_dump(path, rgba);
+                }
                 // Only a composite that actually happened discharges the
                 // realm's owed `frame_done`. On a backend whose clock is
                 // external this is `Scheduled`, and the frame callbacks stay
@@ -1453,6 +1483,37 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
     };
     if let Some(err) = fatal {
         host.stop(Some(err));
+    }
+}
+
+/// Write the core-internal capture (`--capture-dump`, P1.8.5) atomically.
+///
+/// The bytes are the raw RGBA realm-view readback — `width * height * 4`,
+/// rows top-down, exactly what [`Runtime::view_cache`] holds. Written to a
+/// sibling temp and renamed into place so a reader (the P1.8.5 fidelity test)
+/// never observes a half-written frame; the rename is atomic within a
+/// directory, and the single-threaded loop means there is never a second
+/// writer to race. Any I/O error is logged and swallowed: this is a
+/// diagnostic, and a session must never die because a debug dump could not be
+/// written.
+///
+/// The temp name is the target with `.part` **appended** (not an extension
+/// swap): appending a non-empty suffix can never collide with the target, so
+/// the atomicity holds for *every* dump path — including one that itself ends
+/// in `.tmp`, where a `with_extension("tmp")` would have named the target
+/// itself and written straight onto the reader-visible file.
+fn write_capture_dump(path: &std::path::Path, rgba: &[u8]) {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".part");
+    let tmp = std::path::PathBuf::from(tmp);
+    let write = std::fs::write(&tmp, rgba).and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(err) = write {
+        tracing::warn!(
+            path = %path.display(),
+            "capture-dump write failed: {err} (diagnostic only; the session continues)"
+        );
+        // Best-effort cleanup so a failed rename does not strand the temp file.
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -1629,6 +1690,7 @@ mod tests {
                 recorder,
                 shim: crate::spawn::tests::mock_shim_bin(),
                 indicator: crate::consent::TrustedIndicator::for_test(),
+                capture_dump: None,
             };
             let event_loop: EventLoop<'static, TestHost> =
                 EventLoop::try_new().expect("event loop");
@@ -2679,5 +2741,51 @@ mod tests {
             "the same prompt must still be up"
         );
         drop(client);
+    }
+
+    #[test]
+    fn capture_dump_writes_the_readback_atomically_and_leaves_no_temp() {
+        // The `--capture-dump` diagnostic (P1.8.5): the bytes handed in land at
+        // the path verbatim, and the sibling `.tmp` the atomic write goes
+        // through is gone afterwards — a reader polling the path never sees a
+        // half-written frame or a stray temp.
+        let dir = std::env::temp_dir().join(format!("vitrin-dump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("internal.rgba");
+        let frame: Vec<u8> = (0..64u32).flat_map(|i| (i as u8).to_le_bytes()).collect();
+
+        write_capture_dump(&path, &frame);
+
+        assert_eq!(
+            std::fs::read(&path).expect("the dump landed"),
+            frame,
+            "the dumped bytes must be exactly the readback handed in"
+        );
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "the atomic-write temp must not survive a successful write"
+        );
+
+        // A second write overwrites in place (each redraw refreshes it).
+        let frame2: Vec<u8> = frame.iter().rev().copied().collect();
+        write_capture_dump(&path, &frame2);
+        assert_eq!(std::fs::read(&path).expect("second dump"), frame2);
+
+        // A target whose own name ends in `.tmp` must still write atomically:
+        // the temp is the target with `.part` APPENDED, which cannot equal the
+        // target, so a `with_extension("tmp")` self-collision is impossible.
+        let tmpish = dir.join("frame.tmp");
+        write_capture_dump(&tmpish, &frame);
+        assert_eq!(
+            std::fs::read(&tmpish).expect("the .tmp-named dump landed"),
+            frame,
+            "a dump path ending in .tmp must still receive the frame whole",
+        );
+        assert!(
+            !dir.join("frame.tmp.part").exists(),
+            "the appended-suffix temp must not survive a successful write",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

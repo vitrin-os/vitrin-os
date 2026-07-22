@@ -32,6 +32,7 @@ socket with a real forked realm. Nothing constructs a runtime in-process.
 | `harness.py` | `Core` — boots the binary in a throwaway `XDG_RUNTIME_DIR`; `IntegrationTest` — per-test deadline and core reaping. |
 | `test_runtime_wiring.py` | Issue #77's acceptance criteria. |
 | `test_real_app.py` | The **M1.2 exit gate** (P1.9.6, #105): the whole real chain — real `vitrind` → real C shim → real `weston-terminal` — with no mock on any seam. Skips without a built C shim; see the env contract below. |
+| `test_real_capture_fidelity.py` | The **M1.3 exit gate** (P1.8.5, #107): an agent captures a real `solid-client` frame through the real chokepoint; its dominant colour is the served colour, it agrees with the core-internal capture (`vitrind --capture-dump`) by SSIM + per-pixel tolerance via `vitrin-golden-cmp`, and capture-path rate-limit + expiry refuse as `rate_limited`/`expired`. Same C-shim env contract. |
 
 ## Running it locally
 
@@ -69,7 +70,12 @@ cannot silently drift.
   libpixman-1-dev`, which `vitrind` links (winit and headless backends).
   For the real-app gate it also runs `shim/ci/install-deps.sh` (Meson +
   wlroots build deps + weston), builds the C shim into `${RUNNER_TEMP}/shim-build`,
-  and passes its path as `VITRIN_C_SHIM_BIN`.
+  and passes its path as `VITRIN_C_SHIM_BIN`. The M1.3 fidelity gate
+  (`test_real_capture_fidelity.py`) needs no *new* CI wiring: its `solid-client`
+  app is co-built with the shim by the same `meson compile` (resolved as a
+  sibling of `VITRIN_C_SHIM_BIN`, like `gtk-entry-probe`), and its
+  `vitrin-golden-cmp` SSIM tool is built by the `cargo build --workspace`
+  warm-up that already builds `vitrind`.
 - **The real-app gate's opt-in knob:** `test_real_app.py` runs only when
   `VITRIN_C_SHIM_BIN` names a built C shim (`shim/build/vitrin-shim`). Unset,
   it **skips** — the local-dev path for anyone without the C toolchain. Set,

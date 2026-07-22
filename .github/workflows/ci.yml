@@ -533,6 +533,18 @@ jobs:
         if: hashFiles('tests/integration/run.sh') != ''
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libxkbcommon-dev libpixman-1-dev
 
+      - name: Install Meson + wlroots subproject build dependencies (for the real-app gate)
+        # The M1.2 real-e2e gate (tests/integration/test_real_app.py, P1.9.6)
+        # boots the REAL C shim and a REAL weston-terminal, so this job needs
+        # the shim's build toolchain and weston. Same list, from the same
+        # file, as the `conformance` and `shim` jobs, so no third build of the
+        # shim can drift in its dependency set. `sudo` because the script is
+        # written for the shim job's root container; here it runs on a hosted
+        # runner. weston + fonts-dejavu-core (the app and its glyphs) are in
+        # that list already, so the gate FAILS-not-skips on a missing app.
+        if: hashFiles('tests/integration/run.sh') != ''
+        run: sudo bash shim/ci/install-deps.sh
+
       - name: Warm build (workspace)
         # Separates compile time from the suite's 10-minute budget: vitrind
         # is a workspace crate (crates/vitrin-core per the plan layout), so
@@ -541,11 +553,32 @@ jobs:
         if: hashFiles('tests/integration/run.sh') != ''
         run: cargo build --workspace
 
+      - name: Build the C shim (for the real-app gate)
+        # tests/integration/test_real_app.py runs the real core -> real C shim
+        # -> real weston-terminal spine, with the C shim resolved from
+        # VITRIN_C_SHIM_BIN (below). Ubuntu ships no wlroots-0.19, so the Meson
+        # wrap builds it from source (D11) -- untimed here, outside the suite's
+        # 10-minute cap, the same arrangement the warm build has. Copied from
+        # the `conformance` job's recipe.
+        if: hashFiles('tests/integration/run.sh') != ''
+        run: |
+          meson setup "${RUNNER_TEMP}/shim-build" shim
+          meson compile -C "${RUNNER_TEMP}/shim-build"
+
       - name: Run headless integration suite
         if: hashFiles('tests/integration/run.sh') != ''
         # The P1.9.1 acceptance criterion, machine-enforced: the suite
         # completes in < 10 minutes or this step fails.
         timeout-minutes: 10
+        # VITRIN_C_SHIM_BIN activates the M1.2 real-app gate (P1.9.6): with it
+        # set, test_real_app.py runs the real chain and, being CI, FAILS rather
+        # than skips if the shim or weston-terminal is missing. Unset (a
+        # developer without a built C shim) it skips itself. The variable name
+        # matches the `conformance` job and crates/vitrin-core/src/shim.rs's
+        # own cross-track test, deliberately -- one knob for "a real C shim is
+        # available here".
+        env:
+          VITRIN_C_SHIM_BIN: ${{ runner.temp }}/shim-build/vitrin-shim
         run: bash tests/integration/run.sh
 
       - name: Integration suite DORMANT

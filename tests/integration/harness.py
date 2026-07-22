@@ -57,6 +57,22 @@ ANIMATE_FRAMES = 1200
 TEST_TIMEOUT_S = 90
 
 
+def _toml_string(value: str) -> str:
+    r"""A TOML basic string literal for `value`.
+
+    The realm loader (`crates/vitrin-core/src/toml_subset.rs`) reads a small
+    TOML subset; a program path or env name never contains a quote or
+    backslash, but escaping them keeps this honest rather than assuming it.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _toml_string_array(values: list[str]) -> str:
+    """A TOML inline array of basic strings (`[]` when empty)."""
+    return "[" + ", ".join(_toml_string(v) for v in values) + "]"
+
+
 class CoreFailed(Exception):
     """The core exited when a test expected it to be serving."""
 
@@ -84,6 +100,11 @@ class Core:
         runtime_dir: str | os.PathLike[str] | None = None,
         wait: bool = True,
         write_config: bool = True,
+        shim: str | os.PathLike[str] | None = None,
+        command: str | os.PathLike[str] | None = None,
+        args: list[str] | None = None,
+        env_allow: tuple[str, ...] = (),
+        extra_env: dict[str, str] | None = None,
     ) -> None:
         self.runtime = pathlib.Path(runtime_dir or tempfile.mkdtemp(prefix="vitrin-it-"))
         self._owns_runtime = runtime_dir is None
@@ -93,6 +114,13 @@ class Core:
         self.proc: subprocess.Popen[str] | None = None
         self._output = ""
         self._entries: list[dict] | None = None
+
+        # The shim binary the core execs to hold fd 3 (issue #103). Default
+        # is `vitrin-mock-shim`, which every existing test uses and which is
+        # BOTH the fd-3 peer and the app stand-in it ignores. The real-app
+        # gate (test_real_app.py) overrides it with the built C shim, whose
+        # `command` names a genuine Wayland app the C shim fork/execs.
+        shim_bin = pathlib.Path(shim) if shim is not None else MOCK_SHIM
 
         # `write_config=False` reuses whatever config is already in the tree.
         # The R6 test needs it: it deliberately relaxes the registry's mode
@@ -106,17 +134,35 @@ class Core:
             # 0600 or the core refuses to read it at all: the registry holds
             # bearer tokens, and the R6 audit fails closed on any wider mode.
             self.principals.chmod(0o600)
-            # `--seat` (opt-in) mints the shim's input-delivery object so
-            # routed seat events actually land rather than dropping
-            # undelivered — what the #43 demo needs to exercise the seat path.
-            # Default off, so every existing caller's argv is unchanged.
-            seat_arg = ', "--seat"' if seat else ""
-            self.realm.write_text(
-                "[[realm]]\n"
-                'id = "realm-0"\n'
-                f'command = "{MOCK_SHIM}"\n'
-                f'args = ["--serve"{seat_arg}, "--animate", "{animate}"]\n'
-            )
+            if command is None:
+                # The mock path, unchanged: the mock shim is the realm's
+                # `command` app stand-in (which it ignores) as well as the
+                # `--shim` fd-3 peer. `--seat` (opt-in) mints the shim's
+                # input-delivery object so routed seat events actually land
+                # rather than dropping undelivered — what the #43 demo needs
+                # to exercise the seat path. Default off, so every existing
+                # caller's argv is unchanged.
+                seat_arg = ', "--seat"' if seat else ""
+                self.realm.write_text(
+                    "[[realm]]\n"
+                    'id = "realm-0"\n'
+                    f'command = "{MOCK_SHIM}"\n'
+                    f'args = ["--serve"{seat_arg}, "--animate", "{animate}"]\n'
+                )
+            else:
+                # The real-app path: `command` names a genuine app the C shim
+                # fork/execs after the `--` tail, and `env_allow` is the only
+                # route the app's (and the shim's) environment is allowed to
+                # grow by — the headless/software-render WLR_* names travel
+                # this way, exactly as the c_shim conformance test threads
+                # them (crates/vitrin-core/src/shim.rs).
+                self.realm.write_text(
+                    "[[realm]]\n"
+                    'id = "realm-0"\n'
+                    f"command = {_toml_string(os.fspath(command))}\n"
+                    f"args = {_toml_string_array(args or [])}\n"
+                    f"env_allow = {_toml_string_array(list(env_allow))}\n"
+                )
 
         argv = [
             str(VITRIND),
@@ -132,15 +178,19 @@ class Core:
             str(self.recorder),
             # Since #103 the core execs a `--shim` binary (fd-3 holder) that
             # conveys the realm's `command` app in argv after `--`. The mock
-            # shim is that binary here; the fixture flags in the realm's `args`
-            # ride the app tail, which the mock scans. `command` above stays
-            # the mock too, as the app stand-in the mock ignores.
+            # shim is that binary by default; the real-app gate points it at
+            # the built C shim, which in turn fork/execs the `command` app.
             "--shim",
-            str(MOCK_SHIM),
+            str(shim_bin),
         ]
+        env = {**os.environ, "XDG_RUNTIME_DIR": str(self.runtime), "RUST_LOG": "info"}
+        # The core's own environment is the source `env_allow` copies from,
+        # so the real-app gate seeds WLR_* here for the allowlist to forward.
+        if extra_env:
+            env.update(extra_env)
         self.proc = subprocess.Popen(
             argv,
-            env={**os.environ, "XDG_RUNTIME_DIR": str(self.runtime), "RUST_LOG": "info"},
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -328,6 +378,65 @@ def comm_of(pid: int) -> str:
         return pathlib.Path(f"/proc/{pid}/comm").read_text().strip()
     except OSError:
         return ""
+
+
+def descendant_named(pid: int, name: str, timeout: float = 15.0) -> int | None:
+    """Wait for a descendant of `pid` whose `comm` matches `name`, DFS.
+
+    The real spawn spine is core → C shim → app, so the app the test cares
+    about is a *grand*child of the core, not a direct child. `comm` is
+    truncated to 15 bytes by the kernel, so the match is a prefix test —
+    `weston-terminal` arrives as `weston-terminal` (exactly 15) but a longer
+    name would be clipped, and matching a prefix is what survives that.
+    """
+    deadline = time.monotonic() + timeout
+    prefix = name[:15]
+    while True:
+        stack = list(children_of(pid))
+        while stack:
+            candidate = stack.pop()
+            if comm_of(candidate).startswith(prefix):
+                return candidate
+            stack.extend(children_of(candidate))
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
+def environ_of(pid: int) -> dict[str, str]:
+    """A pid's environment at exec time, parsed from `/proc/<pid>/environ`.
+
+    NUL-separated `NAME=VALUE` records; a record without `=` (there is
+    normally none) is skipped rather than guessed at.
+    """
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    env: dict[str, str] = {}
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        name, sep, value = record.partition(b"=")
+        if sep:
+            env[name.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return env
+
+
+def fd_targets_of(pid: int) -> dict[int, str]:
+    """Every open descriptor of `pid` mapped to its `readlink` target.
+
+    Used to prove the confined app holds no descriptor number 3 that the
+    core's socketpair would occupy — the fd-3 leak is the whole confinement
+    gone (`crates/vitrin-core/src/spawn.rs`).
+    """
+    targets: dict[int, str] = {}
+    for entry in pathlib.Path(f"/proc/{pid}/fd").glob("*"):
+        try:
+            targets[int(entry.name)] = os.readlink(entry)
+        except (OSError, ValueError):
+            continue
+    return targets
 
 
 def require_binaries() -> None:

@@ -31,6 +31,7 @@ socket with a real forked realm. Nothing constructs a runtime in-process.
 | `run.sh` | CI entry point. Bash, exit 0 = pass. |
 | `harness.py` | `Core` — boots the binary in a throwaway `XDG_RUNTIME_DIR`; `IntegrationTest` — per-test deadline and core reaping. |
 | `test_runtime_wiring.py` | Issue #77's acceptance criteria. |
+| `test_real_app.py` | The **M1.2 exit gate** (P1.9.6, #105): the whole real chain — real `vitrind` → real C shim → real `weston-terminal` — with no mock on any seam. Skips without a built C shim; see the env contract below. |
 
 ## Running it locally
 
@@ -66,6 +67,22 @@ cannot silently drift.
   `pip install` here means editing the workflow too.
 - **Native dependencies:** the job installs `libxkbcommon-dev
   libpixman-1-dev`, which `vitrind` links (winit and headless backends).
+  For the real-app gate it also runs `shim/ci/install-deps.sh` (Meson +
+  wlroots build deps + weston), builds the C shim into `${RUNNER_TEMP}/shim-build`,
+  and passes its path as `VITRIN_C_SHIM_BIN`.
+- **The real-app gate's opt-in knob:** `test_real_app.py` runs only when
+  `VITRIN_C_SHIM_BIN` names a built C shim (`shim/build/vitrin-shim`). Unset,
+  it **skips** — the local-dev path for anyone without the C toolchain. Set,
+  a missing shim or missing `weston-terminal` is a **failure**, not a skip:
+  CI sets the variable, so CI can never reach the skip, and a requested gate
+  that skipped silently would prove nothing. `VITRIN_SKIP_REAL_APP=1` is the
+  explicit local opt-out. Same variable name as the `conformance` job and
+  `crates/vitrin-core/src/shim.rs`'s cross-track test. Run it locally with:
+
+  ```bash
+  meson setup shim/build shim && meson compile -C shim/build
+  VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" bash tests/integration/run.sh
+  ```
 - **Later occupants:** this job also hosts the M1.5 gates — demo job
   (P1.8.4), golden frames (P1.9.2), hostile-client tests (P1.9.3) — behind
   the same entry point.

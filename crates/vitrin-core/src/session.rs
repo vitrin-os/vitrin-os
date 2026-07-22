@@ -87,6 +87,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::os::fd::BorrowedFd;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use calloop::timer::{TimeoutAction, Timer};
@@ -159,6 +160,11 @@ pub(crate) struct RuntimeSeed {
     pub grants: GrantTable,
     pub realms: RealmRegistry,
     pub recorder: Recorder,
+    /// The core-known shim binary the spawn manager execs to hold fd 3, which
+    /// in turn execs the realm's app (issue #103). Resolved by `main` from
+    /// `--shim` (or its default) and carried here so [`start_realm`] can build
+    /// the spawn's [`SpawnPaths`] from it.
+    pub shim: PathBuf,
     /// This session's trusted consent indicator (issue #85), minted at startup
     /// before the listener accepts anyone. Carried here — the one thing
     /// `run_session` hands the backend — so a single ceremony establishes it
@@ -197,6 +203,10 @@ pub(crate) struct Runtime<H: PreemptionHook> {
     /// The realm's input router: chokepoint-admitted agent actuations and
     /// (nested) physical input converge here before delivery to the shim.
     pub router: InputRouter<H>,
+    /// The core-known shim binary the spawn manager execs (issue #103), from
+    /// the seed. [`start_realm`] reads it to build the spawn's [`SpawnPaths`];
+    /// tests that call [`start_realm_in`] with explicit paths never consult it.
+    shim: PathBuf,
     /// Set by a latched commit, cleared by [`post_dispatch`]. The whole of
     /// the anti-amplification defence the module docs describe.
     pub dirty: bool,
@@ -400,6 +410,7 @@ impl<H: PreemptionHook> Runtime<H> {
             grants,
             realms,
             recorder,
+            shim,
             // Presentation state, not kernel state: the backend read it out of
             // the seed (by `Copy`) into its `ConsentSurface` before handing the
             // rest here, so the runtime deliberately drops it.
@@ -418,6 +429,7 @@ impl<H: PreemptionHook> Runtime<H> {
             conns: BTreeMap::new(),
             realm: None,
             router,
+            shim,
             dirty: false,
             view_cache: None,
             epoch: Instant::now(),
@@ -616,7 +628,11 @@ where
 ///    nothing fails; the only symptom is a wrong `RealmState` in the flight
 ///    recorder.
 pub(crate) fn start_realm<H: RuntimeHost>(host: &mut H) -> Result<(), Box<dyn Error>> {
-    start_realm_in(host, &SpawnPaths::from_env()?)
+    // The shim binary is a core input (`--shim`), carried in the runtime; the
+    // app it will exec is the realm's `command`. Clone it out before the
+    // `start_realm_in` borrow, which takes `host` again.
+    let shim = host.runtime().shim.clone();
+    start_realm_in(host, &SpawnPaths::from_env(shim)?)
 }
 
 /// [`start_realm`] against an explicit runtime tree.
@@ -1599,6 +1615,7 @@ mod tests {
                 grants: GrantTable::new(),
                 realms: crate::realm::tests::registry_with(&[crate::realm::WELL_KNOWN_REALM_ID]),
                 recorder,
+                shim: crate::spawn::tests::mock_shim_bin(),
                 indicator: crate::consent::TrustedIndicator::for_test(),
             };
             let event_loop: EventLoop<'static, TestHost> =
@@ -1646,19 +1663,21 @@ mod tests {
         /// tree and put it on the loop, through the same
         /// [`start_realm_in`] the shipped backends call.
         ///
-        /// The registry is rebuilt to point at the mock-shim binary because
-        /// [`start_realm_in`] spawns "the configured realm" — the point is
-        /// that the test drives the production path rather than a
-        /// hand-assembled `RealmRuntime`.
+        /// The mock shim is both the `--shim` binary (the core's direct child,
+        /// holding fd 3) and the realm's `command` app stand-in: the fixture
+        /// flags in `args` ride the app-argument tail, which the mock scans
+        /// (issue #103). The point is that the test drives the production spawn
+        /// path rather than a hand-assembled `RealmRuntime`.
         fn start_realm(&mut self, args: &[&str]) {
+            let mock = crate::spawn::tests::mock_shim_bin();
             self.host.runtime.kernel.realms =
                 crate::realm::tests::registry_of(vec![crate::realm::tests::realm_with_spawn(
                     crate::realm::WELL_KNOWN_REALM_ID,
-                    &crate::spawn::tests::mock_shim_bin(),
+                    &mock,
                     &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                     &[],
                 )]);
-            start_realm_in(&mut self.host, &SpawnPaths::under(&self.dir))
+            start_realm_in(&mut self.host, &SpawnPaths::under(&self.dir, &mock))
                 .expect("the realm must spawn and attach");
         }
 

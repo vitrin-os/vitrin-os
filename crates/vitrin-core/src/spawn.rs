@@ -385,34 +385,94 @@ pub(crate) const SHIM_CORE_FD: RawFd = 3;
 /// shim's app-facing Wayland socket (module docs).
 const RUNTIME_DIR_MODE: u32 = 0o700;
 
-/// Where a session's runtime tree lives. Held explicitly rather than read
-/// from the environment at each use so the spawn path is deterministic and
-/// testable against a scratch base -- the same reason
-/// [`vitrin_ipc::paths`] ships a `*_in` form of every helper.
+/// Where a session's runtime tree lives, and which shim binary the core
+/// execs to hold fd 3. Held explicitly rather than read from the environment
+/// at each use so the spawn path is deterministic and testable against a
+/// scratch base -- the same reason [`vitrin_ipc::paths`] ships a `*_in` form
+/// of every helper.
+///
+/// # The shim is a *core* input, not a realm one
+///
+/// [`crate::realm`]'s `command` names the **app** (`/usr/bin/foot`); the core
+/// never execs it directly. It execs a core-known **shim** binary, placing
+/// the shim's end of the identity socketpair at [`SHIM_CORE_FD`], and conveys
+/// the app command (`realm.command` + `realm.args`) to the shim in argv after
+/// a `--` separator (PRD Doc 2 §4.1; issue #103). The shim then serves the
+/// app-facing Wayland socket and `exec`s the app -- so no binary is ever both
+/// an fd-3 core peer *and* a Wayland app, which is why the shim is inserted
+/// rather than conflated with the app.
+///
+/// The shim is held here as an argv, not a bare path: its first element is
+/// the program the core execs (audited transitively at spawn, exactly like
+/// `command`), and any further elements are the shim's own leading arguments,
+/// placed *before* the `--`/app tail. Production supplies a single element
+/// (`--shim PATH`, defaulting to a sibling `vitrin-shim` beside `vitrind`);
+/// the multi-element form exists for the lifecycle ladder tests, which spawn
+/// `/bin/sh -c <script>` as the realm's direct child and need `-c <script>`
+/// to be shim arguments rather than app ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpawnPaths {
     xdg_runtime_dir: PathBuf,
+    /// The shim's argv: `[program, leading-args...]`. Never empty; the app
+    /// command follows a `--` after these (module docs).
+    shim: Vec<OsString>,
 }
 
 impl SpawnPaths {
-    /// The session's real runtime tree, from `$XDG_RUNTIME_DIR`.
-    pub fn from_env() -> Result<Self, paths::PathError> {
+    /// The session's real runtime tree, from `$XDG_RUNTIME_DIR`, with the
+    /// core-known shim binary the CLI resolved (`--shim`, or its default).
+    pub fn from_env(shim: impl Into<PathBuf>) -> Result<Self, paths::PathError> {
         Ok(Self {
             xdg_runtime_dir: paths::xdg_runtime_dir()?,
+            shim: vec![shim.into().into_os_string()],
         })
     }
 
-    /// A runtime tree rooted at an explicit base (tests, and any future
-    /// caller that must not depend on ambient environment).
+    /// A runtime tree rooted at an explicit base with an explicit shim binary
+    /// (tests, and any future caller that must not depend on ambient
+    /// environment).
     ///
     /// The runtime uses [`Self::from_env`]; this exists so a spawn can be
     /// driven against a scratch tree without mutating the process
     /// environment, which a single-process test suite cannot do safely.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn under(xdg_runtime_dir: impl Into<PathBuf>) -> Self {
+    pub fn under(xdg_runtime_dir: impl Into<PathBuf>, shim: impl Into<PathBuf>) -> Self {
         Self {
             xdg_runtime_dir: xdg_runtime_dir.into(),
+            shim: vec![shim.into().into_os_string()],
         }
+    }
+
+    /// [`Self::under`] with a multi-element shim argv, for the lifecycle
+    /// ladder tests that spawn `/bin/sh -c <script>` as the realm's direct
+    /// child: the script is a *shim* argument, placed before the `--`/app
+    /// tail, not an app one.
+    #[cfg(test)]
+    pub fn under_with_shim_argv(
+        xdg_runtime_dir: impl Into<PathBuf>,
+        shim_argv: Vec<OsString>,
+    ) -> Self {
+        assert!(
+            !shim_argv.is_empty(),
+            "a shim argv names at least a program"
+        );
+        Self {
+            xdg_runtime_dir: xdg_runtime_dir.into(),
+            shim: shim_argv,
+        }
+    }
+
+    /// The shim binary the core execs -- argv[0] of the child, audited like
+    /// `command`.
+    fn shim_program(&self) -> &OsStr {
+        self.shim
+            .first()
+            .expect("a shim argv names at least a program")
+    }
+
+    /// The shim's own leading arguments, before the `--`/app tail.
+    fn shim_leading_args(&self) -> &[OsString] {
+        &self.shim[1..]
     }
 
     /// `$XDG_RUNTIME_DIR/vitrin-0/<realm_id>` -- validating the id through
@@ -804,8 +864,12 @@ where
 
     // Preconditions first, in the order that leaves the least behind: pure
     // checks before anything is created, so the common refusals never reach
-    // the guard below at all.
+    // the guard below at all. Both the shim (the binary the core actually
+    // execs) and the app (`command`, which the shim will exec) pass the same
+    // transitive trusted-writer audit -- whoever can write either chooses
+    // what the trusted core, or its shim, runs (issue #103).
     reject_reserved_env(spawn)?;
+    audit_program_at_spawn(Path::new(paths.shim_program()))?;
     audit_program_at_spawn(spawn.command())?;
 
     // From here on the call owns filesystem state; the guard unwinds it on
@@ -830,7 +894,15 @@ where
 
     let env = child_env(spawn, &socket_path, &runtime_dir, lookup);
 
-    let mut cmd = Command::new(spawn.command());
+    // The core execs the SHIM, never the app directly: the shim holds fd 3
+    // and, in turn, execs the app. The app command (`command` + `args`)
+    // rides the shim's argv after a `--` separator, where a conformant shim
+    // reads it (PRD Doc 2 §4.1; issue #103). Any leading shim arguments come
+    // before the `--`; production supplies none.
+    let mut cmd = Command::new(paths.shim_program());
+    cmd.args(paths.shim_leading_args());
+    cmd.arg("--");
+    cmd.arg(spawn.command());
     cmd.args(spawn.args());
     // Default-deny: the child's environment starts empty and receives only
     // what `child_env` composed. `env_clear` before `envs` is what makes
@@ -943,7 +1015,9 @@ where
     }
 
     let child = cmd.spawn().map_err(|source| SpawnError::Exec {
-        command: spawn.command().to_path_buf(),
+        // The shim is what the core execs, so an exec failure is the shim's:
+        // the app is exec'd later by the shim, out of this module's reach.
+        command: Path::new(paths.shim_program()).to_path_buf(),
         source,
     })?;
 
@@ -1629,7 +1703,10 @@ pub(crate) mod tests {
         }
 
         fn paths(&self) -> SpawnPaths {
-            SpawnPaths::under(&self.base)
+            // The mock shim is the core-inserted `--shim` binary in tests: a
+            // valid, audit-passing fd-3 holder. The realm's `command` (the
+            // app) is whatever a given test configures.
+            SpawnPaths::under(&self.base, mock_shim_bin())
         }
 
         /// Every recorded entry, parsed. Closes the log first, because a
@@ -1756,6 +1833,96 @@ pub(crate) mod tests {
         );
         assert!(spawn_entry.strings("env_allow").is_empty());
         assert!(spawn_entry.bool("env_cleared"));
+    }
+
+    // -- acceptance: the core inserts a shim; the app rides its argv --------
+
+    #[test]
+    fn the_core_execs_the_shim_and_conveys_the_app_command_in_argv() {
+        // The #103 acceptance: the core execs the core-inserted SHIM binary
+        // (which holds fd 3), never the realm's `command` directly, and
+        // conveys the app command to the shim in argv after a `--` separator.
+        let _fd = fd_lock();
+        let mut h = Harness::new("spawn-shim-insertion");
+        let shim = mock_shim_bin();
+        // A real, always-present app the mock shim ignores (#103 does not exec
+        // it) -- deliberately DISTINCT from the shim, so "the core execs the
+        // shim, not the app" is a real assertion rather than a tautology.
+        // `--serve` rides the app-argument tail, which the mock scans, so the
+        // fixture brings its session up.
+        let app = PathBuf::from("/bin/true");
+        let realm = realm_with_spawn("realm-0", &app, &["--serve".to_string()], &[]);
+        let paths = SpawnPaths::under(&h.base, &shim);
+        let mut spawned = spawn_realm_with_env(&realm, &paths, &mut h.recorder, |_| None)
+            .expect("spawn must succeed against a scratch runtime tree");
+
+        // The direct child is the SHIM, not `/bin/true`: had the core exec'd
+        // `command` directly, `/proc/<pid>/exe` would never flip to the shim
+        // and this would time out.
+        wait_for_exec(spawned.pid(), &shim);
+        // Readiness gate before any /proc read (see `bring_up_shim`).
+        let (_server, _msg) = bring_up_shim(&mut spawned);
+
+        // The app command is conveyed in the shim's argv after `--`.
+        let raw = fs::read(format!("/proc/{}/cmdline", spawned.pid())).expect("cmdline reads");
+        let argv: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        assert_eq!(
+            argv.first().map(String::as_str),
+            shim.to_str(),
+            "argv[0] is the shim the core execs: {argv:?}"
+        );
+        let sep = argv
+            .iter()
+            .position(|a| a == "--")
+            .expect("the app command is conveyed after a `--` separator");
+        assert_eq!(
+            argv.get(sep + 1).map(String::as_str),
+            Some("/bin/true"),
+            "the app command follows `--` in the shim's argv: {argv:?}"
+        );
+
+        // And fd 3 is the inherited core socketpair, held by the shim.
+        let fds = child_fds_of(spawned.pid());
+        assert!(
+            fds.get(&SHIM_CORE_FD)
+                .is_some_and(|t| t.starts_with("socket:")),
+            "the shim must hold the core socketpair at fd {SHIM_CORE_FD}: {fds:?}"
+        );
+
+        h.reap(spawned);
+    }
+
+    #[test]
+    fn a_group_writable_shim_is_refused_at_spawn_time() {
+        // The shim is audited transitively, exactly like `command`: whoever
+        // can write the binary the trusted core execs chooses what it runs. A
+        // group-writable shim is refused with a typed `ProgramAudit` naming
+        // the shim -- the app here is the beyond-reproach mock, so the refusal
+        // is unambiguously the shim's, not the app's.
+        let _fd = fd_lock();
+        let dir = scratch();
+        let shim = dir.join("shim");
+        fs::write(&shim, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o775)).unwrap();
+
+        let realm = realm_with_spawn("realm-0", &mock_shim_bin(), &[], &[]);
+        let (err, _) = refused_spawn_with_shim("spawn-group-writable-shim", &realm, &shim);
+        assert!(matches!(err, SpawnError::ProgramAudit { .. }), "{err}");
+        assert!(
+            err.to_string().contains("writable by group/other"),
+            "the refusal must name the fault: {err}"
+        );
+        if let SpawnError::ProgramAudit { path, .. } = &err {
+            assert_eq!(
+                path, &shim,
+                "the audit refusal must name the shim, not the app"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // -- acceptance: the app's environment names only its shim's socket ----
@@ -1933,7 +2100,8 @@ pub(crate) mod tests {
     fn the_session_runtime_tree_comes_from_xdg_runtime_dir() {
         // The production constructor agrees with the transport's own
         // convention paths; nothing here mutates process-global state.
-        if let (Ok(paths), Ok(dir)) = (SpawnPaths::from_env(), paths::runtime_dir()) {
+        if let (Ok(paths), Ok(dir)) = (SpawnPaths::from_env(mock_shim_bin()), paths::runtime_dir())
+        {
             assert_eq!(paths.realm_dir("realm-0").unwrap(), dir.join("realm-0"));
         }
     }
@@ -2270,8 +2438,17 @@ pub(crate) mod tests {
     /// A spawn expected to fail: run it, assert nothing was created, and
     /// hand back the typed error plus the journal's refusal entry.
     fn refused_spawn(label: &str, realm: &Realm) -> (SpawnError, Json) {
+        // The common case: a valid shim (the mock) and a realm whose *app*
+        // (`command`) is what the test makes hostile.
+        refused_spawn_with_shim(label, realm, &mock_shim_bin())
+    }
+
+    /// [`refused_spawn`] with an explicit `--shim` binary, so a test can make
+    /// the *shim* the hostile half (a group-writable or non-executable shim)
+    /// while the app is beyond reproach.
+    fn refused_spawn_with_shim(label: &str, realm: &Realm, shim: &Path) -> (SpawnError, Json) {
         let mut h = Harness::new(label);
-        let paths = h.paths();
+        let paths = SpawnPaths::under(&h.base, shim);
         let err = spawn_realm_with_env(realm, &paths, &mut h.recorder, |_| Some("hostile".into()))
             .expect_err("this spawn must be refused");
         assert!(
@@ -2300,24 +2477,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_non_executable_command_is_a_typed_error_at_exec() {
+    fn a_non_executable_shim_is_a_typed_error_at_exec() {
         // Distinct from the audit refusals: the file passes the
         // trusted-writer rule (0644 is not group/other WRITABLE) and fails
         // at `execve` with EACCES. It must still be typed, and must still
         // leave nothing behind -- which is the interesting half, because
         // this is the one failure that happens *after* the runtime
         // directory and the socketpair already exist.
+        //
+        // The non-executable file is the **shim** here, not the app: since
+        // issue #103 the shim is the binary the core actually execs, so an
+        // `execve` failure is the shim's. The app (`command`) is the valid
+        // mock, which the shim would exec later, out of this module's reach.
         let _fd = fd_lock();
         let dir = scratch();
-        let program = dir.join("not-executable");
-        fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o644)).unwrap();
+        let shim = dir.join("not-executable");
+        fs::write(&shim, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let realm = realm_with_spawn("realm-0", &program, &[], &[]);
-        let (err, entry) = refused_spawn("spawn-noexec", &realm);
+        let realm = realm_with_spawn("realm-0", &mock_shim_bin(), &[], &[]);
+        let (err, entry) = refused_spawn_with_shim("spawn-noexec", &realm, &shim);
         assert!(matches!(err, SpawnError::Exec { .. }), "{err}");
         assert_eq!(err.cause_class(), "exec");
         assert_eq!(entry.str("cause_class"), "exec");
+        // The exec failure names the shim, the program the core actually ran.
+        if let SpawnError::Exec { command, .. } = &err {
+            assert_eq!(command, &shim, "the exec error must name the shim");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2413,7 +2599,9 @@ pub(crate) mod tests {
     /// The (realm directory, realm lock) pair [`RuntimeDirGuard::create`]
     /// takes, derived from a scratch base exactly the way [`launch`] does.
     fn dir_and_lock(base: &Path) -> (PathBuf, PathBuf) {
-        let paths = SpawnPaths::under(base);
+        // The shim is irrelevant to directory/lock derivation; a placeholder
+        // keeps these pure runtime-tree tests off the mock-binary lookup.
+        let paths = SpawnPaths::under(base, Path::new("/vitrin-shim-placeholder"));
         (
             paths.realm_dir("realm-0").unwrap(),
             paths.realm_lock("realm-0").unwrap(),
@@ -2660,7 +2848,7 @@ pub(crate) mod tests {
     fn a_hostile_realm_id_never_becomes_a_path() {
         // The id is validated by the transport's own rule, so no spawn path
         // can turn a realm id into a traversal.
-        let paths = SpawnPaths::under("/run/user/1000");
+        let paths = SpawnPaths::under("/run/user/1000", Path::new("/vitrin-shim-placeholder"));
         assert!(paths.realm_dir("../../etc").is_err());
         assert_eq!(
             paths.realm_dir("realm-0").unwrap(),

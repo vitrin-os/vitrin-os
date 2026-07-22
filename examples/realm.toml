@@ -53,11 +53,18 @@
 # them discoverable.
 #id = "realm-0"
 
-# REQUIRED. Absolute path of the program this realm launches, which must
-# exist and pass the transitive not-writable check described above. Relative
-# names are refused: they would resolve through the core's own $PATH, so
-# what actually executed would depend on ambient environment this file
-# cannot show. (P1.5.2 executes it; this version only owns the config.)
+# REQUIRED. Absolute path of the APP this realm launches, which must exist
+# and pass the transitive not-writable check described above. Relative names
+# are refused: they would resolve through the core's own $PATH, so what
+# actually executed would depend on ambient environment this file cannot show.
+#
+# The core does NOT exec this program directly. It execs a core-known shim
+# binary (its end of the identity socketpair placed at fd 3), and conveys this
+# `command` plus `args` to the shim in argv after a `--` separator; the shim
+# then serves the app-facing Wayland socket and execs the app. So this file
+# names the app, never the shim: the shim is a *core* input (`vitrind --shim
+# PATH`, defaulting to a sibling `vitrin-shim` beside `vitrind`) and is audited
+# transitively by the same not-writable rule as `command` (issue #103).
 command = "/usr/bin/foot"
 
 # Optional (default []). Arguments AFTER argv[0] -- the core supplies

@@ -938,19 +938,65 @@ pub(crate) fn intake_physical<B: InputBackend>(
                 host::KeyState::Released => KeyState::Released,
             };
             let evdev = event.key_code().raw().saturating_sub(XKB_KEYCODE_OFFSET);
-            match invariant_keysym(evdev) {
-                Some(keysym) => vec![SeatInput::physical(SeatInputKind::Key { keysym, state })],
-                None => {
-                    tracing::trace!(
-                        evdev,
-                        "layout-dependent key dropped at intake (see invariant_keysym docs)"
-                    );
-                    Vec::new()
-                }
-            }
+            // `None` host keysym: Smithay 0.7.0's `WinitKeyboardInputEvent`
+            // carries only the scancode — it drops winit's interpreted
+            // `logical_key` before the core sees it (issue #118) — so intake can
+            // resolve only the layout-invariant subset from the scancode alone
+            // and drops every layout-dependent (text) key. When the winit
+            // backend is made to surface `logical_key` (issue #118, "own the
+            // winit glue"), it calls `physical_key` with `Some(keysym)` and text
+            // keys flow with no change to the resolution or delivery below.
+            physical_key(evdev, None, state)
         }
         _ => Vec::new(),
     }
+}
+
+/// Mint the physical [`SeatInput`]s for one keyboard event, given the host's
+/// interpreted keysym when there is one — the single seam #118's nested-typing
+/// fix turns on.
+///
+/// `host_keysym` is winit's `logical_key` resolved to an X keysym: the
+/// layout-*dependent* interpretation the host already computed, which the core
+/// is forbidden to recompute (see [`invariant_keysym`]). Prefer it; fall back
+/// to the layout-invariant scancode table for the fixed subset (Escape, Enter,
+/// arrows, modifiers…) the core *can* resolve without a keymap; drop the key
+/// otherwise, tracing why. [`intake_physical`] passes `None` today — Smithay
+/// hides the interpreted key — so only invariant keys survive; the deferred
+/// winit wiring passes `Some(keysym)` here and every text key flows. Kept in
+/// this module so the physical-origin minting stays in its one trusted spot
+/// (B2), and separated from the pure [`resolve_key_seat`] so the resolution can
+/// be unit-tested without minting an origin.
+pub(crate) fn physical_key(
+    evdev: u32,
+    host_keysym: Option<u32>,
+    state: KeyState,
+) -> Vec<SeatInput> {
+    match resolve_key_seat(evdev, host_keysym, state) {
+        Some(kind) => vec![SeatInput::physical(kind)],
+        None => {
+            tracing::trace!(
+                evdev,
+                "layout-dependent key dropped at intake: no host keysym and not in the \
+                 layout-invariant table (the #118 nested-typing gap, until the winit wiring lands)"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Resolve one keyboard event to its wire [`SeatInputKind`], preferring the
+/// host's interpreted `host_keysym` and falling back to the layout-invariant
+/// scancode table ([`invariant_keysym`]). `None` when neither yields a keysym —
+/// the key is dropped at intake rather than guessed. Pure and origin-free, so
+/// it is exhaustively unit-testable without a synthetic input backend.
+fn resolve_key_seat(
+    evdev: u32,
+    host_keysym: Option<u32>,
+    state: KeyState,
+) -> Option<SeatInputKind> {
+    let keysym = host_keysym.or_else(|| invariant_keysym(evdev))?;
+    Some(SeatInputKind::Key { keysym, state })
 }
 
 /// The layout-*invariant* evdev-scancode → keysym subset: editing,
@@ -963,16 +1009,18 @@ pub(crate) fn intake_physical<B: InputBackend>(
 /// so no keymap lives here).
 ///
 /// Layout-*dependent* keys (letters, digits, punctuation) return `None`
-/// and are dropped at intake, because producing their keysym requires the
-/// interpreted key the host already computed. Winit delivers it
-/// (`KeyEvent::logical_key`), but Smithay 0.7.0's winit wrapper reduces
-/// the event to a raw scancode before the core sees it — a pinned-
-/// dependency gap, not a protocol gap: full nested typing needs the
-/// wrapper to surface winit's interpreted keysym (flagged for the M1.2
-/// wiring; interpreting scancodes through a keymap in the core is the one
-/// forbidden workaround). The subset below is chosen so the consent /
-/// revocation paths never depend on the gap: Escape — P1.7.3's hold-Esc
-/// chord — is layout-invariant and always translates.
+/// here, because producing their keysym requires the interpreted key the
+/// host already computed. Winit delivers it (`KeyEvent::logical_key`), but
+/// Smithay 0.7.0's `WinitKeyboardInputEvent` reduces the event to a raw
+/// scancode before the core sees it — a pinned-dependency gap, not a
+/// protocol gap (issue #118): full nested typing needs the winit backend to
+/// surface winit's interpreted keysym and feed it as `host_keysym` to
+/// [`physical_key`], where it takes priority over this table (interpreting
+/// scancodes through a keymap *in the core* is the one forbidden workaround).
+/// Until that wiring lands, [`intake_physical`] passes `None` and text keys
+/// are dropped — this subset is chosen so the consent / revocation paths
+/// never depend on the gap: Escape — P1.7.3's hold-Esc chord — is
+/// layout-invariant and always translates.
 fn invariant_keysym(evdev_code: u32) -> Option<u32> {
     Some(match evdev_code {
         1 => 0xff1b,                           // KEY_ESC        -> XK_Escape
@@ -1416,6 +1464,79 @@ pub(crate) mod tests {
                 keysym: 0xff1b,
                 state: KeyState::Released,
             }
+        );
+    }
+
+    #[test]
+    fn resolve_prefers_the_host_keysym_then_falls_back_to_the_invariant_table() {
+        // The #118 seam. `resolve_key_seat`/`physical_key` prefer the host's
+        // interpreted keysym — winit's `logical_key`, the layout-dependent
+        // interpretation the deferred winit wiring will supply — and fall back
+        // to the layout-invariant scancode table only when there is none.
+
+        // A host keysym wins for a layout-*dependent* scancode (KEY_A = 30),
+        // which is exactly the text-key path the wiring turns on.
+        assert_eq!(
+            physical_key(30, Some(0x0061), KeyState::Pressed)[0].kind(),
+            &SeatInputKind::Key {
+                keysym: 0x0061,
+                state: KeyState::Pressed,
+            },
+        );
+        // It overrides the invariant table for the same scancode, too: once the
+        // host has interpreted a key, its interpretation is authoritative.
+        assert_eq!(
+            resolve_key_seat(1, Some(0x0041), KeyState::Pressed),
+            Some(SeatInputKind::Key {
+                keysym: 0x0041,
+                state: KeyState::Pressed,
+            }),
+        );
+        // With no host keysym, the invariant table still resolves Escape...
+        assert_eq!(
+            resolve_key_seat(1, None, KeyState::Released),
+            Some(SeatInputKind::Key {
+                keysym: 0xff1b,
+                state: KeyState::Released,
+            }),
+        );
+        // ...and a layout-dependent key is dropped — the current #118 gap this
+        // groundwork sets the winit wiring up to close in one place.
+        assert_eq!(resolve_key_seat(30, None, KeyState::Pressed), None);
+        assert!(physical_key(30, None, KeyState::Pressed).is_empty());
+    }
+
+    #[test]
+    fn a_text_key_given_a_host_keysym_reaches_the_app_as_physical_input() {
+        // The other half of the #118 groundwork: the DELIVERY path for a
+        // layout-dependent key is already whole — only winit's keysym
+        // extraction is deferred. Fed the interpreted keysym the winit wiring
+        // will one day supply, the app receives the text key over the real
+        // wire, origin=physical — so closing the intake gap is the single
+        // remaining step, and it lands on a delivery path already proven here.
+        let _fd = crate::capture::tests::fd_lock();
+        let (server, _scene, mut core, mut mock) = wire_setup();
+        let view = (VIEW_W, VIEW_H);
+        let surface = Some(view);
+        let mut router = InputRouter::new(NoopHook);
+
+        // KEY_H (scancode 35) is layout-dependent — dropped without a host
+        // keysym today; with winit's `logical_key` ('h' = 0x0068) it flows.
+        for input in physical_key(35, Some(0x0068), KeyState::Pressed) {
+            if let Some(delivery) = router.route(input, view, surface) {
+                server
+                    .deliver_seat_event(&delivery, &mut |frame| core.send_message(frame, None))
+                    .expect("send");
+            }
+        }
+        assert_eq!(
+            mock.next_seat_event().unwrap(),
+            SeatEvent::Key {
+                keysym: 0x0068,
+                state: KeyState::Pressed,
+                origin: Origin::Physical,
+            },
+            "a text key, given the host keysym, must reach the app over the wire as physical input",
         );
     }
 

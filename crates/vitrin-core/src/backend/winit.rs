@@ -699,6 +699,18 @@ impl NestedState {
             kernel,
             ..
         } = &mut self.runtime;
+        // #118 wiring point (deferred): `intake_physical` resolves keyboard
+        // events from the scancode alone, so it delivers only the
+        // layout-invariant subset and drops text keys — Smithay 0.7.0's
+        // `WinitKeyboardInputEvent` hides winit's interpreted `logical_key`
+        // from us here. Closing the gap (issue #118, "own the winit glue")
+        // means this backend owning the winit event loop so a
+        // `WindowEvent::KeyboardInput`'s `logical_key` is in reach, resolving it
+        // to an X keysym, and routing keyboard through
+        // `input::physical_key(evdev, Some(keysym), state)` instead of the
+        // scancode-only `intake_physical` arm. The resolution and delivery past
+        // that seam are already whole and tested (`input`'s
+        // `a_text_key_given_a_host_keysym_reaches_the_app_as_physical_input`).
         route_turn(
             router,
             &self.deadman,

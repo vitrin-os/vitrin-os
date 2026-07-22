@@ -299,12 +299,20 @@ jobs:
         run: BUILD_DIR="${RUNNER_TEMP}/shim-build" bash tests/acceptance/seat_input_replay.sh
 
       # NOTE: quoted because the name contains ": " -- see the two steps above.
-      - name: "Headless acceptance (Firefox bring-up: render, scroll, URL bar, globals ledger)"
-        # The P1.6.4 acceptance criteria. The script FAILS rather than skipping
-        # under CI unless the gap is declared, which is the same rule the
-        # `conformance` job's cross-track test applies to itself -- a criterion
-        # that only ever reports SKIP on the machine gating merges is a
-        # criterion nobody is holding.
+      - name: "Shim-only Firefox smoke (mock core: render, scroll, URL bar, globals ledger)"
+        # firefox_bringup.sh is a SHIM-IN-ISOLATION unit check: real shim, real
+        # Firefox, MOCK core (shim/tests/mock_core.c). Relabelled from a
+        # milestone proof by P1.6.6 (issue #106) -- the M1.2 "Shim runs Firefox"
+        # render proof is now the REAL-core gate in the `integration` job
+        # (tests/integration/test_real_firefox.py), which boots the shipped
+        # vitrind and actually fetches the browser. This step stays because it
+        # still exercises the shim standalone (and asserts an ordered per-frame
+        # colour sequence the poll-based SDK cannot).
+        #
+        # The script FAILS rather than skipping under CI unless the gap is
+        # declared, which is the same rule the `conformance` job's cross-track
+        # test applies to itself -- a criterion that only ever reports SKIP on
+        # the machine gating merges is a criterion nobody is holding.
         #
         # THE GAP IS DECLARED HERE, DELIBERATELY, AND IT IS A REAL GAP. Firefox
         # is a 75 MB tarball fetched from Mozilla (shim/tests/firefox/fetch-esr.sh)
@@ -579,7 +587,55 @@ jobs:
         # available here".
         env:
           VITRIN_C_SHIM_BIN: ${{ runner.temp }}/shim-build/vitrin-shim
+          # The GTK rung (test_real_gtk.py) runs here: shim/ci/install-deps.sh
+          # installs libgtk-3-dev, so the shim build above produced
+          # gtk-entry-probe beside vitrin-shim, and the gate resolves it as a
+          # sibling of VITRIN_C_SHIM_BIN. The Firefox rung (test_real_firefox.py)
+          # does NOT run here -- the pinned ESR is a 75 MB download this step
+          # does not fetch -- so it is skipped for this suite and held by its
+          # own dedicated step below, which fetches Firefox first. Without this
+          # the Firefox gate would (correctly) FAIL here, VITRIN_C_SHIM_BIN
+          # being set, on a browser this step never provided.
+          VITRIN_SKIP_FIREFOX_GATE: "1"
         run: bash tests/integration/run.sh
+
+      # ---- Firefox real-core render gate: the M1.2 "Shim runs Firefox"
+      # render proof under the REAL core (P1.6.6). ------------------------
+      # Separate from the suite above because it is HEAVY (Firefox on software
+      # WebRender) and needs the 75 MB pinned ESR the suite does not fetch. It
+      # is the real-core counterpart to the shim job's mock-core
+      # firefox_bringup.sh -- and, unlike that declared-skip step, it actually
+      # fetches the browser and runs, so the render + globals-ledger criteria
+      # are held in CI rather than only on a developer machine.
+      - name: Cache the pinned Firefox ESR
+        if: hashFiles('tests/integration/run.sh') != ''
+        uses: actions/cache@v4
+        with:
+          # Keyed on the pin: a new firefox-esr.pin (a deliberate ESR bump)
+          # invalidates the cache and re-fetches, exactly as intended.
+          path: shim/.firefox
+          key: firefox-esr-${{ hashFiles('shim/tests/firefox/firefox-esr.pin') }}
+
+      - name: "Firefox real-core render gate (real vitrind -> real vitrin-shim -> Firefox)"
+        # tests/integration/test_real_firefox.py boots the shipped vitrind ->
+        # the built C shim -> the pinned Firefox and asserts a real Firefox
+        # frame of a solid-colour file:// page is captured with the served
+        # colour dominant, plus that Firefox demanded no global outside
+        # shim/docs/firefox-refused-globals.txt. VITRIN_C_SHIM_BIN is set and
+        # VITRIN_SKIP_FIREFOX_GATE is NOT, so it FAILS-not-skips if the shim or
+        # the browser is missing -- the firefox_bringup.sh discipline, now with
+        # the browser actually fetched. The extra apt packages are Firefox's
+        # runtime libraries beyond the libgtk-3 the shim deps already install;
+        # if a future ESR needs more, this step fails loudly naming the missing
+        # library, which is the gap-closing procedure, not a silent skip.
+        if: hashFiles('tests/integration/run.sh') != ''
+        env:
+          VITRIN_C_SHIM_BIN: ${{ runner.temp }}/shim-build/vitrin-shim
+        run: |
+          sudo apt-get install -y -qq libasound2t64 libdbus-glib-1-2 libseccomp2
+          bash shim/tests/firefox/fetch-esr.sh
+          PYTHONPATH="$PWD/sdk/python/src" VITRIN_REPO="$PWD" \
+            python3 -m unittest discover -s tests/integration -p 'test_real_firefox.py' -v
 
       - name: Integration suite DORMANT
         if: hashFiles('tests/integration/run.sh') == ''

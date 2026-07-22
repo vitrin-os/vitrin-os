@@ -1,5 +1,25 @@
 #!/usr/bin/env bash
-# P1.6.4 acceptance proof: Firefox in the realm.
+# SHIM-ONLY UNIT CHECK: Firefox against the shim under the MOCK core.
+#
+# WHAT THIS IS, AND WHAT IT IS NOT (relabelled by P1.6.6, issue #106).
+#
+# This script runs the real pinned Firefox ESR against the real C shim, but the
+# core it runs against is `shim/tests/mock_core.c` -- a hand-written core
+# stand-in that reads a dominant colour off every committed frame. That makes
+# it a valuable SHIM-IN-ISOLATION SMOKE TEST: it exercises the shim standalone,
+# with no Rust core and no Python SDK in the path, and it can assert an ORDERED
+# colour sequence per frame in a way the poll-per-frame SDK cannot. It is NOT,
+# however, the M1.2 milestone integration proof, precisely because the core is
+# a mock -- one half of the system has never met the other real half here.
+#
+# THE MILESTONE PROOF IS `tests/integration/test_real_firefox.py` (P1.6.6): the
+# shipped `vitrind` execs this same shim, which fork/execs this same Firefox,
+# and the real Python SDK captures a real Firefox frame of a solid-colour page
+# and asserts its dominant colour, with the globals ledger asserted against the
+# same refused-globals allowlist check (D) uses below. That gate, not this
+# script, is what "Shim runs Firefox" is held on. This script stays because it
+# still usefully exercises the shim on its own; treat a green here as "the shim
+# is healthy in isolation", not as "the milestone is met".
 #
 # The top of the R4 bring-up ladder (weston-terminal -> GTK app -> Firefox).
 # Firefox is the MVP's real app, so this script is deliberately empirical: it
@@ -574,5 +594,7 @@ ok "the v0 addition made by this task cites real evidence:
     $n_evidence globals-demand line(s) for wl_subcompositor in $(basename "$EVIDENCE")"
 
 echo
-echo "PASS: all P1.6.4 Firefox bring-up acceptance checks green"
+echo "PASS: all Firefox shim-in-isolation checks green (shim + real Firefox, MOCK core)"
 echo "      ($reported, software WebRender, headless pixman, no network)"
+echo "      NOTE: the milestone 'Shim runs Firefox' proof is the REAL-core gate,"
+echo "      tests/integration/test_real_firefox.py -- this is a shim unit check."

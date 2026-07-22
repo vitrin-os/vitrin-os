@@ -1,5 +1,16 @@
-/* mock_core.c -- the CORE side of the shim wire, for acceptance testing the
- * C shim's upstream link (P1.6.2).
+/* mock_core.c -- the CORE side of the shim wire, for SHIM-IN-ISOLATION unit
+ * testing the C shim's upstream link (P1.6.2).
+ *
+ * THIS IS A MOCK, NOT THE REAL CORE (emphasis added by P1.6.6, issue #106).
+ * It is a strict hand-written stand-in that lets the shim be exercised on its
+ * own, and every acceptance script that drives it (shim_globals_and_client.sh,
+ * upstream_frame_path.sh, seat_input_replay.sh, firefox_bringup.sh) is a
+ * shim-only unit check, NOT a milestone integration proof. The milestone
+ * proofs run the shipped Rust `vitrind` against this same shim with no mock on
+ * any seam -- tests/integration/test_real_app.py (weston, M1.2 exit gate),
+ * test_real_gtk.py (GTK), and test_real_firefox.py (Firefox render + globals
+ * ledger). When a claim needs the REAL core, it lives there; this file is for
+ * exercising the shim standalone, quickly, without a Rust toolchain.
  *
  * This is to `crates/vitrin-core/src/shim.rs` what `crates/vitrin-mock-shim`
  * is to the C shim: a small, deliberately strict peer that lets one side be

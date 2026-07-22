@@ -394,6 +394,19 @@ not been validated to carry, so these criteria are held on a developer
 machine only, and CI says so in its job summary rather than implying
 otherwise with a green tick.
 
+**This script runs under the mock core, so it is a shim-in-isolation smoke
+test, not the milestone proof.** Since P1.6.6 (issue #106) the M1.2 "Shim runs
+Firefox" render half is proved against the **real** `vitrind`:
+[`tests/integration/test_real_firefox.py`](../tests/integration/test_real_firefox.py)
+boots the shipped core → this shim → the pinned Firefox and captures a real
+Firefox frame of a solid-colour `file://` page through the real SDK, asserting
+its dominant colour and its globals ledger. That gate fetches the browser and
+runs in CI (its own step in the `integration` job); this mock-core script stays
+because it still exercises the shim standalone and asserts an ordered per-frame
+colour sequence the poll-based SDK cannot. See
+[`docs/firefox.md`](docs/firefox.md) §7 for the split and §8 for the nested
+watch-it-yourself matrix.
+
 ### Conformance against the real core
 
 The mock core can only prove the shim satisfies *a* reading of the spec. The

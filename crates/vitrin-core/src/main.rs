@@ -326,6 +326,15 @@ USAGE:
                                 [[realm]] table: command, args, env_allow).
                                 Default: $XDG_CONFIG_HOME/vitrin/realm.toml
                                 Startup FAILS if it is missing or malformed.
+    vitrind [--shim PATH]       Shim binary the core execs to hold the realm's
+                                fd-3 core connection; it in turn execs the
+                                realm's `command` app (the realm never names
+                                the shim -- that is the core's job). Default: a
+                                sibling `vitrin-shim` beside this `vitrind`.
+                                Audited transitively at spawn exactly like
+                                `command` (regular file; it and every directory
+                                on its path owned by root or the core's uid and
+                                not writable by group or other).
     vitrind [--dead-man-chord KEY]
                                 Key for the dead-man switch: holding it
                                 revokes every grant in the session at once.
@@ -372,6 +381,7 @@ enum Action {
         principals: Option<PathBuf>,
         recorder: Option<PathBuf>,
         realm: Option<PathBuf>,
+        shim: Option<PathBuf>,
         dead_man: DeadManConfig,
     },
     RunHeadless {
@@ -380,6 +390,7 @@ enum Action {
         principals: Option<PathBuf>,
         recorder: Option<PathBuf>,
         realm: Option<PathBuf>,
+        shim: Option<PathBuf>,
         /// Parsed and validated even here, so the same command line is
         /// accepted or refused identically in both modes -- the `--consent`
         /// precedent, which headless also accepts although it can prompt
@@ -422,6 +433,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut principals: Option<PathBuf> = None;
     let mut recorder: Option<PathBuf> = None;
     let mut realm: Option<PathBuf> = None;
+    let mut shim: Option<PathBuf> = None;
     let mut chord: Option<deadman::Chord> = None;
     let mut hold_ms: Option<u64> = None;
     let mut args = args.into_iter();
@@ -463,6 +475,12 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 )?;
                 set_path(&mut realm, "--realm", "config path", value)?;
             }
+            "--shim" => {
+                let value = args.next().ok_or(
+                    "`--shim` requires a shim binary path (e.g. `--shim /usr/lib/vitrin/vitrin-shim`)",
+                )?;
+                set_path(&mut shim, "--shim", "shim path", value)?;
+            }
             "--dead-man-chord" => {
                 let value = args
                     .next()
@@ -486,6 +504,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_path(&mut recorder, "--recorder", "log path", value)?;
                 } else if let Some(value) = other.strip_prefix("--realm=") {
                     set_path(&mut realm, "--realm", "config path", value)?;
+                } else if let Some(value) = other.strip_prefix("--shim=") {
+                    set_path(&mut shim, "--shim", "shim path", value)?;
                 } else if let Some(value) = other.strip_prefix("--dead-man-chord=") {
                     set_chord(&mut chord, value)?;
                 } else if let Some(value) = other.strip_prefix("--dead-man-hold=") {
@@ -521,6 +541,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             principals,
             recorder,
             realm,
+            shim,
             dead_man,
         }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
@@ -546,6 +567,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             principals,
             recorder,
             realm,
+            shim,
             dead_man,
         }),
         (None, Some(_)) => Err("`--size` requires `--headless`".into()),
@@ -698,10 +720,11 @@ fn main() -> ExitCode {
             principals,
             recorder,
             realm,
+            shim,
             dead_man,
         } => {
             init_tracing();
-            run_session(consent, principals, recorder, realm, move |seed| {
+            run_session(consent, principals, recorder, realm, shim, move |seed| {
                 backend::winit::run(dead_man, seed)
             })
         }
@@ -711,13 +734,14 @@ fn main() -> ExitCode {
             principals,
             recorder,
             realm,
+            shim,
             // Validated at parse time so both modes accept the same command
             // line, then unused: headless has no physical input device to
             // hold a chord on (`Action::RunHeadless::dead_man`).
             dead_man: _,
         } => {
             init_tracing();
-            run_session(consent, principals, recorder, realm, move |seed| {
+            run_session(consent, principals, recorder, realm, shim, move |seed| {
                 backend::headless::run(size, seed)
             })
         }
@@ -855,6 +879,7 @@ fn run_session<R>(
     principals_path: Option<PathBuf>,
     recorder_path: Option<PathBuf>,
     realm_path: Option<PathBuf>,
+    shim_path: Option<PathBuf>,
     backend: R,
 ) -> ExitCode
 where
@@ -985,6 +1010,27 @@ where
     // the defaults are the settled values in `petitions`' module docs. A
     // deployment-tunable surface for them (notably `consent_timeout`) is a
     // separate, deliberate CLI change.
+    // The shim binary the spawn manager execs to hold the realm's fd-3 core
+    // connection (issue #103). Resolved here, before the backend starts, so a
+    // core with no usable shim learns it up front rather than at the fork; the
+    // binary itself is audited transitively at spawn time, exactly like the
+    // realm's `command`. The default is a sibling `vitrin-shim` beside this
+    // `vitrind` -- the realm never names the shim, that being the core's job.
+    let shim = match shim_path {
+        Some(path) => path,
+        None => match default_shim_path() {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!(
+                    "fatal: cannot locate the default shim binary: {err}; \
+                     pass an explicit `--shim PATH`"
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    tracing::info!(shim = %shim.display(), "realm shim binary (execs the realm's app; audited at spawn)");
+
     let seed = session::RuntimeSeed {
         listener,
         verifier,
@@ -992,6 +1038,7 @@ where
         grants: grants::GrantTable::new(),
         realms,
         recorder,
+        shim,
         indicator,
     };
 
@@ -1120,6 +1167,21 @@ fn default_recorder_path() -> Result<PathBuf, vitrin_ipc::PathError> {
         "{RECORDER_FILE_PREFIX}-{}.jsonl",
         std::process::id()
     )))
+}
+
+/// A `vitrin-shim` beside this running `vitrind` — the default shim binary
+/// when `--shim` is omitted, resolved through `current_exe` so it honors
+/// whatever directory the core was installed or built into rather than
+/// guessing one. Only its *location* is decided here; whether it exists and
+/// is safe to exec is the spawn-time audit's question (`crate::spawn`), which
+/// refuses a missing or untrusted-writable shim exactly as it does an app.
+fn default_shim_path() -> Result<PathBuf, String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("cannot locate the running vitrind: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| format!("vitrind {} has no parent directory", exe.display()))?;
+    Ok(dir.join("vitrin-shim"))
 }
 
 /// Resolve and load the session's realm configuration (P1.5.1), failing
@@ -1451,6 +1513,7 @@ mod tests {
                 principals: None,
                 recorder: None,
                 realm: None,
+                shim: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1469,6 +1532,7 @@ mod tests {
                 principals: None,
                 recorder: None,
                 realm: None,
+                shim: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1487,6 +1551,7 @@ mod tests {
                 principals: None,
                 recorder: None,
                 realm: None,
+                shim: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1498,6 +1563,7 @@ mod tests {
                 principals: None,
                 recorder: None,
                 realm: None,
+                shim: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1519,6 +1585,7 @@ mod tests {
                     principals: None,
                     recorder: None,
                     realm: None,
+                    shim: None,
                     dead_man: DeadManConfig::default()
                 })
             );
@@ -1530,6 +1597,7 @@ mod tests {
                 principals: None,
                 recorder: None,
                 realm: None,
+                shim: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1576,6 +1644,7 @@ mod tests {
                 principals: None,
                 recorder: None,
                 realm: None,
+                shim: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1600,6 +1669,7 @@ mod tests {
                     principals: None,
                     recorder: Some(PathBuf::from("/tmp/run.jsonl")),
                     realm: None,
+                    shim: None,
                     dead_man: DeadManConfig::default()
                 })
             );
@@ -1616,6 +1686,7 @@ mod tests {
                 principals: None,
                 recorder: Some(PathBuf::from("/tmp/n.jsonl")),
                 realm: None,
+                shim: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1647,6 +1718,7 @@ mod tests {
                     principals: None,
                     recorder: None,
                     realm: Some(PathBuf::from("/etc/vitrin/realm.toml")),
+                    shim: None,
                     dead_man: DeadManConfig::default()
                 })
             );
@@ -1664,6 +1736,7 @@ mod tests {
                 principals: None,
                 recorder: Some(PathBuf::from("/tmp/n.jsonl")),
                 realm: Some(PathBuf::from("/tmp/realm.toml")),
+                shim: None,
                 dead_man: DeadManConfig::default()
             })
         );
@@ -1683,6 +1756,62 @@ mod tests {
                 .unwrap_err()
                 .contains("--realm")
         );
+    }
+
+    #[test]
+    fn shim_path_parses_both_spellings_and_defaults_to_none() {
+        // The shim binary is a core input (issue #103): omitted, `None` means
+        // "resolve the sibling `vitrin-shim` at startup", never "no shim".
+        for args in [
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--shim",
+                "/usr/lib/vitrin/vitrin-shim",
+            ],
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--shim=/usr/lib/vitrin/vitrin-shim",
+            ],
+        ] {
+            assert_eq!(
+                parse_args(args),
+                Ok(Action::RunHeadless {
+                    size: (1280, 800),
+                    consent: ConsentPolicy::AutoApprove,
+                    principals: None,
+                    recorder: None,
+                    realm: None,
+                    shim: Some(PathBuf::from("/usr/lib/vitrin/vitrin-shim")),
+                    dead_man: DeadManConfig::default()
+                })
+            );
+        }
+        // Valid with the nested mode too, and the default is `None`.
+        assert_eq!(
+            parse_args(["--nested", "--shim=/opt/vitrin/vitrin-shim"]),
+            Ok(Action::RunNested {
+                consent: ConsentPolicy::Interactive,
+                principals: None,
+                recorder: None,
+                realm: None,
+                shim: Some(PathBuf::from("/opt/vitrin/vitrin-shim")),
+                dead_man: DeadManConfig::default()
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_or_repeated_shim_is_an_error() {
+        // The `--realm` precedent, flag for flag: no value to consume, an
+        // empty path, and a repeat that names the flag.
+        assert!(parse_args(["--headless", "--shim"]).is_err());
+        assert!(parse_args(["--headless", "--shim="]).is_err());
+        assert!(parse_args(["--headless", "--shim", ""]).is_err());
+        assert!(parse_args(["--headless", "--shim=/a", "--shim=/b"])
+            .unwrap_err()
+            .contains("--shim"));
     }
 
     #[test]
@@ -1930,6 +2059,7 @@ mod tests {
             Some(registry.clone()),
             Some(log.clone()),
             Some(realm.clone()),
+            None,
             |seed| {
                 ran.set(true);
                 (seed.recorder, Ok(()))
@@ -1964,6 +2094,7 @@ mod tests {
             Some(demo_registry),
             Some(log.clone()),
             Some(realm),
+            None,
             |seed| {
                 ran.set(true);
                 (seed.recorder, Ok(()))
@@ -2138,6 +2269,7 @@ mod tests {
                     principals: Some(PathBuf::from("/etc/vitrin/principals.toml")),
                     recorder: None,
                     realm: None,
+                    shim: None,
                     dead_man: DeadManConfig::default()
                 })
             );
@@ -2197,6 +2329,7 @@ mod tests {
                 principals: None,
                 recorder: None,
                 realm: None,
+                shim: None,
                 dead_man: DeadManConfig::default()
             })
         );

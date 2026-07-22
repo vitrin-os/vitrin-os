@@ -1281,6 +1281,8 @@ mod tests {
     use vitrin_protocol::generated::vitrin_grant::Refusal;
 
     use super::*;
+    use std::ffi::OsString;
+
     use crate::capture::tests::fd_lock;
     use crate::input::NoopHook;
     use crate::realm::tests::realm_with_spawn;
@@ -1461,7 +1463,10 @@ mod tests {
                 &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                 &[],
             );
-            let paths = SpawnPaths::under(&self.base);
+            // The mock is both the `--shim` binary (direct child, fd 3) and
+            // the `command` app stand-in; the fixture flags in `args` ride the
+            // app-argument tail, which the mock scans (issue #103).
+            let paths = SpawnPaths::under(&self.base, &bin);
             let mut spawned = spawn_realm_with_env(&realm, &paths, &mut self.recorder, |_| None)
                 .expect("spawn must succeed against a scratch runtime tree");
             assert!(self.realms.mark_running(spawned.realm_id(), spawned.pid()));
@@ -1517,14 +1522,18 @@ mod tests {
         /// the same reason: `trap "" TERM` is a genuine `SIG_IGN`
         /// installed by the child itself after `execve`, so the peer is
         /// really unkillable by `SIGTERM` rather than simulating it.
+        ///
+        /// Since issue #103 the realm's **direct child is the shim**, so this
+        /// misbehaving process is the `--shim` binary: `command`+`args` are
+        /// the shim's own argv (`/bin/sh -c <script>`), placed before the
+        /// `--`/app tail. The realm's `command` (the app) is an inert,
+        /// audit-passing mock the shell never reaches -- the trailing `--
+        /// <app>` are positional parameters the `-c <script>` ignores.
         fn spawn_program(&mut self, command: &str, args: &[&str]) -> RealmLifecycle {
-            let realm = realm_with_spawn(
-                "realm-0",
-                Path::new(command),
-                &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-                &[],
-            );
-            let paths = SpawnPaths::under(&self.base);
+            let realm = realm_with_spawn("realm-0", &mock_shim_bin(), &[], &[]);
+            let mut shim_argv: Vec<OsString> = vec![OsString::from(command)];
+            shim_argv.extend(args.iter().map(OsString::from));
+            let paths = SpawnPaths::under_with_shim_argv(&self.base, shim_argv);
             let spawned = spawn_realm_with_env(&realm, &paths, &mut self.recorder, |_| None)
                 .expect("spawn must succeed against a scratch runtime tree");
             assert!(self.realms.mark_running(spawned.realm_id(), spawned.pid()));

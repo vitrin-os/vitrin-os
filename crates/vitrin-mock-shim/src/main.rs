@@ -9,6 +9,22 @@
 //! the spawn path testable end to end long before the wlroots shim (E6,
 //! issue #33) exists.
 //!
+//! # This is the test-time `--shim` binary
+//!
+//! Since issue #103 the core execs a core-known **shim** binary (holding
+//! fd 3) that in turn execs the realm's app, rather than execing the app
+//! directly. The real shim is the wlroots one (E6/#33); until it lands, this
+//! fixture *is* the `--shim` binary every realm test hands the core. The core
+//! conveys the app command to a shim as `<shim> -- <app> <app-args...>`, so
+//! this binary is invoked with a `-- <app>` tail it must tolerate. It does,
+//! by construction: its mode flags are matched anywhere in argv (the scan
+//! below ignores the `--` separator and the app path, which match none of
+//! them), so a harness places the fixture flags it wants -- `--serve`,
+//! `--seat`, `--animate N`, `--spawn-app` -- in the app-argument tail and
+//! this binary honors them. It deliberately does **not** exec the app named
+//! after `--`: execing the real app is the wlroots shim's job (#104), and
+//! this fixture animates a synthetic buffer instead.
+//!
 //! # The fd-inheritance contract, from the shim's side
 //!
 //! - **Identity is the descriptor.** There is no handshake, no credential,

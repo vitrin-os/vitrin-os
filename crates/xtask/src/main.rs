@@ -528,19 +528,27 @@ fn demo(headless: bool) -> Result<()> {
     fs::set_permissions(&principals, Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", principals.display()))?;
 
+    // The core-inserted shim (issue #103): since the core execs a `--shim`
+    // binary that holds fd 3 and conveys the realm's `command` app in argv,
+    // both venues pass one. The mock shim is that binary here -- the real
+    // wlroots shim (#104/#110) is out of this task's scope -- so `cargo xtask
+    // demo` stays consistent with the core's contract even though the nested
+    // venue does not yet render Firefox through it.
+    let mock_shim = bin_dir.join("vitrin-mock-shim");
+    if !mock_shim.is_file() {
+        bail!(
+            "vitrin-mock-shim not found at {} -- run `cargo build --workspace` first",
+            mock_shim.display()
+        );
+    }
+
     // Assemble the two venue-specific pieces: the realm config, the core's
     // argv, the environment vitrind runs under, and where its socket lands.
     let mut core_cmd = Command::new(&vitrind);
     core_cmd.env("RUST_LOG", "info");
+    core_cmd.args(["--shim".as_ref(), mock_shim.as_os_str()]);
 
     let socket: PathBuf = if headless {
-        let mock_shim = bin_dir.join("vitrin-mock-shim");
-        if !mock_shim.is_file() {
-            bail!(
-                "vitrin-mock-shim not found at {} -- run `cargo build --workspace` first",
-                mock_shim.display()
-            );
-        }
         // The mock shim stands in for the app: `--seat` so seat events deliver,
         // `--animate` so the two captures differ across the actuation sequence.
         fs::write(

@@ -2593,7 +2593,10 @@ mod tests {
 
         let _fd = crate::capture::tests::fd_lock();
         let base = crate::spawn::tests::scratch();
-        let paths = crate::spawn::SpawnPaths::under(&base);
+        // The C shim is the core-inserted `--shim` binary under test (issue
+        // #103); like the mock fixture it doubles as the `command` app
+        // stand-in, so the core execs it as the realm's fd-3 peer.
+        let paths = crate::spawn::SpawnPaths::under(&base, &shim_bin);
         let (mut recorder, _log) = crate::recorder::tests::scratch_recorder("c-shim-conformance");
 
         // The shim must run headless on the software renderer: this test is

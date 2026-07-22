@@ -130,6 +130,13 @@ class Core:
             str(self.realm),
             "--recorder",
             str(self.recorder),
+            # Since #103 the core execs a `--shim` binary (fd-3 holder) that
+            # conveys the realm's `command` app in argv after `--`. The mock
+            # shim is that binary here; the fixture flags in the realm's `args`
+            # ride the app tail, which the mock scans. `command` above stays
+            # the mock too, as the app stand-in the mock ignores.
+            "--shim",
+            str(MOCK_SHIM),
         ]
         self.proc = subprocess.Popen(
             argv,

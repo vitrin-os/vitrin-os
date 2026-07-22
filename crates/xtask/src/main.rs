@@ -469,7 +469,12 @@ fn demo(headless: bool) -> Result<()> {
 
         // Headless owns its runtime tree, so the socket is deterministic.
         core_cmd
-            .args(["--headless", "--size", HEADLESS_SIZE, "--consent=auto-approve"])
+            .args([
+                "--headless",
+                "--size",
+                HEADLESS_SIZE,
+                "--consent=auto-approve",
+            ])
             .args(["--principals".as_ref(), principals.as_os_str()])
             .args(["--realm".as_ref(), realm.as_os_str()])
             .args(["--recorder".as_ref(), recorder.as_os_str()])
@@ -612,10 +617,7 @@ fn make_work_dir() -> Result<PathBuf> {
 fn await_core_socket(socket: &Path, core: &mut Child, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = core
-            .try_wait()
-            .context("polling vitrind while it boots")?
-        {
+        if let Some(status) = core.try_wait().context("polling vitrind while it boots")? {
             bail!(
                 "vitrind exited with {status} during boot, before binding {}",
                 socket.display()

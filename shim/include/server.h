@@ -15,6 +15,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h> /* pid_t (the app child, spawned by main.c) */
 
 #include <wayland-server-core.h>
 
@@ -69,10 +70,26 @@ struct vitrin_config {
 	 * answers the second, without recompiling and without adding anything to
 	 * the real global set on a guess. */
 	const char *probe_filter;
+	/* The app command the core conveyed after `--` (the P1.5.4 / #103 argv
+	 * contract: `<shim> [shim-args] -- <app> <app-args>`): the program this
+	 * shim forks and execs once its session is up (#104). Points into main()'s
+	 * argv -- `argv[argc]` is a guaranteed NULL, so `app_argv` is already the
+	 * NULL-terminated vector execv wants; not owned. NULL = spawn nothing (no
+	 * `--`, or an empty tail: --no-upstream dev mode and the globals/upstream
+	 * acceptance tests run the shim with no app). */
+	char **app_argv;
+	int app_argc;
 };
 
 struct vitrin_shim {
 	struct vitrin_config cfg;
+
+	/* The app child (main.c app-spawn, #104): the pid of the forked app, or
+	 * -1 when none was spawned. The SIGCHLD handler reaps it and brings the
+	 * realm down when it exits (one shim, one app, one universe); SIGTERM/SIGINT
+	 * teardown SIGTERMs and reaps it first, so killing the shim never orphans
+	 * the app (P1.5.2 verification). */
+	pid_t app_pid;
 
 	/* Phase A0 -- the core link (upstream.c/wire.c). Opened before any
 	 * wlroots object exists, because its `configure` sizes everything. */

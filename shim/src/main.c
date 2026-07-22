@@ -21,10 +21,15 @@
  */
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <wayland-server-core.h>
 
@@ -52,6 +57,134 @@ static int handle_terminate(int sig, void *data) {
 	return 0;
 }
 
+/* Reap the app child and bring the realm down with it. Registered on the
+ * event loop's SIGCHLD signalfd (like handle_terminate above), so it runs as
+ * an ordinary callback, free of async-signal-safety limits -- it may waitpid,
+ * log, and terminate the display. The core reaps the SHIM this same way
+ * (P1.5.3); this is the shim reaping its APP. Terminating the display when the
+ * app exits is what makes the realm come down with its one app (no zombies,
+ * one shim/one app/one universe). */
+static int handle_sigchld(int sig, void *data) {
+	(void)sig;
+	struct vitrin_shim *s = data;
+	int status;
+	pid_t pid;
+	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+		if (pid != s->app_pid) {
+			continue; /* not the app we track */
+		}
+		s->app_pid = -1;
+		if (WIFEXITED(status)) {
+			wlr_log(WLR_INFO, "app (pid %d) exited status=%d; terminating realm",
+				(int)pid, WEXITSTATUS(status));
+		} else if (WIFSIGNALED(status)) {
+			wlr_log(WLR_INFO, "app (pid %d) killed by signal %d; terminating realm",
+				(int)pid, WTERMSIG(status));
+		}
+		wl_display_terminate(s->display);
+	}
+	return 0;
+}
+
+/* Fork and exec the app the core conveyed after `--`, if any. The app inherits
+ * the core-composed WAYLAND_DISPLAY + XDG_RUNTIME_DIR set just above and talks
+ * to THIS shim, not the host compositor. It must inherit none of the shim's
+ * private descriptors -- fd 3 (the core link) above all, since a live channel
+ * to the TCB in a confined app is the whole confinement gone. All the shim's
+ * fds are close-on-exec: fd 3 (wire.c re-arms FD_CLOEXEC), the Wayland listen
+ * socket and the event-loop epoll fd (libwayland opens both with SOCK/EPOLL
+ * _CLOEXEC), and the renderer/DRM fds (wlroots opens them O_CLOEXEC), so
+ * execve drops every one. We assert fd 3's flag before forking rather than
+ * trust it -- the one descriptor whose leak matters most. Returns false only
+ * on a fork failure the caller must treat as a bring-up failure; on execv
+ * failure the CHILD _exit(127)s and the parent learns via SIGCHLD. */
+static bool vitrin_spawn_app(struct vitrin_shim *s) {
+	if (s->cfg.app_argv == NULL) {
+		wlr_log(WLR_INFO, "no app command after `--`; spawning nothing");
+		return true;
+	}
+	if (!s->cfg.standalone) {
+		int fl = fcntl(VITRIN_CORE_FD, F_GETFD);
+		if (fl < 0 || (fl & FD_CLOEXEC) == 0) {
+			wlr_log(WLR_ERROR,
+				"fd %d is not FD_CLOEXEC before app spawn; refusing to leak the "
+				"core connection to the confined app",
+				VITRIN_CORE_FD);
+			return false;
+		}
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		wlr_log(WLR_ERROR, "cannot fork the app: %s", strerror(errno));
+		return false;
+	}
+	if (pid == 0) {
+		/* Child: async-signal-safe only, from here to execv.
+		 *
+		 * Restore the default signal mask first. The shim runs its own
+		 * SIGTERM/SIGINT/SIGCHLD through the event loop's signalfd, which
+		 * blocks them process-wide -- and fork inherits that blocked mask
+		 * across execve. An app left with SIGTERM blocked cannot be killed by
+		 * it, and SIGTERM is exactly how both the core's teardown ladder
+		 * (P1.5.3) and this shim's own vitrin_reap_app bring the app down; a
+		 * blocked-mask app would wedge teardown. sigprocmask is
+		 * async-signal-safe and the post-fork child is single-threaded. */
+		sigset_t empty;
+		sigemptyset(&empty);
+		sigprocmask(SIG_SETMASK, &empty, NULL);
+		/* The absolute program the core already audited -- execv, never
+		 * execvp, so no $PATH search can substitute a different binary than
+		 * the audited one. On failure the child dies with 127, the shell's
+		 * "cannot exec" code, and the parent sees it via SIGCHLD. */
+		execv(s->cfg.app_argv[0], s->cfg.app_argv);
+		_exit(127);
+	}
+	s->app_pid = pid;
+	wlr_log(WLR_INFO, "spawned app pid=%d: %s", (int)pid, s->cfg.app_argv[0]);
+	return true;
+}
+
+/* Take the app down with the shim: SIGTERM it and reap it, so a shim told to
+ * exit (the SIGTERM/SIGINT teardown and the err: path) never orphans its app
+ * (P1.5.2: "killing the shim removes the surface and the app; the core
+ * survives"). Idempotent -- a no-op once SIGCHLD has already reaped the app
+ * (app_pid == -1) or when none was ever spawned. */
+static void vitrin_reap_app(struct vitrin_shim *s) {
+	if (s->app_pid <= 0) {
+		return;
+	}
+	pid_t pid = s->app_pid;
+	/* SIGTERM first, then a brief grace before escalating to SIGKILL --
+	 * mirroring the core's own shim-shutdown ladder (P1.5.3): a well-behaved
+	 * app exits on the term, and one that will not must still never wedge the
+	 * shim's teardown. ~2s in 20ms polls. */
+	kill(pid, SIGTERM);
+	bool reaped = false;
+	for (int i = 0; i < 100; i++) {
+		pid_t r = waitpid(pid, NULL, WNOHANG);
+		if (r == pid) {
+			reaped = true;
+			break;
+		}
+		if (r < 0 && errno != EINTR) {
+			break; /* ECHILD: already reaped by the SIGCHLD handler */
+		}
+		struct timespec ts = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
+		nanosleep(&ts, NULL);
+	}
+	if (!reaped) {
+		kill(pid, SIGKILL);
+		pid_t r;
+		do {
+			r = waitpid(pid, NULL, 0);
+		} while (r < 0 && errno == EINTR);
+		wlr_log(WLR_INFO, "app (pid %d) did not exit on SIGTERM; killed and reaped", (int)pid);
+	} else {
+		wlr_log(WLR_INFO, "app (pid %d) reaped on shim teardown", (int)pid);
+	}
+	s->app_pid = -1;
+}
+
 static void parse_args(int argc, char **argv, struct vitrin_config *cfg) {
 	cfg->socket_name = NULL;
 	cfg->dmabuf = false;
@@ -61,6 +194,8 @@ static void parse_args(int argc, char **argv, struct vitrin_config *cfg) {
 	cfg->globals_log = NULL;
 	cfg->probe_globals = false;
 	cfg->probe_filter = NULL;
+	cfg->app_argv = NULL;
+	cfg->app_argc = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--dmabuf") == 0) {
@@ -84,10 +219,17 @@ static void parse_args(int argc, char **argv, struct vitrin_config *cfg) {
 			/* Everything after `--` is the app command the core wants
 			 * this shim to exec (the core→shim argv contract of
 			 * P1.5.4 / #103: `<shim> [shim-args] -- <app> <app-args>`).
-			 * Actually fork/exec'ing that app is the wlroots app-spawn
-			 * step (#104); until it lands, tolerate and ignore the tail
-			 * so the argv the core now sends does not trip the usage
-			 * branch below and abort the shim at startup. */
+			 * Capture it as the app command to fork/exec once the session
+			 * is up (#104). `argv[argc]` is a guaranteed NULL, so
+			 * `&argv[i + 1]` is already the NULL-terminated vector execv
+			 * wants -- no copy. An EMPTY tail (`--` with nothing after it,
+			 * or no `--` at all) leaves app_argv NULL: the shim spawns
+			 * nothing, which preserves --no-upstream dev mode and the
+			 * acceptance tests that run the shim with no app. */
+			if (i + 1 < argc) {
+				cfg->app_argv = &argv[i + 1];
+				cfg->app_argc = argc - (i + 1);
+			}
 			break;
 		} else {
 			fprintf(stderr,
@@ -117,6 +259,10 @@ int main(int argc, char **argv) {
 	wlr_log_init(WLR_DEBUG, NULL);
 
 	struct vitrin_shim s = {0};
+	/* No app forked yet: -1, not the 0 that `= {0}` leaves (0 is a legal pid,
+	 * so a bare zero would make vitrin_reap_app try to signal process 0's whole
+	 * group on an early teardown). */
+	s.app_pid = -1;
 	/* Before the standalone/upstream branch below, because teardown runs on
 	 * both: this is what makes every descriptor the shim owns start at -1
 	 * rather than at 0 (see vitrin_upstream_init). */
@@ -189,6 +335,17 @@ int main(int argc, char **argv) {
 	/* Shut down cleanly on the signals the core (or a user) will send. */
 	wl_event_loop_add_signal(s.loop, SIGTERM, handle_terminate, s.display);
 	wl_event_loop_add_signal(s.loop, SIGINT, handle_terminate, s.display);
+	/* Reap the app and bring the realm down when it exits. Armed BEFORE the
+	 * fork below, so the child's exit can never race ahead of a handler that
+	 * is not yet on the loop. */
+	wl_event_loop_add_signal(s.loop, SIGCHLD, handle_sigchld, &s);
+
+	/* Only now -- session configured, compositor built, socket bound, backend
+	 * and core link running, reaper armed -- is the app forked and exec'd. */
+	if (!vitrin_spawn_app(&s)) {
+		wlr_log(WLR_ERROR, "app spawn failed");
+		goto err;
+	}
 
 	wlr_log(WLR_INFO,
 		"vitrin-shim up: WAYLAND_DISPLAY=%s view=%dx%d dmabuf=%d upstream=%d "
@@ -208,10 +365,14 @@ int main(int argc, char **argv) {
 		(unsigned long long)s.up.frame_dones,
 		(unsigned long long)s.up.buffer_dones);
 
+	/* Take the app down with the shim before releasing the compositor it
+	 * renders into, so a shim exit never orphans its app. */
+	vitrin_reap_app(&s);
 	vitrin_shim_finish(&s);
 	return 0;
 
 err:
+	vitrin_reap_app(&s);
 	vitrin_shim_finish(&s);
 	return 1;
 }

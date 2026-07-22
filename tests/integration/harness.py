@@ -24,6 +24,12 @@ import unittest
 REPO = pathlib.Path(os.environ.get("VITRIN_REPO", pathlib.Path(__file__).resolve().parents[2]))
 VITRIND = REPO / "target" / "debug" / "vitrind"
 MOCK_SHIM = REPO / "target" / "debug" / "vitrin-mock-shim"
+#: The P1.8.5 SSIM bridge (issue #107): the compiled `vitrin-golden` compare
+#: tool the real-app fidelity gate shells out to, so the dependency-free Python
+#: suite scores an agent frame against the core-internal capture with the *real*
+#: harness rather than a second, driftable SSIM port. Built by the same
+#: `cargo build --workspace` that builds `vitrind`.
+GOLDEN_CMP = REPO / "target" / "debug" / "vitrin-golden-cmp"
 
 #: The demo identity, matching `examples/principals.toml`. Auto-approve is
 #: only permitted when the registry holds nothing but this principal (R6),
@@ -106,6 +112,7 @@ class Core:
         env_allow: tuple[str, ...] = (),
         extra_env: dict[str, str] | None = None,
         log_file: str | os.PathLike[str] | None = None,
+        capture_dump: str | os.PathLike[str] | None = None,
     ) -> None:
         self.runtime = pathlib.Path(runtime_dir or tempfile.mkdtemp(prefix="vitrin-it-"))
         self._owns_runtime = runtime_dir is None
@@ -193,6 +200,11 @@ class Core:
             "--shim",
             str(shim_bin),
         ]
+        # The P1.8.5 core-internal capture (issue #107): when set, the core
+        # mirrors every composited realm-view readback to this file as raw
+        # RGBA, the frame the fidelity gate compares an `observe()` against.
+        if capture_dump is not None:
+            argv += ["--capture-dump", str(capture_dump)]
         env = {**os.environ, "XDG_RUNTIME_DIR": str(self.runtime), "RUST_LOG": "info"}
         # The core's own environment is the source `env_allow` copies from,
         # so the real-app gate seeds WLR_* here for the allowlist to forward.
@@ -609,3 +621,60 @@ def dominant_colour(frame) -> tuple[str, int]:
     # (n -> n*0x11), the inverse the acceptance pages are authored against.
     hex6 = "".join(f"{(v >> 4) * 0x11:02x}" for v in (rq, gq, bq))
     return hex6, top * 100 // total
+
+
+# -- the P1.8.5 SSIM bridge (issue #107) ------------------------------------
+
+
+def packed_xrgb(frame) -> bytes:
+    """A captured frame's pixels as tight ``width*height*4`` xrgb bytes.
+
+    Undoes any stride padding (:func:`_packed_pixels`) so the bytes handed to
+    the compare tool are the well-formed frame it expects — the same repack the
+    colour analyses use, kept in one place so the fidelity gate's frame and the
+    dominant-colour check can never disagree about what the frame *is*.
+    """
+    return _packed_pixels(frame)
+
+
+def golden_cmp(
+    actual_path,
+    expected_path,
+    size,
+    policy,
+    *,
+    actual_format="xrgb",
+    expected_format="rgba",
+    artifacts=None,
+):
+    """Score two raw frame files with the compiled ``vitrin-golden-cmp`` tool.
+
+    The P1.8.5 fidelity gate (issue #107) proves an agent's ``observe()`` frame
+    agrees with the core-internal capture (``vitrind --capture-dump``) by SSIM,
+    and the SSIM lives in the Rust ``vitrin-golden`` harness — the one the whole
+    repo scores goldens with. Rather than re-port it into this dependency-free
+    suite (a second definition that could silently drift, plan risk R7), the
+    gate shells out to the real thing here.
+
+    `size` is `(width, height)`; `policy` is the tool's policy string
+    (`"exact"`, `"ssim:0.98"`, `"tol:2,0.01"`). Returns the completed process so
+    a caller can assert on its exit code (0 passed, 1 did not, 2 error) and read
+    the printed report. `artifacts`, when given, is a directory the tool drops
+    actual/expected/diff PNGs into on a failing comparison.
+    """
+    w, h = size
+    cmd = [
+        str(GOLDEN_CMP),
+        str(actual_path),
+        str(expected_path),
+        f"{w}x{h}",
+        "--actual-format",
+        actual_format,
+        "--expected-format",
+        expected_format,
+        "--policy",
+        policy,
+    ]
+    if artifacts is not None:
+        cmd += ["--artifacts", str(artifacts)]
+    return subprocess.run(cmd, capture_output=True, text=True)

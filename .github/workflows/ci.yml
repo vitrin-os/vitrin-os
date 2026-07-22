@@ -590,7 +590,12 @@ jobs:
           # The GTK rung (test_real_gtk.py) runs here: shim/ci/install-deps.sh
           # installs libgtk-3-dev, so the shim build above produced
           # gtk-entry-probe beside vitrin-shim, and the gate resolves it as a
-          # sibling of VITRIN_C_SHIM_BIN. The Firefox rung (test_real_firefox.py)
+          # sibling of VITRIN_C_SHIM_BIN. The M1.3 exit gate
+          # (test_real_capture_fidelity.py, P1.8.5) runs here under the same
+          # knob: its solid-client is co-built with the shim (a VITRIN_C_SHIM_BIN
+          # sibling) and its vitrin-golden-cmp SSIM tool is built by the warm
+          # `cargo build --workspace` above -- no extra CI wiring. The Firefox
+          # rung (test_real_firefox.py)
           # does NOT run here -- the pinned ESR is a 75 MB download this step
           # does not fetch -- so it is skipped for this suite and held by its
           # own dedicated step below, which fetches Firefox first. Without this

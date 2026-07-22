@@ -273,6 +273,23 @@ damage_client = executable(
   dependencies: [wayland_client],
 )
 
+# The P1.8.5 real-app capture rung's app (issue #107): a bare wl_shm client
+# that paints one known solid colour over the whole surface and never
+# animates. That is what the M1.3 exit gate captures through the real chain to
+# assert (a) the agent frame's dominant colour equals the served colour, and
+# (b) it agrees by SSIM with the core-internal capture -- a static, toolkit-free
+# scene neither weston-terminal nor gtk-entry-probe can be. Built beside
+# vitrin-shim so the integration gate resolves it as a sibling of the shim
+# binary, exactly as it resolves gtk-entry-probe.
+solid_client = executable(
+  'solid-client',
+  files('tests/solid_client.c'),
+  xdg_shell_client_header,
+  xdg_shell_code,
+  include_directories: inc,
+  dependencies: [wayland_client],
+)
+
 # --- P1.6.3 acceptance harness -----------------------------------------
 # The input half of the wire, from the app's side: a client that receives
 # seat input and resolves every key through the keymap the shim sent it,

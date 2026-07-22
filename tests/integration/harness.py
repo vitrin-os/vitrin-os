@@ -678,3 +678,57 @@ def golden_cmp(
     if artifacts is not None:
         cmd += ["--artifacts", str(artifacts)]
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+# -- the P1.8.6 actuation gate (issue #108) ---------------------------------
+
+
+def locate_colour(frame, hex6: str):
+    """Centroid ``(cx, cy)`` and pixel count of a quantised colour in a frame.
+
+    Quantises each pixel to 4 bits/channel (:func:`dominant_colour`'s histogram)
+    and returns the centroid of every pixel whose quantised colour equals
+    ``hex6`` — an ``"rrggbb"`` whose channels are multiples of ``0x11`` — plus
+    how many matched. ``(None, None, 0)`` when the colour is absent. This is
+    what the D10 pointer gate clicks: the agent locates a feature by its known
+    colour in its *own* captured frame, and clicks the middle of it.
+    """
+    packed = _packed_pixels(frame)
+    b = packed[0::4].translate(_TOP_NIBBLE)
+    g = packed[1::4].translate(_TOP_NIBBLE)
+    r = packed[2::4].translate(_TOP_NIBBLE)
+    tr = int(hex6[0:2], 16) & 0xF0
+    tg = int(hex6[2:4], 16) & 0xF0
+    tb = int(hex6[4:6], 16) & 0xF0
+    width = frame.width
+    sum_x = sum_y = count = 0
+    for i in range(len(r)):
+        if r[i] == tr and g[i] == tg and b[i] == tb:
+            sum_x += i % width
+            sum_y += i // width
+            count += 1
+    if count == 0:
+        return None, None, 0
+    return sum_x // count, sum_y // count, count
+
+
+def count_changed_pixels(before, after) -> int:
+    """How many pixels differ in colour between two same-size frames.
+
+    Compares the three colour channels (padding ignored) pixel by pixel. Used
+    by the D7 text gate to assert an *observable* change — a typed string
+    rendered into a real text field moves hundreds to thousands of glyph
+    pixels, far above the handful a focus caret alone would, so a threshold on
+    this count distinguishes "the text landed and was drawn" from incidental
+    noise. Raises if the frames are not the same size (a mismatch is a bug to
+    surface, not to paper over).
+    """
+    pa = _packed_pixels(before)
+    pb = _packed_pixels(after)
+    if len(pa) != len(pb):
+        raise ValueError(f"frame size mismatch: {len(pa)} vs {len(pb)} bytes")
+    changed = 0
+    for i in range(0, len(pa), 4):
+        if pa[i : i + 3] != pb[i : i + 3]:
+            changed += 1
+    return changed

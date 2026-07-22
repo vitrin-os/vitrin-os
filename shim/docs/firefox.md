@@ -464,3 +464,35 @@ software pixman render never shows.
 Because it is manual, its "never a silent skip" guarantee is structural: there
 is no CI job to skip. The commands above either run and show you the window or
 fail loudly on a missing host/browser in your own terminal.
+
+### The P1.8.6 agent-actuation nested variant (issue #108, criterion 6)
+
+The headless actuation gate (`test_real_actuation.py`) proves an agent's click
+lands on a `click-target` and a typed Unicode string lands in a `gtk-entry-probe`
+— toolkit-free and GPU-free, on apps built for a clean observe()-able response.
+Its nested counterpart, workstation-only for the same R1 reasons as the capture
+variant above, drives the actuation A/B/C proofs `firefox_bringup.sh` runs under
+the *mock* core (§6) but through the *real* core and the *real agent SDK*, and
+confirms each by the agent's own `observe()`:
+
+- **Pointer scroll (B).** Point the realm's `command` at Firefox on
+  `pages/scroll.html` (three viewports tall, `#ff0000` at the top, repainting
+  `#ffff00` only once the document has really scrolled past a viewport). The
+  agent `grant.pointer.scroll(...)`s, then `observe()`s the dominant colour go
+  red → yellow — the page scrolled, driven from the agent through the real
+  chokepoint.
+- **URL bar text (C).** On `about:blank`, the agent `grant.text.type("\x0c")`
+  (Ctrl+L focuses the URL bar) or clicks it, types the `file://` URL of
+  `pages/urlbar-target.html` ending in `\n`, and `observe()`s the navigation
+  land as that page's dominant colour. The URL — a full Unicode-capable string
+  — arriving intact in a real browser's URL bar is D7 at the top of the ladder.
+
+Same realm and environment as the capture variant above (a fresh `--profile`,
+software WebRender, `file://` pages, `env_allow`), just with the agent
+actuating rather than only observing, and `--consent=interactive` so you
+approve the actuate grant on the nested consent surface. It is manual by
+construction — nested needs a real host compositor and GPU (R1) — so, like the
+capture variant, its "never a silent skip" is structural: there is no CI job to
+skip, and the commands fail loudly in your own terminal on a missing
+host/browser. The agent-driven injection *into* Firefox is issue #108's nested
+rung; the headless rungs are what merges are held on.

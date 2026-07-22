@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <glib-unix.h>
 #include <gtk/gtk.h>
 
 static GtkWidget *g_entry;
@@ -61,6 +62,23 @@ static void dump_and_quit(void) {
 }
 
 static gboolean on_timeout(gpointer data) {
+	(void)data;
+	dump_and_quit();
+	return G_SOURCE_REMOVE;
+}
+
+/* On-demand dump (SIGUSR1). The `--run-ms` timer is a fixed deadline from
+ * startup, which races a driver that must first bring the window up, render it,
+ * and inject a stimulus before the entry is meant to be read -- the P1.8.6
+ * agent-actuation gate (test_real_actuation.py) does exactly that, and under a
+ * slow CI cold-start GTK render the timer could fire before the typed string
+ * lands. So a driver that knows WHEN it has finished typing can trigger the
+ * dump precisely then, instead of guessing a timeout that outlasts every
+ * runner. Delivered through `g_unix_signal_add`, so it runs in the GTK main
+ * loop (not a raw handler) and `dump_and_quit`'s GTK calls are safe. SIGUSR1 is
+ * used by no other caller of this probe -- the P1.6.3 seat-replay gate drives
+ * it purely on the timer -- so adding this path changes nothing for them. */
+static gboolean on_dump_signal(gpointer data) {
 	(void)data;
 	dump_and_quit();
 	return G_SOURCE_REMOVE;
@@ -103,6 +121,9 @@ int main(int argc, char **argv) {
 
 	g_idle_add(on_mapped, NULL);
 	g_timeout_add((guint)g_run_ms, on_timeout, NULL);
+	/* On-demand dump for a driver that knows when it has finished typing; the
+	 * timer above stays as the standalone/fallback deadline. */
+	g_unix_signal_add(SIGUSR1, on_dump_signal, NULL);
 
 #if GTK_MAJOR_VERSION >= 4
 	while (g_list_model_get_n_items(gtk_window_get_toplevels()) > 0) {

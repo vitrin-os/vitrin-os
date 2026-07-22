@@ -290,6 +290,21 @@ solid_client = executable(
   dependencies: [wayland_client],
 )
 
+# The P1.8.6 agent-actuation gate's D10 app (issue #108): a wl_shm + wl_pointer
+# client with a locatable TARGET square that repaints the whole surface to a
+# HIT colour when a click lands on it. That whole-frame colour flip is the
+# clean, GPU-free "the click landed on the observed feature" response the
+# agent's own observe() asserts -- neither weston-terminal nor gtk-entry-probe
+# gives one. Co-built with vitrin-shim so the gate resolves it as a sibling.
+click_target = executable(
+  'click-target',
+  files('tests/click_target.c'),
+  xdg_shell_client_header,
+  xdg_shell_code,
+  include_directories: inc,
+  dependencies: [wayland_client],
+)
+
 # --- P1.6.3 acceptance harness -----------------------------------------
 # The input half of the wire, from the app's side: a client that receives
 # seat input and resolves every key through the keymap the shim sent it,

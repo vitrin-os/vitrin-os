@@ -7,11 +7,17 @@
 //! retains for capture, P1.3.3, with the consent overlay on top, P1.7.1).
 //!
 //! The host window IS the human's display here, so it presents the
-//! human-visible side of the output stage and there is no second window,
-//! no second surface, and no compositing anywhere else (decision D4). The
-//! consent overlay reaching this texture is therefore exactly as far as it
-//! goes: no capture path reads a GL texture (see [`super`] and
-//! [`crate::consent`] for the fork).
+//! human-visible side of the output stage and there is no second window and
+//! no second surface (decision D4). The consent overlay reaching this GL
+//! texture is therefore exactly as far as it goes: **no capture path reads a
+//! GL texture.** A capture served under `--nested` (P1.3.8, issue #116) is the
+//! *bare realm view* composed on the CPU straight from the retained scene
+//! ([`NestedView::view_rgba`] → [`Scene::compose`]) — the same bytes headless
+//! retains for capture, and, because `Scene::compose` sits upstream of the
+//! output-stage fork ([`super::human_visible_from_view`]), overlay-free by
+//! construction. So the fork holds here exactly as it does in headless: the
+//! human sees the GL window with its overlay; the agent sees the composed
+//! realm view without it (see [`super`] and [`crate::consent`] for the fork).
 //!
 //! # This backend is where the human physically *is*
 //!
@@ -180,6 +186,43 @@ fn window_pixels(
     pixels
 }
 
+/// The pixels this backend serves as an **agent capture** (P1.3.8, issue
+/// #116): the **bare realm view**, composed on the CPU straight from the
+/// scene — and deliberately nothing else.
+///
+/// This is the capture counterpart of [`window_pixels`], and the contrast
+/// between the two is the whole of the P1.7.1 fork made local to this backend:
+///
+/// - [`window_pixels`] is what the human sees — [`Scene::compose`] **plus** the
+///   consent overlay (P1.7.1) **plus** the dead-man hold indicator (P1.7.3).
+///   It is uploaded to the GL window.
+/// - `capture_pixels` is what an agent observes — [`Scene::compose`] and
+///   nothing over it. No consent card, no hold indicator, ever: those join
+///   only in [`super::human_visible_from_view`] and [`window_pixels`], both
+///   *downstream* of [`Scene::compose`], so the overlay is excluded here by
+///   construction rather than by a check. This is the identical structural
+///   argument the headless capture rests on, and it is why the two backends'
+///   captures cannot drift: both are exactly [`Scene::compose`].
+///
+/// Split out of [`NestedView::view_rgba`] for the same reason
+/// [`window_pixels`] was split out of [`NestedState::try_redraw`]: so the
+/// decision it encodes — *serve the bare scene, never the presented window* —
+/// is pinned by a test that needs no display, GL context, or host window. A
+/// regression that reached for [`window_pixels`] here instead (leaking the
+/// consent card into every capture) would otherwise pass the whole suite.
+///
+/// `None` for a degenerate (zero-sized, e.g. minimized) window: there is no
+/// realm view, so the capture meets the chokepoint's `no_surface` refusal.
+pub(crate) fn capture_pixels(scene: &Scene, size: Size<i32, Physical>) -> Option<Vec<u8>> {
+    let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    // The bare realm view only — NOT `window_pixels`. Byte-for-byte what the
+    // headless backend retains and reads back for the same scene.
+    Some(scene.compose(w, h))
+}
+
 /// The nested backend's **presentation half**: the winit window + GLES
 /// renderer pair, the realm's [`Scene`], the consent surface, and the
 /// currently uploaded view texture.
@@ -275,12 +318,15 @@ pub(crate) struct NestedState {
 /// state; it is handed straight back so the run's footer is still written by
 /// the code that opened the log.
 ///
-/// **Nested mode cannot serve captures.** This backend is EGL/GLES-bound and
-/// retains no readable image, so [`session::Presenter::view_rgba`] is `None`
-/// here and `vitrin_view.frame_ready` is refused rather than answered with
-/// invented pixels. Everything else — petitions, consent, actuation — works
-/// identically to headless. Stated here because it is a property of the
-/// backend, not a bug in the wiring.
+/// **Nested mode serves captures too (P1.3.8, issue #116).** This backend is
+/// EGL/GLES-bound and retains no readable image of the *presented* window, but
+/// it does not need one: [`session::Presenter::view_rgba`] composes the bare
+/// realm view on the CPU from the retained scene — byte-for-byte what headless
+/// reads back, and structurally overlay-free (see that method). So
+/// `vitrin_view.frame_ready` is answered here, and — because the same
+/// `no_surface` judgement gates actuation — an agent can observe *and* actuate
+/// under `--nested`, not only under `--headless`. Everything else — petitions,
+/// consent, the physical dead-man switch — was already identical to headless.
 pub fn run(dead_man: DeadManConfig, seed: RuntimeSeed) -> (Recorder, Result<(), Box<dyn Error>>) {
     // The seed is consumed the moment the state is built; until then it is
     // still ours, and either way the recorder must come back so `run_session`
@@ -967,24 +1013,71 @@ impl session::Presenter for NestedView {
         Ok(session::Presentation::Scheduled)
     }
 
-    /// Always `None`: the nested backend has no readback path.
+    /// The bare realm view, composed on the CPU from the retained scene —
+    /// the **same bytes headless retains for capture** (P1.3.8, issue #116).
     ///
-    /// It renders through EGL/GLES straight into the host's window and
-    /// retains no readable image — there is no `ExportMem` bind, no
-    /// `copy_framebuffer`, nothing to map. So `vitrin_view.frame_ready` is
-    /// refused under `--nested` by the chokepoint's existing `no_surface`
-    /// judgement.
+    /// This backend renders through EGL/GLES straight into the host's window
+    /// and keeps no readable image of the *presented* frame — there is no
+    /// `ExportMem` bind, no `copy_framebuffer` of the window. It does not need
+    /// one. The capture the chokepoint serves is the **realm view**, and that
+    /// is exactly what [`Scene::compose`] produces: tightly packed RGBA8888,
+    /// rows top-down, every pixel opaque — the one composition implementation
+    /// both backends present (P1.3.3). Headless retains that composition in a
+    /// pixman image and reads it back; its own tests pin the readback as a
+    /// **byte-for-byte identity** of `Scene::compose`
+    /// (`committed_shm_buffer_reaches_retained_framebuffer_and_capture`,
+    /// `retained_framebuffer_is_the_capture_source`). So composing the scene
+    /// here yields the identical bytes headless would for the same scene,
+    /// which is the P1.3.8 requirement — nested and headless captures cannot
+    /// drift.
     ///
-    /// That refusal is the right answer rather than a stopgap. The
-    /// alternatives are worse in the specific way this codebase refuses:
-    /// returning a zeroed buffer would hand an agent pixels it would read as
-    /// the realm's actual content, and reading back the *human-visible*
-    /// image would put the consent overlay into every capture — the one
-    /// thing `docs/protocol/05-vitrin_consent.md` forbids outright.
-    /// Nested mode is the mode a human watches; headless is the mode CI and
-    /// agents capture from.
+    /// **Why compose rather than read back the GL framebuffer.** Two reasons,
+    /// both decisive:
+    ///
+    /// - *The overlay must never reach a capture.* The GL framebuffer holds
+    ///   the *human-visible* output — the realm view **plus** the consent
+    ///   prompt (P1.7.1) and the dead-man hold indicator (P1.7.3), applied in
+    ///   [`window_pixels`]. Reading it back would put the one thing
+    ///   `docs/protocol/05-vitrin_consent.md` forbids outright into every
+    ///   `vitrin_view.frame_ready`. Composing the bare scene instead is
+    ///   overlay-free *structurally*: [`Scene::compose`] is upstream of the
+    ///   output-stage fork ([`super::human_visible_from_view`]) where the
+    ///   overlay joins, so no card and no indicator pixel can be present here
+    ///   — the same by-construction argument the headless capture rests on.
+    /// - *Cost.* A per-frame GL readback would add a full FBO map to the
+    ///   nested compositing path, already a known perf hot-spot. A CPU
+    ///   `Scene::compose` is cheap and, reached only through
+    ///   [`session::post_dispatch`] on a **dirty** dispatch round (never the
+    ///   agent-request path, never per host frame), it composes once per
+    ///   latched batch of commits — not once per presented frame.
+    ///
+    /// **When this refreshes: per dirty round, not per agent request.**
+    /// [`session::post_dispatch`] repopulates `view_cache` from this method on
+    /// every dirty round *whether or not an agent is observing* — the same
+    /// unconditional refresh headless takes, and deliberately so. The refresh
+    /// stays on the compositing path and off the agent-request path because a
+    /// request-path refresh would make an agent's capture trigger a composite
+    /// and make goldens depend on request timing (`session::post_dispatch`
+    /// documents exactly this). The cost of that choice on the nested hot-path
+    /// is one extra CPU `Scene::compose` per *latched batch of commits* — a
+    /// static or idle scene is not dirty and pays nothing, and it is a compose,
+    /// never the forbidden per-frame GL readback. Gating this on a live observe
+    /// grant so a nested session with no agent pays nothing was considered and
+    /// rejected: it would couple the compositing path to grant state and make
+    /// the capture cache's freshness — and the goldens that pin it — depend on
+    /// whether a grant happened to exist, the very timing dependence the
+    /// request-path refresh is kept off the table to avoid.
+    ///
+    /// `None` for a degenerate (zero-sized, e.g. minimized) window: there is
+    /// no realm view to compose, so the capture meets the chokepoint's
+    /// `no_surface` refusal — the honest answer, exactly as before this
+    /// backend could serve captures at all.
     fn view_rgba(&mut self) -> Option<Vec<u8>> {
-        None
+        // The window size is the size the realm view composes at (P1.3.3), the
+        // same one `view_size` and `try_redraw` read. `capture_pixels` composes
+        // the bare scene — never `window_pixels` — so the overlay and the hold
+        // indicator cannot reach a capture.
+        capture_pixels(&self.scene, self.backend.window_size())
     }
 
     fn request_present(&mut self) {
@@ -994,12 +1087,17 @@ impl session::Presenter for NestedView {
     /// The scene, and `None` for the retained half.
     ///
     /// Nested composites straight into the host compositor's surface and
-    /// keeps no readable image of its own, so there is nothing to scrub — a
-    /// dead realm leaves no stale pixels here for the same reason
-    /// [`Self::view_rgba`] can serve none. Worth stating rather than
-    /// leaving as an absence: it means nested has no stale-frame defense in
-    /// depth, which costs nothing only because nested refuses captures
-    /// outright.
+    /// keeps no *retained* image of its own to scrub — [`Self::view_rgba`]
+    /// composes the capture fresh from the scene on demand rather than reading
+    /// a held framebuffer. That is exactly why there is nothing to scrub here
+    /// and no stale-frame hazard to defend against: the death funnel takes the
+    /// dead realm's surface out of the scene ([`Scene::clear_surface`]), so the
+    /// very next `view_rgba` composes the empty-scene background — the dead
+    /// realm's pixels are gone by construction, with `view_is_live` gating the
+    /// capture shut on top of that. Headless needs the retained-image scrub
+    /// because it reads back a *held* framebuffer that would otherwise keep the
+    /// last painted frame; nested, composing on demand from the live scene, has
+    /// no such held image and so needs no scrub.
     fn teardown_view(
         &mut self,
     ) -> (
@@ -1097,6 +1195,77 @@ mod tests {
                 "card row {row} must appear verbatim in the uploaded pixels"
             );
         }
+    }
+
+    /// The nested backend's **capture** path serves the bare realm view — the
+    /// same bytes headless retains — and never the presented window (P1.3.8,
+    /// issue #116).
+    ///
+    /// GL presentation needs a display, but the decision [`NestedView::view_rgba`]
+    /// encodes is *which pixels to serve*, and that is [`capture_pixels`], a pure
+    /// function of the scene. This pins it: a regression that served the
+    /// human-visible composition instead — leaking the consent overlay (P1.7.1)
+    /// or the dead-man hold indicator (P1.7.3) into every capture — fails here,
+    /// exactly as [`the_nested_window_uploads_the_consent_overlay`] guards the
+    /// other, human-visible half of the same fork.
+    #[test]
+    fn the_nested_capture_is_the_bare_realm_view_never_the_overlay() {
+        const W: i32 = 800;
+        const H: i32 = 600;
+        let size = size_of(W, H);
+
+        let mut scene = Scene::new();
+        scene
+            .commit(SurfaceContent::from_rgba(client_pixels(300, 200), 300, 200).expect("content"));
+
+        // The capture is exactly `Scene::compose`: the one composition both
+        // backends present, no renderer of its own. The headless backend's
+        // own tests pin its retained readback as byte-for-byte
+        // `Scene::compose`, so this equality is transitively "nested capture
+        // == headless capture for the same scene" — the cross-backend proof
+        // is made concrete against the real pixman readback in
+        // `backend::headless`'s `nested_and_headless_captures_are_byte_identical`.
+        let capture = capture_pixels(&scene, size).expect("a nonzero view has pixels");
+        assert_eq!(
+            capture,
+            scene.compose(W as u32, H as u32),
+            "the nested capture must be the bare Scene::compose realm view"
+        );
+
+        // A prompt up changes the human-visible window but not the capture: the
+        // overlay is excluded by construction (it joins only downstream of
+        // `Scene::compose`, in `human_visible_from_view`).
+        let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
+        consent.show_for_test(prompt_fixture());
+        let human_visible =
+            super::super::compose_human_visible(&scene, &mut consent, W as u32, H as u32);
+        assert_ne!(
+            capture, human_visible,
+            "the human-visible window carries the prompt; the capture must not"
+        );
+        // Pixel-level: no run of the consent card's bytes survives anywhere in
+        // the capture — catches a partial leak a whole-buffer compare could not.
+        let card = crate::consent::render::rasterize(&prompt_fixture());
+        let card_row = &card.rgba[..card.width as usize * crate::scene::BYTES_PER_PIXEL];
+        assert!(
+            !capture.windows(card_row.len()).any(|w| w == card_row),
+            "a row of consent-prompt pixels reached a nested capture"
+        );
+
+        // The dead-man hold indicator is likewise absent: the presented window
+        // mid-hold differs from the capture, which carries neither the trusted
+        // band nor the indicator — it is the bare view, unchanged.
+        let mut idle = ConsentSurface::new(TrustedIndicator::for_test());
+        let with_hold = window_pixels(&scene, &mut idle, Some(0.5), size);
+        assert_ne!(
+            capture, with_hold,
+            "the dead-man hold indicator must never reach the capture"
+        );
+
+        // A degenerate (minimized) window has no realm view to serve, so the
+        // capture meets the chokepoint's `no_surface` refusal.
+        assert!(capture_pixels(&scene, size_of(0, 0)).is_none());
+        assert!(capture_pixels(&scene, size_of(W, 0)).is_none());
     }
 
     /// The texture cache must re-upload on every transition a human would see.

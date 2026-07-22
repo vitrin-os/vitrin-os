@@ -28,12 +28,16 @@
 //!
 //! - [`Presenter`] is everything the runtime needs from a backend: the scene
 //!   to commit into, the size it composes at, a recomposite, and a readback
-//!   of the latest completed realm view. The nested backend implements it
-//!   with [`Presenter::view_rgba`] returning `None` — it is EGL/GLES-bound
-//!   and retains no readable image — so `--nested` cannot serve
-//!   `vitrin_view.frame_ready` and those captures are refused rather than
-//!   answered with invented pixels. A real, stated limitation of nested
-//!   mode, not an oversight.
+//!   of the latest completed realm view. Both backends serve captures: the
+//!   headless backend reads back its retained pixman framebuffer, and the
+//!   nested backend — though EGL/GLES-bound with no retained image of the
+//!   presented window — composes the bare realm view on the CPU from its
+//!   scene ([`Presenter::view_rgba`] → [`Scene::compose`], P1.3.8/issue #116).
+//!   The two produce byte-identical bytes for the same scene, so `--nested`
+//!   answers `vitrin_view.frame_ready` (and, since the same `no_surface`
+//!   judgement gates actuation, an agent can observe *and* actuate nested)
+//!   exactly as `--headless` does, the overlay excluded from both by
+//!   `Scene::compose` sitting upstream of the output-stage fork.
 //! - [`RuntimeHost`] is the backend's state type, split into its runtime half
 //!   and its presentation half. The split is the whole point: building a
 //!   [`ServerCtx`] borrows the petition registry, the grant table and the
@@ -324,13 +328,17 @@ pub(crate) trait Presenter {
     /// throttled client becomes an unthrottled one.
     fn redraw(&mut self) -> Result<Presentation, Box<dyn Error>>;
     /// The latest completed realm view as tightly packed RGBA8888, or `None`
-    /// on a backend that has no readback path.
+    /// when there is no realm view to serve.
     ///
-    /// `None` is not a failure and must not be treated as one: it is the
-    /// honest answer for the nested backend. A capture then meets the
-    /// chokepoint's existing `no_surface` refusal, which is the correct
-    /// outcome — better than a black frame an agent would read as the realm's
-    /// actual content.
+    /// Both backends produce a view: headless reads back its retained pixman
+    /// framebuffer; nested composes the bare scene on the CPU
+    /// ([`Scene::compose`], P1.3.8) — byte-identical for the same scene, and
+    /// overlay-free on both because `Scene::compose` is upstream of the
+    /// output-stage fork. `None` is not a failure and must not be treated as
+    /// one: it is the honest answer for a degenerate view (a minimized nested
+    /// window, a readback failure). A capture then meets the chokepoint's
+    /// existing `no_surface` refusal, which is the correct outcome — better
+    /// than a black frame an agent would read as the realm's actual content.
     fn view_rgba(&mut self) -> Option<Vec<u8>>;
     /// The scene and the retained framebuffer, borrowed **together**.
     ///
@@ -344,10 +352,14 @@ pub(crate) trait Presenter {
     ///
     /// `None` for the retained half is the nested backend's honest answer:
     /// it composites into the host compositor's surface and retains no
-    /// readable image, so there are no stale pixels to scrub. That also
-    /// means nested loses the stale-frame defense in depth entirely —
-    /// stated here rather than discovered, though it costs nothing today
-    /// because nested cannot serve captures either ([`Self::view_rgba`]).
+    /// readable image to scrub. That costs nothing even though nested now
+    /// *does* serve captures ([`Self::view_rgba`], P1.3.8): its capture is
+    /// composed on demand from the live scene, and the death funnel clears the
+    /// realm's surface out of that scene before the next compose — so the dead
+    /// realm's pixels are gone by construction, with `view_is_live` gating the
+    /// capture shut on top of that. The retained-image scrub is a headless
+    /// need: only a *held* framebuffer can keep a dead realm's last painted
+    /// frame.
     fn teardown_view(&mut self) -> (&mut Scene, Option<&mut dyn RetainedOutput>);
     /// Ask the backend to schedule a presentation, for backends whose frame
     /// clock is external (nested: the host compositor's redraw request). The

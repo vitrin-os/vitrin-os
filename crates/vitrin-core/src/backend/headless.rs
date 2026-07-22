@@ -943,6 +943,117 @@ mod tests {
         assert_eq!(served, expected, "capture must serve the composed view");
     }
 
+    /// The P1.3.8 acceptance, cross-backend: the nested backend serves the
+    /// **same bare-scene bytes** the headless backend does for an identical
+    /// scene (issue #116).
+    ///
+    /// Both are [`Scene::compose`]. Headless retains it in a pixman image and
+    /// reads it back; the nested backend composes it on the CPU on demand
+    /// ([`crate::backend::winit::capture_pixels`]). This drives *both* real
+    /// capture paths against one shared scene and asserts they are
+    /// byte-identical — no winit window, no GL, no display, because pixman is
+    /// CPU and `capture_pixels` needs no renderer at all. It is the concrete
+    /// form of the transitive equality winit's
+    /// `the_nested_capture_is_the_bare_realm_view_never_the_overlay` states,
+    /// and it goes all the way through [`crate::capture::render_frame`] so the
+    /// *delivered* wire bytes are pinned equal too, not merely the readback.
+    #[test]
+    fn nested_and_headless_captures_are_byte_identical() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::fs::FileExt;
+
+        use crate::backend::winit::capture_pixels;
+        use crate::capture::{render_frame, RealmViewFrame};
+        use crate::consent::tests::prompt_fixture;
+        use crate::consent::{ConsentSurface, TrustedIndicator};
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+
+        let _fd = crate::capture::tests::fd_lock();
+        const VW: u32 = 320;
+        const VH: u32 = 200;
+        const SW: u32 = 160;
+        const SH: u32 = 120;
+
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessView> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state =
+            HeadlessView::new(size, event_loop.get_signal(), TrustedIndicator::for_test())
+                .expect("headless state under pixman");
+        state
+            .scene
+            .commit(SurfaceContent::from_rgba(client_pixels(SW, SH), SW, SH).expect("content"));
+        state.redraw().expect("composite the committed surface");
+
+        // Headless capture: the retained pixman framebuffer, read back.
+        let headless_capture = state.latest_frame_rgba().expect("headless readback");
+        // Nested capture: the bare scene composed on the CPU, from the SAME
+        // scene object that fed the headless readback above.
+        let nested_capture = capture_pixels(&state.scene, size).expect("a nonzero view");
+
+        // The P1.3.8 requirement: same scene, same pixels, byte for byte.
+        assert_eq!(
+            nested_capture, headless_capture,
+            "nested and headless captures must be byte-identical for the same scene"
+        );
+        // ...and both are exactly the one shared composition.
+        assert_eq!(nested_capture, state.scene.compose(VW, VH));
+
+        // Overlay excluded on the nested side too: a prompt on the
+        // human-visible composition changes it, but the nested capture is
+        // unmoved — `capture_pixels` takes no `ConsentSurface`, so it *cannot*
+        // carry a card.
+        let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
+        consent.show_for_test(prompt_fixture());
+        let human_visible = super::super::compose_human_visible(&state.scene, &mut consent, VW, VH);
+        assert_ne!(
+            nested_capture, human_visible,
+            "the nested capture must exclude the consent overlay"
+        );
+
+        // The delivered artifact matches too: rendering each capture through
+        // the real capture mechanics yields identical wire frames (format,
+        // shape, and every byte).
+        let render = |rgba: &[u8]| {
+            render_frame(&RealmViewFrame {
+                rgba,
+                width: VW,
+                height: VH,
+            })
+            .expect("render capture")
+            .0
+        };
+        let headless_frame = render(&headless_capture);
+        let nested_frame = render(&nested_capture);
+        assert_eq!(
+            (
+                nested_frame.format,
+                nested_frame.width,
+                nested_frame.height,
+                nested_frame.stride
+            ),
+            (
+                headless_frame.format,
+                headless_frame.width,
+                headless_frame.height,
+                headless_frame.stride
+            ),
+            "the served frame_ready contract must match across backends"
+        );
+        let read = |fd: OwnedFd, len: usize| {
+            let file = std::fs::File::from(fd);
+            let mut buf = vec![0u8; len];
+            file.read_exact_at(&mut buf, 0).expect("read served frame");
+            buf
+        };
+        let len = (nested_frame.stride * nested_frame.height) as usize;
+        assert_eq!(
+            read(nested_frame.fd, len),
+            read(headless_frame.fd, len),
+            "the served capture bytes must be identical across backends"
+        );
+    }
+
     /// The P1.7.1 acceptance criteria, both halves, on real backend pixels.
     ///
     /// The overlay must appear in the human-visible output **and** must be

@@ -80,6 +80,15 @@ static void parse_args(int argc, char **argv, struct vitrin_config *cfg) {
 			cfg->width = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
 			cfg->height = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--") == 0) {
+			/* Everything after `--` is the app command the core wants
+			 * this shim to exec (the core→shim argv contract of
+			 * P1.5.4 / #103: `<shim> [shim-args] -- <app> <app-args>`).
+			 * Actually fork/exec'ing that app is the wlroots app-spawn
+			 * step (#104); until it lands, tolerate and ignore the tail
+			 * so the argv the core now sends does not trip the usage
+			 * branch below and abort the shim at startup. */
+			break;
 		} else {
 			fprintf(stderr,
 				"usage: %s [--socket NAME] [--dmabuf] [--no-upstream] "

@@ -80,6 +80,7 @@ class Core:
         consent: str = "auto-approve",
         size: str = "320x200",
         animate: int = ANIMATE_FRAMES,
+        seat: bool = False,
         runtime_dir: str | os.PathLike[str] | None = None,
         wait: bool = True,
         write_config: bool = True,
@@ -105,11 +106,16 @@ class Core:
             # 0600 or the core refuses to read it at all: the registry holds
             # bearer tokens, and the R6 audit fails closed on any wider mode.
             self.principals.chmod(0o600)
+            # `--seat` (opt-in) mints the shim's input-delivery object so
+            # routed seat events actually land rather than dropping
+            # undelivered — what the #43 demo needs to exercise the seat path.
+            # Default off, so every existing caller's argv is unchanged.
+            seat_arg = ', "--seat"' if seat else ""
             self.realm.write_text(
                 "[[realm]]\n"
                 'id = "realm-0"\n'
                 f'command = "{MOCK_SHIM}"\n'
-                f'args = ["--serve", "--animate", "{animate}"]\n'
+                f'args = ["--serve"{seat_arg}, "--animate", "{animate}"]\n'
             )
 
         argv = [

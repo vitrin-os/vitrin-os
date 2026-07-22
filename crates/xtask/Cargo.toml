@@ -14,3 +14,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 vitrin-scanner = { path = "../vitrin-scanner" }
+# The `demo` subcommand tears the core down with SIGTERM — the clean-shutdown
+# signal the core's ladder runs, which writes the recorder's `run_ended`
+# footer; `Child::kill` would SIGKILL and skip it. rustix's `process` feature
+# is already the workspace's kill(2) path (vitrin-core, vitrin-ipc), so no new
+# crate enters the tree.
+rustix = { version = "1", features = ["process"] }

@@ -59,10 +59,12 @@ from harness import (
     IntegrationTest,
     capture_when_ready,
     children_of,
+    colour_bytes,
     comm_of,
     descendant_named,
     environ_of,
     fd_targets_of,
+    has_real_content as _has_real_content,
     require_binaries,
     whole_realm_grant,
 )
@@ -109,47 +111,12 @@ HOST_LEAK_NAMES = (
 )
 
 
-def colour_bytes(frame) -> bytes:
-    """The colour channels of an xrgb8888 frame, padding byte stripped.
-
-    The capture format is little-endian xrgb8888, so each 4-byte pixel is
-    ``B, G, R, X`` with the ``X`` padding byte last (index ``i % 4 == 3``).
-    That distinction is load-bearing for the content assertion: the C shim
-    composites an **opaque** background surface -- its padding plane is a
-    constant ``0xFF`` -- even when no Wayland client has committed a buffer,
-    so a check over *all* bytes sees the value set ``{0x00, 0xFF}`` and reads
-    as "content" against a frame that carries none. Restricting to the colour
-    channels is what lets assertion 2 reject both the shim's empty background
-    and weston-terminal's content-free initial fill.
-
-    Stride-generic per the IDL (row ``r`` begins at ``r * stride``, carrying
-    ``width * 4`` payload bytes); the slice-per-channel form is C-speed and
-    handles ``stride > width * 4`` padding rows correctly.
-    """
-    raw = frame.raw
-    row_len = frame.width * 4
-    if frame.stride == row_len:
-        packed = raw  # v1 pins stride == width*4; the common, tight path
-    else:
-        packed = b"".join(
-            raw[r * frame.stride : r * frame.stride + row_len]
-            for r in range(frame.height)
-        )
-    # packed is now tightly packed 4-byte pixels: B=[0::4] G=[1::4] R=[2::4]
-    # X=[3::4]. Concatenating the three colour planes drops the padding.
-    return packed[0::4] + packed[1::4] + packed[2::4]
-
-
-def _has_real_content(frame) -> bool:
-    """True once a frame carries real chrome, not a uniform/empty fill.
-
-    A frame is content-bearing iff its colour channels are both non-zero and
-    non-uniform. weston-terminal's chrome yields hundreds of distinct colour
-    values; the shim's opaque-black background yields a single value (0), and
-    weston's pre-chrome fill is likewise uniform.
-    """
-    colour = colour_bytes(frame)
-    return bool(any(colour)) and len(set(colour)) > 1
+# `colour_bytes` and `_has_real_content` (imported above as `has_real_content`)
+# moved to harness.py when the real-app ladder grew past one rung (issue #106):
+# the GTK and Firefox gates share the exact same "not the shim's empty fill"
+# analysis, and one definition cannot drift from another. The behaviour is
+# unchanged -- this gate still rejects both the shim's opaque background and a
+# toolkit's content-free initial fill on the frame's colour channels alone.
 
 
 class RealApp(IntegrationTest):

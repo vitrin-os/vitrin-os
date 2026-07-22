@@ -313,3 +313,88 @@ which is exactly that procedure, run.
 nothing, so an app that waits on one can hang. It is a diagnostic mode, it is
 off by default, it announces itself at `ERROR` level on startup, and every
 report it produces carries `probe_mode=1`. Never run a realm with it.
+
+---
+
+## 7. The real-core gate (P1.6.6) — the milestone proof
+
+`firefox_bringup.sh` (section 6) runs the real shim and the real Firefox, but
+under the **mock core** (`shim/tests/mock_core.c`). That makes it a
+shim-in-isolation smoke test — valuable, and kept — but **not** the M1.2 "Shim
+runs Firefox" milestone proof, because one half of the system (the trusted
+Rust core) is a stand-in.
+
+The milestone proof is
+[`tests/integration/test_real_firefox.py`](../../tests/integration/test_real_firefox.py):
+the shipped `vitrind` execs the built `vitrin-shim`, which fork/execs this same
+pinned Firefox, which renders a local `file://` page
+([`../tests/firefox/pages/solid.html`](../tests/firefox/pages/solid.html),
+a solid `#0000ff`), and the **real Python SDK** captures a real Firefox frame
+through the real enforcement/capture path and asserts its dominant colour is
+the served colour — no mock on any seam. It also captures the globals ledger
+from that real-core run and asserts Firefox demanded nothing outside
+[`firefox-refused-globals.txt`](firefox-refused-globals.txt), the same
+allowlist check (D) makes.
+
+```bash
+# Real chain: real vitrind → real vitrin-shim → Firefox, headless, no network.
+cargo build --workspace
+meson compile -C shim/build
+bash shim/tests/firefox/fetch-esr.sh
+VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" \
+VITRIN_REPO="$PWD" \
+PYTHONPATH="$PWD/sdk/python/src" \
+  python3 -m unittest discover -s tests/integration -p 'test_real_firefox.py' -v
+```
+
+It obeys the same skip-or-fail discipline as `firefox_bringup.sh`:
+`VITRIN_SKIP_FIREFOX_GATE=1` opts out; with `VITRIN_C_SHIM_BIN` set it
+**fails** (never skips) on a missing shim or a missing browser. In CI it is its
+own step in the `integration` job (it fetches the pinned ESR first), separate
+from the ordinary suite, which sets `VITRIN_SKIP_FIREFOX_GATE=1` because it does
+not fetch the browser.
+
+**How the shim gets `--globals-log`/`--probe-globals` under the real core.**
+The production core conveys only the app command in the shim's argv (`<shim> --
+<app> <app-args>`; it does *not* pass shim flags), so the real-core gate asks
+for the ledger and the probe catalogue through the **environment** instead:
+`VITRIN_SHIM_GLOBALS_LOG=<path>` and `VITRIN_SHIM_PROBE_GLOBALS=1`, forwarded to
+the shim the one legal way a realm's environment grows — the realm's
+`env_allow` (`shim/src/main.c` reads them only as a fallback when the matching
+flag is absent, exactly as it already falls back to `$WAYLAND_DISPLAY` for its
+socket). Both are diagnostic, both default off, and neither changes what the
+shim advertises to a normal app, so the isolation-invisible wire contract
+(PRD Doc 2 §4.5) is untouched.
+
+The agent-driven counterpart — *injecting* pointer scroll and typing into
+Firefox's URL bar through the SDK, under the real core — is issue #108
+(`track:sdk`), not this render gate.
+
+## 8. Watching it nested (dev / manual QA matrix)
+
+The CI gates above are headless and GPU-free by construction (R1): they prove
+the pixels are correct, but nobody *sees* the window. To actually watch an
+agent operate Firefox in a nested realm on a workstation with a GPU, run the
+real core in nested mode (`vitrind --nested`, the core as a Wayland client of
+your host compositor, rendering into one host window — PRD Doc 2 §4). This is a
+**manual** procedure, not a CI test.
+
+Both venues need the pinned Firefox fetched (`bash
+shim/tests/firefox/fetch-esr.sh`), the workspace built (`cargo build
+--workspace`), and the shim built (`meson compile -C shim/build`). Point the
+core at the shim with `--shim "$PWD/shim/build/vitrin-shim"` and a `--realm`
+file whose `command` is the Firefox binary with the section 2 environment (a
+fresh `--profile`, `MOZ_ENABLE_WAYLAND=1`, software WebRender, `file://` pages
+only) forwarded via `env_allow` — the same realm the render gate builds, just
+against `--nested` instead of `--headless`.
+
+| Host | How to get a nesting host, and watch |
+|---|---|
+| **GNOME** | A nested GNOME gives the core a host Wayland socket to be a client of, without disturbing your session: `dbus-run-session -- gnome-shell --devkit` (or `--nested` on older GNOME) opens GNOME in a window; run `vitrind --nested …` inside it and Firefox's realm appears as a window within that window. |
+| **Hyprland** | From a spare TTY (Ctrl+Alt+F3), `Hyprland` starts a bare session on that VT; launch `vitrind --nested …` from a terminal inside it. Hyprland is the second host the M1.1/M1.2 nested matrix (docs/plan §5, R1) is validated on, so a regression that only shows under one compositor is caught. |
+
+Keep the nested rendering trivial and expect the winit backend's known rough
+edges (input-model gaps, HiDPI oddities — R1); headless is the fallback venue
+and CI never depends on nested. What you are checking by eye here is the thing
+the headless gates cannot show: that a human and an agent can watch the *same*
+live Firefox in a confined nested surface at once.

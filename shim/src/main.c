@@ -249,6 +249,38 @@ static void parse_args(int argc, char **argv, struct vitrin_config *cfg) {
 	if (cfg->socket_name == NULL || cfg->socket_name[0] == '\0') {
 		cfg->socket_name = "vitrin-shim-0";
 	}
+
+	/* Environment fallbacks for the two DIAGNOSTIC knobs, so a bring-up run
+	 * under the REAL core can request the globals ledger and probe catalogue.
+	 *
+	 * The production spawn path (P1.5.4 / #103) has the core convey ONLY the
+	 * app command after `--`; it controls the shim's ENVIRONMENT, not its
+	 * leading argv (crates/vitrin-core/src/spawn.rs). A realm's environment
+	 * grows by exactly one route -- the realm's `env_allow` list, which
+	 * copies named values from the core's own environment into the shim's --
+	 * so these names are how the real-core Firefox render gate
+	 * (tests/integration/test_real_firefox.py) asks this shim for the same
+	 * globals-touched evidence firefox_bringup.sh gathers under the mock core.
+	 * Both mirror the $WAYLAND_DISPLAY fallback just above: an explicit flag
+	 * always wins, the env only fills a field the argv left unset. Neither
+	 * changes what the shim advertises to a normal app (both default off), so
+	 * the isolation-invisible wire contract (PRD Doc 2 §4.5) is untouched. */
+	if (cfg->globals_log == NULL) {
+		const char *env = getenv("VITRIN_SHIM_GLOBALS_LOG");
+		if (env != NULL && env[0] != '\0') {
+			cfg->globals_log = env;
+		}
+	}
+	if (!cfg->probe_globals) {
+		const char *env = getenv("VITRIN_SHIM_PROBE_GLOBALS");
+		if (env != NULL && env[0] != '\0') {
+			/* Any non-empty value arms the whole catalogue -- the bare
+			 * `--probe-globals` form. A filtered probe stays argv-only:
+			 * bisecting the catalogue is an interactive developer act, not
+			 * something a spawned realm needs to express. */
+			cfg->probe_globals = true;
+		}
+	}
 	if (cfg->width <= 0 || cfg->height <= 0) {
 		fprintf(stderr, "width/height must be positive\n");
 		exit(2);

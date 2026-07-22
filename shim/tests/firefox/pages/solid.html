@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<!--
+  Real-core Firefox render proof (P1.6.6, issue #106).
+
+  A SINGLE solid colour, and nothing else. repaint.html paints blue then green
+  to prove REPAINT for the mock core, which reads a dominant colour off EVERY
+  committed frame and can therefore assert an ordered sequence. The real-core
+  gate (tests/integration/test_real_firefox.py) captures through the Python SDK
+  with poll-per-frame semantics (D6) and cannot deterministically catch a
+  specific frame in an ordered pair -- so its render proof is the simpler,
+  race-free claim the milestone actually needs: Firefox rendered a local
+  file:// page whose KNOWN solid colour is dominant in the frame the agent
+  captured through the real capture path, distinct from both the shim's opaque
+  background (black) and Firefox's grey chrome.
+
+  #0000ff: the blue channel is 0xff, red and green are 0x00 -- every channel a
+  multiple of 0x11, so it survives a 4-bit-per-channel dominant-colour
+  histogram exactly (the same quantisation mock_core.c uses), which is what
+  lets the assertion compare against the literal CSS colour with no tolerance.
+  It is neither black (the shim's background) nor a grey (Firefox's chrome),
+  so a dominant #0000ff can only be the page.
+
+  No network, no fonts, no images, no external anything: opened as file://,
+  everything it needs is in it.
+-->
+<meta charset="utf-8">
+<title>vitrin solid-colour render probe</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body { background: #0000ff; }
+</style>
+<body></body>

@@ -105,6 +105,7 @@ class Core:
         args: list[str] | None = None,
         env_allow: tuple[str, ...] = (),
         extra_env: dict[str, str] | None = None,
+        log_file: str | os.PathLike[str] | None = None,
     ) -> None:
         self.runtime = pathlib.Path(runtime_dir or tempfile.mkdtemp(prefix="vitrin-it-"))
         self._owns_runtime = runtime_dir is None
@@ -114,6 +115,15 @@ class Core:
         self.proc: subprocess.Popen[str] | None = None
         self._output = ""
         self._entries: list[dict] | None = None
+        # A verbose realm (a probing shim under Firefox emits thousands of
+        # DEBUG lines; the browser is chatty on its own) can write more to the
+        # core's inherited stdout/stderr than a pipe holds -- and this harness
+        # reads that pipe only *after* the process exits, so a run that fills
+        # ~64 KiB before then would wedge the writer forever. `log_file`
+        # redirects the child's combined output to a file instead of a pipe,
+        # which cannot back-pressure; `output()` reads it back the same way.
+        # Default (None) keeps the pipe every existing caller relies on.
+        self._logf = open(log_file, "w+") if log_file is not None else None
 
         # The shim binary the core execs to hold fd 3 (issue #103). Default
         # is `vitrin-mock-shim`, which every existing test uses and which is
@@ -191,7 +201,7 @@ class Core:
         self.proc = subprocess.Popen(
             argv,
             env=env,
-            stdout=subprocess.PIPE,
+            stdout=self._logf if self._logf is not None else subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
@@ -252,9 +262,18 @@ class Core:
         return self.proc.returncode
 
     def output(self) -> str:
-        """Everything the core wrote, cached so it can be read more than once."""
-        if not self._output and self.proc is not None and self.proc.stdout is not None:
-            if self.proc.poll() is not None:
+        """Everything the core wrote, cached so it can be read more than once.
+
+        Reads from the redirect file when one was given (`log_file`), else from
+        the stdout pipe. Either way only after the process has exited, so the
+        text is complete and the read cannot race the writer.
+        """
+        if not self._output and self.proc is not None and self.proc.poll() is not None:
+            if self._logf is not None:
+                self._logf.flush()
+                self._logf.seek(0)
+                self._output = self._logf.read() or ""
+            elif self.proc.stdout is not None:
                 self._output = self.proc.stdout.read() or ""
         return self._output
 
@@ -310,6 +329,9 @@ class Core:
         # after the `with` block see the run rather than an empty list.
         self.entries()
         self.output()
+        if self._logf is not None:
+            self._logf.close()
+            self._logf = None
         if self._owns_runtime:
             shutil.rmtree(self.runtime, ignore_errors=True)
 
@@ -495,3 +517,95 @@ def capture_when_ready(grant, timeout=5.0, poll=0.02):
             if time.monotonic() >= deadline:
                 raise
             time.sleep(poll)
+
+
+# -- captured-frame colour analysis (shared by every real-app gate) ---------
+#
+# The M1.2 render proof, in three layers used across the real-app ladder
+# (test_real_app.py weston rung, test_real_gtk.py, test_real_firefox.py):
+# `packed_pixels` turns a stride-generic wire frame into tight BGRX pixels,
+# `has_real_content` is the weston/GTK "not the shim's empty fill" check, and
+# `dominant_colour` is the Firefox "a known solid colour is on screen" check.
+
+
+def _packed_pixels(frame) -> bytes:
+    """`frame.raw` as tightly-packed 4-byte ``B,G,R,X`` pixels.
+
+    Stride-generic per the IDL (row ``r`` begins at ``r * stride`` and carries
+    ``width * 4`` payload bytes); a frame with ``stride > width * 4`` padding
+    rows is repacked, the tight ``stride == width*4`` case (v1's pin) passes
+    through. This is the one place the wire's row addressing is undone, so the
+    two analyses below never re-derive it.
+    """
+    raw = frame.raw
+    row_len = frame.width * 4
+    if frame.stride == row_len:
+        return raw
+    return b"".join(
+        raw[r * frame.stride : r * frame.stride + row_len] for r in range(frame.height)
+    )
+
+
+def colour_bytes(frame) -> bytes:
+    """The colour channels of an xrgb8888 frame, padding byte stripped.
+
+    Each 4-byte pixel is ``B, G, R, X`` (little-endian xrgb8888) with the
+    ``X`` padding byte last. Dropping the padding plane is load-bearing: the C
+    shim composites an **opaque** background whose padding plane is a constant
+    ``0xFF`` even with no client buffer committed, so a check over *all* bytes
+    reads ``{0x00, 0xFF}`` as "content" on an empty frame. The three colour
+    planes concatenated carry only what a client actually painted.
+    """
+    packed = _packed_pixels(frame)
+    return packed[0::4] + packed[1::4] + packed[2::4]
+
+
+def has_real_content(frame) -> bool:
+    """True once a frame carries real, non-uniform content, not an empty fill.
+
+    Content-bearing iff the colour channels are both non-zero (some pixel is
+    not black) and non-uniform (more than one colour value). The shim's opaque
+    background and a toolkit's pre-chrome fill are each a single value and both
+    fail this -- which is what makes "a real app frame reached the agent" a
+    genuine claim rather than a pass on the shim's empty output.
+    """
+    colour = colour_bytes(frame)
+    return bool(any(colour)) and len(set(colour)) > 1
+
+
+#: Keep only a byte's top nibble -- a 4-bit-per-channel quantisation. It
+#: matches mock_core.c's dominant-colour histogram, which is why the Firefox
+#: acceptance pages use channel values that are multiples of 0x11 (they
+#: survive it exactly, ``0xff -> 0xf0`` and back to ``0xff``).
+_TOP_NIBBLE = bytes(i & 0xF0 for i in range(256))
+
+
+def dominant_colour(frame) -> tuple[str, int]:
+    """The most common colour of a captured frame as ``("rrggbb", percent)``.
+
+    A 4-bit-per-channel histogram (mock_core.c's quantisation, so a page whose
+    CSS colour has channels in multiples of 0x11 reads back as that literal
+    colour with no tolerance): each pixel's ``R,G,B`` is reduced to its top
+    nibble, the modal quantised colour wins, and its nibbles are expanded
+    ``n -> n * 0x11`` into a ``rrggbb`` string. ``percent`` is that colour's
+    share of the frame, floored -- the same "dominant over enough of the view
+    to mean it" bar firefox_bringup.sh applies. This is the real-core render
+    proof for Firefox: a local solid-colour page's colour dominating a real
+    captured frame, distinct from the shim's black background and Firefox's
+    grey chrome.
+    """
+    packed = _packed_pixels(frame)
+    # Quantise each colour plane to its top nibble in one C-speed translate;
+    # the padding plane (packed[3::4]) is never read.
+    b = packed[0::4].translate(_TOP_NIBBLE)
+    g = packed[1::4].translate(_TOP_NIBBLE)
+    r = packed[2::4].translate(_TOP_NIBBLE)
+    from collections import Counter
+
+    counts = Counter(zip(r, g, b))
+    (rq, gq, bq), top = counts.most_common(1)[0]
+    total = len(r)
+    # Expand each quantised channel (a multiple of 0x10) by nibble replication
+    # (n -> n*0x11), the inverse the acceptance pages are authored against.
+    hex6 = "".join(f"{(v >> 4) * 0x11:02x}" for v in (rq, gq, bq))
+    return hex6, top * 100 // total

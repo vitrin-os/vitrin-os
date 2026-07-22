@@ -657,14 +657,18 @@ pub(crate) mod tests {
     /// every other pixel is integer math ([`super::canvas`]). So the same
     /// bytes are expected on any machine, in debug and release alike.
     ///
-    /// Regeneration — only when the prompt's design deliberately changes:
+    /// Regeneration — only when the prompt's design deliberately changes —
+    /// goes through the single documented flow (`tests/golden/README.md`):
     ///
     /// ```sh
-    /// VITRIN_REGEN_GOLDEN=1 cargo test -p vitrin-core consent_prompt_golden
+    /// cargo xtask bless --filter consent
     /// ```
     ///
-    /// then read the rewritten ink map in the diff and confirm it is the
-    /// change you meant to make before committing it.
+    /// which drives this test with `VITRIN_REGEN_GOLDEN=1`. Then read the
+    /// rewritten ink map in the diff and confirm it is the change you meant to
+    /// make before committing it. (The header line embedded in the committed
+    /// file still names the raw `VITRIN_REGEN_GOLDEN` command, unchanged, so
+    /// its bytes and this golden's representation do not move.)
     #[test]
     fn consent_prompt_golden() {
         let card = render::rasterize(&prompt_fixture());

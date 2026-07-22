@@ -35,6 +35,19 @@
 //!                                such blind spot: it is correct whether the
 //!                                real paths are untracked, staged, or
 //!                                committed.
+//!
+//! cargo xtask bless [--filter S]  Regenerate the checked-in golden files --
+//!                                the single documented entrypoint for it.
+//!                                Drives the env-var-gated golden tests
+//!                                (`VITRIN_REGEN_GOLDEN=1 cargo test -p
+//!                                vitrin-core`) so every scattered golden --
+//!                                the consent-prompt ink map, the SDK wire
+//!                                bytes, the headless test-pattern image --
+//!                                regenerates through one command that
+//!                                produces a reviewable `git diff`. `--filter
+//!                                S` narrows to golden tests whose name
+//!                                contains `S` (default: every golden). See
+//!                                `tests/golden/README.md`.
 //! ```
 //!
 //! Calls straight into the `vitrin_scanner` library (`parse`, `rust_gen`,
@@ -66,7 +79,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless]"
+    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless]\n       cargo xtask bless [--filter SUBSTR]"
 }
 
 fn run() -> Result<()> {
@@ -103,6 +116,26 @@ fn run() -> Result<()> {
                 }
             }
             demo(headless)
+        }
+        "bless" => {
+            let mut filter: Option<String> = None;
+            let mut rest = args[1..].iter();
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--filter" => {
+                        let value = rest.next().ok_or_else(|| {
+                            anyhow::anyhow!("--filter needs a substring argument\n\n{}", usage())
+                        })?;
+                        filter = Some(value.clone());
+                    }
+                    "-h" | "--help" => {
+                        println!("{}", usage());
+                        return Ok(());
+                    }
+                    other => bail!("unknown flag '{other}' for 'bless'\n\n{}", usage()),
+                }
+            }
+            bless(filter.as_deref())
         }
         "-h" | "--help" => {
             println!("{}", usage());
@@ -382,6 +415,59 @@ fn diff_single_file(
             return Err(err).with_context(|| format!("reading {}", actual_path.display()));
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `cargo xtask bless [--filter SUBSTR]` -- the single golden-regen entrypoint
+// ---------------------------------------------------------------------------
+
+/// Default test-name filter: every golden test in the repo has "golden" in
+/// its name, so this regenerates all of them (the consent-prompt ink map, the
+/// SDK wire bytes, and the headless test-pattern image) in one pass.
+const BLESS_DEFAULT_FILTER: &str = "golden";
+
+/// `cargo xtask bless`: the one documented way to regenerate the checked-in
+/// golden files. Every golden test reads its committed file and, when
+/// `VITRIN_REGEN_GOLDEN` is set, rewrites it first; this drives exactly those
+/// tests with that variable set so the goldens are regenerated uniformly and
+/// the result is a plain `git diff` a reviewer can read. Nothing here knows
+/// the golden formats -- the tests own that -- so a new golden test is covered
+/// automatically as long as its name matches the filter.
+fn bless(filter: Option<&str>) -> Result<()> {
+    let root = workspace_root()?;
+    let name_filter = filter.unwrap_or(BLESS_DEFAULT_FILTER);
+
+    // Reuse the same `cargo` that launched this xtask (honors any toolchain
+    // override); fall back to the bare name if the env var is somehow unset.
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+
+    eprintln!(
+        "xtask bless: regenerating goldens via `VITRIN_REGEN_GOLDEN=1 cargo test -p vitrin-core -- {name_filter}`"
+    );
+    let status = Command::new(&cargo)
+        .current_dir(&root)
+        .args(["test", "-p", "vitrin-core", "--", name_filter])
+        .env("VITRIN_REGEN_GOLDEN", "1")
+        .status()
+        .with_context(|| {
+            format!(
+                "spawning {} to run the golden tests",
+                cargo.to_string_lossy()
+            )
+        })?;
+
+    if !status.success() {
+        bail!(
+            "the golden tests failed under regeneration ({status}); goldens may be partially \
+             rewritten -- inspect `git diff` before committing"
+        );
+    }
+
+    eprintln!(
+        "xtask bless: done. Regenerated every golden whose test name matches '{name_filter}' \
+         -- review `git diff` under tests/golden/ and crates/*/tests/golden/, then commit."
+    );
     Ok(())
 }
 

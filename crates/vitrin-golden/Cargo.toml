@@ -1,0 +1,15 @@
+[package]
+name = "vitrin-golden"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Golden-frame comparison harness (P1.9.2): per-pixel tolerance + SSIM fallback, hand-rolled PNG actual/expected/diff artifacts. No image-processing dependencies (plan risk R7)."
+publish = false
+
+# Deliberately zero dependencies. The comparison, the SSIM score and the PNG
+# encoder are all hand-rolled here: this harness feeds pixel goldens, and the
+# whole point of plan risk R7 is that no image codec (`image`, `png`, ...)
+# enters the tree, not even as a test-only dependency. A stored-block DEFLATE
+# PNG is a few dozen lines (see `png.rs`); SSIM is textbook arithmetic.
+[dependencies]

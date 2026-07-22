@@ -1796,10 +1796,15 @@ dependencies = [
  "smithay",
  "tracing",
  "tracing-subscriber",
+ "vitrin-golden",
  "vitrin-ipc",
  "vitrin-mock-shim",
  "vitrin-protocol",
 ]
+
+[[package]]
+name = "vitrin-golden"
+version = "0.1.0"
 
 [[package]]
 name = "vitrin-ipc"

@@ -225,11 +225,27 @@ pub(crate) mod tests {
     use std::os::unix::fs::FileExt;
     use std::sync::{Mutex, MutexGuard};
 
+    use vitrin_golden::{compare, write_artifacts, Frame, Policy};
     use vitrin_ipc::{Connection, Message};
     use vitrin_protocol::generated::vitrin_view::{events::FrameReady, Format};
 
     use super::*;
     use crate::test_pattern;
+
+    /// Representative dimensions of the checked-in image golden: small enough
+    /// to commit (96*60*4 = ~23 KB) yet large enough to show all four corner
+    /// markers, the color bars and the checkerboard, so a regression is
+    /// legible in `diff.png`.
+    const GOLDEN_W: u32 = 96;
+    const GOLDEN_H: u32 = 60;
+
+    /// Repo-root path of the shared image golden the harness asserts on.
+    /// `CARGO_MANIFEST_DIR` is `crates/vitrin-core`; the golden lives under
+    /// the workspace-wide `tests/golden/` dir (plan §2 layout).
+    const IMAGE_GOLDEN_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/golden/headless_test_pattern_96x60.xrgb"
+    );
 
     /// Serializes the remaining *shared-process* fd tests, so their
     /// socketpairs/memfds cannot race one another on the harness's thread
@@ -472,14 +488,16 @@ pub(crate) mod tests {
     /// SDK alone.
     ///
     /// Regeneration — only when the pattern or the swizzle deliberately
-    /// changes:
+    /// changes — goes through the single documented flow
+    /// (`tests/golden/README.md`):
     ///
     /// ```sh
-    /// VITRIN_REGEN_GOLDEN=1 cargo test -p vitrin-core sdk_capture_golden
+    /// cargo xtask bless --filter sdk_capture_golden
     /// ```
     ///
-    /// then commit the rewritten file together with the change that
-    /// motivated it (the Python capture tests keep consuming it).
+    /// which drives this test with `VITRIN_REGEN_GOLDEN=1`. Then commit the
+    /// rewritten file together with the change that motivated it (the Python
+    /// capture tests keep consuming it).
     #[test]
     fn sdk_capture_golden_file_pins_the_wire_bytes() {
         let _fd = fd_lock();
@@ -502,6 +520,109 @@ pub(crate) mod tests {
              swizzle changed deliberately, regenerate with VITRIN_REGEN_GOLDEN=1 \
              and update the Python capture tests"
         );
+    }
+
+    /// The flagship P1.9.2 consumer: a checked-in headless test-pattern
+    /// **image** golden, compared through the shared `vitrin-golden` harness
+    /// under an [`Exact`](Policy::Exact) policy — the exactness acceptance
+    /// criterion, proven end to end through the same `compare` the harness
+    /// offers every future pixel test. The committed file is the xrgb8888
+    /// wire conversion of the synthetic pattern (the exact bytes a capture
+    /// delivers), stored raw so no image codec is needed to read it back
+    /// (plan risk R7); the harness's own PNG encoder is exercised only when a
+    /// comparison fails, by [`write_artifacts`].
+    ///
+    /// Regeneration goes through the single documented flow — see
+    /// `tests/golden/README.md`:
+    ///
+    /// ```sh
+    /// cargo xtask bless --filter headless_test_pattern_image_golden
+    /// ```
+    ///
+    /// which drives this test with `VITRIN_REGEN_GOLDEN=1`.
+    #[test]
+    fn headless_test_pattern_image_golden() {
+        let actual = rgba_to_xrgb8888(&test_pattern::render(GOLDEN_W, GOLDEN_H));
+        if std::env::var_os("VITRIN_REGEN_GOLDEN").is_some() {
+            std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden"))
+                .expect("golden directory");
+            std::fs::write(IMAGE_GOLDEN_PATH, &actual)
+                .expect("golden regeneration must be writable");
+        }
+        let expected = std::fs::read(IMAGE_GOLDEN_PATH)
+            .expect("committed image golden exists (regenerate: cargo xtask bless)");
+
+        let report = compare(
+            Frame::xrgb(GOLDEN_W, GOLDEN_H, &actual),
+            Frame::xrgb(GOLDEN_W, GOLDEN_H, &expected),
+            Policy::Exact,
+        );
+        assert!(
+            report.passed,
+            "tests/golden/headless_test_pattern_96x60.xrgb no longer matches the synthetic \
+             test pattern ({}); if the pattern changed deliberately, regenerate with \
+             `cargo xtask bless --filter headless_test_pattern_image_golden` and review the diff",
+            report.summary()
+        );
+        assert_eq!(
+            report.max_channel_diff, 0,
+            "an exact golden must be byte-identical"
+        );
+    }
+
+    /// The acceptance criterion made executable: a **one-pixel** change to the
+    /// scene fails the affected golden, and the failure leaves the
+    /// actual/expected/diff artifacts behind for debugging. Guards the harness
+    /// against ever silently passing on a real regression — the exact hazard
+    /// P1.9.2 exists to close.
+    #[test]
+    fn a_one_pixel_change_fails_the_image_golden_and_writes_artifacts() {
+        // Derive the reference straight from the generator, not the committed
+        // file: identical bytes to the golden, but with no dependency on (and
+        // no read race against) the regenerating test above.
+        let golden = rgba_to_xrgb8888(&test_pattern::render(GOLDEN_W, GOLDEN_H));
+
+        // Mutate exactly one channel of exactly one pixel of the captured
+        // frame — the smallest possible scene change.
+        let mut mutated = golden.clone();
+        let target = (GOLDEN_H / 2 * GOLDEN_W + GOLDEN_W / 2) as usize * 4;
+        mutated[target] ^= 0xff;
+
+        let dir =
+            std::env::temp_dir().join(format!("vitrin-golden-onepixel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let actual = Frame::xrgb(GOLDEN_W, GOLDEN_H, &mutated);
+        let expected = Frame::xrgb(GOLDEN_W, GOLDEN_H, &golden);
+        let report = compare(actual, expected, Policy::Exact);
+        assert!(
+            !report.passed,
+            "a one-pixel change must fail the exact golden, but the harness passed it"
+        );
+        assert!(
+            report.comparable,
+            "the frames are the same size — the failure is content, not shape"
+        );
+        assert!(report.max_channel_diff > 0);
+        assert_eq!(
+            report.bad_fraction,
+            1.0 / (GOLDEN_W as f64 * GOLDEN_H as f64),
+            "exactly one pixel differs"
+        );
+
+        let artifacts =
+            write_artifacts(&dir, actual, expected).expect("failure artifacts must be writable");
+        for path in [&artifacts.actual, &artifacts.expected, &artifacts.diff] {
+            let bytes = std::fs::read(path).expect("each artifact was written");
+            assert!(!bytes.is_empty(), "{} is non-empty", path.display());
+            assert_eq!(
+                &bytes[..8],
+                &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+                "{} is a PNG",
+                path.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Every capture yields a *fresh* memfd: two frames held concurrently

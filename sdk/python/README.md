@@ -96,8 +96,10 @@ real sealed memfd through the mock core and asserts `observe()` surfaces
 them through `.raw` and, decoded, through `.to_png()`. Rust CI pins the
 file, Python CI consumes it — drift between the implementations is loud by
 construction, and the golden stays raw bytes so no image codec ever enters
-the core. Regenerate (deliberately only) with
-`VITRIN_REGEN_GOLDEN=1 cargo test -p vitrin-core sdk_capture_golden`.
+the core. Regenerate (deliberately only) through the single documented flow,
+`cargo xtask bless --filter sdk_capture_golden` (see
+`tests/golden/README.md`), which drives that test with
+`VITRIN_REGEN_GOLDEN=1`.
 
 ## Error hierarchy (skeleton — fleshed out in P1.8.3)
 

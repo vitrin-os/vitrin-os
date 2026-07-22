@@ -210,3 +210,9 @@ scripted-consent = []
 # tree. Its deterministic frame generator keeps pixel assertions in-process
 # (plan risk R7: no image codec in the core, in any dependency class).
 vitrin-mock-shim = { path = "../vitrin-mock-shim" }
+# The golden-frame comparison harness (P1.9.2): the shared pixel-assertion
+# library the headless test-pattern image golden runs through
+# (`capture::tests`). Test-only, and itself dependency-free — its SSIM and PNG
+# artifact encoder are hand-rolled, so this adds no image codec to the tree
+# (plan risk R7), same posture as the mock shim above.
+vitrin-golden = { path = "../vitrin-golden" }

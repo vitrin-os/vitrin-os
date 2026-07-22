@@ -594,8 +594,10 @@ jobs:
           # (test_real_capture_fidelity.py, P1.8.5) runs here under the same
           # knob: its solid-client is co-built with the shim (a VITRIN_C_SHIM_BIN
           # sibling) and its vitrin-golden-cmp SSIM tool is built by the warm
-          # `cargo build --workspace` above -- no extra CI wiring. The Firefox
-          # rung (test_real_firefox.py)
+          # `cargo build --workspace` above -- no extra CI wiring. The M1.4
+          # actuation gate (test_real_actuation.py, P1.8.6) also runs here: its
+          # click-target is a co-built shim sibling and its text rung reuses
+          # gtk-entry-probe. The Firefox rung (test_real_firefox.py)
           # does NOT run here -- the pinned ESR is a 75 MB download this step
           # does not fetch -- so it is skipped for this suite and held by its
           # own dedicated step below, which fetches Firefox first. Without this

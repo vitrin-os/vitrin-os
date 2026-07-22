@@ -33,6 +33,7 @@ socket with a real forked realm. Nothing constructs a runtime in-process.
 | `test_runtime_wiring.py` | Issue #77's acceptance criteria. |
 | `test_real_app.py` | The **M1.2 exit gate** (P1.9.6, #105): the whole real chain — real `vitrind` → real C shim → real `weston-terminal` — with no mock on any seam. Skips without a built C shim; see the env contract below. |
 | `test_real_capture_fidelity.py` | The **M1.3 exit gate** (P1.8.5, #107): an agent captures a real `solid-client` frame through the real chokepoint; its dominant colour is the served colour, it agrees with the core-internal capture (`vitrind --capture-dump`) by SSIM + per-pixel tolerance via `vitrin-golden-cmp`, and capture-path rate-limit + expiry refuse as `rate_limited`/`expired`. Same C-shim env contract. |
+| `test_real_actuation.py` | The **M1.4 actuation gate** (P1.8.6, #108): an agent's `grant.pointer` click lands on a real `click-target`'s observed feature (dominant colour flips, D10) and `grant.text` types `héllo→世界` intact into a real `gtk-entry-probe` (D7), each confirmed by the agent's own `observe()` and recorded at the chokepoint. Same C-shim env contract; the GTK rung skips without GTK. |
 
 ## Running it locally
 
@@ -75,7 +76,10 @@ cannot silently drift.
   app is co-built with the shim by the same `meson compile` (resolved as a
   sibling of `VITRIN_C_SHIM_BIN`, like `gtk-entry-probe`), and its
   `vitrin-golden-cmp` SSIM tool is built by the `cargo build --workspace`
-  warm-up that already builds `vitrind`.
+  warm-up that already builds `vitrind`. The M1.4 actuation gate
+  (`test_real_actuation.py`) adds no CI wiring either: its `click-target` app is
+  co-built with the shim, and it reuses the `gtk-entry-probe` the GTK rung
+  already builds.
 - **The real-app gate's opt-in knob:** `test_real_app.py` runs only when
   `VITRIN_C_SHIM_BIN` names a built C shim (`shim/build/vitrin-shim`). Unset,
   it **skips** — the local-dev path for anyone without the C toolchain. Set,

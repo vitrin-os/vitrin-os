@@ -339,6 +339,22 @@ jobs:
             echo "would take to hold the gate here."
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # NOTE: quoted because the name contains ": " -- see the steps above.
+      - name: "Headless acceptance (app spawn: shim forks the app, isolates it, reaps it)"
+        # The P1.6.5 acceptance criteria: the shim ITSELF forks and execs the
+        # app the core conveyed after `--` (until now the app was launched
+        # externally), so vitrind -> vitrin-shim -> app is one process tree.
+        # Machine-checked against the real process tree and the wire: the mock
+        # core spawns the shim with `-- weston-terminal`, then the script
+        # asserts (a) the terminal is a child of the shim, (b) its frame
+        # forwards through the shim, (c) it holds none of the shim's private
+        # descriptors (the core socket above all), and (d) killing the shim
+        # reaps it. GPU-free (pixman); weston-terminal is installed by
+        # shim/ci/install-deps.sh, so a missing binary FAILS here.
+        if: hashFiles('shim/tests/acceptance/app_spawn.sh') != ''
+        working-directory: shim
+        run: BUILD_DIR="${RUNNER_TEMP}/shim-build" bash tests/acceptance/app_spawn.sh
+
       - name: Meson build DORMANT
         if: hashFiles('shim/meson.build') == ''
         run: |

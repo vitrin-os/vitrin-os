@@ -2594,9 +2594,25 @@ mod tests {
         let _fd = crate::capture::tests::fd_lock();
         let base = crate::spawn::tests::scratch();
         // The C shim is the core-inserted `--shim` binary under test (issue
-        // #103); like the mock fixture it doubles as the `command` app
-        // stand-in, so the core execs it as the realm's fd-3 peer.
+        // #103), the realm's fd-3 peer -- so it is the shim *program*, not the
+        // app. Since #104 the shim actually forks/execs the app command the
+        // core conveys after `--`, so the app can no longer be the shim itself
+        // (a second vitrin-shim, execed with no fd 3, would refuse to start and
+        // its immediate exit would race the shim's commit down via SIGCHLD).
+        // The app is instead a trivial `sleep`: it never connects to the shim's
+        // Wayland socket, so the shim still composites and commits its EMPTY
+        // realm view -- the frame this test validates -- while the app stays
+        // alive until teardown reaps it. The duration is a few minutes, not a
+        // day: it comfortably outlives DEADLINE (10s) so the app is always live
+        // during the test, but if the watchdog below has to SIGKILL a wedged
+        // shim -- bypassing its reap -- the orphaned `sleep` clears in minutes
+        // rather than lingering for 24h on a developer's machine.
         let paths = crate::spawn::SpawnPaths::under(&base, &shim_bin);
+        let app_bin = ["/usr/bin/sleep", "/bin/sleep"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.is_file())
+            .expect("the conformance app needs a `sleep` at /usr/bin or /bin");
         let (mut recorder, _log) = crate::recorder::tests::scratch_recorder("c-shim-conformance");
 
         // The shim must run headless on the software renderer: this test is
@@ -2612,7 +2628,12 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let realm = crate::realm::tests::realm_with_spawn("realm-0", &shim_bin, &[], &env_allow);
+        let realm = crate::realm::tests::realm_with_spawn(
+            "realm-0",
+            &app_bin,
+            &["300".to_string()],
+            &env_allow,
+        );
         let mut spawned =
             crate::spawn::spawn_realm_with_env(&realm, &paths, &mut recorder, |name| match name {
                 "WLR_BACKENDS" => Some("headless".into()),
@@ -2704,10 +2725,14 @@ mod tests {
             })
             .expect("frame_done goes out");
 
-        // Orderly teardown: hanging up is the first rung of the core's own
-        // shutdown ladder, and the shim must take it rather than needing a
-        // signal.
-        let _ = spawned.child_mut().kill();
+        // Orderly teardown: SIGTERM the shim rather than SIGKILL it, so it runs
+        // its own teardown and reaps the `sleep` app it forked (#104) -- a
+        // SIGKILL would leave that app orphaned for its full duration. This
+        // also exercises, from the real core's side, that killing the shim
+        // takes its app down with it (P1.5.2).
+        if let Some(pid) = rustix::process::Pid::from_raw(spawned.pid() as i32) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
         let _ = spawned.child_mut().wait();
         let _ = std::fs::remove_dir_all(&base);
     }

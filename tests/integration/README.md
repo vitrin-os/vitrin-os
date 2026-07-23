@@ -26,14 +26,41 @@ socket with a real forked realm. Nothing constructs a runtime in-process.
 
 ## Layout
 
-| File | Role |
-|---|---|
-| `run.sh` | CI entry point. Bash, exit 0 = pass. |
-| `harness.py` | `Core` — boots the binary in a throwaway `XDG_RUNTIME_DIR`; `IntegrationTest` — per-test deadline and core reaping. |
-| `test_runtime_wiring.py` | Issue #77's acceptance criteria. |
-| `test_real_app.py` | The **M1.2 exit gate** (P1.9.6, #105): the whole real chain — real `vitrind` → real C shim → real `weston-terminal` — with no mock on any seam. Skips without a built C shim; see the env contract below. |
-| `test_real_capture_fidelity.py` | The **M1.3 exit gate** (P1.8.5, #107): an agent captures a real `solid-client` frame through the real chokepoint; its dominant colour is the served colour, it agrees with the core-internal capture (`vitrind --capture-dump`) by SSIM + per-pixel tolerance via `vitrin-golden-cmp`, and capture-path rate-limit + expiry refuse as `rate_limited`/`expired`. Same C-shim env contract. |
-| `test_real_actuation.py` | The **M1.4 actuation gate** (P1.8.6, #108): an agent's `grant.pointer` click lands on a real `click-target`'s observed feature (dominant colour flips, D10) and `grant.text` types `héllo→世界` intact into a real `gtk-entry-probe` (D7), each confirmed by the agent's own `observe()` and recorded at the chokepoint. Same C-shim env contract; the GTK rung skips without GTK. |
+**Definition-of-done note (issue #111, plan §5 D12):** only the rows marked
+**mock-free milestone gate** below may be cited as evidence that M1.2–M1.5 is
+done. Every other test here is a **component test**: it drives the shipped
+`vitrind` binary (so it still catches the startup-ordering and wiring bugs
+`cargo test --workspace` structurally cannot — see above), but it does so
+against `vitrin-mock-shim` on the far seam, which the mock-free gates must
+never use as their evidence source. Component tests stay green and keep
+their value; they are just never a substitute for the named gate.
+
+| File | Role | Mock-free milestone gate? |
+|---|---|---|
+| `run.sh` | CI entry point. Bash, exit 0 = pass. | — (harness) |
+| `harness.py` | `Core` — boots the binary in a throwaway `XDG_RUNTIME_DIR` (defaults its shim to `vitrin-mock-shim`, `MOCK_SHIM`, unless a real shim path is passed); `IntegrationTest` — per-test deadline and core reaping. | — (harness) |
+| `test_runtime_wiring.py` | **Component test.** Issue #77's acceptance criteria (startup-ordering trap T1) against the real core + `vitrin-mock-shim`. Never a milestone gate — it predates and is orthogonal to M1.2–M1.5. | No |
+| `test_actuation.py` | **Component test.** P1.8.3 (#42): the SDK's actuation API and typed grant-error exceptions against the real core + `vitrin-mock-shim`. Superseded, for milestone purposes, by `test_real_actuation.py` below. | No |
+| `test_demo.py` | **Component test.** P1.8.4 (#43): the demo agent's headless flow, recorder-verified, against the real core + `vitrin-mock-shim --seat --animate`. **Not** the M1.5 gate — #110 (P1.8.7) is, and is not yet green; `cargo xtask demo --headless` still runs the mock shim as the demo's app today (`crates/xtask/src/main.rs`), which is exactly what #110 exists to replace. | No |
+| `test_real_app.py` | The **M1.2 exit gate** (P1.9.6, #105): the whole real chain — real `vitrind` → real C shim → real `weston-terminal` — with no mock on any seam. Skips without a built C shim; see the env contract below. | **Yes — M1.2** |
+| `test_real_gtk.py` | The GTK rung of the real bring-up ladder (P1.6.6, #106): real `vitrind` → real C shim → real `gtk-entry-probe`, reusing `test_real_app.py`'s real-app mode. Supporting evidence for M1.2's render half, alongside `test_real_firefox.py`. | Supporting — M1.2 |
+| `test_real_firefox.py` | The Firefox rung of the real bring-up ladder (P1.6.6, #106): real `vitrind` → real C shim → real pinned Firefox ESR, asserting a real rendered colour and the globals contract, with no mock on any seam. Supporting evidence for M1.2's render half. | Supporting — M1.2 |
+| `test_real_capture_fidelity.py` | The **M1.3 exit gate** (P1.8.5, #107): an agent captures a real `solid-client` frame through the real chokepoint; its dominant colour is the served colour, it agrees with the core-internal capture (`vitrind --capture-dump`) by SSIM + per-pixel tolerance via `vitrin-golden-cmp`, and capture-path rate-limit + expiry refuse as `rate_limited`/`expired`. Same C-shim env contract. | **Yes — M1.3** |
+| `test_real_actuation.py` | The **M1.4 actuation gate** (P1.8.6, #108): an agent's `grant.pointer` click lands on a real `click-target`'s observed feature (dominant colour flips, D10) and `grant.text` types `héllo→世界` intact into a real `gtk-entry-probe` (D7), each confirmed by the agent's own `observe()` and recorded at the chokepoint. Same C-shim env contract; the GTK rung skips without GTK. M1.4 additionally needs #109 (consent + hold-Esc revocation over a real app), tracked separately and not yet green. | **Yes — M1.4 (actuation half; #109 outstanding)** |
+
+Grep-proving the split (run from repo root): every `test_real_*.py` gate
+module boots its `Core` with an **explicit real shim path**
+(`shim=str(self.shim_bin)`, resolved from `VITRIN_C_SHIM_BIN`), never a bare
+`self.core()` — a bare call defaults to `harness.MOCK_SHIM`. The `no`/mock
+mentions those files do contain are disclaiming prose and assertion strings
+("no `vitrin-mock-shim` in the path"), not the shim they actually run:
+
+```bash
+# Every real-app gate module passes an explicit shim= path to Core(); none
+# relies on Core()'s harness.py default (vitrin-mock-shim). Expect: no output
+# (a file listed here would be one that never overrides the mock default).
+rg --files-without-match 'shim=str\(self\.shim_bin\)' tests/integration/test_real_*.py
+```
 
 ## Running it locally
 

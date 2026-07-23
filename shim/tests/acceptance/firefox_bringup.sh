@@ -28,10 +28,12 @@
 #
 # WHAT IS ASSERTED, AND HOW EACH CLAIM IS MADE OBSERVABLE
 #
-# Nobody can literally LOOK at the nested window yet -- `spawn_realm` still has
-# no non-test caller (see shim/README.md, inherited from P1.6.2) -- so every
-# criterion here is reduced to something measurable in the pixels the shim
-# actually forwarded. The mock core reports a DOMINANT COLOUR per committed
+# This script runs under `mock_core.c`, not the real `vitrind` (see the
+# header above) -- a deliberate shim-in-isolation choice, not a limitation of
+# `spawn_realm`, which has had a real, non-test caller since P1.5.4/#103
+# (`session::start_realm` in the shipped binary). So every criterion here is
+# reduced to something measurable in the pixels the shim actually forwarded.
+# The mock core reports a DOMINANT COLOUR per committed
 # frame (mock_core.c), which is the M1.2 verification the plan specifies:
 # "Firefox smoke (local page rendering a known solid color, assert dominant
 # color)" (docs/plan/01-phase-1-mvp.md section 5). Every page is a local

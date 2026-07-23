@@ -1,9 +1,18 @@
 """P1.8.4 (#43) acceptance: the demo agent's HEADLESS flow, against a live core.
 
-This is the M1.5 acceptance gate, wired into the integration suite so it rides
-``run.sh``'s ``unittest discover`` with no CI-yaml edit — the entry-point
-contract (``tests/integration/README.md``) is exactly that a new
-``test_*.py`` is the whole change.
+**Component test, not the M1.5 milestone gate (plan §5 D12, issue #111).**
+This module drives the real ``vitrind`` binary but against
+``vitrin-mock-shim --seat --animate`` (``harness.py``'s ``Core()`` default),
+which is exactly the kind of mock seam D12 forbids as milestone evidence.
+The *named* M1.5 gate is issue #110 (P1.8.7): it is not yet green, and until
+it lands, ``cargo xtask demo --headless`` also still runs the mock shim as
+the demo's app (see ``crates/xtask/src/main.rs``), not a real one. What this
+module *does* prove — legitimately, as a component test — is that the demo
+entry point drives the real enforcement chokepoint and that the flight
+recorder reconstructs its actuations correctly; it rides ``run.sh``'s
+``unittest discover`` with no CI-yaml edit — the entry-point contract
+(``tests/integration/README.md``) is exactly that a new ``test_*.py`` is the
+whole change.
 
 The demo's *entry point* is imported and called (not run as a subprocess), so
 a failure surfaces as a Python traceback with the demo's own frame dump rather

@@ -1,0 +1,16 @@
+# wlcs (P1.9.4, issue #47): builds shim/wlcs/integration.c into a standalone
+# `vitrin-shim-wlcs.so` WLCS plugin. 'auto' (the default) probes for the
+# `wlcs` pkg-config dependency and enables itself only if found -- so an
+# ordinary shim build on a machine without the wlcs package installed is
+# unaffected. Force 'enabled' to make a missing `wlcs` a configure error
+# instead of a silent skip (what the CI job does); force 'disabled' to keep
+# it off even when `wlcs` happens to be installed.
+#
+# THE LICENSE BOUNDARY THIS OPTION DRAWS: shim/wlcs/integration.c is
+# GPL-3.0-only (see its own header and shim/wlcs/README.md) because it links
+# against the GPL-3.0 wlcs project's headers -- unlike every other target in
+# this file, which is MIT. Nothing this option builds is installed
+# (meson.build has no `install: true` on the wlcs targets) or linked into
+# the `vitrin-shim` executable itself.
+option('wlcs', type: 'feature', value: 'auto',
+	description: 'Build the advisory WLCS integration module (shim/wlcs/, GPL-3.0-only; never installed, never linked into vitrin-shim)')

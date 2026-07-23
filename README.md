@@ -56,40 +56,138 @@ the pillar-by-pillar requirements.
 
 ## Status
 
-**Early Phase 1.** The protocol layer is the only landed code; nothing is
-runnable end-to-end yet.
+**Late Phase 1 — the MVP slice runs end to end, honesty gaps documented
+below.** All nine epics (E1–E9) have landed code on `main`; the remaining
+open work is soak/hardening (fuzzing, an advisory conformance subset,
+nested-mode performance, dmabuf zero-copy) and the docs pass this file is
+part of. See the [issue tracker](https://github.com/vitrin-os/vitrin-os/issues)
+for the exact open set — every remaining Phase-1 issue is linked from its
+epic (`#8` SDK, `#9` CI/docs).
 
-What exists today:
+What exists today, on `main`:
 
 - **Protocol spec v0** — [protocol/vitrin-v0.xml](protocol/vitrin-v0.xml)
-  (11 interfaces, wire format, error taxonomy; the source of truth) and its
-  RELAX NG schema [protocol/vitrin-v0.rng](protocol/vitrin-v0.rng).
-- **Protocol prose** — normative
-  [conventions](docs/protocol/00-conventions.md) plus one page per interface
-  under [docs/protocol/](docs/protocol/00-conventions.md).
-- **Codegen** — [`vitrin-scanner`](crates/vitrin-scanner) plus a
-  `cargo xtask codegen` driver generate the
-  [`vitrin-protocol`](crates/vitrin-protocol) Rust crate (message types +
-  codec; pure data, no I/O) and the C header
+  (11 interfaces, wire format, error taxonomy; the source of truth), its
+  RELAX NG schema [protocol/vitrin-v0.rng](protocol/vitrin-v0.rng), and a
+  prose page per interface under [docs/protocol/](docs/protocol/00-conventions.md)
+  kept in lockstep with every landing PR.
+- **Codegen** — [`vitrin-scanner`](crates/vitrin-scanner) plus
+  `cargo xtask codegen` generate the [`vitrin-protocol`](crates/vitrin-protocol)
+  Rust crate (message types + codec; pure data, no I/O) and the C header
   [shim/include/vitrin-protocol.h](shim/include/vitrin-protocol.h) from the
   IDL.
-- **CI** — [.github/workflows/ci.yml](.github/workflows/ci.yml) validates the
-  IDL against the schema, runs the test suite in debug and release with
-  `-D warnings`, fails on generated-code drift (`cargo xtask codegen
-  --check`), and pins the Rust codec and the C header to the same wire bytes
-  with a golden-frame test.
+- **`vitrind`, the trusted core** ([`crates/vitrin-core`](crates/vitrin-core))
+  — a real Smithay compositor with both output backends (`--nested`, a host
+  Wayland client; `--headless --size WxH`, GPU-less pixman software
+  rendering for CI); the capability kernel and in-memory grant table
+  (request → pending → consent → resolved, sender-constrained, rate-limited,
+  revocable); the realm/spawn manager (fork/exec the shim with a private
+  runtime dir and a scrubbed, allow-listed environment); the core-rendered
+  consent prompt with an exclusive input grab; the hold-Esc dead-man
+  revocation switch; and the flight-recorder log. See the
+  [Architecture at a glance](#architecture-at-a-glance) section and
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full crate↔PRD map.
+- **The Wayland shim** ([`shim/`](shim/README.md)) — a wlroots headless
+  compositor, C + Meson, outside the Cargo workspace by design. It forwards
+  every composited frame to the core over the inherited socketpair, replays
+  origin-tagged input into the app through its own `wl_seat`, and runs real
+  apps: `weston-terminal`, a GTK entry probe, and Firefox ESR (pinned),
+  climbed one rung at a time and proven in CI with no mock on the shim seam.
+- **The agent SDK** ([`sdk/python/`](sdk/python)) — a pure-Python
+  (stdlib-only, D8) wire client: connect → handshake → `request_grant` →
+  `observe()` → `actuate_pointer`/`actuate_text`, typed grant-error
+  exceptions, and capture ergonomics (`.to_png()`).
+  [`examples/agent-demo/run_demo.py`](examples/agent-demo/run_demo.py) is
+  the demo agent and doubles as the M1.5 integration test; run it with
+  `cargo xtask demo` (see [Quickstart](#quickstart) below).
+- **CI** — [.github/workflows/ci.yml](.github/workflows/ci.yml): Rust
+  fmt/clippy/tests (debug + release), IDL schema validation and
+  generated-code drift checking, a Rust-free container build of the C shim,
+  golden-frame pixel/SSIM checks, and a headless integration suite that
+  drives the real core against real apps (`weston-terminal`, GTK, Firefox
+  ESR) with a hard 10-minute budget.
 
-What does not exist yet:
+Known, tracked gaps as of this writing (each has an open issue; none are
+silently swallowed):
 
-- **`vitrind` itself** — no compositor, capability kernel, grant store, or
-  consent surface code has landed.
-- **The shim binary** — `shim/` holds only the generated header and its C
-  tests; the wlroots-based per-app shim is not started.
-- **The agent SDK** — no Python SDK or demo agent yet.
+- **`cargo xtask demo`'s current default still drives
+  [`vitrin-mock-shim`](crates/vitrin-mock-shim)**, a fixture binary, rather
+  than the real wlroots shim — even though the real shim already runs
+  Firefox under CI and integration tests (above). Rewiring the demo itself
+  onto the real shim is the M1.5 acceptance gate,
+  [#110](https://github.com/vitrin-os/vitrin-os/issues/110), and is in
+  progress on an open PR
+  ([#127](https://github.com/vitrin-os/vitrin-os/pull/127)) at the time of
+  this PR. Until it merges, treat the mock-shim demo as a protocol-shape
+  smoke test, not the real-app proof — that proof lives in
+  `tests/integration/test_real_app.py`, `test_real_capture_fidelity.py`,
+  `test_real_actuation.py`, and `test_real_firefox.py` today.
+- **No sandbox (decision D9).** No namespaces, seccomp, or Landlock yet —
+  see [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine)
+  below.
+- **dmabuf zero-copy is not wired at runtime** (both backends pass
+  `importer: None`); frames move as shm copies. Real-GPU zero-copy import is
+  [#117](https://github.com/vitrin-os/vitrin-os/issues/117).
+- **Fuzzing and an advisory wlcs conformance subset** are open
+  ([#46](https://github.com/vitrin-os/vitrin-os/issues/46),
+  [#47](https://github.com/vitrin-os/vitrin-os/issues/47)) — both are
+  M1.5-gating soak work, not blockers to running the demo above.
+- **No published demo screencast yet** — see
+  [docs/demo/README.md](docs/demo/README.md) for the recording plan and why
+  it isn't in this PR.
 
-Phase 1 is tracked as nine epics in the
-[issue tracker](https://github.com/vitrin-os/vitrin-os/issues), one
-`track:*` label each; only the protocol track has landed code so far.
+## Quickstart
+
+From a clean clone to a running demo. Verified against the state of `main`
+described above (headless venue; the nested venue additionally needs a
+Wayland session and Firefox ESR — see the note at the end).
+
+```sh
+git clone https://github.com/vitrin-os/vitrin-os.git
+cd vitrin-os
+
+# The toolchain is pinned (rust-toolchain.toml); rustup installs it on the
+# first cargo invocation. System deps the workspace links:
+sudo apt-get install -y libxkbcommon-dev libpixman-1-dev   # Debian/Ubuntu
+
+# Build vitrind, the demo's mock-shim fixture, and xtask itself.
+cargo build --workspace
+
+# Run the Phase-1 demo agent headless: boots vitrind --headless, the
+# fixture shim, and examples/agent-demo/run_demo.py over a real Unix
+# socket -- connect, request a grant, capture, click, type, capture again,
+# and assert the page changed. Exits non-zero on any failure.
+cargo xtask demo --headless
+```
+
+Expect output ending in `xtask demo: PASS` and a path to the run's flight
+recorder (`flight.jsonl`) and captured frames. This exercises the real wire
+protocol, the real capability kernel, and the real consent auto-approve
+path — but, per the gap noted above, `--headless` drives
+`vitrin-mock-shim`, not the wlroots shim, until
+[#110](https://github.com/vitrin-os/vitrin-os/issues/110) lands. For the
+real shim under a real app today, build it and run the integration suite
+instead:
+
+```sh
+meson setup shim/build shim && meson compile -C shim/build
+VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" bash tests/integration/run.sh
+```
+
+**Nested mode** (`cargo xtask demo`, no `--headless`) draws a real window on
+your own Wayland session and launches Firefox ESR in the realm — it needs a
+running compositor (GNOME, Hyprland, ...) and `firefox-esr` (or
+`VITRIN_DEMO_FIREFOX=/path/to/firefox`) on the machine you run it on; it is
+never a CI dependency (nested mode has no headless equivalent by design —
+plan risk R1).
+
+Other useful commands, all covered in CI:
+
+```sh
+xmllint --noout --relaxng protocol/vitrin-v0.rng protocol/vitrin-v0.xml  # validate the IDL
+cargo test --workspace && cargo test --workspace --release              # unit + integration tests
+cargo xtask codegen --check                                              # generated-code drift check
+```
 
 ## Architecture at a glance
 
@@ -186,15 +284,24 @@ The spawn path and every decision above are documented in full in
 | Path | What it is |
 |---|---|
 | [`docs/PRD.md`](docs/PRD.md) | PRD + Technical Architecture — the canonical vision/design doc |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Maps every crate/directory below to the PRD section it implements |
 | [`protocol/vitrin-v0.xml`](protocol/vitrin-v0.xml) | The wire-protocol IDL — source of truth for every interface |
 | [`protocol/vitrin-v0.rng`](protocol/vitrin-v0.rng) | RELAX NG schema for the IDL dialect |
-| [`docs/protocol/`](docs/protocol/00-conventions.md) | Normative conventions + one prose page per interface |
+| [`docs/protocol/`](docs/protocol/00-conventions.md) | Normative conventions + one prose page per interface, kept in lockstep with the IDL |
+| [`docs/plan/`](docs/plan/README.md) | Phase/epic/task breakdown, decision log, roadmap |
+| [`docs/demo/`](docs/demo/README.md) | Demo screencast: recording plan, and (once recorded) the published artifact |
+| [`crates/vitrin-core/`](crates/vitrin-core) | `vitrind` — the trusted core (compositor, capability kernel, grant store, realms, consent) |
 | [`crates/vitrin-protocol/`](crates/vitrin-protocol) | Generated message types + codec (no I/O, no sockets) |
 | [`crates/vitrin-scanner/`](crates/vitrin-scanner) | Code generator: IDL XML → Rust + C header |
-| [`crates/xtask/`](crates/xtask) | `cargo xtask codegen [--check]` — regenerate or drift-check the generated code |
-| [`shim/include/`](shim/include) | Generated C header for the future wlroots shim |
-| [`shim/tests/`](shim/tests) | C-side checks: header compiles standalone; frames match the Rust codec byte-for-byte |
-| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | CI: schema validation, tests, codegen drift check, C header checks |
+| [`crates/vitrin-ipc/`](crates/vitrin-ipc) | Unix-socket transport: framing, `SCM_RIGHTS`, `SO_PEERCRED`, backpressure policy |
+| [`crates/vitrin-mock-shim/`](crates/vitrin-mock-shim) | Fixture-only shim stand-in for tests and today's `cargo xtask demo` (see [Status](#status)) |
+| [`crates/vitrin-golden/`](crates/vitrin-golden) | Per-pixel + SSIM frame comparison, used by the golden and real-app fidelity tests |
+| [`crates/xtask/`](crates/xtask) | `cargo xtask codegen [--check]` / `bless` / `demo [--headless]` |
+| [`shim/`](shim/README.md) | The wlroots-based per-app Wayland shim (C + Meson, outside the Cargo workspace) |
+| [`sdk/python/`](sdk/python) | The pure-Python agent SDK (`vitrin_os` package, D8) |
+| [`examples/agent-demo/run_demo.py`](examples/agent-demo/run_demo.py) | The Phase-1 demo agent — also the M1.5 integration test, run via `cargo xtask demo` |
+| [`tests/integration/`](tests/integration/README.md) | Drives the shipped `vitrind` binary + real shim + real apps over a real socket |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | CI: schema validation, Rust + C tests, codegen drift check, headless integration suite |
 
 ## Working with the repo today
 
@@ -297,4 +404,19 @@ is split into nine epics, each carrying exactly one `track:*` label
 
 ## License
 
-[Apache-2.0](LICENSE).
+Split per decision D-005 (`docs/plan/20-decision-log.md`) — see
+[`NOTICE`](NOTICE) for the full mapping and current execution status:
+
+- **Protocol wire definitions and schemas**
+  ([`protocol/vitrin-v0.xml`](protocol/vitrin-v0.xml),
+  [`protocol/vitrin-v0.rng`](protocol/vitrin-v0.rng)) and the **client
+  SDKs** ([`sdk/python/`](sdk/python)) — [Apache-2.0](LICENSE).
+- **Spec prose** ([`docs/PRD.md`](docs/PRD.md),
+  [`docs/protocol/`](docs/protocol), [`docs/plan/`](docs/plan)) —
+  [CC-BY-4.0](LICENSE-CC-BY-4.0).
+- **The reference implementation** (`crates/`, `shim/`) is intended per
+  D-005 to carry a weak-copyleft license (MPL-2.0 preferred, LGPL-3.0
+  fallback); that re-licensing has not executed yet — every crate still
+  declares Apache-2.0 today. Tracked in
+  [#133](https://github.com/vitrin-os/vitrin-os/issues/133), stated here
+  rather than silently assumed.

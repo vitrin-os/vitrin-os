@@ -12,10 +12,15 @@ capability-scoped authorization. Full vision, architecture, and roadmap:
 | Path | What it is |
 |---|---|
 | `docs/PRD.md` | PRD + Technical Architecture — the canonical vision/design doc |
+| `docs/ARCHITECTURE.md` | Maps every crate/directory below to the PRD section it implements — read this before "why does this file exist" |
 | `protocol/vitrin-v0.xml` | The wire protocol IDL — **source of truth** for every interface |
 | `protocol/vitrin-v0.rng` | RELAX NG schema for the IDL dialect |
 | `docs/protocol/00-conventions.md` | Normative protocol conventions (wire format, object ids, error taxonomy, versioning, dialect/schema) |
 | `docs/protocol/NN-vitrin_*.md` | One prose page per interface, cross-linked from `00-conventions.md` |
+| `crates/vitrin-core/` | `vitrind` — the trusted core (compositor, capability kernel, grant store, realms, consent, dead-man switch) |
+| `shim/` | The wlroots-based per-app Wayland shim (C + Meson, outside the Cargo workspace) |
+| `sdk/python/` | The pure-Python agent SDK; `examples/agent-demo/run_demo.py` is the demo agent (`cargo xtask demo`) |
+| `tests/integration/` | Drives the shipped `vitrind` binary + real shim + real apps over a real socket — see its own README for the entry-point contract |
 
 Where prose and IDL disagree, **the IDL's `<description>` text wins** — prose
 pages restate it, they don't override it.
@@ -101,13 +106,34 @@ subagent to add a new interface").
   cheat-sheet), `github-conventions` (branch/commit/PR/issue conventions and
   the epic↔track↔milestone taxonomy).
 
-`rust-core`, `c-shim`, and `sdk` now have substantial shipped code
-(`crates/vitrin-core`, `shim/`, `sdk/python` and `examples/agent-demo`
-respectively — Phase 1's epics E2–E9 are largely landed; see the milestone
-table in `docs/plan/01-phase-1-mvp.md` §5 and the epic/track taxonomy in
-`.claude/skills/github-conventions/SKILL.md` for current status). Their agent
-definitions can now be grounded in the real code patterns those trees
-establish, not only in `docs/PRD.md`'s Technical Architecture sections.
-Domain-specific skills for those tracks (Rust/Smithay conventions, wlroots
-idioms, Python SDK packaging) can be added as each track's conventions
-stabilize.
+All nine epics (E1–E9) now have landed code on `main` — `rust-core`,
+`c-shim`, and `sdk` each have real, reviewable patterns to follow (see
+`docs/ARCHITECTURE.md` for the crate/directory map). Domain-specific skills
+for those tracks (Rust/Smithay conventions, wlroots idioms, Python SDK
+packaging) can be added once a recurring pattern across PRs in that track
+justifies its own cheat-sheet; not every track needs one yet.
+
+## Milestone definition-of-done (mock-free acceptance)
+
+A milestone (`M1.1`–`M1.5`) closes only on a **named, mock-free** integrated
+acceptance test against the shipped binaries — never against
+`vitrin-mock-shim` or an in-process test harness alone (see
+`docs/plan/01-phase-1-mvp.md` §5 for the exact gate per milestone and
+`tests/integration/README.md` for why `tests/integration/` exists
+specifically to drive the shipped `vitrind` binary rather than an
+in-process runtime). Tests built on `vitrin-mock-shim` remain valuable as
+fast **component** tests, but citing one as a milestone's proof is the
+exact class of honesty gap this repo's docs are written to avoid — state
+mock-based coverage as what it is, and cite the real-app gate
+(`tests/integration/test_real_*.py`) as the actual milestone evidence.
+
+## Licensing (D-005)
+
+The license is split per decision D-005 (`docs/plan/20-decision-log.md`):
+Apache-2.0 on `protocol/` and the SDKs, CC-BY-4.0 on spec prose
+(`docs/PRD.md`, `docs/protocol/`, `docs/plan/`), and an intended
+weak-copyleft license (MPL-2.0 preferred, LGPL-3.0 fallback) on the
+reference implementation. See the root `NOTICE` for the current execution
+status — the reference-implementation half has not landed yet (tracked in
+issue #133); do not assume MPL-2.0 applies to `crates/`/`shim/` until it
+does.

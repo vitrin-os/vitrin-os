@@ -665,3 +665,12 @@ Finally: the **human principal has no wire presence** in version 0. Host input
 in nested mode is the implicit human (tagged `origin=physical` on the shim
 seat), and only agents handshake. Physically-originated consent — built on the
 day-one `origin` tag — is a later phase.
+
+---
+
+## License
+
+This page and every other page under `docs/protocol/` are prose describing
+`protocol/vitrin-v0.xml` (Apache-2.0) and are themselves licensed under
+[CC BY 4.0](../../LICENSE-CC-BY-4.0), per decision D-005. See the repository
+root [`NOTICE`](../../NOTICE) for the full license split.

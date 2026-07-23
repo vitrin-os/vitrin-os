@@ -1,0 +1,54 @@
+[package]
+name = "vitrin-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# cargo-fuzz's own workspace convention: this crate is deliberately NOT a
+# member of the root workspace (the root manifest's `members = ["crates/*"]`
+# would not pick it up anyway, but the empty `[workspace]` table below makes
+# that explicit and stops cargo from trying to unify it with one if the
+# glob ever widens). Fuzz targets pull libFuzzer's ASan-instrumented build
+# flags, which have no business touching `cargo build --workspace`'s lockfile
+# or profile.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# Pure data + encode/decode, no I/O (crates/vitrin-protocol/src/lib.rs) --
+# exactly what makes its decoders fuzzable in-process with no live socket.
+vitrin-protocol = { path = "../crates/vitrin-protocol" }
+# The `client` slice only: `Connection`/`Listener` framing and SCM_RIGHTS,
+# no calloop event-loop glue. Matches the dependency shape the Rust SDK
+# reference client uses (crates/vitrin-ipc/Cargo.toml's `client` feature
+# doc), since the framing fuzz target below drives a real `Connection` pair
+# over a `socketpair`, not a live `vitrind`.
+vitrin-ipc = { path = "../crates/vitrin-ipc", default-features = false, features = [
+    "client",
+] }
+# `read_string`/message-decode failures are ordinary `Result`s, not panics
+# -- this dependency exists only so the framing target can construct
+# `rustix` ancillary (`SCM_RIGHTS`) sendmsg calls the same way
+# `crates/vitrin-ipc/tests/backpressure.rs`'s hostile-peer helpers do.
+rustix = { version = "1", features = ["net"] }
+
+[[bin]]
+name = "protocol_decode"
+path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_framing"
+path = "fuzz_targets/ipc_framing.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

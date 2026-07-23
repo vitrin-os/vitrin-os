@@ -1,0 +1,22 @@
+target
+# Crash/timeout/OOM reproducers cargo-fuzz writes here on a failure.
+# Deliberately ignored: per the P1.9.3 acceptance criterion "every crash
+# becomes a permanent regression test", a real find belongs in
+# corpus/<target>/ (copy it there and commit it) rather than living only
+# in this ephemeral, unreviewed directory.
+artifacts
+coverage
+# The 24 h campaign's own scratch corpus and logs (see README.md's
+# "24-hour pre-M1.5 campaign" section) -- large, one-machine-specific, and
+# never meant to be committed wholesale. A real find is promoted by hand:
+# copy the one artifact (or corpus entry) that matters into corpus/<target>/
+# below and commit *that*.
+campaign-logs
+campaign-corpus
+# fuzz/corpus/<target>/ is INTENTIONALLY NOT ignored: it holds the
+# checked-in seed corpus (see seed_corpus.py) plus any crash-derived
+# regression a developer has promoted into it. Every command in README.md
+# passes an explicit scratch corpus directory when actually fuzzing (as
+# opposed to replaying), so this directory should stay exactly the curated
+# set checked in here -- if `git status` ever shows unexpected new files
+# under it, a command was run without its scratch-dir argument.

@@ -539,3 +539,92 @@ and back: `WindowEvent::Focused(false)`/`(true)` should log at `debug` (host
 window lost/gained keyboard focus) with no crash and no stuck dead-man hold —
 losing focus mid-hold forgets it (`NestedState::handle_focus`), so alt-tabbing
 away with Escape held never revokes the session with no gesture behind it.
+
+## 9. Holding Escape for real: the nested dead-man recipe (issue #109)
+
+Section 8's rungs are all agent-side (a grant petitioning, capturing,
+actuating) or human-typing. This one is the *human's own off-switch*:
+P1.7.3's hold-Esc dead-man chord, held on a real keyboard against a real
+Firefox realm, watched revoke a real grant on screen.
+
+### Why this is nested-only, structurally, and what the headless CI gate proves instead
+
+The chord's *detection* half — a human pressing and holding a real key long
+enough — needs a physical input device, which headless has none of by
+construction (`crates/vitrin-core/src/deadman.rs`'s module docs; PRD Doc 2
+§9). So, like every other rung on this page, it is **never a CI test** — not
+skipped, not present — and this section is manual by the same R1 posture as
+sections 8's other venues.
+
+What headless CI *does* prove, in
+`tests/integration/test_real_deadman.py` (P1.7.4, the M1.4 dead-man exit
+gate), is everything **downstream** of a completed chord, against a real app:
+a `SIGUSR1` sent to a `dead-man-injector`-feature `vitrind` synthesizes the
+same [`Trigger`] a completed physical hold produces and applies it through
+the identical `Runtime::apply_dead_man` entry point the nested backend's
+`DeadManHost::on_trigger` calls — so what CI proves about *revocation* (every
+grant gone, the table sealed, the real app's `wl_seat` receiving nothing more)
+is exactly as strong as this manual recipe's. Only the keypress-to-`Trigger`
+wiring below is unproven by CI, and that is what this section is for.
+
+### The recipe
+
+Same prerequisites and nesting-host table as section 8 (a nested GNOME or
+Hyprland session, the pinned Firefox fetched, the workspace and shim built).
+Boot the same nested Firefox realm as the P1.8.5 capture variant, adding
+`--dead-man-chord`/`--dead-man-hold` only if you want to override their
+defaults (`esc`, 1000 ms — `crates/vitrin-core/src/deadman.rs`'s
+`DEFAULT_CHORD`/`DEFAULT_HOLD`):
+
+```bash
+# Prerequisites, same as every venue on this page.
+cargo build --workspace
+meson compile -C shim/build
+bash shim/tests/firefox/fetch-esr.sh
+
+# The same nested Firefox realm section 8's capture variant builds
+# (/tmp/ff-nested-realm.toml) — reused here unchanged.
+
+MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland MOZ_ACCELERATED=0 \
+LIBGL_ALWAYS_SOFTWARE=1 MOZ_CRASHREPORTER_DISABLE=1 GTK_A11Y=none \
+NO_AT_BRIDGE=1 HOME=/tmp/ff-nested-profile \
+  target/debug/vitrind --nested --consent=interactive \
+    --shim "$PWD/shim/build/vitrin-shim" \
+    --realm /tmp/ff-nested-realm.toml \
+    --principals examples/principals.toml \
+    --recorder /tmp/ff-nested.jsonl
+    # --dead-man-chord esc --dead-man-hold 1000   (the defaults; spelled out
+    # here only so this is the one place to change them)
+```
+
+From a second terminal, connect the demo agent, request the one whole-realm
+grant, and approve it on the nested consent surface (visible in the trusted
+indicator band, issue #85) exactly as in section 8's capture variant. Confirm
+it is live with one `observe()`.
+
+Then, **with the nested window focused**, press and hold Escape for the
+configured duration (1000 ms by default — long enough that a single tap never
+fires it; P1.7.3's tap-through-hold-swallow design, `deadman.rs`'s module
+docs). You should see:
+
+- Escape does **not** reach Firefox while held (no dialog dismissed, nothing
+  typed) — the chord gate withholds it for the hold/tap decision, exactly the
+  "held-Esc never reaches the confined app" guarantee `deadman.rs` documents.
+- On release *before* the hold completes, Escape is replayed to Firefox as an
+  ordinary tap (press+release) — confirming the gate is a *tap-through* one,
+  not a swallow-everything one.
+- On a *completed* hold, the flight recorder (`tail -f /tmp/ff-nested.jsonl`)
+  gains a `dead_man_triggered` entry with `"chord":"esc"` and a `held_ms` at
+  or above 1000, followed by a `grant_revoked` entry naming the grant row you
+  just approved — the exact write order `deadman::apply` documents.
+- The agent's very next `observe()` (or any `actuate.*`) now raises
+  `vitrin_os.errors.Revoked` — the same typed exception
+  `test_real_deadman.py` asserts headless, now watched fire live over a real
+  Firefox realm from a real held key.
+
+Because it is manual, its "never a silent skip" guarantee is structural, the
+same as every other rung on this page: there is no CI job to skip, and the
+recipe above either shows you the revocation on screen or fails loudly (a
+missing host/browser, a chord that never fires) in your own terminal.
+
+[`Trigger`]: ../../crates/vitrin-core/src/deadman.rs

@@ -665,8 +665,18 @@ jobs:
         # is a workspace crate (crates/vitrin-core per the plan layout), so
         # this builds -- and, via the cache step above, banks -- the heavy
         # dependency tree before the timed suite step runs.
+        #
+        # `vitrin-core/dead-man-injector` (issue #109) rides along: it must
+        # match the flag `tests/integration/run.sh`'s own (idle) fallback
+        # build uses, or this step's binary wins the race (it always runs
+        # first) and `run.sh`'s existence guard skips rebuilding -- silently
+        # shipping a `vitrind` with no SIGUSR1 handler installed to
+        # `test_real_deadman.py`, which sends it one. The feature is purely
+        # additive and never enabled in a deployment build (see the feature's
+        # doc in crates/vitrin-core/Cargo.toml), so it changes nothing else
+        # this job builds or runs.
         if: hashFiles('tests/integration/run.sh') != ''
-        run: cargo build --workspace
+        run: cargo build --workspace --features vitrin-core/dead-man-injector
 
       - name: Build the C shim (for the real-app gate)
         # tests/integration/test_real_app.py runs the real core -> real C shim

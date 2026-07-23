@@ -46,7 +46,8 @@ their value; they are just never a substitute for the named gate.
 | `test_real_gtk.py` | The GTK rung of the real bring-up ladder (P1.6.6, #106): real `vitrind` → real C shim → real `gtk-entry-probe`, reusing `test_real_app.py`'s real-app mode. Supporting evidence for M1.2's render half, alongside `test_real_firefox.py`. | Supporting — M1.2 |
 | `test_real_firefox.py` | The Firefox rung of the real bring-up ladder (P1.6.6, #106): real `vitrind` → real C shim → real pinned Firefox ESR, asserting a real rendered colour and the globals contract, with no mock on any seam. Supporting evidence for M1.2's render half. | Supporting — M1.2 |
 | `test_real_capture_fidelity.py` | The **M1.3 exit gate** (P1.8.5, #107): an agent captures a real `solid-client` frame through the real chokepoint; its dominant colour is the served colour, it agrees with the core-internal capture (`vitrind --capture-dump`) by SSIM + per-pixel tolerance via `vitrin-golden-cmp`, and capture-path rate-limit + expiry refuse as `rate_limited`/`expired`. Same C-shim env contract. | **Yes — M1.3** |
-| `test_real_actuation.py` | The **M1.4 actuation gate** (P1.8.6, #108): an agent's `grant.pointer` click lands on a real `click-target`'s observed feature (dominant colour flips, D10) and `grant.text` types `héllo→世界` intact into a real `gtk-entry-probe` (D7), each confirmed by the agent's own `observe()` and recorded at the chokepoint. Same C-shim env contract; the GTK rung skips without GTK. M1.4 additionally needs #109 (consent + hold-Esc revocation over a real app), tracked separately and not yet green. | **Yes — M1.4 (actuation half; #109 outstanding)** |
+| `test_real_actuation.py` | The **M1.4 actuation gate** (P1.8.6, #108): an agent's `grant.pointer` click lands on a real `click-target`'s observed feature (dominant colour flips, D10) and `grant.text` types `héllo→世界` intact into a real `gtk-entry-probe` (D7), each confirmed by the agent's own `observe()` and recorded at the chokepoint. Same C-shim env contract; the GTK rung skips without GTK. M1.4 additionally needs #109 (consent + hold-Esc revocation over a real app), covered by the `test_real_deadman.py` row below. | **Yes — M1.4 (actuation half)** |
+| `test_real_deadman.py` | The **M1.4 dead-man gate** (P1.7.4, #109): a completed hold-Esc chord, applied over a real `click-target` through the real core, revokes a live grant — `observe()` and `grant.pointer.click()` both refuse `Revoked` on the very next check, the real app's target stays unflipped (read from `--capture-dump`, bypassing the now-revoked grant entirely), and the flight recorder journals `dead_man_triggered` then `grant_revoked`. Headless has no physical key to hold, so a `SIGUSR1` to the core (only meaningful on a `dead-man-injector`-feature `vitrind` — see `run.sh`) stands in for the hold; the nested recipe for a *real* held Escape is `shim/docs/firefox.md` §9. Same C-shim env contract as the rest of the real-app ladder. | **Yes — M1.4 (dead-man half)** |
 
 Grep-proving the split (run from repo root): every `test_real_*.py` gate
 module boots its `Core` with an **explicit real shim path**
@@ -106,7 +107,12 @@ cannot silently drift.
   warm-up that already builds `vitrind`. The M1.4 actuation gate
   (`test_real_actuation.py`) adds no CI wiring either: its `click-target` app is
   co-built with the shim, and it reuses the `gtk-entry-probe` the GTK rung
-  already builds.
+  already builds. The M1.4 dead-man gate (`test_real_deadman.py`) reuses
+  `click-target` too, and needs one extra flag on the `vitrind` this job
+  already builds: `cargo build --workspace --features
+  vitrin-core/dead-man-injector` (both the "Warm build" step and `run.sh`'s
+  own fallback build pass it) — the SIGUSR1 handler that stands in for a
+  completed hold-Esc chord on a physical-input-free runner.
 - **The real-app gate's opt-in knob:** `test_real_app.py` runs only when
   `VITRIN_C_SHIM_BIN` names a built C shim (`shim/build/vitrin-shim`). Unset,
   it **skips** — the local-dev path for anyone without the C toolchain. Set,

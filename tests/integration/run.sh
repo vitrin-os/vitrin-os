@@ -33,11 +33,22 @@ cd "$REPO"
 
 # The binaries this suite drives. CI builds them in an untimed warm-up step;
 # a developer running this locally may not have, so build rather than fail
-# with a confusing "no such file". `--workspace` matches CI exactly, so a
-# warm cache makes this a no-op rather than a second compile.
+# with a confusing "no such file". `--workspace` matches CI exactly, plus
+# `vitrin-core/dead-man-injector` (issue #109): `test_real_deadman.py` sends
+# the built `vitrind` a SIGUSR1 to stand in for a completed hold-Esc chord
+# (headless has no physical input device to hold a real one on), and only a
+# `dead-man-injector` build has a handler installed for that signal at all --
+# without the feature SIGUSR1 takes its default disposition (terminate) and
+# the test fails loudly naming this exact rebuild rather than skipping or
+# hanging (see that test's module docs). The feature is purely additive (an
+# extra signal source in the headless backend only) and is never enabled in
+# a deployment build, so turning it on here changes nothing else this suite
+# exercises. A warm cache still makes this a no-op rather than a second
+# compile: cargo does not recompile a crate whose enabled feature set has not
+# changed since the last build.
 if [ ! -x target/debug/vitrind ] || [ ! -x target/debug/vitrin-mock-shim ]; then
   echo "==> building workspace (missing target/debug/vitrind or vitrin-mock-shim)"
-  cargo build --workspace
+  cargo build --workspace --features vitrin-core/dead-man-injector
 fi
 
 # `python3` on the runner is 3.12, clearing the SDK's >= 3.11 floor (D8).

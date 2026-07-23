@@ -269,9 +269,31 @@
 //! the backend reaches all three through it, borrowing nothing.
 //!
 //! **Headless has no chord**, structurally: no physical input device exists
-//! there, so nothing can hold a key. The off-switch is a nested-mode
-//! guarantee, which is also why it cannot be covered on a GPU-less CI
-//! runner.
+//! there, so nothing can hold a key. The *detection* half — a human pressing
+//! and holding a real key — is therefore a nested-mode guarantee only, and
+//! stays that way; it is documented, workstation-only, in
+//! `shim/docs/firefox.md`.
+//!
+//! # The test injector proves the *consequence* half on a GPU-less CI runner
+//! (issue #109)
+//!
+//! What CI *can* prove against a real app, headless, is everything
+//! downstream of a completed chord: that [`apply`] really does revoke every
+//! grant, seal the table, deny every pending petition, and that the real
+//! app then receives no further seat events — the actual security property,
+//! as opposed to the input-device mechanics that produce the trigger. The
+//! `dead-man-injector` cargo feature (never enabled in a deployment build —
+//! same posture as [`crate::petitions`]'s `scripted-consent`) compiles a
+//! `SIGUSR1` handler into the **headless** backend that synthesizes a
+//! [`Trigger`] using the session's real configured chord/hold and calls the
+//! exact same [`crate::session::Runtime::apply_dead_man`] entry point a
+//! completed physical hold would. It is not a second, weaker revocation
+//! path: it is the *same* embedder call, fed by a signal instead of a timer,
+//! so what it proves about `apply`'s effect is exactly as strong as the
+//! nested path's. What it does **not** prove — and cannot, because headless
+//! has no input device to test it with — is that a real hold of a real key
+//! reaches [`DeadManSwitch::observe_event`]/[`DeadManSwitch::fire_if_due`] in
+//! the first place. That half stays nested-only.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;

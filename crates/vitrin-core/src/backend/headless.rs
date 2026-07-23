@@ -59,6 +59,7 @@ use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use tracing::info;
 
 use crate::consent::{ConsentSurface, TrustedIndicator};
+use crate::deadman::DeadManConfig;
 use crate::input::{InputRouter, NoopHook};
 use crate::recorder::Recorder;
 use crate::scene::Scene;
@@ -151,7 +152,19 @@ fn readback(
 /// because calloop fixes one state type per loop and the whole kernel — the
 /// recorder with it — has to live in that state. It is handed straight back,
 /// so the run's footer is still written by the code that opened the log.
-pub fn run(size: (u32, u32), seed: RuntimeSeed) -> (Recorder, Result<(), Box<dyn Error>>) {
+///
+/// `dead_man` is the session's configured chord/hold — accepted here so both
+/// backends' `run` have the same signature, and read past that only by a
+/// `dead-man-injector` build (issue #109): a plain build has no physical
+/// input device and, structurally, no way to *fire* the switch, so it never
+/// looks at this beyond naming it in the parameter list. See the
+/// `dead-man-injector` block in `run_inner` and [`crate::deadman`]'s module
+/// docs ("the test injector proves the consequence half").
+pub fn run(
+    size: (u32, u32),
+    dead_man: DeadManConfig,
+    seed: RuntimeSeed,
+) -> (Recorder, Result<(), Box<dyn Error>>) {
     // The seed is consumed the moment the state is built; until then it is
     // still ours, and either way the recorder must come back so `run_session`
     // can write the footer it owes. Threading it through two slots keeps `?`
@@ -159,7 +172,7 @@ pub fn run(size: (u32, u32), seed: RuntimeSeed) -> (Recorder, Result<(), Box<dyn
     // four-line `match` (the nested backend does exactly the same).
     let mut seed = Some(seed);
     let mut recovered = None;
-    let result = run_inner(size, &mut seed, &mut recovered);
+    let result = run_inner(size, dead_man, &mut seed, &mut recovered);
     let recorder = recovered
         .or_else(|| seed.take().map(|seed| seed.recorder))
         .expect("the seed is either still unconsumed or its recorder was recovered");
@@ -168,6 +181,8 @@ pub fn run(size: (u32, u32), seed: RuntimeSeed) -> (Recorder, Result<(), Box<dyn
 
 fn run_inner(
     size: (u32, u32),
+    #[cfg_attr(not(feature = "dead-man-injector"), allow(unused_variables))]
+    dead_man: DeadManConfig,
     seed: &mut Option<RuntimeSeed>,
     recovered: &mut Option<Recorder>,
 ) -> Result<(), Box<dyn Error>> {
@@ -191,6 +206,38 @@ fn run_inner(
     loop_handle.insert_source(
         crate::lifecycle::child_signal_source()?,
         |_event, _, state: &mut HeadlessState| session::reap_realm(state),
+    )?;
+
+    // The dead-man test injector (issue #109), compiled in only for a
+    // `dead-man-injector` build and never for a deployment one (same posture
+    // as `crate::petitions`' `scripted-consent`). Headless has no physical
+    // input device to hold the configured chord on
+    // (`crate::deadman`'s module docs), so CI's stand-in for a completed
+    // hold is a signal instead of a keypress -- delivered here through the
+    // exact same `Runtime::apply_dead_man` entry point the nested backend's
+    // `DeadManHost::on_trigger` calls for a real one, so what this proves
+    // about revocation is exactly as strong as the nested path's. Blocked
+    // process-wide by `main::block_loop_signals` before this runs, under the
+    // same feature gate, so this `Signals::new` only creates the descriptor
+    // that reads what is already blocked.
+    #[cfg(feature = "dead-man-injector")]
+    loop_handle.insert_source(
+        Signals::new(&[Signal::SIGUSR1])?,
+        move |_event, _, state: &mut HeadlessState| {
+            let trigger = crate::deadman::Trigger {
+                chord: dead_man.chord.name(),
+                held: dead_man.hold,
+            };
+            tracing::warn!(
+                chord = trigger.chord,
+                held_ms = trigger.held.as_millis(),
+                "dead-man-injector: SIGUSR1 received, synthesizing a completed chord \
+                 (issue #109; this build path never ships)"
+            );
+            state
+                .runtime
+                .apply_dead_man(&trigger, std::time::Instant::now());
+        },
     )?;
 
     let physical_size: Size<i32, Physical> = (width as i32, height as i32).into();
@@ -1222,6 +1269,238 @@ mod tests {
             clean_output,
             "a dismissed prompt must leave no pixels behind"
         );
+    }
+
+    /// The P1.7.1 occlusion proof (issue #109, M1.4 exit gate), against a
+    /// REAL app: the consent overlay really occludes a real app's content on
+    /// the human-visible side, and is really absent from the agent-visible
+    /// capture -- proven against the real C shim (E6, P1.6.2) and a real
+    /// `click-target` client, not the in-process mock shim every other test
+    /// in this module drives.
+    /// `a_prompt_reaches_human_visible_output_but_never_a_capture` above pins
+    /// the identical property against a synthetic committed surface; this is
+    /// its real-app counterpart, in the same spirit -- and following the
+    /// exact same opt-in discipline -- as `shim.rs`'s
+    /// `c_shim_conforms_to_the_real_core` cross-track check.
+    ///
+    /// **Opt-in, but never silently so under CI**, identically to that check:
+    /// unset `VITRIN_C_SHIM_BIN` skips outside CI, and FAILS inside it unless
+    /// `VITRIN_C_SHIM_CONFORMANCE_SKIP` declares the gap (the `rust` job,
+    /// which has no C toolchain). The `conformance` job's
+    /// `cargo test -p vitrin-core c_shim` filter picks this test up by name.
+    /// Run it locally exactly as that test's doc says, with `click-target`
+    /// (co-built with the shim, `shim/meson.build`) beside the built shim:
+    ///
+    /// ```text
+    /// meson setup shim/build shim && meson compile -C shim/build
+    /// VITRIN_C_SHIM_BIN=$PWD/shim/build/vitrin-shim cargo test -p vitrin-core c_shim
+    /// ```
+    #[test]
+    fn c_shim_consent_prompt_occludes_the_human_visible_output_but_never_the_real_apps_capture() {
+        use crate::consent::tests::prompt_fixture;
+        use crate::shim::{ShimConfig, ShimServer};
+
+        let Some(shim_bin) = std::env::var_os("VITRIN_C_SHIM_BIN") else {
+            assert!(
+                std::env::var_os("CI").is_none()
+                    || std::env::var_os("VITRIN_C_SHIM_CONFORMANCE_SKIP").is_some(),
+                "VITRIN_C_SHIM_BIN is unset in CI, so the C shim was never built and this \
+                 real-app occlusion check proved nothing. Build the shim and point the variable \
+                 at it (see the `conformance` job in .github/workflows/ci.yml), or set \
+                 VITRIN_C_SHIM_CONFORMANCE_SKIP=1 in a job that cannot build C."
+            );
+            eprintln!("skipping: set VITRIN_C_SHIM_BIN to the built shim/build/vitrin-shim");
+            return;
+        };
+        let shim_bin = std::path::PathBuf::from(shim_bin);
+        assert!(
+            shim_bin.is_file(),
+            "VITRIN_C_SHIM_BIN does not name a file: {}",
+            shim_bin.display()
+        );
+
+        // `click-target` is co-built beside the shim unconditionally (a bare
+        // wl_shm client, no optional dep -- `shim/meson.build`), resolved the
+        // same way the Python real-app ladder resolves it
+        // (`tests/integration/test_real_actuation.py`'s `_resolve_sibling`),
+        // with the same override escape hatch for a nonstandard layout.
+        let app_bin = std::env::var_os("VITRIN_CLICK_TARGET_APP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                shim_bin
+                    .parent()
+                    .expect("VITRIN_C_SHIM_BIN has a parent directory")
+                    .join("click-target")
+            });
+        assert!(
+            app_bin.is_file(),
+            "no click-target beside the C shim ({}), and VITRIN_C_SHIM_BIN is set. It is \
+             co-built with the shim (shim/meson.build); rebuild it, or set \
+             VITRIN_CLICK_TARGET_APP.",
+            shim_bin
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+
+        let _fd = crate::capture::tests::fd_lock();
+        let base = crate::spawn::tests::scratch();
+        const VW: u32 = 640;
+        const VH: u32 = 480;
+
+        let paths = crate::spawn::SpawnPaths::under(&base, &shim_bin);
+        let env_allow: Vec<String> = [
+            "WLR_BACKENDS",
+            "WLR_RENDERER",
+            "WLR_RENDERER_ALLOW_SOFTWARE",
+            "WLR_LIBINPUT_NO_DEVICES",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (mut recorder, _log) =
+            crate::recorder::tests::scratch_recorder("c-shim-consent-occlusion");
+        let realm = crate::realm::tests::realm_with_spawn(
+            "realm-0",
+            &app_bin,
+            &["--run-ms".to_string(), "40000".to_string()],
+            &env_allow,
+        );
+        let mut spawned =
+            crate::spawn::spawn_realm_with_env(&realm, &paths, &mut recorder, |name| match name {
+                "WLR_BACKENDS" => Some("headless".into()),
+                "WLR_RENDERER" => Some("pixman".into()),
+                "WLR_RENDERER_ALLOW_SOFTWARE" => Some("1".into()),
+                "WLR_LIBINPUT_NO_DEVICES" => Some("1".into()),
+                _ => None,
+            })
+            .expect("the C shim must spawn");
+
+        let mut server = ShimServer::new(ShimConfig {
+            realm: "realm-0".into(),
+            width: VW,
+            height: VH,
+        });
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessView> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+        )
+        .expect("headless state under pixman");
+        server
+            .send_configure(&mut |frame| spawned.connection_mut().send_message(frame, None))
+            .expect("configure is the core's first message");
+
+        // A watchdog: the receive below is blocking, so a wedged real
+        // shim/app must fail this test rather than hang the suite -- the
+        // same posture `shim.rs`'s cross-track check takes.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let done = std::sync::Arc::clone(&done);
+            let pid = spawned.pid();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + crate::spawn::tests::DEADLINE;
+                while std::time::Instant::now() < deadline {
+                    if done.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+            })
+        };
+
+        // Drive the real shim until click-target's REAL content lands --
+        // not merely "a commit happened" -- so the human-visible/capture
+        // split below is checked against real app pixels, and could not be
+        // vacuously satisfied by an empty realm view.
+        let background = test_pattern::render(VW, VH);
+        let clean_view = loop {
+            let Some(msg) = spawned
+                .connection_mut()
+                .recv_message()
+                .expect("the C shim's framing must be readable")
+            else {
+                panic!("the C shim closed the connection before painting real content");
+            };
+            let conn = spawned.connection_mut();
+            let committed = server
+                .handle_message(msg, &mut state.scene, None, &mut |frame| {
+                    conn.send_message(frame, None)
+                })
+                .expect("the C shim must not violate the shim protocol");
+            if committed {
+                state.redraw().expect("composite the shim's commit");
+                let view = state.latest_frame_rgba().expect("readback");
+                if view != background {
+                    break view;
+                }
+            }
+        };
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        watchdog.join().expect("watchdog thread");
+        let clean_output = state.latest_output_rgba().expect("readback");
+
+        // The prompt goes up, over the real app's real content.
+        state.output.consent.show_for_test(prompt_fixture());
+        state.redraw().expect("recomposite with the prompt up");
+
+        // --- Human-visible side: the prompt is really on the display, over
+        // the real app. ---
+        let output = state.latest_output_rgba().expect("readback");
+        assert_ne!(
+            output, clean_output,
+            "a prompt over a real app's content must change the human-visible output"
+        );
+        let card = crate::consent::render::rasterize(&prompt_fixture());
+        let (cx, cy) = state
+            .output
+            .consent
+            .card_origin(VW, VH)
+            .expect("a prompt is up, so the card has an origin");
+        assert!(cx >= 0 && cy >= 0, "the card fits in a {VW}x{VH} view");
+        for row in 0..card.height {
+            let d = ((cy as u32 + row) as usize * VW as usize + cx as usize)
+                * test_pattern::BYTES_PER_PIXEL;
+            let s = row as usize * card.width as usize * test_pattern::BYTES_PER_PIXEL;
+            let run = card.width as usize * test_pattern::BYTES_PER_PIXEL;
+            assert_eq!(
+                &output[d..d + run],
+                &card.rgba[s..s + run],
+                "card row {row} must appear verbatim in the human-visible output, over the \
+                 real app"
+            );
+        }
+
+        // --- Agent side: the capture is the real app's content, unmoved. ---
+        let view = state.latest_frame_rgba().expect("readback");
+        assert_eq!(
+            view, clean_view,
+            "a prompt being up must not move a single pixel of the real app's captured content"
+        );
+        assert_ne!(view, output, "...and the two really do differ now");
+        // Pixel-level: no run of the card's bytes survives anywhere in the
+        // agent-visible capture -- catches a partial leak an equality check
+        // on the whole buffer could not.
+        let card_row = &card.rgba[..card.width as usize * test_pattern::BYTES_PER_PIXEL];
+        assert!(
+            !view.windows(card_row.len()).any(|w| w == card_row),
+            "a row of consent-prompt pixels reached the capture of a real app"
+        );
+
+        // Orderly teardown of the real shim/app: SIGTERM (not SIGKILL) so
+        // the shim reaps click-target itself (P1.5.2), exactly as
+        // `c_shim_conforms_to_the_real_core` tears down.
+        if let Some(pid) = rustix::process::Pid::from_raw(spawned.pid() as i32) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
+        let _ = spawned.child_mut().wait();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The sharing proof for the output stage: the retained human-visible

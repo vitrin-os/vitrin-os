@@ -119,7 +119,11 @@ mod dmabuf;
 /// `deadman::apply` against the session's real grant table and petition
 /// registry (`session::Runtime::apply_dead_man`) instead of being logged and
 /// dropped. Headless has no physical input device, structurally, so it has no
-/// chord to hold -- see `Action::RunHeadless::dead_man`.
+/// chord to *hold* -- see `Action::RunHeadless::dead_man`. Since issue #109,
+/// a `dead-man-injector`-feature build of the headless backend can still
+/// *apply* a synthesized trigger through that same entry point on SIGUSR1 --
+/// the CI stand-in for the hold, never compiled into a deployment binary
+/// (`deadman`'s module docs, "the test injector proves the consequence half").
 mod deadman;
 /// Input intake & routing (P1.3.7): origin tagging at intake (backward
 /// requirement B2), view→surface coordinate mapping, and the preemption
@@ -409,9 +413,11 @@ enum Action {
         /// Parsed and validated even here, so the same command line is
         /// accepted or refused identically in both modes -- the `--consent`
         /// precedent, which headless also accepts although it can prompt
-        /// nobody. Headless then ignores it: it has no physical input
-        /// device, and that absence is structural rather than a runtime
-        /// check ([`crate::input`]), so there is no chord for it to watch.
+        /// nobody. Headless has no physical input device, and that absence
+        /// is structural rather than a runtime check ([`crate::input`]), so
+        /// there is no chord for it to *hold* here. A `dead-man-injector`
+        /// build still reads this to name the synthesized trigger's
+        /// chord/hold (issue #109) -- see `backend::headless::run`.
         dead_man: DeadManConfig,
     },
     Help,
@@ -770,9 +776,12 @@ fn main() -> ExitCode {
             shim,
             capture_dump,
             // Validated at parse time so both modes accept the same command
-            // line, then unused: headless has no physical input device to
-            // hold a chord on (`Action::RunHeadless::dead_man`).
-            dead_man: _,
+            // line. Headless has no physical input device to hold a chord
+            // on (`Action::RunHeadless::dead_man`), so a plain build never
+            // reads this past `backend::headless::run`'s signature; a
+            // `dead-man-injector` build reads it to name the chord/hold a
+            // SIGUSR1-synthesized trigger reports (issue #109).
+            dead_man,
         } => {
             init_tracing();
             run_session(
@@ -782,7 +791,7 @@ fn main() -> ExitCode {
                 realm,
                 shim,
                 capture_dump,
-                move |seed| backend::headless::run(size, seed),
+                move |seed| backend::headless::run(size, dead_man, seed),
             )
         }
     }
@@ -822,6 +831,13 @@ fn main() -> ExitCode {
 /// its creator's. The backends' `Signals::new` calls then re-block what is
 /// already blocked (a no-op) and create the descriptor that actually reads
 /// them.
+///
+/// A `dead-man-injector` build additionally blocks `SIGUSR1` here, for the
+/// same reason as the other three: the headless backend's injector
+/// (`backend::headless`, issue #109) reads it through its own `Signals`
+/// source, and that source is only reachable if no earlier thread has
+/// already taken the signal's default disposition (terminate the process —
+/// `signal(7)`'s table for `SIGUSR1`).
 fn block_loop_signals() -> std::io::Result<()> {
     // SAFETY: `sigset_t` is a plain bitset that `sigemptyset` initializes
     // before any read; the zeroed value is never observed. This runs on the
@@ -835,6 +851,8 @@ fn block_loop_signals() -> std::io::Result<()> {
         libc::sigaddset(&mut set, libc::SIGINT);
         libc::sigaddset(&mut set, libc::SIGTERM);
         libc::sigaddset(&mut set, libc::SIGCHLD);
+        #[cfg(feature = "dead-man-injector")]
+        libc::sigaddset(&mut set, libc::SIGUSR1);
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut())
     };
     if rc != 0 {

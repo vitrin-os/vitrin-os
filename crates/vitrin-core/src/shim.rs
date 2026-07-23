@@ -172,7 +172,7 @@ use vitrin_protocol::generated::vitrin_shim_surface as shim_surface;
 use vitrin_protocol::generated::vitrin_view::Format;
 
 use crate::dmabuf::{CopyMeter, DmabufImporter, DmabufSpec, ImportDenied};
-use crate::scene::{Scene, SurfaceContent, BYTES_PER_PIXEL};
+use crate::scene::{DamageRect, Scene, SurfaceContent, BYTES_PER_PIXEL};
 
 /// The shim-session bootstrap object: implicit object 1 on a shim
 /// connection, never created by a message (conventions section 3).
@@ -332,35 +332,6 @@ struct PendingBuffer {
     width: u32,
     height: u32,
     stride: u32,
-}
-
-/// One pending damage rectangle, verbatim off the wire (clamping is the
-/// composition side's business; out-of-bounds is a non-error per the IDL).
-#[derive(Debug, Clone, Copy)]
-struct DamageRect {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-}
-
-impl DamageRect {
-    /// Fold `other` into `self` as a bounding box (saturating: damage is a
-    /// hint, over-approximation is always legal).
-    fn union(&mut self, other: DamageRect) {
-        let x2 = self
-            .x
-            .saturating_add(self.width)
-            .max(other.x.saturating_add(other.width));
-        let y2 = self
-            .y
-            .saturating_add(self.height)
-            .max(other.y.saturating_add(other.height));
-        self.x = self.x.min(other.x);
-        self.y = self.y.min(other.y);
-        self.width = x2.saturating_sub(self.x);
-        self.height = y2.saturating_sub(self.y);
-    }
 }
 
 /// Per-surface protocol state: the double-buffered pending set.
@@ -800,10 +771,11 @@ impl ShimServer {
     }
 
     /// `commit`: atomically latch pending state. The one call site of
-    /// [`Scene::commit`] on the shim path — copy-in happens entirely here,
-    /// before the scene changes, so composition never observes a partially
-    /// applied frame — and the one call site of [`DmabufImporter::import`],
-    /// so zero-copy content latches at exactly the same seam.
+    /// [`Scene::commit_with_damage`] on the shim path — copy-in happens
+    /// entirely here, before the scene changes, so composition never
+    /// observes a partially applied frame — and the one call site of
+    /// [`DmabufImporter::import`], so zero-copy content latches at exactly
+    /// the same seam.
     fn handle_commit<F>(
         &mut self,
         surface_id: u32,
@@ -824,17 +796,29 @@ impl ShimServer {
 
         // Damage is latched (and logged — per-rectangle wire travel exists
         // so damage-only updates are verifiable in the core log) whether or
-        // not a new buffer is pending.
-        let damage = std::mem::take(&mut state.pending_damage);
+        // not a new buffer is pending. Folded to one bounding box here — the
+        // one hint [`Scene::commit_with_damage`] wants — rather than handing
+        // the whole `Vec` further down; an empty `Vec` (no `damage` request
+        // this commit — a legal but coarse shim) folds to `None`, which the
+        // scene treats as "cannot be bounded", never as "nothing changed".
+        let damage_rects = std::mem::take(&mut state.pending_damage);
+        let damage_hint = damage_rects.iter().copied().reduce(|mut acc, r| {
+            acc.union(r);
+            acc
+        });
         tracing::trace!(
             surface = surface_id,
-            damage_rects = damage.len(),
+            damage_rects = damage_rects.len(),
             "shim commit"
         );
 
         match state.pending_buffer.take() {
             // Repaint: no new attach — re-present the current buffer with
             // the new damage. Legal, no buffer_done (no attach to answer).
+            // Nothing about the *content* changed (the same buffer is being
+            // re-presented), so there is nothing for the scene's damage
+            // bookkeeping to accumulate here — only a new attach's copy-in
+            // produces content the scene has not already seen.
             None => {}
             Some(pending) => {
                 let buffer_id = pending.buffer_id;
@@ -843,7 +827,7 @@ impl ShimServer {
                 // module docs' release semantics); any deferred release it
                 // triggered has already been sent, in attach order.
                 if let Some(status) =
-                    self.apply_buffer(surface_id, pending, scene, importer, send)?
+                    self.apply_buffer(surface_id, pending, damage_hint, scene, importer, send)?
                 {
                     let event = shim_surface::events::BufferDone { buffer_id, status };
                     send(&event.encode(surface_id))?;
@@ -872,6 +856,7 @@ impl ShimServer {
         &mut self,
         surface_id: u32,
         pending: PendingBuffer,
+        damage_hint: Option<DamageRect>,
         scene: &mut Scene,
         importer: Option<&mut dyn DmabufImporter>,
         send: &mut F,
@@ -880,6 +865,9 @@ impl ShimServer {
         F: FnMut(&[u8]) -> Result<(), TransportError>,
     {
         if pending.kind == shim_surface::Kind::Dmabuf {
+            // The zero-copy path has no separate "upload" step to limit —
+            // the GPU samples the client's own buffer directly — so the
+            // damage hint has nothing to do here.
             return self.apply_dmabuf(surface_id, pending, importer, send);
         }
 
@@ -919,7 +907,7 @@ impl ShimServer {
         // half-applied commit.
         let content = SurfaceContent::from_rgba(rgba, pending.width, pending.height)
             .map_err(|e| ShimViolation::InvalidBuffer(e.to_string()))?;
-        scene.commit(content);
+        scene.commit_with_damage(content, damage_hint);
 
         // CPU content replaced any retained zero-copy buffer: retire the
         // GPU side (synced — GPU-done is proven, not assumed) and send the

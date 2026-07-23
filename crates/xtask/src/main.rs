@@ -472,7 +472,10 @@ fn bless(filter: Option<&str>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// `cargo xtask demo [--headless]` -- the P1.8.4 demo agent / M1.5 acceptance
+// `cargo xtask demo [--headless]` -- the P1.8.4/P1.8.7 demo agent, rewired
+// onto the real per-app shim (issue #110): every venue runs
+// vitrind -> vitrin-shim -> a real app, never vitrin-mock-shim. This is
+// M1.5's named acceptance gate.
 // ---------------------------------------------------------------------------
 
 /// The demo identity and its pre-shared token. Must match
@@ -483,15 +486,35 @@ fn bless(filter: Option<&str>) -> Result<()> {
 const DEMO_IDENTITY: &str = "vitrin://local/agent/demo";
 const DEMO_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// Headless virtual-output size. Small and fixed: it keeps captures cheap and
-/// the URL-bar locator's nominal coordinate comfortably in bounds. Matches the
-/// integration harness's default so the two agree on frame geometry.
-const HEADLESS_SIZE: &str = "320x200";
+/// Headless virtual-output size. Large enough for `weston-terminal`'s chrome
+/// to lay out in (matches `tests/integration/test_real_app.py`'s
+/// `REALM_SIZE`), small enough to keep captures cheap.
+const HEADLESS_SIZE: &str = "640x480";
 
-/// Frames the mock shim animates for. A CPU budget, not a duration (headless
-/// has no output clock): enough to outlive the demo's before/after capture
-/// pair and no longer. Mirrors `harness.ANIMATE_FRAMES`.
-const DEMO_ANIMATE_FRAMES: u32 = 1200;
+/// The headless / pure-software render selectors the real C shim's wlroots
+/// backend needs -- CI (and most developer machines running the headless
+/// venue) has no GPU. The shim is *always* internally headless (`shim/README.md`:
+/// "It uses the headless backend and never touches real hardware"), so these
+/// apply in the nested venue too, not only headless. Reaches the shim only
+/// through the realm's `env_allow` (the one route a realm's environment may
+/// grow by), seeded into the core's own environment for the allowlist to copy
+/// from -- mirroring `tests/integration/harness.py`'s `WLR_ENV` /
+/// `test_real_app.py` exactly, so the demo and the integration suite can never
+/// disagree about what the shim needs to render without a GPU.
+const WLR_ENV: [(&str, &str); 4] = [
+    ("WLR_BACKENDS", "headless"),
+    ("WLR_RENDERER", "pixman"),
+    ("WLR_RENDERER_ALLOW_SOFTWARE", "1"),
+    ("WLR_LIBINPUT_NO_DEVICES", "1"),
+];
+
+/// The headless venue's app: a trivial, genuinely real Wayland client with
+/// visible chrome -- the same rung `tests/integration/test_real_app.py` and
+/// the shim's own acceptance scripts (`shim/tests/acceptance/app_spawn.sh`)
+/// use. Never `vitrin-mock-shim` (issue #110): the mock shim is a unit-test
+/// fixture only, and must appear in no demo venue. `VITRIN_DEMO_APP`
+/// overrides the choice; otherwise the first of these found on `PATH` wins.
+const HEADLESS_APP_CANDIDATES: [&str; 2] = ["weston-terminal", "foot"];
 
 /// Default Firefox ESR path for the nested venue. Overridable with
 /// `VITRIN_DEMO_FIREFOX` because the binary's name and location vary by distro
@@ -528,35 +551,46 @@ fn demo(headless: bool) -> Result<()> {
     fs::set_permissions(&principals, Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", principals.display()))?;
 
-    // The core-inserted shim (issue #103): since the core execs a `--shim`
-    // binary that holds fd 3 and conveys the realm's `command` app in argv,
-    // both venues pass one. The mock shim is that binary here -- the real
-    // wlroots shim (#104/#110) is out of this task's scope -- so `cargo xtask
-    // demo` stays consistent with the core's contract even though the nested
-    // venue does not yet render Firefox through it.
-    let mock_shim = bin_dir.join("vitrin-mock-shim");
-    if !mock_shim.is_file() {
-        bail!(
-            "vitrin-mock-shim not found at {} -- run `cargo build --workspace` first",
-            mock_shim.display()
-        );
-    }
+    // The core-inserted shim (issue #103): the core execs a `--shim` binary
+    // that holds fd 3 and conveys the realm's `command` app in argv; that
+    // binary then fork/execs the app inside its own private Wayland socket
+    // (issue #104/#105). This is the REAL wlroots shim in both venues -- the
+    // headless venue used to alias `vitrin-mock-shim` as both the `--shim`
+    // binary and the realm's `command` (an animated buffer standing in for
+    // the app), and the nested venue passed real Firefox as `command` with
+    // NO shim in between at all, which the core cannot actually run (issue
+    // #110: "the core execs it as a shim on fd 3 with an unbound
+    // WAYLAND_DISPLAY -- structurally impossible"). Neither is true anymore:
+    // `vitrin-mock-shim` appears in no venue below.
+    let shim_bin = resolve_shim_bin(&root)?;
 
     // Assemble the two venue-specific pieces: the realm config, the core's
     // argv, the environment vitrind runs under, and where its socket lands.
+    // The real shim is ALWAYS internally headless (`shim/README.md`), in
+    // both venues, so `WLR_ENV` is set on the core's own environment here --
+    // the source each venue's realm `env_allow` below copies it from -- and
+    // every venue passes the real shim as `--shim`.
     let mut core_cmd = Command::new(&vitrind);
     core_cmd.env("RUST_LOG", "info");
-    core_cmd.args(["--shim".as_ref(), mock_shim.as_os_str()]);
+    core_cmd.args(["--shim".as_ref(), shim_bin.as_os_str()]);
+    for (name, value) in WLR_ENV {
+        core_cmd.env(name, value);
+    }
 
     let socket: PathBuf = if headless {
-        // The mock shim stands in for the app: `--seat` so seat events deliver,
-        // `--animate` so the two captures differ across the actuation sequence.
+        // A real, trivial Wayland client -- never the mock shim -- run
+        // through the real C shim. `env_allow` is the only route a realm's
+        // environment may grow by, so it must name exactly the WLR_* set the
+        // shim's software-render backend needs (mirrors
+        // `tests/integration/test_real_app.py`'s `WLR_ENV`/`env_allow`).
+        let app_bin = resolve_headless_app()?;
         fs::write(
             &realm,
             format!(
-                "[[realm]]\nid = \"realm-0\"\ncommand = \"{}\"\n\
-                 args = [\"--serve\", \"--seat\", \"--animate\", \"{DEMO_ANIMATE_FRAMES}\"]\n",
-                mock_shim.display()
+                "[[realm]]\nid = \"realm-0\"\ncommand = \"{}\"\nargs = []\n\
+                 env_allow = {}\n",
+                app_bin.display(),
+                toml_string_array(WLR_ENV.iter().map(|(name, _)| *name)),
             ),
         )
         .with_context(|| format!("writing {}", realm.display()))?;
@@ -575,31 +609,66 @@ fn demo(headless: bool) -> Result<()> {
             .env("XDG_RUNTIME_DIR", &work);
         work.join("vitrin-0").join("core.sock")
     } else {
-        // Nested: a real Firefox ESR in the realm. Correct-by-construction; a
-        // machine with a display and a browser runs it, CI never does.
+        // Nested: a real Firefox ESR, run through the real C shim exactly as
+        // `tests/integration/test_real_firefox.py` and `shim/docs/firefox.md`
+        // §5's nested walkthrough do -- fresh per-run profile, software
+        // WebRender (the shim's Wayland surface has no GPU path into it yet;
+        // issue #117 tracks dmabuf zero-copy), no crash reporter, no a11y
+        // bus. Correct-by-construction; a machine with a display and a
+        // browser runs it, CI never does.
         let firefox = std::env::var_os("VITRIN_DEMO_FIREFOX")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_FIREFOX));
-        // Firefox needs Wayland selection and the session bus. env_allow copies
-        // NAMES from vitrind's own environment, so the core must carry the two
-        // it sets and pass DBUS through from the ambient session (realm.toml's
-        // Firefox note / plan P1.6.4).
+        let profile = work.join("firefox-profile");
+        fs::create_dir_all(&profile).with_context(|| format!("creating {}", profile.display()))?;
+
+        // `--no-remote` matters here, not just hygiene: without it a
+        // `firefox --new-window` on a machine that already has Firefox
+        // running would hand the window to that ALREADY-RUNNING host
+        // instance over its own remoting protocol -- never touching the
+        // shim's confined process at all, silently defeating the whole
+        // rewire this task exists to do. `env_allow` copies NAMES from
+        // vitrind's own environment (the only route a realm's environment
+        // grows by): the Wayland/session names below, the Firefox
+        // software-render names this function sets on `core_cmd`, and the
+        // WLR_* names the shim itself needs.
+        let firefox_env: [(&str, &str); 5] = [
+            ("MOZ_ACCELERATED", "0"),
+            ("LIBGL_ALWAYS_SOFTWARE", "1"),
+            ("MOZ_CRASHREPORTER_DISABLE", "1"),
+            ("GTK_A11Y", "none"),
+            ("NO_AT_BRIDGE", "1"),
+        ];
+        let env_allow = toml_string_array(
+            [
+                "HOME",
+                "LANG",
+                "XDG_SESSION_TYPE",
+                "MOZ_ENABLE_WAYLAND",
+                "GDK_BACKEND",
+                "DBUS_SESSION_BUS_ADDRESS",
+            ]
+            .into_iter()
+            .chain(firefox_env.iter().map(|(name, _)| *name))
+            .chain(WLR_ENV.iter().map(|(name, _)| *name)),
+        );
         fs::write(
             &realm,
             format!(
                 "[[realm]]\nid = \"realm-0\"\ncommand = \"{}\"\n\
-                 args = [\"--new-window\", \"about:blank\"]\n\
-                 env_allow = [\"HOME\", \"LANG\", \"XDG_SESSION_TYPE\", \
-                 \"MOZ_ENABLE_WAYLAND\", \"GDK_BACKEND\", \"DBUS_SESSION_BUS_ADDRESS\"]\n",
-                firefox.display()
+                 args = [\"--profile\", \"{}\", \"--no-remote\", \"--new-window\", \"about:blank\"]\n\
+                 env_allow = {env_allow}\n",
+                firefox.display(),
+                profile.display(),
             ),
         )
         .with_context(|| format!("writing {}", realm.display()))?;
 
         // Nested draws its window on the host compositor, so vitrind keeps the
         // host session's environment (its WAYLAND_DISPLAY, its XDG_RUNTIME_DIR)
-        // and the socket lands under that runtime dir. The two Wayland vars are
-        // injected here so env_allow above has something to copy.
+        // and the socket lands under that runtime dir. The two Wayland vars
+        // and the Firefox render selectors are injected here so env_allow
+        // above has something to copy.
         let xdg = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
             anyhow::anyhow!(
                 "nested demo needs XDG_RUNTIME_DIR set (the host session's runtime dir, \
@@ -613,6 +682,9 @@ fn demo(headless: bool) -> Result<()> {
             .args(["--recorder".as_ref(), recorder.as_os_str()])
             .env("MOZ_ENABLE_WAYLAND", "1")
             .env("GDK_BACKEND", "wayland");
+        for (name, value) in firefox_env {
+            core_cmd.env(name, value);
+        }
         PathBuf::from(xdg).join("vitrin-0").join("core.sock")
     };
 
@@ -652,7 +724,7 @@ fn demo(headless: bool) -> Result<()> {
         Err(err) => {
             // Reap the core we already spawned before propagating, so a failure
             // to launch the demo agent (e.g. `python3` off PATH) never leaks a
-            // live vitrind + mock-shim -- same guard as the socket-wait branch.
+            // live vitrind + shim -- same guard as the socket-wait branch.
             terminate(&mut core);
             return Err(err).with_context(|| format!("running {}", demo_py.display()));
         }
@@ -676,15 +748,98 @@ fn demo(headless: bool) -> Result<()> {
     }
 }
 
-/// The directory holding the sibling `vitrind`/`vitrin-mock-shim` binaries:
-/// this `xtask` executable's own directory. Resolving from `current_exe`
-/// honors `CARGO_TARGET_DIR` and whatever profile built us, without guessing
+/// The directory holding the sibling `vitrind` binary: this `xtask`
+/// executable's own directory. Resolving from `current_exe` honors
+/// `CARGO_TARGET_DIR` and whatever profile built us, without guessing
 /// `target/debug` from the workspace root.
 fn binary_dir() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("locating the running xtask binary")?;
     exe.parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow::anyhow!("xtask binary {} has no parent directory", exe.display()))
+}
+
+/// A TOML inline array of basic string literals, for a realm's `env_allow`.
+/// Mirrors `tests/integration/harness.py`'s `_toml_string_array`; a render
+/// selector's NAME is a fixed literal here (never a program path or anything
+/// else that could carry a quote), so no escaping is needed.
+fn toml_string_array<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let joined = names
+        .into_iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{joined}]")
+}
+
+/// True if `path` names a regular, executable file.
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+/// The first directory on `PATH` that holds an executable named `name`, or
+/// `None`. A minimal, dependency-free stand-in for the `which` command --
+/// this crate pulls in no new crate for it (matching its one-dependency
+/// posture: `anyhow` plus the `rustix` this task's own SIGTERM path needs).
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Resolve the real per-app Wayland shim (issue #103/#104): a wlroots
+/// compositor, Meson-built outside the Cargo workspace, that the core execs
+/// to hold fd 3 and which fork/execs the realm's `command` app inside its own
+/// private Wayland socket. `VITRIN_C_SHIM_BIN` overrides the path -- the same
+/// variable name `tests/integration/harness.py`'s real-app gates and
+/// `crates/vitrin-core/src/shim.rs`'s cross-track conformance test use --
+/// defaulting to the checked-in build tree's usual output path. Never
+/// `vitrin-mock-shim`: that binary is a unit-test fixture only (issue #110).
+fn resolve_shim_bin(root: &Path) -> Result<PathBuf> {
+    let path = std::env::var_os("VITRIN_C_SHIM_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("shim/build/vitrin-shim"));
+    if !is_executable(&path) {
+        bail!(
+            "real vitrin-shim not found at {} -- build it (`meson setup shim/build shim && \
+             meson compile -C shim/build`) or point VITRIN_C_SHIM_BIN at an already-built one",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+/// Resolve the headless venue's app (issue #110): `VITRIN_DEMO_APP` overrides
+/// it; otherwise the first of [`HEADLESS_APP_CANDIDATES`] found on `PATH`
+/// wins. Both are genuinely real Wayland clients -- unlike the shim, whose
+/// path has one supported binary, a demo should not hard-fail a developer who
+/// has `foot` but not `weston`, so this searches rather than picking one name.
+fn resolve_headless_app() -> Result<PathBuf> {
+    if let Some(value) = std::env::var_os("VITRIN_DEMO_APP") {
+        let path = PathBuf::from(&value);
+        if is_executable(&path) {
+            return Ok(path);
+        }
+        bail!(
+            "VITRIN_DEMO_APP={} does not name an executable file",
+            path.display()
+        );
+    }
+    for name in HEADLESS_APP_CANDIDATES {
+        if let Some(path) = find_on_path(name) {
+            return Ok(path);
+        }
+    }
+    bail!(
+        "no headless demo app found on PATH (tried: {}) -- install weston (for \
+         weston-terminal) or foot, or set VITRIN_DEMO_APP to an absolute path",
+        HEADLESS_APP_CANDIDATES.join(", ")
+    );
 }
 
 /// A fresh 0700 runtime directory for one demo run, under the OS temp dir. The

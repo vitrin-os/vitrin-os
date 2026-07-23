@@ -938,14 +938,18 @@ pub(crate) fn intake_physical<B: InputBackend>(
                 host::KeyState::Released => KeyState::Released,
             };
             let evdev = event.key_code().raw().saturating_sub(XKB_KEYCODE_OFFSET);
-            // `None` host keysym: Smithay 0.7.0's `WinitKeyboardInputEvent`
-            // carries only the scancode — it drops winit's interpreted
-            // `logical_key` before the core sees it (issue #118) — so intake can
-            // resolve only the layout-invariant subset from the scancode alone
-            // and drops every layout-dependent (text) key. When the winit
-            // backend is made to surface `logical_key` (issue #118, "own the
-            // winit glue"), it calls `physical_key` with `Some(keysym)` and text
-            // keys flow with no change to the resolution or delivery below.
+            // Always `None` here: this arm exists for the *generic*
+            // `InputBackend` the unit tests drive (a synthetic backend has
+            // no winit `logical_key` to resolve), so it can only ever
+            // resolve the layout-invariant subset from the scancode alone.
+            // The real nested path never reaches this arm at all — the
+            // winit backend's own event pump resolves `logical_key` to a
+            // host keysym itself ([`host_keysym`], called from
+            // `crate::backend::winit::NestedWinitEventsApp::window_event`)
+            // and calls [`physical_key`] directly with `Some(keysym)`
+            // (`crate::backend::winit::NestedState::handle_key`), so a
+            // text key flows without ever passing through this
+            // scancode-only translation (issue #118).
             physical_key(evdev, None, state)
         }
         _ => Vec::new(),
@@ -953,20 +957,22 @@ pub(crate) fn intake_physical<B: InputBackend>(
 }
 
 /// Mint the physical [`SeatInput`]s for one keyboard event, given the host's
-/// interpreted keysym when there is one — the single seam #118's nested-typing
-/// fix turns on.
+/// interpreted keysym when there is one — issue #118's nested-typing fix.
 ///
-/// `host_keysym` is winit's `logical_key` resolved to an X keysym: the
-/// layout-*dependent* interpretation the host already computed, which the core
-/// is forbidden to recompute (see [`invariant_keysym`]). Prefer it; fall back
-/// to the layout-invariant scancode table for the fixed subset (Escape, Enter,
-/// arrows, modifiers…) the core *can* resolve without a keymap; drop the key
-/// otherwise, tracing why. [`intake_physical`] passes `None` today — Smithay
-/// hides the interpreted key — so only invariant keys survive; the deferred
-/// winit wiring passes `Some(keysym)` here and every text key flows. Kept in
-/// this module so the physical-origin minting stays in its one trusted spot
-/// (B2), and separated from the pure [`resolve_key_seat`] so the resolution can
-/// be unit-tested without minting an origin.
+/// `host_keysym` is winit's `logical_key` resolved to an X keysym by
+/// [`host_keysym`]: the layout-*dependent* interpretation the host already
+/// computed, which the core is forbidden to recompute (see
+/// [`invariant_keysym`]). Prefer it; fall back to the layout-invariant
+/// scancode table for the fixed subset (Escape, Enter, arrows, modifiers…)
+/// the core *can* resolve without a keymap; drop the key otherwise, tracing
+/// why. The real call site is
+/// `crate::backend::winit::NestedState::handle_key`, which calls this
+/// directly with the keysym its own winit event pump resolved — bypassing
+/// [`intake_physical`]'s scancode-only `Keyboard` arm entirely, which exists
+/// only for the generic-`InputBackend` tests below. Kept in this module so
+/// the physical-origin minting stays in its one trusted spot (B2), and
+/// separated from the pure [`resolve_key_seat`] so the resolution can be
+/// unit-tested without minting an origin.
 pub(crate) fn physical_key(
     evdev: u32,
     host_keysym: Option<u32>,
@@ -978,7 +984,7 @@ pub(crate) fn physical_key(
             tracing::trace!(
                 evdev,
                 "layout-dependent key dropped at intake: no host keysym and not in the \
-                 layout-invariant table (the #118 nested-typing gap, until the winit wiring lands)"
+                 layout-invariant table"
             );
             Vec::new()
         }
@@ -999,6 +1005,57 @@ fn resolve_key_seat(
     Some(SeatInputKind::Key { keysym, state })
 }
 
+/// Resolve winit's interpreted `logical_key` to an X keysym — the #118 seam
+/// that lets nested typing carry layout-*dependent* keys (letters, digits,
+/// punctuation) at all: producing their keysym needs the interpretation the
+/// host's keymap already performed, which the core is forbidden to redo (no
+/// keymap lives here; see [`invariant_keysym`]).
+///
+/// Only [`smithay::reexports::winit::keyboard::Key::Character`] resolves to
+/// something — a named key (`Enter`, `ArrowLeft`, a bare modifier) or a dead
+/// key mid-composition carries no character yet, so those return `None` and
+/// [`resolve_key_seat`] falls back to the layout-invariant table instead
+/// (which is exactly how Escape/Enter/arrows keep working for dead-man
+/// regardless of which path resolved them).
+///
+/// Called from `crate::backend::winit::NestedWinitEventsApp::window_event`,
+/// the one real producer of a `logical_key` in this crate (a synthetic test
+/// backend has none to offer).
+pub(crate) fn host_keysym(key: &smithay::reexports::winit::keyboard::Key) -> Option<u32> {
+    match key {
+        smithay::reexports::winit::keyboard::Key::Character(text) => {
+            char_keysym(text.chars().next()?)
+        }
+        _ => None,
+    }
+}
+
+/// One Unicode character to its X11 keysym, by the `keysymdef.h` convention:
+/// codepoints below `0x100` (ASCII + the Latin-1 supplement) are their own
+/// keysym; every other codepoint is `0x0100_0000 | codepoint` (the "Unicode
+/// keysym" range every X11/xkbcommon implementation recognizes). Control
+/// characters (`0x00`-`0x1f`, `0x7f`) are not valid keysyms under either
+/// convention and are dropped defensively — winit should never surface one
+/// through `Key::Character` (they arrive as `Key::Named` instead), but
+/// encoding one verbatim would mint a keysym that means something else
+/// entirely rather than the intended key.
+///
+/// A multi-character `Key::Character` (composed input, ligatures) is
+/// approximated by its first character in [`host_keysym`], which is the
+/// only caller — documented there, not here, since this function only ever
+/// sees one `char` at a time.
+fn char_keysym(ch: char) -> Option<u32> {
+    if ch.is_control() {
+        return None;
+    }
+    let code = ch as u32;
+    Some(if code < 0x100 {
+        code
+    } else {
+        0x0100_0000 | code
+    })
+}
+
 /// The layout-*invariant* evdev-scancode → keysym subset: editing,
 /// navigation, function, and modifier keys whose meaning is the same under
 /// every keyboard layout. This is a fixed constant table (kernel
@@ -1010,17 +1067,11 @@ fn resolve_key_seat(
 ///
 /// Layout-*dependent* keys (letters, digits, punctuation) return `None`
 /// here, because producing their keysym requires the interpreted key the
-/// host already computed. Winit delivers it (`KeyEvent::logical_key`), but
-/// Smithay 0.7.0's `WinitKeyboardInputEvent` reduces the event to a raw
-/// scancode before the core sees it — a pinned-dependency gap, not a
-/// protocol gap (issue #118): full nested typing needs the winit backend to
-/// surface winit's interpreted keysym and feed it as `host_keysym` to
-/// [`physical_key`], where it takes priority over this table (interpreting
-/// scancodes through a keymap *in the core* is the one forbidden workaround).
-/// Until that wiring lands, [`intake_physical`] passes `None` and text keys
-/// are dropped — this subset is chosen so the consent / revocation paths
-/// never depend on the gap: Escape — P1.7.3's hold-Esc chord — is
-/// layout-invariant and always translates.
+/// host already computed — [`host_keysym`] resolves those, and
+/// [`resolve_key_seat`] prefers it over this table. This subset is chosen so
+/// the consent / revocation paths never depend on the host resolving
+/// anything: Escape — P1.7.3's hold-Esc chord — is layout-invariant and
+/// always translates, from either path.
 fn invariant_keysym(evdev_code: u32) -> Option<u32> {
     Some(match evdev_code {
         1 => 0xff1b,                           // KEY_ESC        -> XK_Escape
@@ -1470,9 +1521,10 @@ pub(crate) mod tests {
     #[test]
     fn resolve_prefers_the_host_keysym_then_falls_back_to_the_invariant_table() {
         // The #118 seam. `resolve_key_seat`/`physical_key` prefer the host's
-        // interpreted keysym — winit's `logical_key`, the layout-dependent
-        // interpretation the deferred winit wiring will supply — and fall back
-        // to the layout-invariant scancode table only when there is none.
+        // interpreted keysym — winit's `logical_key`, resolved by
+        // `host_keysym` and supplied by `crate::backend::winit`'s owned
+        // event pump — and fall back to the layout-invariant scancode table
+        // only when there is none.
 
         // A host keysym wins for a layout-*dependent* scancode (KEY_A = 30),
         // which is exactly the text-key path the wiring turns on.
@@ -1500,28 +1552,28 @@ pub(crate) mod tests {
                 state: KeyState::Released,
             }),
         );
-        // ...and a layout-dependent key is dropped — the current #118 gap this
-        // groundwork sets the winit wiring up to close in one place.
+        // ...and a layout-dependent key is dropped when winit genuinely has
+        // no interpretation to offer (e.g. a bare modifier chord with no
+        // character result) — `physical_key`/`resolve_key_seat` never guess.
         assert_eq!(resolve_key_seat(30, None, KeyState::Pressed), None);
         assert!(physical_key(30, None, KeyState::Pressed).is_empty());
     }
 
     #[test]
     fn a_text_key_given_a_host_keysym_reaches_the_app_as_physical_input() {
-        // The other half of the #118 groundwork: the DELIVERY path for a
-        // layout-dependent key is already whole — only winit's keysym
-        // extraction is deferred. Fed the interpreted keysym the winit wiring
-        // will one day supply, the app receives the text key over the real
-        // wire, origin=physical — so closing the intake gap is the single
-        // remaining step, and it lands on a delivery path already proven here.
+        // The delivery half of #118: given the interpreted keysym
+        // `crate::backend::winit`'s owned pump resolves via `host_keysym`
+        // and passes to `physical_key` directly (bypassing `intake_physical`
+        // — see both functions' docs), the app receives the text key over
+        // the real wire, origin=physical.
         let _fd = crate::capture::tests::fd_lock();
         let (server, _scene, mut core, mut mock) = wire_setup();
         let view = (VIEW_W, VIEW_H);
         let surface = Some(view);
         let mut router = InputRouter::new(NoopHook);
 
-        // KEY_H (scancode 35) is layout-dependent — dropped without a host
-        // keysym today; with winit's `logical_key` ('h' = 0x0068) it flows.
+        // KEY_H (scancode 35) is layout-dependent — dropped with no host
+        // keysym; given winit's `logical_key` ('h' = 0x0068) it flows.
         for input in physical_key(35, Some(0x0068), KeyState::Pressed) {
             if let Some(delivery) = router.route(input, view, surface) {
                 server
@@ -1556,6 +1608,95 @@ pub(crate) mod tests {
         assert_eq!(invariant_keysym(30), None); // KEY_A
         assert_eq!(invariant_keysym(2), None); // KEY_1
         assert_eq!(invariant_keysym(51), None); // KEY_COMMA
+    }
+
+    // ------------------------------------------------------------------
+    // #118: resolving winit's `logical_key` to a host keysym
+    // ------------------------------------------------------------------
+    //
+    // `winit::keyboard::Key` is a plain public enum -- unlike the
+    // `KeyEvent` that carries it in a real event, it can be constructed
+    // right here with no display, no backend, and no
+    // `crate::backend::winit` event pump at all. These tests drive
+    // `host_keysym` directly with it, which is as close to "feed the real
+    // nested backend's winit glue a keystroke" as a display-free test gets;
+    // the rest of the path from there (`physical_key`/`resolve_key_seat`
+    // preferring the resolved keysym, delivery over the wire) is already
+    // covered above and unchanged by this function's existence.
+
+    use smithay::reexports::winit::keyboard::{Key, NamedKey};
+
+    #[test]
+    fn host_keysym_resolves_ascii_characters_to_their_own_codepoint() {
+        // ASCII/Latin-1 keysyms equal their Unicode codepoint by
+        // construction (keysymdef.h) -- this is the exact case that reaches
+        // the app in `a_text_key_given_a_host_keysym_reaches_the_app_as_physical_input`
+        // above ('h' = 0x0068).
+        assert_eq!(host_keysym(&Key::Character("h".into())), Some(0x0068));
+        assert_eq!(host_keysym(&Key::Character("H".into())), Some(0x0048));
+        assert_eq!(host_keysym(&Key::Character("1".into())), Some(0x0031));
+        assert_eq!(host_keysym(&Key::Character(",".into())), Some(0x002c));
+        // Space is layout-invariant too, but `host_keysym` resolves it just
+        // the same -- the two paths agree rather than disagree, which
+        // `resolve_key_seat` relies on (the host keysym takes priority).
+        assert_eq!(host_keysym(&Key::Character(" ".into())), Some(0x0020));
+    }
+
+    #[test]
+    fn host_keysym_resolves_latin1_supplement_and_wider_unicode() {
+        // 'é' (U+00E9) is within the Latin-1 supplement: keysym ==
+        // codepoint, same as ASCII.
+        assert_eq!(host_keysym(&Key::Character("é".into())), Some(0x00e9));
+        // '€' (U+20AC) is outside Latin-1: the 24-bit-Unicode convention
+        // applies (0x0100_0000 | codepoint).
+        assert_eq!(host_keysym(&Key::Character("€".into())), Some(0x0100_20ac));
+        // An emoji (U+1F600, above the Basic Multilingual Plane) takes the
+        // same convention -- the formula is codepoint-width-agnostic.
+        assert_eq!(
+            host_keysym(&Key::Character("😀".into())),
+            Some(0x0100_0000 | 0x1F600)
+        );
+    }
+
+    #[test]
+    fn host_keysym_leaves_named_and_dead_keys_to_the_invariant_table() {
+        // Named keys (arrows, Enter, function keys, modifiers, ...) are not
+        // resolved here at all -- `invariant_keysym`'s scancode table
+        // already covers the layout-invariant ones, and `None` is exactly
+        // what makes `resolve_key_seat` fall back to it instead of (wrongly)
+        // preferring an unresolved "host keysym".
+        assert_eq!(host_keysym(&Key::Named(NamedKey::Enter)), None);
+        assert_eq!(host_keysym(&Key::Named(NamedKey::ArrowLeft)), None);
+        assert_eq!(host_keysym(&Key::Named(NamedKey::Escape)), None);
+        // A dead key mid-composition (e.g. a standalone '^' awaiting the
+        // next keystroke on an AZERTY/international layout) has no final
+        // character yet -- the combined character arrives as a later,
+        // separate `Character` event, which resolves normally.
+        assert_eq!(host_keysym(&Key::Dead(Some('^'))), None);
+        assert_eq!(host_keysym(&Key::Dead(None)), None);
+    }
+
+    #[test]
+    fn host_keysym_drops_control_characters_rather_than_encode_them() {
+        // Winit should never surface a control character through
+        // `Key::Character` (they arrive as `Key::Named` instead), but if one
+        // ever did, encoding it verbatim would mint an invalid X11 keysym
+        // (0x00-0x1f, 0x7f are not keysyms at all) rather than the intended
+        // key -- so this is dropped defensively, the same "drop rather than
+        // guess" posture `resolve_key_seat` takes for an unresolvable key.
+        assert_eq!(host_keysym(&Key::Character("\u{7}".into())), None); // BEL
+        assert_eq!(host_keysym(&Key::Character("\x7f".into())), None); // DEL
+        assert_eq!(host_keysym(&Key::Character("\r".into())), None);
+        assert_eq!(host_keysym(&Key::Character("\t".into())), None);
+    }
+
+    #[test]
+    fn host_keysym_takes_only_the_first_character_of_a_composed_string() {
+        // A multi-character `Key::Character` (composed input, ligatures) is
+        // approximated by its first character rather than dropped outright
+        // -- an approximation, documented on `host_keysym`, not a silent
+        // truncation a caller could be surprised by.
+        assert_eq!(host_keysym(&Key::Character("fi".into())), Some(0x0066));
     }
 
     // ------------------------------------------------------------------

@@ -21,6 +21,24 @@ path = "src/main.rs"
 # headless backend composites with (P1.3.2) -- the GPU-less path CI runs on,
 # and where the P1.3.2/P1.3.6 goldens are read back. Nothing else.
 smithay = { version = "=0.7.0", default-features = false, features = ["backend_winit", "renderer_pixman"] }
+# The nested backend owns its winit event-loop glue (issue #118): Smithay's
+# own `backend::winit` module discards winit's interpreted `logical_key`
+# before a keyboard event ever reaches the core (`WinitKeyboardInputEvent`
+# carries only the evdev scancode, and its private `ApplicationHandler`
+# gives no hook to see the raw `WindowEvent` either) -- so
+# `crates/vitrin-core/src/backend/winit.rs` builds its own EGL surface
+# directly on the Wayland/X11 window winit hands back, using the same public
+# `smithay::backend::egl` API Smithay's own module calls. `wayland-egl` is
+# the one extra piece that module does not re-export: the native-surface
+# type EGL binds to under a Wayland host. Not pinned exactly (unlike
+# smithay/fontdue above): it is pure plumbing between two other pinned
+# dependencies, one struct and two calls
+# (`WlEglSurface::new_from_raw`/`resize`), and moves no pixel a golden
+# depends on. Already in the tree transitively (Smithay pulls it under
+# `backend_winit` too), so this adds no new transitive surface (plan risk
+# R7) -- only makes an existing one a direct dependency, at the version
+# Smithay's own `Cargo.lock` entry already resolves to.
+wayland-egl = "0.32"
 # The same calloop Smithay links against (it pins 0.14); this direct
 # dependency exists to (a) import event-loop types under their own name and
 # (b) switch on the `signals` feature -- the signalfd event source used for

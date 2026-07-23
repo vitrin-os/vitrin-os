@@ -1800,6 +1800,7 @@ dependencies = [
  "vitrin-ipc",
  "vitrin-mock-shim",
  "vitrin-protocol",
+ "wayland-egl",
 ]
 
 [[package]]

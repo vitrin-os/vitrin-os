@@ -52,6 +52,18 @@ walkthrough.
   callers already build the C shim for the real-app ladder), so CI cannot
   reach the skip — a gate that only ever reports SKIP on the machine that
   gates merges is a gate nobody is holding.
+
+# The hold-Esc revocation half (issue #109/#110, PR #126 addendum)
+
+Issue #110's acceptance criteria named one piece this module could not close
+on its own: "hold-Esc revocation (#109) demonstrably failing the agent's
+next actuation" against the demo's own real chain. That depended on #109 /
+PR #126, which added the `dead-man-injector` cargo feature (a `SIGUSR1`
+handler over the exact same `Runtime::apply_dead_man` entry point a
+completed physical hold reaches) and `test_real_deadman.py`, the pattern
+`DemoHeadlessHoldEsc` below mirrors -- against the demo's `weston-terminal`
+chain and `run_demo`'s own grant shape/locator instead of `click-target`, so
+this is the demo path specifically, not a second copy of the dead-man gate.
 """
 
 from __future__ import annotations
@@ -59,6 +71,7 @@ from __future__ import annotations
 import os
 import pathlib
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -66,10 +79,12 @@ import unittest
 
 from harness import (
     IntegrationTest,
+    capture_when_ready,
     children_of,
     comm_of,
     descendant_named,
     require_binaries,
+    whole_realm_grant,
 )
 
 require_binaries()
@@ -80,6 +95,8 @@ _DEMO_DIR = pathlib.Path(__file__).resolve().parents[2] / "examples" / "agent-de
 sys.path.insert(0, str(_DEMO_DIR))
 
 import run_demo  # noqa: E402
+
+from vitrin_os import errors  # noqa: E402  (needs PYTHONPATH, which run.sh sets)
 
 #: The app the gate boots behind the real shim — never `vitrin-mock-shim`
 #: (issue #110). Same rung `tests/integration/test_real_app.py` uses.
@@ -291,6 +308,189 @@ class DemoHeadless(IntegrationTest):
         self.assertIsNotNone(move_idx)
         self.assertIsNotNone(type_idx)
         self.assertLess(move_idx, type_idx, "the click (move) must precede the typed text")
+
+
+class DemoHeadlessHoldEsc(IntegrationTest):
+    """Issue #110's remaining acceptance criterion: hold-Esc revocation,
+    demonstrated against the demo's own real chain (`vitrind` -> real
+    `vitrin-shim` -> real `weston-terminal`), not `test_real_deadman.py`'s
+    `click-target` chain.
+
+    Headless has no physical Escape key to hold (`crate::deadman`'s module
+    docs), so this drives the identical CI stand-in `test_real_deadman.py`
+    established: a `SIGUSR1` to the core, meaningful only on a
+    `dead-man-injector`-feature `vitrind` (`run.sh` builds one), synthesizes
+    the completed chord through the exact same `Runtime::apply_dead_man`
+    entry point a real held Escape reaches over the nested backend. What
+    this test adds beyond that one is that the actuation the chord cuts off
+    is the demo's own: the same grant shape (`harness.whole_realm_grant`,
+    matching `run_demo.run`'s `observe + actuate.pointer + actuate.text`)
+    and the same pixel locator (`run_demo.locate_url_bar`), reused rather
+    than reimplemented so the two can never quietly disagree about what the
+    demo does.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        if os.environ.get("VITRIN_SKIP_REAL_APP") == "1":
+            self.skipTest("VITRIN_SKIP_REAL_APP=1 (shared real-app-ladder opt-out)")
+
+        shim = os.environ.get("VITRIN_C_SHIM_BIN")
+        if not shim:
+            self.skipTest(
+                "VITRIN_C_SHIM_BIN is unset: no built C shim to run the real demo chain "
+                "against. Build it (meson setup shim/build shim && meson compile -C "
+                "shim/build) and point the variable at shim/build/vitrin-shim. CI sets it, "
+                "so CI cannot reach this skip -- there a missing shim is a failure, below."
+            )
+        self.shim_bin = pathlib.Path(shim)
+        if not (self.shim_bin.is_file() and os.access(self.shim_bin, os.X_OK)):
+            self.fail(
+                f"VITRIN_C_SHIM_BIN={shim} does not name an executable C shim. It is set, "
+                "so a real run was requested; refusing to skip a requested gate (CI misconfig)."
+            )
+        app = shutil.which(APP_NAME) or (
+            f"/usr/bin/{APP_NAME}" if os.access(f"/usr/bin/{APP_NAME}", os.X_OK) else None
+        )
+        if app is None:
+            self.fail(
+                f"{APP_NAME} is not installed, but VITRIN_C_SHIM_BIN is set so a real run "
+                "was requested. Install weston (shim/ci/install-deps.sh does), or set "
+                "VITRIN_SKIP_REAL_APP=1 to opt out. A requested gate must not skip silently."
+            )
+        self.app_bin = str(pathlib.Path(app).resolve())
+
+    def real_core(self):
+        """Identical to `DemoHeadless.real_core`: the demo's own real chain."""
+        return self.core(
+            size="640x480",
+            shim=str(self.shim_bin),
+            command=self.app_bin,
+            args=[],
+            env_allow=tuple(WLR_ENV),
+            extra_env=WLR_ENV,
+        )
+
+    def _spine(self, core) -> None:
+        """Same ancestry proof `DemoHeadless._spine` makes."""
+        deadline = time.monotonic() + 15.0
+        shim_pid = None
+        while time.monotonic() < deadline:
+            kids = children_of(core.pid)
+            if kids:
+                shim_pid = kids[0]
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(
+            shim_pid, f"the core forked no shim; children were {children_of(core.pid)}"
+        )
+        self.assertTrue(
+            comm_of(shim_pid).startswith("vitrin-shim"),
+            f"the core's child must be the real C shim, not {comm_of(shim_pid)!r}",
+        )
+        app_pid = descendant_named(core.pid, APP_NAME, timeout=15.0)
+        self.assertIsNotNone(
+            app_pid, f"the C shim never fork/exec'd {APP_NAME}; core={core.pid} shim={shim_pid}"
+        )
+
+    def _send_dead_man_signal(self, core) -> None:
+        """`SIGUSR1` to the core -- the test-gated stand-in for a completed
+        hold-Esc (module docs above; identical to
+        `test_real_deadman.py::RealDeadManRevocation._send_dead_man_signal`).
+        Tells "the core revoked" apart from "the core died" immediately,
+        rather than letting a feature-less build surface as a bare
+        `ConnectionClosed` several assertions later with no clue why.
+        """
+        os.kill(core.pid, signal.SIGUSR1)
+        # A feature-less `vitrind` has no SIGUSR1 handler installed at all
+        # (the handler only exists under `dead-man-injector`), so the signal
+        # takes its default disposition -- terminate -- and the process
+        # dies within this window rather than revoking anything.
+        time.sleep(0.5)
+        if core.proc.poll() is not None:
+            self.fail(
+                f"the core exited (code {core.proc.returncode}) instead of revoking after "
+                "SIGUSR1. This is what a `vitrind` built WITHOUT the `dead-man-injector` cargo "
+                "feature does -- SIGUSR1's default disposition is terminate -- not what a "
+                "completed dead-man chord does. Rebuild with `cargo build --workspace "
+                "--features vitrin-core/dead-man-injector` (tests/integration/run.sh does this "
+                f"automatically).\ncore output so far:\n{core.output()}"
+            )
+
+    def test_hold_esc_dead_man_revokes_the_demos_next_actuation_and_capture(self):
+        core = self.real_core()
+        self._spine(core)
+
+        conn = core.connect()
+        grant = whole_realm_grant(conn)
+
+        # 1. Before the chord: the demo's own actuation channel is live
+        #    against the real weston-terminal -- click the same point
+        #    `run_demo.locate_url_bar` would (headless has no URL bar, so
+        #    any in-bounds coordinate serves), type the demo's default
+        #    input, and confirm the real app's pixels changed -- exactly
+        #    `DemoHeadless`'s own read of "the actuation reached the app",
+        #    reused rather than reimplemented.
+        before = capture_when_ready(grant)
+        url_x, url_y = run_demo.locate_url_bar(before, headless=True)
+        grant.pointer.click(url_x, url_y)
+        grant.text.type(run_demo.DEFAULT_HEADLESS_INPUT + "\n")
+
+        time.sleep(0.4)
+        mid = grant.observe()
+        changed = run_demo.count_changed_pixels(before, mid)
+        self.assertGreaterEqual(
+            changed,
+            run_demo.MIN_HEADLESS_CHANGED_PIXELS,
+            f"only {changed} pixel(s) changed before the chord fired; the demo's own "
+            "actuation must have already reached the real app for a subsequent refusal "
+            "to mean anything",
+        )
+
+        # 2. The chord fires: SIGUSR1 stands in for a completed hold-Esc
+        #    (module docs), applied through the real `Runtime::apply_dead_man`
+        #    -- the same entry point a real held Escape reaches nested.
+        self._send_dead_man_signal(core)
+
+        # 3. After the chord: the agent's very NEXT actuation AND capture --
+        #    issue #110's named criterion -- both refuse `Revoked`, with no
+        #    sleep/wait between the signal and these checks:
+        #    `apply_dead_man` runs synchronously inside the signal handler's
+        #    dispatch turn, before `_send_dead_man_signal`'s `kill()` call
+        #    even returned.
+        from vitrin_os.protocol import Verb
+
+        with self.assertRaises(errors.Revoked) as observe_ctx:
+            grant.observe()
+        self.assertEqual(observe_ctx.exception.verb, Verb.OBSERVE)
+
+        with self.assertRaises(errors.Revoked):
+            grant.pointer.click(url_x, url_y)
+
+        conn.close()
+        core.terminate()
+        entries = core.entries()
+
+        # 4. The journal says why, in the documented write order
+        #    (`deadman::apply`): the cause, then the revocations it explains.
+        kinds = [e["kind"] for e in entries]
+        self.assertIn(
+            "dead_man_triggered", kinds, "the flight recorder must journal the completed chord"
+        )
+        triggered_at = kinds.index("dead_man_triggered")
+        revoked_at = [i for i, k in enumerate(kinds) if k == "grant_revoked"]
+        self.assertTrue(revoked_at, "the chord must have revoked at least the demo's own grant")
+        self.assertTrue(
+            all(i > triggered_at for i in revoked_at),
+            "every grant_revoked entry must come AFTER the dead_man_triggered cause it explains",
+        )
+
+        print(
+            "\n[demo-hold-esc] SIGUSR1 fired the dead-man switch mid-demo; the agent's next "
+            "observe() and pointer.click() against the real weston-terminal chain both "
+            f"refused Revoked; journal recorded {len(revoked_at)} grant_revoked "
+            "entr" + ("y" if len(revoked_at) == 1 else "ies") + " after dead_man_triggered"
+        )
 
 
 class DemoUsesNoMockShim(unittest.TestCase):

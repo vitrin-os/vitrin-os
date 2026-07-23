@@ -45,6 +45,41 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+# Meson's wlroots-0.19 dependency() has a fallback to a vendored subproject
+# build (see shim/ci/install-deps.sh's note: Ubuntu 24.04 ships wayland 1.22,
+# below wlroots 0.19's >=1.23.1 floor, so the fallback compiles a newer
+# wayland from source too). Those fallback libraries are UNINSTALLED --
+# they live as plain .so files inside the build tree, never copied
+# anywhere ld.so's default search path would find them.
+#
+# $WLCS_BIN is a foreign, already-linked process (the apt `wlcs` package):
+# by the time it dlopen()s $MODULE, ld.so has already resolved $WLCS_BIN's
+# own libwayland-client.so.0 against the *system* copy (1.22, on a runner
+# like Ubuntu 24.04's). An rpath baked into $MODULE or libwlroots-0.19.so
+# cannot retroactively change that -- it only affects how *their own*
+# NEEDED entries resolve, and by then libwayland-client.so.0 is already
+# loaded process-wide under that soname, so ld.so reuses the old one
+# instead of consulting anyone's rpath. libwlroots-0.19.so was built
+# against (and calls symbols only in, e.g. wl_proxy_get_queue) the newer
+# fallback wayland, so it fails to resolve against the old one --
+# "undefined symbol: wl_proxy_get_queue".
+#
+# LD_LIBRARY_PATH, unlike rpath, is consulted for $WLCS_BIN's *own*
+# process-startup dependency resolution too (it's exec'd by us below, not
+# merely dlopen'd), so putting every directory under the build tree that
+# holds a shared object ahead of the default search path makes $WLCS_BIN
+# and $MODULE agree on the SAME (newer) libwayland-client from the start
+# -- there is then only ever one copy of the soname loaded, and it is the
+# one that actually has the symbols wlroots needs. Harmless when nothing
+# under $MODULE_DIR is an uninstalled fallback build (e.g. a system
+# wlroots-0.19 was found and no subprojects were compiled): the `find`
+# below then yields nothing to add.
+MODULE_DIR="$(cd "$(dirname "$MODULE")" && pwd)"
+EXTRA_LIBDIRS="$(find "$MODULE_DIR" -name '*.so*' -exec dirname {} \; 2>/dev/null | sort -u | paste -sd: -)"
+if [ -n "$EXTRA_LIBDIRS" ]; then
+	export LD_LIBRARY_PATH="$EXTRA_LIBDIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
 # THE SCOPE (issue #47: "xdg-shell+seat groups"). Chosen empirically by
 # listing every suite `--gtest_list_tests` reports against this module and
 # keeping the ones that exercise xdg-shell surface/toplevel/popup lifecycle
@@ -99,11 +134,22 @@ SKIPPED=$(grep -c '^\[     SKIP' "$LOG" || true)
 # failed:"), not a grep -c on "[  FAILED  ]" -- that pattern also matches
 # each per-test line in the re-listing gtest prints below the summary
 # header, which would double-count.
+# Each `|| true` below (not just on the outer grep -E) matters: this is
+# exactly the scenario that actually happened when the integration module
+# failed to load (undefined-symbol / dlopen failure, see the LD_LIBRARY_PATH
+# comment above) -- $LOG then has neither a "[ FAILED ]" summary line nor a
+# "[==========] N tests from" line at all, so FAILED_LINE/TOTAL_LINE are
+# empty and the inner `grep -oE '[0-9]+'` on an empty string matches
+# nothing and exits 1. Under `set -o pipefail`, that failure is the exit
+# status of the whole `echo | grep | head` pipeline feeding the assignment,
+# which trips `set -e` on the assignment itself -- aborting the script
+# before it ever reaches `exit 0`, the one guarantee this script exists to
+# keep. (This is not hypothetical: it's what actually happened in CI.)
 FAILED_LINE=$(grep -E '^\[  FAILED  \] [0-9]+ tests? failed:' "$LOG" || true)
-FAILED=$(echo "$FAILED_LINE" | grep -oE '[0-9]+' | head -1)
+FAILED=$(echo "$FAILED_LINE" | grep -oE '[0-9]+' | head -1 || true)
 FAILED="${FAILED:-0}"
 TOTAL_LINE=$(grep -E '^\[==========\] [0-9]+ tests? from' "$LOG" | tail -1 || true)
-TOTAL=$(echo "$TOTAL_LINE" | grep -oE '[0-9]+' | head -1)
+TOTAL=$(echo "$TOTAL_LINE" | grep -oE '[0-9]+' | head -1 || true)
 TOTAL="${TOTAL:-0}"
 
 {
@@ -114,7 +160,12 @@ TOTAL="${TOTAL:-0}"
 	echo "Dominant failure categories in this run (see shim/wlcs/README.md"
 	echo "for the standing, annotated pass-list -- these counts are"
 	echo "THIS RUN's, and are expected to roughly match it):"
-	grep -oE 'C\+\+ exception with description "[^"]*"' "$LOG" | sort | uniq -c | sort -rn | head -10
+	# `|| true`: under `set -o pipefail`, a `grep` that matches zero lines
+	# (e.g. every test passed, or failures came from a mechanism that
+	# doesn't format as a gtest "C++ exception" line) exits 1, which would
+	# otherwise trip `set -e` here and abort the script before `exit 0` --
+	# exactly the "always exits 0" guarantee this script exists to keep.
+	grep -oE 'C\+\+ exception with description "[^"]*"' "$LOG" | sort | uniq -c | sort -rn | head -10 || true
 } | tee -a "$LOG"
 
 echo ""

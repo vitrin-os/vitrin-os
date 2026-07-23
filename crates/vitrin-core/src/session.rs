@@ -103,6 +103,7 @@ use vitrin_ipc::{
 use crate::capture::RealmViewFrame;
 use crate::consent::grab::ConsentGrab;
 use crate::consent::ConsentSurface;
+use crate::dmabuf::DmabufImporter;
 use crate::grants::GrantTable;
 use crate::identity::StaticVerifier;
 use crate::input::{InputRouter, PhysicalPresence, PreemptionHook, SeatInput};
@@ -353,15 +354,34 @@ pub(crate) trait Presenter {
     /// existing `no_surface` refusal, which is the correct outcome — better
     /// than a black frame an agent would read as the realm's actual content.
     fn view_rgba(&mut self) -> Option<Vec<u8>>;
-    /// The scene and the retained framebuffer, borrowed **together**.
+    /// Lend the scene, the retained framebuffer, and the dmabuf importer to
+    /// `f`, all borrowed **together** for the one call.
     ///
-    /// One call rather than two accessors because [`RealmTeardown`] holds
-    /// both at once: `RealmLifecycle::die` takes the realm's surface out of
-    /// the scene and scrubs its last painted frame out of the retained
-    /// image inside a single latched transition, so a backend that could
-    /// only lend one at a time would make the teardown funnel unbuildable —
-    /// and the way out of *that* is a second, unlatched scrub path beside
-    /// the funnel, which is the one thing this teardown must not grow.
+    /// A callback rather than a returned tuple — unlike every other
+    /// [`Presenter`] method — because the concrete importer a GPU-backed
+    /// embedder lends here (P1.3.5, issue #117) wraps a
+    /// `renderer: &mut GlesRenderer` field that has nowhere to live except a
+    /// local of *this* call: a `dyn DmabufImporter` trait object erases that
+    /// concrete type, and a `Box<dyn DmabufImporter + '_>` handed back by
+    /// value looks like the obvious fix but is not one — dropck cannot see
+    /// through the erased type to know its drop glue is trivial, so it
+    /// requires the box's borrowed lifetime to survive strictly past the
+    /// box's own drop point, which conflicts with every caller that also
+    /// needs the *same* borrowed data (the scene, the backend) free again
+    /// afterward. Scoping the concrete importer as this method's own local
+    /// and lending it out only as a bare `&mut dyn DmabufImporter` — a
+    /// reference has no drop glue regardless of what it points to — sidesteps
+    /// that hazard entirely and is why every implementation of both this
+    /// method and [`Self::scene_and_importer`] follows the same shape.
+    ///
+    /// One call rather than separate accessors because [`RealmTeardown`]
+    /// holds all three at once: `RealmLifecycle::die` takes the realm's
+    /// surface out of the scene, scrubs its last painted frame out of the
+    /// retained image, and drops any retained zero-copy GPU content, inside
+    /// a single latched transition, so a backend that could only lend one at
+    /// a time would make the teardown funnel unbuildable — and the way out
+    /// of *that* is a second, unlatched path beside the funnel, which is the
+    /// one thing this teardown must not grow.
     ///
     /// `None` for the retained half is the nested backend's honest answer:
     /// it composites into the host compositor's surface and retains no
@@ -373,7 +393,43 @@ pub(crate) trait Presenter {
     /// capture shut on top of that. The retained-image scrub is a headless
     /// need: only a *held* framebuffer can keep a dead realm's last painted
     /// frame.
-    fn teardown_view(&mut self) -> (&mut Scene, Option<&mut dyn RetainedOutput>);
+    ///
+    /// `None` for the importer half is the headless posture (no GPU
+    /// renderer exists at all): there is never any retained zero-copy
+    /// content to drop.
+    fn teardown_view<R>(
+        &mut self,
+        f: impl for<'v> FnOnce(
+            &'v mut Scene,
+            Option<&'v mut dyn RetainedOutput>,
+            Option<&'v mut dyn DmabufImporter>,
+        ) -> R,
+    ) -> R;
+    /// Lend the scene and a dmabuf importer bound to this backend's live GPU
+    /// renderer to `f`, both borrowed **together**, for one shim dispatch
+    /// (P1.3.5's zero-copy path, issue #117).
+    ///
+    /// A callback for the reason [`Self::teardown_view`]'s docs give in
+    /// full: the concrete importer's `renderer: &mut GlesRenderer` field is
+    /// constructed fresh inside this call and can only be lent out as a
+    /// bare `&mut dyn DmabufImporter` scoped to it, never boxed and handed
+    /// back by value.
+    ///
+    /// One method rather than two accessors for the same reason
+    /// [`Self::teardown_view`] is: the scene and the importer are two
+    /// disjoint field borrows behind a single embedder type, and a caller
+    /// that needs both (every shim message dispatch does) cannot take them
+    /// through two separate `&mut self` calls.
+    ///
+    /// The default is the headless posture: no GPU renderer exists, so
+    /// every `kind=dmabuf` commit resolves as the designed
+    /// `import_failed` shm fallback, exactly as before this method existed.
+    fn scene_and_importer<R>(
+        &mut self,
+        f: impl for<'v> FnOnce(&'v mut Scene, Option<&'v mut dyn DmabufImporter>) -> R,
+    ) -> R {
+        f(self.scene(), None)
+    }
     /// Ask the backend to schedule a presentation, for backends whose frame
     /// clock is external (nested: the host compositor's redraw request). The
     /// default is the headless posture, where a completed composite *is* the
@@ -780,37 +836,38 @@ pub(crate) fn shutdown_realm<H: RuntimeHost>(host: &mut H) {
 /// Run `f` against the realm's lifecycle with a [`RealmTeardown`] built from
 /// the whole session — the one borrow shape every death path needs.
 ///
-/// Every field comes from a distinct place (the presenter's scene and
-/// retained image, the realm's shim server, the runtime's router, the
-/// kernel's registry and recorder), so this exists to assemble that borrow
-/// once rather than three times, and to make sure no death path can quietly
-/// leave one of them out. `importer` is `None` on both backends: neither
-/// runtime path threads a dmabuf importer today, so every `kind=dmabuf`
-/// commit already resolves as the designed `import_failed` shm fallback and
-/// there is no zero-copy content to drop.
+/// Every field comes from a distinct place (the presenter's scene, retained
+/// image and dmabuf importer, the realm's shim server, the runtime's router,
+/// the kernel's registry and recorder), so this exists to assemble that
+/// borrow once rather than four times, and to make sure no death path can
+/// quietly leave one of them out. On headless `importer` is always `None`:
+/// there is no GPU renderer to have imported anything, so every
+/// `kind=dmabuf` commit already resolved as the designed `import_failed` shm
+/// fallback and there is no zero-copy content to drop.
 fn with_realm_teardown<H: RuntimeHost, T>(
     host: &mut H,
-    f: impl FnOnce(&mut RealmLifecycle, &mut RealmTeardown<'_, H::Hook>) -> T,
+    f: impl FnOnce(&mut RealmLifecycle, &mut RealmTeardown<'_, '_, H::Hook>) -> T,
 ) -> Option<T> {
     let (runtime, view) = host.split();
-    let (scene, retained) = view.teardown_view();
-    let Runtime {
-        kernel,
-        realm,
-        router,
-        ..
-    } = runtime;
-    let realm = realm.as_mut()?;
-    let mut teardown = RealmTeardown {
-        scene,
-        shim: &mut realm.server,
-        importer: None,
-        router,
-        retained,
-        realms: &mut kernel.realms,
-        recorder: &mut kernel.recorder,
-    };
-    Some(f(&mut realm.life, &mut teardown))
+    view.teardown_view(move |scene, retained, importer| {
+        let Runtime {
+            kernel,
+            realm,
+            router,
+            ..
+        } = runtime;
+        let realm = realm.as_mut()?;
+        let mut teardown = RealmTeardown {
+            scene,
+            shim: &mut realm.server,
+            importer,
+            router,
+            retained,
+            realms: &mut kernel.realms,
+            recorder: &mut kernel.recorder,
+        };
+        Some(f(&mut realm.life, &mut teardown))
+    })
 }
 
 /// The advisory expiry sweeps, one timer tick.
@@ -1323,11 +1380,23 @@ fn dispatch_shim<H: RuntimeHost>(
                 return;
             };
             let mut send = |frame: &[u8]| vitrin_ipc::reply(conn, frame, None);
-            // No dmabuf importer on either backend's runtime path today
-            // (headless has no GPU import at all, and the nested backend's
-            // importer is not threaded here yet), so every `kind=dmabuf`
-            // commit resolves as the designed `import_failed` shm fallback.
-            match server.handle_message(msg, view.scene(), None, &mut send) {
+            // The nested backend hands back a real importer bound to its
+            // live GLES renderer here (issue #117/P1.3.5); headless has no
+            // GPU renderer at all and inherits the trait's `None` default.
+            // Either way a `kind=dmabuf` commit with no import capability
+            // resolves as the designed `import_failed` shm fallback.
+            //
+            // Scoped to this inner block, and dispatched before it ends:
+            // `importer` owns a `Box<dyn DmabufImporter + '_>`, whose drop
+            // glue is opaque to dropck (the concrete embedder type is
+            // erased), so the borrow of `view` it carries must end at an
+            // explicit point rather than at its last syntactic use — and
+            // `view.request_present()`/`close_realm(host, ..)` below both
+            // need `view`/`host` free again.
+            let outcome = view.scene_and_importer(|scene, importer| {
+                server.handle_message(msg, scene, importer, &mut send)
+            });
+            match outcome {
                 // THE anti-amplification line. Not a redraw, not a
                 // `presented` — a flag. See the module docs.
                 Ok(true) => {
@@ -1587,9 +1656,16 @@ mod tests {
             Some(crate::test_pattern::render(VIEW.0, VIEW.1))
         }
         /// No retained image to scrub: this view keeps a counter, not a
-        /// framebuffer.
-        fn teardown_view(&mut self) -> (&mut Scene, Option<&mut dyn RetainedOutput>) {
-            (&mut self.scene, None)
+        /// framebuffer. No GPU renderer either, so no importer.
+        fn teardown_view<R>(
+            &mut self,
+            f: impl for<'v> FnOnce(
+                &'v mut Scene,
+                Option<&'v mut dyn RetainedOutput>,
+                Option<&'v mut dyn DmabufImporter>,
+            ) -> R,
+        ) -> R {
+            f(&mut self.scene, None, None)
         }
     }
 

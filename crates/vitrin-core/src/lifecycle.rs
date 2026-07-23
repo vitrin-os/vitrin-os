@@ -443,28 +443,40 @@ pub(crate) enum ShutdownRung {
 /// but leave the surface up, would have a realm that is dead in one place
 /// and alive in another -- and the one that stayed alive would be the one
 /// serving frames.
-pub(crate) struct RealmTeardown<'a, H: PreemptionHook> {
+pub(crate) struct RealmTeardown<'a, 'v, H: PreemptionHook> {
     /// The realm's scene. Its surface leaves here, and nothing composites
     /// client content afterwards.
-    pub scene: &'a mut Scene,
+    ///
+    /// `'v`, not `'a`, together with [`Self::importer`] and
+    /// [`Self::retained`] below: those three come from
+    /// [`session::Presenter::teardown_view`], a *callback* rather than a
+    /// returned value (see that method's docs for why), so the lifetime it
+    /// hands them out under is a fresh one scoped to that one call — never
+    /// provably the same region as `'a`, which is `host`'s own borrow in
+    /// [`session::with_realm_teardown`]. A single shared lifetime parameter
+    /// here would force the two to unify, which is unsatisfiable for any
+    /// `'a` shorter than `'static` once `'v` is universally quantified —
+    /// the two are independent on purpose.
+    pub scene: &'v mut Scene,
     /// The realm's shim protocol server, if the session ever came up.
     /// Taken (not borrowed) by the teardown funnel, which consumes it --
     /// so an embedder cannot keep serving a dead shim's object graph.
     pub shim: &'a mut Option<ShimServer>,
     /// The connection's dmabuf importer, if the embedder has a GPU: any
-    /// retained zero-copy content is dropped with the realm.
-    pub importer: Option<&'a mut dyn DmabufImporter>,
+    /// retained zero-copy content is dropped with the realm. `'v` — see
+    /// [`Self::scene`].
+    pub importer: Option<&'v mut dyn DmabufImporter>,
     /// The realm's input router: seat state must not survive into a next
     /// shim generation.
     pub router: &'a mut InputRouter<H>,
     /// The backend's retained output, if this embedder composites into one:
     /// the last completed frame is scrubbed with the realm, so no readback
-    /// can return a pixel the dead shim painted.
+    /// can return a pixel the dead shim painted. `'v` — see [`Self::scene`].
     ///
     /// Optional and a trait object for exactly the reasons [`Self::importer`]
     /// is: not every embedder has one, and `lifecycle` must not name a
     /// backend type.
-    pub retained: Option<&'a mut dyn RetainedOutput>,
+    pub retained: Option<&'v mut dyn RetainedOutput>,
     /// The core's single realm registry: where the terminal state lands,
     /// and through it the single vacancy predicate.
     pub realms: &'a mut RealmRegistry,
@@ -807,7 +819,7 @@ impl RealmLifecycle {
     pub fn note_connection_closed<H: PreemptionHook>(
         &mut self,
         cause: DeathCause,
-        teardown: &mut RealmTeardown<'_, H>,
+        teardown: &mut RealmTeardown<'_, '_, H>,
     ) -> bool {
         debug_assert!(
             matches!(
@@ -852,7 +864,10 @@ impl RealmLifecycle {
     /// `SIGCHLD` says only that *some* child changed state, so the reaper
     /// polls every realm it owns and lets `waitpid` be the authority
     /// (module docs). Already-reaped realms answer `false` immediately.
-    pub fn poll_exit<H: PreemptionHook>(&mut self, teardown: &mut RealmTeardown<'_, H>) -> bool {
+    pub fn poll_exit<H: PreemptionHook>(
+        &mut self,
+        teardown: &mut RealmTeardown<'_, '_, H>,
+    ) -> bool {
         let Some(child) = self.child.as_mut() else {
             // Already reaped: the latch. Not an error, and not a second
             // death.
@@ -890,7 +905,7 @@ impl RealmLifecycle {
     pub fn shutdown<H: PreemptionHook>(
         &mut self,
         timing: ShutdownTiming,
-        teardown: &mut RealmTeardown<'_, H>,
+        teardown: &mut RealmTeardown<'_, '_, H>,
     ) -> ShutdownRung {
         // Rung 0: the realm is dead as far as the core is concerned, and
         // the core's end of the socketpair closes inside `die` -- which is
@@ -941,7 +956,7 @@ impl RealmLifecycle {
     fn die<H: PreemptionHook>(
         &mut self,
         cause: DeathCause,
-        teardown: &mut RealmTeardown<'_, H>,
+        teardown: &mut RealmTeardown<'_, '_, H>,
     ) -> bool {
         if self.death.is_some() {
             return false;
@@ -1043,7 +1058,7 @@ impl RealmLifecycle {
     fn collect_exit<H: PreemptionHook>(
         &mut self,
         status: ExitStatus,
-        teardown: &mut RealmTeardown<'_, H>,
+        teardown: &mut RealmTeardown<'_, '_, H>,
     ) {
         // The reap latch: taken before anything else can fail, so no path
         // can wait on this child twice.
@@ -1079,7 +1094,7 @@ impl RealmLifecycle {
     fn wait_for_exit<H: PreemptionHook>(
         &mut self,
         budget: Duration,
-        teardown: &mut RealmTeardown<'_, H>,
+        teardown: &mut RealmTeardown<'_, '_, H>,
     ) -> bool {
         let deadline = Instant::now() + budget;
         loop {
@@ -1099,7 +1114,7 @@ impl RealmLifecycle {
     /// `SIGKILL` and a blocking wait. The rung that always terminates:
     /// `SIGKILL` can be neither caught, blocked, nor ignored, so the wait
     /// cannot hang on a cooperative peer.
-    fn force_kill<H: PreemptionHook>(&mut self, teardown: &mut RealmTeardown<'_, H>) {
+    fn force_kill<H: PreemptionHook>(&mut self, teardown: &mut RealmTeardown<'_, '_, H>) {
         let Some(mut child) = self.child.take() else {
             return;
         };
@@ -1431,7 +1446,7 @@ mod tests {
         }
 
         /// The bundle every death funnel takes.
-        fn teardown(&mut self) -> RealmTeardown<'_, NoopHook> {
+        fn teardown(&mut self) -> RealmTeardown<'_, '_, NoopHook> {
             RealmTeardown {
                 scene: &mut self.scene,
                 shim: &mut self.shim,

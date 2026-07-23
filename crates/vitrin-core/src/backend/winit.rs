@@ -83,6 +83,7 @@ use tracing::{debug, error, info, trace};
 use crate::consent::grab::{ConsentGate, ConsentGrab};
 use crate::consent::{ConsentSurface, TrustedIndicator};
 use crate::deadman::{DeadManConfig, DeadManHook, DeadManSwitch, Trigger};
+use crate::dmabuf::{render_content, DmabufImporter, GlesDmabufImporter, GpuContent};
 use crate::input;
 use crate::recorder::Recorder;
 use crate::scene::Scene;
@@ -1011,6 +1012,14 @@ pub(crate) struct NestedView {
     /// or leaves the table. It is empty only while no petition is pending.
     consent: ConsentSurface,
     texture: Option<SceneTexture>,
+    /// The retained zero-copy GPU content, if a `kind=dmabuf` commit has
+    /// been imported and nothing has replaced it since (P1.3.5, issue
+    /// #117). Lives here rather than in [`Scene`] because it is GPU state
+    /// bound to this backend's own [`GlesRenderer`] — [`Scene`] stays
+    /// renderer-free and shared with the headless backend, which has no
+    /// GPU to hold this on. `None` on every path that has not imported a
+    /// dmabuf: the ordinary shm/CPU-compose path, unchanged.
+    dmabuf_content: Option<GpuContent>,
 }
 
 /// Per-run state of the nested backend: its presentation half, the session
@@ -1213,6 +1222,7 @@ fn run_inner(
             scene: Scene::new(),
             consent: ConsentSurface::new(indicator),
             texture: None,
+            dmabuf_content: None,
         },
         runtime: Runtime::new(
             seed.take().expect("the seed is consumed exactly once"),
@@ -1690,19 +1700,68 @@ impl NestedState {
             return Ok(session::Presentation::Scheduled);
         }
 
+        // The hold indicator is sampled once per frame, from the same clock
+        // reading nothing else in this frame contends for; both this and
+        // the overlay check below feed the same instant so a hold that
+        // completes mid-frame is judged consistently within it.
+        let hold = self.deadman.borrow().hold_progress(Instant::now());
+        let overlay_up = hold.is_some() || self.view.consent.prompt().is_some();
+
+        // Zero-copy dmabuf presentation (P1.3.5, issue #117): a retained GPU
+        // import exists and neither overlay needs the window this frame, so
+        // the client's own texture goes straight to the framebuffer via
+        // [`render_content`] — no CPU composite, no [`ImportMem`] upload of
+        // any kind. This is the runtime home of the zero-memcpy claim
+        // [`crate::dmabuf`]'s [`crate::dmabuf::CopyMeter`] and its env-gated
+        // real-GPU test (`VITRIN_GPU_TESTS=1`) pin end to end; reaching it
+        // here is what makes that proof describe this backend's actual
+        // frame path rather than only a test harness driving the importer
+        // directly.
+        //
+        // **Known MVP seam, not a silent bug**: the moment either overlay
+        // needs the window, this falls through to the CPU path below, which
+        // composes from [`Scene`] — and the dmabuf arm of `shim.rs`'s
+        // `apply_buffer` deliberately never commits into `Scene` (module
+        // docs: it stays renderer-free and GPU-content-free). So a frame
+        // drawn while an overlay is up shows whatever `Scene` last held on
+        // the CPU side — the deterministic background, or a stale pre-
+        // dmabuf commit — not the live GPU pixels, for as long as the
+        // overlay stays up. Reconciling that would mean a GPU-composited
+        // overlay path or a readback-to-CPU bridge, either of which is the
+        // rendering-pipeline overhaul this backend's module docs already
+        // disclaim for what is a performance optimization, not a
+        // correctness requirement (plan risk R3; shm stays the universal,
+        // always-correct fallback, decision D3). Overlays are transient — a
+        // petition gets decided, a hold releases or fires — so the window
+        // self-heals back to live GPU content the instant `overlay_up` next
+        // reads `false`.
+        if self.view.dmabuf_content.is_some() && !overlay_up {
+            {
+                // Scoped: `bind` holds `self.view.backend` mutably (a
+                // disjoint field from `dmabuf_content`) for the duration of
+                // the composite, and both borrows must end here — `submit`
+                // and `schedule_next_frame` right after need the whole
+                // `self.view`/`self` back.
+                let (renderer, mut framebuffer) = self.view.backend.bind()?;
+                let content = self.view.dmabuf_content.as_ref().expect("checked above");
+                render_content(renderer, &mut framebuffer, size, content)?;
+            }
+            self.view.backend.submit(None)?;
+            trace!(?size, "dmabuf frame presented with zero core-side copies");
+            self.schedule_next_frame(frame_start, hold)?;
+            return Ok(session::Presentation::Completed);
+        }
+
         // Re-upload when the window size, the scene content, or the consent
         // surface changed: the same shared composition both backends present
         // (P1.3.3), plus the prompt (P1.7.1), uploaded here as a full-window
         // texture. Keying on both generations is what makes a prompt appear
         // and disappear at the host's very next frame instead of whenever the
-        // scene happens to change next.
-        // The hold indicator is sampled once per frame, from the same clock
-        // reading nothing else in this frame contends for, and folded into
-        // the cache key — so the bar really animates instead of appearing
-        // whenever the scene next happens to change (the trap
+        // scene happens to change next. The hold bucket folds into the same
+        // key — so the bar really animates instead of appearing whenever the
+        // scene next happens to change (the trap
         // `the_texture_key_changes_on_every_visible_transition` was written
-        // for, now with a third input).
-        let hold = self.deadman.borrow().hold_progress(Instant::now());
+        // for).
         let key = TextureKey::current(size, &self.view.scene, &self.view.consent, hold);
         // The scene's own pending damage (P1.3.9, issue #117), drained here
         // at most once per redraw whenever the scene changed — regardless of
@@ -1805,8 +1864,10 @@ impl NestedState {
             // here (same posture as Smithay's own winit example).
             let _sync_point = frame.finish()?;
         }
-        // Full-frame submit; damage tracking becomes worthwhile once client
-        // damage arrives over the shim protocol (P1.3.4).
+        // Full-window blit regardless of how much of the *upload* above was
+        // damage-limited: the window texture itself is always whole, so the
+        // GPU-side blit that presents it stays one full-window draw call —
+        // only the CPU→GPU upload feeding that texture is bounded.
         self.view.backend.submit(None)?;
         trace!(?size, "frame submitted");
         self.schedule_next_frame(frame_start, hold)?;
@@ -2002,7 +2063,8 @@ impl session::Presenter for NestedView {
         self.backend.window().request_redraw();
     }
 
-    /// The scene, and `None` for the retained half.
+    /// The scene, `None` for the retained half, and the dmabuf importer
+    /// bound to this backend's live `GlesRenderer` (P1.3.5, issue #117).
     ///
     /// Nested composites straight into the host compositor's surface and
     /// keeps no *retained* image of its own to scrub — [`Self::view_rgba`]
@@ -2016,13 +2078,54 @@ impl session::Presenter for NestedView {
     /// because it reads back a *held* framebuffer that would otherwise keep the
     /// last painted frame; nested, composing on demand from the live scene, has
     /// no such held image and so needs no scrub.
-    fn teardown_view(
+    ///
+    /// The importer, unlike the retained half, is very much needed here: a
+    /// GPU renderer exists ([`Self::backend`]'s `GlesRenderer`), and the
+    /// death funnel must drop any retained [`GpuContent`] through it
+    /// ([`DmabufImporter::clear`]) exactly as a live dispatch's replacing
+    /// commit would — the same GPU-done sync, the same single disposal
+    /// path, never a second one for teardown alone.
+    ///
+    /// The concrete [`GlesDmabufImporter`] lives as this call's own local —
+    /// never boxed and handed back by value (see
+    /// [`session::Presenter::teardown_view`]'s docs for why) — and `f` is
+    /// where the whole teardown funnel actually runs, so the local's borrow
+    /// of `self.backend`/`self.dmabuf_content` need only last for that one
+    /// call.
+    fn teardown_view<R>(
         &mut self,
-    ) -> (
-        &mut Scene,
-        Option<&mut dyn crate::lifecycle::RetainedOutput>,
-    ) {
-        (&mut self.scene, None)
+        f: impl for<'v> FnOnce(
+            &'v mut Scene,
+            Option<&'v mut dyn crate::lifecycle::RetainedOutput>,
+            Option<&'v mut dyn DmabufImporter>,
+        ) -> R,
+    ) -> R {
+        let mut importer = GlesDmabufImporter {
+            renderer: self.backend.renderer(),
+            content: &mut self.dmabuf_content,
+        };
+        f(&mut self.scene, None, Some(&mut importer))
+    }
+
+    /// The scene and a [`GlesDmabufImporter`] wrapping this backend's live
+    /// `GlesRenderer` and its retained content slot (P1.3.5, issue #117):
+    /// the seam that lets a `kind=dmabuf` shim commit resolve as a real
+    /// zero-copy import instead of the designed headless fallback.
+    ///
+    /// Constructed fresh per dispatch, as the trait's docs require: the
+    /// importer borrows `self.backend`'s renderer and `self.dmabuf_content`
+    /// for exactly this call and is handed to `f` as a bare trait reference,
+    /// never boxed (see [`session::Presenter::scene_and_importer`]'s docs
+    /// for why that distinction is load-bearing, not stylistic).
+    fn scene_and_importer<R>(
+        &mut self,
+        f: impl for<'v> FnOnce(&'v mut Scene, Option<&'v mut dyn DmabufImporter>) -> R,
+    ) -> R {
+        let mut importer = GlesDmabufImporter {
+            renderer: self.backend.renderer(),
+            content: &mut self.dmabuf_content,
+        };
+        f(&mut self.scene, Some(&mut importer))
     }
 }
 

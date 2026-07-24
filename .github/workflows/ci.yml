@@ -29,6 +29,12 @@ name: CI
 #                 on every PR. The 24 h pre-M1.5 campaign is a separate,
 #                 manual, documented procedure (fuzz/README.md) -- far too
 #                 slow to run here.
+#   wlcs-advisory advisory xdg-shell + seat WLCS conformance run (P1.9.4,
+#                 issue #47) against the GPL-3.0-only shim/wlcs/ bridge --
+#                 `continue-on-error: true` AND the runner script itself
+#                 always exits 0, so this NEVER gates a PR by design. See
+#                 shim/wlcs/README.md for scope, the annotated pass-list,
+#                 and why two independent non-blocking mechanisms exist.
 #
 # Everything runs on GPU-less Linux runners: pixman rendering + shm buffers
 # are mandatory in CI (plan 01-phase-1-mvp.md §6 D3), and nested mode is
@@ -384,6 +390,97 @@ jobs:
             echo "golden-frame, and no-Rust checks ran. The Meson build/test steps activate"
             echo "automatically when \`shim/meson.build\` lands; the landing PR owns"
             echo "\`shim/ci/install-deps.sh\` (see its header, decision D11)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  wlcs-advisory:
+    name: "wlcs-advisory (xdg-shell + seat, ADVISORY: never blocks a PR)"
+    runs-on: ubuntu-latest
+    # ADVISORY, per issue #47 ("never blocks PRs"), enforced by TWO
+    # independent mechanisms on purpose (either alone is one bad rebase
+    # away from silently starting to gate merges -- see shim/wlcs/
+    # README.md's "Why advisory, and how that's enforced"):
+    #   1. continue-on-error here, at the job level.
+    #   2. shim/wlcs/run-advisory.sh itself always exits 0.
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "Install wlcs (universe package: runner binary + headers + wlcs.pc)"
+        id: install-wlcs
+        # `|| true` on the apt-get, not on the whole step: a package that
+        # isn't installable (e.g. a future runner image drops the universe
+        # pocket) is exactly the "setup failure" this job treats as a
+        # skipped step, not a red job -- see the note in shim/wlcs/README.md
+        # ("this suite existing at all is strictly additive information").
+        run: |
+          sudo apt-get update -qq
+          if sudo apt-get install -y -qq wlcs; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=wlcs-advisory: wlcs package unavailable::apt could not install wlcs on this runner image; the whole job is skipping itself (this is a SETUP gap, not a test failure -- see shim/wlcs/README.md)."
+          fi
+
+      - name: Install Meson + wlroots subproject build dependencies
+        # The same list the `shim` and `conformance` jobs use, from the
+        # same file, so all three builds of the shim can never diverge in
+        # their dependency set.
+        if: steps.install-wlcs.outputs.found == 'true'
+        run: sudo bash shim/ci/install-deps.sh
+
+      - name: Build the shim + the GPL-3.0-only WLCS bridge module
+        # -Dwlcs=enabled: turns a missing wlcs pkg-config dependency into a
+        # loud configure error rather than a silent skip, since this job
+        # already confirmed the package installed above.
+        if: steps.install-wlcs.outputs.found == 'true'
+        run: |
+          meson setup "${RUNNER_TEMP}/shim-build" shim -Dwlcs=enabled
+          meson compile -C "${RUNNER_TEMP}/shim-build"
+
+      - name: Run the advisory WLCS suite (xdg-shell + seat scope)
+        if: steps.install-wlcs.outputs.found == 'true'
+        id: run-wlcs
+        run: |
+          WLCS_BIN="$(dpkg -L wlcs | grep -E '/wlcs/wlcs$')"
+          bash shim/wlcs/run-advisory.sh \
+            "$WLCS_BIN" \
+            "${RUNNER_TEMP}/shim-build/vitrin-shim-wlcs.so" \
+            "${RUNNER_TEMP}/wlcs-advisory-out"
+
+      - name: Publish summary
+        if: steps.install-wlcs.outputs.found == 'true' && always()
+        run: |
+          {
+            echo "## wlcs-advisory job (issue #47, ADVISORY -- never blocks this PR)"
+            echo ""
+            echo '```'
+            tail -20 "${RUNNER_TEMP}/wlcs-advisory-out/wlcs-run.log" || echo "(no log produced)"
+            echo '```'
+            echo ""
+            echo "Full log and gtest XML are in the \`wlcs-advisory-results\` artifact."
+            echo "See \`shim/wlcs/README.md\` for the annotated, standing pass-list this"
+            echo "run's numbers should be compared against."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: steps.install-wlcs.outputs.found == 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wlcs-advisory-results
+          path: ${{ runner.temp }}/wlcs-advisory-out/
+          retention-days: 14
+
+      - name: wlcs unavailable on this runner (declared skip, not a failure)
+        if: steps.install-wlcs.outputs.found == 'false'
+        run: |
+          {
+            echo "## wlcs-advisory job: SKIPPED (wlcs package unavailable)"
+            echo ""
+            echo "apt could not install \`wlcs\` on this runner image, so none of the"
+            echo "advisory conformance suite ran. This is a setup gap on the runner,"
+            echo "not a test result -- see \`shim/wlcs/README.md\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
   conformance:

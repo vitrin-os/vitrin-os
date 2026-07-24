@@ -240,6 +240,57 @@ executable(
   install: true,
 )
 
+# --- P1.9.4 advisory WLCS integration (issue #47) -----------------------
+# Builds shim/wlcs/integration.c -- together with every phase file the real
+# `vitrin-shim` executable above uses, except main.c (argv parsing, app
+# spawn and the core link are not needed in this standalone-only mode) --
+# into a WLCS-loadable plugin. This is the SAME bring-up/teardown code the
+# real shim runs, not a second compositor written for the occasion. See
+# shim/wlcs/README.md for what this proves, what it does not, and the
+# GPL-3.0-only license boundary this option draws around shim/wlcs/ alone
+# (the rest of this file, and everything it builds, stays MIT).
+#
+# 'auto' (the default): silently skipped when the `wlcs` pkg-config
+# dependency is not found, so an ordinary shim build is unaffected. The CI
+# job that runs this (advisory, never gating a PR -- see .github/workflows/
+# ci.yml's wlcs-advisory job) passes -Dwlcs=enabled, turning a missing wlcs
+# package into a loud configure error instead of a silent skip.
+wlcs_dep = dependency('wlcs', required: false)
+wlcs_opt = get_option('wlcs')
+if wlcs_opt.enabled() and not wlcs_dep.found()
+  error('wlcs option is "enabled" but the wlcs pkg-config dependency was ' +
+    'not found -- install the wlcs package (Ubuntu/Debian: `wlcs`) or ' +
+    'pass -Dwlcs=disabled')
+endif
+if wlcs_opt.enabled() or (wlcs_opt.auto() and wlcs_dep.found())
+  wlcs_module = shared_module(
+    'vitrin-shim-wlcs',
+    files(
+      'wlcs/integration.c',
+      'src/server.c',
+      'src/globals.c',
+      'src/output.c',
+      'src/xdg.c',
+      'src/seat.c',
+      'src/wire.c',
+      'src/upstream.c',
+      'src/ledger.c',
+    ),
+    protocol_sources,
+    protocol_headers,
+    probe_catalogue_h,
+    include_directories: inc,
+    dependencies: shim_deps + [wlcs_dep, dependency('threads')],
+    # Never installed and never linked into vitrin-shim: a dev/CI-only test
+    # harness artifact, and the one GPL-3.0-only target in this file.
+    install: false,
+    name_prefix: '',
+  )
+else
+  message('wlcs option: skipped (the wlcs pkg-config dependency was not ' +
+    'found; pass -Dwlcs=enabled to turn that into a configure error)')
+endif
+
 # Compile-proof of the checked-in generated wire header (mirrors the CI check
 # in the Cargo workspace; runs standalone here too).
 header_test = executable(

@@ -385,15 +385,21 @@ impl session::Presenter for HeadlessView {
         self.latest_frame_rgba().ok()
     }
 
-    /// Both halves, from the two fields the struct was split into for
-    /// exactly this call (see [`HeadlessView::output`]).
-    fn teardown_view(
+    /// All three, lent to `f`: the scene and retained image from the two
+    /// fields the struct was split into for exactly this call (see
+    /// [`HeadlessView::output`]); no importer, since this backend has no GPU
+    /// renderer at all — [`session::Presenter::scene_and_importer`]'s
+    /// default already answers `None` for the same reason, restated here
+    /// because `teardown_view` carries no default.
+    fn teardown_view<R>(
         &mut self,
-    ) -> (
-        &mut Scene,
-        Option<&mut dyn crate::lifecycle::RetainedOutput>,
-    ) {
-        (&mut self.scene, Some(&mut self.output))
+        f: impl for<'v> FnOnce(
+            &'v mut Scene,
+            Option<&'v mut dyn crate::lifecycle::RetainedOutput>,
+            Option<&'v mut dyn crate::dmabuf::DmabufImporter>,
+        ) -> R,
+    ) -> R {
+        f(&mut self.scene, Some(&mut self.output), None)
     }
 }
 

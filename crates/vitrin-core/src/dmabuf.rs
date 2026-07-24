@@ -334,7 +334,6 @@ fn wire_fourcc(format: Format) -> Option<Fourcc> {
 /// the dmabuf fd itself was already closed when [`GlesDmabufImporter::import`]
 /// returned success (EGL holds its own reference on the buffer — no fd
 /// lives here, and none stays open in the core's fd table).
-#[cfg_attr(not(all(test, feature = "gpu-tests")), allow(dead_code))]
 pub(crate) struct GpuContent {
     texture: GlesTexture,
     width: u32,
@@ -345,13 +344,11 @@ pub(crate) struct GpuContent {
 /// backend's, once P1.5.2 wires shim connections at runtime; the env-gated
 /// tests' today) and the embedder-owned retained-content slot. Constructed
 /// fresh per dispatch — it borrows, it does not own.
-#[cfg_attr(not(all(test, feature = "gpu-tests")), allow(dead_code))]
 pub(crate) struct GlesDmabufImporter<'a> {
     pub renderer: &'a mut GlesRenderer,
     pub content: &'a mut Option<GpuContent>,
 }
 
-#[cfg_attr(not(all(test, feature = "gpu-tests")), allow(dead_code))]
 impl DmabufImporter for GlesDmabufImporter<'_> {
     fn supports(&self, format: Format) -> bool {
         // Pure table lookup: Smithay caches the EGL dmabuf format/modifier
@@ -459,7 +456,6 @@ impl DmabufImporter for GlesDmabufImporter<'_> {
     }
 }
 
-#[cfg_attr(not(all(test, feature = "gpu-tests")), allow(dead_code))]
 fn refusal(stage: ImportStage, err: GlesError) -> ImportDenied {
     ImportDenied::Refusal(ImportError {
         stage,
@@ -473,7 +469,6 @@ fn refusal(stage: ImportStage, err: GlesError) -> ImportDenied {
 /// is also the sync point the deferred-release semantics lean on. The four
 /// bytes read are discarded: this is validation, not a pixel copy of the
 /// frame.
-#[cfg_attr(not(all(test, feature = "gpu-tests")), allow(dead_code))]
 fn probe_render(renderer: &mut GlesRenderer, texture: &GlesTexture) -> Result<(), GlesError> {
     let size: Size<i32, Physical> = (1, 1).into();
     let mut target: GlesRenderbuffer =
@@ -506,7 +501,6 @@ fn probe_render(renderer: &mut GlesRenderer, texture: &GlesTexture) -> Result<()
 /// execution means every previously queued command (including the last
 /// composite that sampled a retiring buffer) has completed when this
 /// returns.
-#[cfg_attr(not(all(test, feature = "gpu-tests")), allow(dead_code))]
 fn force_sync(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     let size: Size<i32, Physical> = (1, 1).into();
     let mut target: GlesRenderbuffer =
@@ -530,7 +524,6 @@ fn force_sync(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
 /// analogue of blitting `Scene::compose` output; used by the env-gated
 /// tests today and by the nested backend once P1.5.2 wires shim
 /// connections at runtime.
-#[cfg_attr(not(all(test, feature = "gpu-tests")), allow(dead_code))]
 pub(crate) fn render_content(
     renderer: &mut GlesRenderer,
     framebuffer: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
@@ -573,7 +566,6 @@ pub(crate) fn render_content(
 /// [`crate::scene::LETTERBOX_RGBA`] as the renderer's float clear color —
 /// derived, not restated, so the matte can never fork between the CPU and
 /// GPU paths.
-#[cfg_attr(not(all(test, feature = "gpu-tests")), allow(dead_code))]
 fn letterbox_color() -> smithay::backend::renderer::Color32F {
     smithay::backend::renderer::Color32F::new(
         LETTERBOX_RGBA[0] as f32 / 255.0,

@@ -402,7 +402,6 @@ impl ConsentSurface {
     }
 
     /// The prompt currently up, if any.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn prompt(&self) -> Option<&PromptContent> {
         self.prompt.as_ref()
     }

@@ -1,0 +1,24 @@
+Vitrin OS — licensing notice
+
+Decision D-005 (docs/plan/20-decision-log.md) settles a split license:
+
+  - protocol wire definitions and schemas (protocol/vitrin-v0.xml,
+    protocol/vitrin-v0.rng) and the client SDKs (sdk/python/, and any
+    future Rust SDK) — Apache License 2.0 (LICENSE), explicit patent grant.
+  - spec prose (docs/PRD.md, docs/protocol/*.md, docs/plan/**) —
+    Creative Commons Attribution 4.0 International (LICENSE-CC-BY-4.0).
+  - the reference implementation (crates/vitrin-core, crates/vitrin-ipc,
+    crates/vitrin-scanner, crates/xtask, shim/) is intended, per D-005, to
+    carry a weak-copyleft license (MPL-2.0 preferred, LGPL-3.0 the recorded
+    fallback) plus SPDX-License-Identifier headers throughout.
+
+**Current state of execution, honestly:** the Apache-2.0 and CC-BY-4.0
+halves above are in force as of this notice. The reference-implementation
+half is NOT yet executed — every crate in Cargo.toml still declares
+`license = "Apache-2.0"` (workspace-inherited), and no file carries an SPDX
+header. Re-licensing existing source (per-crate Cargo.toml edits, SPDX
+headers repo-wide, a per-directory LICENSE where the split changes) is a
+larger, separate action than this docs pass and is tracked as
+https://github.com/vitrin-os/vitrin-os/issues/133 rather than folded in
+here silently. Until that lands, the implementation is Apache-2.0 in
+practice, not yet MPL-2.0/LGPL-3.0.

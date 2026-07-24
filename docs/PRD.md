@@ -523,3 +523,12 @@ sg  = conn.request_grant(realm="realm-3", resource="subtree:/backups",
 - **Scope tiers matter.** v1 is deliberately not a daily-driver desktop, a toolkit, or a remote-desktop product. Session mode, toolkit backends, and the capability-remoting protocol are horizon-tier claims (PRD §5.3), not renunciations; a full toolkit and a consumer remoting product are renounced outright (§5.4). Evaluating v1 against horizon yardsticks would misjudge it.
 - **Same-user confinement is the weakest tier.** At the default and hardened isolation tiers a realm shares the host kernel with the core and other realms; namespaces (mount, net, PID, IPC, UID), Landlock, seccomp, and loopback-only networking bound but do not eliminate shared-kernel escape — a kernel 0-day pierces them. Only the microVM tier (§4.5) escapes that class. Security claims are stated per tier, not as a single absolute (§20.11). The `ssh localhost`-class escapes are closed at _every_ tier by own-netns; the residual risk this caveat names is the kernel beneath the namespace, not the reachable-service vector.
 - **Provenance infrastructure for desktop Linux is uneven.** Sigstore-style identity-bound signing and transparency logs are mature for supply-chain artifacts, not yet the norm for desktop app distribution (Flathub signs repositories, not per-publisher identity-bound certificates); P14 assumes tooling that exists but is not yet ambient. TOFU continuity carries its known blind spot: a malicious v1 is trusted until it misbehaves — provenance is authenticity, not virtue, and the scoped-grant model is what bounds the cost of that gap.
+
+---
+
+## License
+
+This document's prose is licensed under [CC BY 4.0](../LICENSE-CC-BY-4.0),
+per decision D-005 (`docs/plan/20-decision-log.md` — spec prose is
+permissively licensed independently of the reference implementation). See
+the repository root [`NOTICE`](../NOTICE) for the full license split.

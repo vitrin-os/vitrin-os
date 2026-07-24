@@ -1704,16 +1704,80 @@ impl NestedState {
         // for, now with a third input).
         let hold = self.deadman.borrow().hold_progress(Instant::now());
         let key = TextureKey::current(size, &self.view.scene, &self.view.consent, hold);
+        // The scene's own pending damage (P1.3.9, issue #117), drained here
+        // at most once per redraw whenever the scene changed — regardless of
+        // which branch below ends up using it. `Scene::take_damage_view`'s
+        // bookkeeping is one-shot per call and must never straddle two
+        // redraws (see its docs), and this is the only site downstream of a
+        // shim commit that ever calls it.
+        let scene_dirty = self.view.texture.as_ref().map(|v| v.key.scene_generation)
+            != Some(key.scene_generation);
+        let scene_damage = if scene_dirty {
+            self.view
+                .scene
+                .take_damage_view((size.w.max(0) as u32, size.h.max(0) as u32))
+        } else {
+            None
+        };
         if self.view.texture.as_ref().map(|v| v.key) != Some(key) {
             let pixels = window_pixels(&self.view.scene, &mut self.view.consent, hold, size);
             let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
-            let texture = self.view.backend.renderer().import_memory(
-                &pixels,
-                Fourcc::Abgr8888,
-                buffer_size,
-                false,
-            )?;
-            self.view.texture = Some(SceneTexture { texture, key });
+
+            // Damage-limited upload: if the *only* thing that changed since
+            // the last upload is the scene's own content, within a bounded
+            // rectangle, and the existing texture is already the right size,
+            // `update_memory` re-uploads just that rectangle instead of the
+            // whole window — the shim already tracks and forwards real
+            // damage (`shim/src/upstream.c`) and `Scene` already turned it
+            // into view-space coordinates; this is the seam that turns it
+            // into fewer bytes crossing the GPU bus. Any other cause — the
+            // first frame, a resize, unbounded scene damage (a fresh/resized
+            // surface, or a shim that named none), or a consent/hold
+            // transition riding along with this scene change — takes the
+            // full [`ImportMem::import_memory`] path unchanged from before
+            // this.
+            let bounded_scene_only_damage = match (&self.view.texture, scene_damage) {
+                (Some(prev), Some(rect))
+                    if prev.key.size == key.size
+                        && prev.key.consent_generation == key.consent_generation
+                        && prev.key.hold_bucket == key.hold_bucket =>
+                {
+                    Some(rect)
+                }
+                _ => None,
+            };
+            match bounded_scene_only_damage {
+                Some(rect) if rect.width > 0 && rect.height > 0 => {
+                    let region: Rectangle<i32, Buffer> =
+                        Rectangle::new((rect.x, rect.y).into(), (rect.width, rect.height).into());
+                    let prev = self.view.texture.as_ref().expect("checked above");
+                    self.view
+                        .backend
+                        .renderer()
+                        .update_memory(&prev.texture, &pixels, region)?;
+                    self.view.texture.as_mut().expect("checked above").key = key;
+                    trace!(?rect, "damage-limited texture upload");
+                }
+                // Degenerate (all-zero) damage: the accumulated change
+                // clipped away entirely outside the view (e.g. a center-
+                // cropped margin), so nothing visible changed and no upload
+                // — partial or full — is owed. The key still advances so the
+                // next frame's comparison starts from the true current
+                // state rather than re-deriving the same "nothing to do"
+                // answer.
+                Some(_) => {
+                    self.view.texture.as_mut().expect("checked above").key = key;
+                }
+                None => {
+                    let texture = self.view.backend.renderer().import_memory(
+                        &pixels,
+                        Fourcc::Abgr8888,
+                        buffer_size,
+                        false,
+                    )?;
+                    self.view.texture = Some(SceneTexture { texture, key });
+                }
+            }
         }
 
         let full_window = Rectangle::from_size(size);

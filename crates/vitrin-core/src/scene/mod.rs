@@ -28,6 +28,18 @@
 //! Wayland objects. At runtime the seam goes live when the realm spawn
 //! manager provides the shim connection (P1.5.2).
 //!
+//! # Damage tracking (issue #117)
+//!
+//! [`Scene::commit_with_damage`] additionally accepts the bounding box of
+//! the wire `damage` rectangles a commit named, and [`Scene::take_damage_view`]
+//! hands a presentation backend the accumulated damage since its last take,
+//! mapped into view coordinates through the same [`layout::place`]
+//! placement [`Scene::compose`] itself uses. This is what lets the nested
+//! backend upload only the changed region of its window texture instead of
+//! the whole view on every commit — the shim already tracks and forwards
+//! real damage (`shim/src/upstream.c`); before this it was latched by
+//! [`crate::shim`] and then discarded.
+//!
 //! # No surface committed → the deterministic test pattern
 //!
 //! An empty scene composes [`test_pattern::render`] exactly, byte for byte.
@@ -139,6 +151,78 @@ impl SurfaceContent {
     }
 }
 
+/// One damage rectangle, verbatim off the wire (buffer-local coordinates;
+/// clamping is composition's business, not this type's — out-of-bounds is a
+/// non-error per the IDL). Shared between the shim protocol server
+/// ([`crate::shim`], which folds a commit's rectangles into one here) and
+/// this module (which maps the fold into view space for a damage-limited
+/// GPU upload, issue #117).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DamageRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl DamageRect {
+    /// Fold `other` into `self` as a bounding box (saturating: damage is a
+    /// hint, over-approximation is always legal).
+    pub fn union(&mut self, other: DamageRect) {
+        let x2 = self
+            .x
+            .saturating_add(self.width)
+            .max(other.x.saturating_add(other.width));
+        let y2 = self
+            .y
+            .saturating_add(self.height)
+            .max(other.y.saturating_add(other.height));
+        self.x = self.x.min(other.x);
+        self.y = self.y.min(other.y);
+        self.width = x2.saturating_sub(self.x);
+        self.height = y2.saturating_sub(self.y);
+    }
+}
+
+/// What has changed in the scene since the last [`Scene::take_damage_view`],
+/// in the committed surface's own coordinate space.
+///
+/// Three states rather than a plain `Option<DamageRect>` because "nothing
+/// pending" and "pending, but not boundable" are different facts a caller
+/// must not conflate: the first means a redraw can be skipped outright (no
+/// caller of this module currently does, but the distinction is what makes
+/// that safe to add later), the second means any redraw must treat the
+/// *entire* view as changed. Collapsing them would either upload garbage
+/// (treating an unbounded change as "nothing") or waste GPU bandwidth on an
+/// idle scene (treating "nothing" as "everything").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingDamage {
+    /// Nothing has changed since the last take.
+    Clean,
+    /// Exactly this surface-local rectangle changed; nothing else did.
+    Rect(DamageRect),
+    /// Something changed that cannot be soundly bounded to a rectangle (a
+    /// brand-new surface, a resize, or a commit that named no damage at
+    /// all): the next take must report "everything".
+    Unbounded,
+}
+
+impl PendingDamage {
+    /// Fold in one more commit's damage hint: `None` means the commit named
+    /// no boundable rectangle (a hostile or merely lazy shim) and must be
+    /// treated as unbounded, same as any other unbounded cause.
+    fn fold(self, hint: Option<DamageRect>) -> PendingDamage {
+        match (self, hint) {
+            (PendingDamage::Unbounded, _) | (_, None) => PendingDamage::Unbounded,
+            (PendingDamage::Clean, Some(r)) => PendingDamage::Rect(r),
+            (PendingDamage::Rect(mut acc), Some(r)) => {
+                acc.union(r);
+                PendingDamage::Rect(acc)
+            }
+        }
+    }
+}
+
 /// The realm's scene: at most one client surface in the MVP (single
 /// maximized, plan P1.3.3). The realm object (P1.5.1) hangs off this; the
 /// consent overlay (P1.7.1) later composites *above* the view this scene
@@ -148,6 +232,10 @@ pub(crate) struct Scene {
     /// Bumped on every content change; presentation caches (the nested
     /// backend's texture) key on it to know when to re-upload.
     generation: u64,
+    /// Damage accumulated since the last [`Self::take_damage_view`] — the
+    /// bookkeeping [`Self::take_damage_view`] drains and
+    /// [`Self::commit`]/[`Self::clear_surface`] feed.
+    pending_damage: PendingDamage,
 }
 
 impl Scene {
@@ -156,16 +244,48 @@ impl Scene {
         Self {
             surface: None,
             generation: 0,
+            pending_damage: PendingDamage::Clean,
         }
     }
 
-    /// Commit new surface content — the seam the shim protocol server
-    /// ([`crate::shim`], P1.3.4) feeds after its shm copy-in. The caller is
-    /// responsible for triggering a redraw.
+    /// Commit new surface content with no damage hint — every change is
+    /// presumed to cover the whole surface. A thin wrapper over
+    /// [`Self::commit_with_damage`] for the many call sites (mostly tests)
+    /// that have no damage rectangle to offer; the shim protocol server
+    /// ([`crate::shim`], P1.3.4), which does, calls the full form directly.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn commit(&mut self, content: SurfaceContent) {
+        self.commit_with_damage(content, None);
+    }
+
+    /// Commit new surface content — the seam the shim protocol server
+    /// ([`crate::shim`], P1.3.4) feeds after its shm copy-in — together with
+    /// the bounding box of the wire `damage` rectangles that produced it, in
+    /// the *surface's own* coordinates (buffer-local, exactly as the shim
+    /// sent them). `None` means the commit named no boundable damage — a
+    /// legal but coarse shim, or none of the callers that do not track
+    /// damage at all — and is treated exactly like a change this scene
+    /// cannot bound to a rectangle. The caller is responsible for
+    /// triggering a redraw.
+    ///
+    /// A geometry change (the new content's size differs from what was
+    /// committed before, or there was no prior surface at all) always
+    /// widens the pending damage to "everything": the *placement* of the
+    /// surface within the view moves too ([`layout::place`] is a function of
+    /// both sizes), so a rectangle bounded in the old geometry could name
+    /// the wrong pixels in the new one.
+    pub fn commit_with_damage(&mut self, content: SurfaceContent, damage: Option<DamageRect>) {
+        let same_geometry = self
+            .surface
+            .as_ref()
+            .is_some_and(|prev| prev.width == content.width && prev.height == content.height);
         self.surface = Some(content);
         self.generation = self.generation.wrapping_add(1);
+        self.pending_damage = if same_geometry {
+            self.pending_damage.fold(damage)
+        } else {
+            PendingDamage::Unbounded
+        };
     }
 
     /// Drop the committed surface (shim death — the shim server's
@@ -175,6 +295,49 @@ impl Scene {
     pub fn clear_surface(&mut self) {
         self.surface = None;
         self.generation = self.generation.wrapping_add(1);
+        // The whole view changes (background replaces whatever was there),
+        // which no surface-local rectangle from before this call could name.
+        self.pending_damage = PendingDamage::Unbounded;
+    }
+
+    /// Take (and reset) the damage accumulated since the last call, mapped
+    /// into `view`-sized view coordinates through the same [`layout::place`]
+    /// placement [`Self::compose`] uses — so a caller's idea of "what
+    /// changed on screen" can never drift from what composition itself would
+    /// draw differently.
+    ///
+    /// `None` means "the caller must treat the whole view as changed": no
+    /// surface is committed, or the pending damage is
+    /// [`PendingDamage::Unbounded`]. `Some(rect)` is exact — including the
+    /// degenerate all-zero rectangle when the accumulated surface-local
+    /// damage clips away entirely outside the view (e.g. it landed in a
+    /// center-cropped margin), which tells the caller correctly that
+    /// nothing *visible* changed and no GPU upload at all is owed.
+    ///
+    /// Exists for the nested backend's damage-limited texture upload (issue
+    /// #117): the shim already tracks and forwards real damage
+    /// (`shim/src/upstream.c`), and the core already latches it
+    /// ([`crate::shim`]'s `handle_damage`/`handle_commit`) — this is the
+    /// seam that stops it being discarded at the shim→core→GPU boundary.
+    pub fn take_damage_view(&mut self, view: (u32, u32)) -> Option<DamageRect> {
+        let pending = std::mem::replace(&mut self.pending_damage, PendingDamage::Clean);
+        let (local, surface) = match (pending, &self.surface) {
+            (PendingDamage::Rect(r), Some(s)) => (r, s),
+            _ => return None,
+        };
+        let placement = layout::place(view, (surface.width, surface.height));
+        let x1 = (placement.x + i64::from(local.x)).clamp(0, i64::from(view.0));
+        let y1 = (placement.y + i64::from(local.y)).clamp(0, i64::from(view.1));
+        let x2 = (placement.x + i64::from(local.x) + i64::from(local.width.max(0)))
+            .clamp(0, i64::from(view.0));
+        let y2 = (placement.y + i64::from(local.y) + i64::from(local.height.max(0)))
+            .clamp(0, i64::from(view.1));
+        Some(DamageRect {
+            x: x1 as i32,
+            y: y1 as i32,
+            width: (x2 - x1).max(0) as i32,
+            height: (y2 - y1).max(0) as i32,
+        })
     }
 
     /// The content generation: changes exactly when composed output may
@@ -398,6 +561,187 @@ pub(crate) mod tests {
         scene.clear_surface();
         assert_ne!(g1, scene.generation(), "clear must bump the generation");
         assert_eq!(scene.compose(64, 64), test_pattern::render(64, 64));
+    }
+
+    // ------------------------------------------------------------------
+    // Damage tracking (issue #117): the view-space bounding box
+    // `take_damage_view` hands the nested backend for its damage-limited
+    // GPU upload.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_fresh_or_resized_surface_reports_unbounded_damage() {
+        let mut scene = Scene::new();
+        // No prior surface at all.
+        scene.commit_with_damage(
+            SurfaceContent::from_rgba(client_pixels(8, 8), 8, 8).unwrap(),
+            Some(DamageRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            }),
+        );
+        assert_eq!(
+            scene.take_damage_view((64, 64)),
+            None,
+            "the very first commit must report unbounded damage regardless of the hint"
+        );
+
+        // A same-generation resize likewise cannot be bounded: the surface's
+        // placement in the view moved.
+        scene.commit_with_damage(
+            SurfaceContent::from_rgba(client_pixels(8, 8), 8, 8).unwrap(),
+            Some(DamageRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            }),
+        );
+        scene.take_damage_view((64, 64)); // drain, so the next take is clean
+        scene.commit_with_damage(
+            SurfaceContent::from_rgba(client_pixels(16, 8), 16, 8).unwrap(),
+            Some(DamageRect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 8,
+            }),
+        );
+        assert_eq!(
+            scene.take_damage_view((64, 64)),
+            None,
+            "a geometry change must report unbounded damage"
+        );
+    }
+
+    #[test]
+    fn a_commit_naming_no_damage_is_unbounded() {
+        let mut scene = Scene::new();
+        scene.commit(SurfaceContent::from_rgba(client_pixels(8, 8), 8, 8).unwrap());
+        scene.take_damage_view((64, 64)); // drain the initial unbounded state
+        scene.commit_with_damage(
+            SurfaceContent::from_rgba(client_pixels(8, 8), 8, 8).unwrap(),
+            None,
+        );
+        assert_eq!(
+            scene.take_damage_view((64, 64)),
+            None,
+            "a commit with no boundable hint must be treated as unbounded, not skipped"
+        );
+    }
+
+    #[test]
+    fn a_bounded_hint_maps_through_the_same_placement_composition_uses() {
+        let (vw, vh) = (100, 80);
+        let (sw, sh) = (40, 20);
+        let mut scene = Scene::new();
+        scene.commit(SurfaceContent::from_rgba(client_pixels(sw, sh), sw, sh).unwrap());
+        scene.take_damage_view((vw, vh)); // drain the initial unbounded state
+
+        // A 10x6 rectangle at (2, 3) in the surface's own coordinates.
+        scene.commit_with_damage(
+            SurfaceContent::from_rgba(client_pixels(sw, sh), sw, sh).unwrap(),
+            Some(DamageRect {
+                x: 2,
+                y: 3,
+                width: 10,
+                height: 6,
+            }),
+        );
+        let placement = layout::place((vw, vh), (sw, sh));
+        assert_eq!(
+            scene.take_damage_view((vw, vh)),
+            Some(DamageRect {
+                x: placement.x as i32 + 2,
+                y: placement.y as i32 + 3,
+                width: 10,
+                height: 6,
+            }),
+            "the surface-local rectangle must land exactly where compose() would place it"
+        );
+        // Taken: a further take with nothing new pending is unbounded
+        // (nothing has changed, but there is also nothing bounded to hand
+        // back — see PendingDamage::Clean).
+        assert_eq!(scene.take_damage_view((vw, vh)), None);
+    }
+
+    #[test]
+    fn damage_outside_the_view_clips_to_a_degenerate_rect() {
+        // A surface larger than the view, center-cropped (module docs):
+        // damage entirely inside the cropped-away margin clips to a
+        // zero-area rectangle rather than reporting unbounded — nothing
+        // visible changed, and the caller can skip the GPU upload outright.
+        let (vw, vh) = (40, 30);
+        let (sw, sh) = (60, 50);
+        let mut scene = Scene::new();
+        scene.commit(SurfaceContent::from_rgba(client_pixels(sw, sh), sw, sh).unwrap());
+        scene.take_damage_view((vw, vh));
+
+        let placement = layout::place((vw, vh), (sw, sh));
+        assert!(placement.x < 0, "the fixture must actually crop");
+        // Damage confined to the cropped-away left margin (x in [0, -placement.x)).
+        let margin = (-placement.x) as i32;
+        assert!(margin > 0);
+        scene.commit_with_damage(
+            SurfaceContent::from_rgba(client_pixels(sw, sh), sw, sh).unwrap(),
+            Some(DamageRect {
+                x: 0,
+                y: 0,
+                width: margin,
+                height: 1,
+            }),
+        );
+        let rect = scene.take_damage_view((vw, vh)).expect("bounded");
+        assert_eq!((rect.width, rect.height), (0, 0));
+    }
+
+    #[test]
+    fn clearing_the_surface_is_unbounded_damage() {
+        let mut scene = Scene::new();
+        scene.commit(SurfaceContent::from_rgba(client_pixels(8, 8), 8, 8).unwrap());
+        scene.take_damage_view((64, 64));
+        scene.clear_surface();
+        assert_eq!(scene.take_damage_view((64, 64)), None);
+    }
+
+    #[test]
+    fn multiple_commits_accumulate_a_bounding_box_before_the_next_take() {
+        let (vw, vh) = (64, 64);
+        let mut scene = Scene::new();
+        scene.commit(SurfaceContent::from_rgba(client_pixels(64, 64), 64, 64).unwrap());
+        scene.take_damage_view((vw, vh));
+
+        scene.commit_with_damage(
+            SurfaceContent::from_rgba(client_pixels(64, 64), 64, 64).unwrap(),
+            Some(DamageRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }),
+        );
+        scene.commit_with_damage(
+            SurfaceContent::from_rgba(client_pixels(64, 64), 64, 64).unwrap(),
+            Some(DamageRect {
+                x: 20,
+                y: 20,
+                width: 4,
+                height: 4,
+            }),
+        );
+        assert_eq!(
+            scene.take_damage_view((vw, vh)),
+            Some(DamageRect {
+                x: 0,
+                y: 0,
+                width: 24,
+                height: 24,
+            }),
+            "two commits coalesced by one take must union, exactly as a coalesced dispatch \
+             round presents them"
+        );
     }
 
     #[test]

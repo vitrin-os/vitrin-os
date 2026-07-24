@@ -9,32 +9,39 @@ One script, two venues, exactly the same agent code path in both:
       -> await consent (a human clicks Allow in nested; a guarded
          auto-approve resolves it headless)
       -> capture a "before" frame
-      -> locate the URL bar by pixels
-      -> click it, type a URL, press Enter (the trailing "\\n")
+      -> locate the input target by pixels
+      -> click it, type text, press Enter (the trailing "\\n")
       -> capture an "after" frame
       -> assert the page changed.
 
-The two venues differ only in *what stands in for the app* and in *how "the
-page changed" is proven* — never in the agent's protocol conduct:
+Both venues run the SAME real chain: the shipped `vitrind` execs the real
+per-app Wayland shim (`vitrin-shim`, issue #103/#104), which fork/execs a real
+app inside its own private, confined Wayland socket (issue #110) —
+`vitrin-mock-shim` is a unit-test fixture and stands in for nothing here. The
+two venues differ only in *which real app* stands behind the shim and in *how
+"the page changed" is proven*, never in the agent's protocol conduct:
 
-* **Nested** (`cargo xtask demo`): a real Firefox ESR runs in realm-0. This
-  script serves a deterministic solid-colour page from a stdlib
-  ``http.server`` bound to ``127.0.0.1:0`` on a daemon thread, types that
-  local URL into Firefox's URL bar, and proves the navigation happened by the
-  *dominant colour* of the after-frame matching the colour it served (robust
-  to anti-aliasing via colour bucketing). A human answers the consent prompt.
-  This venue needs a display and a browser; it is correct-by-construction here
+* **Nested** (`cargo xtask demo`): a real Firefox ESR runs in realm-0, behind
+  the real shim, on the host's real display. This script serves a
+  deterministic solid-colour page from a stdlib ``http.server`` bound to
+  ``127.0.0.1:0`` on a daemon thread, types that local URL into Firefox's URL
+  bar, and proves the navigation happened by the *dominant colour* of the
+  after-frame matching the colour it served (robust to anti-aliasing via
+  colour bucketing). A human answers the consent prompt. This venue needs a
+  display, a browser, and a built C shim; it is correct-by-construction here
   but is exercised on a workstation, never in CI.
 
-* **Headless** (`cargo xtask demo --headless`, and CI): the ``vitrin-mock-shim``
-  animated buffer stands in for the app — CI must never depend on Firefox or a
-  GPU (plan risk R6/R1). "The page changed" here means the two captures differ
-  (the animation advanced across the actuation sequence). What proves the
-  actuation *causally reached the app* is not pixels but the flight recorder's
+* **Headless** (`cargo xtask demo --headless`, and CI): a real, trivial
+  Wayland client (`weston-terminal`, or `foot`) runs in realm-0, behind the
+  real shim — GPU-free, so CI never depends on Firefox or a GPU (plan risk
+  R6/R1). "The page changed" here means the typed text visibly landed: enough
+  *real* pixels changed between the two captures that a stray blinking cursor
+  could not explain it (see :data:`MIN_HEADLESS_CHANGED_PIXELS`) — never an
+  autonomous mock animation running regardless of actuation. What additionally
+  proves the actuation *causally reached the app* is the flight recorder's
   ``use_decision`` entries — an allowed ``move`` at the clicked coordinate and
-  an allowed ``type`` whose ``chars`` equals the URL's length — exactly as
-  ``tests/integration/test_actuation.py`` establishes. The mock shim is not
-  asked to visibly react to input; nothing in version 1 makes it.
+  an allowed ``type`` whose ``chars`` equals the typed text's length — exactly
+  as ``tests/integration/test_actuation.py`` establishes.
 
 The consent guard (``--consent=auto-approve``) is only sound because the
 principal registry the launcher writes holds *nothing but* the one demo
@@ -97,10 +104,13 @@ _SOLID_PAGE = (
     "</head><body></body></html>"
 ).format(r=SERVED_RGB[0], g=SERVED_RGB[1], b=SERVED_RGB[2]).encode("utf-8")
 
-#: The URL the headless venue "navigates" to. The mock shim ignores it; only
-#: its length reaches the flight recorder (typed text is recorded by shape,
-#: never verbatim). A stable literal keeps the recorder assertion deterministic.
-DEFAULT_HEADLESS_URL = "http://127.0.0.1/vitrin-demo"
+#: The text the headless venue types into the real terminal app. Not a URL —
+#: there is no browser headless — just a harmless shell line: the real app
+#: renders it (and its shell's response, whatever that is), which is what the
+#: pixel-change assertion needs, and its *length* reaches the flight recorder
+#: (typed text is recorded by shape, never verbatim). A stable literal keeps
+#: the recorder assertion deterministic.
+DEFAULT_HEADLESS_INPUT = "echo vitrin-demo"
 
 
 class _SolidPageHandler(http.server.BaseHTTPRequestHandler):
@@ -163,8 +173,8 @@ ESR_URL_BAR = (640, 72)
 #: the window is some size other than :data:`ESR_WINDOW_SIZE`.
 ESR_TOOLBAR_Y = 72
 
-#: Headless nominal Y: the mock shim has no URL bar, so any in-bounds point
-#: serves — what matters headless is that *some* coordinate reaches the
+#: Headless nominal Y: the real terminal app has no URL bar, so any in-bounds
+#: point serves — what matters headless is that *some* coordinate reaches the
 #: chokepoint and is recorded. Kept near the top for parity with a real
 #: toolbar, and clamped into the frame below.
 HEADLESS_NOMINAL_Y = 16
@@ -173,9 +183,9 @@ HEADLESS_NOMINAL_Y = 16
 def locate_url_bar(frame: vitrin_os.Frame, *, headless: bool) -> tuple[int, int]:
     """Pick the pixel to click. Small and honest by construction.
 
-    Headless: a nominal in-bounds coordinate (the mock shim models no URL bar).
-    Nested: the fixed geometry of the pinned ESR when the window is the pinned
-    size, with a proportional fallback for any other size.
+    Headless: a nominal in-bounds coordinate (the real terminal app models no
+    URL bar). Nested: the fixed geometry of the pinned ESR when the window is
+    the pinned size, with a proportional fallback for any other size.
     """
     width, height = frame.width, frame.height
     if headless:
@@ -219,6 +229,41 @@ def colors_close(a: tuple[int, int, int], b: tuple[int, int, int], *, tol: int =
     return all(abs(x - y) <= tol for x, y in zip(a, b))
 
 
+# --- pixel analysis (headless "page changed") -------------------------------
+
+#: Above this many changed pixels, the headless "page changed" assertion
+#: trusts the diff as real actuation-driven content — typed text landing in
+#: the terminal renders many glyph pixels — rather than an incidental
+#: blinking cursor (a handful of pixels in one character cell). Mirrors
+#: ``tests/integration/test_real_actuation.py``'s ``MIN_CHANGED_PIXELS``
+#: reasoning (the D7 text gate) at a lower bar sized for this smaller view.
+MIN_HEADLESS_CHANGED_PIXELS = 24
+
+
+def count_changed_pixels(before: vitrin_os.Frame, after: vitrin_os.Frame) -> int:
+    """How many pixels' colour channels differ between two same-size frames.
+
+    Reads ``frame.raw`` directly (little-endian xrgb8888, ``B, G, R, X`` per
+    pixel) and compares only the three colour bytes — the fourth, padding,
+    byte carries no content and the C shim composites an opaque background
+    whose padding plane is a constant regardless of the client (see
+    ``tests/integration/harness.py``'s ``colour_bytes`` for the same
+    reasoning). Raises if the two frames are not the same size, which would
+    be a bug in the caller, not a "changed" frame. Inlined rather than
+    imported from the harness — this is a *shipped example*, launched with
+    only ``PYTHONPATH=sdk/python/src`` (see :func:`_capture_when_ready`'s
+    docstring for why the demo stays standalone).
+    """
+    a, b = before.raw, after.raw
+    if len(a) != len(b):
+        raise ValueError(f"frame size mismatch: {len(a)} vs {len(b)} bytes")
+    changed = 0
+    for i in range(0, len(a), 4):
+        if a[i : i + 3] != b[i : i + 3]:
+            changed += 1
+    return changed
+
+
 # --- the observe-race-tolerant first capture --------------------------------
 
 def _capture_when_ready(
@@ -260,19 +305,21 @@ def _capture_after_change(
 ) -> vitrin_os.Frame:
     """Capture the "after" frame once the change is observable.
 
-    Headless: poll until the raw bytes differ from ``before`` (the animation
-    advanced across the actuation round trips). Nested: poll until the
-    dominant colour reaches :data:`SERVED_RGB` (the page loaded). Polling is
-    paced (a settle, then ``attempts`` spaced by ``poll``) so a default-rate
-    grant's token bucket is never emptied by the capture loop itself. The last
-    frame is returned regardless, so a genuine failure yields a diagnosable
-    after-frame rather than an exception here.
+    Headless: poll until enough real pixels have changed from ``before`` to
+    rule out a stray blinking cursor (:data:`MIN_HEADLESS_CHANGED_PIXELS`) —
+    the typed text actually landing in the real terminal app, never an
+    autonomous mock animation. Nested: poll until the dominant colour reaches
+    :data:`SERVED_RGB` (the page loaded). Polling is paced (a settle, then
+    ``attempts`` spaced by ``poll``) so a default-rate grant's token bucket is
+    never emptied by the capture loop itself. The last frame is returned
+    regardless, so a genuine failure yields a diagnosable after-frame rather
+    than an exception here.
     """
     time.sleep(settle)
     frame = grant.observe()
     for _ in range(attempts):
         if headless:
-            if frame.raw != before.raw:
+            if count_changed_pixels(before, frame) >= MIN_HEADLESS_CHANGED_PIXELS:
                 return frame
         elif colors_close(dominant_color(frame), SERVED_RGB):
             return frame
@@ -301,11 +348,13 @@ class DemoResult:
 
 def _assert_page_changed(before: vitrin_os.Frame, after: vitrin_os.Frame, *, headless: bool) -> None:
     if headless:
-        if before.raw == after.raw:
+        changed = count_changed_pixels(before, after)
+        if changed < MIN_HEADLESS_CHANGED_PIXELS:
             raise DemoAssertionError(
-                "headless: the two captures are byte-identical — the animation did not "
-                "advance across the actuation sequence, so nothing proves the realm is "
-                "live between the frames"
+                f"headless: only {changed} pixel(s) changed between the two captures "
+                f"(need >= {MIN_HEADLESS_CHANGED_PIXELS}) — the typed text did not visibly "
+                "land in the real app; this venue runs a real terminal behind the real "
+                "shim, not a mock animation, so a genuine actuation effect is required"
             )
         return
     dominant = dominant_color(after)
@@ -364,10 +413,10 @@ def run(
     before: vitrin_os.Frame | None = None
     after: vitrin_os.Frame | None = None
     try:
-        # Nested serves a real local page for Firefox to load; headless types a
-        # nominal URL the mock shim ignores.
+        # Nested serves a real local page for Firefox to load; headless types
+        # a harmless shell line into the real terminal app.
         if headless:
-            target = url or DEFAULT_HEADLESS_URL
+            target = url or DEFAULT_HEADLESS_INPUT
         else:
             page = _LocalPage()
             target = url or page.url
@@ -395,7 +444,7 @@ def run(
 
         before = _capture_when_ready(grant)
         url_x, url_y = locate_url_bar(before, headless=headless)
-        print(f"demo: clicking the URL bar at ({url_x}, {url_y}); typing {target!r} + Enter")
+        print(f"demo: clicking ({url_x}, {url_y}); typing {target!r} + Enter")
         grant.pointer.click(url_x, url_y)
         grant.text.type(target + "\n")  # the trailing newline presses Enter
 
@@ -427,14 +476,15 @@ def _parse_argv(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--socket", required=True,
                         help="path to the core's Unix socket (core.sock)")
     parser.add_argument("--headless", action="store_true",
-                        help="headless venue: the mock shim stands in for the app")
+                        help="headless venue: a real terminal app stands behind the real shim")
     parser.add_argument("--consent", default="auto-approve",
                         choices=("auto-approve", "interactive"),
                         help="the consent policy the launched core runs (informational)")
     parser.add_argument("--out", default=None,
                         help="directory for failure PNGs (a temp dir by default)")
     parser.add_argument("--url", default=None,
-                        help="override the URL to navigate to (nested serves its own by default)")
+                        help="override the text typed (nested: the URL navigated to, and it "
+                             "serves its own by default; headless: the shell line typed)")
     parser.add_argument("--recorder", default=None,
                         help="flight-recorder path, printed on failure for diagnosis")
     return parser.parse_args(argv)

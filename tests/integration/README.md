@@ -41,7 +41,7 @@ their value; they are just never a substitute for the named gate.
 | `harness.py` | `Core` — boots the binary in a throwaway `XDG_RUNTIME_DIR` (defaults its shim to `vitrin-mock-shim`, `MOCK_SHIM`, unless a real shim path is passed); `IntegrationTest` — per-test deadline and core reaping. | — (harness) |
 | `test_runtime_wiring.py` | **Component test.** Issue #77's acceptance criteria (startup-ordering trap T1) against the real core + `vitrin-mock-shim`. Never a milestone gate — it predates and is orthogonal to M1.2–M1.5. | No |
 | `test_actuation.py` | **Component test.** P1.8.3 (#42): the SDK's actuation API and typed grant-error exceptions against the real core + `vitrin-mock-shim`. Superseded, for milestone purposes, by `test_real_actuation.py` below. | No |
-| `test_demo.py` | **Component test.** P1.8.4 (#43): the demo agent's headless flow, recorder-verified, against the real core + `vitrin-mock-shim --seat --animate`. **Not** the M1.5 gate — #110 (P1.8.7) is, and is not yet green; `cargo xtask demo --headless` still runs the mock shim as the demo's app today (`crates/xtask/src/main.rs`), which is exactly what #110 exists to replace. | No |
+| `test_demo.py` | The **M1.5 named acceptance gate** (P1.8.7, #110): `examples/agent-demo/run_demo.py`'s headless venue, imported and run against the real chain — `vitrind` → real `vitrin-shim` → real `weston-terminal`, never `vitrin-mock-shim` — with the process spine asserted by ancestry, the click/type recorded verbatim at the chokepoint, and "the page changed" proven by a real pixel-count threshold instead of a mock's autonomous animation. A second, binary-free test grep-proves neither `crates/xtask` nor `run_demo.py` constructs `vitrin-mock-shim`. Same C-shim env contract; the nested venue (real Firefox) is workstation-only (`shim/docs/firefox.md`). | **Yes — M1.5** |
 | `test_real_app.py` | The **M1.2 exit gate** (P1.9.6, #105): the whole real chain — real `vitrind` → real C shim → real `weston-terminal` — with no mock on any seam. Skips without a built C shim; see the env contract below. | **Yes — M1.2** |
 | `test_real_gtk.py` | The GTK rung of the real bring-up ladder (P1.6.6, #106): real `vitrind` → real C shim → real `gtk-entry-probe`, reusing `test_real_app.py`'s real-app mode. Supporting evidence for M1.2's render half, alongside `test_real_firefox.py`. | Supporting — M1.2 |
 | `test_real_firefox.py` | The Firefox rung of the real bring-up ladder (P1.6.6, #106): real `vitrind` → real C shim → real pinned Firefox ESR, asserting a real rendered colour and the globals contract, with no mock on any seam. Supporting evidence for M1.2's render half. | Supporting — M1.2 |
@@ -126,9 +126,11 @@ cannot silently drift.
   meson setup shim/build shim && meson compile -C shim/build
   VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" bash tests/integration/run.sh
   ```
-- **Later occupants:** this job also hosts the M1.5 gates — demo job
-  (P1.8.4), golden frames (P1.9.2), hostile-client tests (P1.9.3) — behind
-  the same entry point.
+- **Later occupants:** this job also hosts the rest of the M1.5 gates —
+  golden frames (P1.9.2), hostile-client tests (P1.9.3) — behind the same
+  entry point. The demo gate (P1.8.4/P1.8.7, `test_demo.py`) has landed; it
+  adds no new CI wiring, reusing the real-app ladder's `VITRIN_C_SHIM_BIN` /
+  `weston-terminal` install exactly as `test_real_app.py` does.
 
 ## Two invariants worth keeping
 

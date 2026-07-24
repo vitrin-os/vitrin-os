@@ -40,22 +40,44 @@
 
 use std::cell::{Cell, RefCell};
 use std::error::Error;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use calloop::generic::Generic;
 use calloop::signals::{Signal, Signals};
 use calloop::timer::{TimeoutAction, Timer};
-use calloop::{EventLoop, LoopHandle, LoopSignal};
-use smithay::backend::allocator::Fourcc;
-use smithay::backend::egl::context::GlAttributes;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::backend::renderer::{Color32F, Frame, ImportMem, Renderer};
-use smithay::backend::winit::{
-    self as winit_backend, WinitEvent, WinitGraphicsBackend, WinitInput,
+use calloop::EventLoop;
+use calloop::{
+    EventSource, Interest, LoopHandle, LoopSignal, Mode, Poll, PostAction, Readiness, Token,
 };
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::egl::context::{GlAttributes, PixelFormatRequirements};
+use smithay::backend::egl::display::EGLDisplay;
+use smithay::backend::egl::{native, EGLContext, EGLSurface};
+use smithay::backend::input::{
+    AbsolutePositionEvent, Axis as HostAxis, AxisRelativeDirection, AxisSource,
+    ButtonState as HostButtonState, Device, DeviceCapability, Event as HostEvent, InputBackend,
+    InputEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent, UnusedEvent,
+};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::{Bind, Color32F, Frame, ImportMem, Renderer, RendererSuper};
+use smithay::backend::SwapBuffersError;
+use smithay::reexports::winit::application::ApplicationHandler;
 use smithay::reexports::winit::dpi::LogicalSize;
-use smithay::reexports::winit::window::Window as WinitWindow;
-use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
+use smithay::reexports::winit::event::{
+    ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent,
+};
+use smithay::reexports::winit::event_loop::{ActiveEventLoop, EventLoop as HostEventLoop};
+use smithay::reexports::winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+use smithay::reexports::winit::platform::scancode::PhysicalKeyExtScancode;
+use smithay::reexports::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use smithay::reexports::winit::window::{Window as WinitWindow, WindowAttributes, WindowId};
+use smithay::utils::{Buffer, Clock, Monotonic, Physical, Rectangle, Size, Transform};
+use vitrin_protocol::generated::vitrin_shim_seat::KeyState as SeatKeyState;
+use wayland_egl as wegl;
+
 use tracing::{debug, error, info, trace};
 
 use crate::consent::grab::{ConsentGate, ConsentGrab};
@@ -223,6 +245,746 @@ pub(crate) fn capture_pixels(scene: &Scene, size: Size<i32, Physical>) -> Option
     Some(scene.compose(w, h))
 }
 
+// ============================================================================
+// Own winit glue (issue #118)
+// ============================================================================
+//
+// Smithay 0.7.0's `backend::winit` module (`init_from_attributes_with_gl_attr`
+// / `WinitEventLoop`) is a closed box: its `ApplicationHandler` and the
+// `winit::event_loop::EventLoop` it pumps are both private, and the one
+// keyboard event it hands out (`WinitKeyboardInputEvent`) carries only the
+// evdev scancode — winit's interpreted `logical_key` (the layout-*dependent*
+// character a keypress produces) is read and then dropped before the core
+// ever sees it. There is no callback, no accessor, and no second
+// `ApplicationHandler` winit will let us pump the same event loop with (it
+// panics on a second `EventLoop` per thread) — so the only way to reach
+// `logical_key` is for this backend to own the winit event loop itself.
+//
+// What follows is a from-scratch `WinitGraphicsBackend`/`WinitEventLoop`
+// pair, built from the same *public* `smithay::backend::egl` primitives
+// Smithay's own module calls (verified against its source, pinned at
+// `=0.7.0`): one EGL display/context/surface, bound to the raw window handle
+// winit hands back, exactly as upstream does it. The only real difference is
+// the `ApplicationHandler`: ours additionally captures `KeyEvent::logical_key`
+// out of `WindowEvent::KeyboardInput` and resolves it with
+// [`input::host_keysym`], then routes keyboard through
+// [`NestedState::handle_key`] → [`input::physical_key`] directly, bypassing
+// [`input::intake_physical`]'s scancode-only `Keyboard` arm (which stays, for
+// the generic `InputBackend`s the unit tests drive). Every other input class
+// (pointer motion/button/axis) still flows through `intake_physical`, now
+// instantiated over [`NestedInput`] instead of Smithay's private
+// `WinitInput` — its event-struct fields are `pub(crate)` to smithay and so
+// cannot be reused from here; [`NestedInput`]'s pointer/axis event structs
+// and button-code table are copied 1:1 from Smithay's own
+// `backend::winit::input` (verified line-for-line against the pinned
+// source), only the marker type differs. Touch, gestures, and tablet events
+// are `UnusedEvent` — `intake_physical` has never resolved them (its match
+// falls through to `_ => Vec::new()` today, on the private `WinitInput` this
+// backend used before), so nothing observable regresses by not modeling them.
+
+/// Marker used to define the [`InputBackend`] types for this backend's own
+/// winit event pump — the crate-local counterpart of Smithay's private
+/// `WinitInput` (see the module section above for why it cannot be reused
+/// directly).
+#[derive(Debug)]
+pub(crate) struct NestedInput;
+
+/// Virtual input device winit-sourced events are attributed to. Mirrors
+/// Smithay's `WinitVirtualDevice` field-for-field; there is exactly one
+/// physical input path in nested mode, so one device suffices.
+#[derive(PartialEq, Eq, Hash, Debug)]
+pub(crate) struct NestedVirtualDevice;
+
+impl Device for NestedVirtualDevice {
+    fn id(&self) -> String {
+        String::from("vitrin-nested-winit")
+    }
+
+    fn name(&self) -> String {
+        String::from("vitrin nested winit virtual input")
+    }
+
+    fn has_capability(&self, capability: DeviceCapability) -> bool {
+        matches!(
+            capability,
+            DeviceCapability::Keyboard | DeviceCapability::Pointer
+        )
+    }
+
+    fn usb_id(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    fn syspath(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// Position relative to the window, each coordinate in `[0, 1]` — the same
+/// normalization Smithay's private `RelativePosition` performs, needed here
+/// only because that type is not exported.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NestedRelativePosition {
+    x: f64,
+    y: f64,
+}
+
+/// Absolute pointer motion, wrapping [`PointerMotionAbsoluteEvent`]. Built in
+/// [`NestedWinitEventsApp::window_event`] from `WindowEvent::CursorMoved`,
+/// identically to how Smithay's own handler builds `WinitMouseMovedEvent`.
+#[derive(Debug, Clone)]
+pub(crate) struct NestedMotionEvent {
+    time: u64,
+    position: NestedRelativePosition,
+    global_x: f64,
+    global_y: f64,
+}
+
+impl HostEvent<NestedInput> for NestedMotionEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> NestedVirtualDevice {
+        NestedVirtualDevice
+    }
+}
+
+impl PointerMotionAbsoluteEvent<NestedInput> for NestedMotionEvent {}
+impl AbsolutePositionEvent<NestedInput> for NestedMotionEvent {
+    fn x(&self) -> f64 {
+        self.global_x
+    }
+
+    fn y(&self) -> f64 {
+        self.global_y
+    }
+
+    fn x_transformed(&self, width: i32) -> f64 {
+        f64::max(self.position.x * width as f64, 0.0)
+    }
+
+    fn y_transformed(&self, height: i32) -> f64 {
+        f64::max(self.position.y * height as f64, 0.0)
+    }
+}
+
+/// A wheel/touchpad scroll, wrapping [`PointerAxisEvent`]. Built from
+/// `WindowEvent::MouseWheel`; the amount/v120 conversion is
+/// `intake_physical`'s job, not this event's — it only reports the raw
+/// winit delta, exactly as Smithay's `WinitMouseWheelEvent` does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NestedAxisEvent {
+    time: u64,
+    delta: MouseScrollDelta,
+}
+
+impl HostEvent<NestedInput> for NestedAxisEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> NestedVirtualDevice {
+        NestedVirtualDevice
+    }
+}
+
+impl PointerAxisEvent<NestedInput> for NestedAxisEvent {
+    fn source(&self) -> AxisSource {
+        match self.delta {
+            MouseScrollDelta::LineDelta(_, _) => AxisSource::Wheel,
+            MouseScrollDelta::PixelDelta(_) => AxisSource::Continuous,
+        }
+    }
+
+    fn amount(&self, axis: HostAxis) -> Option<f64> {
+        match (axis, self.delta) {
+            (HostAxis::Horizontal, MouseScrollDelta::PixelDelta(delta)) => Some(-delta.x),
+            (HostAxis::Vertical, MouseScrollDelta::PixelDelta(delta)) => Some(-delta.y),
+            (_, MouseScrollDelta::LineDelta(_, _)) => None,
+        }
+    }
+
+    fn amount_v120(&self, axis: HostAxis) -> Option<f64> {
+        match (axis, self.delta) {
+            (HostAxis::Horizontal, MouseScrollDelta::LineDelta(x, _)) => Some(-x as f64 * 120.0),
+            (HostAxis::Vertical, MouseScrollDelta::LineDelta(_, y)) => Some(-y as f64 * 120.0),
+            (_, MouseScrollDelta::PixelDelta(_)) => None,
+        }
+    }
+
+    fn relative_direction(&self, _axis: HostAxis) -> AxisRelativeDirection {
+        AxisRelativeDirection::Identical
+    }
+}
+
+/// A pointer button press/release, wrapping [`PointerButtonEvent`]. Built
+/// from `WindowEvent::MouseInput`; `button_code` reuses the exact
+/// libinput/evdev mapping Smithay's own `WinitMouseInputEvent` uses
+/// ([`mouse_button_code`], copied because the table itself, and the
+/// X11-vs-Wayland `Other(u8)` distinction it encodes, are not exported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct NestedButtonEvent {
+    time: u64,
+    button: WinitMouseButton,
+    state: ElementState,
+    is_x11: bool,
+}
+
+impl HostEvent<NestedInput> for NestedButtonEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> NestedVirtualDevice {
+        NestedVirtualDevice
+    }
+}
+
+impl PointerButtonEvent<NestedInput> for NestedButtonEvent {
+    fn button_code(&self) -> u32 {
+        mouse_button_code(self.button, self.is_x11)
+    }
+
+    fn state(&self) -> HostButtonState {
+        match self.state {
+            ElementState::Pressed => HostButtonState::Pressed,
+            ElementState::Released => HostButtonState::Released,
+        }
+    }
+}
+
+/// libinput/evdev button code for a winit mouse button — Smithay's own
+/// `WinitMouseInputEvent::button_code`, copied verbatim (that method, and
+/// the `xorg_mouse_to_libinput` helper it calls for `Other`, are
+/// `pub(crate)` to smithay and so unreachable from here). `is_x11` mirrors
+/// the same distinction [`init_nested_winit`] derives from the window's raw
+/// handle: X11 numbers extra buttons per the historical `xf86-input-libinput`
+/// table; Wayland already numbers them as libinput does.
+fn mouse_button_code(button: WinitMouseButton, is_x11: bool) -> u32 {
+    match button {
+        WinitMouseButton::Left => 0x110,
+        WinitMouseButton::Right => 0x111,
+        WinitMouseButton::Middle => 0x112,
+        WinitMouseButton::Forward => 0x115,
+        WinitMouseButton::Back => 0x116,
+        WinitMouseButton::Other(b) => {
+            if is_x11 {
+                xorg_mouse_to_libinput(b as u32)
+            } else {
+                b as u32
+            }
+        }
+    }
+}
+
+/// Converts an X11 mouse button number to the libinput/evdev numbering.
+/// Taken from the same source Smithay's own (unreachable) copy cites:
+/// <https://sources.debian.org/src/xserver-xorg-input-libinput/1.1.0-1/src/xf86libinput.c/?hl=1508#L236-L252>
+fn xorg_mouse_to_libinput(xorg: u32) -> u32 {
+    match xorg {
+        0 => 0,
+        1 => 0x110,            // BTN_LEFT
+        2 => 0x112,            // BTN_MIDDLE
+        3 => 0x111,            // BTN_RIGHT
+        _ => xorg - 8 + 0x113, // BTN_SIZE
+    }
+}
+
+impl InputBackend for NestedInput {
+    type Device = NestedVirtualDevice;
+    type KeyboardKeyEvent = UnusedEvent;
+    type PointerAxisEvent = NestedAxisEvent;
+    type PointerButtonEvent = NestedButtonEvent;
+    type PointerMotionEvent = UnusedEvent;
+    type PointerMotionAbsoluteEvent = NestedMotionEvent;
+
+    type GestureSwipeBeginEvent = UnusedEvent;
+    type GestureSwipeUpdateEvent = UnusedEvent;
+    type GestureSwipeEndEvent = UnusedEvent;
+    type GesturePinchBeginEvent = UnusedEvent;
+    type GesturePinchUpdateEvent = UnusedEvent;
+    type GesturePinchEndEvent = UnusedEvent;
+    type GestureHoldBeginEvent = UnusedEvent;
+    type GestureHoldEndEvent = UnusedEvent;
+
+    type TouchDownEvent = UnusedEvent;
+    type TouchUpEvent = UnusedEvent;
+    type TouchMotionEvent = UnusedEvent;
+    type TouchCancelEvent = UnusedEvent;
+    type TouchFrameEvent = UnusedEvent;
+    type TabletToolAxisEvent = UnusedEvent;
+    type TabletToolProximityEvent = UnusedEvent;
+    type TabletToolTipEvent = UnusedEvent;
+    type TabletToolButtonEvent = UnusedEvent;
+
+    type SwitchToggleEvent = UnusedEvent;
+
+    type SpecialEvent = UnusedEvent;
+}
+
+/// This backend's own `WinitGraphicsBackend<GlesRenderer>` — the EGL/GLES
+/// context and window pair, built directly rather than through Smithay's
+/// `init_from_attributes_with_gl_attr` so [`init_nested_winit`] can hand back
+/// an event pump that also owns the raw `winit::event_loop::EventLoop` (see
+/// the module section above). Field-for-field and method-for-method
+/// identical to Smithay's type, hardcoded to [`GlesRenderer`] rather than
+/// generic — the only renderer this backend ever binds.
+pub(crate) struct NestedWinitBackend {
+    renderer: GlesRenderer,
+    // Unused after construction but must outlive `egl_surface`.
+    _display: EGLDisplay,
+    egl_surface: EGLSurface,
+    window: Arc<WinitWindow>,
+    damage_tracking: bool,
+    bind_size: Option<Size<i32, Physical>>,
+}
+
+impl NestedWinitBackend {
+    /// Window size of the underlying window, in physical pixels.
+    pub(crate) fn window_size(&self) -> Size<i32, Physical> {
+        let (w, h): (i32, i32) = self.window.inner_size().into();
+        (w, h).into()
+    }
+
+    /// Reference to the underlying window.
+    pub(crate) fn window(&self) -> &WinitWindow {
+        &self.window
+    }
+
+    /// Access the underlying renderer.
+    pub(crate) fn renderer(&mut self) -> &mut GlesRenderer {
+        &mut self.renderer
+    }
+
+    /// Bind the underlying window to the underlying renderer, resizing the
+    /// EGL surface first if the window size changed since the last bind —
+    /// identical ordering to Smithay's own `bind` (see its doc comment for
+    /// why: resizing after `make_current` latches the back buffer on some
+    /// drivers).
+    pub(crate) fn bind(
+        &mut self,
+    ) -> Result<
+        (
+            &mut GlesRenderer,
+            <GlesRenderer as RendererSuper>::Framebuffer<'_>,
+        ),
+        SwapBuffersError,
+    > {
+        let window_size = self.window_size();
+        if Some(window_size) != self.bind_size {
+            self.egl_surface.resize(window_size.w, window_size.h, 0, 0);
+        }
+        self.bind_size = Some(window_size);
+
+        let fb = self.renderer.bind(&mut self.egl_surface)?;
+        Ok((&mut self.renderer, fb))
+    }
+
+    /// Submit the back buffer to the window by swapping.
+    pub(crate) fn submit(
+        &mut self,
+        damage: Option<&[Rectangle<i32, Physical>]>,
+    ) -> Result<(), SwapBuffersError> {
+        let mut damage = match damage {
+            Some(damage) if self.damage_tracking && !damage.is_empty() => {
+                let bind_size = self
+                    .bind_size
+                    .expect("submitting without ever binding the renderer.");
+                Some(
+                    damage
+                        .iter()
+                        .map(|rect| {
+                            Rectangle::new(
+                                (rect.loc.x, bind_size.h - rect.loc.y - rect.size.h).into(),
+                                rect.size,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ => None,
+        };
+
+        self.window.pre_present_notify();
+        self.egl_surface.swap_buffers(damage.as_deref_mut())?;
+        Ok(())
+    }
+}
+
+/// One event from this backend's own winit event pump. The pointer/resize/
+/// focus/close/redraw variants mirror Smithay's `WinitEvent` exactly; `Key`
+/// is the addition issue #118 exists for — the one event Smithay's own type
+/// cannot carry `logical_key` on.
+pub(crate) enum NestedWinitEvent {
+    /// The window has been resized.
+    Resized,
+    /// The focus state of the window changed.
+    Focus(bool),
+    /// A non-keyboard input event: routed through [`input::intake_physical`]
+    /// exactly as before, now instantiated over [`NestedInput`].
+    Input(InputEvent<NestedInput>),
+    /// A real (non-synthetic, non-repeat — same filter Smithay applies) key
+    /// press or release, with both the evdev scancode (for the
+    /// layout-invariant table) and winit's resolved host keysym, when there
+    /// is one (issue #118's payload).
+    Key {
+        evdev: u32,
+        host_keysym: Option<u32>,
+        state: SeatKeyState,
+    },
+    /// The user requested to close the window.
+    CloseRequested,
+    /// A redraw was requested.
+    Redraw,
+}
+
+/// Per-window state [`NestedWinitEventsApp`] needs across events: the key
+/// counter that filters autorepeat (Smithay's own handler keeps the same
+/// counter, for the same reason — winit's `event.repeat` alone does not
+/// distinguish "still held from before this run" at startup), the clock
+/// events are timestamped from, and whether this is an X11 or Wayland host
+/// (the button-code table's one platform difference).
+struct NestedWinitEventsInner {
+    window: Arc<WinitWindow>,
+    clock: Clock<Monotonic>,
+    key_counter: u32,
+    is_x11: bool,
+}
+
+/// This backend's own `WinitEventLoop` — a `calloop::EventSource` that pumps
+/// a winit `EventLoop<()>` this backend owns outright (see the module
+/// section above for why owning it, rather than using Smithay's, is the
+/// point). Structurally identical to Smithay's type: a `Generic` wrapper
+/// registers the winit loop's own wakeup fd with calloop, and
+/// `process_events`/`before_sleep` pump it with a bounded
+/// `ApplicationHandler` that turns `WindowEvent`s into [`NestedWinitEvent`]s.
+pub(crate) struct NestedWinitEvents {
+    inner: NestedWinitEventsInner,
+    fake_token: Option<Token>,
+    pending_events: Vec<NestedWinitEvent>,
+    event_loop: Generic<HostEventLoop<()>>,
+}
+
+impl NestedWinitEvents {
+    fn dispatch_new_events<F>(&mut self, callback: F) -> PumpStatus
+    where
+        F: FnMut(NestedWinitEvent),
+    {
+        // SAFETY: mirrors Smithay's own `dispatch_new_events` — the wrapped
+        // `EventLoop` is never dropped by us while this reference is live.
+        let event_loop = unsafe { self.event_loop.get_mut() };
+        event_loop.pump_app_events(
+            Some(Duration::ZERO),
+            &mut NestedWinitEventsApp {
+                inner: &mut self.inner,
+                callback,
+            },
+        )
+    }
+}
+
+impl EventSource for NestedWinitEvents {
+    type Event = NestedWinitEvent;
+    type Metadata = ();
+    type Ret = ();
+    type Error = std::io::Error;
+
+    const NEEDS_EXTRA_LIFECYCLE_EVENTS: bool = true;
+
+    fn before_sleep(&mut self) -> calloop::Result<Option<(Readiness, Token)>> {
+        let mut pending_events = std::mem::take(&mut self.pending_events);
+        let callback = |event| pending_events.push(event);
+        // Drain winit's own event loop before going to sleep, so a wakeup
+        // from another thread is not missed — same ordering as Smithay's
+        // own `before_sleep`.
+        self.dispatch_new_events(callback);
+        self.pending_events = pending_events;
+        if self.pending_events.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((Readiness::EMPTY, self.fake_token.unwrap())))
+        }
+    }
+
+    fn process_events<F>(
+        &mut self,
+        _readiness: Readiness,
+        _token: Token,
+        mut callback: F,
+    ) -> Result<PostAction, Self::Error>
+    where
+        F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
+    {
+        let mut callback = |event| callback(event, &mut ());
+        for event in self.pending_events.drain(..) {
+            callback(event);
+        }
+        Ok(match self.dispatch_new_events(callback) {
+            PumpStatus::Continue => PostAction::Continue,
+            PumpStatus::Exit(_) => PostAction::Remove,
+        })
+    }
+
+    fn register(
+        &mut self,
+        poll: &mut Poll,
+        token_factory: &mut calloop::TokenFactory,
+    ) -> calloop::Result<()> {
+        self.fake_token = Some(token_factory.token());
+        self.event_loop.register(poll, token_factory)
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &mut Poll,
+        token_factory: &mut calloop::TokenFactory,
+    ) -> calloop::Result<()> {
+        self.event_loop.register(poll, token_factory)
+    }
+
+    fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
+        self.event_loop.unregister(poll)
+    }
+}
+
+/// The [`ApplicationHandler`] that actually pumps [`NestedWinitEvents`]'s
+/// winit loop. Mirrors Smithay's own `WinitEventLoopApp` variant for
+/// variant, with the one addition issue #118 exists for: `KeyboardInput`
+/// resolves `event.logical_key` through [`input::host_keysym`] instead of
+/// discarding it, and reaches the core as [`NestedWinitEvent::Key`] rather
+/// than an `InputEvent::Keyboard` — the dedicated path
+/// [`NestedState::handle_key`] feeds straight to [`input::physical_key`].
+struct NestedWinitEventsApp<'a, F: FnMut(NestedWinitEvent)> {
+    inner: &'a mut NestedWinitEventsInner,
+    callback: F,
+}
+
+impl<F: FnMut(NestedWinitEvent)> NestedWinitEventsApp<'_, F> {
+    fn timestamp(&self) -> u64 {
+        self.inner.clock.now().as_micros()
+    }
+}
+
+impl<F: FnMut(NestedWinitEvent)> ApplicationHandler for NestedWinitEventsApp<'_, F> {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::Resized(_size) => {
+                trace!("host window resized");
+                (self.callback)(NestedWinitEvent::Resized);
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                (self.callback)(NestedWinitEvent::Resized);
+            }
+            WindowEvent::RedrawRequested => {
+                (self.callback)(NestedWinitEvent::Redraw);
+            }
+            WindowEvent::CloseRequested => {
+                (self.callback)(NestedWinitEvent::CloseRequested);
+            }
+            WindowEvent::Focused(focused) => {
+                (self.callback)(NestedWinitEvent::Focus(focused));
+            }
+            // Same filter Smithay's own handler applies: synthetic events
+            // (a key already down when focus arrived) and autorepeats never
+            // reach `InputBackend` — the dead-man switch's own timer covers
+            // a held key (see the module doc's "the winit backend is
+            // EGL/GLES-bound" section), so intake need not see repeats.
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } if !is_synthetic && !event.repeat => {
+                match event.state {
+                    ElementState::Pressed => self.inner.key_counter += 1,
+                    ElementState::Released => {
+                        self.inner.key_counter = self.inner.key_counter.saturating_sub(1);
+                    }
+                }
+                let evdev = event.physical_key.to_scancode().unwrap_or(0);
+                // The #118 payload: winit's interpreted key, resolved to an
+                // X keysym when it names a character. `None` for named/dead
+                // keys — `physical_key` falls back to the layout-invariant
+                // table for those (Escape, Enter, arrows, …), so dead-man
+                // and every other layout-invariant path is unaffected.
+                let host_keysym = input::host_keysym(&event.logical_key);
+                (self.callback)(NestedWinitEvent::Key {
+                    evdev,
+                    host_keysym,
+                    state: match event.state {
+                        ElementState::Pressed => SeatKeyState::Pressed,
+                        ElementState::Released => SeatKeyState::Released,
+                    },
+                });
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let size = self.inner.window.inner_size();
+                let x = position.x / size.width as f64;
+                let y = position.y / size.height as f64;
+                // The timestamp is read into a local first: `(self.callback)`
+                // takes `&mut self.callback` for the whole call, and
+                // `self.timestamp()` borrows all of `self` — evaluating it
+                // as part of the call's argument list would overlap the two
+                // borrows.
+                let time = self.timestamp();
+                (self.callback)(NestedWinitEvent::Input(InputEvent::PointerMotionAbsolute {
+                    event: NestedMotionEvent {
+                        time,
+                        position: NestedRelativePosition { x, y },
+                        global_x: position.x,
+                        global_y: position.y,
+                    },
+                }));
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let time = self.timestamp();
+                (self.callback)(NestedWinitEvent::Input(InputEvent::PointerAxis {
+                    event: NestedAxisEvent { time, delta },
+                }));
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let time = self.timestamp();
+                let is_x11 = self.inner.is_x11;
+                (self.callback)(NestedWinitEvent::Input(InputEvent::PointerButton {
+                    event: NestedButtonEvent {
+                        time,
+                        button,
+                        state,
+                        is_x11,
+                    },
+                }));
+            }
+            // Every other class -- touch, gestures, IME, file drag, tablet,
+            // window chrome -- is unhandled: `intake_physical` has never
+            // resolved touch/gestures (v0's seat vocabulary is pointer +
+            // keyboard, `crate::input`'s module doc), so dropping them here
+            // regresses nothing observable.
+            _ => {}
+        }
+    }
+}
+
+/// Build this backend's own [`NestedWinitBackend`]/[`NestedWinitEvents`]
+/// pair — the direct replacement for Smithay's
+/// `init_from_attributes_with_gl_attr` (see the module section above for
+/// why). EGL setup below is copied step for step from Smithay's own
+/// `backend::winit::init_from_attributes_with_gl_attr` (verified against the
+/// pinned `=0.7.0` source): same `EGLDisplay`/`EGLContext` construction, same
+/// 10-bit-then-8-bit pixel format fallback, same Wayland/X11 native-surface
+/// branch. Only the window/event-loop creation and the `ApplicationHandler`
+/// wired to it differ.
+fn init_nested_winit(
+    attributes: WindowAttributes,
+    gl_attributes: GlAttributes,
+) -> Result<(NestedWinitBackend, NestedWinitEvents), Box<dyn Error>> {
+    let event_loop: HostEventLoop<()> = HostEventLoop::builder().build()?;
+
+    #[allow(deprecated)]
+    let window = Arc::new(event_loop.create_window(attributes)?);
+
+    let (display, context, surface, is_x11) = {
+        let display = unsafe { EGLDisplay::new(window.clone())? };
+
+        let context = EGLContext::new_with_config(
+            &display,
+            gl_attributes,
+            PixelFormatRequirements::_10_bit(),
+        )
+        .or_else(|_| {
+            EGLContext::new_with_config(&display, gl_attributes, PixelFormatRequirements::_8_bit())
+        })?;
+
+        let (surface, is_x11) = match window.window_handle().map(|handle| handle.as_raw()) {
+            Ok(RawWindowHandle::Wayland(handle)) => {
+                debug!("nested winit backend: Wayland");
+                let size = window.inner_size();
+                let surface = unsafe {
+                    wegl::WlEglSurface::new_from_raw(
+                        handle.surface.as_ptr() as *mut _,
+                        size.width as i32,
+                        size.height as i32,
+                    )
+                }
+                .map_err(|err| Box::new(err) as Box<dyn Error>)?;
+                unsafe {
+                    (
+                        EGLSurface::new(
+                            &display,
+                            context
+                                .pixel_format()
+                                .expect("configured context has a pixel format"),
+                            context.config_id(),
+                            surface,
+                        )?,
+                        false,
+                    )
+                }
+            }
+            Ok(RawWindowHandle::Xlib(handle)) => {
+                debug!("nested winit backend: X11");
+                unsafe {
+                    (
+                        EGLSurface::new(
+                            &display,
+                            context
+                                .pixel_format()
+                                .expect("configured context has a pixel format"),
+                            context.config_id(),
+                            native::XlibWindow(handle.window),
+                        )?,
+                        true,
+                    )
+                }
+            }
+            _ => {
+                return Err("nested backend requires a Wayland or X11 host compositor".into());
+            }
+        };
+
+        let _ = context.unbind();
+        (display, context, surface, is_x11)
+    };
+
+    let renderer = unsafe { GlesRenderer::new(context)? };
+    let damage_tracking = display.supports_damage();
+
+    event_loop.set_control_flow(smithay::reexports::winit::event_loop::ControlFlow::Poll);
+    // Not threaded through `NestedWinitEvent::Resized`, unlike Smithay's own
+    // `WinitEvent::Resized`: every consumer in this crate re-reads the
+    // window size on demand (`NestedWinitBackend::window_size`) rather than
+    // taking it off the event, so there is nothing here that needs it.
+    let event_loop = Generic::new(event_loop, Interest::READ, Mode::Level);
+
+    Ok((
+        NestedWinitBackend {
+            window: window.clone(),
+            _display: display,
+            egl_surface: surface,
+            damage_tracking,
+            bind_size: None,
+            renderer,
+        },
+        NestedWinitEvents {
+            inner: NestedWinitEventsInner {
+                window,
+                clock: Clock::<Monotonic>::new(),
+                key_counter: 0,
+                is_x11,
+            },
+            fake_token: None,
+            pending_events: Vec::new(),
+            event_loop,
+        },
+    ))
+}
+
 /// The nested backend's **presentation half**: the winit window + GLES
 /// renderer pair, the realm's [`Scene`], the consent surface, and the
 /// currently uploaded view texture.
@@ -232,7 +994,7 @@ pub(crate) fn capture_pixels(scene: &Scene, size: Size<i32, Physical>) -> Option
 /// borrows presentation state, so the two must be provably disjoint fields
 /// rather than one flat struct (see [`crate::session`]).
 pub(crate) struct NestedView {
-    backend: WinitGraphicsBackend<GlesRenderer>,
+    backend: NestedWinitBackend,
     /// The realm's scene (P1.3.3) — the same composition implementation the
     /// headless backend retains for capture; this backend presents its
     /// output 1:1 in the host window. The shim-facing protocol server
@@ -374,7 +1136,12 @@ fn run_inner(
     // host's refresh rate. Because drivers are free to ignore the default
     // swap interval, [`FRAME_BUDGET`] additionally caps the chain when the
     // swap does not block (see its doc comment).
-    let (backend, winit_source) = winit_backend::init_from_attributes_with_gl_attr::<GlesRenderer>(
+    //
+    // `init_nested_winit`, not Smithay's `init_from_attributes_with_gl_attr`
+    // (issue #118): this backend owns its winit event loop so
+    // `WindowEvent::KeyboardInput`'s `logical_key` is in reach (see the "Own
+    // winit glue" module section above `NestedInput`).
+    let (backend, winit_source) = init_nested_winit(
         WinitWindow::default_attributes()
             .with_inner_size(LogicalSize::new(INITIAL_SIZE.0, INITIAL_SIZE.1))
             .with_title("vitrind (nested)"),
@@ -388,26 +1155,36 @@ fn run_inner(
     info!(size = ?backend.window_size(), "nested backend initialized");
 
     loop_handle.insert_source(winit_source, |event, _, state| match event {
-        WinitEvent::Redraw => state.redraw(),
-        WinitEvent::Resized { size, .. } => {
+        NestedWinitEvent::Redraw => state.redraw(),
+        NestedWinitEvent::Resized => {
+            let size = state.view.backend.window_size();
             debug!(?size, "host window resized");
             // Drop the uploaded view; the next redraw recomposes it 1:1 at
             // the new size (kept pixel-exact for the P1.3.2/P1.3.6 goldens).
             state.view.texture = None;
             state.view.backend.window().request_redraw();
         }
-        WinitEvent::CloseRequested => {
+        NestedWinitEvent::CloseRequested => {
             info!("host window close requested");
             state.loop_signal.stop();
         }
         // P1.3.7 input intake: nested-mode host events ARE the human
         // principal's input, origin-tagged `physical` at this single point
         // of entry (B2) — see `crate::input`.
-        WinitEvent::Input(event) => state.handle_input(&event),
+        NestedWinitEvent::Input(event) => state.handle_input(&event),
+        // #118: the one event class Smithay's own `WinitEvent` cannot
+        // carry `logical_key` on. Routed straight to `input::physical_key`,
+        // bypassing `intake_physical`'s scancode-only `Keyboard` arm — see
+        // `NestedState::handle_key`.
+        NestedWinitEvent::Key {
+            evdev,
+            host_keysym,
+            state: key_state,
+        } => state.handle_key(evdev, host_keysym, key_state),
         // Not ignorable: a key held when focus leaves produces no release
         // event on either backend, so the dead-man switch must be told the
         // hold is no longer verifiable (see `handle_focus`).
-        WinitEvent::Focus(focused) => state.handle_focus(focused),
+        NestedWinitEvent::Focus(focused) => state.handle_focus(focused),
     })?;
 
     let grab = Rc::new(RefCell::new(ConsentGrab::new()));
@@ -671,8 +1448,46 @@ impl NestedState {
     /// trace-dropped here for now; the full route → encode →
     /// `ShimServer::deliver_seat_event` → wire path is exercised
     /// end-to-end by `crate::input`'s tests against the mock shim.
-    fn handle_input(&mut self, event: &smithay::backend::input::InputEvent<WinitInput>) {
+    ///
+    /// Pointer/axis/button only — keyboard is [`Self::handle_key`]'s (issue
+    /// #118: [`input::intake_physical`]'s `Keyboard` arm is scancode-only,
+    /// so it stays the generic-`InputBackend` path the unit tests drive,
+    /// and this backend's own keyboard events bypass it entirely).
+    fn handle_input(&mut self, event: &smithay::backend::input::InputEvent<NestedInput>) {
         let size = self.view.backend.window_size();
+        let inputs = input::intake_physical(event, (size.w, size.h));
+        self.route_physical_inputs(inputs, size);
+    }
+
+    /// The #118 payload: one real (non-synthetic, non-repeat) keyboard event
+    /// from this backend's own winit event pump, with winit's resolved
+    /// `logical_key` already folded into `host_keysym` (see
+    /// [`NestedWinitEventsApp::window_event`] and [`input::host_keysym`]).
+    ///
+    /// Calls [`input::physical_key`] directly — the same function
+    /// [`input::intake_physical`]'s `Keyboard` arm calls with `None`, so a
+    /// scancode with no host keysym (a modifier chord, or a generic
+    /// `InputBackend` in a test) resolves identically either way, through
+    /// the shared layout-invariant table ([`input::invariant_keysym`]) that
+    /// keeps Esc/Enter/arrows working for dead-man regardless of which path
+    /// reached it.
+    fn handle_key(&mut self, evdev: u32, host_keysym: Option<u32>, state: SeatKeyState) {
+        let size = self.view.backend.window_size();
+        let inputs = input::physical_key(evdev, host_keysym, state);
+        self.route_physical_inputs(inputs, size);
+    }
+
+    /// Shared tail of [`Self::handle_input`] and [`Self::handle_key`]: prime
+    /// the consent grab's view and the dispatch turn's clock, route the
+    /// intake's `SeatInput`s (plus whatever the dead-man watcher's replay
+    /// owes), and tick the watcher. One turn per host event either way, so a
+    /// key and a pointer event judge the grab and the watcher against
+    /// exactly the same discipline the rest of the core follows.
+    fn route_physical_inputs(
+        &mut self,
+        inputs: impl IntoIterator<Item = input::SeatInput>,
+        size: Size<i32, Physical>,
+    ) {
         let view = (size.w.max(0) as u32, size.h.max(0) as u32);
         // The consent grab hit-tests in this same view space, so it is fed
         // from this same local, on the line before the route that uses it.
@@ -699,22 +1514,10 @@ impl NestedState {
             kernel,
             ..
         } = &mut self.runtime;
-        // #118 wiring point (deferred): `intake_physical` resolves keyboard
-        // events from the scancode alone, so it delivers only the
-        // layout-invariant subset and drops text keys — Smithay 0.7.0's
-        // `WinitKeyboardInputEvent` hides winit's interpreted `logical_key`
-        // from us here. Closing the gap (issue #118, "own the winit glue")
-        // means this backend owning the winit event loop so a
-        // `WindowEvent::KeyboardInput`'s `logical_key` is in reach, resolving it
-        // to an X keysym, and routing keyboard through
-        // `input::physical_key(evdev, Some(keysym), state)` instead of the
-        // scancode-only `intake_physical` arm. The resolution and delivery past
-        // that seam are already whole and tested (`input`'s
-        // `a_text_key_given_a_host_keysym_reaches_the_app_as_physical_input`).
         route_turn(
             router,
             &self.deadman,
-            input::intake_physical(event, (size.w, size.h)),
+            inputs,
             view,
             surface,
             &mut |delivery| {

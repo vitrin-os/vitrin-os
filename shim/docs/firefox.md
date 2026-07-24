@@ -497,31 +497,45 @@ skip, and the commands fail loudly in your own terminal on a missing
 host/browser. The agent-driven injection *into* Firefox is issue #108's nested
 rung; the headless rungs are what merges are held on.
 
-### Nested HUMAN keyboard — the #118 status and workstation check
+### Nested HUMAN keyboard — the #118 fix and workstation check
 
 Distinct from the agent-injection rungs above: this is the *human* typing on
 the host keyboard while a nested realm is focused (P1.3.7 — "nested host
-keyboard/pointer events are the human principal"). Pointer works fully. For the
-keyboard there is a **known, tracked gap (issue #118)**:
+keyboard/pointer events are the human principal"). Pointer works fully, and
+since #118, so does the keyboard, text keys included:
 
-- **Layout-invariant keys work today** — Escape (the hold-Esc dead-man chord),
-  Enter, Tab, arrows, Home/End/PageUp/Down, F-keys, modifiers. The core resolves
-  these from the scancode alone (`crates/vitrin-core/src/input/mod.rs`
-  `invariant_keysym`).
-- **Text keys (letters, digits, punctuation) are dropped at intake**, so you
-  cannot yet type a word or a URL into the nested app. Their keysym is
-  layout-dependent and only the host knows it; winit computes it
-  (`KeyEvent::logical_key`), but the pinned Smithay 0.7.0 winit wrapper discards
-  it before the core sees it. Closing the gap is a rust-core change (own the
-  winit event-loop glue so `logical_key` is in reach), tracked in #118; the
-  resolution + delivery past that point are already in place and unit-tested
-  (`input`'s `resolve_prefers_the_host_keysym_…` and
-  `a_text_key_given_a_host_keysym_reaches_the_app_as_physical_input`).
+- **Layout-invariant keys** — Escape (the hold-Esc dead-man chord), Enter,
+  Tab, arrows, Home/End/PageUp/Down, F-keys, modifiers — resolve from the
+  scancode alone (`crates/vitrin-core/src/input/mod.rs` `invariant_keysym`),
+  regardless of which path reached them, so dead-man is unaffected by
+  anything below.
+- **Text keys (letters, digits, punctuation)** now reach the app too. Their
+  keysym is layout-*dependent* and only the host knows it; winit computes it
+  (`KeyEvent::logical_key`), but the pinned Smithay 0.7.0 `backend::winit`
+  wrapper discards it before the core ever sees it — its own
+  `ApplicationHandler` and event loop are both private, with no hook to
+  observe the raw `WindowEvent`. Issue #118's fix is for
+  `crates/vitrin-core/src/backend/winit.rs` to own that winit glue outright: a
+  from-scratch `WinitGraphicsBackend`/`WinitEventLoop` pair
+  (`NestedWinitBackend`/`NestedWinitEvents`), built from the same public
+  `smithay::backend::egl` primitives Smithay's own module uses, whose
+  `ApplicationHandler` (`NestedWinitEventsApp`) resolves `logical_key` via
+  `input::host_keysym` and routes it straight to `input::physical_key`
+  (`NestedState::handle_key`), bypassing `intake_physical`'s scancode-only
+  `Keyboard` arm (which stays, for the generic-`InputBackend` unit tests).
+  Resolution and delivery were already in place and unit-tested before the
+  wiring landed (`input`'s `resolve_prefers_the_host_keysym_…` and
+  `a_text_key_given_a_host_keysym_reaches_the_app_as_physical_input`); #118
+  closed the one remaining gap, winit's own event pump.
 
 **Workstation check** (nested needs a display + GPU, so this is manual, never
-CI): boot the nested realm as in the capture variant above, focus the window,
-and type. Today you should see arrows/Enter/Escape reach the app (e.g. Escape
-closes a Firefox dialog; the flight recorder — JSON lines — carries
-`"kind":"seat_delivered","event":"key","origin":"physical"` for each) while
-letters produce nothing. Once #118's winit wiring lands, a typed URL will
-appear in the URL bar — the same procedure is how you will confirm it.
+CI): boot the nested realm as in the capture variant above, focus the Firefox
+window inside it, and type a `file://` URL into the address bar followed by
+Enter. The typed characters should appear in the URL bar and the page should
+navigate — the flight recorder (JSON lines) carries
+`"kind":"seat_delivered","event":"key","origin":"physical"` for every key, text
+and layout-invariant alike. Click on another window to move host focus away
+and back: `WindowEvent::Focused(false)`/`(true)` should log at `debug` (host
+window lost/gained keyboard focus) with no crash and no stuck dead-man hold —
+losing focus mid-hold forgets it (`NestedState::handle_focus`), so alt-tabbing
+away with Escape held never revokes the session with no gesture behind it.

@@ -98,14 +98,17 @@ const INITIAL_SIZE: (f64, f64) = (1280.0, 800.0);
 /// as client content.
 const CLEAR_COLOR: Color32F = Color32F::new(0.06, 0.06, 0.08, 1.0);
 
-/// Fallback frame budget (~60 Hz). Vsync'd blocking swaps are the primary
+/// Fallback frame budget (~60 Hz), scoped to whatever redraw chain is
+/// already running (P1.3.9, issue #117: the chain itself starts only from a
+/// real state change or an animating dead-man hold — this const paces it,
+/// it does not keep it alive). Vsync'd blocking swaps are the primary
 /// pacing mechanism, but Smithay's `vsync: true` only filters EGL config
 /// selection — it never calls `eglSwapInterval` — so on hosts whose EGL
 /// stack returns from swap immediately (Mesa software EGL under Xvfb,
-/// GPU-less VMs on llvmpipe, X servers without vblank) the redraw chain
-/// would otherwise spin unthrottled. Frames that complete faster than this
-/// budget defer the next redraw to a timer instead. A real frame clock
-/// (client damage + frame callbacks) replaces this in P1.3.4.
+/// GPU-less VMs on llvmpipe, X servers without vblank) a running chain
+/// would otherwise spin unthrottled for as long as it lasts. Frames that
+/// complete faster than this budget defer the next redraw to a timer
+/// instead.
 const FRAME_BUDGET: Duration = Duration::from_micros(16_667);
 
 /// What the uploaded window texture was composed *for*: re-upload exactly
@@ -1131,16 +1134,13 @@ fn run_inner(
         |_event, _, state: &mut NestedState| session::reap_realm(state),
     )?;
 
-    // vsync on (Smithay's default is off): each frame chains the next via
-    // `request_redraw`, and the blocking swap paces that chain to the
-    // host's refresh rate. Because drivers are free to ignore the default
-    // swap interval, [`FRAME_BUDGET`] additionally caps the chain when the
-    // swap does not block (see its doc comment).
-    //
-    // `init_nested_winit`, not Smithay's `init_from_attributes_with_gl_attr`
-    // (issue #118): this backend owns its winit event loop so
-    // `WindowEvent::KeyboardInput`'s `logical_key` is in reach (see the "Own
-    // winit glue" module section above `NestedInput`).
+    // vsync on (Smithay's default is off): while a redraw chain is running
+    // (a dirty frame, or an animating dead-man hold), the blocking swap
+    // paces it to the host's refresh rate. Because drivers are free to
+    // ignore the default swap interval, [`FRAME_BUDGET`] additionally caps
+    // the chain when the swap does not block (see its doc comment). Outside
+    // a running chain the window idles at 0 fps (P1.3.9, issue #117) —
+    // vsync paces frames that happen, it does not manufacture them.
     let (backend, winit_source) = init_nested_winit(
         WinitWindow::default_attributes()
             .with_inner_size(LogicalSize::new(INITIAL_SIZE.0, INITIAL_SIZE.1))
@@ -1227,10 +1227,12 @@ fn run_inner(
         fatal: None,
     };
 
-    // Kick off the redraw cycle; each completed frame requests the next,
-    // so presentation is paced by the host compositor (60 Hz on a 60 Hz
-    // host — winit redraws on Wayland are frame-callback driven), with
-    // FRAME_BUDGET as the floor when the host doesn't throttle swaps.
+    // Kick off exactly the first frame. Past this point the redraw chain no
+    // longer self-sustains (P1.3.9, issue #117): `schedule_next_frame` only
+    // continues it while a dead-man hold is animating, so once this first
+    // composite lands the window idles at 0 fps until a real state change —
+    // a shim commit, a consent transition, physical input, a resize, or an
+    // armed hold — asks for the next one via `request_redraw`.
     state.view.backend.window().request_redraw();
 
     // Every runtime source goes in before the loop starts, and before
@@ -1605,12 +1607,24 @@ impl NestedState {
     fn deadman_tick(&mut self) {
         let handle = self.loop_handle.clone();
         deadman_tick(self, &handle, Instant::now());
-        // Deliberately no `request_redraw` here. The redraw chain is already
-        // self-sustaining (`schedule_next_frame`), so the indicator animates
-        // and disappears at the host's frame cadence for free — and adding a
-        // request on a path the frame loop itself calls would chain a redraw
-        // per frame *outside* `FRAME_BUDGET`, turning a held key into a
-        // busy-spin.
+        // Vsync pacing (P1.3.9, issue #117) stopped `schedule_next_frame`
+        // from self-sustaining once idle, so an armed hold must explicitly
+        // wake the chain back up: without this, pressing the chord while
+        // the window was idling at 0 fps would leave the indicator invisible
+        // until some unrelated redraw happened to come along. Once a frame
+        // has drawn with the hold in progress, `schedule_next_frame` keeps
+        // the chain paced at `FRAME_BUDGET` on its own for as long as the
+        // hold lasts — this only ever needs to kick the *first* one.
+        // `request_redraw` is idempotent per host frame (winit coalesces
+        // repeats before the next `Redraw` event), so calling this on every
+        // tick while a hold is already in progress — this method's other
+        // two call sites, `handle_input` and the frame-cadence backstop in
+        // `redraw` — costs nothing extra; it does not chain a redraw per
+        // frame outside the budget, because the chain that matters for
+        // pacing is still `schedule_next_frame`'s, not this one.
+        if self.deadman.borrow().deadline().is_some() {
+            self.view.backend.window().request_redraw();
+        }
     }
 
     /// Draw one frame. Rendering failure is fatal to the skeleton: log it,
@@ -1731,16 +1745,41 @@ impl NestedState {
         // damage arrives over the shim protocol (P1.3.4).
         self.view.backend.submit(None)?;
         trace!(?size, "frame submitted");
-        self.schedule_next_frame(frame_start)?;
+        self.schedule_next_frame(frame_start, hold)?;
         Ok(session::Presentation::Completed)
     }
 
-    /// Chain the next redraw. If the swap blocked for at least
-    /// [`FRAME_BUDGET`] (effective vsync), request it immediately;
-    /// otherwise arm a one-shot timer for the budget's remainder so the
-    /// render loop stays capped near 60 Hz instead of busy-spinning on
-    /// hosts without swap throttling.
-    fn schedule_next_frame(&mut self, frame_start: Instant) -> Result<(), Box<dyn Error>> {
+    /// Chain the next redraw only while there is already-known work that
+    /// needs one: an in-progress dead-man hold, whose indicator must keep
+    /// animating every frame until it fires or is released (P1.3.9, issue
+    /// #117). Otherwise the chain stops here — the loop idles at 0 fps
+    /// instead of the unconditional self-sustaining redraw this backend used
+    /// to run at all times, dirty or not. The next redraw then comes from an
+    /// actual state change requesting one: a shim commit through
+    /// [`session::Presenter::request_present`], a consent transition
+    /// ([`NestedState::service_consent`]), physical input
+    /// ([`NestedState::handle_input`]), or a resize — never from this method
+    /// chaining itself.
+    ///
+    /// A hold's *first* frame is kicked separately, from
+    /// [`NestedState::deadman_tick`] the moment the chord arms — this method
+    /// only ever continues a chain already running, matching
+    /// [`arm_deadman_timer`]'s "if none outstanding" discipline for the same
+    /// reason: idempotent per hold, not per frame.
+    ///
+    /// While the chain does continue, pacing is unchanged: if the swap
+    /// blocked for at least [`FRAME_BUDGET`] (real vsync throttling it), the
+    /// next request goes out immediately; otherwise a one-shot timer covers
+    /// the remainder so hosts without real swap throttling do not spin past
+    /// the budget even while a hold animates.
+    fn schedule_next_frame(
+        &mut self,
+        frame_start: Instant,
+        hold: Option<f64>,
+    ) -> Result<(), Box<dyn Error>> {
+        if hold.is_none() {
+            return Ok(());
+        }
         let elapsed = frame_start.elapsed();
         if elapsed >= FRAME_BUDGET {
             self.view.backend.window().request_redraw();

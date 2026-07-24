@@ -54,6 +54,18 @@ Phase 3 network+X11+fleet, Phase 4 horizon).
   type. Do not rewrite that history; the new format applies going forward.
 - **Language**: English only, everywhere — code, docs, commits, issues, PRs.
 
+## Milestone definition-of-done (hard requirement)
+
+A milestone `M1.2`–`M1.5` (see `docs/plan/01-phase-1-mvp.md` §5, D12) is
+**done only when its named integration-gate issue passes green with no mock
+on any seam that milestone claims**: `M1.2` = #105, `M1.3` = #107, `M1.4` =
+#108 + #109, `M1.5` = #110. `vitrin-mock-shim` and `shim/tests/mock_core.c`
+are component/unit-test scaffolds — useful, kept, but **never** the evidence
+source for a milestone's definition of done. Tests that use them are
+component tests, not milestone acceptance; see `tests/integration/README.md`
+for the current split. Don't claim a milestone is met on a component-test
+result — say so explicitly if a real, mock-free gate hasn't landed yet.
+
 ## Protocol authoring rule (hard requirement)
 
 A new or changed interface requires **paired** edits, never one alone:
@@ -89,9 +101,13 @@ subagent to add a new interface").
   cheat-sheet), `github-conventions` (branch/commit/PR/issue conventions and
   the epic↔track↔milestone taxonomy).
 
-`rust-core`, `c-shim`, and `sdk` currently have no code to work against yet
-(Phase 1 tracks not yet started) — their agent definitions are grounded in the
-Technical Architecture sections of `docs/PRD.md` rather than existing code
-patterns. Domain-specific skills for those tracks (Rust/Smithay conventions,
-wlroots idioms, Python SDK packaging) should be added once each track lands
-real, reviewable code — not speculatively now.
+`rust-core`, `c-shim`, and `sdk` now have substantial shipped code
+(`crates/vitrin-core`, `shim/`, `sdk/python` and `examples/agent-demo`
+respectively — Phase 1's epics E2–E9 are largely landed; see the milestone
+table in `docs/plan/01-phase-1-mvp.md` §5 and the epic/track taxonomy in
+`.claude/skills/github-conventions/SKILL.md` for current status). Their agent
+definitions can now be grounded in the real code patterns those trees
+establish, not only in `docs/PRD.md`'s Technical Architecture sections.
+Domain-specific skills for those tracks (Rust/Smithay conventions, wlroots
+idioms, Python SDK packaging) can be added as each track's conventions
+stabilize.

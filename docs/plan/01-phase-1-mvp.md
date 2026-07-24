@@ -191,15 +191,71 @@ P1.7.1-3 consent ◄──────────────────┘   
 
 ## 5. Milestones within Phase 1
 
-| Milestone | Statement of done | Contains |
-|---|---|---|
-| **M1.1 — "First light"** (walking skeleton) | `vitrind` runs nested (test pattern on GNOME + Hyprland) and headless (CI); agent handshakes with static identity and captures a pixel-correct frame under an auto-approved grant | P1.1.\*, P1.2.\*, P1.3.1–2, P1.3.6, P1.4.1–3 (partial), P1.8.1–2 |
-| **M1.2 — "Shim runs Firefox"** | Core spawns the shim; weston-terminal, then Firefox; frames flow shim→core (shm) into the nested window; human can click/type into Firefox through it | P1.3.3–4, P1.3.7, P1.5.\*, P1.6.1–2, P1.6.4 (render half) |
-| **M1.3 — "Agent observes Firefox"** | `observe()` returns live Firefox pixels through the enforcement path; rate limits and expiry enforced; shim crash degrades gracefully | P1.3.6 wired to the realm view, P1.4.4, P1.8.2 |
-| **M1.4 — "Agent acts under grant + consent"** | Core-rendered consent (human clicks Allow in nested mode); agent injects pointer + text into Firefox; mid-prompt actuations blocked; hold-Esc revocation; sender-constraint and expiry demonstrably enforced | P1.6.3, P1.7.\*, P1.8.3 |
-| **M1.5 — "Headless + demo + hardening"** (= roadmap **M1**) | Full demo green in headless CI and impressive in nested mode; dmabuf zero-copy on at least one real GPU; fuzzing clean; docs + screencast published | P1.3.5, P1.8.4, P1.9.\* |
+| Milestone | Statement of done | Contains | Named exit gate |
+|---|---|---|---|
+| **M1.1 — "First light"** (walking skeleton) | `vitrind` runs nested (test pattern on GNOME + Hyprland) and headless (CI); agent handshakes with static identity and captures a pixel-correct frame under an auto-approved grant | P1.1.\*, P1.2.\*, P1.3.1–2, P1.3.6, P1.4.1–3 (partial), P1.8.1–2 | (walking skeleton; no dedicated mock-free gate — see D12 below) |
+| **M1.2 — "Shim runs Firefox"** | Core spawns the shim; weston-terminal, then Firefox; frames flow shim→core (shm) into the nested window; human can click/type into Firefox through it | P1.3.3–4, P1.3.7, P1.5.\*, P1.6.1–2, P1.6.4 (render half) | **#105** (P1.9.6) |
+| **M1.3 — "Agent observes Firefox"** | `observe()` returns live Firefox pixels through the enforcement path; rate limits and expiry enforced; shim crash degrades gracefully | P1.3.6 wired to the realm view, P1.4.4, P1.8.2 | **#107** (P1.8.5) |
+| **M1.4 — "Agent acts under grant + consent"** | Core-rendered consent (human clicks Allow in nested mode); agent injects pointer + text into Firefox; mid-prompt actuations blocked; hold-Esc revocation; sender-constraint and expiry demonstrably enforced | P1.6.3, P1.7.\*, P1.8.3 | **#108** (P1.8.6) **+ #109** (P1.7.4) |
+| **M1.5 — "Headless + demo + hardening"** (= roadmap **M1**) | Full demo green in headless CI and impressive in nested mode; dmabuf zero-copy on at least one real GPU; fuzzing clean; docs + screencast published | P1.3.5, P1.8.4, P1.9.\* | **#110** (P1.8.7) |
 
 Scheduling pressure: start M1.2's shim work before M1.1 is polished — the wlroots/Firefox risk retires slowest and should soak longest.
+
+### D12 — Definition of done: a milestone closes only on a named mock-free integration gate
+
+**Adopted following the #111 re-audit.** Through most of Phase 1, every
+component was verified against a **mock on the far side of its seam** —
+`vitrind` against `vitrin-mock-shim` (a synthetic Rust peer that animates a
+hand-drawn buffer and forks no app), and the real C shim against
+`shim/tests/mock_core.c` (a hand-written core stand-in). Both mocks are
+useful and stay, but neither half had, at the time, ever met the *other real
+half*, and the closure record for E1–E8 read "done" without either half
+having run once end to end. That gap is now closed by rule:
+
+> **A milestone M1.2–M1.5 is done only when its named integration-gate issue
+> passes green, and that gate must have no mock on any seam the milestone
+> claims.** `vitrin-mock-shim` and `shim/tests/mock_core.c` are
+> **component/unit-test scaffolds only** — they may never be the source of a
+> milestone's definition-of-done evidence. Existing green tests that use them
+> stay (they still catch real regressions in the half they exercise) but are
+> labelled **component tests**, never milestone acceptance, in
+> [tests/integration/README.md](../../tests/integration/README.md).
+
+The named gates (table above): **M1.2 = #105**, **M1.3 = #107**,
+**M1.4 = #108 + #109**, **M1.5 = #110**. M1.1 predates this rule (walking
+skeleton, no real second app existed yet to be mock-free about) and is not
+retroactively gated.
+
+**Re-audit: mock seams found, and where each one now stands.**
+
+| Seam | Where | Status under D12 |
+|---|---|---|
+| `vitrind` ↔ `vitrin-mock-shim` | `tests/integration/harness.py`'s `Core()` default (`MOCK_SHIM`), used by `test_runtime_wiring.py`, `test_actuation.py`, `test_demo.py` | **Component tests, not a milestone gate.** They verify startup ordering (#77) and the SDK/recorder wiring (#42, #43) against a controllable synthetic peer — legitimate on their own terms, but none of them may stand in for M1.2–M1.5 evidence. Relabelled in `tests/integration/README.md`. |
+| real C shim ↔ `shim/tests/mock_core.c` | `shim/tests/acceptance/*.sh` (`upstream_frame_path.sh`, `seat_input_replay.sh`, `firefox_bringup.sh`) | **Shim-in-isolation smoke tests, not the milestone proof.** `firefox_bringup.sh` says so explicitly in its own header (added at P1.6.6); the equivalent statement now also appears in `shim/README.md`'s Firefox section. |
+| `crates/xtask/src/main.rs` demo venues | `cargo xtask demo` (nested) execs Firefox directly as if it were the shim (structurally bypasses the insert-shim model — issue #110); `cargo xtask demo --headless` runs the real core against `vitrin-mock-shim` | **Not yet mock-free; this is exactly what #110 (the M1.5 gate) exists to fix.** Until #110 lands, M1.5 is **not** done, regardless of how green the demo looks today — this is the honest statement this re-audit exists to write down. |
+| `tests/integration/test_real_app.py` / `test_real_capture_fidelity.py` / `test_real_actuation.py` / `test_real_firefox.py` / `test_real_gtk.py` | real `vitrind` → real `vitrin-shim` → real app (weston-terminal / GTK / Firefox) | **Mock-free.** These are the #105/#107/#108 gates (and their supporting rungs); each boots its `Core` with an explicit real shim path (`shim=str(self.shim_bin)`), grep-provably never the bare `Core()`/`self.core()` call that defaults to `vitrin-mock-shim` (see `tests/integration/README.md`). They *name* `vitrin-mock-shim`/`mock_core` only in disclaiming prose and assertion strings ("no mock in the path") — a plain-text grep for those strings is not the right proof here; check the invocation instead. |
+
+Grep-proving the rule (run from repo root; both expect no output):
+
+```bash
+# (1) The component tests never claim to be a milestone exit/acceptance gate.
+rg -l 'M1\.[2-5].{0,80}(exit gate|acceptance gate)' \
+  tests/integration/test_actuation.py tests/integration/test_demo.py \
+  tests/integration/test_runtime_wiring.py
+
+# (2) Every test_real_*.py gate module boots Core() with an explicit real
+#     shim path, never the bare Core()/self.core() call that defaults to
+#     harness.MOCK_SHIM (see tests/integration/README.md for detail; a plain
+#     text grep for "mock" inside these files would false-positive on their
+#     own disclaiming prose, so this checks the actual invocation instead).
+rg --files-without-match 'shim=str\(self\.shim_bin\)' tests/integration/test_real_*.py
+```
+
+The milestone-closing checklist (used when marking M1.2–M1.5 done in an issue
+or PR) requires: (1) the named gate issue is closed; (2) its test file boots
+its `Core`/shim with an explicit real binary path, never the mock defaults
+(check (2) above); (3) no prose anywhere claims the milestone is met on a
+component-test result.
 
 ### Verification per milestone
 
@@ -226,6 +282,7 @@ Scheduling pressure: start M1.2's shim work before M1.1 is polished — the wlro
 | D9 | Shim sandboxing depth | Environment-structural only in MVP (private socket, scrubbed env, own runtime dir); namespaces/seccomp/Landlock arrive with the Phase-2 powerbox (E2.6/E2.7). Documented as a known temporary gap — the MVP's security claims stay honest. | Before P1.5.2 |
 | D10 | Actuation coordinate space | Realm-view pixel coordinates (what the agent observed is what it addresses); the shim maps view→surface-local. Semantic addressing is Phase 2. | With P1.1.1 |
 | D11 | wlroots consumption | Pin one release, vendor as a Meson subproject (API churns every cycle); budget an upgrade task per phase. | Before P1.6.1 |
+| D12 | Milestone definition-of-done | A milestone (M1.2–M1.5) closes only when its named integration-gate issue (§5) passes green with no mock (`vitrin-mock-shim`, `mock_core.c`) on any seam it claims; mock-based tests are relabelled component tests, never milestone acceptance. | Adopted at #111, before closing any of M1.2–M1.5 |
 
 ---
 

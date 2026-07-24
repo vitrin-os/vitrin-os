@@ -362,12 +362,14 @@ BUILD_DIR=./build bash tests/acceptance/seat_input_replay.sh
 ```
 
 [`tests/acceptance/firefox_bringup.sh`](tests/acceptance/firefox_bringup.sh)
-— the P1.6.4 criteria, against the pinned **Firefox ESR 140.12.0**. Nobody
-can literally look at the nested window yet (`spawn_realm` still has no
-non-test caller, inherited from P1.6.2), so every criterion is reduced to
-something measurable in the pixels the shim actually forwarded: `mock_core.c`
-reports a **dominant colour per committed frame**, which is the M1.2
-verification the plan specifies. Each page is a local `file://` URL and the
+— the P1.6.4 criteria, against the pinned **Firefox ESR 140.12.0**. This
+script runs under `mock_core.c`, not the real `vitrind` — a deliberate
+shim-in-isolation choice, not a limitation of `spawn_realm` (which has had a
+real, non-test caller since P1.5.4/#103: `session::start_realm` in the
+shipped binary's `winit`/`headless` backends). So every criterion here is
+reduced to something measurable in the pixels the shim actually forwarded:
+`mock_core.c` reports a **dominant colour per committed frame**, which is the
+M1.2 verification the plan specifies. Each page is a local `file://` URL and the
 profile makes remote requests fail at connect, so **network flake cannot
 redden this test**.
 

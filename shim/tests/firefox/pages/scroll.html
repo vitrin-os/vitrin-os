@@ -2,9 +2,9 @@
 <!--
   P1.6.4 acceptance page (b): "injected pointer scroll works in the page".
 
-  THE PROBLEM THIS PAGE SOLVES. Nobody can look at the nested window (see the
-  README: `spawn_realm` still has no non-test caller), so "the scroll worked"
-  has to be observable in the pixels that cross the wire. A page that merely
+  THE PROBLEM THIS PAGE SOLVES. This script runs under mock_core.c, not a real
+  nested window (see shim/README.md), so "the scroll worked" has to be
+  observable in the pixels that cross the wire. A page that merely
   scrolls does not give that: its content moves, which changes the frame
   digest, but so does a caret blink, a scrollbar fade, or the browser
   repainting for its own reasons. A digest change proves SOMETHING happened,

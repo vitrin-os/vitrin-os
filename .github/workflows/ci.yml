@@ -16,9 +16,19 @@ name: CI
 #   integration   vitrind --headless + scripted Python SDK tests, suite
 #                 hard-capped at 10 minutes. Dormant until
 #                 tests/integration/run.sh lands
-#                 (needs P1.3.x headless + P1.8.x SDK); later hosts the M1.5
-#                 gates: demo job (P1.8.4), goldens (P1.9.2), hostile-client
-#                 tests (P1.9.3).
+#                 (needs P1.3.x headless + P1.8.x SDK); hosts the M1.5
+#                 gates: demo job (P1.8.4), goldens (P1.9.2), and (since
+#                 P1.9.3, #46) tests/integration/test_hostile_client.py --
+#                 a real hostile peer against a live vitrind, auto-picked
+#                 up by run.sh's `test_*.py` discovery with no extra
+#                 wiring here.
+#   fuzz-smoke    P1.9.3 (#46)'s other half: short cargo-fuzz (libFuzzer)
+#                 runs of fuzz/'s two targets (vitrin-protocol decode,
+#                 vitrin-ipc framing) on every PR, seeded from the
+#                 checked-in fuzz/corpus/ so every past regression replays
+#                 on every PR. The 24 h pre-M1.5 campaign is a separate,
+#                 manual, documented procedure (fuzz/README.md) -- far too
+#                 slow to run here.
 #
 # Everything runs on GPU-less Linux runners: pixman rendering + shm buffers
 # are mandatory in CI (plan 01-phase-1-mvp.md §6 D3), and nested mode is
@@ -656,3 +666,76 @@ jobs:
             echo "vacuous for now. Do not add it to branch protection until it activates."
             echo "Entry-point contract: \`tests/integration/README.md\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  fuzz-smoke:
+    # Quoted: the ": " inside the parenthetical would otherwise open a
+    # nested mapping, per the same YAML gotcha the shim job's "Headless
+    # acceptance" step names call out.
+    name: "fuzz-smoke (cargo-fuzz: protocol_decode, ipc_framing)"
+    runs-on: ubuntu-latest
+    # Cold (no Swatinem/rust-cache hit yet): compiling libfuzzer-sys plus
+    # this workspace's two decoder crates, twice (once per target), can run
+    # a couple of minutes before the first `-max_total_time` second is even
+    # spent. Warm, this job is fast -- the budget below is for the cold case.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (pinned toolchain + components from rust-toolchain.toml)
+        # Same pin as every other job (single source of truth, see the
+        # `rust` job's install step): `fuzz/` is deliberately its own cargo
+        # workspace (fuzz/README.md), not a member of the root one, but
+        # rustup resolves the toolchain by walking up from the cwd, so the
+        # root `rust-toolchain.toml` still governs it. `--sanitizer none`
+        # (below) is exactly what keeps that true -- plain ASan-instrumented
+        # cargo-fuzz needs a nightly toolchain this repo does not pin.
+        run: rustup toolchain install && rustup show active-toolchain
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # fuzz/ is its own workspace with its own lockfile and target dir
+          # (fuzz/target, cargo-fuzz's default) -- named explicitly so this
+          # cache slot never collides with (or gets evicted by) the root
+          # workspace's, which every other job populates.
+          workspaces: "fuzz -> target"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: cargo fuzz build (--sanitizer none; see fuzz/README.md "Why --sanitizer none")
+        run: |
+          cargo fuzz build --sanitizer none protocol_decode
+          cargo fuzz build --sanitizer none ipc_framing
+
+      - name: Replay the checked-in seed corpus (every past regression stays a permanent test)
+        # One file at a time, never a directory: a directory argument is
+        # libFuzzer's corpus-to-GROW, and this step must only replay the
+        # curated set fuzz/corpus/<target>/ already holds, never write to
+        # it (fuzz/README.md's "Running locally" note on why every command
+        # here is careful about this).
+        run: |
+          for target in protocol_decode ipc_framing; do
+            for seed in fuzz/corpus/"$target"/*; do
+              echo "== replaying $seed =="
+              cargo fuzz run --sanitizer none "$target" "$seed"
+            done
+          done
+
+      - name: Short fuzzing burst (60s/target, seeded from the checked-in corpus)
+        # The per-PR half of the P1.9.3 fuzzing story; the 24 h clean-run
+        # acceptance criterion is a separate, manual, pre-M1.5 procedure
+        # (fuzz/README.md's "24-hour pre-M1.5 campaign" section) -- far too
+        # slow to run here. Each target gets its own scratch corpus
+        # ($RUNNER_TEMP, wiped with the runner) as the directory libFuzzer
+        # is allowed to grow; fuzz/corpus/<target> is passed only as a
+        # second, read-seed-only argument, so this step can never dirty the
+        # checked-in corpus.
+        run: |
+          for target in protocol_decode ipc_framing; do
+            scratch="${RUNNER_TEMP}/fuzz-scratch-${target}"
+            mkdir -p "$scratch"
+            cargo fuzz run --sanitizer none "$target" "$scratch" fuzz/corpus/"$target" -- \
+              -max_total_time=60 -print_final_stats=1
+          done

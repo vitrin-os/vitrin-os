@@ -219,6 +219,26 @@ gpu-tests = ["dep:gbm"]
 # seam -- always compiled under cfg(test); this feature additionally exposes
 # it to out-of-crate harnesses (P1.9). Never enabled in deployment builds.
 scripted-consent = []
+# Compile the dead-man test injector (issue #109): a SIGUSR1 handler on the
+# HEADLESS backend that synthesizes a completed dead-man chord and applies it
+# through the exact same `Runtime::apply_dead_man` entry point the nested
+# backend's `DeadManHost::on_trigger` calls for a real one -- against the
+# session's real grant table and petition registry, not a second, weaker
+# path. It exists because headless has no physical input device to hold a
+# real chord on (`crate::deadman`'s module docs), so the M1.4 CI gate for
+# hold-Esc revocation against a real app (`tests/integration/
+# test_real_deadman.py`) needs a stand-in for the human's hold -- the same
+# posture issue #109 asks for explicitly ("a test-only privileged injector...
+# clearly test-gated"). Unlike `scripted-consent` above, this is gated on the
+# feature ALONE, not `cfg(any(test, feature = ...))`: the property under test
+# (a real signal reaching a real running process and revoking a real grant
+# table through the real embedder call) has no useful in-process unit-test
+# shape, so the feature's only consumer is the out-of-process integration
+# suite, which builds `vitrind` with it (`tests/integration/run.sh`) and
+# sends the running core SIGUSR1. Never enabled in a deployment build -- same
+# posture as `scripted-consent`, and for the same reason: a build that cannot
+# even name a test hook cannot be tricked into responding to one.
+dead-man-injector = []
 
 [dev-dependencies]
 # The permanent mock-shim fixture (issue #21): a compliant peer speaking the

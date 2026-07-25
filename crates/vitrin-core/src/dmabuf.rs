@@ -131,13 +131,17 @@
 //! Everything here builds in every configuration — the GLES types come with
 //! the workspace's existing `backend_winit`/`renderer_gl` Smithay features —
 //! but a GPU is only *used* when the embedder passes a live importer.
-//! Headless/CI embedders pass `None` and never touch EGL. Nothing at
-//! runtime constructs an importer yet: like the shim server itself, this
-//! module ships the machinery, and the realm/backend wiring (P1.5.2) will
-//! hand the nested backend's `GlesRenderer` to a [`GlesDmabufImporter`]
-//! when it wires shim connections at all. The env-gated tests below play
-//! that embedder today. Only the *tests* need a buffer allocator (GBM),
-//! which is why the `gpu-tests` cargo feature exists; see `Cargo.toml`.
+//! Headless/CI embedders pass `None` and never touch EGL.
+//!
+//! The **nested** backend does construct one at runtime (issue #132): both
+//! `Presenter::scene_and_importer` and `Presenter::teardown_view` build a
+//! [`GlesDmabufImporter`] over its live `GlesRenderer`, so a `kind=dmabuf`
+//! commit under `--nested` resolves as a real import and the death funnel
+//! disposes of retained content through the same seam. The **headless**
+//! backend has no GPU renderer and inherits the trait's `None` — every
+//! dmabuf commit there is still the designed `import_failed` shm fallback.
+//! Only the *tests* need a buffer allocator (GBM), which is why the
+//! `gpu-tests` cargo feature exists; see `Cargo.toml`.
 
 use std::fmt;
 use std::io;
@@ -150,6 +154,7 @@ use smithay::backend::renderer::{Bind, ExportMem, Frame, ImportDma, Offscreen, R
 use smithay::utils::{Physical, Rectangle, Size, Transform};
 use vitrin_protocol::generated::vitrin_view::Format;
 
+use crate::consent::{TrustedIndicator, TRUST_BAND_HEIGHT};
 use crate::scene::{layout, BYTES_PER_PIXEL, LETTERBOX_RGBA};
 
 /// Counter of core-side CPU copies of client pixels — the zero-copy
@@ -341,9 +346,9 @@ pub(crate) struct GpuContent {
 }
 
 /// The real importer: wraps the embedder's `GlesRenderer` (the nested
-/// backend's, once P1.5.2 wires shim connections at runtime; the env-gated
-/// tests' today) and the embedder-owned retained-content slot. Constructed
-/// fresh per dispatch — it borrows, it does not own.
+/// backend's at runtime since issue #132; the env-gated tests' under
+/// `VITRIN_GPU_TESTS=1`) and the embedder-owned retained-content slot.
+/// Constructed fresh per dispatch — it borrows, it does not own.
 pub(crate) struct GlesDmabufImporter<'a> {
     pub renderer: &'a mut GlesRenderer,
     pub content: &'a mut Option<GpuContent>,
@@ -517,62 +522,171 @@ fn force_sync(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     Ok(())
 }
 
+/// One primitive of a human-visible GPU frame, in draw order.
+///
+/// The list [`human_visible_frame`] returns is *the* description of what the
+/// zero-copy path puts on the human's display, and it is a value rather than
+/// a straight-line sequence of GL calls for exactly the reason
+/// `backend::winit`'s `window_pixels` is its own function: presenting
+/// needs an EGL context and a host window, so CI cannot drive the executor —
+/// but it can drive the decision, and the decision is the one that carries
+/// the trusted-indicator invariant (issue #85). A frame with no
+/// [`Draw::TrustBand`] is a forgeable frame, and
+/// `every_zero_copy_frame_ends_with_the_trusted_band` fails on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Draw {
+    /// Clear the whole view to the letterbox matte.
+    Matte,
+    /// Blit the client's imported texture into this destination rectangle,
+    /// 1:1 and unscaled ([`layout::place`]).
+    Content(Rectangle<i32, Physical>),
+    /// Fill this rectangle with the session's trusted-indicator colour: the
+    /// reserved strip along the top edge the human reads this session's
+    /// secret colour from.
+    TrustBand(Rectangle<i32, Physical>, [u8; 4]),
+}
+
+/// The trusted band's rectangle on a `view`-sized human-visible frame —
+/// the full width, [`TRUST_BAND_HEIGHT`] tall, clamped to a shorter view.
+///
+/// Derived from the same constant
+/// [`ConsentSurface::composite_trust_band`](crate::consent::ConsentSurface::composite_trust_band)
+/// fills on the CPU path, never restated, so the two paths cannot paint
+/// bands of different heights;
+/// `the_gpu_band_covers_exactly_what_the_cpu_band_paints` pins the equality
+/// against the real CPU compositor.
+pub(crate) fn trust_band_rect(view: Size<i32, Physical>) -> Rectangle<i32, Physical> {
+    let h = (TRUST_BAND_HEIGHT as i32).min(view.h.max(0));
+    Rectangle::new((0, 0).into(), (view.w.max(0), h).into())
+}
+
+/// Everything one human-visible GPU frame draws, in order: the letterbox
+/// matte, the client's content at its [`layout::place`] position, and the
+/// trusted band last.
+///
+/// **The band is not optional and there is no arm of this function that
+/// omits it.** That is the whole point of returning a fixed-size array from
+/// one pure function instead of writing three GL calls inline: the zero-copy
+/// path's frame is composed entirely of pixels the confined client owns, so
+/// a frame that reached the display without the band would let the client
+/// rasterize a counterfeit band into the top of its own buffer with nothing
+/// genuine above it — the forgery the indicator exists to make impossible
+/// (see [`crate::consent::TrustedIndicator`]).
+///
+/// The band goes on top of the content for the same reason the CPU path
+/// composites it after the client's surface *and* after the consent overlay:
+/// client content in that strip is always overdrawn by the genuine colour.
+pub(crate) fn human_visible_frame(
+    view: Size<i32, Physical>,
+    content: (u32, u32),
+    indicator: TrustedIndicator,
+) -> [Draw; 3] {
+    let placement = layout::place((view.w.max(0) as u32, view.h.max(0) as u32), content);
+    let dst = Rectangle::new(
+        (placement.x as i32, placement.y as i32).into(),
+        (content.0 as i32, content.1 as i32).into(),
+    );
+    [
+        Draw::Matte,
+        Draw::Content(dst),
+        Draw::TrustBand(trust_band_rect(view), indicator.color()),
+    ]
+}
+
 /// Present retained zero-copy content into a bound framebuffer at the view
-/// size: clear to the letterbox matte, then draw the texture at the
-/// [`layout::place`] position, 1:1 and unscaled — the same single placement
-/// policy the CPU compositor uses, so the two paths cannot drift. The GPU
-/// analogue of blitting `Scene::compose` output; used by the env-gated
-/// tests today and by the nested backend once P1.5.2 wires shim
-/// connections at runtime.
-pub(crate) fn render_content(
+/// size, as **human-visible** output: [`human_visible_frame`]'s draw list,
+/// executed against `renderer`.
+///
+/// This is the GPU analogue of [`crate::backend::human_visible_from_view`],
+/// and the one entry point any backend has for putting retained
+/// [`GpuContent`] on a display. There is deliberately no content-only
+/// variant to reach for: the trusted band rides in the draw list itself, so
+/// a future third presentation path gets it by construction rather than by
+/// remembering to ask for it (the P1.3.5 zero-copy branch shipped without
+/// it, and nothing failed).
+///
+/// **Human-visible only, never a capture.** An agent's frames come from
+/// [`Scene::compose`](crate::scene::Scene::compose) on the CPU on both
+/// backends (see [`crate::backend::winit::capture_pixels`]), which is
+/// upstream of every overlay — so the band painted here can no more reach
+/// `vitrin_view.frame_ready` than the consent card can. Nothing may serve
+/// the output of this function to an agent.
+///
+/// `transform` is the **output** transform of the target being drawn into,
+/// and it is a parameter because the two targets disagree: the winit EGL
+/// window surface has its GL origin at the bottom-left and needs
+/// `backend::winit`'s `WINDOW_TRANSFORM` (`Flipped180`), while an
+/// offscreen renderbuffer read back with `copy_framebuffer` is already
+/// top-down and needs `Normal`. It was hardcoded to `Normal` when this
+/// function only ever ran against the offscreen harness; presenting into the
+/// window with that constant renders the frame upside down.
+pub(crate) fn present_human_visible(
     renderer: &mut GlesRenderer,
     framebuffer: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
     view: Size<i32, Physical>,
+    transform: Transform,
     content: &GpuContent,
+    indicator: TrustedIndicator,
 ) -> Result<(), GlesError> {
-    let full = Rectangle::from_size(view);
-    let mut frame = renderer.render(framebuffer, view, Transform::Normal)?;
-    frame.clear(letterbox_color(), &[full])?;
-    let placement = layout::place(
-        (view.w.max(0) as u32, view.h.max(0) as u32),
-        (content.width, content.height),
-    );
-    let dst = Rectangle::new(
-        (placement.x as i32, placement.y as i32).into(),
-        (content.width as i32, content.height as i32).into(),
-    );
-    Frame::render_texture_from_to(
-        &mut frame,
-        &content.texture,
-        Rectangle::from_size(content.texture.size().to_f64()),
-        dst,
-        // Damage is DST-LOCAL in this call (Smithay 0.7 constrains each
-        // rect into `dst.size`, then translates by `dst.loc` — its own
-        // damage tracker likewise subtracts the element location before
-        // drawing): full-dst damage draws the whole placed rectangle and
-        // the rasterizer clips it to the view, so a larger-than-view
-        // surface center-crops. The view rectangle would be wrong here —
-        // under a negative placement it shifts left/up and leaves
-        // right/bottom strips of matte where client pixels belong.
-        &[Rectangle::from_size(dst.size)],
-        &[],
-        Transform::Normal,
-        1.0,
-    )?;
+    let mut frame = renderer.render(framebuffer, view, transform)?;
+    for draw in human_visible_frame(view, (content.width, content.height), indicator) {
+        match draw {
+            Draw::Matte => frame.clear(letterbox_color(), &[Rectangle::from_size(view)])?,
+            // Qualified calls: `GlesFrame` has inherent methods of both
+            // names (extra custom-shader arguments on one, no blend
+            // handling on the other) that would shadow the
+            // renderer-agnostic trait methods.
+            Draw::Content(dst) => Frame::render_texture_from_to(
+                &mut frame,
+                &content.texture,
+                Rectangle::from_size(content.texture.size().to_f64()),
+                dst,
+                // Damage is DST-LOCAL in this call (Smithay 0.7 constrains
+                // each rect into `dst.size`, then translates by `dst.loc` —
+                // its own damage tracker likewise subtracts the element
+                // location before drawing): full-dst damage draws the whole
+                // placed rectangle and the rasterizer clips it to the view,
+                // so a larger-than-view surface center-crops. The view
+                // rectangle would be wrong here — under a negative placement
+                // it shifts left/up and leaves right/bottom strips of matte
+                // where client pixels belong.
+                &[Rectangle::from_size(dst.size)],
+                &[],
+                Transform::Normal,
+                1.0,
+            )?,
+            Draw::TrustBand(rect, rgba) => Frame::draw_solid(
+                &mut frame,
+                rect,
+                // Dst-local, exactly as above.
+                &[Rectangle::from_size(rect.size)],
+                color32f(rgba),
+            )?,
+        }
+    }
     let _sync = frame.finish()?;
     Ok(())
+}
+
+/// An opaque RGBA8888 core colour as the renderer's float colour. One
+/// conversion for every colour this module puts on a GPU frame, so a colour
+/// the CPU compositor and the GPU path both paint cannot fork between them
+/// in the conversion — which for the trusted indicator would be a new
+/// forgery surface, not a rounding nit.
+fn color32f(rgba: [u8; 4]) -> smithay::backend::renderer::Color32F {
+    smithay::backend::renderer::Color32F::new(
+        rgba[0] as f32 / 255.0,
+        rgba[1] as f32 / 255.0,
+        rgba[2] as f32 / 255.0,
+        rgba[3] as f32 / 255.0,
+    )
 }
 
 /// [`crate::scene::LETTERBOX_RGBA`] as the renderer's float clear color —
 /// derived, not restated, so the matte can never fork between the CPU and
 /// GPU paths.
 fn letterbox_color() -> smithay::backend::renderer::Color32F {
-    smithay::backend::renderer::Color32F::new(
-        LETTERBOX_RGBA[0] as f32 / 255.0,
-        LETTERBOX_RGBA[1] as f32 / 255.0,
-        LETTERBOX_RGBA[2] as f32 / 255.0,
-        LETTERBOX_RGBA[3] as f32 / 255.0,
-    )
+    color32f(LETTERBOX_RGBA)
 }
 
 #[cfg(test)]
@@ -645,6 +759,102 @@ mod tests {
             let fourcc = wire_fourcc(*format).expect("version-1 formats are allowlisted");
             assert_eq!(fourcc as u32, *format as u32);
         }
+    }
+
+    /// **No zero-copy frame reaches a display without the trusted band.**
+    ///
+    /// The regression this exists for shipped: P1.3.5's zero-copy branch did
+    /// `bind → blit → submit` and never went through the CPU output stage
+    /// that paints the band, so every dmabuf-presented frame was made
+    /// entirely of pixels the confined client owns — the client could
+    /// rasterize a counterfeit band into the top of its own buffer with
+    /// nothing genuine above it, which is precisely the forgery the trusted
+    /// indicator exists to make impossible (issue #85). Nothing in the suite
+    /// noticed.
+    ///
+    /// Presenting needs a GPU, so what is pinned here is the decision
+    /// [`present_human_visible`] executes: the draw list. It is the same
+    /// split `backend::winit`'s `window_pixels` was given, for the same
+    /// reason.
+    #[test]
+    fn every_zero_copy_frame_ends_with_the_trusted_band() {
+        let indicator = TrustedIndicator::from_rgb(0x11, 0x22, 0x33);
+        // Exact fit, letterboxed, center-cropped on one axis, center-cropped
+        // on both, and a view shorter than the band itself.
+        for (view, content) in [
+            ((800, 600), (800, 600)),
+            ((800, 600), (320, 240)),
+            ((800, 600), (1024, 240)),
+            ((800, 600), (1024, 900)),
+            ((800, 4), (800, 4)),
+        ] {
+            let size: Size<i32, Physical> = (view.0, view.1).into();
+            let draws = human_visible_frame(size, content, indicator);
+            assert_eq!(draws[0], Draw::Matte, "{view:?}/{content:?}");
+            assert!(
+                matches!(draws[1], Draw::Content(_)),
+                "{view:?}/{content:?}: the client's texture must be drawn"
+            );
+            // Last, so the client's own content can never sit over the one
+            // strip the human reads the session colour from.
+            assert_eq!(
+                draws[2],
+                Draw::TrustBand(trust_band_rect(size), indicator.color()),
+                "{view:?}/{content:?}: every human-visible GPU frame ends with the \
+                 trusted band, in this session's colour"
+            );
+        }
+    }
+
+    /// The GPU band and the CPU band are the same band.
+    ///
+    /// The colour and the geometry are both anti-forgery properties, so a
+    /// GPU path that derived either of them independently would be a second
+    /// indicator the human has no reason to trust. This asserts against what
+    /// the CPU compositor *actually paints* — the footprint
+    /// `ConsentSurface::composite_trust_band` changes on a known buffer —
+    /// rather than against the constants both happen to read.
+    #[test]
+    fn the_gpu_band_covers_exactly_what_the_cpu_band_paints() {
+        use crate::consent::ConsentSurface;
+
+        const W: u32 = 64;
+        const H: u32 = 40;
+        let indicator = TrustedIndicator::from_rgb(0x7F, 0x10, 0xC0);
+
+        // A view of a colour the band is not, so every changed pixel is the
+        // band and only the band.
+        let mut view = vec![0u8; W as usize * H as usize * BYTES_PER_PIXEL];
+        for px in view.chunks_exact_mut(BYTES_PER_PIXEL) {
+            px.copy_from_slice(&[0x00, 0x80, 0x00, 0xff]);
+        }
+        let before = view.clone();
+        ConsentSurface::new(indicator).composite_trust_band(&mut view, W, H);
+
+        let rect = trust_band_rect((W as i32, H as i32).into());
+        for y in 0..H {
+            for x in 0..W {
+                let off = (y as usize * W as usize + x as usize) * BYTES_PER_PIXEL;
+                let px = &view[off..off + BYTES_PER_PIXEL];
+                let painted = px != &before[off..off + BYTES_PER_PIXEL];
+                let inside = (x as i32) < rect.size.w && (y as i32) < rect.size.h;
+                assert_eq!(
+                    painted, inside,
+                    "({x},{y}): the GPU band rectangle {rect:?} must be exactly the \
+                     footprint the CPU band paints"
+                );
+                if inside {
+                    assert_eq!(
+                        px,
+                        indicator.color(),
+                        "({x},{y}): the CPU band's colour is the value the GPU path \
+                         hands to the renderer"
+                    );
+                }
+            }
+        }
+        assert_eq!(rect.loc.x, 0, "the band hugs the top-left corner");
+        assert_eq!(rect.loc.y, 0);
     }
 }
 
@@ -799,8 +1009,23 @@ mod gpu_tests {
         }
     }
 
-    /// Composite the retained GPU content at the view size and read it back
-    /// (test apparatus, not the core frame path) as tightly packed RGBA.
+    /// The indicator the GPU harness presents with. Fixed and vivid, and —
+    /// like every other pixel assertion in this crate — nothing the
+    /// deterministic frame generator can produce, so a band read back in
+    /// these bytes is the band and not client content.
+    fn harness_indicator() -> TrustedIndicator {
+        TrustedIndicator::from_rgb(0xFF, 0x00, 0xAA)
+    }
+
+    /// Present the retained GPU content at the view size through the **real**
+    /// presentation entry point and read the result back as tightly packed
+    /// RGBA. The readback is test apparatus; [`present_human_visible`] is
+    /// not — it is the same function the nested backend's zero-copy branch
+    /// calls, which is why these expectations include the trusted band.
+    ///
+    /// `Transform::Normal` because an offscreen renderbuffer read back with
+    /// `copy_framebuffer` is already top-down; the window surface the nested
+    /// backend binds is not, and passes `WINDOW_TRANSFORM` instead.
     fn composite_and_readback(renderer: &mut GlesRenderer, content: &GpuContent) -> Vec<u8> {
         let size: Size<i32, Physical> = (W as i32, H as i32).into();
         let mut target: GlesRenderbuffer = Offscreen::<GlesRenderbuffer>::create_buffer(
@@ -810,7 +1035,15 @@ mod gpu_tests {
         )
         .expect("offscreen target");
         let mut fb = renderer.bind(&mut target).expect("bind");
-        render_content(renderer, &mut fb, size, content).expect("render retained content");
+        present_human_visible(
+            renderer,
+            &mut fb,
+            size,
+            Transform::Normal,
+            content,
+            harness_indicator(),
+        )
+        .expect("present retained content");
         let mapping = renderer
             .copy_framebuffer(
                 &fb,
@@ -819,6 +1052,23 @@ mod gpu_tests {
             )
             .expect("copy framebuffer");
         renderer.map_texture(&mapping).expect("map").to_vec()
+    }
+
+    /// Overwrite the top [`TRUST_BAND_HEIGHT`] rows of a `W x H` expectation
+    /// with the harness indicator's colour.
+    ///
+    /// Every human-visible GPU frame ends with the trusted band (issue #85),
+    /// so an expectation built from client pixels alone describes a frame
+    /// the core must never present. This is the one place the GPU goldens
+    /// account for it.
+    fn with_trust_band(mut expected: Vec<u8>) -> Vec<u8> {
+        let rows = (TRUST_BAND_HEIGHT as usize).min(H as usize);
+        let band = &harness_indicator().color();
+        for px in expected[..rows * W as usize * BYTES_PER_PIXEL].chunks_exact_mut(BYTES_PER_PIXEL)
+        {
+            px.copy_from_slice(band);
+        }
+        expected
     }
 
     /// The M1.5 acceptance: on a real GPU, shim→core frames are zero-copy —
@@ -914,13 +1164,16 @@ mod gpu_tests {
             );
 
             // The composited view IS the client's pixels — sampled from the
-            // client's own buffer, byte-exact against the generator.
+            // client's own buffer, byte-exact against the generator —
+            // everywhere the trusted band does not overdraw them (issue #85:
+            // the band is on *every* human-visible frame, and this is the
+            // human-visible presentation function).
             let composed =
                 composite_and_readback(&mut renderer, content.as_ref().expect("content retained"));
             assert_eq!(
                 composed,
-                frame_rgba(n, W, H),
-                "composited frame {n} must be the exact generator output"
+                with_trust_band(frame_rgba(n, W, H)),
+                "composited frame {n} must be the exact generator output under the trusted band"
             );
             // The instrumented zero-copy proof: no core-side CPU copy of
             // client pixels happened, for any frame so far.
@@ -1121,8 +1374,10 @@ mod gpu_tests {
             expected.extend_from_slice(&full[off..off + row]);
         }
         assert_eq!(
-            composed, expected,
-            "the view must be the client's central {W}x{H} window, 1:1 — no matte strips"
+            composed,
+            with_trust_band(expected),
+            "the view must be the client's central {W}x{H} window, 1:1 — no matte strips — \
+             under the trusted band"
         );
     }
 }

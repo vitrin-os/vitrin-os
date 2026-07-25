@@ -156,6 +156,45 @@ locally) and how to regenerate it deterministically:
 python3 fuzz/seed_corpus.py
 ```
 
+### A seed that claims a path must reach it
+
+A seed is named for one wire condition, and that name is the only thing a
+reviewer reads — so a seed whose bytes stop reaching that condition is
+invisible in a `git diff` and buys nothing, while still *looking* like
+coverage. That happened twice, found on 2026-07-25:
+`protocol_decode/attach_with_fd` carried a `fd_count = 0` header byte for
+a message whose `HAS_FD` is `true`, so it died at `FdCountMismatch` on
+every run instead of reaching the successful-decode path it exists to
+seed; and `ipc_framing/unsolicited_fd` put its fd on a zero-length
+`sendmsg`, which Linux drops on a `SOCK_STREAM` socket, so it replayed as
+an ordinary valid frame and never seeded `PeerViolation::UnsolicitedFd`.
+
+Two checks now make that class of rot fail loudly:
+
+```bash
+# Structural, no Rust toolchain: cross-checks every seed's header bytes
+# against protocol/vitrin-v0.xml and both targets' input layouts, and
+# requires every seed to be byte-distinct. Runs automatically on every
+# regeneration; --check verifies what is already on disk.
+python3 fuzz/seed_corpus.py --check
+
+# Authoritative: feeds each seed file to the REAL decoder / a REAL
+# vitrin_ipc::Connection over a REAL socketpair and asserts the outcome
+# the seed's name claims. An ordinary `cargo test` — no nightly, no
+# cargo-fuzz, no libFuzzer runtime (both `[[bin]]` targets set
+# `test = false`), so anyone editing `seed_corpus.py` can run it.
+cargo test --manifest-path fuzz/Cargo.toml
+```
+
+Adding a seed means adding its claim to both tables
+(`PROTOCOL_DECODE_CLAIMS` / `IPC_FRAMING_CLAIMS`, one copy in each file);
+a seed that claims nothing fails the checks, and so does a claim with no
+seed. Neither check is wired into `ci.yml` yet — the `fuzz-smoke` job
+replays the corpus but cannot tell which path a replay reached — so today
+they are a documented local gate. Wiring `python3 fuzz/seed_corpus.py
+--check` plus `cargo test --manifest-path fuzz/Cargo.toml` into that job
+is the natural follow-up.
+
 ## CI
 
 - **Every PR** (`ci.yml`'s `fuzz-smoke` job): both targets, `-sanitizer

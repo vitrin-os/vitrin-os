@@ -6,6 +6,15 @@
 //! realm view of [`Scene::compose`], the same bytes the headless backend
 //! retains for capture, P1.3.3, with the consent overlay on top, P1.7.1).
 //!
+//! There are **two** presentation paths into that one window, and both are
+//! human-visible output: the CPU texture blit above, and the zero-copy
+//! dmabuf present ([`crate::dmabuf::present_human_visible`], taken when a
+//! GPU import is retained and no overlay needs the window this frame). Both
+//! draw with [`WINDOW_TRANSFORM`] and both carry the trusted band, because a
+//! path that presented without it would put a frame made entirely of
+//! client-owned pixels on the human's display — see [`NestedState::try_redraw`]
+//! and `no_presentation_path_can_drop_the_trusted_band`.
+//!
 //! The host window IS the human's display here, so it presents the
 //! human-visible side of the output stage and there is no second window and
 //! no second surface (decision D4). The consent overlay reaching this GL
@@ -83,7 +92,7 @@ use tracing::{debug, error, info, trace};
 use crate::consent::grab::{ConsentGate, ConsentGrab};
 use crate::consent::{ConsentSurface, TrustedIndicator};
 use crate::deadman::{DeadManConfig, DeadManHook, DeadManSwitch, Trigger};
-use crate::dmabuf::{render_content, DmabufImporter, GlesDmabufImporter, GpuContent};
+use crate::dmabuf::{present_human_visible, DmabufImporter, GlesDmabufImporter, GpuContent};
 use crate::input;
 use crate::recorder::Recorder;
 use crate::scene::Scene;
@@ -98,6 +107,21 @@ const INITIAL_SIZE: (f64, f64) = (1280.0, 800.0);
 /// Deliberately near [`crate::scene::LETTERBOX_RGBA`] so nothing here reads
 /// as client content.
 const CLEAR_COLOR: Color32F = Color32F::new(0.06, 0.06, 0.08, 1.0);
+
+/// The output transform every draw into the host window's EGL surface takes.
+///
+/// GL's window framebuffer has its origin at the bottom-left, while every
+/// composition in this core is top-down (`Scene::compose`'s contract), so the
+/// whole projection is flipped vertically. **One const, read by both
+/// presentation paths** — the CPU texture blit in [`NestedState::try_redraw`]
+/// and the zero-copy dmabuf present through
+/// [`crate::dmabuf::present_human_visible`] — because a path that derived its
+/// own would present that path's frames upside down while the other stayed
+/// correct, which is exactly the regression this const replaces: the dmabuf
+/// branch inherited `Transform::Normal` from the offscreen renderbuffer
+/// harness `render_content` was written against, and kept it when it started
+/// drawing into the window surface instead.
+const WINDOW_TRANSFORM: Transform = Transform::Flipped180;
 
 /// Fallback frame budget (~60 Hz), scoped to whatever redraw chain is
 /// already running (P1.3.9, issue #117: the chain itself starts only from a
@@ -628,10 +652,11 @@ pub(crate) enum NestedWinitEvent {
     /// A non-keyboard input event: routed through [`input::intake_physical`]
     /// exactly as before, now instantiated over [`NestedInput`].
     Input(InputEvent<NestedInput>),
-    /// A real (non-synthetic, non-repeat — same filter Smithay applies) key
-    /// press or release, with both the evdev scancode (for the
-    /// layout-invariant table) and winit's resolved host keysym, when there
-    /// is one (issue #118's payload).
+    /// One key press or release that passed [`admits_key_event`] — never an
+    /// autorepeat, never a synthetic press, but *including* the synthetic
+    /// releases winit emits on X11 focus loss — with both the evdev scancode
+    /// (for the layout-invariant table) and winit's resolved host keysym,
+    /// when there is one (issue #118's payload).
     Key {
         evdev: u32,
         host_keysym: Option<u32>,
@@ -796,16 +821,11 @@ impl<F: FnMut(NestedWinitEvent)> ApplicationHandler for NestedWinitEventsApp<'_,
             WindowEvent::Focused(focused) => {
                 (self.callback)(NestedWinitEvent::Focus(focused));
             }
-            // Same filter Smithay's own handler applies: synthetic events
-            // (a key already down when focus arrived) and autorepeats never
-            // reach `InputBackend` — the dead-man switch's own timer covers
-            // a held key (see the module doc's "the winit backend is
-            // EGL/GLES-bound" section), so intake need not see repeats.
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic,
                 ..
-            } if !is_synthetic && !event.repeat => {
+            } if admits_key_event(is_synthetic, event.repeat, event.state) => {
                 match event.state {
                     ElementState::Pressed => self.inner.key_counter += 1,
                     ElementState::Released => {
@@ -873,6 +893,45 @@ impl<F: FnMut(NestedWinitEvent)> ApplicationHandler for NestedWinitEventsApp<'_,
             _ => {}
         }
     }
+}
+
+/// Whether one winit keyboard event reaches intake.
+///
+/// Split out of [`NestedWinitEventsApp::window_event`] so the filter is
+/// pinned by a test that needs no host window — the whole event handler is
+/// otherwise unreachable from CI, which is how the release half of this
+/// decision shipped inverted and stayed green.
+///
+/// - **Autorepeats never do.** A held key produces no new physical fact and
+///   the dead-man switch owns its own clock (module docs), so repeats are
+///   pure noise on the wire.
+/// - **Synthetic *presses* never do.** Those are winit's report of keys
+///   already down when focus *arrived*: the core did not see that press
+///   begin, the human may well have pressed it in another window entirely,
+///   and admitting it would hand the confined app — and the dead-man
+///   watcher — a press with no gesture behind it.
+/// - **Synthetic *releases* do, and this is the #124 regression it fixes.**
+///   Those are exactly the events winit's X11 backend emits for keys that
+///   were down when the window lost focus, and they are the only notice the
+///   core ever gets that such a key came up. Filtering them left the key
+///   latched down in the confined app indefinitely — a stuck modifier the
+///   human cannot clear, because the release they eventually perform is
+///   delivered to whatever window took focus. Smithay's own handler drops
+///   them too, which is why the earlier comment here cited it; matching a
+///   compositor that also owns the keyboard focus it lost is not the same
+///   situation as a nested core that does not.
+///
+/// A release admitted this way is still *paired*: the router delivers a
+/// release only if it delivered its press ([`input::InputRouter::route`]),
+/// so a synthetic release for a key the app never saw pressed goes nowhere.
+/// The Wayland half of the same hazard — `wl_keyboard.leave` emits no key
+/// events at all — is covered by [`NestedState::handle_focus`], which pays
+/// the app whatever releases the router still shows outstanding.
+fn admits_key_event(is_synthetic: bool, repeat: bool, state: ElementState) -> bool {
+    if repeat {
+        return false;
+    }
+    !is_synthetic || matches!(state, ElementState::Released)
 }
 
 /// Build this backend's own [`NestedWinitBackend`]/[`NestedWinitEvents`]
@@ -1011,6 +1070,20 @@ pub(crate) struct NestedView {
     /// petition's card here and lowers it again when the petition is decided
     /// or leaves the table. It is empty only while no petition is pending.
     consent: ConsentSurface,
+    /// This session's trusted indicator (issue #85), the same value
+    /// [`Self::consent`] frames its prompts and paints its band in.
+    ///
+    /// Held here as well because the two presentation paths need it in two
+    /// different shapes: the CPU path paints the band through the consent
+    /// surface's own canvas, while the zero-copy path
+    /// ([`crate::dmabuf::present_human_visible`]) has no CPU canvas and hands
+    /// the colour straight to the renderer. Both are seeded from the one
+    /// `RuntimeSeed::indicator` minted before the listener accepted anyone,
+    /// on the same line of `run_inner`, so they cannot be two secrets;
+    /// `no_presentation_path_can_drop_the_trusted_band` re-checks that
+    /// against what the consent surface actually paints rather than trusting
+    /// the construction site.
+    indicator: TrustedIndicator,
     texture: Option<SceneTexture>,
     /// The retained zero-copy GPU content, if a `kind=dmabuf` commit has
     /// been imported and nothing has replaced it since (P1.3.5, issue
@@ -1221,6 +1294,7 @@ fn run_inner(
             backend,
             scene: Scene::new(),
             consent: ConsentSurface::new(indicator),
+            indicator,
             texture: None,
             dmabuf_content: None,
         },
@@ -1310,14 +1384,52 @@ pub(crate) trait DeadManHost {
     /// session's real authority through
     /// [`crate::session::Runtime::apply_dead_man`]; a test host counts it.
     fn on_trigger(&mut self, trigger: Trigger);
+    /// Ask the host compositor for a frame. The nested backend forwards to
+    /// its window; a test host counts the requests, which is what makes
+    /// "how often does an armed hold repaint" an assertable number rather
+    /// than something only a live compositor could show.
+    fn request_redraw(&mut self);
 }
 
-/// Complete the chord if due, dispose of any trigger, and keep the timer
-/// armed. Idempotent and level-triggered; safe to call from anywhere.
+/// Where a [`deadman_tick`] call is coming from, which decides whether that
+/// tick may also start the hold indicator's redraw chain.
+///
+/// The distinction is load-bearing rather than descriptive: a hold has to
+/// animate, so *something* must keep asking for frames, but there are two
+/// candidates and only one of them is budgeted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickSource {
+    /// Outside the redraw chain — an input dispatch turn, a focus change.
+    /// Nothing else is going to ask for a frame here, so an armed hold must
+    /// kick the chain or the indicator never appears on a window idling at
+    /// 0 fps (P1.3.9 stopped the chain self-sustaining). Bounded by the host
+    /// event rate, and `request_redraw` is idempotent per host frame, so a
+    /// burst of events still costs at most one frame each.
+    OffChain,
+    /// From inside [`NestedState::redraw`], where a chain is by definition
+    /// already running and [`NestedState::schedule_next_frame`] paces its
+    /// continuation at [`FRAME_BUDGET`].
+    ///
+    /// **Requesting a redraw here is the busy-spin**, and it shipped: a
+    /// request issued while handling `RedrawRequested` makes winit emit the
+    /// next one as soon as the loop turns, so the hold repainted as fast as
+    /// the loop could go, outside the budget, for as long as the human held
+    /// the key — the un-budgeted spin P1.3.9 had just removed. Coalescing
+    /// does not help, because there is nothing to coalesce *with*: the frame
+    /// this tick runs inside has not been drawn yet, so the request is
+    /// always the only one outstanding.
+    InChain,
+}
+
+/// Complete the chord if due, dispose of any trigger, keep the timer armed,
+/// and — from [`TickSource::OffChain`] only — make sure an armed hold has a
+/// redraw chain to animate in. Idempotent and level-triggered; safe to call
+/// from anywhere, given the right `source`.
 pub(crate) fn deadman_tick<D: DeadManHost + 'static>(
     host: &mut D,
     handle: &LoopHandle<'static, D>,
     now: Instant,
+    source: TickSource,
 ) {
     let trigger = {
         let mut switch = host.switch().borrow_mut();
@@ -1328,6 +1440,12 @@ pub(crate) fn deadman_tick<D: DeadManHost + 'static>(
         host.on_trigger(trigger);
     }
     arm_deadman_timer(host, handle);
+    // Read the deadline out into a local first: the `Ref` must be dropped
+    // before `request_redraw` takes `&mut host`.
+    let armed = host.switch().borrow().deadline().is_some();
+    if armed && source == TickSource::OffChain {
+        host.request_redraw();
+    }
 }
 
 /// Arm a one-shot timer at the hold's deadline, if a hold is armed and no
@@ -1425,6 +1543,47 @@ pub(crate) fn route_turn<H: input::PreemptionHook>(
     }
 }
 
+/// Hand one routed seat event to the realm's shim, and journal it.
+///
+/// Physical input reaches the realm's seat over the same outbox an agent's
+/// chokepoint-admitted actuation uses; the origin tag bound at intake rides
+/// the wire unchanged (B2). This is the *only* site that produces
+/// `origin="physical"` at runtime — a human's input reaching the app is the
+/// half of the physical-vs-emulated audit that never crosses a chokepoint —
+/// so sharing [`input::record_seat_delivery`] with the agent path keeps the
+/// two from silently diverging (and inherits the motion-flood guard the
+/// physical path needs most, issue #83).
+///
+/// A free function rather than [`NestedState::route_physical_inputs`]'s
+/// inline closure so [`NestedState::handle_focus`] can pay the app the key
+/// releases a focus change owes it through *this* funnel — same outbox, same
+/// journal entry — instead of a second delivery path that could drift from
+/// it.
+fn deliver_physical(
+    realm: &Option<session::RealmRuntime>,
+    recorder: &mut Recorder,
+    delivery: input::SeatDelivery,
+) {
+    let Some(realm) = realm.as_ref() else {
+        trace!(origin = ?delivery.origin(), "routed input dropped: no realm attached");
+        return;
+    };
+    let Some(server) = realm.server.as_ref() else {
+        return;
+    };
+    let mut send = |frame: &[u8]| realm.outbox.send(frame);
+    match server.deliver_seat_event(&delivery, &mut send) {
+        Ok(sent) => {
+            if sent {
+                input::record_seat_delivery(recorder, &delivery);
+            }
+        }
+        Err(err) => {
+            tracing::warn!(%err, "seat delivery to the realm failed");
+        }
+    }
+}
+
 impl DeadManHost for NestedState {
     fn switch(&self) -> &Rc<RefCell<DeadManSwitch>> {
         &self.deadman
@@ -1443,6 +1602,10 @@ impl DeadManHost for NestedState {
     /// already in flight, and delivers each denial to its petitioner.
     fn on_trigger(&mut self, trigger: Trigger) {
         self.runtime.apply_dead_man(&trigger, Instant::now());
+    }
+
+    fn request_redraw(&mut self) {
+        self.view.backend.window().request_redraw();
     }
 }
 
@@ -1471,7 +1634,7 @@ impl NestedState {
         self.route_physical_inputs(inputs, size);
     }
 
-    /// The #118 payload: one real (non-synthetic, non-repeat) keyboard event
+    /// The #118 payload: one keyboard event admitted by [`admits_key_event`]
     /// from this backend's own winit event pump, with winit's resolved
     /// `logical_key` already folded into `host_keysym` (see
     /// [`NestedWinitEventsApp::window_event`] and [`input::host_keysym`]).
@@ -1532,71 +1695,69 @@ impl NestedState {
             inputs,
             view,
             surface,
-            &mut |delivery| {
-                // Physical input reaches the realm's seat over the same
-                // outbox an agent's chokepoint-admitted actuation uses; the
-                // origin tag bound at intake rides the wire unchanged (B2).
-                let Some(realm) = realm.as_ref() else {
-                    trace!(origin = ?delivery.origin(), "routed input dropped: no realm attached");
-                    return;
-                };
-                let Some(server) = realm.server.as_ref() else {
-                    return;
-                };
-                let mut send = |frame: &[u8]| realm.outbox.send(frame);
-                match server.deliver_seat_event(&delivery, &mut send) {
-                    // Journal the delivery with its origin through the same
-                    // funnel the agent path uses (issue #83). This is the
-                    // *only* site that produces `origin="physical"` at runtime
-                    // — a human's input reaching the app is the half of the
-                    // physical-vs-emulated audit that never crosses a
-                    // chokepoint — so sharing `record_seat_delivery` keeps it
-                    // from silently diverging from the tested agent copy (and
-                    // inherits the motion-flood guard the physical path needs
-                    // most).
-                    Ok(sent) => {
-                        if sent {
-                            crate::input::record_seat_delivery(&mut kernel.recorder, &delivery);
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(%err, "seat delivery to the realm failed");
-                    }
-                }
-            },
+            &mut |delivery| deliver_physical(realm, &mut kernel.recorder, delivery),
         );
         // Backstop 2 of 3 for the elapse check (`crate::deadman`): the
         // switch is already being asked about this turn's events, so ask it
-        // about the clock too.
-        self.deadman_tick();
+        // about the clock too. `OffChain` — a host input event is not a
+        // frame, so an armed hold needs this to start animating.
+        self.deadman_tick(TickSource::OffChain);
     }
 
     /// The host window lost or gained keyboard focus.
     ///
-    /// On loss the dead-man hold is forgotten. This is the one cause of a
-    /// lost key release that the core can actually see: the release will be
-    /// delivered to whatever window took focus, and neither backend reports
-    /// it (Smithay 0.7.0 filters `is_synthetic` key events, and winit's
-    /// Wayland `wl_keyboard.leave` emits no key events at all — both verified
-    /// in the pinned sources). Without this, an ordinary alt-tab with Esc
-    /// down either revokes the whole session a second later with no gesture
-    /// behind it, or — after such a fire — leaves the switch in a state only
-    /// a release can exit, silently dead with no indicator to say so.
+    /// Focus loss is the one moment the core knows a physical key release
+    /// will be delivered *somewhere else*, and it has two victims. Both are
+    /// handled here, because a fix to either alone leaves a stuck key.
     ///
-    /// [`DeadManSwitch::forget_hold`] carries the argument for cancelling
+    /// **The dead-man hold** is forgotten. Without this, an ordinary alt-tab
+    /// with Esc down either revokes the whole session a second later with no
+    /// gesture behind it, or — after such a fire — leaves the switch in a
+    /// state only a release can exit, silently dead with no indicator to say
+    /// so. [`DeadManSwitch::forget_hold`] carries the argument for cancelling
     /// rather than firing, and for why an agent cannot reach this path.
     ///
     /// The tick afterwards is not decoration: it lets the outstanding timer's
     /// callback see `deadline() == None` on its next wakeup and drop itself,
     /// and it repaints nothing, so a disarmed indicator disappears at the
     /// host's ordinary frame cadence.
+    ///
+    /// **The confined app's keyboard state** is settled: every key whose
+    /// press the router delivered gets its release, through the same funnel
+    /// an ordinary release takes. On Wayland this is the *only* notice the
+    /// app will ever get — winit's `wl_keyboard.leave` handler emits
+    /// `ModifiersChanged` and `Focused(false)` and no key events at all
+    /// (verified in the pinned source) — so without it a key held across an
+    /// alt-tab stays latched down in the app indefinitely. On X11 winit does
+    /// emit synthetic releases, which [`admits_key_event`] now lets through;
+    /// whichever arrives first empties the router's pairing table and the
+    /// other finds nothing to release, so the two cannot double up.
+    ///
+    /// Ordering: the hold is forgotten *before* the drain, so a chord in
+    /// progress is already cancelled when the releases go out. The chord's
+    /// press was consumed by the gate and never delivered, so it is not in
+    /// the router's table and the app is owed nothing for it.
     fn handle_focus(&mut self, focused: bool) {
         if focused {
             return;
         }
         debug!("host window lost keyboard focus; forgetting any dead-man hold in progress");
         self.deadman.borrow_mut().forget_hold();
-        self.deadman_tick();
+        self.deadman_tick(TickSource::OffChain);
+
+        // Disjoint field borrows, the same split `route_physical_inputs`
+        // takes: the router hands back the deliveries while the sink reaches
+        // the realm's shim session.
+        let session::Runtime {
+            router,
+            realm,
+            kernel,
+            ..
+        } = &mut self.runtime;
+        for delivery in router.release_all_keys() {
+            debug!("releasing a key held across focus loss so it cannot latch in the app");
+            deliver_physical(realm, &mut kernel.recorder, delivery);
+        }
     }
 
     /// Complete the dead-man chord if its hold has elapsed, apply whatever
@@ -1614,27 +1775,16 @@ impl NestedState {
     /// inline here, deleting every time-driven path left the entire workspace
     /// suite green, which for a dead-man switch is the one regression nothing
     /// may be allowed to hide.
-    fn deadman_tick(&mut self) {
+    ///
+    /// `source` says whether this tick is allowed to start a redraw chain:
+    /// vsync pacing (P1.3.9, issue #117) stopped `schedule_next_frame` from
+    /// self-sustaining once idle, so a hold armed while the window idles at
+    /// 0 fps needs one kick to become visible — but only from *outside* the
+    /// chain. See [`TickSource`], which carries the whole argument and the
+    /// spin that omitting it caused.
+    fn deadman_tick(&mut self, source: TickSource) {
         let handle = self.loop_handle.clone();
-        deadman_tick(self, &handle, Instant::now());
-        // Vsync pacing (P1.3.9, issue #117) stopped `schedule_next_frame`
-        // from self-sustaining once idle, so an armed hold must explicitly
-        // wake the chain back up: without this, pressing the chord while
-        // the window was idling at 0 fps would leave the indicator invisible
-        // until some unrelated redraw happened to come along. Once a frame
-        // has drawn with the hold in progress, `schedule_next_frame` keeps
-        // the chain paced at `FRAME_BUDGET` on its own for as long as the
-        // hold lasts — this only ever needs to kick the *first* one.
-        // `request_redraw` is idempotent per host frame (winit coalesces
-        // repeats before the next `Redraw` event), so calling this on every
-        // tick while a hold is already in progress — this method's other
-        // two call sites, `handle_input` and the frame-cadence backstop in
-        // `redraw` — costs nothing extra; it does not chain a redraw per
-        // frame outside the budget, because the chain that matters for
-        // pacing is still `schedule_next_frame`'s, not this one.
-        if self.deadman.borrow().deadline().is_some() {
-            self.view.backend.window().request_redraw();
-        }
+        deadman_tick(self, &handle, Instant::now(), source);
     }
 
     /// Draw one frame. Rendering failure is fatal to the skeleton: log it,
@@ -1660,8 +1810,13 @@ impl NestedState {
         //
         // In practice a minimized window is also an unfocused one, and
         // `handle_focus` has already forgotten the hold by then.
+        //
+        // `InChain`: this runs inside the host's own `RedrawRequested`
+        // handling, and `schedule_next_frame` below already continues the
+        // chain at `FRAME_BUDGET` while the hold animates. A second request
+        // from here would be the un-budgeted spin — see [`TickSource`].
         if self.deadman.borrow().deadline().is_some() {
-            self.deadman_tick();
+            self.deadman_tick(TickSource::InChain);
         }
         match self.try_redraw() {
             // The composite landed, so the realm's owed frame callbacks are
@@ -1710,13 +1865,26 @@ impl NestedState {
         // Zero-copy dmabuf presentation (P1.3.5, issue #117): a retained GPU
         // import exists and neither overlay needs the window this frame, so
         // the client's own texture goes straight to the framebuffer via
-        // [`render_content`] — no CPU composite, no [`ImportMem`] upload of
-        // any kind. This is the runtime home of the zero-memcpy claim
-        // [`crate::dmabuf`]'s [`crate::dmabuf::CopyMeter`] and its env-gated
-        // real-GPU test (`VITRIN_GPU_TESTS=1`) pin end to end; reaching it
-        // here is what makes that proof describe this backend's actual
-        // frame path rather than only a test harness driving the importer
-        // directly.
+        // [`present_human_visible`] — no CPU composite, no [`ImportMem`]
+        // upload of any kind, and no core-side copy of a client pixel. This
+        // is the runtime home of the zero-memcpy claim [`crate::dmabuf`]'s
+        // [`crate::dmabuf::CopyMeter`] and its env-gated real-GPU test
+        // (`VITRIN_GPU_TESTS=1`) pin end to end; reaching it here is what
+        // makes that proof describe this backend's actual frame path rather
+        // than only a test harness driving the importer directly.
+        //
+        // **It is still human-visible output, so it still carries the
+        // trusted band** (issue #85). The band is inside
+        // [`crate::dmabuf::human_visible_frame`]'s draw list rather than
+        // applied by a caller, so this branch cannot present without it: as
+        // first merged it did `bind → blit → submit` and skipped
+        // [`super::human_visible_from_view`] entirely, which left every
+        // dmabuf frame made *only* of pixels the confined client owns — free
+        // to rasterize a counterfeit band with nothing genuine above it. The
+        // band is a solid fill of the same [`TrustedIndicator`] colour the
+        // CPU path paints, drawn last, so it costs one draw call and takes
+        // nothing away from the zero-copy claim (which is about client-pixel
+        // *copies*, not about the core never drawing).
         //
         // **Known MVP seam, not a silent bug**: the moment either overlay
         // needs the window, this falls through to the CPU path below, which
@@ -1738,13 +1906,23 @@ impl NestedState {
         if self.view.dmabuf_content.is_some() && !overlay_up {
             {
                 // Scoped: `bind` holds `self.view.backend` mutably (a
-                // disjoint field from `dmabuf_content`) for the duration of
-                // the composite, and both borrows must end here — `submit`
-                // and `schedule_next_frame` right after need the whole
-                // `self.view`/`self` back.
+                // disjoint field from `dmabuf_content` and `indicator`) for
+                // the duration of the composite, and both borrows must end
+                // here — `submit` and `schedule_next_frame` right after need
+                // the whole `self.view`/`self` back.
+                let indicator = self.view.indicator;
                 let (renderer, mut framebuffer) = self.view.backend.bind()?;
                 let content = self.view.dmabuf_content.as_ref().expect("checked above");
-                render_content(renderer, &mut framebuffer, size, content)?;
+                present_human_visible(
+                    renderer,
+                    &mut framebuffer,
+                    size,
+                    // The window surface, not the offscreen harness — see
+                    // `WINDOW_TRANSFORM`, which the CPU blit below reads too.
+                    WINDOW_TRANSFORM,
+                    content,
+                    indicator,
+                )?;
             }
             self.view.backend.submit(None)?;
             trace!(?size, "dmabuf frame presented with zero core-side copies");
@@ -1845,7 +2023,7 @@ impl NestedState {
             // the view texture is read from `self.view.texture`.
             let view = self.view.texture.as_ref().expect("view composed above");
             let (renderer, mut framebuffer) = self.view.backend.bind()?;
-            let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+            let mut frame = renderer.render(&mut framebuffer, size, WINDOW_TRANSFORM)?;
             frame.clear(CLEAR_COLOR, &[full_window])?;
             // Qualified call: GlesFrame has an inherent method of the same
             // name (extra custom-shader arguments) that would shadow the
@@ -1890,34 +2068,66 @@ impl NestedState {
     /// [`NestedState::deadman_tick`] the moment the chord arms — this method
     /// only ever continues a chain already running, matching
     /// [`arm_deadman_timer`]'s "if none outstanding" discipline for the same
-    /// reason: idempotent per hold, not per frame.
+    /// reason: idempotent per hold, not per frame. **This is the only thing
+    /// that paces an animating hold**, which is why the frame-cadence
+    /// backstop inside [`NestedState::redraw`] must not also request one
+    /// ([`TickSource::InChain`]).
     ///
-    /// While the chain does continue, pacing is unchanged: if the swap
-    /// blocked for at least [`FRAME_BUDGET`] (real vsync throttling it), the
-    /// next request goes out immediately; otherwise a one-shot timer covers
-    /// the remainder so hosts without real swap throttling do not spin past
-    /// the budget even while a hold animates.
+    /// The decision itself is [`next_frame`], a pure function, so CI can pin
+    /// the cadence without a host window; this method is its executor.
     fn schedule_next_frame(
         &mut self,
         frame_start: Instant,
         hold: Option<f64>,
     ) -> Result<(), Box<dyn Error>> {
-        if hold.is_none() {
-            return Ok(());
-        }
-        let elapsed = frame_start.elapsed();
-        if elapsed >= FRAME_BUDGET {
-            self.view.backend.window().request_redraw();
-        } else {
-            let timer = Timer::from_duration(FRAME_BUDGET - elapsed);
-            self.loop_handle
-                .insert_source(timer, |_deadline, _, state| {
-                    state.view.backend.window().request_redraw();
-                    TimeoutAction::Drop
-                })
-                .map_err(|err| err.error)?;
+        match next_frame(hold, frame_start.elapsed()) {
+            NextFrame::Idle => {}
+            NextFrame::Now => self.view.backend.window().request_redraw(),
+            NextFrame::After(remaining) => {
+                let timer = Timer::from_duration(remaining);
+                self.loop_handle
+                    .insert_source(timer, |_deadline, _, state| {
+                        state.view.backend.window().request_redraw();
+                        TimeoutAction::Drop
+                    })
+                    .map_err(|err| err.error)?;
+            }
         }
         Ok(())
+    }
+}
+
+/// What the redraw chain owes after one frame.
+///
+/// Split from [`NestedState::schedule_next_frame`] because presenting needs
+/// a host window but the *cadence* is arithmetic, and an under- or
+/// over-paced hold indicator is a safety-relevant defect either way: too
+/// slow and the human cannot see how far the off-switch gesture has got, too
+/// fast and the compositor burns a core on a window nothing is changing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NextFrame {
+    /// Nothing is animating: the chain stops and the window idles at 0 fps
+    /// until a real state change asks for a frame.
+    Idle,
+    /// The frame already cost at least [`FRAME_BUDGET`] — a real
+    /// vsync-blocking swap did the pacing — so request the next immediately.
+    Now,
+    /// The frame completed early: defer the next request by this much. Hosts
+    /// whose EGL swap returns immediately (Mesa software EGL under Xvfb,
+    /// llvmpipe VMs, X servers without vblank) would otherwise spin the
+    /// chain as fast as the loop turns.
+    After(Duration),
+}
+
+/// The pacing decision: continue the chain only while a hold animates, and
+/// never faster than [`FRAME_BUDGET`].
+pub(crate) fn next_frame(hold: Option<f64>, elapsed: Duration) -> NextFrame {
+    if hold.is_none() {
+        return NextFrame::Idle;
+    }
+    match FRAME_BUDGET.checked_sub(elapsed) {
+        Some(remaining) if !remaining.is_zero() => NextFrame::After(remaining),
+        _ => NextFrame::Now,
     }
 }
 
@@ -2218,6 +2428,92 @@ mod tests {
         }
     }
 
+    /// **No presentation path on this backend emits a frame without the
+    /// trusted band** (issue #85).
+    ///
+    /// The nested backend has two, and only one of them went through the
+    /// output stage. P1.3.5's zero-copy branch did `bind → render → submit`
+    /// and never reached [`super::human_visible_from_view`] — the only
+    /// non-test caller of `ConsentSurface::composite_trust_band` — so every
+    /// dmabuf-presented frame consisted entirely of pixels the confined
+    /// client owns. A client that maximized its surface could then rasterize
+    /// a counterfeit band into the top of its own buffer with nothing genuine
+    /// above it, and the human's one unforgeable reference for judging a
+    /// consent prompt would be the app's own drawing. The whole suite passed.
+    ///
+    /// The sibling of [`the_nested_window_uploads_the_consent_overlay`]:
+    /// that one holds the CPU path's half, this one holds both halves
+    /// together and — crucially — pins that they paint the *same* colour, so
+    /// a GPU band derived from anywhere but this session's indicator (a
+    /// second forgery surface, not a rounding nit) fails here.
+    #[test]
+    fn no_presentation_path_can_drop_the_trusted_band() {
+        const W: i32 = 800;
+        const H: i32 = 600;
+        let size = size_of(W, H);
+        let indicator = TrustedIndicator::for_test();
+
+        let mut scene = Scene::new();
+        scene
+            .commit(SurfaceContent::from_rgba(client_pixels(300, 200), 300, 200).expect("content"));
+
+        // Path 1, the CPU texture upload. The band's *bottom* row is read
+        // rather than its top, because the dead-man hold indicator is
+        // deliberately composited above everything (`composite_hold_indicator`
+        // — a human mid-gesture on the off-switch must see that, whatever
+        // else is on screen) and its bar is shorter than the band, so the
+        // band survives underneath it. Row 0 would only test the no-hold
+        // case.
+        let band_row = crate::consent::TRUST_BAND_HEIGHT - 1;
+        let band_px = |buf: &[u8]| {
+            let off = band_row as usize * W as usize * crate::scene::BYTES_PER_PIXEL;
+            buf[off..off + crate::scene::BYTES_PER_PIXEL].to_vec()
+        };
+        let mut consent = ConsentSurface::new(indicator);
+        for hold in [None, Some(0.0), Some(0.5), Some(1.0)] {
+            assert_eq!(
+                band_px(&window_pixels(&scene, &mut consent, hold, size)),
+                indicator.color(),
+                "the CPU path dropped the trusted band (hold={hold:?})"
+            );
+        }
+        consent.show_for_test(prompt_fixture());
+        assert_eq!(
+            band_px(&window_pixels(&scene, &mut consent, None, size)),
+            indicator.color(),
+            "a raised prompt must not cover the band it is checked against"
+        );
+
+        // Path 2, the zero-copy dmabuf present: the band is the last thing
+        // the frame draws, at the same rectangle, in the same colour.
+        let draws = crate::dmabuf::human_visible_frame(size, (300, 200), indicator);
+        assert_eq!(
+            draws[2],
+            crate::dmabuf::Draw::TrustBand(crate::dmabuf::trust_band_rect(size), indicator.color()),
+            "the zero-copy path presented a frame made only of client pixels"
+        );
+
+        // The two paths' colour is one secret, not two. `NestedView` holds
+        // the indicator beside the consent surface it also seeded, so this
+        // re-derives what the consent surface actually paints rather than
+        // trusting that construction site: a band and a frame in different
+        // colours would teach the human to distrust genuine prompts.
+        let mut probe = vec![0u8; W as usize * crate::consent::TRUST_BAND_HEIGHT as usize * 4];
+        ConsentSurface::new(indicator).composite_trust_band(
+            &mut probe,
+            W as u32,
+            crate::consent::TRUST_BAND_HEIGHT,
+        );
+        assert_eq!(
+            probe[..crate::scene::BYTES_PER_PIXEL],
+            match draws[2] {
+                crate::dmabuf::Draw::TrustBand(_, rgba) => rgba,
+                other => panic!("the last draw must be the band, got {other:?}"),
+            },
+            "the GPU band's colour must be the very colour the consent surface paints"
+        );
+    }
+
     /// The nested backend's **capture** path serves the bare realm view — the
     /// same bytes headless retains — and never the presented window (P1.3.8,
     /// issue #116).
@@ -2435,6 +2731,11 @@ mod tests {
         switch: Rc<RefCell<DeadManSwitch>>,
         timer_armed: bool,
         triggers: Vec<Trigger>,
+        /// How many frames this host has been asked for. The production
+        /// implementation forwards to the host window; counting is what
+        /// turns "how often does an armed hold repaint" into an assertion
+        /// (see `an_armed_hold_kicks_the_chain_once_and_never_from_inside_it`).
+        redraw_requests: usize,
     }
 
     impl TestHost {
@@ -2446,6 +2747,7 @@ mod tests {
                 switch: Rc::new(RefCell::new(DeadManSwitch::new(config))),
                 timer_armed: false,
                 triggers: Vec::new(),
+                redraw_requests: 0,
             }
         }
     }
@@ -2459,6 +2761,9 @@ mod tests {
         }
         fn on_trigger(&mut self, trigger: Trigger) {
             self.triggers.push(trigger);
+        }
+        fn request_redraw(&mut self) {
+            self.redraw_requests += 1;
         }
     }
 
@@ -2486,8 +2791,9 @@ mod tests {
             .borrow_mut()
             .observe_event(&crate::input::tests::chord_press(), pressed_at);
 
-        // The input turn's tick: this is what arms the timer in production.
-        deadman_tick(&mut host, &handle, pressed_at);
+        // The input turn's tick: this is what arms the timer in production,
+        // and it is `OffChain` there for the same reason it is here.
+        deadman_tick(&mut host, &handle, pressed_at, TickSource::OffChain);
         assert!(
             host.timer_armed,
             "the input turn did not arm a timer for an armed hold"
@@ -2621,12 +2927,166 @@ mod tests {
             .observe_event(&crate::input::tests::chord_press(), t0);
         host.switch.borrow_mut().forget_hold();
 
-        deadman_tick(&mut host, &handle, t0 + Duration::from_secs(5));
+        deadman_tick(
+            &mut host,
+            &handle,
+            t0 + Duration::from_secs(5),
+            TickSource::OffChain,
+        );
         assert!(!host.timer_armed, "a forgotten hold armed a timer anyway");
         assert!(
             host.triggers.is_empty(),
             "a forgotten hold completed the chord"
         );
+        assert_eq!(
+            host.redraw_requests, 0,
+            "a forgotten hold has no indicator to animate, so it must not wake the \
+             compositor either"
+        );
+    }
+
+    /// **An armed hold wakes the compositor from outside the redraw chain,
+    /// and never from inside it.**
+    ///
+    /// Both halves are regressions that shipped, in opposite directions, one
+    /// release apart:
+    ///
+    /// - Without the `OffChain` kick, pressing the chord while the window
+    ///   idles at 0 fps leaves the indicator invisible until some unrelated
+    ///   redraw comes along — the human holds the panic button and sees
+    ///   nothing.
+    /// - With the kick unconditional, the frame-cadence backstop inside
+    ///   [`NestedState::redraw`] requested a fresh frame on *every* frame,
+    ///   from inside the host's own `RedrawRequested` handling. That is not
+    ///   coalesced with anything (the frame it runs in has not been drawn
+    ///   yet), so the hold repainted as fast as the loop could turn, outside
+    ///   [`FRAME_BUDGET`] — the un-budgeted spin P1.3.9 had just removed.
+    ///
+    /// The switch's own firing must be unaffected by either, which is what
+    /// the trigger assertions below are for: under-ticking a dead-man switch
+    /// is as bad as over-drawing for it.
+    #[test]
+    fn an_armed_hold_kicks_the_chain_once_and_never_from_inside_it() {
+        let _fd = crate::capture::tests::fd_lock();
+        let event_loop: EventLoop<'static, TestHost> = EventLoop::try_new().expect("loop");
+        let handle = event_loop.handle();
+        let mut host = TestHost::new(250);
+
+        let t0 = Instant::now();
+        host.switch
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_press(), t0);
+
+        // The arming input turn: nothing else will ask for a frame, so this
+        // one must.
+        deadman_tick(&mut host, &handle, t0, TickSource::OffChain);
+        assert_eq!(
+            host.redraw_requests, 1,
+            "an armed hold must wake an idle window, or the indicator never appears"
+        );
+
+        // Ten frames' worth of the in-chain backstop. `schedule_next_frame`
+        // is what paces the chain; these ticks must add nothing to it.
+        for frame in 0..10 {
+            deadman_tick(
+                &mut host,
+                &handle,
+                t0 + Duration::from_millis(frame * 16),
+                TickSource::InChain,
+            );
+        }
+        assert_eq!(
+            host.redraw_requests, 1,
+            "the frame-cadence backstop requested a redraw from inside the redraw chain: \
+             the hold now repaints as fast as the loop turns, not at FRAME_BUDGET"
+        );
+
+        // The tick still does its real job on both sources: the hold has not
+        // elapsed, the timer is armed, and the chord completes on time.
+        assert!(host.timer_armed);
+        assert!(host.triggers.is_empty(), "the hold has not elapsed yet");
+        deadman_tick(
+            &mut host,
+            &handle,
+            t0 + Duration::from_millis(300),
+            TickSource::InChain,
+        );
+        assert_eq!(
+            host.triggers.len(),
+            1,
+            "an in-chain tick must still complete an elapsed chord -- it is backstop 3 of 3"
+        );
+    }
+
+    /// The chain's cadence while a hold animates: [`FRAME_BUDGET`], never
+    /// loop speed, and it stops the moment the hold does.
+    ///
+    /// [`next_frame`] is the whole decision [`NestedState::schedule_next_frame`]
+    /// executes, split out because presenting needs a host window but pacing
+    /// is arithmetic — and because a hold indicator that under-paints is a
+    /// safety defect, not a cosmetic one.
+    #[test]
+    fn a_hold_repaints_at_the_frame_budget_not_at_loop_speed() {
+        // No hold: the chain stops and the window idles at 0 fps, whatever
+        // the frame cost.
+        assert_eq!(next_frame(None, Duration::ZERO), NextFrame::Idle);
+        assert_eq!(next_frame(None, Duration::from_secs(1)), NextFrame::Idle);
+
+        // A hold, on a host whose swap does not block: the whole budget is
+        // still owed, so the next frame waits.
+        assert_eq!(
+            next_frame(Some(0.0), Duration::ZERO),
+            NextFrame::After(FRAME_BUDGET),
+            "an instant frame must defer the next one by the full budget"
+        );
+        assert_eq!(
+            next_frame(Some(0.5), FRAME_BUDGET / 4),
+            NextFrame::After(FRAME_BUDGET - FRAME_BUDGET / 4)
+        );
+
+        // A hold, on a host with real vsync throttling: the swap already
+        // spent the budget, so the next request goes out immediately.
+        assert_eq!(next_frame(Some(0.5), FRAME_BUDGET), NextFrame::Now);
+        assert_eq!(next_frame(Some(1.0), FRAME_BUDGET * 3), NextFrame::Now);
+    }
+
+    /// The keyboard filter that decides what reaches intake at all.
+    ///
+    /// The release half of this shipped inverted (#124) and nothing caught
+    /// it: winit's X11 backend reports keys that were down at focus-out as
+    /// **synthetic releases**, and dropping them left the key latched down in
+    /// the confined app with no event that could ever clear it. Synthetic
+    /// *presses* — keys already down when focus arrived — must still be
+    /// dropped: the core never saw that press begin.
+    #[test]
+    fn a_synthetic_release_reaches_intake_but_a_synthetic_press_does_not() {
+        // Real events, both directions.
+        assert!(admits_key_event(false, false, ElementState::Pressed));
+        assert!(admits_key_event(false, false, ElementState::Released));
+
+        // The focus-out releases: the only notice the core gets that a key
+        // held across an alt-tab came up.
+        assert!(
+            admits_key_event(true, false, ElementState::Released),
+            "a synthetic release is the focus-out release; dropping it latches the key"
+        );
+
+        // The focus-in presses: a gesture the core never saw begin, and one
+        // the dead-man watcher must not be handed.
+        assert!(
+            !admits_key_event(true, false, ElementState::Pressed),
+            "a synthetic press is a key the core never saw go down"
+        );
+
+        // Autorepeat is noise on every path: the switch owns its own clock.
+        for synthetic in [false, true] {
+            for state in [ElementState::Pressed, ElementState::Released] {
+                assert!(
+                    !admits_key_event(synthetic, true, state),
+                    "autorepeat must never reach intake ({synthetic}, {state:?})"
+                );
+            }
+        }
     }
 
     #[test]

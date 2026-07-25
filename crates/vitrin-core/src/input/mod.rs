@@ -697,6 +697,48 @@ impl<H: PreemptionHook> InputRouter<H> {
         self.pointer = None;
     }
 
+    /// Release every key the router still believes the app is holding, in
+    /// press order, and forget them — one wire-ready [`SeatDelivery`] per
+    /// key, for the caller to deliver.
+    ///
+    /// This is [`Self::pressed_keys`]'s pairing invariant read out loud: the
+    /// table holds exactly the keysyms whose **press this router delivered**,
+    /// so one release per entry is precisely what the app is owed and never
+    /// more. A key whose press a gate consumed (the dead-man chord's) is not
+    /// in there and gets nothing, because the app never saw it go down.
+    ///
+    /// **Why the preemption hook is bypassed.** These are not new physical
+    /// events to judge — no key moved — they are the delivery debt the router
+    /// itself is recording. Routing them back through [`Self::route`] would
+    /// hand the dead-man watcher a release with no press, and a gate that
+    /// consumed one would strand exactly the key this exists to free.
+    ///
+    /// Called on host-window focus loss (`crate::backend::winit`'s
+    /// `handle_focus`), the one moment the core knows the physical release
+    /// will be delivered somewhere else: winit's Wayland backend emits no key
+    /// events at all on `wl_keyboard.leave`, so without this a key held
+    /// across an alt-tab stays latched down in the confined app forever.
+    ///
+    /// Distinct from [`Self::reset`] on purpose. `reset` forgets *all*
+    /// per-shim-generation state for a shim that is gone, where no delivery
+    /// is possible or wanted; this pays the app what it is owed while the
+    /// shim is very much alive, and leaves the pointer and the implicit grab
+    /// untouched — a focus change is not a new shim generation.
+    pub fn release_all_keys(&mut self) -> Vec<SeatDelivery> {
+        self.pressed_keys
+            .drain(..)
+            .map(|keysym| SeatDelivery {
+                // The human's key really is coming up, and the tag is the
+                // same one its press carried.
+                origin: Origin::Physical,
+                kind: SeatDeliveryKind::Key {
+                    keysym,
+                    state: KeyState::Released,
+                },
+            })
+            .collect()
+    }
+
     /// Route one tagged event against the current geometry: `view` is the
     /// composed realm-view size (nested: the host window size the scene
     /// composes at), `surface` the committed client surface size
@@ -3479,6 +3521,126 @@ pub(crate) mod tests {
         assert!(
             deadman.borrow_mut().take_replay().is_empty(),
             "a completed chord owes the app nothing"
+        );
+    }
+
+    /// **A key held across a focus change comes up in the app, not latched
+    /// down in it.**
+    ///
+    /// The hazard the nested backend's `handle_focus` reaches for this
+    /// method to close: on Wayland, `wl_keyboard.leave` produces no key
+    /// events at all, so the physical release the human eventually performs
+    /// is delivered to whatever window took focus and the core never hears
+    /// about it. Left alone, the confined app holds that key forever — a
+    /// stuck Ctrl or Shift the human has no way to clear.
+    ///
+    /// The pairing invariant is the whole safety argument, so it is asserted
+    /// on all three sides: exactly the delivered presses are released, in
+    /// press order; a press the gate consumed (the dead-man chord's) gets
+    /// nothing, because the app never saw it go down; and a physical release
+    /// that arrives afterwards — X11's synthetic focus-out release, which
+    /// `admits_key_event` now lets through — finds nothing to pair with and
+    /// is dropped rather than double-releasing.
+    #[test]
+    fn a_key_held_across_a_focus_change_is_released_not_latched() {
+        let deadman = Rc::new(RefCell::new(crate::deadman::DeadManSwitch::new(
+            crate::deadman::DeadManConfig::default(),
+        )));
+        let now = Rc::new(Cell::new(std::time::Instant::now()));
+        let mut router = InputRouter::new(crate::deadman::DeadManHook::new(
+            Rc::clone(&deadman),
+            Rc::clone(&now),
+            NoopHook,
+        ));
+        let view = (64, 48);
+        let surface = Some(view);
+
+        // Two ordinary keys go down and are delivered, then the chord goes
+        // down and is withheld by the gate.
+        for keysym in [NON_CHORD_KEYSYM, 0x061] {
+            assert!(
+                router
+                    .route(
+                        phys(SeatInputKind::Key {
+                            keysym,
+                            state: KeyState::Pressed
+                        }),
+                        view,
+                        surface,
+                    )
+                    .is_some(),
+                "fixture check: an ordinary key press reaches the app"
+            );
+        }
+        assert!(
+            router.route(chord_press(), view, surface).is_none(),
+            "fixture check: the chord's press is withheld"
+        );
+
+        // Focus leaves. Every key the app is holding — and only those — is
+        // released, in press order.
+        let released = router.release_all_keys();
+        assert_eq!(
+            released
+                .iter()
+                .map(|d| (d.origin(), d.kind().clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Origin::Physical,
+                    SeatDeliveryKind::Key {
+                        keysym: NON_CHORD_KEYSYM,
+                        state: KeyState::Released
+                    }
+                ),
+                (
+                    Origin::Physical,
+                    SeatDeliveryKind::Key {
+                        keysym: 0x061,
+                        state: KeyState::Released
+                    }
+                ),
+            ],
+            "focus loss must release exactly the keys whose press the app saw, in order -- \
+             a missing one stays latched down in the confined app forever"
+        );
+        assert!(
+            router.pressed_keys.is_empty(),
+            "the router still believes a key is down after focus loss: {:?}",
+            router.pressed_keys
+        );
+
+        // Idempotent: a second focus-out (or a `handle_focus` racing the
+        // synthetic releases) owes nothing.
+        assert!(router.release_all_keys().is_empty());
+
+        // And X11's synthetic release, arriving after the drain, pairs with
+        // nothing and is dropped -- the app is never told a key came up twice.
+        assert!(
+            router
+                .route(
+                    phys(SeatInputKind::Key {
+                        keysym: NON_CHORD_KEYSYM,
+                        state: KeyState::Released
+                    }),
+                    view,
+                    surface,
+                )
+                .is_none(),
+            "an already-paid release must not reach the app a second time"
+        );
+
+        // The pointer and its implicit grab are untouched: a focus change is
+        // not a new shim generation, which is what `reset` is for.
+        let mut router = InputRouter::new(NoopHook);
+        assert!(router
+            .route(phys(motion(10.0, 10.0)), view, surface)
+            .is_some());
+        assert!(router.route(phys(press()), view, surface).is_some());
+        assert!(router.release_all_keys().is_empty());
+        assert!(
+            router.route(phys(release()), view, surface).is_some(),
+            "releasing held keys must not drop the pointer's implicit grab"
         );
     }
 

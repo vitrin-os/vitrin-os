@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """**Component test, NOT a milestone gate** (issue #138): the fail-closed
 matrix of the `consent-injector` channel, driven against the shipped `vitrind`
 binary and `vitrin-mock-shim`.

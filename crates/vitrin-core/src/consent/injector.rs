@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The out-of-process consent injector's channel (issue #138): the line
 //! vocabulary a harness one process boundary away uses to *see* the prompt a
 //! headless `vitrind` raised and to say which button the human pressed.

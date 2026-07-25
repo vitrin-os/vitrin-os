@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Issue #138 (M1.4 exit gate, the CONSENT half): a real consent prompt, raised
 by the shipped `vitrind` over a REAL app, really occludes the human-visible
 output, is really absent from the agent's capture, really holds that

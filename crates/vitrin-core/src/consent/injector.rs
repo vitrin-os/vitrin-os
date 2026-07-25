@@ -83,8 +83,16 @@ use crate::grants::PersistenceRung;
 /// The peer controls exactly one thing about this channel — the bytes it
 /// writes — so the parse surface is bounded before it is interpreted. The
 /// longest legal request is `decide ` + 16 hex + ` ` + `allow-while-running`
-/// = 43 bytes; 128 leaves room for the vocabulary to grow without leaving
-/// room for a peer to make the core allocate.
+/// = 43 bytes; 128 leaves room for the vocabulary to grow.
+///
+/// **This bounds one line, not a batch of them.** A peer writing many short
+/// newline-terminated lines is bounded by the *other* constant,
+/// `live::MAX_REQUESTS_PER_POLL`, which stops one readiness callback from
+/// serving an unlimited number of them — and by `Injector::poll_requests`
+/// draining complete lines before each `recv`, which is what makes the test
+/// below "is this line too long" rather than "has the peer sent a lot".
+/// Before those two, a burst of `describe\n` grew both the reassembly buffer
+/// and the returned batch without limit while this comment claimed otherwise.
 pub(crate) const MAX_LINE: usize = 128;
 
 /// The banner the core writes as soon as it adopts the channel, so a harness
@@ -301,6 +309,26 @@ mod live {
     /// session's own stdio; adopting one of those would take the core's log
     /// away from it and turn every `tracing::warn!` into channel garbage.
     const LOWEST_FD: RawFd = 3;
+
+    /// The most requests one [`Injector::poll_requests`] call will return.
+    ///
+    /// The companion bound to [`MAX_LINE`]: that one bounds a single line,
+    /// this one bounds a *batch*. Both are needed, because answering a
+    /// request is expensive (a recomposite, a readback, a `sendmsg` with a
+    /// descriptor) and the peer chooses how many it asks for.
+    ///
+    /// 32 is far above anything the harness pipelines — the largest batch in
+    /// `tests/integration/test_consent_injector.py` is two `decide` lines in
+    /// one write, and that test's determinism depends on both landing in one
+    /// callback — and far below a number that could wedge a dispatch.
+    const MAX_REQUESTS_PER_POLL: usize = 32;
+
+    /// One `recv` at a time. Named because it is the second half of the
+    /// reassembly buffer's bound: a capped call leaves behind at most one
+    /// unterminated line ([`MAX_LINE`]) plus one chunk's worth of complete
+    /// lines it stopped short of, so `pending` never exceeds
+    /// `MAX_LINE + READ_CHUNK` — asserted in the tests below.
+    const READ_CHUNK: usize = 256;
 
     /// The `consent-injector` channel (module docs).
     pub(crate) struct Injector {
@@ -541,19 +569,110 @@ mod live {
             self.token = None;
         }
 
-        /// Read whatever the peer has written and return the complete
-        /// requests in it, oldest first.
+        /// Move **every** complete line out of `pending` onto `out`, leaving
+        /// at most one unterminated line behind.
+        ///
+        /// Draining before each `recv` (rather than after the whole read
+        /// loop) is what makes both bounds in [`Self::poll_requests`] real:
+        /// the `MAX_LINE` test on `pending` is then a test on *a line*,
+        /// which is what `MAX_LINE` documents itself as bounding, rather
+        /// than on a batch that merely happens to contain newlines.
+        ///
+        /// It drains *fully* rather than stopping at the cap on purpose. A
+        /// complete line left in `pending` would be a request nothing wakes
+        /// the loop for: the readiness source is `Mode::Level` on the
+        /// **socket**, so a buffer the core is holding is invisible to it,
+        /// and a peer that stopped writing would leave that request unserved
+        /// forever. Stopping the *reads* bounds the work; stopping the drain
+        /// would strand it.
+        fn take_complete_lines(&mut self, out: &mut Vec<Option<Request>>) -> Result<(), ()> {
+            loop {
+                let Some(nl) = self.pending.iter().position(|b| *b == b'\n') else {
+                    return Ok(());
+                };
+                let line: Vec<u8> = self.pending.drain(..=nl).collect();
+                let line = &line[..nl];
+                if line.len() > MAX_LINE {
+                    tracing::warn!("consent-injector: over-long line; closing the channel");
+                    return Err(());
+                }
+                match std::str::from_utf8(line) {
+                    Ok(text) => out.push(parse_request(text)),
+                    Err(_) => {
+                        tracing::warn!("consent-injector: non-UTF-8 line; closing the channel");
+                        return Err(());
+                    }
+                }
+            }
+        }
+
+        /// Read what the peer has written and return the complete requests in
+        /// it, oldest first — a **bounded** batch, never "everything the peer
+        /// can write".
         ///
         /// `Err(())` means the channel is finished — EOF, or a protocol
         /// violation (an over-long line, a non-UTF-8 byte) — and the caller
         /// must drop the source. A malformed *request* is not a violation:
         /// it comes back as `None` in the vector so the caller can answer
         /// `decided-ack malformed` and keep the channel.
+        ///
+        /// # Both allocations are bounded, per call
+        ///
+        /// The peer controls how many bytes it writes and how fast, and the
+        /// caller (`HeadlessState::service_injector`) answers *each*
+        /// `describe` with a full recomposite, a readback and a `sendmsg`
+        /// carrying a descriptor. So "read until `EAGAIN`" would
+        /// let a peer that pipelines faster than the core drains turn one
+        /// readiness callback into an unbounded batch of those — the
+        /// compositor's dispatch loop wedged for as long as the peer keeps
+        /// writing, with in-flight descriptors piling up at the receiver.
+        ///
+        /// Hence: complete lines are drained *before* each `recv`, reading
+        /// **stops** once [`MAX_REQUESTS_PER_POLL`] requests are in hand, and
+        /// whatever is still in the socket stays there. The source is
+        /// registered `calloop::Mode::Level`, so a socket left readable fires
+        /// again on the next dispatch and the remainder is served then —
+        /// bounded work per callback, no request dropped, no descriptor
+        /// leaked.
+        ///
+        /// The exact bound on the returned vector is
+        /// `MAX_REQUESTS_PER_POLL + READ_CHUNK`, not `MAX_REQUESTS_PER_POLL`:
+        /// the cap is tested between reads, and the last `recv` before it
+        /// trips may itself deliver up to [`READ_CHUNK`] complete lines (a
+        /// chunk of bare `\n`s is `READ_CHUNK` empty ones). Both are
+        /// constants, which is the whole point — the peer no longer chooses
+        /// the number. `a_burst_of_requests_is_served_in_bounded_batches`
+        /// pins it.
+        ///
+        /// And `pending` is bounded by `MAX_LINE` after every full drain, so
+        /// a peer cannot make the core buffer without limit either — which is
+        /// what `MAX_LINE`'s own doc comment claimed and, before the drain
+        /// moved ahead of the reads, did not deliver.
         #[allow(clippy::result_unit_err)]
         pub(crate) fn poll_requests(&mut self) -> Result<Vec<Option<Request>>, ()> {
             let mut out = Vec::new();
             loop {
-                let mut buf = [0u8; 256];
+                self.take_complete_lines(&mut out)?;
+                if out.len() >= MAX_REQUESTS_PER_POLL {
+                    tracing::warn!(
+                        served = out.len(),
+                        "consent-injector: per-callback request cap reached; whatever is still \
+                         in the socket is served on the next dispatch"
+                    );
+                    break;
+                }
+                // `pending` now holds at most one unterminated line, so this
+                // bound really is `MAX_LINE`'s stated one: the longest thing
+                // a peer may spell before a `\n`.
+                if self.pending.len() > MAX_LINE {
+                    tracing::warn!(
+                        buffered = self.pending.len(),
+                        "consent-injector: peer sent more than MAX_LINE bytes with no \
+                         newline; closing the channel"
+                    );
+                    return Err(());
+                }
+                let mut buf = [0u8; READ_CHUNK];
                 let read = match rustix::net::recv(
                     self.conn.as_fd(),
                     &mut buf[..],
@@ -571,34 +690,6 @@ mod live {
                     return Err(());
                 }
                 self.pending.extend_from_slice(&buf[..read]);
-                if self.pending.len() > MAX_LINE {
-                    // Either an over-long line or a peer pipelining faster
-                    // than the core drains; both are answered by draining
-                    // what is complete first, and only then judging.
-                    if !self.pending.contains(&b'\n') {
-                        tracing::warn!(
-                            buffered = self.pending.len(),
-                            "consent-injector: peer sent more than MAX_LINE bytes with no \
-                             newline; closing the channel"
-                        );
-                        return Err(());
-                    }
-                }
-            }
-            while let Some(nl) = self.pending.iter().position(|b| *b == b'\n') {
-                let line: Vec<u8> = self.pending.drain(..=nl).collect();
-                let line = &line[..nl];
-                if line.len() > MAX_LINE {
-                    tracing::warn!("consent-injector: over-long line; closing the channel");
-                    return Err(());
-                }
-                match std::str::from_utf8(line) {
-                    Ok(text) => out.push(parse_request(text)),
-                    Err(_) => {
-                        tracing::warn!("consent-injector: non-UTF-8 line; closing the channel");
-                        return Err(());
-                    }
-                }
             }
             Ok(out)
         }
@@ -768,6 +859,143 @@ mod live {
 
             drop(listener);
             let _ = std::fs::remove_file(&path);
+        }
+
+        /// A socketpair whose core end is wrapped in an [`Injector`], for the
+        /// batching tests below. `send_all` writes until the socket buffer
+        /// fills and reports how many bytes really landed.
+        fn injector_pair() -> (Injector, OwnedFd) {
+            use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+            let (core_end, peer) = rustix::net::socketpair(
+                AddressFamily::UNIX,
+                SocketType::STREAM,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .expect("a socketpair");
+            let conn = vitrin_ipc::Connection::from_fd(core_end).expect("SO_PEERCRED");
+            let injector = Injector {
+                conn,
+                pending: Vec::new(),
+                live: None,
+                token: None,
+                write_dead: false,
+            };
+            (injector, peer)
+        }
+
+        fn send_all(peer: &OwnedFd, bytes: &[u8]) -> usize {
+            let mut written = 0;
+            while written < bytes.len() {
+                match rustix::net::send(
+                    peer.as_fd(),
+                    &bytes[written..],
+                    rustix::net::SendFlags::DONTWAIT,
+                ) {
+                    Ok(sent) => written += sent,
+                    // The socket buffer filled. What is in it is already far
+                    // more than one call's worth, which is what these tests
+                    // need.
+                    Err(rustix::io::Errno::AGAIN) => break,
+                    Err(err) => panic!("send: {err}"),
+                }
+            }
+            written
+        }
+
+        /// A burst of newline-terminated requests is served in **bounded**
+        /// batches, with nothing dropped and the reassembly buffer bounded
+        /// throughout.
+        ///
+        /// Before the cap, `MAX_LINE` only fired when `pending` held no
+        /// newline at all, so a peer writing `describe\n` faster than the
+        /// core drained grew both `pending` and the returned vector without
+        /// limit — and each returned request costs the caller a recomposite,
+        /// a framebuffer readback and a `sendmsg` carrying a descriptor,
+        /// inside one calloop callback. `describe` is exactly that expensive
+        /// verb, so it is what this burst is made of.
+        #[test]
+        fn a_burst_of_requests_is_served_in_bounded_batches() {
+            const LINE: &str = "describe\n";
+            let (mut injector, peer) = injector_pair();
+            let burst = LINE.repeat(64 * MAX_REQUESTS_PER_POLL);
+            let written = send_all(&peer, burst.as_bytes());
+            assert!(
+                written > MAX_REQUESTS_PER_POLL * LINE.len() * 4,
+                "the test needs several calls' worth in the socket; only {written} landed"
+            );
+
+            let ceiling = MAX_REQUESTS_PER_POLL + READ_CHUNK;
+            let mut served = 0usize;
+            let mut batches = 0usize;
+            loop {
+                let batch = injector.poll_requests().expect("a legal batch");
+                assert!(
+                    batch.len() <= ceiling,
+                    "one callback served {} requests; the bound is {ceiling}",
+                    batch.len()
+                );
+                assert!(
+                    batch.iter().all(|r| *r == Some(Request::Describe)),
+                    "every served line is the request the peer wrote"
+                );
+                assert!(
+                    injector.pending.len() <= MAX_LINE,
+                    "the reassembly buffer held {} bytes -- MAX_LINE must bound a LINE, not a \
+                     batch that happens to contain newlines",
+                    injector.pending.len()
+                );
+                if batch.is_empty() {
+                    break;
+                }
+                served += batch.len();
+                batches += 1;
+            }
+            assert_eq!(
+                served,
+                written / LINE.len(),
+                "every line the peer wrote is served -- just not all in one callback"
+            );
+            assert!(
+                batches > 1,
+                "the burst must really have spanned several callbacks, or this test proves \
+                 nothing about the cap"
+            );
+        }
+
+        /// An over-long line with no newline still closes the channel — the
+        /// fail-closed behaviour the drain-first restructure must not lose.
+        #[test]
+        fn an_unterminated_over_long_line_still_closes_the_channel() {
+            let (mut injector, peer) = injector_pair();
+            let junk = vec![b'x'; MAX_LINE * 8];
+            assert!(send_all(&peer, &junk) > MAX_LINE);
+            injector
+                .poll_requests()
+                .expect_err("an unterminated over-long line ends the channel");
+        }
+
+        /// The batch the harness really pipelines — two `decide` lines in one
+        /// write — still lands in **one** callback.
+        ///
+        /// `tests/integration/test_consent_injector.py`'s spent-token case
+        /// depends on that: the second line has to be judged against a prompt
+        /// that is provably still up, which is only true if the core drains
+        /// both before `post_dispatch` can lower the card. The cap must sit
+        /// far above what the harness sends, and this pins that it does.
+        #[test]
+        fn the_harnesss_pipelined_pair_still_arrives_in_one_callback() {
+            let (mut injector, peer) = injector_pair();
+            let token = PromptToken::from_bytes([0xab; 8]).to_hex();
+            let pair = format!("decide {token} deny\ndecide {token} allow-while-running\n");
+            assert_eq!(send_all(&peer, pair.as_bytes()), pair.len());
+            let batch = injector.poll_requests().expect("a legal batch");
+            assert_eq!(
+                batch.len(),
+                2,
+                "a pipelined pair must not be split across callbacks"
+            );
         }
     }
 }

@@ -51,9 +51,12 @@ Wayland app.
   physical device.
 - **`create_touch`**: returns `NULL`. `vitrin_shim_seat`'s wire vocabulary
   has no touch event at all (by design — touch is out of scope for the
-  Phase 1 MVP slice), so there is nothing to bridge; wlcs treats a `NULL`
-  touch factory as "skip touch-dependent tests" rather than a failure (see
-  the SKIP counts below).
+  Phase 1 MVP slice), so there is nothing to bridge. **On wlcs 1.7.0 this
+  crashes the runner** the moment a test actually reaches for the touch
+  device — see "Known hazard" below. An earlier version of this file claimed
+  wlcs treats a `NULL` touch factory as "skip touch-dependent tests"; that
+  is not what happens, and it is also what the 32 SKIPs in the pass-list
+  were incorrectly attributed to.
 - **`position_window_absolute`**: a no-op. The shim's `xdg.c` policy is a
   fixed single-maximized-toplevel-at-the-origin layout (Phase 1 has no
   window manager), so there is no window position for wlcs to set.
@@ -84,20 +87,76 @@ hardcodes a `--gtest_filter` covering:
 
 **Deliberately excluded, not merely expected to fail:** every `*Touch*`
 suite (e.g. `AllSurfaceTypes/TouchTest`). `create_touch` returning `NULL` is
-a real, structural absence (see above), not a bug this run would surface —
-including those suites would only add skip-noise, not information. Any
-other wlcs suite (data device, subsurfaces, layer-shell, ...) is excluded
-for the same reason: the shim doesn't implement the underlying global, so
-the "failure" would just be "no such interface," which nobody here needs
-wlcs to tell them.
+a real, structural absence (see above), not a bug this run would surface.
+Any other wlcs suite (data device, subsurfaces, layer-shell, ...) is
+excluded for the same reason: the shim doesn't implement the underlying
+global, so the "failure" would just be "no such interface," which nobody
+here needs wlcs to tell them.
 
-## The pass-list, annotated (as of this writing)
+**That exclusion is incomplete.** Excluding the `*Touch*` suites by name
+does *not* exclude the touch-device *parameters* of the parameterised suites
+that are in scope — `SurfaceInputRegions/SurfaceInputCombinations` is
+instantiated over (surface type × input device), so half its parameters use
+a touch device. On the wlcs version CI installs they fail before reaching
+the touch device at all; on a newer one they crash the runner. See "Known
+hazard".
 
-A full run of the scope above, against the current shim:
+## Known hazard: `create_touch` returning NULL crashes newer wlcs
+
+With **wlcs 1.6.1**, the version Ubuntu 24.04 (noble) ships and therefore the
+one the CI job installs, the scope above runs to completion. With **wlcs
+1.7.0** (a later Ubuntu release's package) the runner **segfaults** partway
+through, at
+`SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/9`
+— the `subsurface_at_x0_y0` surface type paired with a **touch** device —
+and the remaining ~131 tests in scope never run.
+
+What is established, on 1.7.0:
+
+- The crash is reproducible on demand: `--gtest_filter` narrowed to that one
+  parameter segfaults every time.
+- It is the *first* test parameter that gets far enough to actually use a
+  touch device; earlier touch parameters die on a protocol error before
+  reaching `create_touch`.
+- `AllSurfaceTypes/TouchTest.*` reproduces the same thing at the same point:
+  the first parameter whose surface is created successfully.
+- `gdb` puts every frame of the crash inside the `wlcs` runner binary, not
+  inside `vitrin-shim-wlcs.so`. (The distribution binary is stripped, so
+  there are no symbols — the frames are addresses in the main executable's
+  mapping. That places the fault in wlcs, but does not name the function.)
+
+The obvious explanation is that wlcs dereferences the `NULL` this module
+returns from `create_touch`. That is consistent with every observation above
+and with `WlcsTouch`'s ABI having no "unsupported" value to return instead,
+but it is not *proven* here — proving it would need a wlcs build with
+symbols. What *is* proven is that the behaviour this repository previously
+documented — "wlcs treats a `NULL` touch factory as skip-these-tests" — does
+not happen.
+
+Why it matters even though CI's current wlcs survives it: the touch-device
+*parameters* of the parameterised suites are in scope (see "Scope" above),
+so the day the runner image's `wlcs` moves past 1.6.1 this job starts losing
+most of its coverage to a crash. `run-advisory.sh` now prints
+`status=aborted` and a warning in exactly that case, because a partial run's
+`failed=` is a floor, not a tally — and `failed=0` from a run that died two
+tests in reads the same as `failed=0` from a clean sweep.
+
+## The pass-list, annotated
+
+**Provenance.** wlcs 1.6.1-1 — the version in Ubuntu 24.04 (noble) universe,
+which is what the `wlcs-advisory` job's `apt install wlcs` gets on
+`ubuntu-latest` — driving a `vitrin-shim-wlcs.so` built from this tree
+against system wlroots 0.19.3 and wayland 1.25.0,
+`WLR_BACKENDS=headless`, `WLR_RENDERER=pixman`, full `run-advisory.sh`
+scope, 2026-07-25.
 
 ```
-total=180 passed=3 failed=145 skipped=32
+total=180 passed=3 failed=145 skipped=32 status=complete
 ```
+
+These are the same counts this file has carried since the harness landed,
+reproduced here on a re-run. **The numbers were right. The root-cause
+annotation attached to them was not** — see below.
 
 **Passing (3):**
 
@@ -105,59 +164,154 @@ total=180 passed=3 failed=145 skipped=32
 - `WlOutputTest.wl_output_properties_set`
 - `WlOutputTest.wl_output_release`
 
-**Skipped (32):** all `SurfaceInputRegions/SurfaceInputCombinations.*` —
-wlcs's own fixture for this suite requires more than one output mode /
-buffer-format combination to parameterize over, which this shim's
-single-headless-output setup doesn't provide; wlcs correctly self-skips
-rather than failing. Not investigated further because it's wlcs's own
-gating, not a shim behavior difference.
+**Skipped (32):** all `SurfaceInputRegions/SurfaceInputCombinations.*`
+parameters whose surface type is `wl_shell` or `zxdg_shell_v6`. wlcs prints
+its own reason on the line above each one — `Missing extension: wl_shell>= 1`
+(16) and `Missing extension: zxdg_shell_v6>= 1` (16) — and gates them on the
+extension list this module advertises (`xdg_shell` v6, and nothing else).
+This shim implements neither the deprecated `wl_shell` nor the unstable
+`zxdg_shell_v6`, by design. Nothing to fix.
 
-**Failing (145), by root cause — one dominant cause explains the large
-majority:**
+> Two earlier explanations of these 32 are retracted: they are not wlcs
+> needing "more than one output mode / buffer-format combination", and they
+> are not `create_touch` returning `NULL`. Both were wrong; the reason is
+> printed in the log.
 
-1. **128 failures — `"Wayland protocol error: 3 on interface xdg_surface
-   v5"` ("xdg_surface has never been configured").** This is a real,
-   pre-existing conformance gap in the shim's `xdg.c`, not an artifact of
-   this bridge. The shim currently only sends the initial `xdg_surface
-   .configure` on the surface's first `wl_surface.commit`
-   (`initial_commit`-gated). The xdg-shell-stable spec — and wlcs's test
-   client — expect the compositor to send that configure proactively, as
-   soon as the toplevel/popup *role* is assigned
-   (`xdg_surface.get_toplevel`/`get_popup`), before the client's first
-   commit. wlcs's client library commits promptly after requesting the
-   role and then blocks waiting for the ack it was already spec-entitled
-   to have — so almost every test in `XdgSurfaceStableTest`,
-   `XdgToplevelStableTest`, `XdgToplevelStableConfigurationTest`,
-   `XdgPopupStable/XdgPopupTest`, and `ClientSurfaceEventsTest` hits this
-   same wall on its very first surface, regardless of what the test is
-   actually trying to check. **This is the single most useful thing this
-   PR's wlcs run demonstrates**: fixing xdg.c's configure timing to be
-   spec-proactive is the highest-leverage next step for xdg-shell
-   conformance, and it's now filed as a tracked follow-up rather than a
-   vague "conformance TBD" — see #128.
-2. **12 failures — `"Timeout waiting for condition"`, in
-   `XdgToplevelStableTest.{parent_can_be_set, null_parent_can_be_set,
-   when_parent_is_set_to_{self,child_descendant}_error_is_raised,
-   pointer_respects_window_geom_offset,
-   touch_respects_window_geom_offset}` and
-   `XdgToplevelStableConfigurationTest.{defaults,
-   activated_state_follows_pointer, window_can_{,un}maximize_itself,
-   window_can_{,un}fullscreen_itself}`.** These need either multiple,
-   independently-positioned toplevels (parenting tests) or configure-driven
-   state transitions (maximize/fullscreen/activate) that this shim's fixed
-   single-maximized-toplevel layout policy (`xdg.c`, plus
-   `position_window_absolute` being a no-op above) has no mechanism to
-   satisfy — expected, given Phase 1 has no window manager, not a bug this
-   run found.
-3. **5 failures — remainder of `XdgSurfaceStableTest`, timing/geometry
-   edge cases layered on top of cause 1** once a surface *does* get past
-   its first configure; not independently triaged since they're
-   downstream of the same root cause.
+### Failing (145), by cause
 
-Net: of 52 real (non-skipped-by-wlcs, non-touch) test *intents* in scope,
-this run surfaces essentially one architectural gap (proactive xdg-shell
-configure) plus one known-and-accepted policy limitation (no window
-manager), rather than 145 independent bugs.
+**1. 128 failures — `"Wayland protocol error: 3 on interface xdg_surface v5"`
+(wlroots' message: `xdg_surface has never been configured`), spread across
+`SurfaceInputRegions/SurfaceInputCombinations` (100),
+`XdgPopupStable/XdgPopupTest` (8), `ClientSurfaceEventsTest` (6),
+`XdgToplevelStableTest` (5), the two `SurfacePointerMotionTest`
+instantiations (8) and `XdgSurfaceStableTest` (2).**
+
+`xdg_surface` error 3 is `unconfigured_buffer` — "Attaching a buffer to an
+unconfigured surface". `WAYLAND_DEBUG=1` traces show wlcs 1.6.1's client
+reaching that state two different ways. `ClientSurfaceEventsTest
+.surface_enters_output`, representative of the bulk:
+
+```
+ -> wl_compositor#5.create_surface(new id wl_surface#11)
+ -> xdg_wm_base#7.get_xdg_surface(new id xdg_surface#9, wl_surface#11)
+ -> xdg_surface#9.get_toplevel(new id xdg_toplevel#13)
+ -> wl_surface#11.commit()                  <- initial commit: present
+ -> wl_shm_pool#14.create_buffer(new id wl_buffer#15, ...)
+ -> wl_surface#11.attach(wl_buffer#15, 0, 0)
+ -> wl_surface#11.commit()                  <- no ack_configure in between
+```
+
+Every one of those requests is written before the compositor processes any
+of them; there is no `xdg_surface.ack_configure` anywhere in the trace. And
+`XdgSurfaceStableTest.gets_configure_event` — one of the five "other"
+failures below — goes further: it does `get_toplevel`, `attach`, then a
+`wl_display.sync`, with **no `wl_surface.commit` at all**, and asserts a
+`configure` arrived.
+
+Both are the same assumption: that the compositor sends
+`xdg_surface.configure` without the client having performed the buffer-less
+initial commit and acknowledged the result. xdg-shell-stable requires the
+opposite, in the `xdg_surface` interface description:
+
+> After creating a role-specific object and setting it up […], the client
+> must perform an initial commit without any buffer attached. The compositor
+> will reply with initial `wl_surface` state […] followed by an
+> `xdg_surface.configure` event. **The client must acknowledge it and is
+> then allowed to attach a buffer** to map the surface.
+
+and
+
+> any attempts by a client to attach or manipulate a buffer prior to the
+> first `xdg_surface.configure` call must also be treated as errors.
+
+wlroots 0.19.3 implements exactly that: `surface->configured` is set **only**
+in `xdg_surface_handle_ack_configure`, and a commit carrying a buffer while
+`!configured` is rejected with `unconfigured_buffer`
+(`types/xdg_shell/wlr_xdg_surface.c`). The shim is right to reject these.
+
+**Cross-version confirmation, against the same shim sources.** Rebuilt only
+against wlcs 1.7.0's headers and run under the 1.7.0 runner — `shim/src`
+untouched — the pass count goes from 3 to 8, picking up
+`XdgSurfaceStableTest.gets_configure_event`,
+`XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_existing_role_is_an_error`,
+`ClientSurfaceEventsTest.frame_timestamp_increases` and
+`ClientSurfaceEventsTest.surface_enters_output`, because 1.7.0's helpers
+perform the initial-commit/configure/ack sequence. Nothing about the shim's
+configure timing changed between those two runs.
+
+> **The root cause previously recorded here was the exact inverse of the
+> rule, and is retracted.** It claimed `xdg.c` gating the initial configure
+> on the first `wl_surface.commit` was a spec violation and that the
+> compositor should configure proactively at role assignment. That is wrong
+> three times over: the spec mandates the ordering `xdg.c` already
+> implements; wlroots makes the alternative unreachable
+> (`wlr_xdg_surface_schedule_configure` opens with
+> `assert(surface->initialized)`, and `initialized` only becomes true at the
+> initial commit); and it would not even fix these tests, because the
+> failing clients never send `ack_configure` at all, so `configured` would
+> stay false no matter when the configure was sent.
+>
+> **Issue #128 was filed on that retracted premise. Its premise is invalid —
+> do not implement it.** Doing so would move `xdg.c` from conformant to
+> non-conformant while changing none of these results. The issue text itself
+> is not edited by this change; someone with write access needs to close or
+> rewrite it.
+
+What is *not* established: whether wlcs 1.6.1's behaviour is a plain bug or
+a deliberate accommodation of compositors that configure eagerly at role
+assignment (Mir, wlcs's home compositor, being the obvious candidate), and
+what exactly changed in 1.7.0. Settling that needs wlcs's own sources, which
+this repository deliberately does not vendor. Either way there is nothing
+for `xdg.c` to change.
+
+**2. 12 failures — `"Timeout waiting for condition"`**, all in
+`XdgToplevelStableTest.{parent_can_be_set, null_parent_can_be_set,
+when_parent_is_set_to_{self,child_descendant}_error_is_raised,
+pointer_respects_window_geom_offset, touch_respects_window_geom_offset}` (6)
+and `XdgToplevelStableConfigurationTest.{defaults,
+activated_state_follows_pointer, window_can_{,un}maximize_itself,
+window_can_{,un}fullscreen_itself}` (6).
+
+These need either independently-positioned toplevels (the parenting and
+geometry-offset tests — `position_window_absolute` is a no-op here) or
+configure-driven state transitions the shim's fixed
+single-maximized-activated-toplevel policy never produces. That
+correspondence is inferred from the test names against `xdg.c`'s documented
+layout policy ("LAYOUT IS ONE RULE"), **not** verified test by test with a
+trace the way cause 1 was. It is consistent with Phase 1 having no window
+manager.
+
+**3. 5 failures, individually triaged.** Small, concrete, and the only ones
+here that point at shim-side work:
+
+- `XdgToplevelStableTest.wm_capabilities_are_sent` — a gmock
+  `EXPECT_CALL(toplevel, wm_capabilities)` that is never satisfied. The shim
+  advertises `xdg_wm_base` version 6 but never sends
+  `xdg_toplevel.wm_capabilities`, which v5+ clients are entitled to. A
+  genuine, narrow conformance gap in `xdg.c`.
+- `XdgSurfaceStableTest.gets_configure_event` — see cause 1; on 1.6.1 this
+  test never commits, so no conformant compositor can pass it. It passes on
+  wlcs 1.7.0 against the same shim.
+- `XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_attached_buffer_is_an_error`
+  — "Expected protocol error not received". Creating an `xdg_surface` from a
+  `wl_surface` that has a buffer *attached but not yet committed* is
+  supposed to be an error; the shim accepts it.
+- `XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_committed_buffer_is_an_error`
+  — the error *is* raised, with a different code than wlcs expects:
+  `xdg_wm_base` error 3 (`invalid_popup_parent`) carrying the message
+  "xdg_surface must not have a buffer at creation", where wlcs expects 4
+  (`invalid_surface_state`). That code comes from wlroots 0.19.3, not from
+  anything under `shim/src`.
+- `XdgSurfaceStableTest.attaching_buffer_to_unconfigured_xdg_surface_is_an_error`
+  — "Expected protocol error not received": the one test that *wants*
+  `unconfigured_buffer` does not get it, while 128 others get it unasked.
+  Not triaged.
+
+Net: of the 148 tests that actually exercise the shim, 128 fail on a test
+client that skips the xdg-shell bring-up sequence the shim is required to
+enforce, 12 on an accepted Phase-1 policy limitation (inferred, not traced),
+and 5 individually — of which one (`wm_capabilities`) is a real, actionable
+`xdg.c` gap and one is a wlroots error-code mismatch.
 
 ## Building
 
@@ -189,10 +343,48 @@ shim/wlcs/run-advisory.sh <path-to-wlcs-binary> <path-to-vitrin-shim-wlcs.so> [o
 shim/wlcs/run-advisory.sh /usr/lib/x86_64-linux-gnu/wlcs/wlcs build/shim/vitrin-shim-wlcs.so
 ```
 
-Prints a `total=/passed=/failed=/skipped=` summary and a breakdown of the
-most common failure messages, and writes a full gtest log plus JUnit XML
-into the output directory (default `./wlcs-advisory-out/`). **Always exits
-0** — see below.
+Prints a `total=/passed=/failed=/skipped=/status=` summary and a breakdown
+of the most common failure messages, and writes a full gtest log plus JUnit
+XML into the output directory (default `./wlcs-advisory-out/`). **Always
+exits 0** — see below.
+
+`status=` is the part to read first:
+
+| `status` | Meaning |
+|---|---|
+| `complete` | the runner printed its end-of-run summary; the counts are its own tally |
+| `aborted` | the runner died mid-suite (see "Known hazard"); the counts are only what finished before that, and everything after is counted nowhere |
+| `no-output` | no test ever started — almost always the module failing to `dlopen`. **Not** a clean run |
+
+Without that word, `failed=0` from a run that crashed on its second test is
+textually identical to `failed=0` from a clean sweep. Distinguishing them is
+the whole point of the field.
+
+## Testing the harness itself
+
+```sh
+bash shim/wlcs/test-summary.sh
+```
+
+Self-test for the log parsing (`summary.sh`) and for `run-advisory.sh`
+end-to-end. No wlcs package, no built module, no compositor, no GPU — it
+replays real wlcs captures checked in under `testdata/` and drives
+`run-advisory.sh` against a stub runner. It is a real test: it exits
+non-zero on failure, unlike `run-advisory.sh`.
+
+It exists because the counting patterns are matched against a format
+nothing here controls — the wlcs runner's own gtest event listener, which
+does *not* print stock googletest output (`[     SKIP ]`, not
+`[  SKIPPED ]`; `N tests failed:`, not `N tests, listed below:`). A pattern
+that stops matching does not fail loudly, it reports zero. Every fixture in
+the self-test therefore asserts non-zero failure and skip counts, so a
+rotted pattern takes the test red with it. `summary.sh` additionally derives
+every count twice — from the per-test lines and from the end-of-run summary
+block — and warns on stderr when the two disagree.
+
+Not wired into `meson test` or CI: `shim/meson.build` and
+`.github/workflows/ci.yml` are outside this directory. Run it by hand after
+touching `summary.sh` or `run-advisory.sh`.
 
 ## Why advisory, and how that's enforced
 
@@ -229,12 +421,18 @@ requirement.
   contention the way the shim's own (MIT-licensed) test suite is.
 - **No touch coverage**, by design (see above) — this run says nothing
   about touch input, because the shim has no touch input to say anything
-  about yet.
+  about yet. And the touch parameters that remain in scope are a standing
+  hazard rather than merely uninformative, see "Known hazard".
 - **Scope is hand-picked**, not "all of wlcs" — see "Scope" above. A green
   number here is not evidence about any wlcs suite not in that table.
 - **A point-in-time snapshot.** The pass-list above reflects one run
-  against the shim as of this PR. It will drift as `xdg.c` and `seat.c`
-  evolve; re-run `run-advisory.sh` rather than trusting this file's numbers
-  once meaningful time has passed. The CI job's per-run summary
-  (`$GITHUB_STEP_SUMMARY`) and uploaded artifact are the live source of
-  truth; this file is the annotated baseline for interpreting them.
+  against the shim, dated and attributed in that section. It will drift as
+  `xdg.c` and `seat.c` evolve; re-run `run-advisory.sh` rather than trusting
+  this file's numbers once meaningful time has passed. The CI job's per-run
+  summary (`$GITHUB_STEP_SUMMARY`) and uploaded artifact are the live source
+  of truth; this file is the annotated baseline for interpreting them.
+- **Version-sensitive in both directions.** The same shim scores 3/180
+  against wlcs 1.6.1 and (before crashing) 8/49 against wlcs 1.7.0, with no
+  shim change in between — see the pass-list. A number from this harness
+  means nothing without the wlcs version beside it, which is why the
+  pass-list leads with provenance.

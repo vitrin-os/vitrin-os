@@ -196,7 +196,7 @@ P1.7.1-3 consent ◄──────────────────┘   
 | **M1.1 — "First light"** (walking skeleton) | `vitrind` runs nested (test pattern on GNOME + Hyprland) and headless (CI); agent handshakes with static identity and captures a pixel-correct frame under an auto-approved grant | P1.1.\*, P1.2.\*, P1.3.1–2, P1.3.6, P1.4.1–3 (partial), P1.8.1–2 | (walking skeleton; no dedicated mock-free gate — see D12 below) |
 | **M1.2 — "Shim runs Firefox"** | Core spawns the shim; weston-terminal, then Firefox; frames flow shim→core (shm) into the nested window; human can click/type into Firefox through it | P1.3.3–4, P1.3.7, P1.5.\*, P1.6.1–2, P1.6.4 (render half) | **#105** (P1.9.6) |
 | **M1.3 — "Agent observes Firefox"** | `observe()` returns live Firefox pixels through the enforcement path; rate limits and expiry enforced; shim crash degrades gracefully | P1.3.6 wired to the realm view, P1.4.4, P1.8.2 | **#107** (P1.8.5) |
-| **M1.4 — "Agent acts under grant + consent"** | Core-rendered consent (human clicks Allow in nested mode); agent injects pointer + text into Firefox; mid-prompt actuations blocked; hold-Esc revocation; sender-constraint and expiry demonstrably enforced | P1.6.3, P1.7.\*, P1.8.3 | **#108** (P1.8.6) **+ #109** (P1.7.4) |
+| **M1.4 — "Agent acts under grant + consent"** | Core-rendered consent (human clicks Allow in nested mode); agent injects pointer + text into Firefox; mid-prompt actuations blocked; hold-Esc revocation; sender-constraint and expiry demonstrably enforced | P1.6.3, P1.7.\*, P1.8.3 | **#108** (P1.8.6) **+ #109** (P1.7.4, hold-Esc half) **+ #138** (P1.7.5, consent half) |
 | **M1.5 — "Headless + demo + hardening"** (= roadmap **M1**) | Full demo green in headless CI and impressive in nested mode; dmabuf zero-copy on at least one real GPU; fuzzing clean; docs + screencast published | P1.3.5, P1.8.4, P1.9.\* | **#110** (P1.8.7) |
 
 Scheduling pressure: start M1.2's shim work before M1.1 is polished — the wlroots/Firefox risk retires slowest and should soak longest.
@@ -222,7 +222,7 @@ having run once end to end. That gap is now closed by rule:
 > [tests/integration/README.md](../../tests/integration/README.md).
 
 The named gates (table above): **M1.2 = #105**, **M1.3 = #107**,
-**M1.4 = #108 + #109**, **M1.5 = #110**. M1.1 predates this rule (walking
+**M1.4 = #108 + #109 + #138**, **M1.5 = #110**. M1.1 predates this rule (walking
 skeleton, no real second app existed yet to be mock-free about) and is not
 retroactively gated.
 
@@ -234,7 +234,7 @@ retroactively gated.
 | real C shim ↔ `shim/tests/mock_core.c` | `shim/tests/acceptance/*.sh` (`upstream_frame_path.sh`, `seat_input_replay.sh`, `firefox_bringup.sh`) | **Shim-in-isolation smoke tests, not the milestone proof.** `firefox_bringup.sh` says so explicitly in its own header (added at P1.6.6); the equivalent statement now also appears in `shim/README.md`'s Firefox section. |
 | `crates/xtask/src/main.rs` demo venues | `cargo xtask demo` and `cargo xtask demo --headless` both exec the real `vitrin-shim` (`resolve_shim_bin`), which fork/execs a real app — Firefox ESR nested, `weston-terminal`/`foot` headless | **Mock-free, as of #110 / PR #127.** The prior state is worth keeping on the record: nested execed Firefox *as if it were the shim* (structurally impossible — the core hands a shim fd 3 with an unbound `WAYLAND_DISPLAY`), and headless aliased `vitrin-mock-shim` as both the `--shim` binary and the realm's app. Neither is true now; `vitrin-mock-shim` appears in no venue, and `tests/integration/test_demo.py`'s `DemoUsesNoMockShim` grep-proves it against the two launcher files. |
 | The M1.5 gate's own discriminating power | `tests/integration/test_demo.py` + `examples/agent-demo/run_demo.py` | **Was vacuous until the P1.9.8 gate-integrity pass; now real.** Being mock-free was necessary and not sufficient: the headless assertion asked for 24 changed pixels between two captures, and a real `weston-terminal`'s own asynchronous startup paint clears that unaided (measured: 569 changed pixels spanning 81 px), so the gate passed whether or not the agent's click and typed text reached the app. It now takes a settled control capture first, watches the app idle through a window at least as long as the one it later polls, and requires a change carrying the shape a typed line makes. **Read any green M1.5 run from before that change as "the demo completed against a real app", not as "the actuation landed."** The same pass fixed the real-app consent-occlusion proof in `crates/vitrin-core/src/backend/headless.rs`, which was waiting only for the view to differ from the empty-scene test pattern — satisfied by the shim's first commit, before any client attached. **The first attempt at the shape metric was itself wrong in the same family, and that is the more useful lesson:** it measured the *bounding span* of a scanline's changed pixels (last minus first) while its own prose derived a contiguous *run*, so three unrelated one-cell repaints at x=0, x=300 and x=600 — a cursor, a mode indicator, a scrollbar — cleared it with a 608 px "span" and nothing typed. A metric's name is not evidence about the metric; `ChangeProfileShapeMetrics` in `test_demo.py` now asserts that exact frame pair is rejected, in-process and binary-free. |
-| `tests/integration/test_real_app.py` / `test_real_capture_fidelity.py` / `test_real_actuation.py` / `test_real_firefox.py` / `test_real_gtk.py` | real `vitrind` → real `vitrin-shim` → real app (weston-terminal / GTK / Firefox) | **Mock-free.** These are the #105/#107/#108 gates (and their supporting rungs); each boots its `Core` with an explicit real shim path (`shim=str(self.shim_bin)`), grep-provably never the bare `Core()`/`self.core()` call that defaults to `vitrin-mock-shim` (see `tests/integration/README.md`). They *name* `vitrin-mock-shim`/`mock_core` only in disclaiming prose and assertion strings ("no mock in the path") — a plain-text grep for those strings is not the right proof here; check the invocation instead. |
+| `tests/integration/test_real_app.py` / `test_real_capture_fidelity.py` / `test_real_actuation.py` / `test_real_deadman.py` / `test_real_consent.py` / `test_real_firefox.py` / `test_real_gtk.py` | real `vitrind` → real `vitrin-shim` → real app (weston-terminal / GTK / Firefox / click-target) | **Mock-free.** These are the #105/#107/#108/#109/#138 gates (and their supporting rungs); each boots its `Core` with an explicit real shim path (`shim=str(self.shim_bin)`), grep-provably never the bare `Core()`/`self.core()` call that defaults to `vitrin-mock-shim` (see `tests/integration/README.md`). They *name* `vitrin-mock-shim`/`mock_core` only in disclaiming prose and assertion strings ("no mock in the path") — a plain-text grep for those strings is not the right proof here; check the invocation instead. |
 
 Grep-proving the rule (run from repo root; both expect no output):
 
@@ -279,10 +279,49 @@ prose named. Where a gate's criterion is a computed metric, pin the metric
 itself against constructed inputs — one it must accept, and one from the
 class it claims to reject.
 
-**Open against this checklist today:** M1.4's consent half (#109) has no
-gate-level evidence — `test_real_deadman.py` never raises a prompt, and the
-real-app consent-occlusion proof is an in-process Rust test, which item (2)
-disqualifies. See `tests/integration/README.md`'s "M1.4's open consent gap".
+**Closed since, against this checklist (#138):** M1.4's consent half now has
+gate-level evidence — `tests/integration/test_real_consent.py` raises a real
+prompt from the shipped binary over a real `click-target`, answers it from
+outside the process over an inherited socketpair, and asserts the occlusion
+split, the `consent_held` hold, and `issuer: human_consent` in the journal. It
+was checked the way item (4) asks rather than merely written: **ten** separate
+breakages each turned it red, on a different assertion each time — never
+raising the prompt; skipping `composite_over`; folding the two retained images
+(pointing `view_rgba` at `latest_output_rgba`); exporting the whole frame
+instead of the card's footprint (twice — once refused by the trust-band guard,
+once accepted and caught by the geometry cross-check); disabling the
+chokepoint's `consent_held` step; suppressing its `use_decision` refusal
+record; making `consent_held` refuse *captures* too (the over-broadening a
+naive `assertRaises(ConsentHeld)` would have accepted); mis-issuing the
+resolution; and dropping the run's `interactive+consent-injector` marker.
+Removing the post-denial control click turns the gate red with a message
+saying in as many words that the earlier `ConsentHeld` now proves nothing.
+
+**Still open against this checklist:** that gate proves **occlusion**, not
+**unspoofability**. It never learns the session's trusted-indicator colour —
+deliberately: the secret is never written to any descriptor or file in any
+build, so the instrumented core exports only the consent card's own footprint,
+which is indicator-free by construction (`consent::ConsentSurface::card_rect`,
+and `the_card_footprint_carries_no_indicator_pixel` which checks it). So issue
+#85's "a confined app cannot forge the frame" property remains
+**component-level** evidence — `consent/mod.rs`'s band and frame tests,
+`backend/headless.rs`'s occlusion tests, and `shim/docs/firefox.md` §9 for a
+human at a real display. **If unspoofability is read as part of M1.4's consent
+criterion, that part is not closed.** The physical click itself — the hit
+test, the 500 ms guard interval, press-arms/release-commits, and the origin
+check that stops an agent answering its own prompt — is likewise proven only
+by `consent/grab.rs`'s own tests and that nested recipe, exactly as
+`test_real_deadman.py`'s SIGUSR1 stands in for a held Escape. Both scopes are
+stated in `tests/integration/README.md`'s "What the consent gate still does not
+prove" and in the gate's own module docstring.
+
+That review found a gap one level up, now closed too: `unittest discover`
+collects whatever `test_*.py` files happen to exist, so a **missing** named
+gate was indistinguishable from a green suite — not a gate that cannot fail,
+but a gate that cannot be noticed. `tests/integration/run.sh` and CI's "Guard
+against milestone-gate drift" step now assert every named milestone-gate
+module is present, and that the two build-feature lists agree, before anything
+else runs.
 
 ### Verification per milestone
 

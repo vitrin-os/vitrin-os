@@ -1723,15 +1723,24 @@ impl NestedState {
     /// host's ordinary frame cadence.
     ///
     /// **The confined app's keyboard state** is settled: every key whose
-    /// press the router delivered gets its release, through the same funnel
-    /// an ordinary release takes. On Wayland this is the *only* notice the
-    /// app will ever get — winit's `wl_keyboard.leave` handler emits
-    /// `ModifiersChanged` and `Focused(false)` and no key events at all
-    /// (verified in the pinned source) — so without it a key held across an
-    /// alt-tab stays latched down in the app indefinitely. On X11 winit does
-    /// emit synthetic releases, which [`admits_key_event`] now lets through;
-    /// whichever arrives first empties the router's pairing table and the
-    /// other finds nothing to release, so the two cannot double up.
+    /// press the router delivered *for the human* gets its release, through
+    /// the same funnel an ordinary release takes. On Wayland this is the
+    /// *only* notice the app will ever get — winit's `wl_keyboard.leave`
+    /// handler emits `ModifiersChanged` and `Focused(false)` and no key
+    /// events at all (verified in the pinned source) — so without it a key
+    /// held across an alt-tab stays latched down in the app indefinitely. On
+    /// X11 winit does emit synthetic releases, which [`admits_key_event`] now
+    /// lets through; whichever arrives first takes the key out of the
+    /// router's pairing table and the other finds nothing to release, so the
+    /// two cannot double up.
+    ///
+    /// Keys an *agent* is holding are not touched, which is why the router
+    /// method is [`input::InputRouter::release_physical_keys`] and not a blanket
+    /// drain: both origins share one router (`session::route_seat`), the host
+    /// window's keyboard focus is not part of an agent's actuation path, and
+    /// a release synthesised for an agent's key would reach the shim and the
+    /// flight recorder tagged as the human's. That method's docs carry the
+    /// full argument and the one bounded imprecision.
     ///
     /// Ordering: the hold is forgotten *before* the drain, so a chord in
     /// progress is already cancelled when the releases go out. The chord's
@@ -1754,7 +1763,7 @@ impl NestedState {
             kernel,
             ..
         } = &mut self.runtime;
-        for delivery in router.release_all_keys() {
+        for delivery in router.release_physical_keys() {
             debug!("releasing a key held across focus loss so it cannot latch in the app");
             deliver_physical(realm, &mut kernel.recorder, delivery);
         }

@@ -1449,10 +1449,24 @@ fn close_realm<H: RuntimeHost>(host: &mut H, cause: DeathCause) {
         life.note_connection_closed(cause, teardown);
     });
     // Recomposite without the dead realm's surface. The scene is already
-    // clear, but this backend composites on demand, so without a redraw the
+    // clear, but both backends composite on demand, so without a redraw the
     // dead realm's pixels would stay on the human-visible output until
     // something else happened to damage the scene.
-    host.runtime().dirty = true;
+    //
+    // **Exactly what a latched commit does**, and for the same reason: the
+    // dirty flag alone is only half of it. `post_dispatch` consumes the flag
+    // by calling [`Presenter::redraw`], which on a backend whose frame clock
+    // is external answers `Scheduled` and composites nothing — the nested
+    // backend's `redraw` deliberately does not touch the window, because the
+    // host compositor owns the clock. [`Presenter::request_present`] is the
+    // half that actually asks the host for a frame, and it is a no-op on
+    // headless, where a completed composite *is* the cadence. Setting the
+    // flag without requesting the present left a dead app's last frame on a
+    // nested human's screen until an unrelated resize, focus change or
+    // petition happened along.
+    let (runtime, view) = host.split();
+    runtime.dirty = true;
+    view.request_present();
 }
 
 /// The once-per-dispatch-round presentation step.
@@ -1628,6 +1642,12 @@ mod tests {
     struct TestView {
         scene: Scene,
         redraws: usize,
+        /// How many times the backend was asked to *schedule* a
+        /// presentation. Distinct from [`Self::redraws`] on purpose: on a
+        /// backend whose frame clock is external, `redraw` composites
+        /// nothing and this is the only call that reaches the host
+        /// compositor at all.
+        presents: usize,
         /// Which frame-clock posture to answer with. Defaults to the
         /// headless one; the pacing test flips it to the nested one.
         posture: Presentation,
@@ -1654,6 +1674,13 @@ mod tests {
         }
         fn view_rgba(&mut self) -> Option<Vec<u8>> {
             Some(crate::test_pattern::render(VIEW.0, VIEW.1))
+        }
+        /// Counts the requests the nested backend turns into
+        /// `Window::request_redraw`. Overridden rather than inherited as the
+        /// trait's headless no-op, because "did this state change ever reach
+        /// the compositor" is only assertable if something counts it.
+        fn request_present(&mut self) {
+            self.presents += 1;
         }
         /// No retained image to scrub: this view keeps a counter, not a
         /// framebuffer. No GPU renderer either, so no importer.
@@ -1776,6 +1803,7 @@ mod tests {
                 view: TestView {
                     scene: Scene::new(),
                     redraws: 0,
+                    presents: 0,
                     posture: Presentation::Completed,
                     consent: ConsentSurface::new(crate::consent::TrustedIndicator::for_test()),
                 },
@@ -2547,6 +2575,67 @@ mod tests {
                 .and_then(|realm| realm.server.as_ref())
                 .is_some_and(|server| server.wants_presentation()),
             "a real composite must pay every owed callback"
+        );
+    }
+
+    /// **A realm's death reaches the compositor, so its last frame leaves
+    /// the human's screen.**
+    ///
+    /// [`close_realm`] takes the dead realm's surface out of the scene, so
+    /// the *next* composite shows an empty view — but only if a next
+    /// composite happens. Marking the frame dirty is not enough on a backend
+    /// whose frame clock is external: [`post_dispatch`] consumes the flag by
+    /// calling [`Presenter::redraw`], which in the nested posture answers
+    /// [`Presentation::Scheduled`] and deliberately composites nothing. The
+    /// call that actually asks the host compositor for a frame is
+    /// [`Presenter::request_present`], and `close_realm` did not make it —
+    /// so a killed app's last painted frame stayed on screen until an
+    /// unrelated resize, focus change or petition happened along, looking
+    /// for all the world like a live window.
+    ///
+    /// Asserted in the nested posture, because that is the one where the two
+    /// calls differ; headless inherits `request_present` as a no-op and was
+    /// never affected, which is exactly why the gap was invisible.
+    #[test]
+    fn a_dead_realm_asks_the_backend_for_the_frame_that_clears_it() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "close-present",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        rig.host.view.posture = Presentation::Scheduled;
+        rig.start_realm(&["--serve", "--animate", "100000"]);
+        // Let the shim commit at least one frame, so there really are dead
+        // pixels for the teardown to clear rather than an empty scene.
+        rig.pump_until(Duration::from_secs(10), |host| {
+            host.view.scene.surface_size().is_some()
+        });
+        assert!(
+            rig.host.view.scene.surface_size().is_some(),
+            "fixture check: the realm painted something before it died"
+        );
+
+        rig.host.runtime.dirty = false;
+        let presents_before = rig.host.view.presents;
+        close_realm(&mut rig.host, DeathCause::ConnectionClosed);
+
+        assert!(
+            rig.host.view.scene.surface_size().is_none(),
+            "fixture check: the death funnel takes the surface out of the scene"
+        );
+        assert!(
+            rig.host.runtime.dirty,
+            "realm death must mark the frame dirty"
+        );
+        assert_eq!(
+            rig.host.view.presents,
+            presents_before + 1,
+            "realm death never reached the compositor: on the nested backend the dead \
+             app's last frame stays on the human's screen until something unrelated \
+             happens to ask for a redraw"
         );
     }
 

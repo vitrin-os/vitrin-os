@@ -184,7 +184,17 @@ This shim implements neither the deprecated `wl_shell` nor the unstable
 `SurfaceInputRegions/SurfaceInputCombinations` (100),
 `XdgPopupStable/XdgPopupTest` (8), `ClientSurfaceEventsTest` (6),
 `XdgToplevelStableTest` (5), the two `SurfacePointerMotionTest`
-instantiations (8) and `XdgSurfaceStableTest` (2).**
+instantiations (4 + 4) and `XdgSurfaceStableTest` (1) — 128 exactly.**
+
+> Correction: an earlier revision of this table said `XdgSurfaceStableTest`
+> (2), which made the breakdown sum to 129 for a 128-failure cause. It is 1:
+> only `creating_xdg_surface_from_wl_surface_with_existing_role_is_an_error`
+> throws the `"Wayland protocol error: 3"` exception. That suite's four
+> other failures are itemised under cause 3 below — including
+> `creating_xdg_surface_from_wl_surface_with_committed_buffer_is_an_error`,
+> which *does* raise a code-3 error but fails on the code-mismatch
+> assertion rather than on an unexpected protocol error, and so belongs
+> there and not here. Counting it twice is what produced the 129.
 
 `xdg_surface` error 3 is `unconfigured_buffer` — "Attaching a buffer to an
 unconfigured surface". `WAYLAND_DEBUG=1` traces show wlcs 1.6.1's client
@@ -381,6 +391,26 @@ the self-test therefore asserts non-zero failure and skip counts, so a
 rotted pattern takes the test red with it. `summary.sh` additionally derives
 every count twice — from the per-test lines and from the end-of-run summary
 block — and warns on stderr when the two disagree.
+
+Three things about that arrangement are load-bearing in a way the
+summarised counts alone do **not** pin, so the self-test asserts each of
+them directly:
+
+- **Every pattern, in both dialects.** Each `WLCS_RE_SUM_*` is asserted
+  against both a wlcs capture and a stock-googletest log. A summary pattern
+  that matches only the wlcs spelling changes no printed number (the
+  per-test fallback covers it) while silently collapsing the two
+  extractions to one for that dialect — at which point the disagreement
+  canary compares one source against itself and can never fire.
+- **De-duplication.** wlcs prints every failed and skipped test twice, and
+  only the trailing `(N ms)` anchor separates the live line from the
+  end-of-run re-listing. The parser's de-duplicated per-test counts are
+  asserted directly, because on a *complete* log the summary block wins and
+  those counts never reach the output — so nothing else would notice the
+  anchor going away until the next aborted run double-counted.
+- **The stderr diagnostics.** Both the `ABORTED` warning and the
+  disagreement canary are asserted as stderr output, plus the negative: a
+  consistent complete run must print nothing at all.
 
 Not wired into `meson test` or CI: `shim/meson.build` and
 `.github/workflows/ci.yml` are outside this directory. Run it by hand after

@@ -554,7 +554,10 @@ pub(crate) enum Draw {
 /// fills on the CPU path, never restated, so the two paths cannot paint
 /// bands of different heights;
 /// `the_gpu_band_covers_exactly_what_the_cpu_band_paints` pins the equality
-/// against the real CPU compositor.
+/// against the real CPU compositor, and
+/// `every_zero_copy_frame_ends_with_the_trusted_band` pins the rectangle
+/// itself against the view's numbers (never against this function's own
+/// output, which would make the check vacuous).
 pub(crate) fn trust_band_rect(view: Size<i32, Physical>) -> Rectangle<i32, Physical> {
     let h = (TRUST_BAND_HEIGHT as i32).min(view.h.max(0));
     Rectangle::new((0, 0).into(), (view.w.max(0), h).into())
@@ -776,6 +779,15 @@ mod tests {
     /// [`present_human_visible`] executes: the draw list. It is the same
     /// split `backend::winit`'s `window_pixels` was given, for the same
     /// reason.
+    ///
+    /// The band's rectangle is asserted against numbers derived from the
+    /// *inputs*, never against [`trust_band_rect`]'s own return value.
+    /// Comparing the last draw to `Draw::TrustBand(trust_band_rect(size), _)`
+    /// re-runs the function under test to compute the expectation, so a
+    /// `trust_band_rect` returning a zero-sized rectangle passed it — this
+    /// test, and its `backend::winit` sibling, were both vacuous on geometry
+    /// when they first shipped, which is exactly the class of gate this
+    /// change exists to stop merging.
     #[test]
     fn every_zero_copy_frame_ends_with_the_trusted_band() {
         let indicator = TrustedIndicator::from_rgb(0x11, 0x22, 0x33);
@@ -797,11 +809,37 @@ mod tests {
             );
             // Last, so the client's own content can never sit over the one
             // strip the human reads the session colour from.
+            let Draw::TrustBand(rect, rgba) = draws[2] else {
+                panic!(
+                    "{view:?}/{content:?}: every human-visible GPU frame must end with the \
+                     trusted band, got {:?}",
+                    draws[2]
+                )
+            };
             assert_eq!(
-                draws[2],
-                Draw::TrustBand(trust_band_rect(size), indicator.color()),
-                "{view:?}/{content:?}: every human-visible GPU frame ends with the \
-                 trusted band, in this session's colour"
+                rgba,
+                indicator.color(),
+                "{view:?}/{content:?}: the band must carry this session's colour"
+            );
+            assert_eq!(
+                (rect.loc.x, rect.loc.y),
+                (0, 0),
+                "{view:?}/{content:?}: the band hugs the top-left corner"
+            );
+            assert_eq!(
+                rect.size.w, view.0,
+                "{view:?}/{content:?}: a band narrower than the view leaves a strip of \
+                 client-owned pixels where the human reads the session colour"
+            );
+            assert_eq!(
+                rect.size.h,
+                (TRUST_BAND_HEIGHT as i32).min(view.1),
+                "{view:?}/{content:?}: the band is the CPU path's height, clamped only by \
+                 a view shorter than the band itself"
+            );
+            assert!(
+                rect.size.h > 0,
+                "{view:?}/{content:?}: a zero-height band is no band at all"
             );
         }
     }

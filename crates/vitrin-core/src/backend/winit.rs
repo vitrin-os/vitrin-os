@@ -2494,12 +2494,24 @@ mod tests {
         );
 
         // Path 2, the zero-copy dmabuf present: the band is the last thing
-        // the frame draws, at the same rectangle, in the same colour.
+        // the frame draws, at the same rectangle, in the same colour. The
+        // rectangle is checked against the view's own numbers rather than
+        // against `trust_band_rect(size)` — asserting a function's output
+        // equals that same function's output is vacuous, and this test used
+        // to pass with the band collapsed to zero size.
         let draws = crate::dmabuf::human_visible_frame(size, (300, 200), indicator);
+        let crate::dmabuf::Draw::TrustBand(band, band_rgba) = draws[2] else {
+            panic!(
+                "the zero-copy path presented a frame made only of client pixels: {:?}",
+                draws[2]
+            )
+        };
         assert_eq!(
-            draws[2],
-            crate::dmabuf::Draw::TrustBand(crate::dmabuf::trust_band_rect(size), indicator.color()),
-            "the zero-copy path presented a frame made only of client pixels"
+            (band.loc.x, band.loc.y, band.size.w, band.size.h),
+            (0, 0, W, crate::consent::TRUST_BAND_HEIGHT as i32),
+            "the zero-copy band must cover the full width of the view's top strip, at the \
+             CPU path's height -- a narrower or shorter one leaves client-owned pixels \
+             where the human reads the session colour"
         );
 
         // The two paths' colour is one secret, not two. `NestedView` holds
@@ -2515,10 +2527,7 @@ mod tests {
         );
         assert_eq!(
             probe[..crate::scene::BYTES_PER_PIXEL],
-            match draws[2] {
-                crate::dmabuf::Draw::TrustBand(_, rgba) => rgba,
-                other => panic!("the last draw must be the band, got {other:?}"),
-            },
+            band_rgba,
             "the GPU band's colour must be the very colour the consent surface paints"
         );
     }

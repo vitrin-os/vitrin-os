@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The GTK rung of the real bring-up ladder, under the real core (P1.6.6).
 
 The M1.2 ladder is weston-terminal -> GTK app -> Firefox. `test_real_app.py`

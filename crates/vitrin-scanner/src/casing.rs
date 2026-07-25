@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Identifier-casing helpers shared by codegen backends.
 //!
 //! The IDL uses snake_case throughout (Wayland-style) for interface, message,

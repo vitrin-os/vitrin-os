@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `vitrind` — the Vitrin OS trusted core.
 //!
 //! This binary is the entire Trusted Computing Base (TCB) of a Vitrin

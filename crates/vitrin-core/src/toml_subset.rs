@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The strict TOML subset the core's configuration files are written in --
 //! one lexer, shared by every schema.
 //!

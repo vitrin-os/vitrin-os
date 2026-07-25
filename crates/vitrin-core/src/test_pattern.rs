@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The deterministic test pattern the skeleton renders.
 //!
 //! [`render`] is a pure function of the dimensions — integer math only, no

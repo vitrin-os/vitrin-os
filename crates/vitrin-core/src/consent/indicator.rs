@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The per-session trusted indicator (issue #85): a secret colour every
 //! genuine consent prompt is framed in, so a human can tell a real prompt
 //! from a replica a confined app painted into its own surface.

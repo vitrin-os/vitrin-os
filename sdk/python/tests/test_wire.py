@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the framing primitives and client-side validation."""
 
 from __future__ import annotations

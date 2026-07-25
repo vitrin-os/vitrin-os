@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Vitrin OS wire protocol: message types and codec.
 //!
 //! This crate is pure data plus encode/decode logic -- **no I/O, no

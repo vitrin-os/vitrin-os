@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The dead-man switch (P1.7.3, issue #39): the human's unconditional
 //! off-switch, reduced from PRD P10 to its MVP core — **holding one key for
 //! a configured duration revokes every grant the core has issued, at once.**

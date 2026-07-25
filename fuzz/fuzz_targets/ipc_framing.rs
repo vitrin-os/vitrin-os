@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Fuzz target: `vitrin-ipc`'s frame reassembly and `SCM_RIGHTS` matching,
 //! driven with arbitrary byte streams and arbitrary fd batches over a real
 //! `socketpair` -- the P1.9.3 (#46) framing half of "cargo-fuzz targets on

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Unix-socket transport for the Vitrin OS wire protocol.
 //!
 //! This crate moves **frames and file descriptors** between processes and

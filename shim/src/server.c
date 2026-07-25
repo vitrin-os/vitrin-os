@@ -1,5 +1,7 @@
 /* server.c -- Phase A (core bring-up) and Phase E (teardown).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * Stands up the wl_display, its event loop, the headless backend, the
  * renderer/allocator, and the single wl_shm global. Headless is chosen
  * explicitly (not wlr_backend_autocreate) so the shim can never grab a DRM

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The consent surface's input grab and decision routing (P1.7.2, issue
 //! #38): the *trust* half of the consent surface.
 //!

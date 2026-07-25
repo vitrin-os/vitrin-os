@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `cargo xtask`: repo-local developer tooling, aliased via
 //! `.cargo/config.toml` (`xtask = "run --package xtask --"`).
 //!

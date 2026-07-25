@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `vitrin-scanner`: reads `protocol/vitrin-v0.xml` and emits generated code.
 //!
 //! Usage:

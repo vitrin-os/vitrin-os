@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # P1.6.5 acceptance proof: the SHIM ITSELF forks and execs the app.
 #
 # Up to now the app was launched EXTERNALLY, next to a shim already running

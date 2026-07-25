@@ -2,6 +2,8 @@
  * a real Wayland client of the shim, that prints back exactly what landed in
  * it.
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * WHY GTK AND NOT `input_echo_client.c`. The echo client proves the shim
  * delivered the right keysyms, because it resolves them through the keymap
  * itself with xkbcommon. That is necessary but not sufficient for the

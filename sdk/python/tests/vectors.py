@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Protocol test vectors, independent of the SDK's own codec.
 
 Two layers:

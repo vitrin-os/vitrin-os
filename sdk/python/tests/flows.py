@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Shared script fragments for the mocked-server flow tests.
 
 Object ids follow from the SDK's watermark allocator (strictly increasing

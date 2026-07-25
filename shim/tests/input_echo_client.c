@@ -2,6 +2,8 @@
  * Wayland client that receives seat input and writes down exactly what it
  * got.
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * `damage_client.c` proves things about the frame path; this one proves
  * things about the input path, and it has to be a separate program for the
  * same reason: the claims are mechanical, so the client has to be

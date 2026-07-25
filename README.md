@@ -4,7 +4,7 @@
 
 Vitrin OS is an open-source, **agent-first display server**: a small trusted
 core (`vitrind`) speaking a new capability-native wire protocol, with every
-legacy Wayland/X11 application confined to its own per-app nested shim — so
+legacy [Wayland](https://wayland.freedesktop.org/)/X11 application confined to its own per-app nested shim — so
 that humans and AI agents can concurrently observe and operate GUIs under
 granular, revocable, capability-scoped authorization. Every principal has
 identity; every action carries a capability; every action is journaled; the
@@ -27,20 +27,20 @@ say: *this agent may operate this one form in this one app, may not read the
 password-manager window beside it, and loses all input the instant a human
 touches the keyboard.*
 
-The underlying stack cannot express that sentence. X11 grants every client
+The underlying stack cannot express that sentence. [X11](https://www.x.org/wiki/) grants every client
 near-total authority over the session — that is its protocol model, not a
 bug. Wayland achieved isolation by *removing* cross-client capabilities
 rather than *mediating* them, and its `wl_seat` singleton has no notion of N
-concurrent authenticated principals. AT-SPI2, the accessibility tree agents
+concurrent authenticated principals. [AT-SPI2](https://gitlab.gnome.org/GNOME/at-spi2-core), the accessibility tree agents
 use to avoid pixels, is an unauthorized backdoor onto every application's
-widgets. The managed-cloud answers (AWS WorkSpaces for AI agents, Windows 365
+widgets. The managed-cloud answers ([AWS WorkSpaces](https://aws.amazon.com/workspaces/ai-agents/) for AI agents, [Windows 365](https://www.microsoft.com/en-us/windows-365/agents)
 for Agents) have the right instinct — identity per agent, audit, oversight —
 but at whole-VM granularity, locked to proprietary clouds.
 
 Vitrin is designed from day zero around the missing primitives:
 
 - **Principals.** Every connection authenticates an identity (human or agent
-  workload) at handshake; agent credentials are SPIFFE/OIDC-shaped.
+  workload) at handshake; agent credentials are [SPIFFE](https://spiffe.io/)/OIDC-shaped.
 - **Grants.** No ambient authority. A grant is (principal × resource × verbs
   × constraints — expiry, rate ceilings, focus conditions), sender-constrained
   to the connection, attenuable, and revocable — immediately and transitively.
@@ -59,7 +59,7 @@ the pillar-by-pillar requirements.
 **Late Phase 1 — the MVP slice runs end to end, honesty gaps documented
 below.** All nine epics (E1–E9) have landed code on `main`; the remaining
 open work is soak/hardening (fuzzing, an advisory conformance subset,
-nested-mode performance, dmabuf zero-copy) and the docs pass this file is
+nested-mode performance, [dmabuf](https://docs.kernel.org/driver-api/dma-buf.html) zero-copy) and the docs pass this file is
 part of. See the [issue tracker](https://github.com/vitrin-os/vitrin-os/issues)
 for the exact open set — every remaining Phase-1 issue is linked from its
 epic (`#8` SDK, `#9` CI/docs).
@@ -77,7 +77,7 @@ What exists today, on `main`:
   [shim/include/vitrin-protocol.h](shim/include/vitrin-protocol.h) from the
   IDL.
 - **`vitrind`, the trusted core** ([`crates/vitrin-core`](crates/vitrin-core))
-  — a real Smithay compositor with both output backends (`--nested`, a host
+  — a real [Smithay](https://github.com/Smithay/smithay) compositor with both output backends (`--nested`, a host
   Wayland client; `--headless --size WxH`, GPU-less pixman software
   rendering for CI); the capability kernel and in-memory grant table
   (request → pending → consent → resolved, sender-constrained, rate-limited,
@@ -87,11 +87,11 @@ What exists today, on `main`:
   revocation switch; and the flight-recorder log. See the
   [Architecture at a glance](#architecture-at-a-glance) section and
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full crate↔PRD map.
-- **The Wayland shim** ([`shim/`](shim/README.md)) — a wlroots headless
-  compositor, C + Meson, outside the Cargo workspace by design. It forwards
+- **The Wayland shim** ([`shim/`](shim/README.md)) — a [wlroots](https://gitlab.freedesktop.org/wlroots/wlroots) headless
+  compositor, C + [Meson](https://mesonbuild.com/), outside the Cargo workspace by design. It forwards
   every composited frame to the core over the inherited socketpair, replays
   origin-tagged input into the app through its own `wl_seat`, and runs real
-  apps: `weston-terminal`, a GTK entry probe, and Firefox ESR (pinned),
+  apps: `weston-terminal`, a [GTK](https://www.gtk.org/) entry probe, and [Firefox ESR](https://www.mozilla.org/en-US/firefox/enterprise/) (pinned),
   climbed one rung at a time and proven in CI with no mock on the shim seam.
 - **The agent SDK** ([`sdk/python/`](sdk/python)) — a pure-Python
   (stdlib-only, D8) wire client: connect → handshake → `request_grant` →
@@ -139,7 +139,7 @@ silently swallowed):
   rejected frame pair pinned as an in-process test.) Read green runs from
   before these changes as "the demo completed against a real app", not as
   "the actuation landed".
-- **No sandbox (decision D9).** No namespaces, seccomp, or Landlock yet —
+- **No sandbox (decision D9).** No namespaces, [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html), or [Landlock](https://landlock.io/) yet —
   see [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine)
   below.
 - **dmabuf zero-copy is not wired at runtime** (both backends pass
@@ -251,7 +251,7 @@ store, scene composition, input routing, consent surface, journals. Legacy
 apps never touch it directly — each is launched with `WAYLAND_DISPLAY`
 pointing only at its own private shim, which is itself an unprivileged client
 of the core. Frame buffers move as dmabuf file descriptors over `SCM_RIGHTS`
-(zero-copy, one extra IPC hop — the gamescope/Qubes precedent). Window
+(zero-copy, one extra IPC hop — the [gamescope](https://github.com/ValveSoftware/gamescope)/[Qubes](https://www.qubes-os.org/) precedent). Window
 management policy, decoration, and theming stay out of the core, permanently.
 
 ## Security notes — what the MVP does and does not confine
@@ -287,7 +287,7 @@ That is the complete list of what confines a realm right now.
   MVP. Real sandboxing arrives with the Phase-2 powerbox (E2.6/E2.7).
   Environment hygiene confines the well-behaved; it does not contain the
   hostile.
-- **The session D-Bus is reachable (known hole, closes with P13 in Phase
+- **The session [D-Bus](https://www.freedesktop.org/wiki/Software/dbus/) is reachable (known hole, closes with P13 in Phase
   2).** The core advertises no `DBUS_SESSION_BUS_ADDRESS` and points
   `XDG_RUNTIME_DIR` at the realm's private directory, so a well-behaved
   client finds no bus. But advertisement is not reachability:
@@ -405,11 +405,11 @@ Condensed from [docs/PRD.md](docs/PRD.md) §8:
   wlroots Wayland shim, Firefox in a realm, and an agent that captures the
   realm and injects scoped input — gated by a single grant with consent
   rendered by the core.
-- **Phase 2 — Semantic + epochs.** AccessKit/AT-SPI2 bridge, versioned and
+- **Phase 2 — Semantic + epochs.** [AccessKit](https://accesskit.dev/)/AT-SPI2 bridge, versioned and
   diffable semantic trees, epoch/CAS action semantics, VLM fallback for
   treeless surfaces, native semantic demo app, filesystem powerbox v0,
   network authority v0 (per-realm loopback-only netns, egress as a grant).
-- **Phase 3 — Network + X11 + fleet.** QUIC network sessions, per-app X11
+- **Phase 3 — Network + X11 + fleet.** [QUIC](https://www.rfc-editor.org/rfc/rfc9000) network sessions, per-app X11
   shim with embedded WM, multi-realm headless fleet mode, journal replay
   tooling, synthetic-path FUSE layer, credential wallet v0, mission-control
   shell v0.
@@ -441,19 +441,52 @@ is split into nine epics, each carrying exactly one `track:*` label
 
 ## License
 
-Split per decision D-005 (`docs/plan/20-decision-log.md`) — see
-[`NOTICE`](NOTICE) for the full mapping and current execution status:
+Split per decisions D-005 and D-016 (`docs/plan/20-decision-log.md`).
+[`NOTICE`](NOTICE) is the normative path→license map; the
+`SPDX-License-Identifier` header on a file is authoritative for that file.
 
-- **Protocol wire definitions and schemas**
+- **Apache-2.0** ([`LICENSE`](LICENSE)) — the protocol
   ([`protocol/vitrin-v0.xml`](protocol/vitrin-v0.xml),
-  [`protocol/vitrin-v0.rng`](protocol/vitrin-v0.rng)) and the **client
-  SDKs** ([`sdk/python/`](sdk/python)) — [Apache-2.0](LICENSE).
-- **Spec prose** ([`docs/PRD.md`](docs/PRD.md),
-  [`docs/protocol/`](docs/protocol), [`docs/plan/`](docs/plan)) —
-  [CC-BY-4.0](LICENSE-CC-BY-4.0).
-- **The reference implementation** (`crates/`, `shim/`) is intended per
-  D-005 to carry a weak-copyleft license (MPL-2.0 preferred, LGPL-3.0
-  fallback); that re-licensing has not executed yet — every crate still
-  declares Apache-2.0 today. Tracked in
-  [#133](https://github.com/vitrin-os/vitrin-os/issues/133), stated here
-  rather than silently assumed.
+  [`protocol/vitrin-v0.rng`](protocol/vitrin-v0.rng)), the bindings
+  generated from it (`crates/vitrin-protocol`,
+  `shim/include/vitrin-protocol.h`), the code generator that emits them and
+  its driver (`crates/vitrin-scanner`, `crates/xtask`), the conformance and
+  fuzz instruments, the
+  **client SDKs** ([`sdk/python/`](sdk/python)), the integration harness
+  ([`tests/integration/`](tests/integration)) and the shipped
+  [`examples/`](examples).
+- **MPL-2.0** (`LICENSE-MPL-2.0`) — the reference implementation:
+  `crates/vitrin-core` (the trusted core), `crates/vitrin-ipc`, and the
+  per-app Wayland shim under [`shim/`](shim).
+- **CC-BY-4.0** ([`LICENSE-CC-BY-4.0`](LICENSE-CC-BY-4.0)) — spec prose
+  ([`docs/PRD.md`](docs/PRD.md), [`docs/protocol/`](docs/protocol),
+  [`docs/plan/`](docs/plan)).
+- **GPL-3.0-only** (`LICENSE-GPL-3.0-only`) — one carve-out,
+  [`shim/wlcs/`](shim/wlcs), the advisory [WLCS](https://github.com/canonical/wlcs) conformance module, which
+  links GPL-3.0 headers from Canonical's wlcs. It is never built by
+  default, never installed, and never linked into `vitrin-shim`.
+
+**What that means for you, plainly:** you never have to touch an MPL-2.0
+file to write a client, build an alternate compositor or shim, or ship an
+integration — the protocol, the generated bindings, the codegen and the
+SDKs are all Apache-2.0, patent grant included. The copyleft binds one
+group only: people who modify the trusted core itself, whose changes to a
+capability kernel should come back. MPL's copyleft is per-file, so
+applications running under Vitrin are unaffected — running an app inside a
+shim does not make it derivative of anything here.
+
+**No CLA.** Contributions are taken under the
+[Developer Certificate of Origin](https://developercertificate.org/)
+(a `Signed-off-by:` line), not a Contributor License Agreement — decision
+D-012. Nobody is asked to assign copyright: contributors keep theirs, and
+the project never acquires the unilateral power over *their* code that a
+CLA would hand it. That is deliberate — it is what stops the split above
+from being merely this year's mood.
+
+**No patents.** Vitrin OS files none and intends to file none (D-015). The
+design is protected by publishing it — a timestamped spec is itself the
+prior art — and by the Apache-2.0 §3 and MPL-2.0 §2.1(b) patent grants that
+ship with the code. Both are in force today. A third leg, joining the [Open
+Invention Network](https://openinventionnetwork.com/)'s royalty-free cross-licence, is decided but **not yet
+done**. None of this is a patent wall, and none of it is a
+freedom-to-operate opinion.

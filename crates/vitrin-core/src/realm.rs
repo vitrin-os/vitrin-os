@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The realm object and the realm registry (P1.5.1, issue #30): the core's
 //! model of *what a realm is*, loaded from `realm.toml` at startup.
 //!

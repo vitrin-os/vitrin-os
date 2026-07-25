@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Dependency install for the CI shim job (.github/workflows/ci.yml).
 #
 # OWNERSHIP: the c-shim track. The PR that lands shim/meson.build (P1.6.1)

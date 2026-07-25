@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The grant request flow (P1.4.3, issue #27): the petition lifecycle state
 //! machine of the capability kernel -- `request_grant` to pending entry, the
 //! consent-policy seam, and resolution toward an active [`GrantTable`] row

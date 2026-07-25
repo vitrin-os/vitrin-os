@@ -10,7 +10,9 @@ mechanisms that guarantee that.
 ## Licensing boundary (read this before touching this directory)
 
 `wlcs`'s own headers (`<wlcs/display_server.h>`, `<wlcs/pointer.h>`, ...) are
-**GPL-3.0-only**. The rest of this repository is MIT. To keep those apart:
+**GPL-3.0-only**. The shim's own sources are MPL-2.0 and the generated
+`include/vitrin-protocol.h` is Apache-2.0 (D-005/D-016; the root `NOTICE` is
+the map). To keep those apart:
 
 - `integration.c` (this directory) is the *only* file in the repo that
   `#include`s a wlcs header, and it is marked `SPDX-License-Identifier:
@@ -462,7 +464,7 @@ requirement.
   correctness rests on the wake-pipe/mutex/condvar scheme in
   `integration.c` being race-free. It has been run repeatedly without a
   hang in this PR's development, but it has not been stress-tested under
-  contention the way the shim's own (MIT-licensed) test suite is.
+  contention the way the shim's own (MPL-2.0) test suite is.
 - **No touch coverage**, by design (see above) — this run says nothing
   about touch input, because the shim has no touch input to say anything
   about yet. And the touch parameters that remain in scope are a standing

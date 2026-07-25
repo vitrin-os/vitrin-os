@@ -1,5 +1,7 @@
 # Vitrin OS principal registry -- the StaticVerifier's input (P1.4.1).
 #
+# SPDX-License-Identifier: Apache-2.0
+#
 # One [[principal]] table per agent identity the core will accept at
 # handshake time (`vitrin_handshake.hello` with credential_type
 # "static-token"). This file is parsed by a deliberately strict TOML

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Regenerate the checked-in seed corpus for both fuzz targets.
 
 Per the P1.9.3 (#46) acceptance criterion "fuzz corpus + regression inputs

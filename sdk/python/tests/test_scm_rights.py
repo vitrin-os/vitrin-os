@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """SCM_RIGHTS fd receipt: a real sealed memfd arrives usable, CLOEXEC set."""
 
 from __future__ import annotations

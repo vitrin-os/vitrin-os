@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Typed exception hierarchy for the Vitrin OS Python SDK.
 
 P1.8.1 skeleton, fleshed out ergonomically in P1.8.3. The wire-to-exception

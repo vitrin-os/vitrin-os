@@ -2,6 +2,8 @@
  * solid colour over its whole surface, for the P1.8.5 real-app capture gate
  * (issue #107).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * WHY THIS EXISTS, next to damage_client.c and gtk_entry_probe.c. The M1.3
  * exit gate asks two things of a REAL app captured through the real chain:
  *

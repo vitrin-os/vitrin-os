@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! P1.2.3 acceptance: backpressure & misbehavior policy. A client that stops
 //! reading is disconnected at the send-queue cap; oversized frames and
 //! fd-bombs terminate the connection with a logged reason; and the compositor

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Round-trip property test: `encode(decode(bytes)) == bytes` for every
 //! message type across every interface in `protocol/vitrin-v0.xml`.
 //!

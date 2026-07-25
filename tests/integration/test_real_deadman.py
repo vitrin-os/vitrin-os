@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Issue #109 (M1.4 exit gate, the hold-Esc half): a completed dead-man chord,
 applied over a REAL app through the REAL core, really revokes every grant and
 really stops the app receiving seat events -- no mock DoD, no mock shim.

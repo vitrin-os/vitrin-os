@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Phase 1's integrating demo agent — and the M1.5 acceptance test.
 
 One script, two venues, exactly the same agent code path in both:

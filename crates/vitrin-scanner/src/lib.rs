@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `vitrin-scanner` library: parses `protocol/vitrin-v0.xml` into an IR
 //! ([`ir`], built by [`parse`]) and emits generated code from it ([`rust_gen`]
 //! for `crates/vitrin-protocol/src/generated`, [`c_gen`] for

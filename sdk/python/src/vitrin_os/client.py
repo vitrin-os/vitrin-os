@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The blocking object API: connect, handshake, grants, facets, frames.
 
 Threadless and blocking by design (conventions section 4: the single

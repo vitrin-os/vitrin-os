@@ -1,5 +1,7 @@
 /* main.c -- Vitrin OS Wayland shim entry point.
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * Owns the process lifecycle and the single load-bearing bring-up order:
  *
  *   upstream -> backend -> ledger -> globals -> output -> window

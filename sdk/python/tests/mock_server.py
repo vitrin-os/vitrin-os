@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """A scripted mock core for driving the blocking SDK under test.
 
 The SDK itself is threadless; the *tests* run this scripted server on a

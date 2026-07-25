@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Input intake & routing v0 (P1.3.7, issue #24): where input *enters* the
 //! trusted core, gets its origin tag, and is routed to the realm's shim
 //! seat.

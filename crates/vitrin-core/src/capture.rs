@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Capture-frame mechanics: the pixel half of `vitrin_view.capture_frame`
 //! (P1.3.6, the observe half of artifact A1).
 //!

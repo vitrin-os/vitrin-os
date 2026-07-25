@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! C codegen backend: IR -> `shim/include/vitrin-protocol.h`.
 //!
 //! Emits a single self-contained, header-only C11 header (every function is
@@ -47,8 +48,15 @@ use crate::ir::{Arg, ArgType, EnumDef, EnumRef, Interface, Message, Protocol};
 /// twice produces byte-identical output) depends on it. Kept textually
 /// identical to `rust_gen::BANNER`'s content (differs only in comment
 /// syntax, which is the same `//` in both languages) so a reader sees the
-/// same provenance notice regardless of which generated file they're in.
+/// same provenance notice regardless of which generated file they're in --
+/// including the SPDX tag, which is `Apache-2.0` for the same reason on both
+/// sides (D-005 / issue #133: a mechanical transliteration of the Apache-2.0
+/// `protocol/vitrin-v0.xml` stays Apache-2.0, so the one generated header
+/// under `shim/` is carved out of the shim's MPL-2.0 sources by name and any
+/// third-party C client can `#include` it without touching copyleft code).
 const BANNER: &str = "\
+// SPDX-License-Identifier: Apache-2.0
+//
 // GENERATED FILE -- DO NOT EDIT BY HAND.
 //
 // Source: protocol/vitrin-v0.xml

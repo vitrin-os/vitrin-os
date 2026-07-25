@@ -12,13 +12,17 @@ The [PRD](../PRD.md) treats bus factor (§9, Q8) and communication opacity (§9,
 
 ## 2. Licensing setup (executes D-005)
 
-At first public push:
+Planned for first public push; status tracked here. [D-016](20-decision-log.md) records the execution decisions and the root [`NOTICE`](../../NOTICE) is the normative path→license map.
 
-- **MPL-2.0** on the reference implementation (LGPL-3.0 the recorded fallback);
-- **Apache-2.0** (+ explicit patent-grant notice) on wire definitions, schemas, and SDKs;
-- **CC-BY-4.0** on spec prose;
-- SPDX headers throughout; per-directory LICENSE files where the split changes.
-- **DCO, not CLA** (D-012): sign-off on commits; a CLA deters the contributors a single-maintainer project needs most.
+- [x] **MPL-2.0** on the reference implementation — taken over the LGPL-3.0 fallback D-005 also recorded (D-016 gives the four reasons; the load-bearing one is that copyleft on the TCB makes "small and auditable" a license property rather than a README promise).
+- [x] **Apache-2.0** (+ explicit patent-grant notice) on wire definitions, schemas, and SDKs — in force since first publication. D-016 extends it to everything *derived* from the protocol (the checked-in generated bindings, the generated C header, the codegen that emits them) and to the conformance instruments, which is the answer to the open question in issue #133.
+- [x] **CC-BY-4.0** on spec prose — in force since first publication.
+- [x] **SPDX headers** on first-party sources — every `.rs`, `.c`, `.h`, `.py`, `.sh` and `.js` file — plus a per-crate `license` field and no workspace-wide default, so a new crate cannot inherit the wrong half silently. Two scoping facts, stated rather than glossed: build manifests, the IDL and its schema, Markdown and fixture data carry **no** inline header and are covered by the `NOTICE` path map instead; and coverage is *not machine-checked* — there is no `reuse lint`-style CI gate, so it can rot. Adopting the REUSE layout is a deliberate follow-up, not something to assume done.
+- [x] **Root license texts + `NOTICE` as the map** — this supersedes the planned "per-directory LICENSE files where the split changes", which D-016 rejected on the facts: `shim/` carries three licenses and `shim/include/` two, so a directory-level file would be *false* in both places. Per-file headers plus one map is the truthful spelling.
+- [x] The pre-existing **GPL-3.0-only carve-out** (`shim/wlcs/`) is preserved and now has its license text in the tree, which GPL-3.0 §4 requires and which was missing.
+- [x] **No patent filings; defensive publication instead** ([D-015](20-decision-log.md)) — recorded, with the 2026-07-26 landscape scan, its prior-art anchors, and its explicit limits (a public-source scan, *not* a freedom-to-operate opinion).
+- [ ] **Join the Open Invention Network** (D-015) — free below $10M revenue and the third leg of that decision, but **not yet done**; the other two legs (publication, license patent grants) are already in force.
+- [ ] **DCO, not CLA** (D-012): sign-off on commits; a CLA deters the contributors a single-maintainer project needs most. The decision is recorded and stated publicly in the README and `NOTICE`, but is **not executed** — D-012 is still `proposed`, there is no `CONTRIBUTING.md` yet, and nothing enforces sign-off. Lands with the M1 hygiene ladder (§3).
 
 ## 3. Repo-hygiene ladder
 

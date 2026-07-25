@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Text for the consent prompt: the bundled font, glyph rasterization, and
 //! the measure/wrap/draw operations [`super::render`] lays the card out with.
 //!

@@ -2,6 +2,8 @@
  * answers. See upstream.h for the flow, the seat-minting decision, and the
  * two settled decisions (damage granularity, memfd reuse).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * The three things that happen here, in the order a frame meets them:
  *
  *   forward   composed pixels -> a pooled memfd -> attach/damage/commit

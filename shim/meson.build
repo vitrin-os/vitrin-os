@@ -2,7 +2,15 @@ project(
   'vitrin-shim',
   'c',
   version: '0.1.0',
-  license: 'MIT',
+  # D-005 / issue #133: the shim's own sources are MPL-2.0; the one generated
+  # header (include/vitrin-protocol.h) is Apache-2.0, transliterated from
+  # protocol/vitrin-v0.xml. Per-file SPDX headers are normative; the root
+  # NOTICE is the full map. The GPL-3.0-only carve-out (shim/wlcs/) is
+  # deliberately NOT listed here: it is never built by default, never
+  # installed and never linked into vitrin-shim, so declaring it would tell
+  # `meson introspect` consumers the shim is GPL-encumbered when it is not.
+  # See shim/wlcs/README.md and meson_options.txt.
+  license: ['MPL-2.0', 'Apache-2.0'],
   meson_version: '>=1.3',
   default_options: [
     'c_std=c11',
@@ -248,7 +256,18 @@ executable(
 # real shim runs, not a second compositor written for the occasion. See
 # shim/wlcs/README.md for what this proves, what it does not, and the
 # GPL-3.0-only license boundary this option draws around shim/wlcs/ alone
-# (the rest of this file, and everything it builds, stays MIT).
+# (the rest of this file, and everything it builds, is MPL-2.0, except the
+# generated include/vitrin-protocol.h, which is Apache-2.0).
+#
+# LICENSE CONSTRAINT, DO NOT BREAK IT: this target combines the GPL-3.0-only
+# shim/wlcs/integration.c with the MPL-2.0 shim sources into one shared
+# module. That is lawful only because MPL-2.0 names GPL-3.0 a Secondary
+# License (section 1.12) and permits distributing the Larger Work under GPL
+# terms (section 3.3) -- which is exactly what MPL's Exhibit B switches off.
+# Never add the Exhibit B "Incompatible With Secondary Licenses" notice to
+# any file under shim/; doing so makes this module undistributable.
+# (include/vitrin-protocol.h is Apache-2.0, which is one-way compatible into
+# GPL-3.0, so that leg is clean too.)
 #
 # 'auto' (the default): silently skipped when the `wlcs` pkg-config
 # dependency is not found, so an ordinary shim build is unaffected. The CI

@@ -3,6 +3,8 @@
  * and the two open questions this task settles (keymap caching, pointer
  * batching).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * The order of the file follows the order an event meets it:
  *
  *   tag       the wire's origin becomes a `struct vitrin_origin`

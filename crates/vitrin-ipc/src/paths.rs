@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Socket path convention (settled in P1.2.1, per the plan's E2 table):
 //!
 //! ```text

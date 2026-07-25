@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! XML -> IR parsing, using `roxmltree`.
 //!
 //! This module assumes the input has already been validated against

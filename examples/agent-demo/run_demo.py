@@ -353,6 +353,16 @@ SETTLE_QUIET_ROUNDS = 3
 #: only *then* draw its shell prompt; a run of quiet captures taken before
 #: that prompt would produce a control frame the prompt itself later "changes"
 #: — a startup repaint masquerading as the agent's typed text.
+#:
+#: This is now a **backstop, not the guard**. A wall-clock constant cannot
+#: know when a given runner's app has painted, and this one did not: on
+#: 2026-07-26, the first CI run to ever execute :func:`_idle_probe` failed
+#: with 26545 changed pixels across all 480 scanlines and a full-width dense
+#: run, with the agent deliberately idle — the app's own startup paint landing
+#: after a control capture this floor had already blessed. The actual guard is
+#: :func:`frame_has_content`: quiet rounds do not begin accumulating until the
+#: app has demonstrably drawn something. The floor stays as a cheap second
+#: opinion for a paint that arrives in stages.
 SETTLE_FLOOR = 1.0
 
 #: How long :func:`_settle` waits for the app to go quiet before giving up.
@@ -499,6 +509,51 @@ def actuation_landed(profile: ChangeProfile) -> bool:
     )
 
 
+def frame_has_content(frame: vitrin_os.Frame) -> bool:
+    """True once a frame carries real, non-uniform content from the app.
+
+    Content-bearing iff some pixel is not black *and* more than one colour
+    value is present. The shim composites an opaque background before the app
+    has drawn anything, and a toolkit's pre-chrome fill is likewise a single
+    value; both are uniform, and both fail this. So this is the difference
+    between "the app has drawn" and "there is a surface to observe", which
+    :func:`_capture_when_ready` alone cannot tell apart — it returns the first
+    buffer the realm commits, blank or not.
+
+    :func:`_settle` needs exactly that distinction. Its quiet condition is
+    "consecutive captures barely differ", which a frame nobody has drawn into
+    satisfies *perfectly* — 0 px, every interval, indefinitely. Without a
+    positive test for paint, "settled" and "not started" are the same
+    observation.
+
+    Reads ``frame.raw`` the way :func:`change_profile` does — little-endian
+    xrgb8888, walked by ``frame.stride``, comparing only the three colour
+    bytes so inter-row padding and the constant padding byte are never
+    mistaken for content. Returns as soon as the answer is known rather than
+    scanning the whole buffer. Same rule as
+    ``tests/integration/harness.has_real_content``, inlined for the same
+    reason :func:`change_profile` is: this is a *shipped example* launched
+    with only ``PYTHONPATH=sdk/python/src``, and must not reach into the test
+    tree.
+    """
+    raw = frame.raw
+    stride, width, height = frame.stride, frame.width, frame.height
+    first_seen: bytes | None = None
+    any_non_black = False
+    for y in range(height):
+        base = y * stride
+        for x in range(width):
+            off = base + x * 4
+            pixel = raw[off : off + 3]
+            if pixel != b"\x00\x00\x00":
+                any_non_black = True
+            if first_seen is None:
+                first_seen = pixel
+            elif pixel != first_seen and any_non_black:
+                return True
+    return False
+
+
 # --- the observe-race-tolerant first capture --------------------------------
 
 def _capture_when_ready(
@@ -549,12 +604,19 @@ def _settle(
     shaped* diff produced by no actuation at all. No threshold can tell that
     apart from the real thing; only moving it into the "before" frame can.
 
-    "Settled" means ``quiet_rounds`` consecutive captures each differing from
-    the one before it by fewer than :data:`SETTLE_MAX_CHANGED_PIXELS` pixels,
-    and never sooner than ``floor`` seconds in — a shell prompt that arrives
-    a beat after the window maps must not be able to slip past a run of quiet
-    captures taken before it. The tolerance is sized to absorb a blinking
-    cursor. It is emphatically *not* sized to make the gate sound: it is a
+    "Settled" means the app has **drawn** (:func:`frame_has_content`) and has
+    *then* held still for ``quiet_rounds`` consecutive captures each differing
+    from the one before it by fewer than :data:`SETTLE_MAX_CHANGED_PIXELS`
+    pixels, never sooner than ``floor`` seconds in. The paint precondition is
+    load-bearing and was missing until 2026-07-26: quiescence alone cannot
+    distinguish "the app finished painting" from "the app has not started",
+    because a frame nobody has drawn into differs from its predecessor by 0 px
+    every interval, forever. This loop would return that blank frame as the
+    control capture, and the app's own first paint — measured on a real
+    weston-terminal at 569 px across a dense run of 81, which already
+    satisfies :func:`actuation_landed` on its own — would land afterwards,
+    inside the very window the gate measures. The tolerance is sized to absorb
+    a blinking cursor. It is emphatically *not* sized to make the gate sound: it is a
     per-interval tolerance and the gate's threshold is cumulative (see
     :data:`SETTLE_MAX_CHANGED_PIXELS`), so quiescence by this definition is
     then checked against the gate's own predicate by :func:`_idle_probe`,
@@ -571,14 +633,35 @@ def _settle(
     previous = first
     quiet = 0
     profile = None
+    # Quiescence only means anything *after* the app has drawn. Until then a
+    # run of identical captures is the shim's blank background holding still,
+    # which is indistinguishable from a settled app by every metric this loop
+    # has except this one.
+    painted = frame_has_content(first)
     while time.monotonic() < deadline:
         time.sleep(poll)
         frame = grant.observe()
         profile = change_profile(previous, frame)
         previous = frame
+        if not painted:
+            # Nothing has been drawn yet: reset rather than accumulate quiet,
+            # so the paint that eventually lands is followed by a full
+            # `quiet_rounds` of genuine post-paint stillness.
+            painted = frame_has_content(frame)
+            quiet = 0
+            continue
         quiet = quiet + 1 if profile.count < SETTLE_MAX_CHANGED_PIXELS else 0
         if quiet >= quiet_rounds and time.monotonic() - started >= floor:
             return _idle_probe(grant, frame)
+    if not painted:
+        raise DemoAssertionError(
+            f"the real app never drew anything within {timeout:.0f}s: every "
+            "capture was uniform (the shim's opaque background), so there is "
+            "no app paint for this loop to settle. Returning here would make "
+            "the control capture a blank frame, and the app's own first paint "
+            "would then land inside the gate's measuring window and read as "
+            "the agent's click and typed text."
+        )
     raise DemoAssertionError(
         f"the real app never went quiet within {timeout:.0f}s (last comparison: "
         f"{profile}; needed {quiet_rounds} consecutive captures under "

@@ -230,18 +230,25 @@ class DemoHeadless(IntegrationTest):
             recorder=str(core.recorder),
         )
 
-        # 1) The demo succeeded, and enough real pixels changed that a stray
-        #    blinking cursor could not explain it -- the SAME threshold the
-        #    demo's own `_assert_page_changed` already enforced above, so a
-        #    passing `result.ok` already implies this; re-asserted here with
-        #    the raw count for a diagnosable test failure message.
+        # 1) The demo succeeded, and the change between its two captures
+        #    carries the shape only the typed line makes -- the SAME predicate
+        #    the demo's own `_assert_page_changed` already enforced above, so a
+        #    passing `result.ok` already implies this; re-asserted here with the
+        #    raw profile for a diagnosable test failure message.
+        #
+        #    `result.before` is the demo's *settled control* capture, not its
+        #    first frame (`run_demo._settle`): weston-terminal's own startup
+        #    paint has been measured at 569 changed pixels spanning 81 px, which
+        #    is indistinguishable in shape from typed text, so the control frame
+        #    -- not the thresholds -- is what makes this assertion mean
+        #    "the agent's actuation landed".
         self.assertTrue(result.ok)
-        changed = run_demo.count_changed_pixels(result.before, result.after)
-        self.assertGreaterEqual(
-            changed,
-            run_demo.MIN_HEADLESS_CHANGED_PIXELS,
-            f"only {changed} real pixel(s) changed between captures; frames dumped "
-            f"under {out_dir}",
+        profile = run_demo.change_profile(result.before, result.after)
+        self.assertTrue(
+            run_demo.actuation_landed(profile),
+            f"{profile} between the settled control capture and the after-frame; need "
+            f">= {run_demo.MIN_HEADLESS_CHANGED_PIXELS} px AND a run >= "
+            f"{run_demo.MIN_HEADLESS_CHANGED_SPAN} px wide. Frames dumped under {out_dir}",
         )
 
         conn_closed_url = result.url
@@ -431,20 +438,36 @@ class DemoHeadlessHoldEsc(IntegrationTest):
         #    input, and confirm the real app's pixels changed -- exactly
         #    `DemoHeadless`'s own read of "the actuation reached the app",
         #    reused rather than reimplemented.
+        #
+        #    Every step below is the demo's own helper, not a local copy:
+        #    `_settle` for the control capture and `_capture_after_change`
+        #    for the bounded poll, so this precondition can never drift
+        #    from what `DemoHeadless` accepts. They are underscore-private
+        #    by convention only; reaching for them deliberately is the same
+        #    choice this class already makes for `locate_url_bar`.
         before = capture_when_ready(grant)
+        before = run_demo._settle(grant, before)
         url_x, url_y = run_demo.locate_url_bar(before, headless=True)
         grant.pointer.click(url_x, url_y)
         grant.text.type(run_demo.DEFAULT_HEADLESS_INPUT + "\n")
 
-        time.sleep(0.4)
-        mid = grant.observe()
-        changed = run_demo.count_changed_pixels(before, mid)
-        self.assertGreaterEqual(
-            changed,
-            run_demo.MIN_HEADLESS_CHANGED_PIXELS,
-            f"only {changed} pixel(s) changed before the chord fired; the demo's own "
-            "actuation must have already reached the real app for a subsequent refusal "
-            "to mean anything",
+        # Poll to a bounded deadline rather than sleeping a fixed 0.4 s and
+        # taking a single observe(): a real app's response time is a
+        # function of the runner's load, and one unlucky sample on a slow
+        # CI machine used to fail this gate for reasons that had nothing to
+        # do with revocation. Flaky gates get muted, and a muted gate is
+        # worse than none. The assertion itself is NOT weakened -- it is the
+        # same `actuation_landed` predicate `DemoHeadless` applies, polled
+        # for instead of guessed at.
+        mid = run_demo._capture_after_change(grant, before, headless=True)
+        profile = run_demo.change_profile(before, mid)
+        self.assertTrue(
+            run_demo.actuation_landed(profile),
+            f"{profile} before the chord fired (need >= "
+            f"{run_demo.MIN_HEADLESS_CHANGED_PIXELS} px AND a run >= "
+            f"{run_demo.MIN_HEADLESS_CHANGED_SPAN} px wide, polled for up to ~3.4 s "
+            "after a settled control capture); the demo's own actuation must have "
+            "already reached the real app for a subsequent refusal to mean anything",
         )
 
         # 2. The chord fires: SIGUSR1 stands in for a completed hold-Esc
@@ -490,6 +513,49 @@ class DemoHeadlessHoldEsc(IntegrationTest):
             "observe() and pointer.click() against the real weston-terminal chain both "
             f"refused Revoked; journal recorded {len(revoked_at)} grant_revoked "
             "entr" + ("y" if len(revoked_at) == 1 else "ies") + " after dead_man_triggered"
+        )
+
+
+class HeadlessGateThresholdsStayDiscriminating(unittest.TestCase):
+    """The headless gate's numbers must keep their ordering, or it goes vacuous.
+
+    Binary-free, so it runs (and can fail) in a from-scratch checkout. Each
+    assertion pins one way the gate could quietly stop discriminating:
+
+    - a settle tolerance at or above the change threshold would let
+      `_settle` accept a frame whose next diff is already big enough to
+      "pass", so the gate would be measuring its own tolerance;
+    - a span threshold below one character cell (~20 px at any plausible
+      terminal font) would be cleared by a blinking cursor;
+    - the pre-2026-07-25 value of 24 changed pixels is called out by name,
+      because that is the number weston-terminal's own repaint cleared and
+      the number a future "let's relax this, it's flaky" edit would drift
+      back toward.
+    """
+
+    def test_settle_tolerance_stays_below_the_change_threshold(self):
+        self.assertLess(
+            run_demo.SETTLE_MAX_CHANGED_PIXELS,
+            run_demo.MIN_HEADLESS_CHANGED_PIXELS,
+            "the settle tolerance must stay strictly under the change threshold, or a "
+            "frame the settle loop calls 'quiet' could already carry a passing diff",
+        )
+
+    def test_span_threshold_cannot_be_cleared_by_one_character_cell(self):
+        self.assertGreaterEqual(
+            run_demo.MIN_HEADLESS_CHANGED_SPAN,
+            48,
+            "the span threshold is the signature only a line of typed characters "
+            "makes; below ~48 px a single blinking cursor cell clears it",
+        )
+
+    def test_change_threshold_is_well_above_the_vacuous_pre_fix_value(self):
+        self.assertGreaterEqual(
+            run_demo.MIN_HEADLESS_CHANGED_PIXELS,
+            256,
+            "24 changed pixels in a 640x480 frame is what weston-terminal's own async "
+            "first paint and shell prompt clear unaided; a threshold anywhere near it "
+            "makes the M1.5 gate pass whether or not the agent's actuation landed",
         )
 
 

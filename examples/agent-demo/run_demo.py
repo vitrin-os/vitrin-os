@@ -8,11 +8,13 @@ One script, two venues, exactly the same agent code path in both:
          on realm-0, `while-running`)
       -> await consent (a human clicks Allow in nested; a guarded
          auto-approve resolves it headless)
-      -> capture a "before" frame
+      -> capture a "before" frame (headless: settle the app first, so the
+         "before" is a real control capture and not a frame racing the app's
+         own startup paint)
       -> locate the input target by pixels
       -> click it, type text, press Enter (the trailing "\\n")
       -> capture an "after" frame
-      -> assert the page changed.
+      -> assert the page changed *because of the actuation*.
 
 Both venues run the SAME real chain: the shipped `vitrind` execs the real
 per-app Wayland shim (`vitrin-shim`, issue #103/#104), which fork/execs a real
@@ -34,14 +36,19 @@ two venues differ only in *which real app* stands behind the shim and in *how
 * **Headless** (`cargo xtask demo --headless`, and CI): a real, trivial
   Wayland client (`weston-terminal`, or `foot`) runs in realm-0, behind the
   real shim — GPU-free, so CI never depends on Firefox or a GPU (plan risk
-  R6/R1). "The page changed" here means the typed text visibly landed: enough
-  *real* pixels changed between the two captures that a stray blinking cursor
-  could not explain it (see :data:`MIN_HEADLESS_CHANGED_PIXELS`) — never an
-  autonomous mock animation running regardless of actuation. What additionally
-  proves the actuation *causally reached the app* is the flight recorder's
-  ``use_decision`` entries — an allowed ``move`` at the clicked coordinate and
-  an allowed ``type`` whose ``chars`` equals the typed text's length — exactly
-  as ``tests/integration/test_actuation.py`` establishes.
+  R6/R1). "The page changed" here has to mean *the typed text landed*, not
+  merely "the app repainted", because a real app is always repainting
+  something. Two things make it mean that: the app is **settled** before the
+  control capture (:func:`_settle`), so its asynchronous first paint and shell
+  prompt are inside the "before" frame rather than straddling it; and the
+  change that follows must carry the *shape* a typed line makes — enough
+  pixels to rule out a one-cell repaint AND a changed run wide enough that
+  only a row of characters could have drawn it (:func:`actuation_landed`).
+  What additionally proves the actuation *causally reached the app* is the
+  flight recorder's ``use_decision`` entries — an allowed ``move`` at the
+  clicked coordinate and an allowed ``type`` whose ``chars`` equals the typed
+  text's length — exactly as ``tests/integration/test_actuation.py``
+  establishes.
 
 The consent guard (``--consent=auto-approve``) is only sound because the
 principal registry the launcher writes holds *nothing but* the one demo
@@ -230,38 +237,151 @@ def colors_close(a: tuple[int, int, int], b: tuple[int, int, int], *, tol: int =
 
 
 # --- pixel analysis (headless "page changed") -------------------------------
+#
+# The headless venue's whole job is to tell the agent's actuation apart from
+# the app's own repaint, and a bare "some pixels changed" cannot do that: a
+# real app is *always* repainting something. The threshold here used to be 24
+# changed pixels in a 640x480 frame, which weston-terminal clears on its own
+# — its asynchronous first paint alone rewrites the whole view, and it can
+# easily land between the demo's two captures — so the named M1.5 gate passed
+# whether or not the click and the typed text ever reached the app.
+#
+# Two changes fix that, and both are needed:
+#
+#   1. The app is SETTLED before the control capture (:func:`_settle`), so
+#      startup paint is finished and inside the "before" frame, not straddling
+#      it. That removes the race, rather than trying to out-threshold it.
+#   2. The change that follows must carry the *shape* the typed text makes:
+#      not merely enough pixels, but a run of them wide enough that only a
+#      line of typed characters could have drawn it.
+#
+# Both thresholds below are derived from the input the demo types, not from
+# one lucky measurement, so they do not have to be retuned per runner.
 
-#: Above this many changed pixels, the headless "page changed" assertion
-#: trusts the diff as real actuation-driven content — typed text landing in
-#: the terminal renders many glyph pixels — rather than an incidental
-#: blinking cursor (a handful of pixels in one character cell). Mirrors
-#: ``tests/integration/test_real_actuation.py``'s ``MIN_CHANGED_PIXELS``
-#: reasoning (the D7 text gate) at a lower bar sized for this smaller view.
-MIN_HEADLESS_CHANGED_PIXELS = 24
+
+#: Minimum changed pixels for the headless "the page changed" claim.
+#:
+#: Justification: a filled character cell in a terminal at any plausible
+#: font size is roughly 8x17 = ~140 pixels, and glyphs ink well under half
+#: of that, so a blinking cursor or a single re-drawn glyph tops out around
+#: one cell. 400 is ~3 cells: unreachable by incidental one-cell repaint,
+#: and far below what the demo's own input produces — typing
+#: ``echo vitrin-demo`` + Enter into a real weston-terminal on a 640x480
+#: pixman view measured 1703 changed pixels across 49 scanlines, i.e. a 4x
+#: margin. Deliberately not tuned close to that measurement: a gate that
+#: fails randomly gets muted, which is how gates die.
+MIN_HEADLESS_CHANGED_PIXELS = 400
+
+#: Minimum width, in pixels, of the widest changed run on any one scanline.
+#:
+#: This is the discriminating half — the signature only the typed text makes.
+#: The demo types at least 16 characters, a terminal renders them into that
+#: many adjacent monospace cells, and no monospace cell is narrower than
+#: ~4 px, so the echoed line must span >= 64 px on at least one scanline. A
+#: blinking cursor, a focus ring, or a one-glyph repaint is *one* cell wide
+#: (~8-20 px) and cannot reach it however many times it blinks. Measured
+#: span for the real run above: 143 px.
+MIN_HEADLESS_CHANGED_SPAN = 64
+
+#: Two consecutive captures differing by fewer than this many pixels count as
+#: "the app has settled" (:func:`_settle`). Sized to absorb a blinking cursor
+#: (one cell, ~140 px) while staying strictly below
+#: :data:`MIN_HEADLESS_CHANGED_PIXELS`, so the settle tolerance can never
+#: swallow a change the gate is supposed to demand.
+SETTLE_MAX_CHANGED_PIXELS = 200
+
+#: Consecutive quiet captures :func:`_settle` needs before it calls the app
+#: settled. Three at the 0.15 s poll below is ~0.45 s of continuous quiet.
+SETTLE_QUIET_ROUNDS = 3
+
+#: :func:`_settle` never accepts quiescence sooner than this many seconds in,
+#: however quiet the app looks. A terminal can map its window, go quiet, and
+#: only *then* draw its shell prompt; a run of quiet captures taken before
+#: that prompt would produce a control frame the prompt itself later "changes"
+#: — a startup repaint masquerading as the agent's typed text.
+SETTLE_FLOOR = 1.0
+
+#: How long :func:`_settle` waits for the app to go quiet before giving up.
+#: It gives up by FAILING: an unsettled app means the control capture would
+#: be racing the app's own paint, which is exactly the vacuity this gate is
+#: being fixed for.
+SETTLE_TIMEOUT = 12.0
 
 
-def count_changed_pixels(before: vitrin_os.Frame, after: vitrin_os.Frame) -> int:
-    """How many pixels' colour channels differ between two same-size frames.
+@dataclass(frozen=True)
+class ChangeProfile:
+    """How two same-size frames differ, in the shapes the headless gate needs."""
+
+    #: Pixels whose colour channels differ.
+    count: int
+    #: Widest first-to-last changed-pixel run on any single scanline.
+    widest_row_span: int
+    #: Scanlines carrying at least one changed pixel.
+    rows: int
+
+    def __str__(self) -> str:
+        return (
+            f"{self.count} px changed, widest row span {self.widest_row_span} px, "
+            f"{self.rows} scanline(s) touched"
+        )
+
+
+def change_profile(before: vitrin_os.Frame, after: vitrin_os.Frame) -> ChangeProfile:
+    """Compare two same-size frames pixel by pixel, row by row.
 
     Reads ``frame.raw`` directly (little-endian xrgb8888, ``B, G, R, X`` per
     pixel) and compares only the three colour bytes — the fourth, padding,
     byte carries no content and the C shim composites an opaque background
     whose padding plane is a constant regardless of the client (see
     ``tests/integration/harness.py``'s ``colour_bytes`` for the same
-    reasoning). Raises if the two frames are not the same size, which would
-    be a bug in the caller, not a "changed" frame. Inlined rather than
-    imported from the harness — this is a *shipped example*, launched with
-    only ``PYTHONPATH=sdk/python/src`` (see :func:`_capture_when_ready`'s
-    docstring for why the demo stays standalone).
+    reasoning). Walks rows via ``frame.stride`` so inter-row padding is never
+    mistaken for image content. Raises if the two frames are not the same
+    size, which would be a bug in the caller, not a "changed" frame. Inlined
+    rather than imported from the harness — this is a *shipped example*,
+    launched with only ``PYTHONPATH=sdk/python/src`` (see
+    :func:`_capture_when_ready`'s docstring for why the demo stays
+    standalone).
     """
     a, b = before.raw, after.raw
-    if len(a) != len(b):
-        raise ValueError(f"frame size mismatch: {len(a)} vs {len(b)} bytes")
-    changed = 0
-    for i in range(0, len(a), 4):
-        if a[i : i + 3] != b[i : i + 3]:
-            changed += 1
-    return changed
+    if len(a) != len(b) or (before.width, before.height) != (after.width, after.height):
+        raise ValueError(
+            f"frame size mismatch: {before.width}x{before.height} ({len(a)} bytes) "
+            f"vs {after.width}x{after.height} ({len(b)} bytes)"
+        )
+    stride, width, height = before.stride, before.width, before.height
+    count = rows = widest = 0
+    for y in range(height):
+        base = y * stride
+        first = last = -1
+        for x in range(width):
+            off = base + x * 4
+            if a[off : off + 3] != b[off : off + 3]:
+                count += 1
+                if first < 0:
+                    first = x
+                last = x
+        if first >= 0:
+            rows += 1
+            widest = max(widest, last - first + 1)
+    return ChangeProfile(count=count, widest_row_span=widest, rows=rows)
+
+
+def count_changed_pixels(before: vitrin_os.Frame, after: vitrin_os.Frame) -> int:
+    """How many pixels' colour channels differ between two same-size frames."""
+    return change_profile(before, after).count
+
+
+def actuation_landed(profile: ChangeProfile) -> bool:
+    """True only for a change the demo's own typed line could have drawn.
+
+    Both conditions, never either alone: enough pixels to rule out one-cell
+    repaint, *and* a run wide enough that only a line of characters explains
+    it. See the two constants above for why each number is what it is.
+    """
+    return (
+        profile.count >= MIN_HEADLESS_CHANGED_PIXELS
+        and profile.widest_row_span >= MIN_HEADLESS_CHANGED_SPAN
+    )
 
 
 # --- the observe-race-tolerant first capture --------------------------------
@@ -294,6 +414,61 @@ def _capture_when_ready(
             time.sleep(poll)
 
 
+def _settle(
+    grant: vitrin_os.Grant,
+    first: vitrin_os.Frame,
+    *,
+    timeout: float = SETTLE_TIMEOUT,
+    poll: float = 0.15,
+    quiet_rounds: int = SETTLE_QUIET_ROUNDS,
+    floor: float = SETTLE_FLOOR,
+) -> vitrin_os.Frame:
+    """Capture until the app has stopped repainting on its own; return the last.
+
+    The frame this returns is the **control capture**: everything the app was
+    going to draw by itself — its asynchronous first paint, its shell prompt,
+    whatever it does on startup — is already inside it. This is the load-
+    bearing half of the headless proof, more so than either threshold below
+    it: a real weston-terminal's own startup paint has been measured at 569
+    changed pixels spanning 81 px across 19 scanlines, which is a *typed-text-
+    shaped* diff produced by no actuation at all. No threshold can tell that
+    apart from the real thing; only moving it into the "before" frame can.
+
+    "Settled" means ``quiet_rounds`` consecutive captures each differing from
+    the one before it by fewer than :data:`SETTLE_MAX_CHANGED_PIXELS` pixels,
+    and never sooner than ``floor`` seconds in — a shell prompt that arrives
+    a beat after the window maps must not be able to slip past a run of quiet
+    captures taken before it. The tolerance is sized to absorb a blinking
+    cursor without absorbing anything the gate cares about. Paced at ``poll``
+    so a default-rate grant's token bucket (20/s) is never emptied by the
+    settle loop itself.
+
+    Raises :class:`DemoAssertionError` on timeout rather than proceeding with
+    an unsettled control frame: a gate that cannot establish its own baseline
+    must fail, not guess.
+    """
+    started = time.monotonic()
+    deadline = started + timeout
+    previous = first
+    quiet = 0
+    profile = None
+    while time.monotonic() < deadline:
+        time.sleep(poll)
+        frame = grant.observe()
+        profile = change_profile(previous, frame)
+        previous = frame
+        quiet = quiet + 1 if profile.count < SETTLE_MAX_CHANGED_PIXELS else 0
+        if quiet >= quiet_rounds and time.monotonic() - started >= floor:
+            return frame
+    raise DemoAssertionError(
+        f"the real app never went quiet within {timeout:.0f}s (last comparison: "
+        f"{profile}; needed {quiet_rounds} consecutive captures under "
+        f"{SETTLE_MAX_CHANGED_PIXELS} changed pixels). Without a settled control "
+        "capture, a later pixel diff would prove the app finished painting, not "
+        "that the agent's click and typed text reached it."
+    )
+
+
 def _capture_after_change(
     grant: vitrin_os.Grant,
     before: vitrin_os.Frame,
@@ -305,10 +480,10 @@ def _capture_after_change(
 ) -> vitrin_os.Frame:
     """Capture the "after" frame once the change is observable.
 
-    Headless: poll until enough real pixels have changed from ``before`` to
-    rule out a stray blinking cursor (:data:`MIN_HEADLESS_CHANGED_PIXELS`) —
-    the typed text actually landing in the real terminal app, never an
-    autonomous mock animation. Nested: poll until the dominant colour reaches
+    Headless: poll until the diff from ``before`` — which is the *settled*
+    control capture, see :func:`_settle` — carries the signature only the
+    demo's own typed line makes (:func:`actuation_landed`), never merely
+    "some pixels moved". Nested: poll until the dominant colour reaches
     :data:`SERVED_RGB` (the page loaded). Polling is paced (a settle, then
     ``attempts`` spaced by ``poll``) so a default-rate grant's token bucket is
     never emptied by the capture loop itself. The last frame is returned
@@ -319,7 +494,7 @@ def _capture_after_change(
     frame = grant.observe()
     for _ in range(attempts):
         if headless:
-            if count_changed_pixels(before, frame) >= MIN_HEADLESS_CHANGED_PIXELS:
+            if actuation_landed(change_profile(before, frame)):
                 return frame
         elif colors_close(dominant_color(frame), SERVED_RGB):
             return frame
@@ -348,13 +523,16 @@ class DemoResult:
 
 def _assert_page_changed(before: vitrin_os.Frame, after: vitrin_os.Frame, *, headless: bool) -> None:
     if headless:
-        changed = count_changed_pixels(before, after)
-        if changed < MIN_HEADLESS_CHANGED_PIXELS:
+        profile = change_profile(before, after)
+        if not actuation_landed(profile):
             raise DemoAssertionError(
-                f"headless: only {changed} pixel(s) changed between the two captures "
-                f"(need >= {MIN_HEADLESS_CHANGED_PIXELS}) — the typed text did not visibly "
-                "land in the real app; this venue runs a real terminal behind the real "
-                "shim, not a mock animation, so a genuine actuation effect is required"
+                f"headless: {profile} between the settled control capture and the "
+                f"after-frame — need >= {MIN_HEADLESS_CHANGED_PIXELS} px changed AND a "
+                f"changed run >= {MIN_HEADLESS_CHANGED_SPAN} px wide on some scanline. "
+                "The control capture was taken after the app went quiet, so the app's "
+                "own startup paint cannot account for a diff; what is missing is the "
+                "shape a line of typed characters draws. The agent's click and typed "
+                "text did not visibly reach the real app."
             )
         return
     dominant = dominant_color(after)
@@ -443,6 +621,14 @@ def run(
         print("demo: grant resolved; capturing the before-frame")
 
         before = _capture_when_ready(grant)
+        if headless:
+            # The control capture: wait out the real app's own startup paint
+            # BEFORE the actuation, so the diff that follows cannot be
+            # explained by the app finishing what it had already started.
+            # Nested needs no equivalent — its proof is the served page's
+            # dominant colour, which the browser's chrome cannot produce.
+            before = _settle(grant, before)
+            print("demo: the real app is quiet; that frame is the control capture")
         url_x, url_y = locate_url_bar(before, headless=headless)
         print(f"demo: clicking ({url_x}, {url_y}); typing {target!r} + Enter")
         grant.pointer.click(url_x, url_y)

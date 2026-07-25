@@ -33,10 +33,19 @@
 //!   intake) — an untagged event is unrepresentable, and a
 //!   physical-origin masquerade outside nested intake is a compile
 //!   error.
-//! - A [`SeatDelivery`] is constructed **only** by [`InputRouter::route`],
-//!   which *moves* the origin from the `SeatInput` it consumed. The tag is
-//!   never re-derived downstream, so it provably cannot drift between
-//!   intake and the wire.
+//!   `SeatInput` is not the only producer of a wire-ready event, so the
+//!   compile-time half of the guarantee needs the next bullet to be
+//!   complete.
+//! - A [`SeatDelivery`] is constructed at exactly two sites, both inside
+//!   `InputRouter`, and **neither invents an origin**. `InputRouter::route`
+//!   *moves* the tag out of the `SeatInput` it consumed.
+//!   `InputRouter::release_physical_keys` — the focus-loss drain, the one
+//!   place a wire event exists with no intake event behind it — *copies* the
+//!   tag off the pairing-table entry that key's own press recorded
+//!   (`InputRouter::pressed_keys` stores `(keysym, origin)` for exactly this
+//!   reason) and drains only the entries a human's press put there. The tag
+//!   is therefore never re-derived downstream and never minted, so it cannot
+//!   drift between intake and the wire.
 //! - [`SeatDelivery::encode`] is the single seat-event encoder, an
 //!   exhaustive match with no catch-all: every arm feeds the origin into
 //!   the generated event type, whose `origin` field the IDL (and the RNG
@@ -236,11 +245,18 @@ pub(crate) struct SeatInput {
 
 impl SeatInput {
     /// Tag input from a physical human device. Private to this module by
-    /// design: the only producer of physical-tagged events in the crate
+    /// design: the only producer of physical-tagged *intake* in the crate
     /// is [`intake_physical`] (nested mode's single point of entry), so a
     /// physical-origin masquerade anywhere else — the headless backend, a
     /// P1.4.x actuation path, a replay helper — is a compile error, not a
     /// convention. Headless mode has no physical source, structurally.
+    ///
+    /// One physical-tagged *delivery* does not pass through here:
+    /// [`InputRouter::release_physical_keys`] pays down presses this router
+    /// already delivered, so it reads each tag back off its own pairing
+    /// table rather than minting one. That is inside the same module and
+    /// under the same privacy, and it can only ever emit a tag a real intake
+    /// event recorded — see the module docs' B2 section.
     fn physical(kind: SeatInputKind) -> Self {
         Self {
             origin: Origin::Physical,
@@ -662,13 +678,26 @@ pub(crate) struct InputRouter<H: PreemptionHook> {
     /// the surface; a release is delivered iff its code is present here —
     /// per-button pairing, Wayland-style, never a bare count.
     pressed: Vec<u32>,
-    /// Keysyms of delivered-and-unreleased key presses, same multiset
-    /// discipline as [`Self::pressed`] and for the same razor: a key
+    /// Delivered-and-unreleased key presses as `(keysym, origin)`, same
+    /// multiset discipline as [`Self::pressed`] and for the same razor: a key
     /// release is delivered iff its own press was (module docs). Keys hold
     /// no implicit grab — they carry no geometry — so this is *only*
     /// pairing, and it is what lets a consuming gate stop a key release
     /// without leaving a latched modifier in the app.
-    pressed_keys: Vec<u32>,
+    ///
+    /// **Why the origin is stored and not assumed.** Both origins share this
+    /// router on purpose (`session::route_seat` routes chokepoint-admitted
+    /// actuations through the very same instance, which is what makes the
+    /// preemption hook meaningful), so the table holds an agent's held keys
+    /// beside a human's. Anything that synthesises a release from an entry
+    /// therefore has to read the tag back off the entry rather than assume
+    /// one: minting `Origin::Physical` for an agent's key would forge the
+    /// physical-vs-emulated distinction (B2) on the wire *and* in the flight
+    /// recorder — the exact thing [`SeatInput::physical`]'s privacy makes a
+    /// compile error at intake. Pairing itself stays per-keysym, not
+    /// per-`(keysym, origin)`: the app has one keyboard, and its latch state
+    /// counts presses, not who made them.
+    pressed_keys: Vec<(u32, Origin)>,
 }
 
 impl<H: PreemptionHook> InputRouter<H> {
@@ -695,6 +724,82 @@ impl<H: PreemptionHook> InputRouter<H> {
         self.pressed.clear();
         self.pressed_keys.clear();
         self.pointer = None;
+    }
+
+    /// Release every key the router believes the app is holding **on the
+    /// human's behalf**, in press order, and forget those — one wire-ready
+    /// [`SeatDelivery`] per key, for the caller to deliver. Keys an agent is
+    /// holding are left exactly as they were.
+    ///
+    /// This is [`Self::pressed_keys`]'s pairing invariant read out loud: the
+    /// table holds exactly the keysyms whose **press this router delivered**,
+    /// so one release per physical entry is precisely what the app is owed
+    /// and never more. A key whose press a gate consumed (the dead-man
+    /// chord's) is not in there and gets nothing, because the app never saw
+    /// it go down.
+    ///
+    /// **Why only the physical entries.** The caller's whole warrant is that
+    /// host-window focus loss is the moment the core knows *the human's*
+    /// release will land somewhere else. Nothing about an agent's actuation
+    /// channel changed — it does not run through the host window's keyboard
+    /// focus at all — so draining an agent's held key here would invent a
+    /// release the principal never sent, drop a modifier it is deliberately
+    /// holding without telling it, and (since the delivery and the flight
+    /// recorder both carry the tag) attribute that to the human. Both
+    /// origins share this router by design (`session::route_seat`), so the
+    /// filter is load-bearing, not defensive.
+    ///
+    /// Each release carries the tag its own entry recorded, so no origin is
+    /// minted here; the filter is what makes that tag always `Physical` in
+    /// practice. Entries are removed in place, so press order survives.
+    ///
+    /// **Why the preemption hook is bypassed.** These are not new physical
+    /// events to judge — no key moved — they are the delivery debt the router
+    /// itself is recording. Routing them back through [`Self::route`] would
+    /// hand the dead-man watcher a release with no press, and a gate that
+    /// consumed one would strand exactly the key this exists to free.
+    ///
+    /// Called on host-window focus loss (`crate::backend::winit`'s
+    /// `handle_focus`), the one moment the core knows the physical release
+    /// will be delivered somewhere else: winit's Wayland backend emits no key
+    /// events at all on `wl_keyboard.leave`, so without this a key held
+    /// across an alt-tab stays latched down in the confined app forever.
+    ///
+    /// Distinct from [`Self::reset`] on purpose. `reset` forgets *all*
+    /// per-shim-generation state for a shim that is gone, where no delivery
+    /// is possible or wanted; this pays the app what it is owed while the
+    /// shim is very much alive, and leaves the pointer and the implicit grab
+    /// untouched — a focus change is not a new shim generation.
+    ///
+    /// Known imprecision, bounded and deliberate: pairing is per-keysym (see
+    /// [`Self::pressed_keys`]), so if both origins hold the *same* keysym at
+    /// once, a release consumes the oldest entry regardless of tag and the
+    /// surviving entry's tag can name the other origin. The number of
+    /// outstanding presses is always right, and no release is ever emitted
+    /// with a tag the table did not record — but in that one overlap the
+    /// drain can skip a human's key (leaving it latched until the agent
+    /// releases) or keep an agent's. Making the table exact would mean
+    /// pairing per-`(keysym, origin)`, which would drop a human's release of
+    /// an agent-pressed key as unpaired — a latched modifier, the worse of
+    /// the two failures.
+    pub fn release_physical_keys(&mut self) -> Vec<SeatDelivery> {
+        let mut released = Vec::new();
+        self.pressed_keys.retain(|&(keysym, origin)| {
+            if origin != Origin::Physical {
+                return true;
+            }
+            released.push(SeatDelivery {
+                // The tag is read back off the entry, never minted: see the
+                // origin argument above.
+                origin,
+                kind: SeatDeliveryKind::Key {
+                    keysym,
+                    state: KeyState::Released,
+                },
+            });
+            false
+        });
+        released
     }
 
     /// Route one tagged event against the current geometry: `view` is the
@@ -756,7 +861,10 @@ impl<H: PreemptionHook> InputRouter<H> {
             // (module docs).
             SeatInputKind::Key { keysym, state } => match state {
                 KeyState::Pressed => {
-                    self.pressed_keys.push(keysym);
+                    // The tag rides into the pairing table with the press, so
+                    // whatever synthesises this key's release later reads it
+                    // back rather than assuming one ([`Self::pressed_keys`]).
+                    self.pressed_keys.push((keysym, origin));
                     SeatDeliveryKind::Key { keysym, state }
                 }
                 KeyState::Released => {
@@ -832,8 +940,15 @@ impl<H: PreemptionHook> InputRouter<H> {
     /// whether one existed (i.e. whether a release of this keysym pairs
     /// with a delivered press). The keyboard twin of
     /// [`Self::release_pressed`].
+    ///
+    /// Matches on the keysym alone, never on the origin: the app has one
+    /// keyboard and its latch state counts presses, so a release must be able
+    /// to pay down any outstanding press of that keysym. The entry's tag is
+    /// carried for the benefit of [`Self::release_physical_keys`], which is
+    /// the only reader of it — see [`Self::pressed_keys`] for the bound on
+    /// how far a mixed-origin overlap can skew it.
     fn release_pressed_key(&mut self, keysym: u32) -> bool {
-        match self.pressed_keys.iter().position(|&k| k == keysym) {
+        match self.pressed_keys.iter().position(|&(k, _)| k == keysym) {
             Some(i) => {
                 self.pressed_keys.remove(i);
                 true
@@ -3480,6 +3595,222 @@ pub(crate) mod tests {
             deadman.borrow_mut().take_replay().is_empty(),
             "a completed chord owes the app nothing"
         );
+    }
+
+    /// **A key held across a focus change comes up in the app, not latched
+    /// down in it.**
+    ///
+    /// The hazard the nested backend's `handle_focus` reaches for this
+    /// method to close: on Wayland, `wl_keyboard.leave` produces no key
+    /// events at all, so the physical release the human eventually performs
+    /// is delivered to whatever window took focus and the core never hears
+    /// about it. Left alone, the confined app holds that key forever — a
+    /// stuck Ctrl or Shift the human has no way to clear.
+    ///
+    /// The pairing invariant is the whole safety argument, so it is asserted
+    /// on all three sides: exactly the delivered presses are released, in
+    /// press order; a press the gate consumed (the dead-man chord's) gets
+    /// nothing, because the app never saw it go down; and a physical release
+    /// that arrives afterwards — X11's synthetic focus-out release, which
+    /// `admits_key_event` now lets through — finds nothing to pair with and
+    /// is dropped rather than double-releasing.
+    ///
+    /// All presses here are physical; the drain's *other* half — that an
+    /// agent's held key is neither released nor re-tagged as the human's —
+    /// is [`a_focus_drain_never_speaks_for_an_agents_held_key`].
+    #[test]
+    fn a_key_held_across_a_focus_change_is_released_not_latched() {
+        let deadman = Rc::new(RefCell::new(crate::deadman::DeadManSwitch::new(
+            crate::deadman::DeadManConfig::default(),
+        )));
+        let now = Rc::new(Cell::new(std::time::Instant::now()));
+        let mut router = InputRouter::new(crate::deadman::DeadManHook::new(
+            Rc::clone(&deadman),
+            Rc::clone(&now),
+            NoopHook,
+        ));
+        let view = (64, 48);
+        let surface = Some(view);
+
+        // Two ordinary keys go down and are delivered, then the chord goes
+        // down and is withheld by the gate.
+        for keysym in [NON_CHORD_KEYSYM, 0x061] {
+            assert!(
+                router
+                    .route(
+                        phys(SeatInputKind::Key {
+                            keysym,
+                            state: KeyState::Pressed
+                        }),
+                        view,
+                        surface,
+                    )
+                    .is_some(),
+                "fixture check: an ordinary key press reaches the app"
+            );
+        }
+        assert!(
+            router.route(chord_press(), view, surface).is_none(),
+            "fixture check: the chord's press is withheld"
+        );
+
+        // Focus leaves. Every key the app is holding — and only those — is
+        // released, in press order.
+        let released = router.release_physical_keys();
+        assert_eq!(
+            released
+                .iter()
+                .map(|d| (d.origin(), d.kind().clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Origin::Physical,
+                    SeatDeliveryKind::Key {
+                        keysym: NON_CHORD_KEYSYM,
+                        state: KeyState::Released
+                    }
+                ),
+                (
+                    Origin::Physical,
+                    SeatDeliveryKind::Key {
+                        keysym: 0x061,
+                        state: KeyState::Released
+                    }
+                ),
+            ],
+            "focus loss must release exactly the keys whose press the app saw, in order -- \
+             a missing one stays latched down in the confined app forever"
+        );
+        assert!(
+            router.pressed_keys.is_empty(),
+            "the router still believes a key is down after focus loss: {:?}",
+            router.pressed_keys
+        );
+
+        // Idempotent: a second focus-out (or a `handle_focus` racing the
+        // synthetic releases) owes nothing.
+        assert!(router.release_physical_keys().is_empty());
+
+        // And X11's synthetic release, arriving after the drain, pairs with
+        // nothing and is dropped -- the app is never told a key came up twice.
+        assert!(
+            router
+                .route(
+                    phys(SeatInputKind::Key {
+                        keysym: NON_CHORD_KEYSYM,
+                        state: KeyState::Released
+                    }),
+                    view,
+                    surface,
+                )
+                .is_none(),
+            "an already-paid release must not reach the app a second time"
+        );
+
+        // The pointer and its implicit grab are untouched: a focus change is
+        // not a new shim generation, which is what `reset` is for.
+        let mut router = InputRouter::new(NoopHook);
+        assert!(router
+            .route(phys(motion(10.0, 10.0)), view, surface)
+            .is_some());
+        assert!(router.route(phys(press()), view, surface).is_some());
+        assert!(router.release_physical_keys().is_empty());
+        assert!(
+            router.route(phys(release()), view, surface).is_some(),
+            "releasing held keys must not drop the pointer's implicit grab"
+        );
+    }
+
+    /// **A human's focus change never speaks for an agent's keyboard.**
+    ///
+    /// `session::route_seat` routes chokepoint-admitted actuations through
+    /// this same router, deliberately, so the pairing table holds an agent's
+    /// held keys next to a human's. The first shape of the focus drain
+    /// stamped `Origin::Physical` on everything it drained, which is two
+    /// defects at once:
+    ///
+    /// 1. **Origin forgery inside the TCB.** The wire event and the flight
+    ///    recorder's `SeatDelivered` entry would both say a human released a
+    ///    key no human touched — the physical-vs-emulated distinction (PRD
+    ///    Doc 2 §8, requirement B2) that [`SeatInput::physical`]'s privacy
+    ///    makes a compile error at intake, laundered back in on the way out.
+    /// 2. **Silently dropping an agent's modifier.** The agent is told
+    ///    nothing and its model of the keyboard diverges from the app's.
+    ///
+    /// Both are closed by draining only the entries the table recorded as
+    /// physical, so this asserts the emulated press is neither released nor
+    /// re-tagged, that its own release still pairs afterwards, and that the
+    /// human's key sitting beside it is still released (the fix must not
+    /// have traded one stuck key for another).
+    #[test]
+    fn a_focus_drain_never_speaks_for_an_agents_held_key() {
+        let mut router = InputRouter::new(NoopHook);
+        let view = (64, 48);
+        let surface = Some(view);
+        const AGENT_KEY: u32 = 0xffe1; // Shift_L, an agent holding a modifier
+        const HUMAN_KEY: u32 = 0x062; // 'b'
+
+        for input in [
+            SeatInput::emulated(SeatInputKind::Key {
+                keysym: AGENT_KEY,
+                state: KeyState::Pressed,
+            }),
+            phys(SeatInputKind::Key {
+                keysym: HUMAN_KEY,
+                state: KeyState::Pressed,
+            }),
+        ] {
+            assert!(
+                router.route(input, view, surface).is_some(),
+                "fixture check: both origins' presses reach the app"
+            );
+        }
+
+        // The human alt-tabs. Exactly one release goes out, it is the human's
+        // key, and it carries the human's tag.
+        let released = router.release_physical_keys();
+        assert_eq!(
+            released
+                .iter()
+                .map(|d| (d.origin(), d.kind().clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                Origin::Physical,
+                SeatDeliveryKind::Key {
+                    keysym: HUMAN_KEY,
+                    state: KeyState::Released
+                }
+            )],
+            "a focus drain must release the human's key and only the human's: an agent's \
+             held key released here is an origin forgery on the wire and in the journal"
+        );
+        assert_eq!(
+            router.pressed_keys,
+            vec![(AGENT_KEY, Origin::Emulated)],
+            "the agent's press must survive a human's focus change, with its own tag"
+        );
+
+        // The agent's own release still pairs and still goes out as the
+        // agent's -- the drain neither paid this debt nor forgot it.
+        let delivery = router
+            .route(
+                SeatInput::emulated(SeatInputKind::Key {
+                    keysym: AGENT_KEY,
+                    state: KeyState::Released,
+                }),
+                view,
+                surface,
+            )
+            .expect("an agent's release of its own held key must reach the app");
+        assert_eq!(delivery.origin(), Origin::Emulated);
+        assert_eq!(
+            delivery.kind(),
+            &SeatDeliveryKind::Key {
+                keysym: AGENT_KEY,
+                state: KeyState::Released
+            }
+        );
+        assert!(router.pressed_keys.is_empty());
     }
 
     // ------------------------------------------------------------------

@@ -27,13 +27,35 @@
 //! (issue #85) — the always-present band and the per-prompt frame — lives on
 //! this side too, and is invisible to a capture for exactly the same reason.
 //!
-//! Both backends reach that one function: the nested backend through
-//! [`compose_human_visible`] (compose + overlay in one step) and the headless
-//! backend by calling it directly with the view it already composed for its
-//! capture image. Stated because the previous arrangement had headless
-//! open-coding the same two steps, which meant "both backends present the same
-//! output" rested on an equality assertion in a single test rather than on
-//! there being one implementation — and a doc comment claiming the latter.
+//! Both backends reach that one function on the **CPU compositing path**:
+//! the nested backend through [`compose_human_visible`] (compose + overlay in
+//! one step) and the headless backend by calling it directly with the view it
+//! already composed for its capture image. Stated because the previous
+//! arrangement had headless open-coding the same two steps, which meant "both
+//! backends present the same output" rested on an equality assertion in a
+//! single test rather than on there being one implementation — and a doc
+//! comment claiming the latter.
+//!
+//! # There is a second human-visible path, and it does not come through here
+//!
+//! The nested backend's zero-copy dmabuf branch (P1.3.5) presents the
+//! client's imported texture straight to the window with no CPU composite at
+//! all, so it reaches neither [`Scene::compose`] nor this function. That is
+//! not a hole in the capture argument above — a capture is *still* only ever
+//! `Scene::compose` on the CPU, on both backends, so nothing this branch
+//! draws can reach an agent — but it **is** a second place the trusted band
+//! has to be painted, and the first cut of it was not painted there at all:
+//! every dmabuf-presented frame consisted purely of pixels the confined
+//! client owns, free to carry a counterfeit band with nothing genuine above
+//! it (issue #85's whole threat).
+//!
+//! The band is therefore inside
+//! [`crate::dmabuf::human_visible_frame`]'s draw list rather than applied by
+//! whoever calls the GPU presenter, so the invariant survives a third
+//! presentation path being added by someone who never read this paragraph.
+//! `no_presentation_path_can_drop_the_trusted_band` (in [`winit`]'s tests)
+//! holds the two paths against each other, including that they paint the one
+//! session secret and not two.
 
 pub mod headless;
 pub mod winit;
@@ -45,9 +67,14 @@ use crate::scene::Scene;
 /// human-visible output.
 ///
 /// This is *the* overlay-application step — the one place in the core where
-/// prompt pixels join view pixels — and both backends reach it, which is what
-/// makes "nested and headless cannot drift in what a human sees" a property of
-/// the code rather than of an assertion in one test.
+/// prompt pixels join view pixels — and every CPU-composited frame on both
+/// backends reaches it, which is what makes "nested and headless cannot drift
+/// in what a human sees" a property of the code rather than of an assertion
+/// in one test. A consent prompt or a dead-man hold forces the nested backend
+/// onto the CPU path, so it is also the only step a *prompt* can be applied
+/// in; the trusted band, which is on every frame prompt or not, has a second
+/// home on the zero-copy path (see this module's docs and
+/// [`crate::dmabuf::human_visible_frame`]).
 ///
 /// It takes composed bytes rather than a [`Scene`] because the headless
 /// backend needs the realm view *by itself* as well (it retains that image

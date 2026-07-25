@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """P1.8.4/P1.8.7 (#43/#110) acceptance: the demo agent's HEADLESS flow, against
 the real chain end to end.
 

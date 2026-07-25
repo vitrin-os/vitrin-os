@@ -1,5 +1,7 @@
 /* globals.c -- Phase B (protocol globals).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * Advertises exactly the v0 global set (wl_shm and wl_output are created
  * elsewhere -- server.c and output.c respectively):
  *

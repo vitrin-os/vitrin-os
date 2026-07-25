@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Boot a real `vitrind` and talk to it the way an agent does.
 
 Everything in this suite goes through :class:`Core`, which starts the

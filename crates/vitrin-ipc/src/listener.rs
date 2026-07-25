@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The principal-facing listening socket.
 //!
 //! [`Listener::bind`] owns the whole named-socket lifecycle: it creates the

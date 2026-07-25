@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Handshake tests against the scripted mock core (P1.1.3 semantics)."""
 
 from __future__ import annotations

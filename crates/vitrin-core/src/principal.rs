@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The principal-connection protocol server (P1.4.1, issue #25): the server
 //! side of the P1.1.3 handshake state machine, where the [`identity`] layer
 //! binds -- `vitrin_handshake` (bootstrap object 1) plus the

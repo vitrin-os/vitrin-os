@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The shim-facing protocol server (P1.3.4, issue #21): the core side of the
 //! shim boundary — half of artifact A5's contract.
 //!

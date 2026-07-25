@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The realm spawn model (P1.5.2, issue #31): how the trusted core launches
 //! the one confined app a realm owns, and the *only* place in the TCB that
 //! creates a process.

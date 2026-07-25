@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Targeted negative-path tests for `DecodeError`, one per variant not
 //! already exercised by `wire`'s own unit tests (`Truncated`, `InvalidUtf8`,
 //! `EmbeddedNul`, `StringTooLong` are covered there at the primitive level).

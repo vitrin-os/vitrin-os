@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Protocol constants and enums, transcribed by hand from protocol/vitrin-v0.xml.
 
 This module is deliberately *not* generated from the IDL: the Python SDK is

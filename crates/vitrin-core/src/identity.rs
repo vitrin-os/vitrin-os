@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The identity layer of the capability kernel (P1.4.1, issue #25): the
 //! pluggable [`Verifier`] trait and its MVP implementation,
 //! [`StaticVerifier`].

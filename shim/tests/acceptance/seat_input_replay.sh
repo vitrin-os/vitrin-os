@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # P1.6.3 acceptance proof: virtual-seat input replay.
 #
 # Three independent witnesses, deliberately, because no two of them share a

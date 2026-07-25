@@ -185,6 +185,8 @@ Open-source first. Realistic path: **NLnet / NGI Zero** grants (which fund exact
 
 Split licensing: **the protocol specification and wire definitions under a permissive license** (Apache-2.0 with an explicit patent grant; CC-BY for prose) to maximize reimplementation; **the reference implementation under weak copyleft** (MPL-2.0 or LGPL-3.0) to keep core improvements open while allowing linking from differently-licensed clients; **client SDKs (TypeScript/Python) under Apache-2.0.** This mirrors how the permissively-licensed Wayland _protocol_ coexists with diverse implementations.
 
+> **Executed as MPL-2.0.** The choice this section leaves open was closed by D-016 (`docs/plan/20-decision-log.md`), which also draws the copyleft/permissive line by *derivation* rather than by directory. The root [`NOTICE`](../NOTICE) is the normative path→license map. D-015 records the related decision to file no patents.
+
 ---
 
 # DOCUMENT 2 — TECHNICAL ARCHITECTURE

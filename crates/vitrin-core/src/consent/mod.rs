@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The consent surface's renderer (P1.7.1, issue #37): the core-internal
 //! prompt that asks a human to decide one pending petition, drawn by the TCB
 //! itself and composited above the realm view.

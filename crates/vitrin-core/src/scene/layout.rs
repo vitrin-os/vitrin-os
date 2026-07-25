@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Single-maximized placement — the **entire** layout policy of the MVP
 //! core, quarantined in this module.
 //!

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # SHIM-ONLY UNIT CHECK: Firefox against the shim under the MOCK core.
 #
 # WHAT THIS IS, AND WHAT IT IS NOT (relabelled by P1.6.6, issue #106).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Nested backend: the core runs as a client of the host compositor
 //! (GNOME, Hyprland, …), presenting exactly one host window — the gamescope
 //! nested-session pattern (PRD Doc 2 §4/§17). Rendering stays deliberately

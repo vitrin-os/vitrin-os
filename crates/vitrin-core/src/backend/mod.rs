@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Presentation backends for the trusted core.
 //!
 //! Two backends exist. The nested [`winit`] backend runs the core as a client

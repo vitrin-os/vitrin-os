@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Transport-level errors.
 //!
 //! The split mirrors who is at fault and therefore who must react:

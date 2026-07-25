@@ -441,19 +441,52 @@ is split into nine epics, each carrying exactly one `track:*` label
 
 ## License
 
-Split per decision D-005 (`docs/plan/20-decision-log.md`) — see
-[`NOTICE`](NOTICE) for the full mapping and current execution status:
+Split per decisions D-005 and D-016 (`docs/plan/20-decision-log.md`).
+[`NOTICE`](NOTICE) is the normative path→license map; the
+`SPDX-License-Identifier` header on a file is authoritative for that file.
 
-- **Protocol wire definitions and schemas**
+- **Apache-2.0** ([`LICENSE`](LICENSE)) — the protocol
   ([`protocol/vitrin-v0.xml`](protocol/vitrin-v0.xml),
-  [`protocol/vitrin-v0.rng`](protocol/vitrin-v0.rng)) and the **client
-  SDKs** ([`sdk/python/`](sdk/python)) — [Apache-2.0](LICENSE).
-- **Spec prose** ([`docs/PRD.md`](docs/PRD.md),
-  [`docs/protocol/`](docs/protocol), [`docs/plan/`](docs/plan)) —
-  [CC-BY-4.0](LICENSE-CC-BY-4.0).
-- **The reference implementation** (`crates/`, `shim/`) is intended per
-  D-005 to carry a weak-copyleft license (MPL-2.0 preferred, LGPL-3.0
-  fallback); that re-licensing has not executed yet — every crate still
-  declares Apache-2.0 today. Tracked in
-  [#133](https://github.com/vitrin-os/vitrin-os/issues/133), stated here
-  rather than silently assumed.
+  [`protocol/vitrin-v0.rng`](protocol/vitrin-v0.rng)), the bindings
+  generated from it (`crates/vitrin-protocol`,
+  `shim/include/vitrin-protocol.h`), the code generator that emits them and
+  its driver (`crates/vitrin-scanner`, `crates/xtask`), the conformance and
+  fuzz instruments, the
+  **client SDKs** ([`sdk/python/`](sdk/python)), the integration harness
+  ([`tests/integration/`](tests/integration)) and the shipped
+  [`examples/`](examples).
+- **MPL-2.0** (`LICENSE-MPL-2.0`) — the reference implementation:
+  `crates/vitrin-core` (the trusted core), `crates/vitrin-ipc`, and the
+  per-app Wayland shim under [`shim/`](shim).
+- **CC-BY-4.0** ([`LICENSE-CC-BY-4.0`](LICENSE-CC-BY-4.0)) — spec prose
+  ([`docs/PRD.md`](docs/PRD.md), [`docs/protocol/`](docs/protocol),
+  [`docs/plan/`](docs/plan)).
+- **GPL-3.0-only** (`LICENSE-GPL-3.0-only`) — one carve-out,
+  [`shim/wlcs/`](shim/wlcs), the advisory WLCS conformance module, which
+  links GPL-3.0 headers from Canonical's wlcs. It is never built by
+  default, never installed, and never linked into `vitrin-shim`.
+
+**What that means for you, plainly:** you never have to touch an MPL-2.0
+file to write a client, build an alternate compositor or shim, or ship an
+integration — the protocol, the generated bindings, the codegen and the
+SDKs are all Apache-2.0, patent grant included. The copyleft binds one
+group only: people who modify the trusted core itself, whose changes to a
+capability kernel should come back. MPL's copyleft is per-file, so
+applications running under Vitrin are unaffected — running an app inside a
+shim does not make it derivative of anything here.
+
+**No CLA.** Contributions are taken under the
+[Developer Certificate of Origin](https://developercertificate.org/)
+(a `Signed-off-by:` line), not a Contributor License Agreement — decision
+D-012. Nobody is asked to assign copyright: contributors keep theirs, and
+the project never acquires the unilateral power over *their* code that a
+CLA would hand it. That is deliberate — it is what stops the split above
+from being merely this year's mood.
+
+**No patents.** Vitrin OS files none and intends to file none (D-015). The
+design is protected by publishing it — a timestamped spec is itself the
+prior art — and by the Apache-2.0 §3 and MPL-2.0 §2.1(b) patent grants that
+ship with the code. Both are in force today. A third leg, joining the Open
+Invention Network's royalty-free cross-licence, is decided but **not yet
+done**. None of this is a patent wall, and none of it is a
+freedom-to-operate opinion.

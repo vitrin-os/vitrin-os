@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Transport behavior over real sockets: fd round-trips, peer credentials,
 //! frame reassembly, violation handling, CLOEXEC hygiene, listener
 //! lifecycle. The fd-leak acceptance test lives alone in `fd_leak.rs` so

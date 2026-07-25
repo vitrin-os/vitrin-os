@@ -4,7 +4,13 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
-license = "Apache-2.0"
+# No workspace-wide `license`: the split is per-crate (D-005 / issue #133,
+# the root NOTICE is the map), so every crate must state its own and a new
+# crate cannot silently inherit the wrong half. MPL-2.0 covers the
+# reference implementation (vitrin-core, vitrin-ipc); Apache-2.0 covers
+# everything derived from protocol/vitrin-v0.xml (vitrin-protocol,
+# vitrin-scanner, xtask) and the conformance instruments (vitrin-golden,
+# vitrin-mock-shim).
 # Minimum supported Rust version. The hard floor is std::io::pipe() (stable
 # since 1.87, used by the fd-bearing round-trip tests); the workspace is
 # developed and CI-verified on the exact toolchain pinned in

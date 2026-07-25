@@ -1,6 +1,8 @@
 /* mock_core.c -- the CORE side of the shim wire, for SHIM-IN-ISOLATION unit
  * testing the C shim's upstream link (P1.6.2).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * THIS IS A MOCK, NOT THE REAL CORE (emphasis added by P1.6.6, issue #106).
  * It is a strict hand-written stand-in that lets the shim be exercised on its
  * own, and every acceptance script that drives it (shim_globals_and_client.sh,

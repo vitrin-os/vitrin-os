@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A minimal, hand-rolled PNG encoder — just enough to write the harness's
 //! debugging artifacts (`actual.png`, `expected.png`, `diff.png`).
 //!

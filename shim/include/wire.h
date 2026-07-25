@@ -1,6 +1,8 @@
 /* wire.h -- the framed transport between the shim and the trusted core
  * (P1.6.2).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * This is the C counterpart of `crates/vitrin-ipc` and, like it, it does
  * FRAMING ONLY: it neither decodes argument payloads nor knows what an
  * object id means. The generated header (include/vitrin-protocol.h) encodes

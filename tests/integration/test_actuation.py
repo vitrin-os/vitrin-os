@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """P1.8.3 (#42) acceptance: the SDK's actuation API and its typed grant-error
 exceptions, verified against the shipped `vitrind` — the "live core" the issue
 calls for, not the in-process mock the unit tests (`sdk/python/tests`) use.

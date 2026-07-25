@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Hand-written decode-error type.
 //!
 //! `DecodeError` is this crate's own Rust-side `Result` error type for turning

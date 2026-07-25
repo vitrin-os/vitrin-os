@@ -1,5 +1,7 @@
 // Deterministic demo/test profile for the pinned Firefox ESR (P1.6.4).
 //
+// SPDX-License-Identifier: MPL-2.0
+//
 // Copied to <profile>/user.js by the acceptance script, which creates a fresh
 // profile per run -- a profile that persists across runs accumulates session
 // state, and "deterministic" then means "deterministic until someone runs it

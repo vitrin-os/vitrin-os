@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Hand-written wire-format primitives shared by every generated message's
 //! `encode`/`decode`. This is runtime support code, not generated output: the
 //! byte-level rules here (header shape, string padding, bounds checks) are

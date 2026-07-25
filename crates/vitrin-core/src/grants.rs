@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The grant table v0 (P1.4.2, issue #26): the in-memory heart of the
 //! capability kernel (artifact A3).
 //!

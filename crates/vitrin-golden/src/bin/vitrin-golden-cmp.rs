@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `vitrin-golden-cmp` — compare two raw framebuffer files with the shared
 //! [`vitrin_golden`] harness, from any language that can spawn a process.
 //!

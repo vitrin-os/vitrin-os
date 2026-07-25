@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # P1.6.2 acceptance proof: the shim's upstream link to the trusted core.
 #
 # Every check below is made against the WIRE, by a peer that spawns the shim

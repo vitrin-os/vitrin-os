@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Tiny formatting helpers shared by both codegen backends (`rust_gen.rs`,
 //! `c_gen.rs`). Nothing here is IDL-specific logic -- it's just string-
 //! building plumbing so each backend's `gen_*` functions read as a flat

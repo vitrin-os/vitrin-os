@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Golden-bytes (known-answer) tests: hardcoded wire frames asserted
 //! byte-for-byte against `encode`, then decoded back and compared field-wise.
 //!

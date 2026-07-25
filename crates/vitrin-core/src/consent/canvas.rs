@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The consent surface's pixel primitives: a borrowed RGBA8888 canvas and
 //! the handful of operations the prompt is drawn from — rectangle fill,
 //! rectangle stroke, whole-canvas darkening (the scrim), and a clipped

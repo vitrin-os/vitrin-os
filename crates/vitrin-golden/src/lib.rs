@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Golden-frame comparison harness (P1.9.2).
 //!
 //! Shared pixel-assertion infrastructure: compare a freshly captured frame

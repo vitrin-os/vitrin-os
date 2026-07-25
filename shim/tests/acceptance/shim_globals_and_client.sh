@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # P1.6.1 acceptance proof for the Vitrin OS Wayland shim skeleton:
 #
 #   (a) `wayland-info` against the shim's socket lists EXACTLY the expected

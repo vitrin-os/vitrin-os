@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
 # test-summary.sh -- self-test for shim/wlcs/summary.sh and run-advisory.sh.
 #
 # Runs anywhere: no wlcs package, no built module, no compositor, no GPU. It

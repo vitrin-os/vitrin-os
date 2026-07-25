@@ -1,5 +1,7 @@
 /* ledger.c -- the "globals touched" ledger and the probe catalogue (P1.6.4).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * See ledger.h for what this is for and why the probe half has to exist at
  * all. This file is the mechanism:
  *

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Issue #77's acceptance criteria, against the shipped binary.
 
 Each test here corresponds to a criterion that `cargo test --workspace`

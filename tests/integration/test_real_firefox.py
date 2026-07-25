@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The Firefox rung of the real bring-up ladder, under the real core (P1.6.6).
 
 This is the top of the M1.2 ladder (weston-terminal -> GTK app -> Firefox) and

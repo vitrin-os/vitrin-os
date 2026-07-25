@@ -5,6 +5,8 @@
  * the Rust and C encoders cannot silently drift apart, and a symmetric
  * encode/decode bug (which the round-trip property cannot see) fails here.
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * Also exercises the encode-side guards the compile-only test cannot:
  * per-string bound rejection, and the decode-side size/opcode/padding
  * checks.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """P1.8.6 (#108): agent pointer + text actuation LANDS on a real app surface
 through the real core, with an effect the agent confirms by its own observe().
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Fetch and CHECKSUM-VERIFY the pinned Firefox ESR (P1.6.4, issue #36).
 #
 # The pin lives in firefox-esr.pin beside this script and nowhere else. This

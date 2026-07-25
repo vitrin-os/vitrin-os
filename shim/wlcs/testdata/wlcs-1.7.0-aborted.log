@@ -1,0 +1,18 @@
+Note: Google Test filter = SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/2:SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/4:SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/8:SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/9
+[==========] Running 4 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 4 tests from SurfaceInputRegions/SurfaceInputCombinations
+[ RUN      ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/2
+[          ] Missing extension: zxdg_shell_v6>= 1
+[     SKIP ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/2 (1ms)
+[ RUN      ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/4
+00:00:00.003 [ERROR] [../../../../../../build/vitrin/shim/src/ledger.c:86] globals-error: seq=16 code=3 message="xdg_surface has never been configured"
+xdg_surface#9: error 3: xdg_surface has never been configured
+unknown file: Failure
+C++ exception with description "Wayland protocol error: 3 on interface xdg_surface v5" thrown in the test body.
+
+[  FAILED  ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/4, where GetParam() = ((ptr = 0x5602e8eb3d70, value = 40-byte object <00-B7 C5-CF 02-56 00-00 10-52 EC-E8 02-56 00-00 12-00 00-00 00-00 00-00 12-00 00-00 00-00 00-00 00-44 65-61 74-68 54-65>), (ptr = 0x5602e8ec59b0, value = 40-byte object <D8-D6 C5-CF 02-56 00-00 C8-59 EC-E8 02-56 00-00 07-00 00-00 00-00 00-00 70-6F 69-6E 74-65 72-00 00-00 00-00 00-00 00-00>)) (1 ms)
+[ RUN      ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/8
+[       OK ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/8 (34 ms)
+[ RUN      ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/9
+timeout: the monitored command dumped core

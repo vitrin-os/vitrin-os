@@ -70,7 +70,12 @@ fn seed_names(target: &str) -> Vec<String> {
     let dir = fuzz_dir().join("corpus").join(target);
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("listing {}: {e}", dir.display()))
-        .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     names.sort();
     names

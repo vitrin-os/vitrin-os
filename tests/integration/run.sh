@@ -92,16 +92,28 @@ fi
 # Both are purely additive (an extra signal source, an extra socket source,
 # and a card-footprint export, all on the headless backend only) and neither
 # is ever enabled in a deployment build, so turning them on here changes
-# nothing else this suite exercises. A warm cache still makes this a no-op
-# rather than a second compile: cargo does not recompile a crate whose enabled
-# feature set has not changed since the last build -- which is also why CI's
-# warm-build step must pass the SAME list, or its binary (built first) wins
-# the race and the guard below skips a rebuild that was needed.
+# nothing else this suite exercises.
+#
+# **Unconditional, deliberately.** This build step used to be guarded by
+# `if [ ! -x target/debug/vitrind ]`, which tested that *a* binary existed and
+# never that it was the right one -- so a `target/debug/vitrind` left behind by
+# any other build (`cargo build -p vitrin-core`, a run with only one of the two
+# features, CI's warm-build step passing a different list) silently won, and
+# the suite reported on a core missing a handler it needs. That is not
+# hypothetical: it turns up as `test_real_deadman` and `DemoHeadlessHoldEsc`
+# failing with SIGUSR1 taking its default disposition, which reads as a broken
+# dead-man switch rather than as a stale binary. Two injectors now share this
+# hazard, so the guard's whole premise is gone.
+#
+# Dropping it costs nothing: cargo does not recompile a crate whose enabled
+# feature set has not changed since the last build, so a warm tree makes this a
+# no-op, and a tree built with any other feature set is exactly the case that
+# MUST recompile. A gate that can run against the wrong binary reports
+# something other than what it claims, which is the one thing this suite exists
+# to not do.
 INJECTORS=vitrin-core/dead-man-injector,vitrin-core/consent-injector
-if [ ! -x target/debug/vitrind ] || [ ! -x target/debug/vitrin-mock-shim ]; then
-  echo "==> building workspace (missing target/debug/vitrind or vitrin-mock-shim)"
-  cargo build --workspace --features "$INJECTORS"
-fi
+echo "==> building workspace with $INJECTORS"
+cargo build --workspace --features "$INJECTORS"
 
 # `python3` on the runner is 3.12, clearing the SDK's >= 3.11 floor (D8).
 PY="${PYTHON:-python3}"

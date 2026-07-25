@@ -206,7 +206,15 @@ fn rgba_to_xrgb8888(rgba: &[u8]) -> Vec<u8> {
 /// the fd out of any concurrently spawned realm (P1.5.2 fork/exec); the
 /// write happens through `write(2)`, never a writable mapping, so the
 /// write seal cannot fail with `EBUSY`.
-fn sealed_frame_memfd(frame: &[u8]) -> io::Result<OwnedFd> {
+///
+/// `pub(crate)` for exactly one further caller: the `consent-injector`
+/// build's [`crate::backend::headless::HeadlessView::consent_occlusion_window`]
+/// (issue #138), which exports the consent card's own footprint of the
+/// human-visible framebuffer. Sharing this rather than growing a second
+/// exporter keeps the invariant worth having — **there is exactly one way
+/// pixels leave this process, and it is a sealed copy** — true of the
+/// instrumented build as well as the shipping one.
+pub(crate) fn sealed_frame_memfd(frame: &[u8]) -> io::Result<OwnedFd> {
     let fd = rustix::fs::memfd_create(MEMFD_NAME, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
     let mut file = File::from(fd);
     file.write_all(frame)?;

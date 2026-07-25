@@ -65,7 +65,14 @@ vitrin-ipc = { path = "../vitrin-ipc" }
 # only `geteuid`, which anchors the identity layer's registry-ownership
 # check and its SO_PEERCRED same-user policy -- a feature bump on an
 # existing dependency, not a new one.
-rustix = { version = "1", features = ["fs", "process"] }
+# The `net` feature (issue #138) adds `sendmsg`/`recv`/`sockopt::socket_type`
+# for the `consent-injector` channel: a sealed memfd rides SCM_RIGHTS beside a
+# one-line reply on an inherited socketpair, and the adopted descriptor is
+# validated as a `SOCK_STREAM` socket before anything is read from it. A
+# feature bump on a crate already in the graph -- exactly the posture
+# `process` above already documents -- not a new dependency, and no image
+# codec anywhere near it (plan risk R7): the one pixel payload is raw RGBA.
+rustix = { version = "1", features = ["fs", "net", "process"] }
 # Raw syscalls where rustix cannot express them or where a thin `extern "C"`
 # call is the honest spelling. Four sites: (1) the post-`fork`, pre-`execve`
 # closure in `spawn` (P1.5.2), which must be async-signal-safe and therefore
@@ -239,6 +246,64 @@ scripted-consent = []
 # posture as `scripted-consent`, and for the same reason: a build that cannot
 # even name a test hook cannot be tricked into responding to one.
 dead-man-injector = []
+# Compile the out-of-process consent injector (issue #138): on the HEADLESS
+# backend only, and only when a runtime flag ALSO names it, three things a
+# deployment build cannot even mention --
+#
+#   1. the real interactive consent round (`session::service_consent_round`)
+#      driven once per dispatch, so a headless core really raises the front
+#      pending petition's prompt and really composites it into the retained
+#      human-visible framebuffer;
+#   2. an inherited `AF_UNIX`/`SOCK_STREAM` socketpair, adopted from the
+#      descriptor number `--consent-injector-fd N` names, on which a harness
+#      may `describe` the raised prompt and `decide <token> <button>`. The
+#      decision is deposited into that round's `ConsentGrab` -- exactly where
+#      a physical click on the card deposits one;
+#   3. `HeadlessView::consent_occlusion_window`, which exports the CARD's
+#      footprint (and nothing else) of the human-visible framebuffer as a
+#      sealed memfd over that same socket.
+#
+# The decision goes nowhere near `scripted-consent`'s `resolve_scripted`: it
+# is drained by the SAME `service_consent_round` and applied by the SAME
+# `PetitionRegistry::resolve_human` the nested backend's real human click
+# reaches, so this adds no second authority-checking site -- it feeds the one
+# that exists from a socket instead of a pointer. What it cannot prove, and
+# only nested mode with a human at a mouse can, is that a real click lands on
+# the real button rectangle; `consent::grab`'s own hit-test tests and
+# `shim/docs/firefox.md` §9 hold that half.
+#
+# # Two independent gates, and why the feature is not enough by itself
+#
+# Everything carrying authority is gated on the feature ALONE, the
+# `dead-man-injector` posture: the fd adoption, the calloop source, the
+# `service_consent` override, `consent_occlusion_window`. Only the LINE
+# PARSER is `cfg(any(test, feature = "consent-injector"))` -- it is a pure
+# function with no authority, and its vocabulary is exactly the thing that
+# rots if only a Python test ever exercises it.
+#
+# A feature build is additionally inert until `--consent-injector-fd N` is
+# passed: `--headless --consent=interactive` is still REFUSED at startup
+# without it, byte-for-byte as a plain build refuses it, and with no flag
+# there is no grab, no channel and no prompt machinery at runtime at all.
+# That is deliberate (issue #138): a running process must be identifiable as
+# instrumented by inspecting how it was INVOKED (`/proc/<pid>/cmdline`), not
+# only by knowing how it was built.
+#
+# # What never leaves the process
+#
+# The session's trusted indicator (issue #85) is never written to any file or
+# log in any build, this one included. The exported occlusion window is the
+# consent card's own footprint, which `consent::ConsentSurface::composite_over`
+# paints with an opaque `blit_opaque` AFTER the indicator-coloured ring that
+# hugs its outside edge -- so the ring, the scrim and the trust band are never
+# even read back. `HeadlessView::latest_output_rgba` stays `#[cfg(test)]`: no
+# shipping build and no instrumented build can obtain a whole human-visible
+# frame.
+#
+# Never enabled in a deployment build -- same posture as the two features
+# above, and for the same reason: a build that cannot even name a test hook
+# cannot be tricked into responding to one.
+consent-injector = []
 
 [dev-dependencies]
 # The permanent mock-shim fixture (issue #21): a compliant peer speaking the

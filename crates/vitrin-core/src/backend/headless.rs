@@ -714,6 +714,108 @@ mod tests {
         render_once(size).expect("headless render_once must succeed under pixman")
     }
 
+    // --- click-target's on-screen signature ------------------------------
+    //
+    // `shim/tests/click_target.c` paints, before any click lands, a solid
+    // black field with exactly ONE centred green square of `TARGET_SIZE`
+    // edge. Both colours are chosen there with channels that are multiples
+    // of 0x11 and travel the shm path unscaled, so they arrive byte-exact
+    // in the RGBA readback -- no tolerance, no image codec, no decoding
+    // (plan risk R7: nothing but raw byte comparison in this crate).
+    //
+    // This shape is the discriminator the real-app occlusion proof needs.
+    // "The view differs from the empty-scene test pattern" is NOT: the C
+    // shim's own first commit -- an app-less realm view -- already differs
+    // from it, so a wait on mere difference passes before any client has
+    // attached. The test pattern is also, specifically, not excluded by a
+    // green-pixel count alone: it contains a full-height green colour bar
+    // and a green corner marker. What only click-target produces is the
+    // conjunction below: black corners AND a single green region whose
+    // bounding box is exactly the square's edge.
+
+    /// click-target's `TARGET_SIZE`.
+    const CLICK_TARGET_EDGE: u32 = 160;
+    /// click-target's `BACKGROUND` (`0x000000`), as RGBA.
+    const CLICK_TARGET_BG: [u8; 4] = [0x00, 0x00, 0x00, 0xff];
+    /// click-target's `TARGET` (`0x00ff00`), as RGBA.
+    const CLICK_TARGET_FG: [u8; 4] = [0x00, 0xff, 0x00, 0xff];
+
+    /// What a candidate realm view looks like, measured against
+    /// click-target's rendering. Kept as a struct rather than a bare
+    /// `bool` so a timeout can say *how far off* the closest frame was --
+    /// "0 green pixels, corners not black" and "25600 green pixels in a
+    /// 160x160 box but corners not black" are very different bugs.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct ClickTargetSignature {
+        /// All four corners are click-target's black field.
+        corners_are_field: bool,
+        /// Pixels exactly equal to click-target's green.
+        target_pixels: u32,
+        /// Bounding box of those pixels, `(w, h)`; `(0, 0)` if there are none.
+        target_box: (u32, u32),
+    }
+
+    impl ClickTargetSignature {
+        fn of(view: &[u8], w: u32, h: u32) -> Self {
+            let at = |x: u32, y: u32| -> [u8; 4] {
+                let o = (y as usize * w as usize + x as usize) * test_pattern::BYTES_PER_PIXEL;
+                view[o..o + test_pattern::BYTES_PER_PIXEL]
+                    .try_into()
+                    .unwrap()
+            };
+            let corners_are_field = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+                .into_iter()
+                .all(|(x, y)| at(x, y) == CLICK_TARGET_BG);
+            let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
+            let mut target_pixels = 0u32;
+            for y in 0..h {
+                for x in 0..w {
+                    if at(x, y) == CLICK_TARGET_FG {
+                        target_pixels += 1;
+                        x0 = x0.min(x);
+                        y0 = y0.min(y);
+                        x1 = x1.max(x);
+                        y1 = y1.max(y);
+                    }
+                }
+            }
+            let target_box = if target_pixels == 0 {
+                (0, 0)
+            } else {
+                (x1 - x0 + 1, y1 - y0 + 1)
+            };
+            Self {
+                corners_are_field,
+                target_pixels,
+                target_box,
+            }
+        }
+
+        /// True only for a frame click-target itself could have drawn.
+        ///
+        /// The square must be solid (every pixel of a `TARGET_SIZE`-edge
+        /// box) and nothing outside it may be that green, which the
+        /// count-equals-area check enforces jointly with the bounding box:
+        /// a stray green pixel elsewhere grows the box, and a hole in the
+        /// square lowers the count.
+        fn is_click_target(self) -> bool {
+            self.corners_are_field
+                && self.target_box == (CLICK_TARGET_EDGE, CLICK_TARGET_EDGE)
+                && self.target_pixels == CLICK_TARGET_EDGE * CLICK_TARGET_EDGE
+        }
+
+        /// The more app-like of two observations, for the timeout message.
+        fn better_of(self, other: Self) -> Self {
+            if (other.corners_are_field, other.target_pixels)
+                > (self.corners_are_field, self.target_pixels)
+            {
+                other
+            } else {
+                self
+            }
+        }
+    }
+
     /// The RGBA quadruple at `(x, y)` in a tightly packed WIDTH*HEIGHT buffer.
     fn pixel(buf: &[u8], x: u32, y: u32) -> [u8; 4] {
         let offset = (y as usize * WIDTH as usize + x as usize) * test_pattern::BYTES_PER_PIXEL;
@@ -1402,13 +1504,17 @@ mod tests {
 
         // A watchdog: the receive below is blocking, so a wedged real
         // shim/app must fail this test rather than hang the suite -- the
-        // same posture `shim.rs`'s cross-track check takes.
+        // same posture `shim.rs`'s cross-track check takes. Its window is
+        // deliberately WIDER than the content deadline the loop below
+        // enforces: a shim that keeps talking but never paints the app is
+        // the interesting failure, and it should be reported by that
+        // loop's own diagnostic rather than as an anonymous SIGKILL.
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let watchdog = {
             let done = std::sync::Arc::clone(&done);
             let pid = spawned.pid();
             std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + crate::spawn::tests::DEADLINE;
+                let deadline = std::time::Instant::now() + 2 * crate::spawn::tests::DEADLINE;
                 while std::time::Instant::now() < deadline {
                     if done.load(std::sync::atomic::Ordering::Relaxed) {
                         return;
@@ -1422,17 +1528,29 @@ mod tests {
         };
 
         // Drive the real shim until click-target's REAL content lands --
-        // not merely "a commit happened" -- so the human-visible/capture
-        // split below is checked against real app pixels, and could not be
-        // vacuously satisfied by an empty realm view.
-        let background = test_pattern::render(VW, VH);
+        // not merely "a commit happened", and not merely "the view stopped
+        // being the empty-scene test pattern" (the shim's own first commit
+        // satisfies that before any client has attached, which would run
+        // this whole occlusion proof against an app-less realm view). The
+        // wait below blocks on a signature only click-target's rendering
+        // produces, so the human-visible/capture split further down is
+        // checked against real app pixels or not at all.
+        let deadline = std::time::Instant::now() + crate::spawn::tests::DEADLINE;
+        let mut commits = 0u32;
+        let mut best = ClickTargetSignature::default();
         let clean_view = loop {
             let Some(msg) = spawned
                 .connection_mut()
                 .recv_message()
                 .expect("the C shim's framing must be readable")
             else {
-                panic!("the C shim closed the connection before painting real content");
+                panic!(
+                    "the C shim closed the connection after {commits} commit(s) without \
+                     click-target's content ever reaching the realm view (best seen: \
+                     {best:?}); expected a solid {CLICK_TARGET_BG:?} field with one \
+                     centred {CLICK_TARGET_EDGE}x{CLICK_TARGET_EDGE} {CLICK_TARGET_FG:?} \
+                     square"
+                );
             };
             let conn = spawned.connection_mut();
             let committed = server
@@ -1441,12 +1559,31 @@ mod tests {
                 })
                 .expect("the C shim must not violate the shim protocol");
             if committed {
+                commits += 1;
                 state.redraw().expect("composite the shim's commit");
                 let view = state.latest_frame_rgba().expect("readback");
-                if view != background {
+                let seen = ClickTargetSignature::of(&view, VW, VH);
+                if seen.is_click_target() {
                     break view;
                 }
+                best = best.better_of(seen);
             }
+            // A bounded wait that FAILS, never one that proceeds: an
+            // app-less realm view must not be allowed to stand in for the
+            // real app's pixels just because the shim kept talking. (The
+            // blocking `recv_message` above cannot check a clock while it
+            // waits; the watchdog thread covers that half by killing a
+            // wedged shim, which surfaces as the panic above.)
+            assert!(
+                std::time::Instant::now() < deadline,
+                "click-target's content never reached the realm view within {:?} \
+                 ({commits} commit(s) composed; best seen: {best:?}). Expected a solid \
+                 {CLICK_TARGET_BG:?} field with one centred \
+                 {CLICK_TARGET_EDGE}x{CLICK_TARGET_EDGE} {CLICK_TARGET_FG:?} square \
+                 (shim/tests/click_target.c). Proceeding would run the consent-occlusion \
+                 proof against a realm view with no app in it.",
+                crate::spawn::tests::DEADLINE
+            );
         };
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         watchdog.join().expect("watchdog thread");

@@ -230,32 +230,59 @@ retroactively gated.
 
 | Seam | Where | Status under D12 |
 |---|---|---|
-| `vitrind` ↔ `vitrin-mock-shim` | `tests/integration/harness.py`'s `Core()` default (`MOCK_SHIM`), used by `test_runtime_wiring.py`, `test_actuation.py`, `test_demo.py` | **Component tests, not a milestone gate.** They verify startup ordering (#77) and the SDK/recorder wiring (#42, #43) against a controllable synthetic peer — legitimate on their own terms, but none of them may stand in for M1.2–M1.5 evidence. Relabelled in `tests/integration/README.md`. |
+| `vitrind` ↔ `vitrin-mock-shim` | `tests/integration/harness.py`'s `Core()` default (`MOCK_SHIM`), used by `test_runtime_wiring.py` and `test_actuation.py` | **Component tests, not a milestone gate.** They verify startup ordering (#77) and the SDK/recorder wiring (#42) against a controllable synthetic peer — legitimate on their own terms, but neither may stand in for M1.2–M1.5 evidence. Relabelled in `tests/integration/README.md`. `test_demo.py` used to sit in this row; #110/#127 moved it off the mock default onto an explicit real shim path, and it is now the named M1.5 gate (row below). |
 | real C shim ↔ `shim/tests/mock_core.c` | `shim/tests/acceptance/*.sh` (`upstream_frame_path.sh`, `seat_input_replay.sh`, `firefox_bringup.sh`) | **Shim-in-isolation smoke tests, not the milestone proof.** `firefox_bringup.sh` says so explicitly in its own header (added at P1.6.6); the equivalent statement now also appears in `shim/README.md`'s Firefox section. |
-| `crates/xtask/src/main.rs` demo venues | `cargo xtask demo` (nested) execs Firefox directly as if it were the shim (structurally bypasses the insert-shim model — issue #110); `cargo xtask demo --headless` runs the real core against `vitrin-mock-shim` | **Not yet mock-free; this is exactly what #110 (the M1.5 gate) exists to fix.** Until #110 lands, M1.5 is **not** done, regardless of how green the demo looks today — this is the honest statement this re-audit exists to write down. |
+| `crates/xtask/src/main.rs` demo venues | `cargo xtask demo` and `cargo xtask demo --headless` both exec the real `vitrin-shim` (`resolve_shim_bin`), which fork/execs a real app — Firefox ESR nested, `weston-terminal`/`foot` headless | **Mock-free, as of #110 / PR #127.** The prior state is worth keeping on the record: nested execed Firefox *as if it were the shim* (structurally impossible — the core hands a shim fd 3 with an unbound `WAYLAND_DISPLAY`), and headless aliased `vitrin-mock-shim` as both the `--shim` binary and the realm's app. Neither is true now; `vitrin-mock-shim` appears in no venue, and `tests/integration/test_demo.py`'s `DemoUsesNoMockShim` grep-proves it against the two launcher files. |
+| The M1.5 gate's own discriminating power | `tests/integration/test_demo.py` + `examples/agent-demo/run_demo.py` | **Was vacuous until the P1.9.8 gate-integrity pass; now real.** Being mock-free was necessary and not sufficient: the headless assertion asked for 24 changed pixels between two captures, and a real `weston-terminal`'s own asynchronous startup paint clears that unaided (measured: 569 changed pixels spanning 81 px), so the gate passed whether or not the agent's click and typed text reached the app. It now takes a settled control capture first, watches the app idle through a window at least as long as the one it later polls, and requires a change carrying the shape a typed line makes. **Read any green M1.5 run from before that change as "the demo completed against a real app", not as "the actuation landed."** The same pass fixed the real-app consent-occlusion proof in `crates/vitrin-core/src/backend/headless.rs`, which was waiting only for the view to differ from the empty-scene test pattern — satisfied by the shim's first commit, before any client attached. **The first attempt at the shape metric was itself wrong in the same family, and that is the more useful lesson:** it measured the *bounding span* of a scanline's changed pixels (last minus first) while its own prose derived a contiguous *run*, so three unrelated one-cell repaints at x=0, x=300 and x=600 — a cursor, a mode indicator, a scrollbar — cleared it with a 608 px "span" and nothing typed. A metric's name is not evidence about the metric; `ChangeProfileShapeMetrics` in `test_demo.py` now asserts that exact frame pair is rejected, in-process and binary-free. |
 | `tests/integration/test_real_app.py` / `test_real_capture_fidelity.py` / `test_real_actuation.py` / `test_real_firefox.py` / `test_real_gtk.py` | real `vitrind` → real `vitrin-shim` → real app (weston-terminal / GTK / Firefox) | **Mock-free.** These are the #105/#107/#108 gates (and their supporting rungs); each boots its `Core` with an explicit real shim path (`shim=str(self.shim_bin)`), grep-provably never the bare `Core()`/`self.core()` call that defaults to `vitrin-mock-shim` (see `tests/integration/README.md`). They *name* `vitrin-mock-shim`/`mock_core` only in disclaiming prose and assertion strings ("no mock in the path") — a plain-text grep for those strings is not the right proof here; check the invocation instead. |
 
 Grep-proving the rule (run from repo root; both expect no output):
 
 ```bash
-# (1) The component tests never claim to be a milestone exit/acceptance gate.
+# (1) The MOCK-BACKED COMPONENT tests never claim to be a milestone
+#     exit/acceptance gate. test_demo.py is deliberately NOT in this list any
+#     more: since #110 it *is* the named M1.5 gate and says so in its own
+#     docstring, which is the correct claim -- listing it here would flag its
+#     own truthful prose.
 rg -l 'M1\.[2-5].{0,80}(exit gate|acceptance gate)' \
-  tests/integration/test_actuation.py tests/integration/test_demo.py \
+  tests/integration/test_actuation.py \
   tests/integration/test_runtime_wiring.py
 
-# (2) Every test_real_*.py gate module boots Core() with an explicit real
-#     shim path, never the bare Core()/self.core() call that defaults to
+# (2) Every NAMED MILESTONE GATE boots Core() with an explicit real shim
+#     path, never the bare Core()/self.core() call that defaults to
 #     harness.MOCK_SHIM (see tests/integration/README.md for detail; a plain
 #     text grep for "mock" inside these files would false-positive on their
 #     own disclaiming prose, so this checks the actual invocation instead).
-rg --files-without-match 'shim=str\(self\.shim_bin\)' tests/integration/test_real_*.py
+#     test_demo.py is named explicitly because the test_real_*.py glob does
+#     not match it -- which meant this check could not see the M1.5 gate file
+#     at all, the one gate whose mock-freeness the check exists to prove.
+rg --files-without-match 'shim=str\(self\.shim_bin\)' \
+  tests/integration/test_real_*.py \
+  tests/integration/test_demo.py
 ```
 
 The milestone-closing checklist (used when marking M1.2–M1.5 done in an issue
 or PR) requires: (1) the named gate issue is closed; (2) its test file boots
 its `Core`/shim with an explicit real binary path, never the mock defaults
 (check (2) above); (3) no prose anywhere claims the milestone is met on a
-component-test result.
+component-test result; and (4) — added by the P1.9.8 gate-integrity pass —
+**the gate has been watched failing.** Mock-freeness proves what a test is
+*wired to*, never what it *discriminates*: both a gate that waited only for
+the view to stop being the empty test pattern and one that asked for 24
+changed pixels were mock-free and could not fail on the property they named.
+Before citing a gate, break the behaviour it claims to prove and confirm it
+goes red. Watching it go red on the *actuation* is still not enough on its
+own: the replacement M1.5 predicate failed correctly when the click and the
+typed text were removed, and simultaneously accepted a frame pair carrying no
+typed text at all, because the quantity it measured was not the quantity its
+prose named. Where a gate's criterion is a computed metric, pin the metric
+itself against constructed inputs — one it must accept, and one from the
+class it claims to reject.
+
+**Open against this checklist today:** M1.4's consent half (#109) has no
+gate-level evidence — `test_real_deadman.py` never raises a prompt, and the
+real-app consent-occlusion proof is an in-process Rust test, which item (2)
+disqualifies. See `tests/integration/README.md`'s "M1.4's open consent gap".
 
 ### Verification per milestone
 

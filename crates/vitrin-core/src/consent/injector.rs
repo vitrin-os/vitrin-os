@@ -24,6 +24,13 @@
 //! it reports the creating process, so it excludes an exotic cross-uid
 //! handover and nothing more.
 //!
+//! Which is exactly why [`live::validate_injector_fd`] must be a check on the
+//! descriptor's *shape* and not on its peer: the core's own `core.sock`
+//! listener is an `AF_UNIX`/`SOCK_STREAM` socket whose `SO_PEERCRED` reports
+//! this very process, so every credential test passes on it while adopting it
+//! would give one live descriptor two owners. See that function's docs — the
+//! rule is "connected, never listening", and it is a memory-safety rule.
+//!
 //! # Why not a signal
 //!
 //! `dead-man-injector` uses `SIGUSR1`, and the asymmetry is decisive rather
@@ -322,6 +329,30 @@ mod live {
     ///
     /// Fails closed on every ambiguity; the caller turns a failure into a
     /// **startup error**, never a warning.
+    ///
+    /// # Why "connected, never listening" is a memory-safety rule, not taste
+    ///
+    /// [`Injector::adopt`] takes **ownership** of the number this returns
+    /// `Ok` for, so the predicate must exclude every descriptor the core
+    /// already owns — otherwise the `OwnedFd` is a *second* owner and its
+    /// `Drop` closes a descriptor the first owner still holds (best case an
+    /// abort on a double close, worst case the number was recycled in between
+    /// and an unrelated live descriptor — a client connection, the recorder,
+    /// a memfd — is closed instead). File type plus `SO_TYPE` does not
+    /// exclude that: the core's own `core.sock` **listener** is an
+    /// `AF_UNIX`/`SOCK_STREAM` socket, bound by `bind_core_socket` before
+    /// this runs, and `SO_PEERCRED` on it reports this very process, so the
+    /// same-uid check in `adopt` passes as well. `--consent-injector-fd 4` on
+    /// a core whose listener landed on 4 reproduced exactly that: adopted,
+    /// served two clients, then died at shutdown with `IO Safety violation:
+    /// owned file descriptor already closed`.
+    ///
+    /// The channel is by construction the **connected** end of a socketpair
+    /// the harness made, so `SO_ACCEPTCONN == 0` plus a successful
+    /// `getpeername` states that positively, and nothing the core owns at
+    /// adoption time satisfies both: the listener is `SO_ACCEPTCONN == 1`,
+    /// and no accepted client connection exists yet (the injector is adopted
+    /// in `start_headless`, before the loop dispatches a single event).
     pub(crate) fn validate_injector_fd(fd: BorrowedFd<'_>, number: RawFd) -> Result<(), String> {
         if number < LOWEST_FD {
             return Err(format!(
@@ -351,6 +382,28 @@ mod live {
                 ))
             }
         }
+        match rustix::net::sockopt::socket_acceptconn(fd) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(format!(
+                    "`--consent-injector-fd {number}` is a LISTENING socket; the channel is the \
+                     connected end of an inherited socketpair. A listener at this number is \
+                     almost certainly this core's own `core.sock`, which the core already owns \
+                     — adopting it would give one descriptor two owners"
+                ))
+            }
+            Err(err) => {
+                return Err(format!(
+                    "`--consent-injector-fd {number}`: cannot read SO_ACCEPTCONN: {err}"
+                ))
+            }
+        }
+        if let Err(err) = rustix::net::getpeername(fd) {
+            return Err(format!(
+                "`--consent-injector-fd {number}` is not connected to a peer ({err}); the \
+                 channel is the connected end of an inherited socketpair"
+            ));
+        }
         Ok(())
     }
 
@@ -377,11 +430,15 @@ mod live {
                 .map_err(|err| format!("`--consent-injector-fd {number}`: F_GETFL: {err}"))?;
             rustix::fs::fcntl_setfl(borrowed, flags | rustix::fs::OFlags::NONBLOCK)
                 .map_err(|err| format!("`--consent-injector-fd {number}`: O_NONBLOCK: {err}"))?;
-            // SAFETY: validated immediately above as an open SOCK_STREAM
-            // socket, and nothing else in this process owns it — it was
-            // inherited across `fork`/`exec` from the harness and named on
-            // the command line, so no other `OwnedFd` in the core wraps it.
-            // From here the `Injector` is its sole owner and closes it once.
+            // SAFETY: validated immediately above as an open, *connected*,
+            // non-listening SOCK_STREAM socket. That is what excludes the one
+            // descriptor the core itself owns at this point — its `core.sock`
+            // listener, which is otherwise the same file type, the same
+            // `SO_TYPE` and the same peer uid (see `validate_injector_fd`'s
+            // docs). No other `OwnedFd` in the core wraps a connected socket
+            // yet: the listener has accepted nobody, because the event loop
+            // has not dispatched. So this `OwnedFd` is the sole owner from
+            // here and closes the descriptor exactly once.
             let owned = unsafe { OwnedFd::from_raw_fd(number) };
             let conn = vitrin_ipc::Connection::from_fd(owned).map_err(|err| {
                 format!("`--consent-injector-fd {number}`: cannot read SO_PEERCRED: {err}")
@@ -644,6 +701,73 @@ mod live {
             let (read, _write) = rustix::pipe::pipe().expect("a pipe");
             let err = validate_injector_fd(read.as_fd(), 7).expect_err("a pipe is not a socket");
             assert!(err.contains("not a socket"), "{err}");
+        }
+
+        /// A **listening** `AF_UNIX`/`SOCK_STREAM` socket is refused, and an
+        /// unconnected one with it.
+        ///
+        /// This is the descriptor shape the core already owns: `core.sock`,
+        /// bound by `bind_core_socket` before the headless backend starts, is
+        /// the right file type, the right `SO_TYPE`, and reports this very
+        /// process from `SO_PEERCRED`. Adopting it made the `OwnedFd` in
+        /// `Injector::adopt` a *second* owner of a live descriptor, which
+        /// aborted the process at shutdown (`IO Safety violation: owned file
+        /// descriptor already closed`) and, with a recycled number, would
+        /// have closed an unrelated live descriptor instead.
+        #[test]
+        fn a_listening_or_unconnected_socket_is_never_the_channel() {
+            use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+            // Exactly how the core's own listener is shaped: an AF_UNIX
+            // stream socket bound to a path and listening.
+            let path = std::env::temp_dir().join(format!(
+                "vitrin-injector-listener-{}-{:?}.sock",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+            let err = validate_injector_fd(listener.as_fd(), 4)
+                .expect_err("the core's own listener must never be adoptable");
+            assert!(err.contains("LISTENING"), "{err}");
+
+            // ...and it really would have passed every earlier check.
+            let stat = rustix::fs::fstat(listener.as_fd()).expect("fstat");
+            assert_eq!(
+                rustix::fs::FileType::from_raw_mode(stat.st_mode),
+                rustix::fs::FileType::Socket
+            );
+            assert_eq!(
+                rustix::net::sockopt::socket_type(listener.as_fd()).expect("SO_TYPE"),
+                SocketType::STREAM
+            );
+
+            // A socket that was never connected and never bound: the right
+            // type, no peer. `getpeername` is what refuses it.
+            let lone = rustix::net::socket_with(
+                AddressFamily::UNIX,
+                SocketType::STREAM,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .expect("an unconnected socket");
+            let err = validate_injector_fd(lone.as_fd(), 7)
+                .expect_err("an unconnected socket is not the channel");
+            assert!(err.contains("not connected"), "{err}");
+
+            // The genuine article -- a connected socketpair end -- still
+            // passes, so the two new rules refuse nothing the harness sends.
+            let (a, _b) = rustix::net::socketpair(
+                AddressFamily::UNIX,
+                SocketType::STREAM,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .expect("a socketpair");
+            validate_injector_fd(a.as_fd(), 7).expect("the real channel is still adoptable");
+
+            drop(listener);
+            let _ = std::fs::remove_file(&path);
         }
     }
 }

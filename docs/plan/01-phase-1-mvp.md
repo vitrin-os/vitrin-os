@@ -322,8 +322,17 @@ and `the_card_footprint_carries_no_indicator_pixel` which checks it). So issue
 #85's "a confined app cannot forge the frame" property remains
 **component-level** evidence — `consent/mod.rs`'s band and frame tests,
 `backend/headless.rs`'s occlusion tests, and `shim/docs/firefox.md` §9 for a
-human at a real display. **If unspoofability is read as part of M1.4's consent
-criterion, that part is not closed.** The physical click itself — the hit
+human at a real display. **Adjudicated 2026-07-25: unspoofability is not an
+M1.4 criterion, and M1.4 is closed on #108 + #109 + #138.** Neither the
+milestone table above nor this section's verification list for M1.4 names it —
+M1.4 asks for core-rendered consent, pointer+text actuation, mid-prompt
+actuations blocked, hold-Esc revocation, and sender-constraint/expiry
+enforcement, each of which now has a named mock-free gate. Reading an unstated
+criterion in at closing time would be its own kind of dishonesty — the mirror
+of the understated claims this checklist exists to catch — so the gap is
+tracked on its own terms as **#139** rather than absorbed into a closed
+milestone, and a later reader of "M1.4 done" can find exactly what it did and
+did not buy. The physical click itself — the hit
 test, the 500 ms guard interval, press-arms/release-commits, and the origin
 check that stops an agent answering its own prompt — is likewise proven only
 by `consent/grab.rs`'s own tests and that nested recipe, exactly as

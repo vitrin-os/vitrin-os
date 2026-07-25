@@ -70,8 +70,12 @@ be discovered:
   band and frame tests, `backend/headless.rs`'s
   `a_prompt_reaches_human_visible_output_but_never_a_capture` and the
   real-app `c_shim_consent_prompt_occludes_…`, and, for a human,
-  `shim/docs/firefox.md` §9's nested recipe. If unspoofability is read as
-  part of M1.4's consent criterion, **this gate does not close it.**
+  `shim/docs/firefox.md` §9's nested recipe. **Adjudicated 2026-07-25:
+  unspoofability is not an M1.4 criterion** — neither the milestone table
+  nor its verification list in `docs/plan/01-phase-1-mvp.md` §5 names it —
+  **so M1.4 is closed, and this gap is tracked separately as #139** rather
+  than folded into a closed milestone. Do not cite M1.4 as evidence that
+  the trusted indicator is unforgeable; cite #139's status instead.
   (A whole-frame mirror would have let the gate check the band — and would
   have written the session secret to a file a same-uid app can read, which
   is precisely what `consent/indicator.rs` forbids. The smaller claim is

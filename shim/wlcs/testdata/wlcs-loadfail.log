@@ -1,0 +1,1 @@
+Failed to load compositor integration module /build/scratch/broken.so: /build/scratch/broken.so: undefined symbol: no_such_symbol_anywhere

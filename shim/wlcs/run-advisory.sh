@@ -23,12 +23,24 @@
 #
 # Exit code: always 0. Non-zero only for a usage error (missing arguments
 # or an unusable binary/module), never for a failing or skipped test.
+#
+# Self-test: `bash shim/wlcs/test-summary.sh` -- exercises this script and
+# shim/wlcs/summary.sh against checked-in real wlcs output, with no wlcs
+# package or built module required. Run it after touching anything here.
 set -euo pipefail
 
 if [ "$#" -lt 2 ]; then
 	echo "usage: $0 <wlcs-binary> <vitrin-shim-wlcs.so> [output-dir]" >&2
 	exit 2
 fi
+
+# The log parsing lives in its own file so shim/wlcs/test-summary.sh can drive
+# it against checked-in, real wlcs output without a wlcs binary, a built
+# module or a compositor. Run that self-test after touching anything about
+# how this script counts: `bash shim/wlcs/test-summary.sh`.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=shim/wlcs/summary.sh
+. "$SCRIPT_DIR/summary.sh"
 
 WLCS_BIN="$1"
 MODULE="$2"
@@ -93,6 +105,19 @@ fi
 #     "v0's seat vocabulary has no touch event") -- there is structurally
 #     nothing for these tests to exercise, so running them would only
 #     generate noise, not information.
+#
+#     THAT EXCLUSION IS INCOMPLETE, AND IT IS A TIME BOMB. Excluding
+#     *Touch* SUITES does not exclude the touch-device PARAMETERS of the
+#     parameterised suites kept below:
+#     SurfaceInputRegions/SurfaceInputCombinations is instantiated over
+#     (surface type x input device), so half its parameters use a touch
+#     device. On wlcs 1.6.1 (what Ubuntu 24.04 ships, so what CI installs)
+#     those parameters fail before they ever reach create_touch, so the
+#     run completes. On wlcs 1.7.0 the first one that gets that far
+#     SEGFAULTS the runner, taking the remaining ~131 tests in scope with
+#     it -- see README.md's "Known hazard". Left as-is deliberately: a
+#     crash the summary reports as `status=aborted` is evidence; a crash
+#     filtered out by test index is a number nobody can interpret later.
 #   - Interactive move/resize and multi-window (parent/child) toplevel
 #     tests: KEPT IN, even though README.md's pass-list explains they are
 #     expected to fail or time out (xdg.c's layout is fixed
@@ -128,34 +153,44 @@ echo "" | tee -a "$LOG"
 	--gtest_output="xml:$XML" \
 	>>"$LOG" 2>&1 || true
 
-PASSED=$(grep -c '^\[       OK \]' "$LOG" || true)
-SKIPPED=$(grep -c '^\[     SKIP' "$LOG" || true)
-# The failure count from gtest's own summary line ("[  FAILED  ] N tests
-# failed:"), not a grep -c on "[  FAILED  ]" -- that pattern also matches
-# each per-test line in the re-listing gtest prints below the summary
-# header, which would double-count.
-# Each `|| true` below (not just on the outer grep -E) matters: this is
-# exactly the scenario that actually happened when the integration module
-# failed to load (undefined-symbol / dlopen failure, see the LD_LIBRARY_PATH
-# comment above) -- $LOG then has neither a "[ FAILED ]" summary line nor a
-# "[==========] N tests from" line at all, so FAILED_LINE/TOTAL_LINE are
-# empty and the inner `grep -oE '[0-9]+'` on an empty string matches
-# nothing and exits 1. Under `set -o pipefail`, that failure is the exit
-# status of the whole `echo | grep | head` pipeline feeding the assignment,
-# which trips `set -e` on the assignment itself -- aborting the script
-# before it ever reaches `exit 0`, the one guarantee this script exists to
-# keep. (This is not hypothetical: it's what actually happened in CI.)
-FAILED_LINE=$(grep -E '^\[  FAILED  \] [0-9]+ tests? failed:' "$LOG" || true)
-FAILED=$(echo "$FAILED_LINE" | grep -oE '[0-9]+' | head -1 || true)
-FAILED="${FAILED:-0}"
-TOTAL_LINE=$(grep -E '^\[==========\] [0-9]+ tests? from' "$LOG" | tail -1 || true)
-TOTAL=$(echo "$TOTAL_LINE" | grep -oE '[0-9]+' | head -1 || true)
-TOTAL="${TOTAL:-0}"
+# Counting is delegated to summary.sh's wlcs_summarize_log; see that file for
+# why every count is derived twice and why the patterns are wlcs's own
+# listener's format rather than stock googletest's.
+#
+# It swallows its own errors by construction so the guarantee this script
+# exists to keep survives a log that isn't there. That is not a theoretical
+# concern: when the integration module failed to dlopen (undefined-symbol
+# failure, see the LD_LIBRARY_PATH comment above) $LOG had no googletest
+# output in it at all, every inner `grep` matched nothing and exited 1, and
+# under `set -o pipefail` that failure became the exit status of the
+# assignment itself -- tripping `set -e` and aborting the script before it
+# ever reached `exit 0`. (This is not hypothetical: it is what actually
+# happened in CI. testdata/wlcs-loadfail.log is a real capture of that log
+# shape, and test-summary.sh asserts this path still ends at `exit 0`.)
+#
+# STATUS, not just counts. `failed=0` from a run that DIED mid-suite is the
+# same three characters as `failed=0` from a clean run; the status word is
+# what tells those apart, and it is why the summary line below carries one.
+read -r TOTAL PASSED FAILED SKIPPED STATUS < <(wlcs_summarize_log "$LOG")
 
 {
 	echo ""
 	echo "== summary =="
-	echo "total=$TOTAL passed=$PASSED failed=$FAILED skipped=$SKIPPED"
+	echo "total=$TOTAL passed=$PASSED failed=$FAILED skipped=$SKIPPED status=$STATUS"
+	if [ "$STATUS" = "aborted" ]; then
+		echo ""
+		echo "WARNING: the wlcs runner died before finishing (no end-of-run"
+		echo "summary in the log). The counts above are only the tests that"
+		echo "completed before it died -- everything after that point never"
+		echo "ran and is counted nowhere. See shim/wlcs/README.md's \"Known"
+		echo "blocker\" section."
+	elif [ "$STATUS" = "no-output" ]; then
+		echo ""
+		echo "WARNING: no test ever started -- the log contains no wlcs test"
+		echo "output at all. This normally means the module failed to load"
+		echo "(check the log for a dlopen/undefined-symbol error), not that"
+		echo "the suite passed."
+	fi
 	echo ""
 	echo "Dominant failure categories in this run (see shim/wlcs/README.md"
 	echo "for the standing, annotated pass-list -- these counts are"
@@ -171,6 +206,6 @@ TOTAL="${TOTAL:-0}"
 echo ""
 echo "full log:      $LOG"
 echo "gtest XML:     $XML"
-echo "total=$TOTAL passed=$PASSED failed=$FAILED skipped=$SKIPPED"
+echo "total=$TOTAL passed=$PASSED failed=$FAILED skipped=$SKIPPED status=$STATUS"
 
 exit 0

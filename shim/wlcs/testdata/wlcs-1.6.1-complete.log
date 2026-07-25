@@ -1,0 +1,79 @@
+Note: Google Test filter = XdgSurfaceStableTest.*:WlOutputTest.*:SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/0:SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/1:SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/2:SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/3
+[==========] Running 12 tests from 3 test suites.
+[----------] Global test environment set-up.
+[----------] 6 tests from XdgSurfaceStableTest
+[ RUN      ] XdgSurfaceStableTest.supports_xdg_shell_stable_protocol
+[       OK ] XdgSurfaceStableTest.supports_xdg_shell_stable_protocol (2 ms)
+[ RUN      ] XdgSurfaceStableTest.gets_configure_event
+./tests/xdg_surface_stable.cpp:54: Failure
+Actual function call count doesn't match EXPECT_CALL(xdg_surface, configure)...
+         Expected: to be called once
+           Actual: never called - unsatisfied and active
+
+[  FAILED  ] XdgSurfaceStableTest.gets_configure_event (1 ms)
+[ RUN      ] XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_existing_role_is_an_error
+00:00:00.005 [ERROR] [../../../../../../build/vitrin/shim/src/ledger.c:86] globals-error: seq=17 code=3 message="xdg_surface has never been configured"
+xdg_surface#13: error 3: xdg_surface has never been configured
+unknown file: Failure
+C++ exception with description "Wayland protocol error: 3 on interface xdg_surface v5" thrown in the test body.
+
+[  FAILED  ] XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_existing_role_is_an_error (1 ms)
+[ RUN      ] XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_attached_buffer_is_an_error
+./tests/xdg_surface_stable.cpp:122: Failure
+Failed
+Expected protocol error not received
+
+[  FAILED  ] XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_attached_buffer_is_an_error (1 ms)
+[ RUN      ] XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_committed_buffer_is_an_error
+00:00:00.008 [ERROR] [../../../../../../build/vitrin/shim/src/ledger.c:86] globals-error: seq=17 code=3 message="xdg_surface must not have a buffer at creation"
+xdg_wm_base#11: error 3: xdg_surface must not have a buffer at creation
+./tests/xdg_surface_stable.cpp:145: Failure
+Value of: error.error_code()
+Expected: is equal to 4
+  Actual: 3 (of type unsigned int)
+
+[  FAILED  ] XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_committed_buffer_is_an_error (1 ms)
+[ RUN      ] XdgSurfaceStableTest.attaching_buffer_to_unconfigured_xdg_surface_is_an_error
+./tests/xdg_surface_stable.cpp:175: Failure
+Failed
+Expected protocol error not received
+
+[  FAILED  ] XdgSurfaceStableTest.attaching_buffer_to_unconfigured_xdg_surface_is_an_error (1 ms)
+[----------] 6 tests from XdgSurfaceStableTest (9 ms total)
+
+[----------] 2 tests from WlOutputTest
+[ RUN      ] WlOutputTest.wl_output_properties_set
+[       OK ] WlOutputTest.wl_output_properties_set (1 ms)
+[ RUN      ] WlOutputTest.wl_output_release
+[       OK ] WlOutputTest.wl_output_release (1 ms)
+[----------] 2 tests from WlOutputTest (2 ms total)
+
+[----------] 4 tests from SurfaceInputRegions/SurfaceInputCombinations
+[ RUN      ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/0
+[          ] Missing extension: wl_shell>= 1
+[     SKIP ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/0 (1ms)
+[ RUN      ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/1
+[          ] Missing extension: wl_shell>= 1
+[     SKIP ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/1 (1ms)
+[ RUN      ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/2
+[          ] Missing extension: zxdg_shell_v6>= 1
+[     SKIP ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/2 (1ms)
+[ RUN      ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/3
+[          ] Missing extension: zxdg_shell_v6>= 1
+[     SKIP ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/3 (1ms)
+[----------] 4 tests from SurfaceInputRegions/SurfaceInputCombinations (5 ms total)
+
+[----------] Global test environment tear-down
+[==========] 12 tests from 3 test cases run. (18ms total elapsed)
+[  PASSED  ] 3 tests
+[  SKIPPED ] 4 tests skipped:
+[  SKIPPED ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/2
+[  SKIPPED ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/3
+[  SKIPPED ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/1
+[  SKIPPED ] SurfaceInputRegions/SurfaceInputCombinations.input_not_seen_in_region_after_null_buffer_committed/0
+[  FAILED  ] 5 tests failed:
+[  FAILED  ] XdgSurfaceStableTest.attaching_buffer_to_unconfigured_xdg_surface_is_an_error
+[  FAILED  ] XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_committed_buffer_is_an_error
+[  FAILED  ] XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_attached_buffer_is_an_error
+[  FAILED  ] XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_existing_role_is_an_error
+[  FAILED  ] XdgSurfaceStableTest.gets_configure_event

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The M1.3 exit gate (P1.8.5, issue #107): an agent observes a REAL app end
 to end through the real enforcement chokepoint, and the capture path is proved
 to add no distortion.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The mock shim as an **executable** — the child `vitrin-core`'s spawn
 //! manager (P1.5.2, issue #31) actually forks and `exec`s.
 //!

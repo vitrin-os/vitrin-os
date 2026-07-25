@@ -2,6 +2,8 @@
  * pointer click landing on a known feature, for the P1.8.6 agent-actuation
  * gate (issue #108).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * WHY THIS EXISTS. The M1.4 gate asks that an agent's injected pointer click
  * lands on a REAL app surface at the coordinate the agent observed, and that
  * the landing is confirmed by the agent's own observe() -- decision D10, the

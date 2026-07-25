@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Minimal deterministic PNG encoding for captured frames (pure stdlib).
 
 PNG encoding lives in the SDK, never in the core (plan risk R7: the TCB

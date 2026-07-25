@@ -1,5 +1,7 @@
 /* xdg.c -- Phase D (the app's window).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * Puts the app's xdg_toplevel into the scene graph and holds it at exactly
  * the realm-view size the core announced in `configure`. Without this the
  * shim is a compositor with nothing to composite: P1.6.1 stood up

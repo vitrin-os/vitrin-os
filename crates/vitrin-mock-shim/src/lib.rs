@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A mock per-app shim: the **permanent test fixture** for the shim-facing
 //! side of the trusted core (issue #21, P1.3.4).
 //!

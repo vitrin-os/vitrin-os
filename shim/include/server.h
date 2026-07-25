@@ -1,6 +1,8 @@
 /* server.h -- shared state and phase prototypes for the Vitrin OS Wayland
  * shim (P1.6.1 skeleton, P1.6.2 upstream link).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * The shim is a tiny wlroots headless-backend compositor that serves exactly
  * one app over one private Wayland socket. It never touches real hardware --
  * the trusted core owns the screen. What it composites, it forwards up to

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Acceptance criterion (issue #14): the open-fd count stays flat over
 //! 10 000 messages, half of them carrying an fd via `SCM_RIGHTS`.
 //!

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Blocking Unix-socket transport: frame buffering and SCM_RIGHTS receipt.
 
 One :class:`Transport` wraps one connected ``AF_UNIX`` ``SOCK_STREAM``

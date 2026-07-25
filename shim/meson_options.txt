@@ -9,7 +9,8 @@
 # THE LICENSE BOUNDARY THIS OPTION DRAWS: shim/wlcs/integration.c is
 # GPL-3.0-only (see its own header and shim/wlcs/README.md) because it links
 # against the GPL-3.0 wlcs project's headers -- unlike every other target in
-# this file, which is MIT. Nothing this option builds is installed
+# this file, which is MPL-2.0 (plus the generated, Apache-2.0
+# include/vitrin-protocol.h). Nothing this option builds is installed
 # (meson.build has no `install: true` on the wlcs targets) or linked into
 # the `vitrin-shim` executable itself.
 option('wlcs', type: 'feature', value: 'auto',

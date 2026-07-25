@@ -1,5 +1,7 @@
 /* ledger.h -- the "globals touched" ledger (P1.6.4).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * A permanent diagnostic, not a debugging hack. The v0 global set is "a
  * contract, not a floor" (plan E6 / R2), which is only an honest thing to say
  * if additions to it are *driven by evidence*. This file is that evidence: it

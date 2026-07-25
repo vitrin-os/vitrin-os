@@ -3,6 +3,13 @@ name = "vitrin-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
+# Not a workspace member (see below), so nothing is inherited -- state it.
+# Apache-2.0 per D-005 / issue #133: these are protocol-robustness
+# instruments an alternate implementer should be able to point at their own
+# decoder, not part of the MPL-2.0 reference implementation. The dependency
+# on vitrin-ipc (MPL-2.0) is fine under MPL-2.0 section 3.3 and moot in
+# practice -- fuzz targets are never distributed.
+license = "Apache-2.0"
 
 # cargo-fuzz's own workspace convention: this crate is deliberately NOT a
 # member of the root workspace (the root manifest's `members = ["crates/*"]`

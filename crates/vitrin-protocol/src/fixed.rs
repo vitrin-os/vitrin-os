@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The `fixed` wire argument type: signed 24.8 fixed-point, wire-encoded as a
 //! raw `i32` (see `docs/protocol/00-conventions.md` 2.2). Used only by
 //! `vitrin_shim_seat.motion`'s `x`/`y` in v0, so that later server-side

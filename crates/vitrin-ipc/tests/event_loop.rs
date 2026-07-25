@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! P1.2.2 acceptance: the transport plugs into a calloop event loop as an
 //! ordinary event source. Both tests run the whole server side on a single
 //! thread inside one [`EventLoop`] -- there is no dedicated IPC thread; the

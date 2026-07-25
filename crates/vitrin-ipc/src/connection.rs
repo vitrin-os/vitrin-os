@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! One transport connection: blocking frame send/receive with `SCM_RIGHTS`
 //! fd passing and the peer credentials captured when the connection came
 //! into existence.

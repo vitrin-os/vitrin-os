@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The M1.2 exit gate: the whole real system, end to end, no mock on any seam.
 
 Every other integration test drives the shipped `vitrind` against

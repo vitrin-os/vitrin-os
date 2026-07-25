@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Intermediate representation of the Vitrin wire protocol.
 //!
 //! This module is the losslessly-parsed, structured form of `protocol/vitrin-v0.xml`

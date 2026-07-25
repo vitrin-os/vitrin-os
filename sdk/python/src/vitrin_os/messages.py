@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Per-message codecs for the principal-facing half of the protocol.
 
 Opcodes are implicit document order in protocol/vitrin-v0.xml, requests and

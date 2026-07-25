@@ -1,5 +1,7 @@
 /* output.c -- Phase C (output + scene) and the frame path.
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * Adds one headless output, publishes its wl_output global, wires it into a
  * wlr_scene via a wlr_output_layout, and drives the loop that turns the
  * app's commits into frames on the core's wire.

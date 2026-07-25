@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The flight-recorder log v0 (P1.4.5, issue #29): the journal seed --
 //! a JSON-lines structured event log recording handshakes, grant lifecycle
 //! transitions, consent decisions, realm launches, and **every** enforcement

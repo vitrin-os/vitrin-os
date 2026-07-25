@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The shared golden-bytes corpus, asserted against the Python codec.
 
 These frames are byte-for-byte identical to

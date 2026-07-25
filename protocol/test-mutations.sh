@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Negative-mutation corpus for the Vitrin protocol IDL schema.
 #
 # Each case applies one illegal mutation to a copy of protocol/vitrin-v0.xml

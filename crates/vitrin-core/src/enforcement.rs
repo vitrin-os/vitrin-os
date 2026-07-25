@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The enforcement chokepoint (P1.4.4, issue #28): the **single function**
 //! through which every capture and every actuation passes --
 //! [`Chokepoint::enforce_use`] -- checking `connection -> principal ->

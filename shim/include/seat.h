@@ -2,6 +2,8 @@
  * `vitrin_shim_seat` events from the core, replayed into the app through the
  * shim's own `wl_seat`.
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * This is the actuation half of artifact A5. `upstream.c` receives the five
  * seat events off the wire; everything that happens to them afterwards lives
  * here. The core is a router, this file is the replayer, and the app is an

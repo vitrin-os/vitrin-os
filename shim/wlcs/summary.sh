@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
 # summary.sh -- parse a wlcs run log into total/passed/failed/skipped counts.
 #
 # Sourced by run-advisory.sh and exercised directly by test-summary.sh against

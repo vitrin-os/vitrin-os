@@ -1,6 +1,8 @@
 /* wire.c -- framed send/receive over the core socketpair. See wire.h for
  * the design and for why the receive path needs no fd machinery.
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * What happens, in what order:
  *
  *   adopt   -- claim fd 3, re-arm FD_CLOEXEC, go non-blocking

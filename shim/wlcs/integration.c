@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-only
  *
  * ============================================================================
- * WHY THIS ONE FILE IS GPL-3.0, IN A REPOSITORY THAT IS OTHERWISE MIT
+ * WHY THIS ONE FILE IS GPL-3.0, IN AN OTHERWISE MPL-2.0 REPOSITORY
  * ============================================================================
  * This translation unit #includes <wlcs/display_server.h> and
  * <wlcs/pointer.h> (from Canonical's `wlcs` project, MirServer/wlcs), which
@@ -12,9 +12,16 @@
  * the `wlcs` Debian/Ubuntu package, or LICENSE in the wlcs source tree). A
  * compiled object that implements that header's ABI is a work based on it,
  * so the resulting shared module is a GPL-3.0 combined work regardless of
- * this repository's default MIT license. shim/wlcs/README.md is the
- * normative statement of that boundary and of everything this module does
- * NOT cover; read it before touching this file.
+ * how the rest of this repository is licensed. That combination is lawful
+ * because the shim sources this module links (shim/src/*.c) are MPL-2.0,
+ * which names GPL-3.0 a Secondary License (MPL 2.0 section 1.12) and
+ * permits distributing the Larger Work under GPL terms (section 3.3) --
+ * which is exactly what MPL's Exhibit B switches off, so no file under
+ * shim/ may ever carry the Exhibit B notice. (The one Apache-2.0 file that
+ * also lands here, the generated include/vitrin-protocol.h, is one-way
+ * compatible into GPL-3.0.) shim/wlcs/README.md is the normative statement
+ * of that boundary and of everything this module does NOT cover; read it
+ * before touching this file.
  *
  * The boundary is drawn at the directory: nothing outside shim/wlcs/ needs
  * to know this file exists, the main `vitrin-shim` executable never links

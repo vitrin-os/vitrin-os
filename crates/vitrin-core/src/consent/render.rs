@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Layout and rasterization of the consent card: [`rasterize`] turns one
 //! [`PromptContent`] into an opaque RGBA8888 buffer plus the rectangle of
 //! every choice it offers.

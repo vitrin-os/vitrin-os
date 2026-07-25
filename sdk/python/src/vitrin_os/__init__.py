@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """vitrin_os — the pure-Python agent SDK for the Vitrin OS wire protocol.
 
 A deliberately independent second implementation of the wire format

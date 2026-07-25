@@ -1,24 +1,135 @@
 Vitrin OS — licensing notice
 
-Decision D-005 (docs/plan/20-decision-log.md) settles a split license:
+This file is the normative path -> license map for this repository.
 
-  - protocol wire definitions and schemas (protocol/vitrin-v0.xml,
-    protocol/vitrin-v0.rng) and the client SDKs (sdk/python/, and any
-    future Rust SDK) — Apache License 2.0 (LICENSE), explicit patent grant.
-  - spec prose (docs/PRD.md, docs/protocol/*.md, docs/plan/**) —
-    Creative Commons Attribution 4.0 International (LICENSE-CC-BY-4.0).
-  - the reference implementation (crates/vitrin-core, crates/vitrin-ipc,
-    crates/vitrin-scanner, crates/xtask, shim/) is intended, per D-005, to
-    carry a weak-copyleft license (MPL-2.0 preferred, LGPL-3.0 the recorded
-    fallback) plus SPDX-License-Identifier headers throughout.
+Decision D-005 (docs/plan/20-decision-log.md) settles the split; D-016 in the
+same log records its execution — why MPL-2.0 was taken over the LGPL-3.0
+fallback D-005 also recorded, and exactly where the line between the
+copyleft and permissive halves falls. D-015 records the related decision to
+file no patents and rely on defensive publication plus the license patent
+grants instead.
 
-**Current state of execution, honestly:** the Apache-2.0 and CC-BY-4.0
-halves above are in force as of this notice. The reference-implementation
-half is NOT yet executed — every crate in Cargo.toml still declares
-`license = "Apache-2.0"` (workspace-inherited), and no file carries an SPDX
-header. Re-licensing existing source (per-crate Cargo.toml edits, SPDX
-headers repo-wide, a per-directory LICENSE where the split changes) is a
-larger, separate action than this docs pass and is tracked as
-https://github.com/vitrin-os/vitrin-os/issues/133 rather than folded in
-here silently. Until that lands, the implementation is Apache-2.0 in
-practice, not yet MPL-2.0/LGPL-3.0.
+Where a source file carries an `SPDX-License-Identifier:` header, that
+header is authoritative for that file. This map exists so a reader can see
+the shape of the whole tree without grepping it, and so the boundaries are
+stated in one place rather than inferred.
+
+
+APACHE-2.0 (LICENSE) — explicit patent grant
+
+  - the protocol itself: protocol/vitrin-v0.xml, protocol/vitrin-v0.rng;
+  - everything transliterated from it: crates/vitrin-protocol (its
+    checked-in generated bindings *and* the hand-written wire/fixed-point/
+    error code around them) and shim/include/vitrin-protocol.h, the C
+    header emitted from the same IDL by the same scanner;
+  - the code generator and its driver: crates/vitrin-scanner, crates/xtask
+    — a third party writing a Go, TypeScript or C++ SDK forks these;
+  - the conformance and robustness instruments: crates/vitrin-golden,
+    crates/vitrin-mock-shim, fuzz/;
+  - the client SDKs: sdk/python/ and any future SDK;
+  - the integration harness and the shipped examples: tests/integration/,
+    examples/.
+
+  The rule behind that list: content derived from the Apache-2.0 protocol
+  artifacts stays Apache-2.0. Nobody should have to touch a copyleft file to
+  write a client, an alternate compositor, or an integration.
+
+CC-BY-4.0 (LICENSE-CC-BY-4.0)
+
+  - spec prose: docs/PRD.md, docs/protocol/, docs/plan/.
+
+MPL-2.0 (LICENSE-MPL-2.0)
+
+  - the reference implementation: crates/vitrin-core (the trusted core —
+    compositor, capability kernel, grant store, realms, consent, dead-man
+    switch, flight recorder), crates/vitrin-ipc (the transport), and the
+    per-app Wayland shim under shim/ — its C sources, its hand-written
+    headers, and its own test fixtures.
+
+  Weak copyleft on the TCB is the point: Vitrin's claim is a small,
+  auditable trusted core, and a modified capability kernel should not be
+  shippable as a black box. MPL's copyleft is per-file, so an application
+  running inside a shim is never derivative, and the Larger Work allowance
+  (MPL 2.0 §3.3) keeps linking against MIT-licensed wlroots and Smithay
+  clean.
+
+  MPL Exhibit B ("Incompatible With Secondary Licenses") is deliberately
+  NOT used anywhere in this repository, and must not be added. The advisory
+  WLCS module below compiles MPL-2.0 shim sources into a GPL-3.0-only
+  combined work; that is lawful only because MPL 2.0 keeps GPL-3.0 as a
+  Secondary License (§1.12, §3.3). Exhibit B would switch that off and make
+  the module undistributable.
+
+GPL-3.0-only (LICENSE-GPL-3.0-only)
+
+  - shim/wlcs/ — the advisory WLCS (Wayland Conformance Test Suite)
+    integration module, which #includes GPL-3.0-only headers from
+    Canonical's wlcs project. It is built only behind a non-default Meson
+    feature, is never installed, and is never linked into the vitrin-shim
+    executable. shim/wlcs/README.md is the normative statement of that
+    boundary; the SPDX header in shim/wlcs/integration.c is the normative
+    statement for the file. This carve-out predates the split above and is
+    unchanged by it.
+
+EVERYTHING NOT NAMED ABOVE
+
+  Repository-level prose (README.md, NOTICE, SECURITY.md, TRADEMARK.md,
+  CLAUDE.md, docs/ARCHITECTURE.md and other docs/ pages outside the spec
+  paths) is CC-BY-4.0 with the rest of this project's prose. Repository
+  tooling that is not part of a shipped artifact (.github/workflows/,
+  build manifests, .claude/ agent and skill definitions) is Apache-2.0
+  with the rest of the tooling. Neither category is a shipped artifact,
+  and no tracked path is left unassigned by this map.
+
+THIRD-PARTY — not ours to license
+
+  - crates/vitrin-core/assets/fonts/ — Liberation Sans, SIL Open Font
+    License 1.1, with the license text alongside it. Vendored, not
+    relicensed by anything in this file.
+  - shim/subprojects/ — wlroots and wayland-protocols and the transitive
+    Meson subprojects they pull in (libdrm, pixman, libxkbcommon, wayland,
+    seatd, libliftoff, libdisplay-info, v4l-utils). Only the .wrap files
+    are tracked here; the fetched trees carry their own MIT/HPND/GPL/BSD
+    headers and keep them.
+  - shim/build/ and target/ are build output, not source, and are not
+    tracked.
+
+
+Current state of execution, honestly
+
+The Apache-2.0 and CC-BY-4.0 halves have been in force since the repository
+was first published. The reference-implementation half — the part earlier
+revisions of this file described as "NOT yet executed" — is executed as of
+this notice: the license texts are present at the repository root, each
+crate declares its own license rather than inheriting a workspace default,
+and first-party sources carry SPDX headers. Issue #133's open question
+about generated code is answered above and recorded in D-016: it stays
+Apache-2.0.
+
+Three things are still worth knowing, and are stated rather than glossed:
+
+  - "Sources" above means what it says, and no more: every first-party
+    `.rs`, `.c`, `.h`, `.py`, `.sh` and `.js` file carries an inline SPDX
+    header. Build manifests (`Cargo.toml`, `meson.build`), the IDL and its
+    schema, Markdown, and test fixture data do not; those are covered by
+    the path map above and, for crates, by the `license` field. A file
+    without an inline header is not unlicensed — read the map.
+  - Header coverage is not machine-checked. There is no `reuse lint`-style
+    CI gate yet, so a new file added without an SPDX header will not be
+    caught automatically. Adopting the REUSE Specification layout is the
+    clean fix and is deferred to a follow-up, not silently assumed done.
+  - GitHub's license detector reads the root LICENSE file and will keep
+    reporting this repository as "Apache-2.0". That understates the
+    copyleft half. This file, and the SPDX header on the file in front of
+    you, are the accurate answer — the repository badge is not.
+
+There is no MIT-licensed first-party code in this repository. Earlier
+revisions of the shim's build file asserted a project-level MIT license; no
+MIT license text ever accompanied it, and that assertion is retired by
+D-016. Vendored dependencies under shim/subprojects/ do carry MIT and HPND
+terms, as the third-party section above records.
+
+Contributions are taken under the Developer Certificate of Origin
+(sign-off), not a Contributor License Agreement — D-012. No copyright
+assignment is asked for or accepted, and contributors keep their own
+copyright.

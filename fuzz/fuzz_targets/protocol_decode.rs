@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Fuzz target: every `vitrin-protocol` message decoder, fed arbitrary
 //! bytes and an arbitrary fd presence.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // GENERATED FILE -- DO NOT EDIT BY HAND.
 //
 // Source: protocol/vitrin-v0.xml

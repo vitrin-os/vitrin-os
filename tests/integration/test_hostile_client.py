@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Issue #46's second half: a hostile peer against a live `vitrind`.
 
 `fuzz/` (this repo's cargo-fuzz workspace) proves the other half in-process:

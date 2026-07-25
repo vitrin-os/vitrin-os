@@ -127,13 +127,41 @@ exact class of honesty gap this repo's docs are written to avoid — state
 mock-based coverage as what it is, and cite the real-app gate
 (`tests/integration/test_real_*.py`) as the actual milestone evidence.
 
-## Licensing (D-005)
+## Licensing (D-005, executed per D-016)
 
-The license is split per decision D-005 (`docs/plan/20-decision-log.md`):
-Apache-2.0 on `protocol/` and the SDKs, CC-BY-4.0 on spec prose
-(`docs/PRD.md`, `docs/protocol/`, `docs/plan/`), and an intended
-weak-copyleft license (MPL-2.0 preferred, LGPL-3.0 fallback) on the
-reference implementation. See the root `NOTICE` for the current execution
-status — the reference-implementation half has not landed yet (tracked in
-issue #133); do not assume MPL-2.0 applies to `crates/`/`shim/` until it
-does.
+The split is executed. **The root `NOTICE` is the normative path→license
+map — read it, not this summary, before adding or moving a file.** The
+per-file `SPDX-License-Identifier` header wins for that file; the per-crate
+`license` field in each `Cargo.toml` wins for that crate.
+
+The boundary is drawn by **derivation, not by directory**:
+
+- **MPL-2.0** — original implementation expression: `crates/vitrin-core`,
+  `crates/vitrin-ipc`, and the shim's own C sources, hand-written headers
+  and test fixtures under `shim/`.
+- **Apache-2.0** — anything derived from the protocol, plus everything a
+  third party needs: `protocol/`, `crates/vitrin-protocol` (**including its
+  checked-in generated code**), `shim/include/vitrin-protocol.h` (generated
+  from the same IDL, so it is Apache-2.0 *despite living under `shim/`* —
+  writing a C client must never require touching copyleft code),
+  `crates/vitrin-scanner` and `crates/xtask`, the conformance instruments
+  (`crates/vitrin-golden`, `crates/vitrin-mock-shim`, `fuzz/`),
+  `sdk/python/`, `tests/integration/`, `examples/`.
+- **CC-BY-4.0** — spec prose: `docs/PRD.md`, `docs/protocol/`, `docs/plan/`.
+- **GPL-3.0-only** — `shim/wlcs/` only, the advisory WLCS module. Unchanged
+  by the split; never built by default, never installed, never linked into
+  `vitrin-shim`.
+
+Three rules that are easy to break by accident:
+
+1. **Never add MPL Exhibit B** to any file. `shim/wlcs/` compiles MPL-2.0
+   shim sources into a GPL-3.0-only module, which stays lawful only because
+   MPL keeps GPL-3.0 as a Secondary License. Exhibit B would break it.
+2. **Never hand-edit the SPDX line in generated files.** It comes from the
+   templates in `crates/vitrin-scanner/`; hand-editing turns
+   `cargo xtask codegen --check` red.
+3. **A new crate must state its own `license`.** The workspace-wide default
+   was deliberately deleted so nothing can inherit the wrong half silently.
+
+`shim/include/` is a mixed directory on purpose, so per-directory LICENSE
+files were rejected — see D-016 for the reasoning and the accepted costs.

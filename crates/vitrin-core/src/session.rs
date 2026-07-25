@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The runtime wiring: the session state every backend's event loop carries,
 //! and the sources that make the capability kernel reachable from the wire
 //! (P1.M1.1, issue #77).

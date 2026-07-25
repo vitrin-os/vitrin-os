@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
 # run-advisory.sh -- run the real `wlcs` conformance runner against
 # vitrin-shim-wlcs.so (P1.9.4, issue #47) and print a pass/fail/skip summary.
 #
@@ -14,7 +15,7 @@
 # WHAT THIS DOES NOT PROVE. wlcs itself is GPL-3.0 (as is the module this
 # runs -- shim/wlcs/integration.c, see its own header and README.md), so
 # nothing this script does is a substitute for, or a gate alongside, the
-# MIT-licensed `shim` and `conformance` CI jobs. Read shim/wlcs/README.md
+# MPL-2.0 `shim` and `conformance` CI jobs. Read shim/wlcs/README.md
 # for the full scope and the current, evidence-based pass-list before
 # reading too much into any single number this prints.
 #

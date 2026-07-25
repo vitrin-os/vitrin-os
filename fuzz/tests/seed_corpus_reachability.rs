@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Every checked-in seed must reach the path its filename claims.
 //!
 //! # Why this test exists

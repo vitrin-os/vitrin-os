@@ -1,6 +1,8 @@
 /* test_header_compiles.c -- proves shim/include/vitrin-protocol.h compiles
  * standalone under -Wall -Werror (P1.1.2 acceptance criterion 4).
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * HAND-WRITTEN, not generated: unlike vitrin-protocol.h itself, this file
  * carries no "DO NOT EDIT" banner and is free to be edited directly.
  *

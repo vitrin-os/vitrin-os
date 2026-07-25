@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Scene composition v0 (P1.3.3): the realm's client surface composited
 //! into the **realm view** — the framebuffer that both presentation paths
 //! present and that capture serves.

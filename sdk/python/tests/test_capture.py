@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Capture ergonomics (P1.8.2): Frame.raw / to_png against the cross-pinned golden.
 
 The golden file

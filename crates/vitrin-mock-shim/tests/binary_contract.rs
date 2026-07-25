@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The `vitrin-mock-shim` **binary**'s own contract.
 //!
 //! This file has a second, load-bearing job beyond what it asserts: an

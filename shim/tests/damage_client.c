@@ -1,6 +1,8 @@
 /* damage_client.c -- a deterministic Wayland client for the P1.6.2
  * acceptance proof.
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * weston-terminal proves the shim is usable by a real app, which is what the
  * P1.6.1 test uses it for. It cannot prove the two claims this task has to
  * make mechanically, because what it damages and how often it draws are its

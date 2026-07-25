@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Headless backend: a fixed-size virtual output composited entirely in
 //! software — no display, no DRM/KMS, no EGL, no GPU (PRD Doc 2 §9, "headless
 //! mode = one virtual framebuffer per realm"). This is the path CI runs: the

@@ -1,6 +1,8 @@
 /* upstream.h -- the shim's half of the shim-facing protocol (P1.6.2):
  * `vitrin_shim_session` + `vitrin_shim_surface` over the core socketpair.
  *
+ * SPDX-License-Identifier: MPL-2.0
+ *
  * wire.c moves bytes; this layer decides which bytes. It is the C
  * counterpart of `crates/vitrin-mock-shim` (the compliant reference shim
  * the core's tests are written against) and the peer of

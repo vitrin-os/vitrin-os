@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Realm lifecycle (P1.5.3, issue #32): the realm's **death paths** -- crash
 //! detection, exit propagation, reaping, and the orderly shutdown ladder.
 //!

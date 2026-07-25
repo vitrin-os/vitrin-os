@@ -1,5 +1,7 @@
 # Vitrin OS realm configuration -- the realm manager's input (P1.5.1).
 #
+# SPDX-License-Identifier: Apache-2.0
+#
 # One [[realm]] table describing the realm this session serves: its
 # wire-visible id, and the app it owns. This file is parsed by the same
 # deliberately strict TOML subset as principals.toml (see

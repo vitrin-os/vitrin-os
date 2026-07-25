@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The dmabuf import path (P1.3.5, issue #22): zero-copy shim→core frames
 //! on real GPUs — the M1.5 optimization over the universal shm copy-in
 //! (plan D3; PRD Doc 2 §3.4/§4.4 "dmabuf fd passed to core → core

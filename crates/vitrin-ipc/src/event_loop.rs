@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Calloop event-source glue for the trusted core (the `server` feature).
 //!
 //! This module is what lets `vitrind` stay a single-threaded compositor whose

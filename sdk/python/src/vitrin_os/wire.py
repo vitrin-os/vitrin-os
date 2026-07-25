@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Framing primitives: the 8-byte header and the seven argument types.
 
 Hand-implemented from docs/protocol/00-conventions.md section 2 (and the

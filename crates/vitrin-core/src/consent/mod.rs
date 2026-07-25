@@ -523,10 +523,17 @@ impl ConsentSurface {
     /// display vitrind owns is the one reference the app cannot forge or
     /// observe. A prompt is trusted when its frame matches this band.
     ///
-    /// Human-visible output only, the same as the frame: the one call site is
-    /// [`crate::backend::human_visible_from_view`], never the capture path, so
-    /// the band cannot leak through `vitrin_view.frame_ready` either. A
-    /// dimension mismatch is refused rather than panicking, as elsewhere.
+    /// Human-visible output only, the same as the frame — never the capture
+    /// path, so the band cannot leak through `vitrin_view.frame_ready` either.
+    /// This function is the **CPU** half of that guarantee, reached from its one
+    /// caller [`crate::backend::human_visible_from_view`]. The zero-copy GPU
+    /// path cannot call it — it never materializes a CPU view — and so paints
+    /// the band itself as [`crate::dmabuf::Draw::TrustBand`], derived from this
+    /// same [`TRUST_BAND_HEIGHT`] and this same [`TrustedIndicator::color`] so
+    /// the two paths carry one session secret rather than two. Those are the
+    /// only two presentation paths, and [`crate::dmabuf::human_visible_frame`]
+    /// is shaped so no arm of it can emit a frame without the band. A dimension
+    /// mismatch is refused rather than panicking, as elsewhere.
     pub fn composite_trust_band(&self, view: &mut [u8], width: u32, height: u32) {
         let Some(mut canvas) = Canvas::new(view, width, height) else {
             return;

@@ -175,7 +175,11 @@ Two checks now make that class of rot fail loudly:
 # Structural, no Rust toolchain: cross-checks every seed's header bytes
 # against protocol/vitrin-v0.xml and both targets' input layouts, and
 # requires every seed to be byte-distinct. Runs automatically on every
-# regeneration; --check verifies what is already on disk.
+# regeneration; --check additionally diffs the generator's bytes against
+# what is on disk, and prints its "verified N seed(s)" verdict only when
+# BOTH halves hold -- a corpus file that has drifted prints FAILED on
+# stdout (per-seed detail on stderr) and exits 1, so a log that keeps only
+# stdout cannot read as a clean pass.
 python3 fuzz/seed_corpus.py --check
 
 # Authoritative: feeds each seed file to the REAL decoder / a REAL

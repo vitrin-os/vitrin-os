@@ -430,15 +430,21 @@ def verify_ipc_framing_seeds(seeds: dict[str, bytes]) -> None:
             )
 
 
-def verify_seeds(all_seeds: dict[str, dict[str, bytes]]) -> None:
+def verify_seeds(all_seeds: dict[str, dict[str, bytes]]) -> int:
+    """Structurally verify the seeds this script *generates*; return the count.
+
+    Raises :class:`SeedRotError` on a seed whose bytes no longer reach the
+    path its name claims. Deliberately silent on success: it verifies the
+    generator's output, and in ``--check`` mode that is only half the
+    question -- the other half is whether the bytes on disk still match. Only
+    :func:`main` knows both answers, so only :func:`main` prints a verdict.
+    (It used to print "verified N seed(s)" from here, unconditionally, which
+    in ``--check`` mode put a reassuring line on stdout even when the on-disk
+    corpus had been altered and the FAIL lines had gone to stderr.)
+    """
     verify_protocol_decode_seeds(all_seeds["protocol_decode"])
     verify_ipc_framing_seeds(all_seeds["ipc_framing"])
-    total = sum(len(s) for s in all_seeds.values())
-    print(f"verified {total} seed(s): every seed reaches the path its name claims")
-    print(
-        "  (structural half; run `cargo test --manifest-path fuzz/Cargo.toml` for "
-        "the real-decoder proof)"
-    )
+    return sum(len(s) for s in all_seeds.values())
 
 
 def write_seeds(target: str, seeds: dict[str, bytes]) -> None:
@@ -482,15 +488,39 @@ def main(argv: list[str] | None = None) -> int:
         "ipc_framing": ipc_framing_seeds(),
     }
     # Unconditional: a regeneration must never be able to write a dead seed.
-    verify_seeds(all_seeds)
+    total = verify_seeds(all_seeds)
 
     if check_only:
         problems = [p for t, s in all_seeds.items() for p in check_seeds(t, s)]
         for problem in problems:
             print(f"FAIL: {problem}", file=sys.stderr)
-        return 1 if problems else 0
+        if problems:
+            # On stdout too, and *instead of* any success line: a log that
+            # keeps only stdout must not be able to read as a clean pass.
+            print(
+                f"FAILED: {len(problems)} seed(s) on disk do not match this "
+                "generator (details on stderr). The structural verification this "
+                "script just ran covered the bytes it would WRITE, not the bytes in "
+                "`fuzz/corpus/` -- so it says nothing about the corpus the fuzzer "
+                "actually reads."
+            )
+            return 1
+        print(
+            f"verified {total} seed(s): every seed reaches the path its name claims, "
+            "and every corpus file on disk matches this generator byte for byte"
+        )
+        print(
+            "  (structural half; run `cargo test --manifest-path fuzz/Cargo.toml` for "
+            "the real-decoder proof)"
+        )
+        return 0
     for target, seeds in all_seeds.items():
         write_seeds(target, seeds)
+    print(f"verified {total} seed(s): every seed reaches the path its name claims")
+    print(
+        "  (structural half; run `cargo test --manifest-path fuzz/Cargo.toml` for "
+        "the real-decoder proof)"
+    )
     return 0
 
 

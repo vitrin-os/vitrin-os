@@ -422,10 +422,15 @@ mod live {
             self.conn.as_fd()
         }
 
-        /// The peer's pid, for the per-decision `warn` that attributes a
-        /// synthetic decision to whoever made it.
-        pub(crate) fn peer_pid(&self) -> Option<i32> {
-            self.conn.peer_cred().pid
+        /// The peer's captured credentials, for the per-decision `warn` that
+        /// attributes a synthetic decision to whoever made it.
+        ///
+        /// Read from the `SO_PEERCRED` [`vitrin_ipc::Connection`] captured at
+        /// adoption, never re-derived: the log line must name the peer, not
+        /// restate the core's own identity.
+        pub(crate) fn peer_cred(&self) -> (Option<i32>, u32) {
+            let cred = self.conn.peer_cred();
+            (cred.pid, cred.uid)
         }
 
         /// The petition whose card is up, if any -- regardless of whether

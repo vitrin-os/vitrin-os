@@ -643,12 +643,16 @@ impl HeadlessState {
                     // synthesise either.
                     DecideAck::NoSuchButton
                 } else {
-                    let peer = self.injector.as_ref().and_then(|inj| inj.peer_pid());
+                    let (peer_pid, peer_uid) = self
+                        .injector
+                        .as_ref()
+                        .map(|inj| inj.peer_cred())
+                        .unwrap_or((None, 0));
                     tracing::warn!(
                         %petition,
                         choice = choice.label(),
-                        peer_pid = ?peer,
-                        peer_uid = rustix::process::geteuid().as_raw(),
+                        peer_pid = ?peer_pid,
+                        peer_uid,
                         "consent-injector: synthesizing a human decision on the raised prompt \
                          (issue #138; this build path never ships)"
                     );

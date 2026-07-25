@@ -38,12 +38,16 @@ two venues differ only in *which real app* stands behind the shim and in *how
   real shim — GPU-free, so CI never depends on Firefox or a GPU (plan risk
   R6/R1). "The page changed" here has to mean *the typed text landed*, not
   merely "the app repainted", because a real app is always repainting
-  something. Two things make it mean that: the app is **settled** before the
+  something. Three things make it mean that: the app is **settled** before the
   control capture (:func:`_settle`), so its asynchronous first paint and shell
-  prompt are inside the "before" frame rather than straddling it; and the
-  change that follows must carry the *shape* a typed line makes — enough
-  pixels to rule out a one-cell repaint AND a changed run wide enough that
-  only a row of characters could have drawn it (:func:`actuation_landed`).
+  prompt are inside the "before" frame rather than straddling it; the settled
+  app is then watched, idle, for at least as long as the gate later polls
+  (:func:`_idle_probe`), so an app that can forge the gate's own signature
+  unaided fails the run instead of passing it; and the change that follows
+  must carry the *shape* a typed line makes — enough pixels to rule out a
+  one-cell repaint AND a densely inked run of them along one scanline, wide
+  enough that only a row of characters could have drawn it
+  (:func:`actuation_landed`).
   What additionally proves the actuation *causally reached the app* is the
   flight recorder's ``use_decision`` entries — an allowed ``move`` at the
   clicked coordinate and an allowed ``type`` whose ``chars`` equals the typed
@@ -246,16 +250,21 @@ def colors_close(a: tuple[int, int, int], b: tuple[int, int, int], *, tol: int =
 # easily land between the demo's two captures — so the named M1.5 gate passed
 # whether or not the click and the typed text ever reached the app.
 #
-# Two changes fix that, and both are needed:
+# Three things fix that, and all three are needed:
 #
 #   1. The app is SETTLED before the control capture (:func:`_settle`), so
 #      startup paint is finished and inside the "before" frame, not straddling
 #      it. That removes the race, rather than trying to out-threshold it.
-#   2. The change that follows must carry the *shape* the typed text makes:
-#      not merely enough pixels, but a run of them wide enough that only a
-#      line of typed characters could have drawn it.
+#   2. The settled app is then left strictly alone for an IDLE PROBE at least
+#      as long as the window the gate later polls (:func:`_idle_probe`). If
+#      the app can draw an actuation-shaped diff with nobody actuating, this
+#      gate cannot discriminate on this runner, and it says so instead of
+#      passing.
+#   3. The change that follows must carry the *shape* the typed text makes:
+#      not merely enough pixels, but a densely inked chain of them along one
+#      scanline that only a row of characters could have drawn.
 #
-# Both thresholds below are derived from the input the demo types, not from
+# The thresholds below are derived from the input the demo types, not from
 # one lucky measurement, so they do not have to be retuned per runner.
 
 
@@ -272,22 +281,66 @@ def colors_close(a: tuple[int, int, int], b: tuple[int, int, int], *, tol: int =
 #: fails randomly gets muted, which is how gates die.
 MIN_HEADLESS_CHANGED_PIXELS = 400
 
-#: Minimum width, in pixels, of the widest changed run on any one scanline.
+#: Two changed pixels on one scanline belong to the same *run* when they lie
+#: no more than this many pixels apart.
+#:
+#: Typed text does not ink a solid bar. Within a line of monospace glyphs the
+#: ink is broken by intra-glyph whitespace and by blank cells (a space
+#: character inks nothing at all), so a *strictly contiguous* run through a
+#: real typed line is only a handful of pixels long — measured 9 px for
+#: ``echo vitrin-demo`` in a real weston-terminal on a 640x480 pixman view. A
+#: contiguous-run threshold would therefore be unreachable by the very thing
+#: this gate demands. What a typed line does guarantee is that its ink never
+#: skips more than about one blank cell: measured maximum gap inside that same
+#: echoed line, 15 px. 24 px covers a blank cell at any plausible terminal
+#: font size in a 640x480 view, while staying far below the distance between
+#: independent widgets — a cursor at the left margin, a mode indicator
+#: mid-line and a scrollbar at the right edge sit hundreds of pixels apart and
+#: can never chain into one run.
+RUN_GAP_TOLERANCE = 24
+
+#: A run counts only if at least this fraction of the pixels it covers
+#: actually changed. Without it the gap tolerance alone would accept a dotted
+#: artefact — one changed pixel every 24 — as a "run". A real row of glyphs
+#: inks far more than a quarter of its own width: measured 96 of 143 px (67%)
+#: on the densest scanline of the real run above, a 2.7x margin.
+MIN_RUN_INK_RATIO = 0.25
+
+#: Minimum width, in pixels, of the widest *dense run* (:data:`RUN_GAP_TOLERANCE`,
+#: :data:`MIN_RUN_INK_RATIO`) on any one scanline.
 #:
 #: This is the discriminating half — the signature only the typed text makes.
 #: The demo types at least 16 characters, a terminal renders them into that
 #: many adjacent monospace cells, and no monospace cell is narrower than
-#: ~4 px, so the echoed line must span >= 64 px on at least one scanline. A
+#: ~4 px, so the echoed line must chain >= 64 px on at least one scanline. A
 #: blinking cursor, a focus ring, or a one-glyph repaint is *one* cell wide
-#: (~8-20 px) and cannot reach it however many times it blinks. Measured
-#: span for the real run above: 143 px.
-MIN_HEADLESS_CHANGED_SPAN = 64
+#: (~8-20 px) and cannot reach it however many times it blinks. Measured dense
+#: run for the real run above: 143 px.
+#:
+#: Note what changed on 2026-07-25 and why: this used to be checked against the
+#: *bounding span* of a scanline's changed pixels (last minus first), which is
+#: not what the paragraph above derives. Three unrelated one-cell repaints at
+#: x=0, x=300 and x=600 have a 608 px bounding span and would have cleared a
+#: 64 px "span" threshold while containing no drawn line at all — the exact
+#: class of change this constant exists to reject. It is now checked against a
+#: run, so those three cells measure 8 px and are rejected.
+MIN_HEADLESS_CHANGED_RUN = 64
 
 #: Two consecutive captures differing by fewer than this many pixels count as
 #: "the app has settled" (:func:`_settle`). Sized to absorb a blinking cursor
 #: (one cell, ~140 px) while staying strictly below
-#: :data:`MIN_HEADLESS_CHANGED_PIXELS`, so the settle tolerance can never
-#: swallow a change the gate is supposed to demand.
+#: :data:`MIN_HEADLESS_CHANGED_PIXELS`.
+#:
+#: That ordering is necessary but *not* sufficient, and the docstring here
+#: used to claim otherwise ("the settle tolerance can never swallow a change
+#: the gate is supposed to demand"). It cannot: this tolerance is measured per
+#: poll interval, while :data:`MIN_HEADLESS_CHANGED_PIXELS` is measured
+#: cumulatively across the whole post-actuation window. An app repainting 150
+#: px every 150 ms — a spinner, a clock — looks quiet to every consecutive
+#: comparison here and still accumulates well past 400 px later. What actually
+#: rules that out is :func:`_idle_probe`, which measures the *cumulative* diff
+#: from the control capture over a window at least as long as the one the gate
+#: later polls.
 SETTLE_MAX_CHANGED_PIXELS = 200
 
 #: Consecutive quiet captures :func:`_settle` needs before it calls the app
@@ -307,6 +360,25 @@ SETTLE_FLOOR = 1.0
 #: being fixed for.
 SETTLE_TIMEOUT = 12.0
 
+#: The post-actuation capture window (:func:`_capture_after_change`): one
+#: initial pause plus this many polls. Named as constants because
+#: :data:`IDLE_PROBE_SECONDS` is derived from them — the idle probe is only
+#: meaningful if it is at least as long as the window it is vouching for.
+AFTER_SETTLE = 0.4
+AFTER_ATTEMPTS = 12
+AFTER_POLL = 0.15
+
+#: The longest a post-actuation diff has to accumulate before the gate gives
+#: up on it: 0.4 + 12 * 0.15 = 2.2 s.
+ACTUATION_POLL_BUDGET = AFTER_SETTLE + AFTER_ATTEMPTS * AFTER_POLL
+
+#: How long :func:`_idle_probe` watches the settled app with nobody actuating.
+#: Tied to :data:`ACTUATION_POLL_BUDGET`, not chosen: the probe's claim is
+#: "over a window at least as long as the one the gate later polls, this app
+#: drew nothing actuation-shaped by itself", and a shorter probe could not
+#: make it. ``HeadlessGateThresholdsStayDiscriminating`` pins the ordering.
+IDLE_PROBE_SECONDS = ACTUATION_POLL_BUDGET
+
 
 @dataclass(frozen=True)
 class ChangeProfile:
@@ -314,20 +386,42 @@ class ChangeProfile:
 
     #: Pixels whose colour channels differ.
     count: int
-    #: Widest first-to-last changed-pixel run on any single scanline.
+    #: Width of the widest *dense run* on any single scanline: the widest
+    #: stretch whose consecutive changed pixels are never more than
+    #: :data:`RUN_GAP_TOLERANCE` apart AND at least :data:`MIN_RUN_INK_RATIO`
+    #: of whose pixels changed. This is the gate's shape metric — the one
+    #: :func:`actuation_landed` reads.
+    widest_dense_run: int
+    #: How many pixels inside that dense run actually changed (its ink).
+    dense_run_ink: int
+    #: Widest first-to-last changed-pixel distance on any single scanline: a
+    #: *bounding span*, kept for diagnosis and deliberately NOT the gate's
+    #: metric. Three isolated one-cell repaints at x=0, x=300 and x=600 have a
+    #: 608 px bounding span and no run wider than one cell — reading the span
+    #: as if it were a run is precisely the defect this field's name now makes
+    #: impossible to repeat.
     widest_row_span: int
     #: Scanlines carrying at least one changed pixel.
     rows: int
 
     def __str__(self) -> str:
         return (
-            f"{self.count} px changed, widest row span {self.widest_row_span} px, "
+            f"{self.count} px changed, widest dense run {self.widest_dense_run} px "
+            f"({self.dense_run_ink} px inked), bounding span {self.widest_row_span} px, "
             f"{self.rows} scanline(s) touched"
         )
 
 
 def change_profile(before: vitrin_os.Frame, after: vitrin_os.Frame) -> ChangeProfile:
     """Compare two same-size frames pixel by pixel, row by row.
+
+    Per scanline this measures three things: how many pixels changed, the
+    first-to-last *bounding span* of the changed ones (diagnostic), and the
+    widest *dense run* — a stretch whose consecutive changed pixels are never
+    more than :data:`RUN_GAP_TOLERANCE` apart and at least
+    :data:`MIN_RUN_INK_RATIO` of whose covered pixels changed. Only the dense
+    run feeds :func:`actuation_landed`; see :data:`MIN_HEADLESS_CHANGED_RUN`
+    for why the span cannot.
 
     Reads ``frame.raw`` directly (little-endian xrgb8888, ``B, G, R, X`` per
     pixel) and compares only the three colour bytes — the fourth, padding,
@@ -349,38 +443,58 @@ def change_profile(before: vitrin_os.Frame, after: vitrin_os.Frame) -> ChangePro
             f"vs {after.width}x{after.height} ({len(b)} bytes)"
         )
     stride, width, height = before.stride, before.width, before.height
-    count = rows = widest = 0
+    gap = RUN_GAP_TOLERANCE
+    count = rows = widest_span = best_run = best_ink = 0
+
+    def _offer(length: int, ink: int) -> None:
+        """Keep the widest run that is inked densely enough to be a drawing."""
+        nonlocal best_run, best_ink
+        if ink >= length * MIN_RUN_INK_RATIO and (length, ink) > (best_run, best_ink):
+            best_run, best_ink = length, ink
+
     for y in range(height):
         base = y * stride
         first = last = -1
+        run_start = run_ink = 0
         for x in range(width):
             off = base + x * 4
             if a[off : off + 3] != b[off : off + 3]:
                 count += 1
                 if first < 0:
-                    first = x
+                    first, run_start, run_ink = x, x, 0
+                elif x - last > gap:
+                    # Too far from the previous changed pixel to be the same
+                    # drawing: close the run that ended at `last`, open a new
+                    # one here.
+                    _offer(last - run_start + 1, run_ink)
+                    run_start, run_ink = x, 0
+                run_ink += 1
                 last = x
         if first >= 0:
             rows += 1
-            widest = max(widest, last - first + 1)
-    return ChangeProfile(count=count, widest_row_span=widest, rows=rows)
-
-
-def count_changed_pixels(before: vitrin_os.Frame, after: vitrin_os.Frame) -> int:
-    """How many pixels' colour channels differ between two same-size frames."""
-    return change_profile(before, after).count
+            widest_span = max(widest_span, last - first + 1)
+            _offer(last - run_start + 1, run_ink)
+    return ChangeProfile(
+        count=count,
+        widest_dense_run=best_run,
+        dense_run_ink=best_ink,
+        widest_row_span=widest_span,
+        rows=rows,
+    )
 
 
 def actuation_landed(profile: ChangeProfile) -> bool:
     """True only for a change the demo's own typed line could have drawn.
 
-    Both conditions, never either alone: enough pixels to rule out one-cell
-    repaint, *and* a run wide enough that only a line of characters explains
-    it. See the two constants above for why each number is what it is.
+    Both conditions, never either alone: enough pixels to rule out a one-cell
+    repaint, *and* a dense run wide enough that only a line of characters
+    explains it. See the constants above for why each number is what it is —
+    in particular :data:`MIN_HEADLESS_CHANGED_RUN` for why this reads a run
+    and not the bounding span it used to read.
     """
     return (
         profile.count >= MIN_HEADLESS_CHANGED_PIXELS
-        and profile.widest_row_span >= MIN_HEADLESS_CHANGED_SPAN
+        and profile.widest_dense_run >= MIN_HEADLESS_CHANGED_RUN
     )
 
 
@@ -439,9 +553,13 @@ def _settle(
     and never sooner than ``floor`` seconds in — a shell prompt that arrives
     a beat after the window maps must not be able to slip past a run of quiet
     captures taken before it. The tolerance is sized to absorb a blinking
-    cursor without absorbing anything the gate cares about. Paced at ``poll``
-    so a default-rate grant's token bucket (20/s) is never emptied by the
-    settle loop itself.
+    cursor. It is emphatically *not* sized to make the gate sound: it is a
+    per-interval tolerance and the gate's threshold is cumulative (see
+    :data:`SETTLE_MAX_CHANGED_PIXELS`), so quiescence by this definition is
+    then checked against the gate's own predicate by :func:`_idle_probe`,
+    whose frame — not this loop's last capture — is what this returns. Paced
+    at ``poll`` so a default-rate grant's token bucket (20/s) is never emptied
+    by the settle loop itself.
 
     Raises :class:`DemoAssertionError` on timeout rather than proceeding with
     an unsettled control frame: a gate that cannot establish its own baseline
@@ -459,7 +577,7 @@ def _settle(
         previous = frame
         quiet = quiet + 1 if profile.count < SETTLE_MAX_CHANGED_PIXELS else 0
         if quiet >= quiet_rounds and time.monotonic() - started >= floor:
-            return frame
+            return _idle_probe(grant, frame)
     raise DemoAssertionError(
         f"the real app never went quiet within {timeout:.0f}s (last comparison: "
         f"{profile}; needed {quiet_rounds} consecutive captures under "
@@ -469,14 +587,71 @@ def _settle(
     )
 
 
+def _idle_probe(
+    grant: vitrin_os.Grant,
+    control: vitrin_os.Frame,
+    *,
+    seconds: float = IDLE_PROBE_SECONDS,
+    poll: float = 0.15,
+) -> vitrin_os.Frame:
+    """Watch the settled app do nothing, for as long as the gate later polls.
+
+    :func:`_settle`'s quiet condition is per-interval; the gate's is
+    cumulative over the whole post-actuation window. An app repainting just
+    under :data:`SETTLE_MAX_CHANGED_PIXELS` every interval — a spinner, a
+    clock, a progress bar — therefore settles happily and can still pile up a
+    passing diff with nobody actuating anything. This closes that: with the
+    agent deliberately idle, it measures the *cumulative* diff from ``control``
+    over :data:`IDLE_PROBE_SECONDS` (>= :data:`ACTUATION_POLL_BUDGET`, the
+    window :func:`_capture_after_change` is allowed to poll) and fails if that
+    diff ever satisfies :func:`actuation_landed`. If the app can draw the
+    gate's own signature unaided, the gate cannot discriminate on this runner,
+    and saying so is the honest outcome — passing would not be.
+
+    The frame it returns is the new control capture: the last idle observation,
+    so whatever harmless drift the probe did see is behind the "before" frame
+    rather than inside the actuation diff.
+
+    What this does NOT establish: that the app is quiet at *every* future
+    moment. An app quiet during the probe and bursty a second later still
+    slips through, and no pre-actuation probe can exclude that. What it does
+    establish is that a *steady* incidental repaint — the realistic shape of
+    this failure — cannot masquerade as actuation.
+    """
+    deadline = time.monotonic() + seconds
+    frame = control
+    worst = ChangeProfile(
+        count=0, widest_dense_run=0, dense_run_ink=0, widest_row_span=0, rows=0
+    )
+    while time.monotonic() < deadline:
+        time.sleep(poll)
+        frame = grant.observe()
+        profile = change_profile(control, frame)
+        if actuation_landed(profile):
+            raise DemoAssertionError(
+                f"the app drew an actuation-shaped change on its own: {profile} "
+                f"accumulated over a {seconds:.1f}s idle probe with the agent "
+                "deliberately doing nothing (the settled control capture is the "
+                f"baseline; >= {MIN_HEADLESS_CHANGED_PIXELS} px AND a dense run >= "
+                f"{MIN_HEADLESS_CHANGED_RUN} px is exactly what this gate later "
+                "accepts as proof the click and typed text landed). A gate whose "
+                "app can forge its own evidence proves nothing, so this fails "
+                "rather than passing on an unusable baseline."
+            )
+        if profile.count > worst.count:
+            worst = profile
+    print(f"demo: idle probe ({seconds:.1f}s, no actuation) worst drift: {worst}")
+    return frame
+
+
 def _capture_after_change(
     grant: vitrin_os.Grant,
     before: vitrin_os.Frame,
     *,
     headless: bool,
-    settle: float = 0.4,
-    attempts: int = 20,
-    poll: float = 0.15,
+    settle: float = AFTER_SETTLE,
+    attempts: int = AFTER_ATTEMPTS,
+    poll: float = AFTER_POLL,
 ) -> vitrin_os.Frame:
     """Capture the "after" frame once the change is observable.
 
@@ -486,9 +661,12 @@ def _capture_after_change(
     "some pixels moved". Nested: poll until the dominant colour reaches
     :data:`SERVED_RGB` (the page loaded). Polling is paced (a settle, then
     ``attempts`` spaced by ``poll``) so a default-rate grant's token bucket is
-    never emptied by the capture loop itself. The last frame is returned
-    regardless, so a genuine failure yields a diagnosable after-frame rather
-    than an exception here.
+    never emptied by the capture loop itself. The defaults come from the
+    module constants, because :func:`_idle_probe` watches the idle app for at
+    least this whole budget (:data:`ACTUATION_POLL_BUDGET`) — shortening the
+    window here without shortening the probe is safe, lengthening it is not.
+    The last frame is returned regardless, so a genuine failure yields a
+    diagnosable after-frame rather than an exception here.
     """
     time.sleep(settle)
     frame = grant.observe()
@@ -528,7 +706,10 @@ def _assert_page_changed(before: vitrin_os.Frame, after: vitrin_os.Frame, *, hea
             raise DemoAssertionError(
                 f"headless: {profile} between the settled control capture and the "
                 f"after-frame — need >= {MIN_HEADLESS_CHANGED_PIXELS} px changed AND a "
-                f"changed run >= {MIN_HEADLESS_CHANGED_SPAN} px wide on some scanline. "
+                f"dense run >= {MIN_HEADLESS_CHANGED_RUN} px wide on some scanline "
+                f"(pixels chained at <= {RUN_GAP_TOLERANCE} px, at least "
+                f"{MIN_RUN_INK_RATIO:.0%} of the run inked; the bounding span is "
+                "reported for diagnosis only and is not the criterion). "
                 "The control capture was taken after the app went quiet, so the app's "
                 "own startup paint cannot account for a diff; what is missing is the "
                 "shape a line of typed characters draws. The agent's click and typed "
@@ -624,9 +805,12 @@ def run(
         if headless:
             # The control capture: wait out the real app's own startup paint
             # BEFORE the actuation, so the diff that follows cannot be
-            # explained by the app finishing what it had already started.
-            # Nested needs no equivalent — its proof is the served page's
-            # dominant colour, which the browser's chrome cannot produce.
+            # explained by the app finishing what it had already started, and
+            # then watch it idle for the gate's own polling budget so a
+            # steadily-repainting app cannot forge the gate's signature
+            # (`_settle` -> `_idle_probe`; the probe's last frame is the
+            # control). Nested needs no equivalent — its proof is the served
+            # page's dominant colour, which the browser's chrome cannot draw.
             before = _settle(grant, before)
             print("demo: the real app is quiet; that frame is the control capture")
         url_x, url_y = locate_url_bar(before, headless=headless)

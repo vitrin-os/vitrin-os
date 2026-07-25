@@ -129,10 +129,16 @@ silently swallowed):
   until the change that added `run_demo._settle`, that gate asked only for
   24 changed pixels between its two captures, which weston-terminal's own
   startup paint clears unaided: it could pass with the agent's click and
-  typed text reaching nothing. It now settles the app first and demands a
-  change shaped like a typed line. Read green runs from before that change
-  as "the demo completed against a real app", not as "the actuation
-  landed".
+  typed text reaching nothing. It now settles the app, watches it idle for
+  at least as long as it later polls, and demands a change shaped like a
+  typed line — enough changed pixels *and* a densely inked run of them along
+  one scanline. (The first version of that shape check was itself wrong in
+  the same family: it measured the changed pixels' bounding span while
+  claiming to measure a run, so three unrelated one-cell repaints at
+  opposite ends of a scanline satisfied it. Fixed in the same pass, with the
+  rejected frame pair pinned as an in-process test.) Read green runs from
+  before these changes as "the demo completed against a real app", not as
+  "the actuation landed".
 - **No sandbox (decision D9).** No namespaces, seccomp, or Landlock yet —
   see [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine)
   below.

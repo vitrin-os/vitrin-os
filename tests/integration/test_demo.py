@@ -32,10 +32,23 @@ first:
   indistinguishable in shape from typed text. So the gate passed whether or
   not the actuation landed. It now takes a **settled control capture** first
   (``run_demo._settle``, so the app's startup paint is inside the "before"
-  frame rather than straddling it) and then requires a change carrying the
-  shape a typed line makes (``run_demo.actuation_landed``: enough pixels AND
-  a wide enough changed run). ``HeadlessGateThresholdsStayDiscriminating``
-  below pins the numbers' ordering so that cannot silently relax again.
+  frame rather than straddling it), watches the settled app idle for at least
+  the window it later polls (``run_demo._idle_probe``, so an app that repaints
+  steadily on its own fails the run instead of forging its evidence), and then
+  requires a change carrying the shape a typed line makes
+  (``run_demo.actuation_landed``: enough pixels AND a densely inked *run* of
+  them along one scanline). ``HeadlessGateThresholdsStayDiscriminating`` below
+  pins the numbers' ordering, and ``ChangeProfileShapeMetrics`` pins what the
+  shape metric actually accepts and rejects, so neither can silently relax
+  again.
+
+  The run metric was itself a defect once, worth naming here because it is the
+  kind that survives review: it measured the *bounding span* of a scanline's
+  changed pixels while every sentence around it said "run". Three unrelated
+  one-cell repaints at x=0, x=300 and x=600 -- a cursor, a mode indicator, a
+  scrollbar -- have a 608 px bounding span and satisfied the gate.
+  ``ChangeProfileShapeMetrics.test_scattered_one_cell_repaints_are_rejected``
+  is that exact frame pair, asserted to fail.
 
 Register, deliberately: this gate is mock-free, and it now *discriminates
 actuation from incidental repaint* — but that second property dates from the
@@ -110,7 +123,8 @@ sys.path.insert(0, str(_DEMO_DIR))
 
 import run_demo  # noqa: E402
 
-from vitrin_os import errors  # noqa: E402  (needs PYTHONPATH, which run.sh sets)
+import vitrin_os  # noqa: E402  (needs PYTHONPATH, which run.sh sets)
+from vitrin_os import errors  # noqa: E402
 
 #: The app the gate boots behind the real shim — never `vitrin-mock-shim`
 #: (issue #110). Same rung `tests/integration/test_real_app.py` uses.
@@ -261,8 +275,9 @@ class DemoHeadless(IntegrationTest):
         self.assertTrue(
             run_demo.actuation_landed(profile),
             f"{profile} between the settled control capture and the after-frame; need "
-            f">= {run_demo.MIN_HEADLESS_CHANGED_PIXELS} px AND a run >= "
-            f"{run_demo.MIN_HEADLESS_CHANGED_SPAN} px wide. Frames dumped under {out_dir}",
+            f">= {run_demo.MIN_HEADLESS_CHANGED_PIXELS} px AND a dense run >= "
+            f"{run_demo.MIN_HEADLESS_CHANGED_RUN} px wide (the bounding span is not the "
+            f"criterion). Frames dumped under {out_dir}",
         )
 
         conn_closed_url = result.url
@@ -454,9 +469,12 @@ class DemoHeadlessHoldEsc(IntegrationTest):
         #    reused rather than reimplemented.
         #
         #    Every step below is the demo's own helper, not a local copy:
-        #    `_settle` for the control capture and `_capture_after_change`
-        #    for the bounded poll, so this precondition can never drift
-        #    from what `DemoHeadless` accepts. They are underscore-private
+        #    `_settle` for the control capture (which now ends in
+        #    `_idle_probe`, so this precondition also inherits the "the app
+        #    cannot forge the signature unaided" check) and
+        #    `_capture_after_change` for the bounded poll, so this
+        #    precondition can never drift from what `DemoHeadless` accepts
+        #    -- including its shape metric. They are underscore-private
         #    by convention only; reaching for them deliberately is the same
         #    choice this class already makes for `locate_url_bar`.
         before = capture_when_ready(grant)
@@ -478,9 +496,10 @@ class DemoHeadlessHoldEsc(IntegrationTest):
         self.assertTrue(
             run_demo.actuation_landed(profile),
             f"{profile} before the chord fired (need >= "
-            f"{run_demo.MIN_HEADLESS_CHANGED_PIXELS} px AND a run >= "
-            f"{run_demo.MIN_HEADLESS_CHANGED_SPAN} px wide, polled for up to ~3.4 s "
-            "after a settled control capture); the demo's own actuation must have "
+            f"{run_demo.MIN_HEADLESS_CHANGED_PIXELS} px AND a dense run >= "
+            f"{run_demo.MIN_HEADLESS_CHANGED_RUN} px wide, polled for up to "
+            f"{run_demo.ACTUATION_POLL_BUDGET:.1f} s after a settled control capture "
+            "the app was watched idle through); the demo's own actuation must have "
             "already reached the real app for a subsequent refusal to mean anything",
         )
 
@@ -536,11 +555,16 @@ class HeadlessGateThresholdsStayDiscriminating(unittest.TestCase):
     Binary-free, so it runs (and can fail) in a from-scratch checkout. Each
     assertion pins one way the gate could quietly stop discriminating:
 
-    - a settle tolerance at or above the change threshold would let
-      `_settle` accept a frame whose next diff is already big enough to
-      "pass", so the gate would be measuring its own tolerance;
-    - a span threshold below one character cell (~20 px at any plausible
+    - a settle tolerance at or above the change threshold would put the two
+      numbers in an order nothing else in the design expects (note what this
+      does *not* buy, below);
+    - a run threshold below one character cell (~20 px at any plausible
       terminal font) would be cleared by a blinking cursor;
+    - a gap tolerance that is not far below the run threshold would let two
+      unrelated repaints chain into one "run", which is the bounding-span
+      defect wearing the run's name;
+    - an idle probe shorter than the post-actuation poll budget would vouch
+      for less time than the gate then spends collecting evidence;
     - the pre-2026-07-25 value of 24 changed pixels is called out by name,
       because that is the number weston-terminal's own repaint cleared and
       the number a future "let's relax this, it's flaky" edit would drift
@@ -548,19 +572,53 @@ class HeadlessGateThresholdsStayDiscriminating(unittest.TestCase):
     """
 
     def test_settle_tolerance_stays_below_the_change_threshold(self):
+        # What this pins: the two numbers keep the order the design reads in.
+        # What it does NOT establish -- and an earlier version of this
+        # docstring wrongly claimed it did -- is that the settle tolerance
+        # "cannot swallow a change the gate demands". The tolerance is
+        # per-poll-interval, the threshold is cumulative over the whole
+        # post-actuation window, so an app repainting 150 px every 150 ms
+        # settles happily and still accumulates past 400 px. What actually
+        # rules that out is `run_demo._idle_probe` (see the two assertions
+        # below it) -- not this ordering.
         self.assertLess(
             run_demo.SETTLE_MAX_CHANGED_PIXELS,
             run_demo.MIN_HEADLESS_CHANGED_PIXELS,
-            "the settle tolerance must stay strictly under the change threshold, or a "
-            "frame the settle loop calls 'quiet' could already carry a passing diff",
+            "the settle tolerance must stay strictly under the change threshold; a "
+            "tolerance at or above it would mean a single 'quiet' interval already "
+            "carries a passing diff",
         )
 
-    def test_span_threshold_cannot_be_cleared_by_one_character_cell(self):
+    def test_run_threshold_cannot_be_cleared_by_one_character_cell(self):
         self.assertGreaterEqual(
-            run_demo.MIN_HEADLESS_CHANGED_SPAN,
+            run_demo.MIN_HEADLESS_CHANGED_RUN,
             48,
-            "the span threshold is the signature only a line of typed characters "
+            "the run threshold is the signature only a line of typed characters "
             "makes; below ~48 px a single blinking cursor cell clears it",
+        )
+
+    def test_gap_tolerance_cannot_chain_two_unrelated_repaints_into_a_run(self):
+        # With a gap tolerance G, reaching a run of length R needs ink at
+        # least every G px, i.e. at least R/G clusters. Pinning G <= R/2
+        # keeps that at three or more, so no *pair* of unrelated repaints can
+        # chain into a passing run however far apart the gate's other numbers
+        # drift. (The ink-ratio rule does the rest of the work; see
+        # `ChangeProfileShapeMetrics`.)
+        self.assertLessEqual(
+            run_demo.RUN_GAP_TOLERANCE * 2,
+            run_demo.MIN_HEADLESS_CHANGED_RUN,
+            "the gap tolerance must stay at or under half the run threshold, or two "
+            "isolated repaints could chain into one 'run' -- the exact bounding-span "
+            "defect this metric replaced",
+        )
+
+    def test_idle_probe_covers_the_whole_post_actuation_poll_budget(self):
+        self.assertGreaterEqual(
+            run_demo.IDLE_PROBE_SECONDS,
+            run_demo.ACTUATION_POLL_BUDGET,
+            "the idle probe vouches that the app draws nothing actuation-shaped on "
+            "its own over the window the gate later polls; a probe shorter than that "
+            "window vouches for less time than the gate spends collecting evidence",
         )
 
     def test_change_threshold_is_well_above_the_vacuous_pre_fix_value(self):
@@ -571,6 +629,121 @@ class HeadlessGateThresholdsStayDiscriminating(unittest.TestCase):
             "first paint and shell prompt clear unaided; a threshold anywhere near it "
             "makes the M1.5 gate pass whether or not the agent's actuation landed",
         )
+
+
+class ChangeProfileShapeMetrics(unittest.TestCase):
+    """What the gate's shape metric accepts and rejects, on frames built here.
+
+    The thresholds above pin numbers against each other; this pins the
+    *predicate* against pixels. Binary-free and deterministic: frames are
+    assembled in-process from raw bytes, so no image codec enters any
+    dependency graph (plan risk R7) and no display, shim or app is needed.
+
+    Every case is a shape a real terminal actually draws, and the first one is
+    the defect that made this class necessary: the gate used to measure the
+    first-to-last *bounding span* of a scanline's changed pixels while calling
+    it a "run", so three unrelated one-cell repaints -- a cursor at the left
+    margin, a mode indicator mid-line, a scrollbar at the right edge, none of
+    them anything the agent typed -- satisfied it.
+    """
+
+    WIDTH, HEIGHT = 640, 32
+    STRIDE = WIDTH * 4
+    #: One character cell, at the ~8x17 a terminal draws in a 640x480 view.
+    CELL_W, CELL_H = 8, 17
+
+    def _frame(self, pixels) -> "vitrin_os.Frame":
+        """A black frame with white ink at the given ``(x, y)`` pixels."""
+        buf = bytearray(self.STRIDE * self.HEIGHT)
+        for x, y in pixels:
+            off = y * self.STRIDE + x * 4
+            buf[off : off + 3] = b"\xff\xff\xff"
+        return vitrin_os.Frame(
+            bytes(buf),
+            format=vitrin_os.Format.XRGB8888,
+            width=self.WIDTH,
+            height=self.HEIGHT,
+            stride=self.STRIDE,
+        )
+
+    def _cell(self, x0, y0=4, ink_columns=None):
+        """One filled (or partly inked) character cell at ``(x0, y0)``."""
+        columns = range(self.CELL_W) if ink_columns is None else ink_columns
+        return [
+            (x0 + dx, y0 + dy) for dy in range(self.CELL_H) for dx in columns
+        ]
+
+    def _profile(self, pixels):
+        return run_demo.change_profile(self._frame([]), self._frame(pixels))
+
+    def test_scattered_one_cell_repaints_are_rejected(self):
+        # A cursor, a mode indicator and a scrollbar repainting on the same
+        # scanlines, hundreds of pixels apart, drawing nothing anyone typed.
+        pixels = self._cell(0) + self._cell(300) + self._cell(632)
+        profile = self._profile(pixels)
+
+        # It clears BOTH conditions the pre-2026-07-25 gate applied ...
+        self.assertGreaterEqual(profile.count, run_demo.MIN_HEADLESS_CHANGED_PIXELS)
+        self.assertGreaterEqual(
+            profile.widest_row_span,
+            run_demo.MIN_HEADLESS_CHANGED_RUN,
+            "this fixture only tests anything if its bounding span clears the "
+            "threshold the old, span-based gate applied",
+        )
+        # ... and must still be rejected, because no run in it is wider than
+        # the single cell that drew it.
+        self.assertLess(profile.widest_dense_run, run_demo.MIN_HEADLESS_CHANGED_RUN)
+        self.assertFalse(
+            run_demo.actuation_landed(profile),
+            f"{profile}: three isolated one-cell repaints are not a typed line",
+        )
+
+    def test_a_typed_line_of_cells_is_accepted(self):
+        # 16 monospace cells at an 8 px pitch, inked the way glyphs ink --
+        # broken, never a solid bar. The real measurement this models: a real
+        # weston-terminal echoing `echo vitrin-demo` produced a 143 px dense
+        # run inked 96 px, and a *contiguous* run of only 9 px, which is why
+        # the metric chains across intra-line gaps at all.
+        pixels = []
+        for cell in range(16):
+            pixels += self._cell(cell * self.CELL_W, ink_columns=(1, 2, 4, 6))
+        profile = self._profile(pixels)
+        self.assertTrue(
+            run_demo.actuation_landed(profile),
+            f"{profile}: a 16-cell typed line must clear the gate, or the gate "
+            "demands something the demo's own input cannot draw",
+        )
+
+    def test_one_blinking_cursor_cell_is_rejected(self):
+        profile = self._profile(self._cell(40))
+        self.assertFalse(
+            run_demo.actuation_landed(profile),
+            f"{profile}: one repainted cell is a cursor blink, not typed text",
+        )
+
+    def test_a_dotted_artefact_is_not_a_run(self):
+        # Ink exactly at the gap tolerance, right across the frame: chained
+        # by the gap rule alone, but nothing is drawn there. The ink-ratio
+        # half of the metric is what rejects it.
+        pixels = [
+            (x, y)
+            for y in range(self.HEIGHT)
+            for x in range(0, self.WIDTH, run_demo.RUN_GAP_TOLERANCE)
+        ]
+        profile = self._profile(pixels)
+        self.assertGreaterEqual(profile.count, run_demo.MIN_HEADLESS_CHANGED_PIXELS)
+        self.assertFalse(
+            run_demo.actuation_landed(profile),
+            f"{profile}: a dotted artefact chained only by the gap tolerance is not "
+            "a drawn line",
+        )
+
+    def test_identical_frames_profile_as_no_change(self):
+        profile = self._profile([])
+        self.assertEqual(
+            (profile.count, profile.widest_dense_run, profile.rows), (0, 0, 0)
+        )
+        self.assertFalse(run_demo.actuation_landed(profile))
 
 
 class DemoUsesNoMockShim(unittest.TestCase):

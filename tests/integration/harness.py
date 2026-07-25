@@ -15,6 +15,7 @@ import os
 import pathlib
 import shutil
 import signal
+import socket as socket_mod
 import subprocess
 import sys
 import tempfile
@@ -83,6 +84,202 @@ class CoreFailed(Exception):
     """The core exited when a test expected it to be serving."""
 
 
+class InjectorFailed(Exception):
+    """The consent-injector channel said something the harness cannot use."""
+
+
+class ConsentInjector:
+    """The `consent-injector` channel (issue #138), from the harness side.
+
+    A `consent-injector`-feature `vitrind` invoked with
+    `--consent-injector-fd N` speaks a small line vocabulary on the inherited
+    socketpair (`crates/vitrin-core/src/consent/injector.rs`):
+
+    * unsolicited **edges** -- ``raised <petition> <token>`` and
+      ``lowered <petition>``, emitted from inside the core's own consent round
+      *after* `ConsentGrab::raise` has already marked the petition shown. So a
+      `raised` line is a guarantee, in the core's ordering, that
+      `consent_held` is in force for that principal: a caller blocks on the
+      line and then acts, with no sleep and no pixel poll;
+    * a synchronous **snapshot** -- ``describe`` replies with the consent
+      surface's geometry and, when a card is up, the card's own footprint of
+      the human-visible framebuffer as a sealed memfd over ``SCM_RIGHTS``;
+    * **message acceptance** -- ``decide <token> <button>`` replies
+      ``decided-ack <queued|...>``.
+
+    The channel never reports an authority *outcome*. Whether the decision
+    conferred anything is read where it always is: the agent's `resolved`
+    event on the wire and the flight recorder.
+    """
+
+    #: Everything the core may say, so an unknown verb is a loud failure
+    #: rather than a silently ignored line.
+    VERBS = ("vitrin-consent-injector", "raised", "lowered", "prompt", "decided-ack")
+
+    def __init__(self, sock: "socket_mod.socket") -> None:
+        self.sock = sock
+        self._buf = b""
+        self._edges: list[tuple[str, ...]] = []
+        self._replies: list[tuple[str, ...]] = []
+        self._fds: list[int] = []
+        self.banner: str | None = None
+
+    # -- transport ---------------------------------------------------------
+
+    def _pump(self, deadline: float) -> None:
+        """Read one message, classify its lines, and keep any descriptor.
+
+        `recvmsg` on a stream socket stops at the boundary of a segment
+        carrying ancillary data, so a descriptor is always delivered with the
+        chunk that starts the line it belongs to -- which is what lets the
+        pixels be matched to the `prompt` line positionally.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise InjectorFailed("the consent injector channel went quiet")
+        self.sock.settimeout(remaining)
+        try:
+            data, fds, _flags, _addr = socket_mod.recv_fds(self.sock, 4096, 1)
+        except TimeoutError as exc:
+            raise InjectorFailed("the consent injector channel went quiet") from exc
+        self._fds.extend(fds)
+        if not data:
+            raise InjectorFailed(
+                "the core closed the consent injector channel (it exited, or never adopted it)"
+            )
+        self._buf += data
+        while b"\n" in self._buf:
+            raw, self._buf = self._buf.split(b"\n", 1)
+            fields = tuple(raw.decode("utf-8", "replace").split(" "))
+            if fields[0] not in self.VERBS:
+                raise InjectorFailed(f"unknown consent-injector line: {fields!r}")
+            if fields[0] == "vitrin-consent-injector":
+                self.banner = " ".join(fields)
+            elif fields[0] in ("raised", "lowered"):
+                self._edges.append(fields)
+            else:
+                self._replies.append(fields)
+
+    def await_banner(self, timeout: float = 20.0) -> str:
+        """Block for the core's ``vitrin-consent-injector 1`` greeting."""
+        deadline = time.monotonic() + timeout
+        while self.banner is None:
+            self._pump(deadline)
+        return self.banner
+
+    def _next_reply(self, verb: str, timeout: float) -> tuple[str, ...]:
+        deadline = time.monotonic() + timeout
+        while True:
+            for i, fields in enumerate(self._replies):
+                if fields[0] == verb:
+                    return self._replies.pop(i)
+            self._pump(deadline)
+
+    # -- edges -------------------------------------------------------------
+
+    def await_raised(self, timeout: float = 30.0) -> tuple[str, str]:
+        """Block until a card goes up; return ``(petition_id, token)``."""
+        deadline = time.monotonic() + timeout
+        while True:
+            for i, fields in enumerate(self._edges):
+                if fields[0] == "raised":
+                    self._edges.pop(i)
+                    return fields[1], fields[2]
+            self._pump(deadline)
+
+    def await_lowered(self, petition: str | None = None, timeout: float = 30.0) -> str:
+        """Block until a card comes down; return the petition it named."""
+        deadline = time.monotonic() + timeout
+        while True:
+            for i, fields in enumerate(self._edges):
+                if fields[0] == "lowered" and (petition is None or fields[1] == petition):
+                    self._edges.pop(i)
+                    return fields[1]
+            self._pump(deadline)
+
+    # -- requests ----------------------------------------------------------
+
+    def describe(self, timeout: float = 30.0) -> tuple[dict[str, object], bytes | None]:
+        """Snapshot the consent surface: geometry, and the card's pixels.
+
+        Returns ``(fields, rgba_or_none)``. The pixels are the **card's
+        footprint only** -- never a whole human-visible frame, and never the
+        trust band or the trusted ring, which are painted in this session's
+        secret indicator colour and are therefore not read back at all
+        (issue #85; `crates/vitrin-core/src/consent/mod.rs`'s `card_rect`).
+        """
+        self.sock.sendall(b"describe\n")
+        fields = self._next_reply("prompt", timeout)
+        keys = (
+            "state",
+            "token",
+            "card_x",
+            "card_y",
+            "card_w",
+            "card_h",
+            "view_w",
+            "view_h",
+            "band_h",
+            "win_x",
+            "win_y",
+            "win_w",
+            "win_h",
+            "bytes",
+        )
+        if len(fields) != len(keys) + 1:
+            raise InjectorFailed(f"malformed `prompt` reply: {fields!r}")
+        out: dict[str, object] = {}
+        for key, value in zip(keys, fields[1:]):
+            out[key] = value if key in ("state", "token") else int(value)
+        size = int(out["bytes"])  # type: ignore[arg-type]
+        if size == 0:
+            return out, None
+        if not self._fds:
+            raise InjectorFailed(
+                f"the core reported {size} bytes of occlusion window but sent no descriptor"
+            )
+        fd = self._fds.pop(0)
+        try:
+            pixels = os.pread(fd, size, 0)
+        finally:
+            os.close(fd)
+        if len(pixels) != size:
+            raise InjectorFailed(f"short occlusion window: {len(pixels)} of {size} bytes")
+        return out, pixels
+
+    def decide(self, token: str, choice: str, timeout: float = 30.0) -> str:
+        """Press a button on the prompt `token` names; return the ack word."""
+        self.sock.sendall(f"decide {token} {choice}\n".encode())
+        return self._next_reply("decided-ack", timeout)[1]
+
+    def send_raw(self, raw: bytes) -> None:
+        """Write arbitrary bytes -- for the fail-closed component tests."""
+        self.sock.sendall(raw)
+
+    def next_ack(self, timeout: float = 30.0) -> str:
+        """The next ``decided-ack`` word, for callers that pipelined lines.
+
+        Sending several `decide` lines in **one** write is how the component
+        test pins the spent-token rule deterministically: the core drains the
+        whole batch inside one `service_injector` call, before `post_dispatch`
+        gets a chance to lower the card, so the second line is judged against
+        a prompt that is provably still up.
+        """
+        return self._next_reply("decided-ack", timeout)[1]
+
+    def close(self) -> None:
+        for fd in self._fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fds.clear()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 class Core:
     """One `vitrind --headless` process, its runtime tree, and its log.
 
@@ -113,6 +310,7 @@ class Core:
         extra_env: dict[str, str] | None = None,
         log_file: str | os.PathLike[str] | None = None,
         capture_dump: str | os.PathLike[str] | None = None,
+        consent_injector: bool = False,
     ) -> None:
         self.runtime = pathlib.Path(runtime_dir or tempfile.mkdtemp(prefix="vitrin-it-"))
         self._owns_runtime = runtime_dir is None
@@ -205,6 +403,27 @@ class Core:
         # RGBA, the frame the fidelity gate compares an `observe()` against.
         if capture_dump is not None:
             argv += ["--capture-dump", str(capture_dump)]
+        # The consent-injector channel (issue #138): an inherited AF_UNIX
+        # SOCK_STREAM socketpair, one end passed to the core by NUMBER on the
+        # command line. Deliberately not a bound path plus a nonce -- the
+        # confined realm runs as the core's own uid, so it could read both out
+        # of `/proc`; a socketpair has no name to connect to and `spawn.rs`'s
+        # post-fork `close_range(..., CLOSE_RANGE_CLOEXEC)` means neither the
+        # shim nor the app holds it past `execve`. Authentication is
+        # descriptor possession (crates/vitrin-core/src/consent/injector.rs).
+        pass_fds: tuple[int, ...] = ()
+        theirs: "socket_mod.socket | None" = None
+        if consent_injector:
+            ours, theirs = socket_mod.socketpair(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+            # `pass_fds` keeps the descriptor number in the child, and the
+            # pipes above are allocated first, so this is always >= 3 (which
+            # the core also checks and refuses at startup).
+            pass_fds = (theirs.fileno(),)
+            argv += ["--consent-injector-fd", str(theirs.fileno())]
+            self.injector: ConsentInjector | None = ConsentInjector(ours)
+        else:
+            self.injector = None
+        self.injector_fd = pass_fds[0] if pass_fds else None
         env = {**os.environ, "XDG_RUNTIME_DIR": str(self.runtime), "RUST_LOG": "info"}
         # The core's own environment is the source `env_allow` copies from,
         # so the real-app gate seeds WLR_* here for the allowlist to forward.
@@ -216,7 +435,13 @@ class Core:
             stdout=self._logf if self._logf is not None else subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            pass_fds=pass_fds,
         )
+        # Our copy of the core's end goes away immediately: with it open, a
+        # core that died would leave the channel readable-but-never-EOF and a
+        # waiting harness would hang instead of failing.
+        if theirs is not None:
+            theirs.close()
         if wait:
             self.await_socket()
 
@@ -336,6 +561,9 @@ class Core:
         return self
 
     def __exit__(self, *_exc: object) -> None:
+        if self.injector is not None:
+            self.injector.close()
+            self.injector = None
         self.terminate()
         # Read the log before the tree it lives in goes away, so assertions
         # after the `with` block see the run rather than an empty list.

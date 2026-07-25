@@ -22,7 +22,10 @@
 #           run. (63ms total elapsed)             ran. (63 ms total)
 #
 # Both dialects are accepted below, because which one you get depends on the
-# wlcs build, not on anything this repository controls. testdata/*.log is real
+# wlcs build, not on anything this repository controls -- and test-summary.sh
+# asserts that for every pattern in BOTH dialects, per-test AND end-of-run,
+# because a summary pattern that matches only one dialect degrades this file
+# to a single extraction without failing anything. testdata/*.log is real
 # wlcs output; see test-summary.sh for the provenance of each fixture.
 #
 # TWO INDEPENDENT EXTRACTIONS, ON PURPOSE. Every count is derived twice:
@@ -57,8 +60,18 @@ WLCS_RE_TEST_STARTED='^\[ RUN      \] '
 # matching the START-of-run line, "[==========] Running N tests from ...".
 WLCS_RE_SUM_TOTAL='^\[==========\] [0-9]+ tests? from .*(ran|run)\.'
 WLCS_RE_SUM_PASSED='^\[  PASSED  \] [0-9]+ tests?[.]?$'
-WLCS_RE_SUM_FAILED='^\[  FAILED  \] [0-9]+ tests? (failed|, listed below):'
-WLCS_RE_SUM_SKIPPED='^\[  SKIPPED \] [0-9]+ tests? (skipped|, listed below):'
+# NOTE THE PLACEMENT OF THE SPACE. wlcs writes "5 tests failed:" (space,
+# then the word); stock googletest writes "2 tests, listed below:" (comma
+# IMMEDIATELY after the count, no space). Putting the space outside the
+# alternation -- `tests? (failed|, listed below)` -- silently matches only
+# the wlcs spelling, which costs nothing on a wlcs log and quietly reduces
+# summary.sh to a SINGLE extraction on a stock-googletest one: sum_failed
+# and sum_skipped stay empty, the per-test fallback becomes the only
+# source, and the canary below then compares that source with itself and
+# can never fire. The space therefore belongs inside the alternation.
+# test-summary.sh asserts both spellings against both dialects.
+WLCS_RE_SUM_FAILED='^\[  FAILED  \] [0-9]+ tests?( failed|, listed below):'
+WLCS_RE_SUM_SKIPPED='^\[  SKIPPED \] [0-9]+ tests?( skipped|, listed below):'
 
 # wlcs_count <log> <ere> -- number of matching lines, always a decimal integer
 # on stdout, always exit 0.

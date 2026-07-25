@@ -78,8 +78,16 @@ check_gt0() {
 }
 
 summarize() {
-	# Discards the stderr diagnostics; the assertions are on the counts.
+	# Only the counts. Section 7 asserts the stderr diagnostics separately.
 	wlcs_summarize_log "$1" 2>/dev/null
+}
+
+stderr_of() {
+	# Only the stderr diagnostics: the counts line is discarded inside the
+	# group, then the group's stderr becomes this function's stdout. Written
+	# as a group rather than `2>&1 >/dev/null` so that it is unambiguous
+	# (and shellcheck-clean) that stderr is the payload here, not stdout.
+	{ wlcs_summarize_log "$1" >/dev/null; } 2>&1
 }
 
 echo "== summary.sh against real wlcs captures =="
@@ -121,15 +129,50 @@ check_eq "missing log" "0 0 0 0 no-output" "$(summarize "$TMP/does-not-exist.log
 
 # --- 5. the end-of-run listing must not be double-counted ---------------
 # wlcs prints every failed and skipped test twice: once as it happens (with a
-# duration) and once in the end-of-run listing (without one). Counting the
-# bracket tag alone would report 11 failures for the 5 real ones in the
-# fixture.
-listing_failed=$(grep -cE '^\[  FAILED  \]' "$HERE/testdata/wlcs-1.6.1-complete.log" || true)
+# duration) and once in the end-of-run listing (without one). The trailing
+# `\([0-9]+ ?ms\)$` anchor in WLCS_RE_TEST_FAILED / _SKIPPED is the only
+# thing telling the two apart.
+#
+# This asserts the PARSER's de-duplicated counts, not merely that the
+# fixture still contains a re-listing. Asserting the fixture's shape alone
+# pins nothing: no other check in this file reaches the per-test counts for
+# this log (checks 1 and 6 both take the end-of-run summary block, which
+# wins whenever it is present), so deleting the anchor from both patterns
+# used to leave the whole self-test green while every aborted run silently
+# double-counted afterwards. With the anchor gone these go 5 -> 11 and
+# 4 -> 9, and this check goes red.
+complete_log="$HERE/testdata/wlcs-1.6.1-complete.log"
+raw_failed=$(grep -cE '^\[  FAILED  \]' "$complete_log" || true)
+raw_skipped=$(grep -cE '^\[(     SKIP |  SKIPPED )\]' "$complete_log" || true)
 CHECKS=$((CHECKS + 1))
-if [ "$listing_failed" -le 5 ]; then
-	fail "fixture no longer exercises the re-listing (found $listing_failed" \
-		"'[  FAILED  ]' lines for 5 failed tests; expected more than 5)"
+if [ "$raw_failed" -le 5 ] || [ "$raw_skipped" -le 4 ]; then
+	fail "fixture no longer exercises the re-listing (found $raw_failed" \
+		"'[  FAILED  ]' and $raw_skipped skip-tagged lines, for 5 failed" \
+		"and 4 skipped tests; expected strictly more of each). The" \
+		"de-duplication assertions below are vacuous without it."
 fi
+check_eq "de-duplicated per-test failures" "5" \
+	"$(wlcs_count "$complete_log" "$WLCS_RE_TEST_FAILED")"
+check_eq "de-duplicated per-test skips" "4" \
+	"$(wlcs_count "$complete_log" "$WLCS_RE_TEST_SKIPPED")"
+check_eq "de-duplicated per-test passes" "3" \
+	"$(wlcs_count "$complete_log" "$WLCS_RE_TEST_OK")"
+check_eq "per-test started lines" "12" \
+	"$(wlcs_count "$complete_log" "$WLCS_RE_TEST_STARTED")"
+
+# The same for the aborted fixture, where the per-test counts are the only
+# ones there are -- nothing else here would notice WLCS_RE_TEST_* rotting
+# against that dialect either, since check 2 asserts the summarised line
+# rather than the individual extractions.
+aborted_log="$HERE/testdata/wlcs-1.7.0-aborted.log"
+check_eq "aborted: per-test failures" "1" \
+	"$(wlcs_count "$aborted_log" "$WLCS_RE_TEST_FAILED")"
+check_eq "aborted: per-test skips" "1" \
+	"$(wlcs_count "$aborted_log" "$WLCS_RE_TEST_SKIPPED")"
+check_eq "aborted: per-test passes" "1" \
+	"$(wlcs_count "$aborted_log" "$WLCS_RE_TEST_OK")"
+check_eq "aborted: per-test started lines" "4" \
+	"$(wlcs_count "$aborted_log" "$WLCS_RE_TEST_STARTED")"
 
 # --- 6. stock-googletest output is understood too ----------------------
 # Not a wlcs capture: googletest's own PrettyUnitTestResultPrinter, which a
@@ -171,7 +214,80 @@ cat >"$TMP/stock-gtest.log" <<'EOF'
 EOF
 check_eq "stock googletest dialect" "8 2 2 4 complete" "$(summarize "$TMP/stock-gtest.log")"
 
-# --- 7. run-advisory.sh end to end -------------------------------------
+# The line above is NOT sufficient on its own, and this is the trap that was
+# actually sprung: with sum_failed/sum_skipped empty, `failed` and `skipped`
+# fall back to the per-test counts and the summarised line comes out
+# identical. So a WLCS_RE_SUM_* pattern that matches only the wlcs spelling
+# passes the check above while quietly reducing summary.sh to ONE
+# extraction for this dialect -- and the stale-pattern canary, which then
+# compares the per-test count against itself, can never fire.
+#
+# Each end-of-run pattern is therefore asserted directly, in both dialects.
+# Empty (the "no such line" answer) is a distinct, visible failure here.
+check_summary_block() {
+	# check_summary_block <name> <log> <total> <passed> <failed> <skipped>
+	check_eq "$1 summary-block total" "$3" \
+		"$(wlcs_summary_number "$2" "$WLCS_RE_SUM_TOTAL")"
+	check_eq "$1 summary-block passed" "$4" \
+		"$(wlcs_summary_number "$2" "$WLCS_RE_SUM_PASSED")"
+	check_eq "$1 summary-block failed" "$5" \
+		"$(wlcs_summary_number "$2" "$WLCS_RE_SUM_FAILED")"
+	check_eq "$1 summary-block skipped" "$6" \
+		"$(wlcs_summary_number "$2" "$WLCS_RE_SUM_SKIPPED")"
+}
+check_summary_block "stock gtest" "$TMP/stock-gtest.log" 8 2 2 4
+check_summary_block "wlcs" "$complete_log" 12 3 5 4
+
+# --- 7. the stderr diagnostics are the product, not a side effect -------
+# summary.sh's claim is not "it prints numbers", it is "a number you should
+# not trust is LOUD". Two mechanisms carry that claim and both write only to
+# stderr: the aborted-run warning and the stale-pattern canary. `summarize`
+# discards stderr, so without this section either could be deleted outright
+# and every assertion above would still pass.
+echo
+echo "== summary.sh stderr diagnostics =="
+
+CHECKS=$((CHECKS + 1))
+if ! stderr_of "$aborted_log" | grep -qF '::warning::wlcs run ABORTED'; then
+	fail "an aborted run printed no ABORTED warning on stderr"
+fi
+
+# A complete, self-consistent run must be SILENT. Without this, a canary
+# that fired unconditionally would satisfy the check below.
+CHECKS=$((CHECKS + 1))
+quiet=$(stderr_of "$complete_log")
+if [ -n "$quiet" ]; then
+	fail "a consistent complete run printed a diagnostic on stderr: $quiet"
+fi
+
+# The canary itself. A log whose end-of-run block disagrees with its own
+# per-test lines cannot be produced by a healthy parser -- that shape IS the
+# symptom of a rotted pattern set -- so it is synthesised. Here the block
+# claims 5 passes where only 2 per-test OK lines exist.
+cat >"$TMP/disagreeing.log" <<'EOF'
+[==========] Running 3 tests from 1 test suite.
+[ RUN      ] T.a
+[       OK ] T.a (0 ms)
+[ RUN      ] T.b
+[       OK ] T.b (0 ms)
+[ RUN      ] T.c
+[  FAILED  ] T.c (0 ms)
+[----------] Global test environment tear-down
+[==========] 3 tests from 1 test suite ran. (0 ms total)
+[  PASSED  ] 5 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] T.c
+EOF
+check_eq "disagreeing log: summary block still wins" "3 5 1 0 complete" \
+	"$(summarize "$TMP/disagreeing.log")"
+CHECKS=$((CHECKS + 1))
+if ! stderr_of "$TMP/disagreeing.log" |
+	grep -qF 'parse disagreement: passed(summary=5 per-test=2)'; then
+	fail "the two extractions disagreed and no canary fired on stderr; got:" \
+		"$(stderr_of "$TMP/disagreeing.log")"
+fi
+
+# --- 8. run-advisory.sh end to end -------------------------------------
 # A stub standing in for the wlcs runner: replays a real capture and exits
 # non-zero, exactly as the runner does when tests fail. This exercises the
 # whole script -- argument checks, LD_LIBRARY_PATH computation, the `|| true`

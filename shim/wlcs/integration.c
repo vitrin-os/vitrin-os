@@ -98,8 +98,47 @@ enum pending_kind {
 
 /* Largest frame this module ever hands to vitrin_seat_handle_event: the
  * motion and button events are both header(8) + 3*u32(12) = 20 bytes.
- * Rounded up generously; _Static_assert below pins it to the real events. */
+ * Rounded up generously; the _Static_asserts below pin it to the real
+ * events. */
 #define PENDING_FRAME_CAP 32u
+
+/* The wire length of the only two events this module encodes, spelled the way
+ * the generated encoders in vitrin-protocol.h spell it:
+ *
+ *   uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4;
+ *
+ * -- three u32-wide scalar arguments (x/y/origin, button/state/origin), no
+ * strings, no arrays, no fds. The generated header exposes no per-message
+ * length constant to import, so this restates that arithmetic. */
+#define VITRIN_WLCS_SEAT_FRAME_LEN (VITRIN_HEADER_LEN + 4u + 4u + 4u)
+
+/* WHAT THESE ASSERTIONS DO AND DO NOT COVER -- the previous version of this
+ * comment claimed a `_Static_assert` "below" that did not exist anywhere in
+ * the file, so be precise about the ones that now do.
+ *
+ * They catch PENDING_FRAME_CAP being shrunk below what the seat events
+ * already need, and -- via sizeof on the generated argument structs -- they
+ * also catch the IDL GROWING either event by another fixed-width scalar,
+ * because that grows the struct in lockstep with the frame. What they cannot
+ * catch is a string or array argument being added: the struct would then gain
+ * a small descriptor while the wire frame gained an unbounded payload, and
+ * the two would stop tracking each other.
+ *
+ * That residual case is still caught, just at runtime rather than at compile
+ * time, and NOT silently: emit_motion/emit_button encode into a
+ * PENDING_FRAME_CAP-sized buffer, so an over-long frame makes the encoder
+ * return VITRIN_ENCODE_ERR_OVERFLOW, which those functions log at WLR_ERROR
+ * and then DROP -- run_on_display_thread's own frame_len > PENDING_FRAME_CAP
+ * branch does the same. A dropped input event means the wlcs test waiting on
+ * it times out rather than reporting anything about the shim, so if this
+ * module ever starts logging "failed to encode" or "frame too large", the
+ * run's numbers are meaningless until the cap is raised. */
+_Static_assert(PENDING_FRAME_CAP >= VITRIN_WLCS_SEAT_FRAME_LEN,
+	"PENDING_FRAME_CAP must hold a whole vitrin_shim_seat motion/button frame");
+_Static_assert(PENDING_FRAME_CAP >= VITRIN_HEADER_LEN + sizeof(vitrin_shim_seat_evt_motion_t),
+	"vitrin_shim_seat.motion grew past PENDING_FRAME_CAP -- raise the cap");
+_Static_assert(PENDING_FRAME_CAP >= VITRIN_HEADER_LEN + sizeof(vitrin_shim_seat_evt_button_t),
+	"vitrin_shim_seat.button grew past PENDING_FRAME_CAP -- raise the cap");
 
 struct vitrin_wlcs_server {
 	/* MUST be first: WLCS hands every hook a `WlcsDisplayServer*` that is
@@ -310,9 +349,26 @@ static WlcsPointer *create_pointer(WlcsDisplayServer *server) {
 /* No wl_touch capability exists on this seat (globals.c: "v0's seat
  * vocabulary has no touch event"), and there is no `touch` opcode on
  * `vitrin_shim_seat` for this module to encode even if there were a capability
- * to advertise -- see shim/wlcs/README.md's "Known limitations". Returning
- * NULL is documented WLCS behaviour for "this display server has no touch
- * support": the Touch* test group skips itself rather than crashing. */
+ * to advertise -- see shim/wlcs/README.md's "Limitations".
+ *
+ * RETURNING NULL DOES NOT MAKE WLCS SKIP TOUCH TESTS. An earlier version of
+ * this comment asserted it did ("the Touch* test group skips itself rather
+ * than crashing"); that is not what happens. On wlcs 1.7.0 the first test
+ * parameter that gets far enough to actually use a touch device SEGFAULTS
+ * inside the wlcs runner binary, taking the rest of the run with it. On
+ * wlcs 1.6.1 -- what Ubuntu 24.04 ships, so what CI installs -- the same
+ * parameters fail on a protocol error before reaching this function, so the
+ * run survives; that is luck, not design. See README.md's "Known hazard"
+ * for the reproduction and the evidence. run-advisory.sh's `--gtest_filter`
+ * excludes the *Touch* suites, but NOT the touch-device parameters of the
+ * parameterised input suites, so nothing in the scope protects against
+ * this.
+ *
+ * There is nothing to return instead: WlcsTouch's ABI has no "unsupported"
+ * value, and a stub that accepted touch events would have no wire event to
+ * encode them into. This stays NULL, honestly documented, until either
+ * `vitrin_shim_seat` gains touch or the scope stops including touch
+ * parameters. */
 static WlcsTouch *create_touch(WlcsDisplayServer *server) {
 	(void)server;
 	return NULL;

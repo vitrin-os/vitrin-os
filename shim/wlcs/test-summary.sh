@@ -32,9 +32,12 @@
 #   wlcs-1.7.0-aborted.log    wlcs 1.7.0-1ubuntu1 (a LATER Ubuntu release's
 #                             package, not noble's), where the runner
 #                             segfaults mid-suite -- see README.md's "Known
-#                             blocker". This is the case a summary parser
-#                             that only reads the end-of-run block reports
-#                             as total=0 failed=0, i.e. as a clean run.
+#                             hazard". A skip, a failure and a pass complete
+#                             first, so this is precisely the case a summary
+#                             parser that only reads the end-of-run block
+#                             reports as total=0 failed=0: a run with a real
+#                             failure in it, indistinguishable from a clean
+#                             sweep.
 #   wlcs-loadfail.log         the module failing to dlopen: no test ever ran,
 #                             and the log has no googletest output in it at
 #                             all. This is the shape of the log from the CI
@@ -91,13 +94,17 @@ check_gt0 "complete run: failed" "$c_failed"
 check_gt0 "complete run: skipped" "$c_skipped"
 
 # --- 2. a run that died mid-suite --------------------------------------
-# Two skips and one pass completed, then the runner segfaulted before
-# printing any summary block. The counts must be the three that completed,
-# and the status must say the tally is partial rather than pretending the
-# suite finished with nothing wrong.
+# One skip, one failure and one pass completed, then the runner segfaulted
+# before printing any summary block. THIS IS THE REGRESSION: a parser that
+# reads only the end-of-run block reports total=0 failed=0 here, i.e. a run
+# in which a test demonstrably failed reads as one in which nothing did. The
+# counts must be the three that completed, the failure count must be
+# non-zero, and the status must say the tally is partial.
 got=$(summarize "$HERE/testdata/wlcs-1.7.0-aborted.log")
-check_eq "aborted run (wlcs 1.7.0)" "3 1 0 2 aborted" "$got"
-check_gt0 "aborted run: skipped" "$(echo "$got" | cut -d' ' -f4)"
+check_eq "aborted run (wlcs 1.7.0)" "3 1 1 1 aborted" "$got"
+read -r _ _ a_failed a_skipped _ <<<"$got"
+check_gt0 "aborted run: failed" "$a_failed"
+check_gt0 "aborted run: skipped" "$a_skipped"
 
 # --- 3. the module failing to load -------------------------------------
 got=$(summarize "$HERE/testdata/wlcs-loadfail.log")

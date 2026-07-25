@@ -195,6 +195,20 @@ instantiations (4 + 4) and `XdgSurfaceStableTest` (1) — 128 exactly.**
 > which *does* raise a code-3 error but fails on the code-mismatch
 > assertion rather than on an unexpected protocol error, and so belongs
 > there and not here. Counting it twice is what produced the 129.
+>
+> To re-derive the split, attribute *tests*: each `[ RUN      ]` … result
+> block whose body carries the exception. Two things will otherwise give you
+> 129 rather than 128, and both are artefacts of the log, not of the shim.
+> `grep -c` over the **finished** `wlcs-run.log` counts one extra hit
+> because `run-advisory.sh` appends its own "Dominant failure categories"
+> block to that same file, and that block quotes the exception string
+> verbatim. Naive attribution of every matching line to the preceding
+> `[ RUN      ]` then charges that appended line to whichever test ran last
+> (`PointerCrossingSurfaceEdge/SurfacePointerMotionTest.pointer_movement/3`
+> here), inflating that instantiation to 5. Stop attribution at each test's
+> result line and both go away: the exception occurs exactly 128 times in
+> the gtest output, once per failing test, which is also what
+> `run-advisory.sh`'s own counter reports.
 
 `xdg_surface` error 3 is `unconfigured_buffer` — "Attaching a buffer to an
 unconfigured surface". `WAYLAND_DEBUG=1` traces show wlcs 1.6.1's client

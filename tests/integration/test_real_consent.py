@@ -44,6 +44,16 @@ shortcut would journal `scripted_consent` there and fail.
    path.** Three independently transported artifacts of one instant agree:
    the sealed memfd (human-visible, card footprint), the core-internal
    `--capture-dump` (realm view), and the agent's own `observe()` frame.
+   Stated as the metric it really is: the sealed memfd is first shown to *be*
+   a raster of vitrind's consent card, on exactly the rectangle the core
+   named -- accent ring on all four edges, exact perimeter count, opaque
+   body, buttons, antialiased text (`_assert_is_a_real_card_raster`) -- and
+   only then shown to carry zero pixels of the app's target colour, while the
+   realm view carries that target at those same coordinates. The order
+   matters: without the positive control the second half is an absence over
+   bytes of unproven provenance, and an empty or synthetic export satisfies
+   an absence perfectly. That gap was real and is the first entry in the
+   watched-failing list below.
 3. **Mid-prompt actuations never land, demonstrably BECAUSE a prompt was
    pending** -- five independent facts, listed on the test method.
 4. **The decision resolves through the real state machine and the flight
@@ -73,9 +83,24 @@ shortcut would journal `scripted_consent` there and fail.
   `shim/docs/firefox.md` §9 with a human at a mouse. The injector bypasses
   `judge` completely, and the headless router still stacks `NoopHook`, so no
   input of any origin can reach this grab.
-- It says nothing about the human-visible frame OUTSIDE the card footprint:
-  not the scrim, not the ring. A defect corrupting only that region is
-  invisible to it.
+- **It says nothing about the human-visible frame OUTSIDE the card
+  footprint** -- not the scrim, not the ring -- and with `click-target` it
+  structurally cannot, which is worth stating precisely rather than as a
+  caveat. The export is clamped to the card's footprint (C1, above), and the
+  card is `blit_opaque`-ed last, so those bytes do not depend on the frame
+  underneath them at all. Measured on this gate's own artifacts: the realm
+  view outside the card footprint is 93 840 px of a single colour, black --
+  `click-target` paints black everywhere except one centred 160x160 square
+  that the 560x381 centred card wholly covers. So a regression that erased
+  the realm view from the human-visible output entirely (`view.fill(0)`
+  before `composite_over`) changes **no pixel** of what a human sees here:
+  the exported window is byte-identical, sha256 and all, which was confirmed
+  by running it. No assertion this gate could add would see it. That defect
+  is real and it *is* caught -- by
+  `backend::headless`'s `a_prompt_reaches_human_visible_output_but_never_a_capture`
+  (a full-bleed test pattern, bottom-left asserted scrimmed-not-erased) and
+  `backend::winit`'s `the_nested_window_uploads_the_consent_overlay`, both of
+  which go red on it. Component evidence, named as such.
 - It cannot show the card is legible or names the right principal;
   `consent/render.rs`'s golden and sourcing tests hold that.
 
@@ -91,6 +116,13 @@ cited:
 - **P2, occlusion half**: make `backend::human_visible_from_view` skip
   `composite_over` -> the exported window shows click-target's green ->
   `green(A) == 0` fails.
+- **P2, the export's provenance**: replace the `readback_region` call in
+  `consent_occlusion_window` with `Some((region, vec![0u8; w*h*4]))`, so the
+  human-visible framebuffer is never read at all -> the positive control
+  fails on the very first edge pixel, naming the cause ("these bytes are not
+  a readback of the card at the rectangle the core reported"). Before that
+  control existed this sabotage kept the gate GREEN and printed its success
+  line verbatim; it is the reason `_assert_is_a_real_card_raster` is here.
 - **P2, capture half**: point `Presenter::view_rgba` at
   `latest_output_rgba` -- folding the two retained images, the exact mistake
   that accessor is `#[cfg(test)]` to prevent -> the byte-equality against the
@@ -173,6 +205,39 @@ MIN_TARGET_PIXELS = 5000
 #: and hard-codes only the one constant that really is one.
 CARD_WIDTH = 560
 
+#: The card raster's own palette, from `consent/render.rs`. Every one of these
+#: is pinned against that file by
+#: `test_the_card_raster_constants_match_the_renderer`, the same way
+#: `CARD_WIDTH` is, so a renderer that restyled the card fails there loudly
+#: instead of quietly turning the positive control below into a check on
+#: colours nothing paints any more.
+#:
+#: They exist because "no pixel of the app's green is inside the card's
+#: footprint" is an ABSENCE, and an absence is equally true of an empty
+#: buffer, a synthetic one, or a rectangle of some other part of the screen.
+#: The gate has no independent view of the human-visible framebuffer -- it
+#: must not have one, that is C1 (issue #85) -- so the provenance of those
+#: bytes has to come from their own content: they have to BE a raster of
+#: vitrind's consent card, at exactly the rectangle the core named.
+#:
+#: `BORDER`/`ACCENT` carry most of that weight, because the accent ring is
+#: positional: `render::rasterize` strokes it `BORDER` px wide along the edges
+#: of the card image, so finding it exactly on the exported rectangle's four
+#: edges -- and nowhere else, an exact pixel count -- says the readback landed
+#: on the card's footprint and not one pixel off it.
+CARD_BG = (0x14, 0x16, 0x1C, 0xFF)
+ACCENT = (0x4D, 0x9D, 0xE0, 0xFF)
+BUTTON_BG = (0x22, 0x27, 0x31, 0xFF)
+BUTTON_BORDER = (0x5C, 0x66, 0x78, 0xFF)
+BORDER = 2
+
+#: How many distinct colours a genuinely rasterized card carries. The real
+#: export measures 824: `render::text` antialiases every glyph, so a card with
+#: text on it has hundreds of blend values between `CARD_BG` and the label
+#: colours. A flat forgery -- fill, ring, buttons -- has a handful. Set far
+#: below the measured value and far above any flat construction.
+MIN_CARD_COLOURS = 64
+
 #: How many consecutive identical `--capture-dump` reads mean "the app has
 #: settled". The P1.9.8 gate-integrity lesson: a control capture taken while
 #: the app is still painting lets the app forge the later evidence.
@@ -246,6 +311,28 @@ def _count_rgba(buf: bytes, hex6: str) -> int:
         if (buf[off] & 0xF0, buf[off + 1] & 0xF0, buf[off + 2] & 0xF0) == want:
             hits += 1
     return hits
+
+
+def _exact_rgba(buf: bytes, want: tuple[int, int, int, int]) -> int:
+    """How many pixels of a raw-RGBA buffer are EXACTLY `want`.
+
+    Unquantised, unlike `_count_rgba`. The app's colours come off a real GPU-less
+    renderer and through a shim, so those get the 4-bit tolerance; the card's
+    do not -- `render::rasterize` writes `CARD_BG`/`ACCENT` into a CPU buffer
+    with `copy_from_slice` and `readback_region` reads that buffer back, so an
+    exact count is a check on identity, not on similarity.
+    """
+    return sum(
+        1
+        for off in range(0, len(buf), 4)
+        if (buf[off], buf[off + 1], buf[off + 2], buf[off + 3]) == want
+    )
+
+
+def _px(buf: bytes, width: int, x: int, y: int) -> tuple[int, int, int, int]:
+    """One pixel of a raw-RGBA buffer, as a 4-tuple."""
+    off = (y * width + x) * 4
+    return (buf[off], buf[off + 1], buf[off + 2], buf[off + 3])
 
 
 def _crop_rgba(buf: bytes, size: tuple[int, int], rect: tuple[int, int, int, int]) -> bytes:
@@ -442,6 +529,119 @@ class RealConsentPrompt(IntegrationTest):
             persistence=persistence or vitrin_os.Persistence.WHILE_RUNNING,
         )
 
+    def _assert_is_a_real_card_raster(
+        self, window: bytes, card: tuple[int, int, int, int]
+    ) -> tuple[int, int, set[bytes]]:
+        """The POSITIVE control on the exported occlusion window.
+
+        Proof 2's occlusion half is an ABSENCE -- "no pixel of the app's green
+        is in this rectangle" -- and an absence is equally true of an empty
+        buffer, a synthetic one, or a rectangle of some other part of the
+        screen. Without this, a `consent_occlusion_window` that returned
+        `vec![0u8; w*h*4]` and never touched the framebuffer at all would keep
+        the gate green while printing the same success line, which is exactly
+        how a gate comes to be cited for a property it never checked.
+
+        The harness has no independent view of the human-visible framebuffer,
+        and must not have one: that is C1 (issue #85). Whole-frame readback is
+        `#[cfg(test)]` precisely so no running build can be asked for one. So
+        the provenance of these bytes has to come from the bytes: they have to
+        BE a raster of vitrind's consent card, laid out on exactly the
+        rectangle the core named.
+
+        Four independent things are checked, in rising strength:
+
+        1. **The accent ring is on the exported rectangle's four edges.**
+           `render::rasterize` strokes it `BORDER` px wide along the edges of
+           the CARD image, so this is positional: a readback that landed a
+           pixel off the card's footprint, or on a different region, or on
+           nothing, does not have the ring on its border. This is what ties
+           the delivered bytes to the reported geometry -- the geometry
+           assertions above are otherwise the core's own numbers checked
+           against each other.
+        2. **The accent appears nowhere else**, by exact pixel count against
+           the perimeter formula -- so it is a frame, not a fill.
+        3. **The card body and its BUTTONS are there**: `CARD_BG` dominant,
+           and both button colours present. A consent card with no buttons
+           would not be one a human could answer.
+        4. **The raster carries antialiased text** (`MIN_CARD_COLOURS`
+           distinct colours). A flat forgery -- fill, ring, two rectangles --
+           cannot reach it.
+
+        What this does NOT prove is that some *other* correct card raster was
+        not substituted for this one; under C1 no assertion available to this
+        harness can, and pretending otherwise is the failure this docstring
+        exists to avoid.
+
+        Returns `(accent_px, card_bg_px, distinct_colours)` so the run's
+        summary line can state what was checked instead of only the absence.
+        """
+        _, _, cw, ch = card
+        self.assertEqual(len(window), cw * ch * 4, "the export is the whole card footprint")
+
+        # 1. The ring, positionally: every pixel of the outermost BORDER-wide
+        #    band on all four edges.
+        for row in list(range(BORDER)) + list(range(ch - BORDER, ch)):
+            for col in range(cw):
+                self.assertEqual(
+                    _px(window, cw, col, row),
+                    ACCENT,
+                    f"the exported window's edge pixel ({col},{row}) is not the card's accent "
+                    "border: these bytes are not a readback of the card at the rectangle the "
+                    "core reported",
+                )
+        for col in list(range(BORDER)) + list(range(cw - BORDER, cw)):
+            for row in range(ch):
+                self.assertEqual(
+                    _px(window, cw, col, row),
+                    ACCENT,
+                    f"the exported window's edge pixel ({col},{row}) is not the card's accent "
+                    "border: these bytes are not a readback of the card at the rectangle the "
+                    "core reported",
+                )
+        # ...and the ring really is BORDER thick, so it is a frame drawn on a
+        # card and not a flood fill that happens to reach the edges.
+        self.assertEqual(
+            _px(window, cw, BORDER, BORDER),
+            CARD_BG,
+            "the pixel just inside the accent ring must be the card's background",
+        )
+
+        # 2. Exactly the perimeter, nowhere else.
+        ring = cw * ch - (cw - 2 * BORDER) * (ch - 2 * BORDER)
+        accent_px = _exact_rgba(window, ACCENT)
+        self.assertEqual(
+            accent_px,
+            ring,
+            f"the accent colour must occupy exactly the {ring}px border ring of a "
+            f"{cw}x{ch} card and nothing else",
+        )
+
+        # 3. The card body, and the buttons a human is meant to press.
+        body = _exact_rgba(window, CARD_BG)
+        self.assertGreater(
+            body,
+            cw * ch // 2,
+            f"only {body} of {cw * ch} px are the card's background: the export is not an "
+            "opaque consent card",
+        )
+        self.assertGreater(
+            _exact_rgba(window, BUTTON_BG), 0, "the card must carry its button row"
+        )
+        self.assertGreater(
+            _exact_rgba(window, BUTTON_BORDER), 0, "the card's buttons must be outlined"
+        )
+
+        # 4. Real, antialiased text.
+        colours = {window[off : off + 4] for off in range(0, len(window), 4)}
+        self.assertGreaterEqual(
+            len(colours),
+            MIN_CARD_COLOURS,
+            f"the exported card carries only {len(colours)} distinct colours: a rasterized "
+            "card antialiases its glyphs and carries hundreds",
+        )
+        return accent_px, body, colours
+
     def _locate_target(self, grant, timeout=20.0):
         """Observe until the green target is on screen; return `(frame, cx, cy)`."""
         deadline = time.monotonic() + timeout
@@ -610,8 +810,15 @@ class RealConsentPrompt(IntegrationTest):
             "otherwise the occlusion assertion below is about empty space",
         )
 
-        # A = the human-visible output, card footprint. The human sees the
-        # card exactly where the real app is painting its green target.
+        # A0 = the POSITIVE control on those bytes, before any absence is read
+        # out of them. See `_assert_is_a_real_card_raster`: "no green here" is
+        # a statement about the human-visible framebuffer only if these bytes
+        # ARE the human-visible framebuffer's card footprint, and the only
+        # evidence for that available under C1 is the bytes' own content.
+        ring_px, body_px, window_colours = self._assert_is_a_real_card_raster(window, card)
+
+        # A = the human-visible output, card footprint. Nothing of the app's
+        # target survives inside the rectangle just shown to be the card.
         green_a = _count_rgba(window, self.TARGET)
         self.assertEqual(
             green_a,
@@ -796,8 +1003,10 @@ class RealConsentPrompt(IntegrationTest):
 
         print(
             f"\n[real-consent] prompt {id1} raised over a real click-target and allowed via "
-            f"resolve_human (while_running). Prompt {id2} raised: the human-visible card "
-            f"footprint {card} carried {green_a} px of the app's target, the realm view carried "
+            f"resolve_human (while_running). Prompt {id2} raised: the export at {card} was "
+            f"checked to BE a card raster there ({ring_px} px of accent border on all four "
+            f"edges, {body_px} px of card background, {len(window_colours)} distinct colours) "
+            f"and carried {green_a} px of the app's target, the realm view carried "
             f"{green_b} px at those same coordinates and was byte-identical to the settled "
             f"control, the agent's mid-prompt observe() still showed {green_c} px and agreed "
             f"with the core-internal capture. pointer.click refused ConsentHeld and the app "
@@ -846,6 +1055,60 @@ class ConsentGateThresholdsStayDiscriminating(unittest.TestCase):
             "constant; the height is content-derived). If the renderer's constant moved, the "
             "geometry cross-check would be asserting the wrong number.",
         )
+
+    def test_the_card_raster_constants_match_the_renderer(self):
+        """Every colour the positive control looks for is still one the card
+        is painted in.
+
+        `_assert_is_a_real_card_raster` is the whole provenance argument for
+        the exported occlusion window, and it is written in terms of exact
+        RGBA values. A restyled card would leave every one of those searches
+        finding nothing -- which fails loudly, so this is not a soundness
+        hole, but it would fail with "no accent border" rather than "the
+        renderer's palette moved". This says which.
+        """
+        source = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "crates/vitrin-core/src/consent/render.rs"
+        ).read_text()
+
+        def rgba(name: str, value: tuple[int, int, int, int]) -> str:
+            body = ", ".join(f"0x{c:02x}" for c in value)
+            return f"const {name}: [u8; 4] = [{body}];"
+
+        for name, value in (
+            ("CARD_BG", CARD_BG),
+            ("ACCENT", ACCENT),
+            ("BUTTON_BG", BUTTON_BG),
+            ("BUTTON_BORDER", BUTTON_BORDER),
+        ):
+            self.assertIn(
+                rgba(name, value),
+                source,
+                f"consent::render::{name} moved; the positive control on the exported "
+                "occlusion window is searching for a colour the card no longer carries",
+            )
+        self.assertIn(
+            f"const BORDER: u32 = {BORDER};",
+            source,
+            "the accent ring's thickness moved; the exact perimeter count and the "
+            "just-inside-the-ring check are both computed from it",
+        )
+
+    def test_the_card_colour_thresholds_stay_discriminating(self):
+        """The positive control's two numeric bars are reachable and not free.
+
+        `MIN_CARD_COLOURS` of 1 would be true of a solid fill; above the ~824
+        a real card measures it would be unsatisfiable and every run would
+        fail with a message about text antialiasing rather than about consent.
+        """
+        self.assertGreater(MIN_CARD_COLOURS, 8, "a flat forgery has a handful of colours")
+        self.assertLess(
+            MIN_CARD_COLOURS,
+            824,
+            "the real export measures 824 distinct colours; the bar must sit under it",
+        )
+        self.assertGreaterEqual(BORDER, 1, "a zero-thickness ring would make the ring check free")
 
 
 if __name__ == "__main__":

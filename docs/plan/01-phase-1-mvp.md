@@ -284,18 +284,34 @@ gate-level evidence — `tests/integration/test_real_consent.py` raises a real
 prompt from the shipped binary over a real `click-target`, answers it from
 outside the process over an inherited socketpair, and asserts the occlusion
 split, the `consent_held` hold, and `issuer: human_consent` in the journal. It
-was checked the way item (4) asks rather than merely written: **ten** separate
-breakages each turned it red, on a different assertion each time — never
-raising the prompt; skipping `composite_over`; folding the two retained images
-(pointing `view_rgba` at `latest_output_rgba`); exporting the whole frame
-instead of the card's footprint (twice — once refused by the trust-band guard,
-once accepted and caught by the geometry cross-check); disabling the
-chokepoint's `consent_held` step; suppressing its `use_decision` refusal
+was checked the way item (4) asks rather than merely written: **eleven**
+separate breakages each turned it red, on a different assertion each time —
+never raising the prompt; skipping `composite_over`; folding the two retained
+images (pointing `view_rgba` at `latest_output_rgba`); exporting the whole
+frame instead of the card's footprint (twice — once refused by the trust-band
+guard, once accepted and caught by the geometry cross-check); **replacing the
+occlusion window's `readback_region` with a synthetic zero buffer**; disabling
+the chokepoint's `consent_held` step; suppressing its `use_decision` refusal
 record; making `consent_held` refuse *captures* too (the over-broadening a
 naive `assertRaises(ConsentHeld)` would have accepted); mis-issuing the
 resolution; and dropping the run's `interactive+consent-injector` marker.
 Removing the post-denial control click turns the gate red with a message
 saying in as many words that the earlier `ConsentHeld` now proves nothing.
+
+The synthetic-buffer breakage in that list is the one this checklist exists
+for, and it was found by an adversarial reviewer *after* the gate was first
+written, not before: the occlusion half was a pure ABSENCE (`green == 0`) over
+bytes whose provenance nothing tested, so an export that never read the
+framebuffer at all passed and printed the success line verbatim. **This is the
+P1.9.8 lesson in a second dress: a metric's name is not evidence about the
+metric, and neither is an absence.** The fix is a positive control — the
+exported rectangle must first be shown to *be* a raster of vitrind's card
+(accent ring on all four edges, exact perimeter count, opaque body, buttons,
+antialiased text) at exactly the rectangle the core named — and only then is
+the app's green looked for and not found. Generalisable: **where a gate's
+criterion is the absence of something in a delivered artifact, the artifact's
+provenance needs its own assertion, or the gate is equally satisfied by no
+artifact at all.**
 
 **Still open against this checklist:** that gate proves **occlusion**, not
 **unspoofability**. It never learns the session's trusted-indicator colour —
@@ -314,6 +330,17 @@ by `consent/grab.rs`'s own tests and that nested recipe, exactly as
 `test_real_deadman.py`'s SIGUSR1 stands in for a held Escape. Both scopes are
 stated in `tests/integration/README.md`'s "What the consent gate still does not
 prove" and in the gate's own module docstring.
+
+A third scope belongs in that list and is now recorded in both places: the
+gate says nothing about the human-visible frame **outside** the card
+footprint. With `click-target` that is structural rather than an omission an
+extra assertion could close — the export is clamped to the card, the card is
+blitted opaque last, and the realm view outside the card is (measured) 93 840
+px of a single black, so a regression erasing the realm view from the
+human-visible output entirely leaves the exported window byte-identical.
+`backend/headless.rs`'s `a_prompt_reaches_human_visible_output_but_never_a_capture`
+and `backend/winit.rs`'s `the_nested_window_uploads_the_consent_overlay` are
+what catch that, at component level; both were confirmed red against it.
 
 That review found a gap one level up, now closed too: `unittest discover`
 collects whatever `test_*.py` files happen to exist, so a **missing** named

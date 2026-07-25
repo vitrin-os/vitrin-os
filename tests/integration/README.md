@@ -48,7 +48,7 @@ their value; they are just never a substitute for the named gate.
 | `test_real_capture_fidelity.py` | The **M1.3 exit gate** (P1.8.5, #107): an agent captures a real `solid-client` frame through the real chokepoint; its dominant colour is the served colour, it agrees with the core-internal capture (`vitrind --capture-dump`) by SSIM + per-pixel tolerance via `vitrin-golden-cmp`, and capture-path rate-limit + expiry refuse as `rate_limited`/`expired`. Same C-shim env contract. | **Yes — M1.3** |
 | `test_real_actuation.py` | The **M1.4 actuation gate** (P1.8.6, #108): an agent's `grant.pointer` click lands on a real `click-target`'s observed feature (dominant colour flips, D10) and `grant.text` types `héllo→世界` intact into a real `gtk-entry-probe` (D7), each confirmed by the agent's own `observe()` and recorded at the chokepoint. Same C-shim env contract; the GTK rung skips without GTK. M1.4 additionally needs #109, whose **hold-Esc half** is the `test_real_deadman.py` row below and whose **consent half** is the `test_real_consent.py` row below it (#138) — with the scope that gate deliberately does *not* cover recorded under "What the consent gate still does not prove". | **Yes — M1.4 (actuation half)** |
 | `test_real_deadman.py` | The **M1.4 dead-man gate** (P1.7.4, #109): a completed hold-Esc chord, applied over a real `click-target` through the real core, revokes a live grant — `observe()` and `grant.pointer.click()` both refuse `Revoked` on the very next check, the real app's target stays unflipped (read from `--capture-dump`, bypassing the now-revoked grant entirely), and the flight recorder journals `dead_man_triggered` then `grant_revoked`. Headless has no physical key to hold, so a `SIGUSR1` to the core (only meaningful on a `dead-man-injector`-feature `vitrind` — see `run.sh`) stands in for the hold; the nested recipe for a *real* held Escape is `shim/docs/firefox.md` §9. Same C-shim env contract as the rest of the real-app ladder. | **Yes — M1.4 (dead-man half)** |
-| `test_real_consent.py` | The **M1.4 consent gate** (P1.7.5, #138): a real petition raises a real core-rendered prompt over a real `click-target`; the prompt occludes the human-visible output (zero of the app's target pixels inside the card's own footprint) and never the capture path (the realm-view dump is **byte-identical** to a settled control taken while the app was watched idle, and the agent's own mid-prompt `observe()` still shows the full target and agrees with that dump through `vitrin-golden-cmp`); a mid-prompt actuation on an *already-granted* grant, on a **second connection of the same principal**, refuses `ConsentHeld` **specifically**, the app's own surface stays green in the core-internal dump, and the chokepoint's `consent_held` record falls strictly between the prompt's `shown` and its resolution in the journal; then the identical click lands after the denial (the positive control, last, because `click-target`'s flip is one-way). The decision is resolved by `PetitionRegistry::resolve_human` — asserted as `issuer: "human_consent"` — and the run brands itself `consent_policy: "interactive+consent-injector"`. Headless has no pointer for a human to click with, so an inherited socketpair named by `--consent-injector-fd N` on a `consent-injector`-feature `vitrind` stands in for the click; see "What the consent gate still does not prove" below. Same C-shim env contract as the rest of the real-app ladder. | **Yes — M1.4 (consent half)** |
+| `test_real_consent.py` | The **M1.4 consent gate** (P1.7.5, #138): a real petition raises a real core-rendered prompt over a real `click-target`; the prompt occludes the human-visible output (the exported footprint is first shown to *be* a card raster at exactly the rectangle the core named — accent ring on all four edges, exact perimeter count, opaque body, buttons, antialiased text — and then to carry zero of the app's target pixels) and never the capture path (the realm-view dump is **byte-identical** to a settled control taken while the app was watched idle, and the agent's own mid-prompt `observe()` still shows the full target and agrees with that dump through `vitrin-golden-cmp`); a mid-prompt actuation on an *already-granted* grant, on a **second connection of the same principal**, refuses `ConsentHeld` **specifically**, the app's own surface stays green in the core-internal dump, and the chokepoint's `consent_held` record falls strictly between the prompt's `shown` and its resolution in the journal; then the identical click lands after the denial (the positive control, last, because `click-target`'s flip is one-way). The decision is resolved by `PetitionRegistry::resolve_human` — asserted as `issuer: "human_consent"` — and the run brands itself `consent_policy: "interactive+consent-injector"`. Headless has no pointer for a human to click with, so an inherited socketpair named by `--consent-injector-fd N` on a `consent-injector`-feature `vitrind` stands in for the click; see "What the consent gate still does not prove" below. Same C-shim env contract as the rest of the real-app ladder. | **Yes — M1.4 (consent half)** |
 | `test_consent_injector.py` | **Component test.** The `consent-injector` channel's fail-closed matrix (no card up, a button the card does not draw, an unknown or spent token, an unparseable line, an over-long line, the peer disappearing) against the real core + `vitrin-mock-shim`. Explicitly **not** a milestone gate: it exists so the gate above stays about the milestone property rather than about the channel's error handling. | No |
 
 ### What the consent gate still does not prove
@@ -91,6 +91,32 @@ The gate also says nothing about the human-visible frame *outside* the
 card footprint (not the scrim, not the ring), and nothing about whether
 the card is legible or names the right principal — `consent/render.rs`'s
 golden and sourcing tests hold that.
+
+With `click-target` the first of those is **structural, not an omission
+an extra assertion could close**, and it is worth knowing which: the
+export is clamped to the card's footprint and the card is blitted opaque
+last, so those bytes do not depend on the frame beneath them; and the
+realm view *outside* that footprint is, measured on the gate's own
+artifacts, 93 840 px of one colour (black — the app paints black except
+for one centred 160×160 square the card wholly covers). A regression that
+erased the realm view from the human-visible output altogether therefore
+moves no pixel a human sees in this scenario; the exported window comes
+back byte-identical, sha256 and all, which was confirmed by running it.
+That defect is caught, at component level, by `backend/headless.rs`'s
+`a_prompt_reaches_human_visible_output_but_never_a_capture` (full-bleed
+test pattern, bottom-left asserted scrimmed-not-erased) and
+`backend/winit.rs`'s `the_nested_window_uploads_the_consent_overlay`.
+
+What the gate *does* now establish about those exported bytes, and did
+not before the P1.7.5 repair pass, is their **provenance**: they are
+checked to be a raster of vitrind's card at exactly the rectangle the
+core named — accent ring on all four edges, its exact perimeter count,
+`CARD_BG` over most of the body, both button colours present, and enough
+distinct colours to carry antialiased text — *before* the absence of the
+app's green is read out of them. An absence over bytes of unproven origin
+is satisfied just as well by an empty buffer: an export that never read
+the framebuffer at all used to pass this gate, printing its success line
+verbatim, and now fails it on the first edge pixel.
 
 `crates/vitrin-core/src/backend/headless.rs`'s
 `c_shim_consent_prompt_occludes_the_human_visible_output_but_never_the_real_apps_capture`

@@ -1,41 +1,55 @@
 """P1.8.4/P1.8.7 (#43/#110) acceptance: the demo agent's HEADLESS flow, against
 the real chain end to end.
 
-**Component test, not the M1.5 milestone gate (plan §5 D12, issue #111).**
-This module drives the real ``vitrind`` binary but against
-``vitrin-mock-shim --seat --animate`` (``harness.py``'s ``Core()`` default),
-which is exactly the kind of mock seam D12 forbids as milestone evidence.
-The *named* M1.5 gate is issue #110 (P1.8.7): it is not yet green, and until
-it lands, ``cargo xtask demo --headless`` also still runs the mock shim as
-the demo's app (see ``crates/xtask/src/main.rs``), not a real one. What this
-module *does* prove — legitimately, as a component test — is that the demo
-entry point drives the real enforcement chokepoint and that the flight
-recorder reconstructs its actuations correctly; it rides ``run.sh``'s
+**This is the named M1.5 acceptance gate** (issue #110, P1.8.7), as
+``tests/integration/README.md``'s table records. It has no mock on any seam:
+the shipped ``vitrind`` execs the real C shim (``vitrin-shim``), which
+fork/execs a real, trivial Wayland client (``weston-terminal``) inside its own
+confined Wayland socket — the same rung ``tests/integration/test_real_app.py``
+uses. The demo's ``run`` entry point is imported and called (not run as a
+subprocess), so a failure surfaces as a Python traceback with the demo's own
+frame dump rather than an opaque non-zero exit. It rides ``run.sh``'s
 ``unittest discover`` with no CI-yaml edit — the entry-point contract
 (``tests/integration/README.md``) is exactly that a new ``test_*.py`` is the
 whole change.
 
-Issue #110 retired the mock shim from this gate. Before, the realm's
-``command`` (and the core's ``--shim``) were both ``vitrin-mock-shim``: an
-animated buffer that stands in for nothing real, and that animated
-*regardless of actuation* — so a byte-diff between two captures proved a
-timer ran, not that the agent's click and typed text reached anything. This
-module now drives the real chain instead: the shipped ``vitrind`` execs the
-real C shim (``vitrin-shim``), which fork/execs a real, trivial Wayland
-client (``weston-terminal``) inside its own confined Wayland socket — the same
-rung ``tests/integration/test_real_app.py`` uses. The demo's ``run`` entry
-point is imported and called (not run as a subprocess), so a failure surfaces
-as a Python traceback with the demo's own frame dump rather than an opaque
-non-zero exit.
+(The paragraph that used to stand here called this module a component test
+running against ``vitrin-mock-shim --seat --animate`` and said #110 "is not
+yet green". #110 merged; the docstring was the stale half.)
+
+Two rounds of work got this gate here, and the second matters as much as the
+first:
+
+* **#110 retired the mock shim.** Before it, the realm's ``command`` (and the
+  core's ``--shim``) were both ``vitrin-mock-shim``: an animated buffer that
+  stands in for nothing real and animated *regardless of actuation*, so a
+  byte-diff between two captures proved a timer ran, not that the agent's
+  click and typed text reached anything.
+* **A real app repaints on its own too.** With the real chain in place the
+  gate still asked only for 24 changed pixels in a 640x480 frame, and
+  weston-terminal's own asynchronous first paint clears that unaided —
+  measured at 569 changed pixels spanning 81 px across 19 scanlines, a diff
+  indistinguishable in shape from typed text. So the gate passed whether or
+  not the actuation landed. It now takes a **settled control capture** first
+  (``run_demo._settle``, so the app's startup paint is inside the "before"
+  frame rather than straddling it) and then requires a change carrying the
+  shape a typed line makes (``run_demo.actuation_landed``: enough pixels AND
+  a wide enough changed run). ``HeadlessGateThresholdsStayDiscriminating``
+  below pins the numbers' ordering so that cannot silently relax again.
+
+Register, deliberately: this gate is mock-free, and it now *discriminates
+actuation from incidental repaint* — but that second property dates from the
+change that added ``_settle``, not from #110. A green run before that proved
+the demo completed against a real app; it did not prove the agent's input
+reached one.
 
 What only a live, real chain can show — and what the mock-based SDK tests
 cannot — is that the real enforcement chokepoint records the demo's
 actuations, AND that the pixels changed because the click and typed text
-actually reached a real app, not because a mock animated on its own clock:
-an allowed ``move`` at the clicked coordinate and an allowed ``type`` whose
-``chars`` equals the typed text's length, in the order the recorder is meant
-to reconstruct, backed by a genuine pixel change too small to be a stray
-blinking cursor and too real to be a mock's synthetic frame.
+actually reached a real app: an allowed ``move`` at the clicked coordinate
+and an allowed ``type`` whose ``chars`` equals the typed text's length, in
+the order the recorder is meant to reconstruct, backed by a pixel change the
+app could not have drawn on its own.
 
 The nested venue (real Firefox) is the workstation half of ``cargo xtask
 demo``; it has no display or browser on a CI runner and is deliberately not

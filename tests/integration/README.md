@@ -41,27 +41,73 @@ their value; they are just never a substitute for the named gate.
 | `harness.py` | `Core` — boots the binary in a throwaway `XDG_RUNTIME_DIR` (defaults its shim to `vitrin-mock-shim`, `MOCK_SHIM`, unless a real shim path is passed); `IntegrationTest` — per-test deadline and core reaping. | — (harness) |
 | `test_runtime_wiring.py` | **Component test.** Issue #77's acceptance criteria (startup-ordering trap T1) against the real core + `vitrin-mock-shim`. Never a milestone gate — it predates and is orthogonal to M1.2–M1.5. | No |
 | `test_actuation.py` | **Component test.** P1.8.3 (#42): the SDK's actuation API and typed grant-error exceptions against the real core + `vitrin-mock-shim`. Superseded, for milestone purposes, by `test_real_actuation.py` below. | No |
-| `test_demo.py` | The **M1.5 named acceptance gate** (P1.8.7, #110): `examples/agent-demo/run_demo.py`'s headless venue, imported and run against the real chain — `vitrind` → real `vitrin-shim` → real `weston-terminal`, never `vitrin-mock-shim` — with the process spine asserted by ancestry, the click/type recorded verbatim at the chokepoint, and "the page changed" proven by a real pixel-count threshold instead of a mock's autonomous animation. A second, binary-free test grep-proves neither `crates/xtask` nor `run_demo.py` constructs `vitrin-mock-shim`. Same C-shim env contract; the nested venue (real Firefox) is workstation-only (`shim/docs/firefox.md`). | **Yes — M1.5** |
+| `test_demo.py` | The **M1.5 named acceptance gate** (P1.8.7, #110): `examples/agent-demo/run_demo.py`'s headless venue, imported and run against the real chain — `vitrind` → real `vitrin-shim` → real `weston-terminal`, never `vitrin-mock-shim` — with the process spine asserted by ancestry, the click/type recorded verbatim at the chokepoint, and "the page changed" proven against a **settled control capture** by a change carrying the shape only the typed line makes (enough pixels *and* a wide enough changed run) — not by a bare pixel count, which weston-terminal's own startup paint clears unaided. Two more binary-free test classes ride along: `DemoUsesNoMockShim` grep-proves neither `crates/xtask` nor `run_demo.py` constructs `vitrin-mock-shim`, and `HeadlessGateThresholdsStayDiscriminating` pins the thresholds' ordering so the gate cannot be relaxed back into vacuity. Same C-shim env contract; the nested venue (real Firefox) is workstation-only (`shim/docs/firefox.md`). | **Yes — M1.5** |
 | `test_real_app.py` | The **M1.2 exit gate** (P1.9.6, #105): the whole real chain — real `vitrind` → real C shim → real `weston-terminal` — with no mock on any seam. Skips without a built C shim; see the env contract below. | **Yes — M1.2** |
 | `test_real_gtk.py` | The GTK rung of the real bring-up ladder (P1.6.6, #106): real `vitrind` → real C shim → real `gtk-entry-probe`, reusing `test_real_app.py`'s real-app mode. Supporting evidence for M1.2's render half, alongside `test_real_firefox.py`. | Supporting — M1.2 |
 | `test_real_firefox.py` | The Firefox rung of the real bring-up ladder (P1.6.6, #106): real `vitrind` → real C shim → real pinned Firefox ESR, asserting a real rendered colour and the globals contract, with no mock on any seam. Supporting evidence for M1.2's render half. | Supporting — M1.2 |
 | `test_real_capture_fidelity.py` | The **M1.3 exit gate** (P1.8.5, #107): an agent captures a real `solid-client` frame through the real chokepoint; its dominant colour is the served colour, it agrees with the core-internal capture (`vitrind --capture-dump`) by SSIM + per-pixel tolerance via `vitrin-golden-cmp`, and capture-path rate-limit + expiry refuse as `rate_limited`/`expired`. Same C-shim env contract. | **Yes — M1.3** |
-| `test_real_actuation.py` | The **M1.4 actuation gate** (P1.8.6, #108): an agent's `grant.pointer` click lands on a real `click-target`'s observed feature (dominant colour flips, D10) and `grant.text` types `héllo→世界` intact into a real `gtk-entry-probe` (D7), each confirmed by the agent's own `observe()` and recorded at the chokepoint. Same C-shim env contract; the GTK rung skips without GTK. M1.4 additionally needs #109 (consent + hold-Esc revocation over a real app), covered by the `test_real_deadman.py` row below. | **Yes — M1.4 (actuation half)** |
+| `test_real_actuation.py` | The **M1.4 actuation gate** (P1.8.6, #108): an agent's `grant.pointer` click lands on a real `click-target`'s observed feature (dominant colour flips, D10) and `grant.text` types `héllo→世界` intact into a real `gtk-entry-probe` (D7), each confirmed by the agent's own `observe()` and recorded at the chokepoint. Same C-shim env contract; the GTK rung skips without GTK. M1.4 additionally needs #109, whose **hold-Esc half** is the `test_real_deadman.py` row below and whose **consent half is not covered by any gate in this directory** — see "M1.4's open consent gap" below. | **Yes — M1.4 (actuation half)** |
 | `test_real_deadman.py` | The **M1.4 dead-man gate** (P1.7.4, #109): a completed hold-Esc chord, applied over a real `click-target` through the real core, revokes a live grant — `observe()` and `grant.pointer.click()` both refuse `Revoked` on the very next check, the real app's target stays unflipped (read from `--capture-dump`, bypassing the now-revoked grant entirely), and the flight recorder journals `dead_man_triggered` then `grant_revoked`. Headless has no physical key to hold, so a `SIGUSR1` to the core (only meaningful on a `dead-man-injector`-feature `vitrind` — see `run.sh`) stands in for the hold; the nested recipe for a *real* held Escape is `shim/docs/firefox.md` §9. Same C-shim env contract as the rest of the real-app ladder. | **Yes — M1.4 (dead-man half)** |
 
-Grep-proving the split (run from repo root): every `test_real_*.py` gate
-module boots its `Core` with an **explicit real shim path**
-(`shim=str(self.shim_bin)`, resolved from `VITRIN_C_SHIM_BIN`), never a bare
-`self.core()` — a bare call defaults to `harness.MOCK_SHIM`. The `no`/mock
-mentions those files do contain are disclaiming prose and assertion strings
-("no `vitrin-mock-shim` in the path"), not the shim they actually run:
+### M1.4's open consent gap
+
+Issue #109 has two halves — "consent occlusion over a real app" and
+"hold-Esc revocation over a real app". This directory covers the second
+(`test_real_deadman.py`) and **not the first**. `test_real_deadman.py`
+never raises a consent prompt: it takes a grant, fires the dead-man chord,
+and asserts the refusals. No `test_real_*.py` module in this directory
+puts a consent prompt on screen over a real app at all.
+
+The consent-occlusion evidence that *does* exist is
+`crates/vitrin-core/src/backend/headless.rs`'s
+`c_shim_consent_prompt_occludes_the_human_visible_output_but_never_the_real_apps_capture`.
+It is genuinely mock-free on the app seam — real C shim, real
+`click-target`, real pixels — and it is a real proof of the property. But
+it is an **in-process Rust test**: it builds a `HeadlessView` and a
+`ShimServer` directly instead of driving the shipped `vitrind` binary,
+which is exactly what the top of this file says no gate here does, and
+what plan §5 D12 disqualifies as milestone evidence. So:
+
+> **M1.4's consent half has component-level evidence, not gate-level
+> evidence.** Do not cite `test_real_deadman.py` for it, and do not cite
+> the Rust test as milestone acceptance. Closing the gap means a
+> `test_real_consent.py` here that drives the shipped binary, raises a
+> prompt over a real app (the build-gated `scripted-consent` feature is
+> the headless stand-in, as `dead-man-injector` is for the hold), and
+> asserts the same split: the prompt in the human-visible output, absent
+> from the agent's capture.
+
+Stated plainly because the previous version of this row claimed the
+consent half was "covered by the `test_real_deadman.py` row below", which
+it never was.
+
+Grep-proving the split (run from repo root): every named-gate module boots
+its `Core` with an **explicit real shim path** (`shim=str(self.shim_bin)`,
+resolved from `VITRIN_C_SHIM_BIN`), never a bare `self.core()` — a bare call
+defaults to `harness.MOCK_SHIM`. The `no`/mock mentions those files do
+contain are disclaiming prose and assertion strings ("no `vitrin-mock-shim`
+in the path"), not the shim they actually run:
 
 ```bash
-# Every real-app gate module passes an explicit shim= path to Core(); none
+# Every named-gate module passes an explicit shim= path to Core(); none
 # relies on Core()'s harness.py default (vitrin-mock-shim). Expect: no output
 # (a file listed here would be one that never overrides the mock default).
-rg --files-without-match 'shim=str\(self\.shim_bin\)' tests/integration/test_real_*.py
+# test_demo.py is named explicitly: it is the M1.5 gate, and the
+# `test_real_*.py` glob does not match it -- which is how this check used to
+# skip the one gate file whose mock-freeness it most needed to prove.
+rg --files-without-match 'shim=str\(self\.shim_bin\)' \
+  tests/integration/test_real_*.py \
+  tests/integration/test_demo.py
 ```
+
+**Mock-freeness is not discriminating power.** Both checks above answer
+"what is this test wired to", never "can this test fail". Two gates in this
+repo were mock-free and still could not fail on the property they named — the
+M1.5 demo gate asked for 24 changed pixels, which the real app's own startup
+paint clears; the real-app consent-occlusion proof waited only for the view
+to stop being the empty test pattern, which the shim's first commit satisfies
+before any client attaches. Before citing a gate as evidence, break the
+behaviour it claims to prove and watch it go red.
 
 ## Running it locally
 

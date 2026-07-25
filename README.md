@@ -110,28 +110,44 @@ What exists today, on `main`:
 Known, tracked gaps as of this writing (each has an open issue; none are
 silently swallowed):
 
-- **`cargo xtask demo`'s current default still drives
-  [`vitrin-mock-shim`](crates/vitrin-mock-shim)**, a fixture binary, rather
-  than the real wlroots shim — even though the real shim already runs
-  Firefox under CI and integration tests (above). Rewiring the demo itself
-  onto the real shim is the M1.5 acceptance gate,
-  [#110](https://github.com/vitrin-os/vitrin-os/issues/110), and is in
-  progress on an open PR
-  ([#127](https://github.com/vitrin-os/vitrin-os/pull/127)) at the time of
-  this PR. Until it merges, treat the mock-shim demo as a protocol-shape
-  smoke test, not the real-app proof — that proof lives in
-  `tests/integration/test_real_app.py`, `test_real_capture_fidelity.py`,
-  `test_real_actuation.py`, and `test_real_firefox.py` today.
+- **M1.4's consent half has no integration gate.**
+  [#109](https://github.com/vitrin-os/vitrin-os/issues/109) is two halves;
+  the hold-Esc half is `tests/integration/test_real_deadman.py`, and the
+  consent-occlusion half is **not** covered by any test in that directory —
+  `test_real_deadman.py` never raises a prompt. The property is proven by an
+  in-process Rust test against the real C shim and a real `click-target`
+  (`crates/vitrin-core/src/backend/headless.rs`), which is real evidence but
+  is not a gate against the shipped binary, so it does not close the
+  milestone under D12. See `tests/integration/README.md`'s "M1.4's open
+  consent gap" for what closing it takes.
+- **The M1.5 demo gate only just became able to fail on actuation.**
+  `cargo xtask demo` drives the real wlroots shim in both venues as of
+  [#127](https://github.com/vitrin-os/vitrin-os/pull/127) —
+  [`vitrin-mock-shim`](crates/vitrin-mock-shim) remains in the tree as a
+  unit-test fixture only, and appears in no demo venue — and
+  `tests/integration/test_demo.py` is the named, mock-free M1.5 gate. But
+  until the change that added `run_demo._settle`, that gate asked only for
+  24 changed pixels between its two captures, which weston-terminal's own
+  startup paint clears unaided: it could pass with the agent's click and
+  typed text reaching nothing. It now settles the app first and demands a
+  change shaped like a typed line. Read green runs from before that change
+  as "the demo completed against a real app", not as "the actuation
+  landed".
 - **No sandbox (decision D9).** No namespaces, seccomp, or Landlock yet —
   see [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine)
   below.
 - **dmabuf zero-copy is not wired at runtime** (both backends pass
   `importer: None`); frames move as shm copies. Real-GPU zero-copy import is
   [#117](https://github.com/vitrin-os/vitrin-os/issues/117).
-- **Fuzzing and an advisory wlcs conformance subset** are open
-  ([#46](https://github.com/vitrin-os/vitrin-os/issues/46),
-  [#47](https://github.com/vitrin-os/vitrin-os/issues/47)) — both are
-  M1.5-gating soak work, not blockers to running the demo above.
+- **Fuzzing is wired but not soaked; the wlcs subset is still open.**
+  `fuzz/` ships two cargo-fuzz targets (protocol decode, `vitrin-ipc`
+  framing) with a checked-in seed corpus that CI replays on every PR, plus a
+  short per-PR burst
+  ([#46](https://github.com/vitrin-os/vitrin-os/issues/46)). The 24-hour
+  clean run M1.5 exit asks for is still a manual, documented procedure, not
+  a scheduled job — see [fuzz/README.md](fuzz/README.md). The advisory wlcs
+  conformance subset ([#47](https://github.com/vitrin-os/vitrin-os/issues/47))
+  is open. Neither blocks running the demo above.
 - **No published demo screencast yet** — see
   [docs/demo/README.md](docs/demo/README.md) for the recording plan and why
   it isn't in this PR.
@@ -142,35 +158,50 @@ From a clean clone to a running demo. Verified against the state of `main`
 described above (headless venue; the nested venue additionally needs a
 Wayland session and Firefox ESR — see the note at the end).
 
+The demo runs the **real** wlroots shim in both venues, so unlike a
+Rust-only build it needs the C shim built and a real Wayland client
+installed. `cargo xtask demo` fails with the exact `meson` command below if
+the shim is missing, rather than silently substituting anything.
+
 ```sh
 git clone https://github.com/vitrin-os/vitrin-os.git
 cd vitrin-os
 
 # The toolchain is pinned (rust-toolchain.toml); rustup installs it on the
-# first cargo invocation. System deps the workspace links:
-sudo apt-get install -y libxkbcommon-dev libpixman-1-dev   # Debian/Ubuntu
+# first cargo invocation. System deps the workspace links, plus the C
+# shim's build deps and a real Wayland client for it to run:
+sudo apt-get install -y libxkbcommon-dev libpixman-1-dev weston   # Debian/Ubuntu
+bash shim/ci/install-deps.sh                                      # Meson + wlroots deps
 
-# Build vitrind, the demo's mock-shim fixture, and xtask itself.
+# Build vitrind, xtask, and the fixtures the test suites use.
 cargo build --workspace
 
-# Run the Phase-1 demo agent headless: boots vitrind --headless, the
-# fixture shim, and examples/agent-demo/run_demo.py over a real Unix
-# socket -- connect, request a grant, capture, click, type, capture again,
-# and assert the page changed. Exits non-zero on any failure.
+# Build the real per-app wlroots shim (C + Meson, outside the Cargo
+# workspace). cargo xtask demo looks for it at shim/build/vitrin-shim, or
+# wherever VITRIN_C_SHIM_BIN points.
+meson setup shim/build shim && meson compile -C shim/build
+
+# Run the Phase-1 demo agent headless: boots vitrind --headless, which
+# execs the real shim, which fork/execs a real weston-terminal in its own
+# confined Wayland socket, and drives examples/agent-demo/run_demo.py over
+# a real Unix socket -- connect, request a grant, settle, capture, click,
+# type, capture again, and assert the typed text landed. Exits non-zero on
+# any failure.
 cargo xtask demo --headless
 ```
 
 Expect output ending in `xtask demo: PASS` and a path to the run's flight
 recorder (`flight.jsonl`) and captured frames. This exercises the real wire
-protocol, the real capability kernel, and the real consent auto-approve
-path — but, per the gap noted above, `--headless` drives
-`vitrin-mock-shim`, not the wlroots shim, until
-[#110](https://github.com/vitrin-os/vitrin-os/issues/110) lands. For the
-real shim under a real app today, build it and run the integration suite
-instead:
+protocol, the real capability kernel, the real consent auto-approve path,
+the real wlroots shim, and a real app — `vitrin-mock-shim` appears in no
+demo venue ([#110](https://github.com/vitrin-os/vitrin-os/issues/110) /
+[#127](https://github.com/vitrin-os/vitrin-os/pull/127)); it survives only
+as a unit-test fixture for the component tests in `tests/integration/`.
+
+The same chain under the full integration suite, including the named
+milestone gates:
 
 ```sh
-meson setup shim/build shim && meson compile -C shim/build
 VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" bash tests/integration/run.sh
 ```
 
@@ -294,7 +325,7 @@ The spawn path and every decision above are documented in full in
 | [`crates/vitrin-protocol/`](crates/vitrin-protocol) | Generated message types + codec (no I/O, no sockets) |
 | [`crates/vitrin-scanner/`](crates/vitrin-scanner) | Code generator: IDL XML → Rust + C header |
 | [`crates/vitrin-ipc/`](crates/vitrin-ipc) | Unix-socket transport: framing, `SCM_RIGHTS`, `SO_PEERCRED`, backpressure policy |
-| [`crates/vitrin-mock-shim/`](crates/vitrin-mock-shim) | Fixture-only shim stand-in for tests and today's `cargo xtask demo` (see [Status](#status)) |
+| [`crates/vitrin-mock-shim/`](crates/vitrin-mock-shim) | Fixture-only shim stand-in for component tests. Never a demo venue and never milestone evidence (plan §5 D12) |
 | [`crates/vitrin-golden/`](crates/vitrin-golden) | Per-pixel + SSIM frame comparison, used by the golden and real-app fidelity tests |
 | [`crates/xtask/`](crates/xtask) | `cargo xtask codegen [--check]` / `bless` / `demo [--headless]` |
 | [`shim/`](shim/README.md) | The wlroots-based per-app Wayland shim (C + Meson, outside the Cargo workspace) |

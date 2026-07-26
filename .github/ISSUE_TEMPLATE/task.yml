@@ -1,0 +1,61 @@
+name: Task
+description: A tracked piece of work — feature, refactor, docs, or CI
+labels: []
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences on what this is and why it exists.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: track
+    attributes:
+      label: Track
+      description: >-
+        Each issue carries exactly one `track:*` label. See CLAUDE.md for the
+        epic→track map.
+      options:
+        - "track:protocol — IDL + docs/protocol/ prose"
+        - "track:rust-core — vitrind, the trusted core"
+        - "track:c-shim — the wlroots per-app shim"
+        - "track:sdk — the Python agent SDK"
+        - "track:ci-docs — CI, test harnesses, repo-wide docs"
+    validations:
+      required: true
+
+  - type: textarea
+    id: tasks
+    attributes:
+      label: Tasks
+      value: |
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: >-
+        What has to be true for this to close. Be specific about evidence: if
+        a criterion is "proven by a test", name the test. If this closes a
+        milestone, it needs a **mock-free** gate against the shipped binaries
+        (decision D12) — `vitrin-mock-shim` is never milestone evidence.
+      value: |
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      placeholder: |
+        - docs/PRD.md §N
+        - docs/protocol/00-conventions.md §N (if protocol work)
+        - docs/plan/01-phase-1-mvp.md — task row

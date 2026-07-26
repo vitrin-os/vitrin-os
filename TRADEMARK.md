@@ -7,9 +7,11 @@ enforces the security claims.
 ## The marks
 
 "Vitrin OS"; "Vitrin" where it refers to this project; `vitrind`, the
-trusted-core daemon; and the project namespaces claimed on 12 July 2026
-under decision **D-006** (the GitHub org `vitrin-os`, the npm scope
-`@vitrin-os`, and the crates `vitrin-os` and `vitrind`).
+trusted-core daemon; the aperture mark and the "vitrin os" wordmark in
+[`assets/brand/`](assets/brand/README.md); and the project namespaces
+claimed on 12 July 2026 under decision **D-006** (the GitHub org
+`vitrin-os`, the npm scope `@vitrin-os`, and the crates `vitrin-os` and
+`vitrind`).
 
 No registration exists. This is an unregistered claim, written down here
 so that it is at least stated rather than assumed. There is no ®, no

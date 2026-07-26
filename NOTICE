@@ -71,6 +71,19 @@ GPL-3.0-only (LICENSE-GPL-3.0-only)
     statement for the file. This carve-out predates the split above and is
     unchanged by it.
 
+TRADEMARKS — not licensed by any of the above
+
+  - assets/brand/ — the Vitrin OS mark, wordmark, lockups, favicons and
+    social card. These are trademarks, and the catch-all below does NOT
+    reach them: a mark released under CC-BY-4.0 could be modified and
+    reapplied to a modified core, which is the one outcome TRADEMARK.md
+    exists to prevent. Nominative use needs no permission; TRADEMARK.md
+    states where the line falls.
+
+    assets/brand/generate.py is the exception inside the exception: the
+    generator is repository tooling and is Apache-2.0 like the rest, and
+    carries an SPDX header saying so. What it emits is not.
+
 EVERYTHING NOT NAMED ABOVE
 
   Repository-level prose (README.md, NOTICE, SECURITY.md, TRADEMARK.md,

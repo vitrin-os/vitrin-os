@@ -1,0 +1,81 @@
+name: DCO
+
+# Executes decision D-012: contributions are taken under the Developer
+# Certificate of Origin (a Signed-off-by line), not a Contributor License
+# Agreement. CONTRIBUTING.md states the policy; this job is what makes it
+# true rather than aspirational.
+#
+# Deliberately a shell script rather than a third-party action. It is twenty
+# lines of git plumbing, and a capability-security project should not add a
+# supply-chain dependency to check a trailer.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  sign-off:
+    name: "Every commit signed off"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the PR's commits and the base to diff against, not a
+          # single squashed snapshot.
+          fetch-depth: 0
+
+      - name: Check Signed-off-by on each commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          missing=0
+          # Merge commits carry no authorship of their own; skip them.
+          commits=$(git rev-list --no-merges "$BASE".."$HEAD")
+          if [ -z "$commits" ]; then
+            echo "No non-merge commits in this range; nothing to check."
+            exit 0
+          fi
+          for sha in $commits; do
+            subject=$(git log -1 --format=%s "$sha")
+            author=$(git log -1 --format='%an <%ae>' "$sha")
+            # Grep the whole message rather than git's trailer parser.
+            # %(trailers) only sees the *last* paragraph, so a commit whose
+            # footer is "Signed-off-by: ...\n\nCloses #12" -- which this
+            # repo's own conventions encourage -- would be failed for a
+            # formatting detail that has nothing to do with the DCO.
+            signoffs=$(git log -1 --format=%B "$sha" \
+              | grep -i '^[[:space:]]*Signed-off-by:' || true)
+            if printf '%s\n' "$signoffs" | grep -qiF "$author"; then
+              echo "ok    ${sha:0:8}  $subject"
+            else
+              echo "MISS  ${sha:0:8}  $subject"
+              echo "        author:   $author"
+              echo "        sign-off: ${signoffs:-(none)}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            cat <<'EOF'
+
+          ---
+          At least one commit is missing a Signed-off-by trailer matching its
+          author, which this project requires under the Developer Certificate
+          of Origin (https://developercertificate.org/) -- decision D-012.
+          There is no CLA and no copyright assignment; you keep your
+          copyright. See CONTRIBUTING.md.
+
+          Fix the last commit:
+              git commit --amend -s && git push --force-with-lease
+
+          Fix a whole branch:
+              git rebase --signoff main && git push --force-with-lease
+          ---
+          EOF
+            exit 1
+          fi
+          echo "All commits signed off."

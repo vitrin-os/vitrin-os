@@ -1,0 +1,63 @@
+name: Protocol change
+description: A new or changed interface, message, enum, or error code
+labels: ["track:protocol"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Read
+        [`docs/protocol/00-conventions.md`](https://github.com/vitrin-os/vitrin-os/blob/main/docs/protocol/00-conventions.md)
+        first. A protocol change is a **paired edit** — the IDL and its prose
+        page move together, never one alone.
+
+  - type: textarea
+    id: change
+    attributes:
+      label: The change
+      description: Which interface, and what is added, removed, or altered.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why the protocol has to change
+      description: >-
+        The bar is high: this is a wire contract with generated bindings in
+        two languages. Say why the need cannot be met by an existing
+        interface, or by something outside the protocol entirely.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: compat
+    attributes:
+      label: Compatibility
+      options:
+        - "Additive — new message/enum value, old clients unaffected"
+        - "Breaking — changes or removes existing wire behaviour"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: errors
+    attributes:
+      label: Error behaviour
+      description: >-
+        Which errors can this raise, and is each **fatal** (protocol
+        violation, connection dies) or **recoverable** (the request fails,
+        the connection lives)? The razor is in `00-conventions.md`; getting
+        this wrong is the most common protocol mistake.
+
+  - type: checkboxes
+    id: pairing
+    attributes:
+      label: The paired edits
+      description: A PR for this issue must do all of these.
+      options:
+        - label: "`protocol/vitrin-v0.xml` updated"
+        - label: "The matching `docs/protocol/NN-vitrin_name.md` prose page updated"
+        - label: "`protocol/vitrin-v0.rng` updated — only if the *dialect itself* changes"
+        - label: "`xmllint --noout --relaxng protocol/vitrin-v0.rng protocol/vitrin-v0.xml` passes"
+        - label: "`cargo xtask codegen` run and the regenerated code committed in the same change"

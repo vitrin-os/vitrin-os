@@ -19,3 +19,6 @@ __pycache__/
 # reproducible from shim/tests/firefox/firefox-esr.pin -- so the PIN is
 # checked in and the browser never is.
 /shim/.firefox/
+
+# mdBook build output
+docs/book/book/

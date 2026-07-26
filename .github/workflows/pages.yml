@@ -1,0 +1,104 @@
+name: Pages
+
+# Publishes vitrin-os.github.io/vitrin-os:
+#
+#   /        site/index.html      hand-written landing page, no build step
+#   /docs/   docs/book/           the mdBook ladder
+#
+# The landing page is deliberately a single static file with inlined CSS and
+# no external requests -- a page describing a capability-security project
+# should not pull a font or a script from someone else's CDN.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "docs/book/**"
+      - "assets/brand/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let an in-flight run finish rather than cancelling
+# it, so a half-published site is never the end state.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdBook
+        env:
+          MDBOOK_VERSION: "0.5.4"
+        run: |
+          set -euo pipefail
+          url="https://github.com/rust-lang/mdBook/releases/download"
+          url="$url/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build the book
+        run: mdbook build docs/book
+
+      - name: Assemble the site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp -r site/. _site/
+          mkdir -p _site/docs
+          cp -r docs/book/book/. _site/docs/
+          # The brand assets the landing page and the unfurl card reference.
+          cp assets/brand/vitrin-favicon.svg   _site/favicon.svg
+          cp assets/brand/apple-touch-icon.png _site/apple-touch-icon.png
+          cp assets/brand/social-card.png      _site/social-card.png
+          # Jekyll would otherwise eat mdBook's _-prefixed asset paths.
+          touch _site/.nojekyll
+
+      - name: Check for broken internal links
+        run: |
+          set -euo pipefail
+          # Every local href in the landing page must resolve inside _site.
+          # A launch-day 404 from the front page is the cheapest possible
+          # thing to catch and the most embarrassing to ship.
+          missing=0
+          # read -r line by line rather than word-splitting an unquoted
+          # expansion: the latter behaves differently across shells and
+          # breaks on any path containing a space.
+          while IFS= read -r h; do
+            [ -n "$h" ] || continue
+            target="_site/${h%%#*}"
+            case "$target" in */) target="${target}index.html";; esac
+            if [ ! -e "$target" ]; then
+              echo "BROKEN: $h -> $target"
+              missing=1
+            fi
+          done <<< "$(grep -oE 'href="[^"#][^"]*"' _site/index.html \
+                      | sed 's/href="//; s/"$//' \
+                      | grep -v '^https\?://' || true)"
+          [ "$missing" -eq 0 ] && echo "All internal links resolve."
+          exit "$missing"
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

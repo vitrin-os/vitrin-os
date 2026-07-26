@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vitrin OS — an agent-first display server</title>
+<meta name="description" content="An open-source, agent-first display server: a small trusted core speaking a capability-native protocol, with every legacy app confined to its own per-app shim. Humans and AI agents operate the same GUIs under granular, revocable authorization.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta property="og:title" content="Vitrin OS — an agent-first display server">
+<meta property="og:description" content="Humans and AI agents observe and operate the same GUIs, under granular, revocable, capability-scoped authorization.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://vitrin-os.github.io/vitrin-os/">
+<meta property="og:image" content="https://vitrin-os.github.io/vitrin-os/social-card.png">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+:root{
+  --accent:#4d9de0; --accent-dim:#3a7cb5;
+  --bg:#0c1116; --bg-2:#11181f; --bg-3:#161f28;
+  --fg:#e6edf3; --fg-dim:#9fb0bd; --fg-faint:#6b7f8d;
+  --line:#22303c;
+  --warn-bg:rgba(224,158,77,.09); --warn-line:#e09e4d;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+}
+@media (prefers-color-scheme:light){
+  :root{
+    --bg:#fff; --bg-2:#f6f8fa; --bg-3:#eef2f5;
+    --fg:#0c1116; --fg-dim:#4a5b68; --fg-faint:#6b7f8d;
+    --line:#dde5ea; --accent:#2f7cb8;
+    --warn-bg:rgba(176,110,20,.08); --warn-line:#b06e14;
+  }
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--bg); color:var(--fg);
+  font-family:var(--sans); font-size:17px; line-height:1.65;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:920px;margin:0 auto;padding:0 24px}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code,kbd{font-family:var(--mono);font-size:.9em}
+
+/* ---- header ---- */
+header{border-bottom:1px solid var(--line);position:sticky;top:0;background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(8px);z-index:10}
+.nav{display:flex;align-items:center;gap:20px;height:60px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:600;color:var(--fg)}
+.brand:hover{text-decoration:none}
+.brand svg{width:26px;height:26px;display:block}
+.nav .spacer{flex:1}
+.nav a.navlink{color:var(--fg-dim);font-size:15px}
+.nav a.navlink:hover{color:var(--fg)}
+@media(max-width:620px){.nav a.navlink.opt{display:none}}
+
+/* ---- hero ---- */
+.hero{padding:76px 0 64px;text-align:center}
+.hero .mark{width:96px;height:96px;margin:0 auto 26px;display:block}
+h1{font-size:clamp(30px,5.2vw,46px);line-height:1.15;margin:0 0 18px;letter-spacing:-.02em;font-weight:680}
+.tagline{font-size:clamp(17px,2.4vw,20px);color:var(--fg-dim);margin:0 auto 34px;max-width:640px}
+.cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-block;padding:11px 22px;border-radius:7px;font-weight:600;font-size:15px;border:1px solid var(--line)}
+.btn.primary{background:var(--accent);color:#080f15;border-color:var(--accent)}
+.btn.primary:hover{background:var(--accent-dim);text-decoration:none}
+.btn.ghost{color:var(--fg)}
+.btn.ghost:hover{background:var(--bg-2);text-decoration:none}
+
+/* ---- sections ---- */
+section{padding:54px 0;border-top:1px solid var(--line)}
+h2{font-size:26px;margin:0 0 10px;letter-spacing:-.01em}
+h2+.sub{color:var(--fg-dim);margin:0 0 26px}
+h3{font-size:18px;margin:30px 0 8px}
+
+/* ---- the quote ---- */
+blockquote.claim{
+  margin:0 0 30px; padding:22px 26px; background:var(--bg-2);
+  border-left:3px solid var(--accent); border-radius:0 8px 8px 0;
+  font-size:18px; line-height:1.7;
+}
+blockquote.claim strong{color:var(--accent);font-weight:600}
+
+/* ---- tables ---- */
+.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{border-collapse:collapse;width:100%;font-size:15px;min-width:520px}
+th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--fg-dim);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.04em}
+td:first-child{color:var(--fg);font-weight:500;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+
+/* ---- code ---- */
+pre{
+  background:var(--bg-2);border:1px solid var(--line);border-radius:8px;
+  padding:16px 18px;overflow-x:auto;font-family:var(--mono);font-size:14px;
+  line-height:1.6;margin:0 0 18px;
+}
+pre .c{color:var(--fg-faint)}
+pre .p{color:var(--accent)}
+
+/* ---- steps ---- */
+.step{display:flex;gap:16px;margin-bottom:22px;align-items:flex-start}
+.step .n{
+  flex:0 0 28px;height:28px;border-radius:50%;background:var(--bg-3);
+  color:var(--accent);display:grid;place-items:center;font-size:14px;
+  font-weight:700;font-family:var(--mono);margin-top:2px;
+}
+.step .body{flex:1;min-width:0}
+.step .body p{margin:0 0 10px;color:var(--fg-dim);font-size:15px}
+
+/* ---- callout ---- */
+.warn{
+  background:var(--warn-bg);border-left:3px solid var(--warn-line);
+  border-radius:0 8px 8px 0;padding:18px 22px;margin:26px 0;font-size:15.5px;
+}
+.warn strong{color:var(--warn-line)}
+.warn p{margin:0 0 10px}
+.warn p:last-child{margin:0}
+
+/* ---- demo slot ---- */
+.demo{background:var(--bg-2);border:1px solid var(--line);border-radius:10px;padding:0;overflow:hidden}
+.demo video{width:100%;display:block;background:#000}
+.demo .cap{padding:14px 18px;font-size:14px;color:var(--fg-dim);border-top:1px solid var(--line)}
+
+/* ---- arch ---- */
+.arch{font-family:var(--mono);font-size:12.5px;line-height:1.45;white-space:pre;overflow-x:auto;color:var(--fg-dim);background:var(--bg-2);border:1px solid var(--line);border-radius:8px;padding:20px}
+.arch b{color:var(--accent);font-weight:600}
+
+/* ---- cards ---- */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px;margin-top:8px}
+.card{background:var(--bg-2);border:1px solid var(--line);border-radius:9px;padding:18px 20px}
+.card h3{margin:0 0 6px;font-size:16px}
+.card p{margin:0;color:var(--fg-dim);font-size:14.5px;line-height:1.55}
+
+/* ---- footer ---- */
+footer{border-top:1px solid var(--line);padding:36px 0 56px;color:var(--fg-faint);font-size:14px}
+footer a{color:var(--fg-dim)}
+.flinks{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:16px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="./">
+      <svg viewBox="-104 -104 208 208" aria-hidden="true"><clipPath id="nm"><circle r="92"/></clipPath><g clip-path="url(#nm)" fill="currentColor" stroke="currentColor" stroke-width="6" stroke-linejoin="round"><path d="M22.75,-35.45L4.50,-91.89A92,92 0 0 1 91.89,-4.50L40.62,11.12Z"/><path d="M35.45,22.75L91.89,4.50A92,92 0 0 1 4.50,91.89L-11.12,40.62Z"/><path d="M-22.75,35.45L-4.50,91.89A92,92 0 0 1 -91.89,4.50L-40.62,-11.12Z"/><path d="M-35.45,-22.75L-91.89,-4.50A92,92 0 0 1 -4.50,-91.89L11.12,-40.62Z"/></g></svg>
+      vitrin os
+    </a>
+    <div class="spacer"></div>
+    <a class="navlink" href="docs/">Docs</a>
+    <a class="navlink opt" href="docs/05-the-wire-protocol.html">Protocol</a>
+    <a class="navlink opt" href="docs/limits.html">Limits</a>
+    <a class="navlink" href="https://github.com/vitrin-os/vitrin-os">GitHub</a>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="hero">
+    <svg class="mark" viewBox="-104 -104 208 208" role="img" aria-label="Vitrin OS"><clipPath id="hm"><circle r="92"/></clipPath><g clip-path="url(#hm)" fill="#4D9DE0" stroke="#4D9DE0" stroke-width="6" stroke-linejoin="round"><path d="M22.75,-35.45L4.50,-91.89A92,92 0 0 1 91.89,-4.50L40.62,11.12Z"/><path d="M35.45,22.75L91.89,4.50A92,92 0 0 1 4.50,91.89L-11.12,40.62Z"/><path d="M-22.75,35.45L-4.50,91.89A92,92 0 0 1 -91.89,4.50L-40.62,-11.12Z"/><path d="M-35.45,-22.75L-91.89,-4.50A92,92 0 0 1 -4.50,-91.89L11.12,-40.62Z"/></g></svg>
+    <h1>An agent-first display server</h1>
+    <p class="tagline">
+      Humans and AI agents observe and operate the same GUIs — under granular,
+      revocable, capability-scoped authorization.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="docs/01-run-the-demo.html">Run the demo →</a>
+      <a class="btn ghost" href="https://github.com/vitrin-os/vitrin-os">View on GitHub</a>
+    </div>
+  </div>
+
+  <section id="claim">
+    <h2>The sentence today's stack cannot express</h2>
+    <blockquote class="claim">
+      An agent is allowed to fill in <strong>one form</strong>, in
+      <strong>one Firefox window</strong>, for the <strong>next five
+      minutes</strong>. It cannot see the password manager open beside it.
+      The moment you touch the mouse, you have control back. Hold
+      <strong>Escape</strong> for a second and its authority is gone —
+      mid-click, mid-keystroke, whatever it was doing.
+    </blockquote>
+    <p class="sub">Every clause is a mechanism, not a policy setting:</p>
+    <div class="tw">
+    <table>
+      <thead><tr><th>The claim</th><th>What makes it true</th></tr></thead>
+      <tbody>
+        <tr><td>one form</td><td>A <b>grant</b>: (principal × resource × verbs × constraints). Not a role, not a config flag — a row the core checks on every single action.</td></tr>
+        <tr><td>five minutes</td><td>Expiry is a constraint <em>on the grant</em>, enforced at the chokepoint. There is no path that skips it.</td></tr>
+        <tr><td>can't see the other window</td><td>The agent's Firefox is in a <b>realm</b>, talking to its own private nested shim. The other window is not hidden from it; it is not in its universe.</td></tr>
+        <tr><td>you touch the mouse</td><td>Physical input is origin-tagged at the core and preempts agent input <em>by construction</em> — not by a race between two clients.</td></tr>
+        <tr><td>hold Escape</td><td>The <b>dead-man switch</b>: every live grant dies, transitively. The agent's next call fails <code>revoked</code>.</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section id="demo">
+    <h2>See it run</h2>
+    <p class="sub">
+      An agent connects, petitions for a capability, a human approves a prompt
+      the core drew itself, and the agent drives a real Firefox inside a realm.
+    </p>
+    <!-- DEMO-VIDEO-SLOT: replace this block with the <video> element once
+         docs/demo/nested-demo.webm is recorded. See docs/demo/README.md. -->
+    <div class="demo">
+      <div class="cap">
+        <strong>Recording in progress.</strong> Until it lands, the demo is two
+        commands and about five minutes on your own machine —
+        <a href="docs/01-run-the-demo.html">run it yourself</a>. It drives the
+        real wlroots shim and a real application; nothing in the path is mocked.
+      </div>
+    </div>
+  </section>
+
+  <section id="start">
+    <h2>Get started</h2>
+    <p class="sub">From a clean clone to an agent driving a real app.</p>
+
+    <div class="step">
+      <div class="n">1</div>
+      <div class="body">
+        <p>Build the core and the per-app shim.</p>
+<pre><span class="c"># the Rust side: vitrind, xtask, fixtures</span>
+cargo build --workspace
+
+<span class="c"># the C side: a real wlroots compositor, one per app</span>
+bash shim/ci/install-deps.sh
+meson setup shim/build shim &amp;&amp; meson compile -C shim/build</pre>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="n">2</div>
+      <div class="body">
+        <p>Run the demo agent against a real application, headless.</p>
+<pre>cargo xtask demo --headless
+<span class="c"># → xtask demo: PASS</span></pre>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="n">3</div>
+      <div class="body">
+        <p>Write your own — the SDK is pure Python, standard library only.</p>
+<pre><span class="p">import</span> vitrin_os
+
+conn  = vitrin_os.connect(sock, identity=<span class="p">"agent://demo"</span>)
+grant = conn.request_grant(verbs=(<span class="p">"observe"</span>, <span class="p">"actuate.pointer"</span>),
+                           expiry_ms=300_000)
+grant.await_consent()          <span class="c"># a human decides</span>
+
+grant.observe().to_png(<span class="p">"before.png"</span>)
+grant.pointer.click(640, 84)</pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="how">
+    <h2>How it fits together</h2>
+    <p class="sub">
+      Legacy apps never touch the trusted core. Each gets its own private
+      compositor, which is itself an unprivileged client.
+    </p>
+    <div class="arch">        human                          agent principal
+   physical input                    SDK client
+          │                               │
+          │      capability-native wire protocol
+          │      handshake · grants · observe · actuate
+          ▼                               ▼
+ ┌───────────────────────────────────────────────────┐
+ │ <b>vitrind — the trusted core</b>                        │
+ │ capability kernel · grant store · compositor      │
+ │ input router · consent surface · journal          │
+ └───────────────────────────────────────────────────┘
+      ▲                              ▲
+      │ frames up (fd)               │ frames up (fd)
+      │ input down (origin-tagged)   │ input down
+      ▼                              ▼
+ ┌──────────────────┐        ┌──────────────────┐
+ │ <b>realm</b>            │        │ <b>realm</b>            │
+ │  per-app shim    │        │  per-app shim    │
+ │       ↓          │        │       ↓          │
+ │  unmodified app  │        │  unmodified app  │
+ └──────────────────┘        └──────────────────┘</div>
+    <div class="cards">
+      <div class="card">
+        <h3>Small trusted core</h3>
+        <p>The entire TCB: capability kernel, grant store, scene composition, input routing, consent, journals. Window management and theming stay out of it, permanently.</p>
+      </div>
+      <div class="card">
+        <h3>Legacy complexity, exiled</h3>
+        <p>Serving the full Wayland surface is a large, messy job. It happens in an untrusted, disposable, per-app shim — not in the process holding the grant table.</p>
+      </div>
+      <div class="card">
+        <h3>Unspoofable consent</h3>
+        <p>The prompt is drawn by the process that owns the screen, composited above every client, with an exclusive input grab. No client can paint over it.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="status">
+    <h2>Status: Phase 1 complete</h2>
+    <p class="sub">
+      Every milestone closed on a named test that runs against the shipped
+      binaries with <em>no mock</em> on any seam it claims — the project's
+      decision D12. Mock-based tests are labelled component tests and close
+      nothing.
+    </p>
+    <div class="tw">
+    <table>
+      <thead><tr><th>Milestone</th><th>Proven by</th></tr></thead>
+      <tbody>
+        <tr><td>M1.2 — buffer path</td><td><code>test_real_app.py</code> — real core + real shim + real <code>weston-terminal</code></td></tr>
+        <tr><td>M1.3 — observation</td><td><code>test_real_capture_fidelity.py</code> — through the enforcement chokepoint</td></tr>
+        <tr><td>M1.4 — actuation, consent, dead-man</td><td><code>test_real_actuation.py</code>, <code>test_real_consent.py</code>, <code>test_real_deadman.py</code></td></tr>
+        <tr><td>M1.5 — demo</td><td><code>test_demo.py</code> — asserting the typed text actually landed</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <div class="warn">
+      <p><strong>There is no sandbox yet.</strong> No namespaces, no seccomp,
+      no Landlock. A realm's app runs as the core's own uid with the core's
+      full view of the filesystem and network. Environment hygiene confines
+      the well-behaved; it does not contain the hostile.</p>
+      <p>Do not run untrusted applications, or untrusted agents, against this.
+      <a href="docs/limits.html">Every other known gap is listed here</a> —
+      the 24-hour fuzz soak that has never been run, wlcs conformance at
+      3/180, and the rest.</p>
+    </div>
+  </section>
+
+  <section id="docs">
+    <h2>Read on</h2>
+    <div class="cards">
+      <div class="card"><h3><a href="docs/01-run-the-demo.html">Run the demo</a></h3><p>Clean clone to a passing run, and what each step actually did.</p></div>
+      <div class="card"><h3><a href="docs/02-your-first-agent.html">Your first agent</a></h3><p>The Python SDK end to end, including every way actuation is refused.</p></div>
+      <div class="card"><h3><a href="docs/03-grants-consent-revocation.html">The security model</a></h3><p>Grants, consent the core draws itself, and the dead-man switch.</p></div>
+      <div class="card"><h3><a href="docs/05-the-wire-protocol.html">The wire protocol</a></h3><p>Framing, the interfaces, and the fatal-vs-recoverable razor.</p></div>
+      <div class="card"><h3><a href="https://github.com/vitrin-os/vitrin-os/blob/main/docs/PRD.md">PRD &amp; architecture</a></h3><p>The canonical vision doc: object model, threat model, roadmap.</p></div>
+      <div class="card"><h3><a href="https://github.com/vitrin-os/vitrin-os/blob/main/CONTRIBUTING.md">Contribute</a></h3><p>DCO not CLA. What gets a change rejected, stated up front.</p></div>
+    </div>
+  </section>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    <div class="flinks">
+      <a href="https://github.com/vitrin-os/vitrin-os">GitHub</a>
+      <a href="docs/">Documentation</a>
+      <a href="https://github.com/vitrin-os/vitrin-os/blob/main/SECURITY.md">Security</a>
+      <a href="https://github.com/vitrin-os/vitrin-os/blob/main/NOTICE">Licensing</a>
+      <a href="https://github.com/vitrin-os/vitrin-os/blob/main/TRADEMARK.md">Trademark</a>
+    </div>
+    <p>
+      Source under MPL-2.0 (the trusted core) and Apache-2.0 (the protocol,
+      bindings and SDKs) — <a href="https://github.com/vitrin-os/vitrin-os/blob/main/NOTICE">NOTICE</a>
+      is the normative map. Spec prose CC-BY-4.0. The name and marks are
+      trademarks and are not covered by those licenses.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

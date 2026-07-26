@@ -1,0 +1,15 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/vitrin-os/vitrin-os/security/advisories/new
+    about: >-
+      Report privately through GitHub security advisories. Do NOT open a
+      public issue with details. See SECURITY.md for scope and what to
+      expect.
+  - name: Read the design docs first
+    url: https://github.com/vitrin-os/vitrin-os/blob/main/docs/PRD.md
+    about: >-
+      The PRD is the canonical vision and architecture; docs/plan/ has the
+      roadmap and the decision log. Many "why is it like this" questions are
+      answered there with the reasoning recorded.
+

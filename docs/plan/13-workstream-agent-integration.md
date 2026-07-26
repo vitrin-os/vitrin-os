@@ -204,10 +204,13 @@ and follow the paired-edit rule.
    server holds it, every agent behind that server shares one authority, which
    destroys per-principal identity — the project's first pillar. Probably each
    agent session must petition for its own. Needs deciding before any code.
-3. **How is an agent's identity established through MCP?** Vitrin authenticates
-   principals at handshake. An MCP client is a process the user launched; what
-   credential does it present, and does the *model* have an identity distinct
-   from the *runtime*? This touches Q7 (identity-standard churn) directly.
+3. ~~**How is an agent's identity established through MCP?**~~ **Answered in
+   §7: OAuth.** Every agent presents its own token, with its own claims and
+   scopes; the verifier canonicalizes it into the principal identity. The wire
+   already accommodates it (`credential_type: "oidc"` is named in the IDL) and
+   D-008's pluggable verifier is the extension point, so no protocol change is
+   needed. Still touches Q7 (identity-standard churn), and §7.6 records what it
+   leaves open.
 4. **Does a returned frame count as an observation for rate-limiting?** An MCP
    client may cache and re-show an image the model already has. The grant's
    `max_event_rate` governs captures, not model context.
@@ -216,7 +219,132 @@ and follow the paired-edit rule.
    core-composited cursors and overlays, and a client-side annotation is
    arguably outside it — but it should be decided, not assumed.
 
-## 7. What this workstream is not
+## 7. Identity: OAuth is the substrate
+
+This answers §6.3 (*what credential does an agent present?*) and it is the piece
+that makes per-agent identity real rather than aspirational: **every agent gets
+its own token, with its own claims and scopes.**
+
+### 7.1 The fit needs no protocol change
+
+The wire was built for this. `vitrin_handshake.hello` carries
+`credential_type` naming a scheme and `credential` carrying scheme-defined
+bytes, and [`protocol/vitrin-v0.xml`](../../protocol/vitrin-v0.xml) already
+names **`"oidc"`** among its examples. `credential` admits 32768 bytes — ample
+for a JWT. **D-008** put a pluggable `Verifier` behind exactly this and already
+names OIDC.
+
+Two existing properties do real work here:
+
+- **The verifier canonicalizes identity.** The IDL is explicit that the claimed
+  `identity` is only a routing hint and "the authoritative principal identity is
+  the verifier-canonical string later delivered in `vitrin_principal.bound`".
+  That is precisely where a token's `sub`/`iss`/`aud` become the principal — the
+  agent does not get to assert who it is.
+- **Credentials are already secret material.** The IDL forbids writing
+  credential bytes to logs, `error.message`, or the flight recorder. Correct and
+  necessary for bearer tokens, and already normative.
+
+So the work is a verifier, not a protocol edit.
+
+### 7.2 The load-bearing rule: a scope is a ceiling, not a grant
+
+This is the one way to get this catastrophically wrong, and it would be an easy
+mistake to make while feeling productive.
+
+> **A token scope bounds what an agent may *petition* for. It never approves a
+> petition.**
+
+If `scope: vitrin:actuate` were treated as "actuation allowed", OAuth would
+become **ambient authority** — the precise thing this project exists to
+abolish. An agent holding that scope must still petition, a human must still
+consent, and the grant must still expire and revoke. The two layers are not
+substitutes and must not collapse:
+
+| | OAuth scope | Vitrin grant |
+|---|---|---|
+| Granted by | an administrator, in advance | a human, in the moment, on screen |
+| Lifetime | the token's | the grant's expiry, or until revoked |
+| Answers | *what may this agent ever ask for?* | *what may it do right now?* |
+| Effect of holding it | it may petition | it may act |
+
+A scope can only ever **narrow** what is petitionable. A petition outside the
+token's scope should be refused before a prompt is ever raised — which is also
+a consent-fatigue win, since a human is never asked about something the agent
+was never permitted to request.
+
+### 7.3 What OAuth buys that static tokens do not
+
+1. **Per-agent identity — the answer to §6.2.** If each agent session presents
+   its own token, an MCP server in front of Vitrin does not hold one shared
+   authority. It passes through per-agent identity, and the first pillar
+   survives contact with a shared runtime.
+2. **Provenance, which unlocks durable persistence.** The IDL says the durable
+   rungs (`until_revoked`, `always`) exist from day one but resolve
+   `unsupported` in version 1, "pending provenance verification in a later
+   phase". A verified issuer + audience + subject *is* a provenance story. This
+   is a real unlock, and it connects to **Q9** (standing-grant ergonomics).
+3. **Two-layer revocation.** Revoking the token stops future petitions;
+   revoking the grant stops current authority. Both are needed and neither
+   substitutes for the other — the dead-man switch must not depend on an
+   authorization server being reachable.
+4. **Audience binding.** A token minted for one core cannot be replayed at
+   another service (RFC 8707 resource indicators). This complements, and does
+   not replace, the connection-level sender-constraint already in the IDL.
+
+### 7.4 It aligns with MCP rather than fighting it
+
+MCP's own authorization spec is OAuth 2.1 plus RFC 9728 protected-resource
+metadata. So an MCP server fronting Vitrin (#164) is naturally an OAuth
+**resource server**: it validates the agent's token, then presents that verified
+identity to Vitrin's handshake. One identity model, two hops, no bespoke scheme.
+
+### 7.5 Generic by requirement, not vendor-specific
+
+Vitrin must specify **standards**, not a product: OIDC / OAuth 2.1, RFC 7662
+introspection, RFC 9728 metadata, RFC 8707 resource indicators. Any conforming
+authorization server must work, and nothing in the core may depend on a
+particular one. (The author maintains one such server,
+[QAuth](https://github.com/tahaayan/qauth) — useful as a reference
+implementation and as the thing this design is being validated against, but
+never a dependency.)
+
+The corollary matters for the TCB: **token validation is a verifier concern, not
+a core concern.** Introspection means a network call, and the core must never
+block a grant-time hot path on a remote service. Validate at handshake, cache
+the canonical identity for the connection's life, and keep the authorization
+server off the actuation path entirely.
+
+### 7.6 Open questions this raises
+
+1. **Does token expiry kill a live connection?** An agent may hold a connection
+   for longer than its access token's lifetime. Options: the connection dies at
+   expiry (safe, disruptive); the connection survives on the already-verified
+   identity but may not petition again (probably right, since grants carry
+   their own expiry); or re-presentation is allowed mid-connection (a new
+   message, so a protocol edit). **Undecided, and it must be decided before a
+   verifier ships.**
+2. **What is the scope vocabulary?** `vitrin:observe` / `vitrin:actuate` is the
+   obvious start, but scopes could also bound realms or resources
+   (`vitrin:observe:realm-0`), which begins to overlap the `resource` selector
+   and #161's `region:` prefix. Two ways to express the same narrowing is a
+   design smell; decide which layer owns it.
+3. **Who mints an agent's token, and does the *model* have an identity distinct
+   from the *runtime*?** A token proves which process is connecting. It does not
+   prove which model, prompt, or operator is behind it. Vitrin should be honest
+   that it authenticates a **workload**, not an intelligence.
+4. **What happens when the authorization server is down?** Fail closed for new
+   handshakes is right. Existing connections and live grants must be unaffected
+   — otherwise an outage becomes a revocation, and worse, a dependency of the
+   dead-man switch.
+
+An operational note worth recording because it has already bitten this author
+elsewhere: adding `iss` enforcement or a `jti` denylist to a running
+authorization server invalidates tokens already cached by long-lived clients,
+which surfaces as an unexplained 401 rather than as a config error. Whatever
+question 1 answers, the failure mode should be legible.
+
+## 8. What this workstream is not
 
 Not an agent framework, not a planner, and not a prompt library. Vitrin's job
 ends at the wire: identity, authority, observation, actuation, revocation, and

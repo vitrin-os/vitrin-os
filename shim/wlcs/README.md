@@ -160,6 +160,28 @@ These are the same counts this file has carried since the harness landed,
 reproduced here on a re-run. **The numbers were right. The root-cause
 annotation attached to them was not** — see below.
 
+> **These counts are from the 2026-07-25 run and have NOT been re-measured
+> since.** `src/xdg.c` changed twice on 2026-07-26, and the two changes have
+> very different odds of moving them:
+>
+> - `xdg_toplevel.wm_capabilities` narrowed from wlroots' default set of four
+>   to the two the shim implements (under "3. 5 failures" below).
+>   **Predicted, not measured**, to change nothing here: the only wlcs test
+>   that looks at that event asks for its *presence*, never its contents, and
+>   none of the three passing tests reads it at all.
+> - An `xdg_shell.new_popup` listener was added, so a popup is configured on
+>   its initial commit instead of never (cause 1b below). This one **plausibly
+>   moves the numbers** — the 8 `XdgPopupStable/XdgPopupTest` failures are the
+>   obvious candidates — but it is a guess in the other direction and is
+>   labelled as one: nobody has run those tests against the fixed shim, and
+>   that suite asserts popup grabs and dismissal, which remain unimplemented.
+>
+> Neither is measured because `wlcs` is not installed on the machine either
+> change was made on (`meson setup` reports `Run-time dependency wlcs found:
+> NO`), so `run-advisory.sh` was not run. Treat the next real run's output,
+> not this paragraph, as the measurement — and if it disagrees, this paragraph
+> is what was wrong.
+
 **Passing (3):**
 
 - `XdgSurfaceStableTest.supports_xdg_shell_stable_protocol`
@@ -187,6 +209,19 @@ This shim implements neither the deprecated `wl_shell` nor the unstable
 `XdgPopupStable/XdgPopupTest` (8), `ClientSurfaceEventsTest` (6),
 `XdgToplevelStableTest` (5), the two `SurfacePointerMotionTest`
 instantiations (4 + 4) and `XdgSurfaceStableTest` (1) — 128 exactly.**
+
+> **One exception string is one measurement, not one cause, and this entry
+> used to conflate the two.** The diagnosis below — "the wlcs client skips the
+> initial-commit/ack sequence" — is traced, but only on **toplevel** tests
+> (the two `WAYLAND_DEBUG` captures quoted are `ClientSurfaceEventsTest
+> .surface_enters_output` and `XdgSurfaceStableTest.gets_configure_event`).
+> It was then generalised to all 128, including the 8
+> `XdgPopupStable/XdgPopupTest`, on no popup evidence at all. For those 8 the
+> generalisation was **wrong**, and measurably so: the shim registered no
+> `xdg_shell.new_popup` listener, so it never configured a popup at any
+> moment, and a client that performs the popup bring-up *correctly* was still
+> disconnected. They are carved out as **cause 1b** below. Read everything
+> from here to the end of cause 1 as being about the other 120.
 
 > Correction: an earlier revision of this table said `XdgSurfaceStableTest`
 > (2), which made the breakdown sum to 129 for a 128-failure cause. It is 1:
@@ -253,7 +288,10 @@ and
 wlroots 0.19.3 implements exactly that: `surface->configured` is set **only**
 in `xdg_surface_handle_ack_configure`, and a commit carrying a buffer while
 `!configured` is rejected with `unconfigured_buffer`
-(`types/xdg_shell/wlr_xdg_surface.c`). The shim is right to reject these.
+(`types/xdg_shell/wlr_xdg_surface.c`). **The shim is right to reject the two
+traced above, and every test that fails the same way for the same reason** —
+which is the claim the traces support, and not the stronger one this
+paragraph used to make about all 128 (see cause 1b).
 
 **Cross-version confirmation, against the same shim sources.** Rebuilt only
 against wlcs 1.7.0's headers and run under the 1.7.0 runner — `shim/src`
@@ -261,9 +299,20 @@ untouched — the pass count goes from 3 to 8, picking up
 `XdgSurfaceStableTest.gets_configure_event`,
 `XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_existing_role_is_an_error`,
 `ClientSurfaceEventsTest.frame_timestamp_increases` and
-`ClientSurfaceEventsTest.surface_enters_output`, because 1.7.0's helpers
-perform the initial-commit/configure/ack sequence. Nothing about the shim's
-configure timing changed between those two runs.
+`ClientSurfaceEventsTest.surface_enters_output`, because 1.7.0 performs the
+initial-commit/configure/ack sequence those tests were missing. Nothing about
+the shim's configure timing changed between those two runs.
+
+> Correction: this paragraph used to say 1.7.0's *helpers* do that. They do
+> not — `wlcs::XdgSurfaceStable`'s and `wlcs::XdgToplevelStable`'s
+> constructors are byte-identical in `src/xdg_shell_stable.cpp` at tags
+> `v1.6.1` and `v1.7.0`, and neither commits. What changed is the **test
+> bodies**. `tests/xdg_surface_stable.cpp`'s `gets_configure_event` gains a
+> literal `wl_surface_commit(surface);` under the comment "The first commit
+> triggers an initial `xdg_surface.configure` event", and swaps the bare
+> `roundtrip()` for a `dispatch_until` on having received one. Read at the
+> upstream tags rather than from a vendored copy — this repository still does
+> not vendor wlcs.
 
 > **The root cause previously recorded here was the exact inverse of the
 > rule, and is retracted.** It claimed `xdg.c` gating the initial configure
@@ -277,18 +326,106 @@ configure timing changed between those two runs.
 > failing clients never send `ack_configure` at all, so `configured` would
 > stay false no matter when the configure was sent.
 >
-> **Issue #128 was filed on that retracted premise. Its premise is invalid —
-> do not implement it.** Doing so would move `xdg.c` from conformant to
-> non-conformant while changing none of these results. The issue text itself
-> is not edited by this change; someone with write access needs to close or
-> rewrite it.
+> **Issue #128 was filed on that retracted premise. Its TIMING premise is
+> invalid — do not implement it.** Configuring at role assignment would move
+> `xdg.c` from conformant to non-conformant while changing none of these
+> results.
+>
+> **But #128 is not wholly invalid, and saying so was itself an evidence
+> gap.** Its task list and acceptance criterion both name `get_popup`, and the
+> shim really did send no popup configure at any moment — the exact
+> `xdg_surface has never been configured` symptom the issue quotes, reachable
+> without any of the bring-up shortcuts the 1.6.1 client takes. That half was
+> genuine, is measured under cause 1b below, and is fixed. The re-adjudication
+> that declared the whole issue invalid made four checks and not one of them
+> exercised a popup, which is how a right answer about timing became a wrong
+> answer about the issue. The issue text itself is not edited by this change;
+> someone with write access needs to rewrite it — closing it as invalid would
+> be wrong.
+>
+> **Re-adjudicated from the primary sources on 2026-07-26, without taking
+> either the issue or this file on faith, and the retraction holds.** Four
+> independent checks, three of them things this file previously asserted
+> without running:
+>
+> 1. **The spec.** `xdg-shell.xml` (wayland-protocols 1.49,
+>    `stable/xdg-shell/`), `xdg_surface`'s interface description, quoted
+>    above. The ordering `xdg.c` implements is the mandated one.
+> 2. **wlroots 0.19.3, read at the tag.** `wlr_xdg_surface_schedule_configure`
+>    opens `assert(surface->initialized)` (`types/xdg_shell/wlr_xdg_surface.c`
+>    line 168); `initialized` is assigned in exactly one place,
+>    `xdg_surface_role_commit`; `configured` is assigned `true` in exactly
+>    one place, the `ack_configure` handler.
+> 3. **The abort, observed rather than predicted.** `xdg.c` was temporarily
+>    patched to do precisely what #128 asks — `configure_to_view()` plus
+>    `wlr_xdg_surface_schedule_configure()` at the end of `on_new_toplevel`,
+>    i.e. at role assignment — and run against a plain v6 client. The shim
+>    dies on the client's first `get_toplevel` with
+>    `vitrin-shim: types/xdg_shell/wlr_xdg_surface.c:168:
+>    wlr_xdg_surface_schedule_configure: Assertion 'surface->initialized'
+>    failed.` The client receives no configure and no `wm_capabilities`; the
+>    realm goes down with the shim. The patch was reverted; nothing of it is
+>    in the tree.
+> 4. **wlcs agrees, upstream.** 1.7.0's `gets_configure_event` fixes itself by
+>    adding the initial commit (see the correction above), which is wlcs
+>    conceding the ordering rather than this repository asserting it.
+>
+> **What those four checks do not cover: popups.** All four are about a
+> toplevel — one spec paragraph, one wlroots assertion, one abort experiment
+> on `on_new_toplevel`, one wlcs toplevel test. None of them would have
+> noticed that the shim never configured a popup either, which is a different
+> defect that produces the same error string. It took a fifth check, a popup
+> client, and that one came back red (cause 1b).
 
 What is *not* established: whether wlcs 1.6.1's behaviour is a plain bug or
 a deliberate accommodation of compositors that configure eagerly at role
-assignment (Mir, wlcs's home compositor, being the obvious candidate), and
-what exactly changed in 1.7.0. Settling that needs wlcs's own sources, which
-this repository deliberately does not vendor. Either way there is nothing
-for `xdg.c` to change.
+assignment (Mir, wlcs's home compositor, being the obvious candidate). The
+1.6.1→1.7.0 diff in the test bodies is now read (above), so "what exactly
+changed" is answered; *why* it was written that way in the first place is
+not, and does not need to be. Either way, **for the toplevel tests traced
+here**, there is nothing for `xdg.c` to change. That qualifier is the point:
+the same sentence without it swallowed the 8 popup failures, which did have
+something for `xdg.c` to change.
+
+**1b. 8 of those 128 — `XdgPopupStable/XdgPopupTest` — sat on a real
+shim-side defect, and it is fixed.** Measured on 2026-07-26 against the
+shipped binary (`build/vitrin-shim --no-upstream`, headless/pixman) with a
+client that does the popup bring-up *correctly*: parent toplevel configured,
+acked, given a buffer and mapped, then `get_popup`, then a buffer-less
+initial commit on the popup and two round trips. The popup received **zero**
+`xdg_surface.configure` events, and its first buffer commit killed the
+client — `xdg_surface#9: error 3: xdg_surface has never been configured`,
+with the shim's own ledger recording `globals-error: seq=13 code=3
+message="xdg_surface has never been configured"`.
+
+Be precise about what that does and does not settle, because imprecision here
+is what produced the original error. It does **not** show what the 8 wlcs
+popup tests do — they were not traced, and they may well skip bring-up like
+their toplevel neighbours. What it shows is that the shim rejected **every**
+popup that reached a buffer commit, correct bring-up or not, so the traced
+explanation could not have been the whole reason for those 8, and "the shim
+is right to reject these" was asserted over a case where the shim was wrong.
+
+The cause: `vitrin_setup_xdg` registered only `xdg_shell.events.new_toplevel`.
+wlroots does **not** configure popups for the compositor — for a popup commit
+it only rejects a parentless one (`handle_xdg_popup_client_commit`,
+`types/xdg_shell/wlr_xdg_popup.c`) — and its own reference compositor
+schedules that configure by hand in `xdg_popup_commit`. A compositor with no
+`new_popup` listener therefore does not merely fail to draw menus: it
+**disconnects every app that opens one**. `src/xdg.c` now has that listener
+(`on_new_popup` → `wlr_xdg_surface_schedule_configure` on the popup's
+`initial_commit`, plus a scene node under the parent's), and the same probe
+is checked in as FACT 3 of `tests/xdg_conformance_client.c`, so it runs under
+`meson test` and goes red if the listener is ever removed.
+
+**Whether that makes these 8 wlcs tests pass is NOT known.** `wlcs` is not
+installed on the machine this was fixed on (`meson setup` reports `Run-time
+dependency wlcs found: NO`), so `run-advisory.sh` was not re-run, and the
+`XdgPopupTest` bodies were not read to see what else they assert — popup
+grabs, `popup_done` on dismissal and repositioning are all in that suite's
+name and none of them is implemented or claimed here. The honest statement is
+narrow: one real shim-side defect that this cause was masking is fixed and
+measured; the pass-list numbers stand un-remeasured.
 
 **2. 12 failures — `"Timeout waiting for condition"`**, all in
 `XdgToplevelStableTest.{parent_can_be_set, null_parent_can_be_set,
@@ -307,37 +444,148 @@ layout policy ("LAYOUT IS ONE RULE"), **not** verified test by test with a
 trace the way cause 1 was. It is consistent with Phase 1 having no window
 manager.
 
-**3. 5 failures, individually triaged.** Small, concrete, and the only ones
-here that point at shim-side work:
+**3. 5 failures, individually triaged.** Small and concrete. This section
+used to open "the only ones here that point at shim-side work"; after the
+2026-07-26 re-triage below, **none of the five is a test `shim/src` can
+make pass**, and the one that read as an outright missing event was not
+missing at all.
 
 - `XdgToplevelStableTest.wm_capabilities_are_sent` — a gmock
-  `EXPECT_CALL(toplevel, wm_capabilities)` that is never satisfied. The shim
-  advertises `xdg_wm_base` version 6 but never sends
-  `xdg_toplevel.wm_capabilities`, which v5+ clients are entitled to. A
-  genuine, narrow conformance gap in `xdg.c`.
+  `EXPECT_CALL(toplevel, wm_capabilities)` that is never satisfied.
+
+  > **Retracted diagnosis.** This entry used to read "the shim advertises
+  > `xdg_wm_base` version 6 but never sends `xdg_toplevel.wm_capabilities`
+  > […] a genuine, narrow conformance gap in `xdg.c`." **The shim was
+  > sending it, and always had been.** Two checks, either of which settles
+  > it. In wlroots 0.19.3, `create_xdg_toplevel`
+  > (`types/xdg_shell/wlr_xdg_toplevel.c`) seeds all four capabilities into
+  > `scheduled` at `get_toplevel` time, under the comment "The first
+  > configure event must carry WM capabilities", whenever the shell global's
+  > version is ≥ 5 — and `globals.c` creates it at 6. And a bare v6 client
+  > run against the then-shipping `vitrin-shim` on the headless/pixman
+  > backend received `xdg_toplevel.wm_capabilities` carrying all four
+  > values, *before* the `xdg_surface.configure` — which is the ordering
+  > xdg-shell asks for ("compositors must send this event once before the
+  > first `xdg_surface.configure` event"). A client that makes those
+  > assertions mechanically is now checked in as
+  > `tests/xdg_conformance_client.c` and runs under `meson test`; it asserts
+  > the *corrected* set of two, so it is red on the tree as it stood before
+  > this entry was rewritten and green on the tree after.
+  >
+  > **Why it fails is a wlroots-API constraint, not cause 1**, and the
+  > version of this entry that said otherwise misread the spec. Its body —
+  > unchanged across wlcs `v1.6.1`, `v1.7.0` and `v1.8.1` — creates a
+  > surface, an `xdg_surface` and an `xdg_toplevel`, then calls
+  > `client.roundtrip()` with **no `wl_surface.commit` anywhere**, and asks
+  > only for the event: `EXPECT_CALL(toplevel, wm_capabilities).Times(1)`.
+  > The previous reasoning ("no compositor has sent a configure at that
+  > point, so none has had a first configure to precede") turns xdg-shell's
+  > sentence inside out. "Compositors must send this event once before the
+  > first `xdg_surface.configure` event" is a **deadline, not a trigger**: it
+  > forbids sending it late, it does not forbid sending it when no configure
+  > exists yet. A compositor that emits `wm_capabilities` at
+  > `get_toplevel` time passes this test and violates nothing — so the test
+  > is passable in principle, and calling it unpassable was wrong.
+  >
+  > This shim cannot pass it because wlroots offers no way to send the event
+  > detached from a configure: `wlr_xdg_toplevel_set_wm_capabilities`
+  > (`types/xdg_shell/wlr_xdg_toplevel.c` lines 625-632) sets
+  > `scheduled.wm_capabilities` and then **returns
+  > `wlr_xdg_surface_schedule_configure(toplevel->base)`**, which opens
+  > `assert(surface->initialized)`. The only public route to the event runs
+  > through a configure, and a configure before the initial commit is both
+  > illegal (cause 1's spec quote) and fatal (it aborts the process — see the
+  > observed abort under cause 1). That is a **wlroots-side** limitation,
+  > which is this file's third bucket, not the "test skips bring-up" one.
+
+  What the re-triage *did* find, and `xdg.c` now fixes, is narrower and is
+  not something wlcs measures: the capability **set** was wlroots' default
+  of all four, so the shim was telling apps they could `set_minimized` and
+  `show_window_menu` when it implements neither (no `request_minimize` or
+  `request_show_window_menu` listener, nowhere to minimize to, no
+  decorations and no window manager). Since a client "should hide or disable
+  the UI elements" for a capability it is not offered, the practical effect
+  was a dead minimize button in the app's own chrome — a shim artifact of
+  exactly the kind `xdg.c`'s "maximized and activated" note exists to
+  prevent. `xdg.c` now sends `{maximize, fullscreen}`, the two it answers.
+  **This does not make the wlcs test pass**, and is not predicted to change
+  any number in the pass-list.
 - `XdgSurfaceStableTest.gets_configure_event` — see cause 1; on 1.6.1 this
   test never commits, so no conformant compositor can pass it. It passes on
   wlcs 1.7.0 against the same shim.
 - `XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_attached_buffer_is_an_error`
   — "Expected protocol error not received". Creating an `xdg_surface` from a
   `wl_surface` that has a buffer *attached but not yet committed* is
-  supposed to be an error; the shim accepts it.
+  supposed to be an error (`xdg_surface`: "Creating an xdg_surface from a
+  wl_surface which has a buffer attached or committed is a client error");
+  the shim accepts it. Reproduced directly against the shipped binary, not
+  just read out of the log.
+
+  **This one is wlroots', not `shim/src`'s, and cannot be closed here
+  without reaching into wlroots' private state.** `create_xdg_surface`
+  tests `wlr_surface_has_buffer()`, which reads the **current** state, so an
+  attach that has not been committed is invisible to it — and that is still
+  true on wlroots `master`. From the shim's side, at
+  `wlr_xdg_shell.events.new_surface`, the public API cannot tell the two
+  apart either: `wlr_surface_state_has_buffer(&surface->pending)` is
+  `buffer_width > 0 && buffer_height > 0`, and those are only resolved at
+  commit, while the attached resource itself lives in the `WLR_PRIVATE`
+  block. The one thing the shim *can* see, `pending.committed &
+  WLR_SURFACE_STATE_BUFFER`, is set by `wl_surface.attach(NULL)` too — so
+  enforcing on it would kill an app for a legal no-op. Trading a permissive
+  nonconformance for a fatal one is not an improvement, and no such check
+  was added.
 - `XdgSurfaceStableTest.creating_xdg_surface_from_wl_surface_with_committed_buffer_is_an_error`
   — the error *is* raised, with a different code than wlcs expects:
   `xdg_wm_base` error 3 (`invalid_popup_parent`) carrying the message
   "xdg_surface must not have a buffer at creation", where wlcs expects 4
   (`invalid_surface_state`). That code comes from wlroots 0.19.3, not from
-  anything under `shim/src`.
+  anything under `shim/src`: `create_xdg_surface` posts
+  `XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER` (an `xdg_surface` enum value,
+  3) on the `xdg_wm_base` resource, where 3 means `invalid_popup_parent`.
+  Unchanged on wlroots `master`, and reproduced against the shipped binary
+  (`xdg_wm_base#6: error 3`). The shim cannot pre-empt it — wlroots owns
+  `get_xdg_surface` and returns before any signal the shim listens to.
 - `XdgSurfaceStableTest.attaching_buffer_to_unconfigured_xdg_surface_is_an_error`
   — "Expected protocol error not received": the one test that *wants*
   `unconfigured_buffer` does not get it, while 128 others get it unasked.
-  Not triaged.
 
-Net: of the 148 tests that actually exercise the shim, 128 fail on a test
+  Now triaged, and it is the same wlroots-versus-spec seam as the two
+  entries above. The test does `get_xdg_surface`, then
+  `wl_surface.attach(buffer)`, then a roundtrip — **no commit** — and
+  expects the error on the attach itself, which is what the spec says
+  ("any attempts by a client to attach or manipulate a buffer prior to the
+  first `xdg_surface.configure` call must also be treated as errors").
+  wlroots enforces the same rule one step later, at the commit that would
+  make the buffer current (`xdg_surface_role_client_commit`). The client is
+  rejected either way; only the moment differs, and the moment is wlroots'
+  to choose. Nothing under `shim/src` sees a `wl_surface.attach`.
+
+Net: of the 148 tests that actually exercise the shim, 120 fail on a test
 client that skips the xdg-shell bring-up sequence the shim is required to
-enforce, 12 on an accepted Phase-1 policy limitation (inferred, not traced),
-and 5 individually — of which one (`wm_capabilities`) is a real, actionable
-`xdg.c` gap and one is a wlroots error-code mismatch.
+enforce (traced on two of them, generalised over the rest), **8 were charged
+to that same cause untraced while the shim was in fact rejecting every popup
+that reached a buffer commit — a real `xdg.c` gap, now fixed and covered by a
+checked-in test** (cause 1b),
+12 on an accepted Phase-1 policy limitation (inferred, not traced), and 5
+individually — of which **one** is the skipped-bring-up assumption
+(`gets_configure_event` on 1.6.1) and **four** are wlroots' own handling: a
+missing pending-state check on `get_xdg_surface`, a mismatched error code,
+`wl_surface.attach` enforcement deferred to commit (all three unchanged on
+wlroots `master`), and `wm_capabilities` being reachable only through a
+configure. The `wm_capabilities` correction `xdg.c` took from this list is a
+fix to the *contents* of an event wlcs never gets far enough to see; the
+popup fix is not — it is the one thing on this list an app would have hit on
+its first menu.
+
+Two caveats on that sentence, both load-bearing. The 120/8 split is a
+re-attribution of a **2026-07-25** run, not a new count: `wlcs` is absent
+from the machine the popup fix was made on, so nothing here has been
+re-measured, and whether those 8 now pass is unknown (they assert popup grabs
+and dismissal too, neither of which is implemented). And "traced on two of
+them, generalised over the rest" is exactly the shape of reasoning that hid
+the popup gap for a revision — the remaining 120 have not been traced test by
+test either.
 
 ## Building
 

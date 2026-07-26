@@ -227,7 +227,7 @@ xdg_shell_client_header = custom_target(
 inc = include_directories('include')
 shim_deps = [wlroots, wayland_server, pixman, xkbcommon, drm]
 
-executable(
+shim_exe = executable(
   'vitrin-shim',
   files(
     'src/main.c',
@@ -388,6 +388,44 @@ input_echo_client = executable(
   xdg_shell_code,
   include_directories: inc,
   dependencies: [wayland_client, xkbcommon],
+)
+
+# --- xdg-shell conformance, from the app's side ------------------------
+# Three facts about src/xdg.c that only a client can observe: the initial
+# `xdg_surface.configure` is sent on the client's initial commit and NOT
+# before it, `xdg_toplevel.wm_capabilities` precedes that configure carrying
+# exactly the capabilities the shim implements, and a POPUP gets its own
+# configure on its own initial commit -- without which the app is not merely
+# menu-less, it is disconnected. The reasoning for each assertion is in the
+# client's own header comment.
+#
+# This one IS a `meson test`, unlike the scripts beside it in
+# tests/acceptance/: it needs nothing but the shim and this client, both
+# built here, and runs headless with the pixman software renderer. The
+# others need wayland-info, weston, GTK or Firefox and so stay separate CI
+# steps that can be skipped when the dependency is absent.
+xdg_conformance_client = executable(
+  'xdg-conformance-client',
+  files('tests/xdg_conformance_client.c'),
+  xdg_shell_client_header,
+  xdg_shell_code,
+  include_directories: inc,
+  dependencies: [wayland_client],
+)
+
+test(
+  'xdg-conformance',
+  find_program('bash'),
+  args: [
+    files('tests/acceptance/xdg_conformance.sh'),
+    shim_exe,
+    xdg_conformance_client,
+  ],
+  depends: [shim_exe, xdg_conformance_client],
+  # Generous: the body is two compositor round trips, but the shim has to
+  # come up and bind a socket first, and the script polls for that with its
+  # own SOCKET_TIMEOUT rather than racing it.
+  timeout: 60,
 )
 
 # The R5 gate's app: a real GTK text entry, so "héllo→世界 arrives intact in a

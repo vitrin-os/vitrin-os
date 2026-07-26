@@ -25,11 +25,26 @@ Unicode text. **Firefox runs in it**: the pinned ESR renders, repaints,
 scrolls under injected input and navigates from a URL typed into its URL bar,
 all headless with software WebRender and no GPU. Every global an app touches
 is now recorded by a **permanent ledger**, and an interface an app wants but
-does not get is recorded too. **Not yet**: popups are not in the scene graph
-(an `xdg_shell.new_popup` listener is missing, so a menu is neither rendered
-nor clickable — the input path already routes by hit-testing the scene, so it
-needs no change when they land), and `text-input-v3` / IME is the Phase-2
-workstream (E2.8) that retires the synthesized keymap below.
+does not get is recorded too. **Popups map too** — a menu, tooltip or combo
+box gets its own `xdg_surface.configure` on its initial commit and its own
+scene node under its parent's, so it is drawn where its positioner put it and
+is clickable through the same scene hit test the rest of the input path uses.
+**Not yet**: `text-input-v3` / IME is the Phase-2 workstream (E2.8) that
+retires the synthesized keymap below.
+
+**A bug the popup path was hiding, and why "not yet" was the wrong words for
+it.** This paragraph used to say popups were "neither rendered nor clickable"
+— as if a menu were missing from an otherwise working app. Measured against
+the shipped binary, the app **died**: with no `xdg_shell.new_popup` listener
+the shim never configured a popup at any moment, so the popup's first buffer
+commit is `xdg_surface` error 3 (`unconfigured_buffer`, "xdg_surface has
+never been configured") and the client is disconnected. wlroots does not send
+that configure on the compositor's behalf — for popups it only rejects a
+parentless one — which is the kind of asymmetry with the toplevel path that a
+reading of the spec alone will not catch. Both halves of the fix are in
+[`src/xdg.c`](src/xdg.c) (`on_new_popup`), and the configure half is asserted
+from the client's side by the conformance test below, which was red on the
+tree before it.
 
 ### The "globals touched" ledger, in one pass
 
@@ -284,7 +299,7 @@ task per phase.
 ```bash
 meson setup build            # uses system wlroots-0.19 if available
 ninja -C build
-meson test -C build          # header-compiles
+meson test -C build          # header-compiles, xdg-conformance
 
 # Build the vendored wlroots from source (e.g. CI, or no system wlroots-0.19),
 # taking wlroots' own dependencies from the system:
@@ -319,6 +334,34 @@ WLR_RENDERER_ALLOW_SOFTWARE=1`.
 ## Acceptance tests
 
 All are GPU-free, headless, and need no Rust toolchain.
+
+[`tests/acceptance/xdg_conformance.sh`](tests/acceptance/xdg_conformance.sh)
+— three xdg-shell facts about [`src/xdg.c`](src/xdg.c) that only the app's
+side of the socket can observe: the initial `xdg_surface.configure` is sent
+on the client's initial commit and **not** before it;
+`xdg_toplevel.wm_capabilities` precedes that configure carrying exactly the
+capabilities the shim implements (`maximize`, `fullscreen` — not wlroots'
+default four); and a **popup** is configured on *its* initial commit, so an
+app that opens a menu maps it instead of being disconnected. The client is
+[`tests/xdg_conformance_client.c`](tests/xdg_conformance_client.c); the
+reasoning for each assertion is in its header comment, and the wlcs failures
+that provoked it are annotated in
+[`wlcs/README.md`](wlcs/README.md). Alone among the scripts here it is wired
+into `meson test`, because it needs nothing but this tree's own binaries.
+
+Each of the three was measured failing before the code that makes it pass:
+the popup checks go red on the tree as it stood one commit earlier, with
+`xdg_surface#9: error 3: xdg_surface has never been configured` on the
+client's side and `globals-error: seq=13 code=3` in the shim's own ledger.
+What this script does **not** cover is popup *pixels* — that a popup
+composites into the frames the shim forwards was checked by hand under
+`mock-core` (a view-sized popup painted over a differently-coloured toplevel
+flipped the reported `dominant=` from `ff0000` to `0000ff`), not by any
+checked-in test.
+
+```bash
+bash tests/acceptance/xdg_conformance.sh ./build/vitrin-shim ./build/xdg-conformance-client
+```
 
 [`tests/acceptance/shim_globals_and_client.sh`](tests/acceptance/shim_globals_and_client.sh)
 — the P1.6.1 criteria: `wayland-info` lists exactly the expected globals, and

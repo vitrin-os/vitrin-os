@@ -131,12 +131,14 @@ struct vitrin_shim {
 	struct wl_listener frame;   /* output.frame */
 	struct wl_listener destroy; /* output.destroy */
 
-	/* Phase D -- the app's window. `xdg_wired` records that the listener
-	 * below was actually attached: bring-up can fail between creating the
+	/* Phase D -- the app's window. `xdg_wired` records that the listeners
+	 * below were actually attached: bring-up can fail between creating the
 	 * xdg_shell global (phase B) and attaching to it (phase D), and teardown
-	 * must not `wl_list_remove` a link that was never inserted. */
+	 * must not `wl_list_remove` a link that was never inserted. Both are
+	 * attached together in `vitrin_setup_xdg`, so one flag covers both. */
 	bool xdg_wired;
 	struct wl_listener new_toplevel; /* xdg_shell.new_toplevel */
+	struct wl_listener new_popup;    /* xdg_shell.new_popup */
 };
 
 /* Phase A (server.c): wl_display, event loop, headless backend, renderer,

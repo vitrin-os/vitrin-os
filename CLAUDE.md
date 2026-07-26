@@ -42,6 +42,34 @@ Milestones `M1.1`–`M1.5` sequence the work within Phase 1 (see PRD §8 for the
 phase-level roadmap: Phase 0 spec, Phase 1 MVP slice, Phase 2 semantic+epochs,
 Phase 3 network+X11+fleet, Phase 4 horizon).
 
+Phase 1 is complete. Work since is tracked with the same two label axes plus one
+rule, so the tracker never becomes a second roadmap:
+
+**Labels state membership; dependency edges state order.**
+
+- `track:*` — exactly one per issue, naming the **owner of the deliverable**, not
+  the diff's footprint. A protocol+core change is `track:protocol` when the
+  gating deliverable is the paired IDL+prose edit. Phase 1's most cross-cutting
+  gate issues each carried exactly one, and that precedent governs.
+- `phase-N` — only where a plan document actually schedules the work. Its
+  **absence is meaningful**: no document schedules it yet. Do not add `phase-2`
+  to make a tracker look tidy.
+- `workstream:*` — membership of a workstream (`docs/plan/1x-workstream-*.md`).
+- `known-limit` — closes a gap the project **publishes** (`docs/book/src/limits.md`,
+  `README.md`, `NOTICE`, or the site). Enumerate every surface when closing one.
+- **No GitHub milestones.** They are single-valued (an issue can be both Phase-2
+  and a workstream member), they carry `due_on` where
+  [`docs/plan/00-roadmap.md`](docs/plan/00-roadmap.md) refuses dates outright,
+  and their progress bar is a completeness claim this repo cannot honestly make
+  while named gaps have no issue. `docs/plan/` remains the source of truth for
+  sequencing.
+- Ordering uses **GitHub native issue dependencies** (`gh api
+  repos/OWNER/REPO/issues/N/dependencies/blocked_by`, which takes a database id,
+  not an issue number) and native **sub-issues** for workstream rollups. Reserve
+  a hard `blocked_by` for edges that are genuinely gating; record softer
+  couplings as a `## Depends on` section so GitHub cannot block a close for a
+  dependency that turned out to be optional.
+
 ## Conventions observed in this repo (follow them, don't reinvent)
 
 - **Branch naming**: `p<phase>.<epic>.<task>-slug`, e.g. `p1.1.1-protocol-idl`.

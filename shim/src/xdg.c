@@ -3,10 +3,11 @@
  * SPDX-License-Identifier: MPL-2.0
  *
  * Puts the app's xdg_toplevel into the scene graph and holds it at exactly
- * the realm-view size the core announced in `configure`. Without this the
- * shim is a compositor with nothing to composite: P1.6.1 stood up
- * `xdg_wm_base` so the app could bind it, but nothing listened for the
- * windows it created, which is why weston-terminal ran there truly blind.
+ * the realm-view size the core announced in `configure`, and does the same
+ * for the popups it opens under it. Without this the shim is a compositor
+ * with nothing to composite: P1.6.1 stood up `xdg_wm_base` so the app could
+ * bind it, but nothing listened for the windows it created, which is why
+ * weston-terminal ran there truly blind.
  *
  * LAYOUT IS ONE RULE: single maximized, at the origin, no decorations. That
  * is the whole of version 1's policy (PRD Doc 2; the core's own scene layer
@@ -48,6 +49,48 @@ struct vitrin_toplevel {
 	struct wl_listener request_fullscreen;
 };
 
+/* A menu, a tooltip, a combo box drop-down: the other half of xdg-shell an app
+ * cannot live without. See `on_new_popup` for what the shim owes one. */
+struct vitrin_popup {
+	struct wlr_xdg_popup *popup;
+
+	struct wl_listener commit;
+	struct wl_listener destroy;
+};
+
+/* WHAT THE APP IS TOLD IT MAY ASK FOR (`xdg_toplevel.wm_capabilities`, v5+).
+ *
+ * Exactly the two state requests this shim implements a handler for. wlroots
+ * marks `request_maximize` and `request_fullscreen` as the ones a compositor
+ * MUST answer with a configure (wlr_xdg_shell.h, on `wlr_xdg_toplevel.events`)
+ * and both are wired below. The other two are dropped because there is no
+ * mechanism behind them, not to save a round trip: `set_minimized` has nowhere
+ * to minimize to -- one app, one realm view, and `request_minimize` is
+ * unhandled here -- and `show_window_menu` needs decorations and a window
+ * manager, neither of which version 1 has (globals.c declines server-side
+ * decorations, `request_show_window_menu` is unhandled).
+ *
+ * THIS IS A CORRECTION, NOT AN ADDITION, and the distinction matters because
+ * the opposite was written down. wlroots seeds all four capabilities into
+ * `scheduled` the moment the toplevel is created (0.19.3,
+ * `create_xdg_toplevel`, "The first configure event must carry WM
+ * capabilities"), so a v5+ client has been receiving `wm_capabilities` from
+ * this shim all along -- listing two capabilities the shim does not implement.
+ * An app hides or disables the UI for a capability it is not offered
+ * (xdg-shell, `xdg_toplevel.wm_capabilities`), so the effect of the wlroots
+ * default was a minimize button and a window menu that do nothing: an artifact
+ * of the shim showing up in the app's own chrome, which is the same failure
+ * the "maximized and activated" note above exists to avoid.
+ *
+ * Advertising a capability is not a promise to grant every request made under
+ * it -- xdg-shell puts that explicitly under compositor policy ("Whether this
+ * configure actually sets the window maximized is subject to compositor
+ * policies") -- it is a promise that the request is available and answered.
+ * Both of these are. */
+#define VITRIN_WM_CAPABILITIES \
+	(WLR_XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE | \
+	 WLR_XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN)
+
 /* The realm view fills the output, so "maximized" and "fullscreen" and "the
  * window" are all the same rectangle. Sending it on the initial commit is
  * required by xdg-shell: the client cannot attach a buffer until it has been
@@ -59,10 +102,37 @@ static void configure_to_view(struct vitrin_toplevel *t) {
 	wlr_xdg_toplevel_set_activated(t->toplevel, true);
 }
 
+/* ON THE INITIAL COMMIT, AND NOT ONE INSTRUCTION EARLIER.
+ * `wlr_xdg_toplevel_set_wm_capabilities` schedules a configure, and scheduling
+ * one against a surface that has not had its initial commit aborts the whole
+ * shim -- the same trap `toplevel_request_maximize` documents below. The
+ * initial commit is the first legal moment and it is exactly where xdg-shell
+ * wants the event: "compositors must send this event once before the first
+ * xdg_surface.configure event", and the first configure is the one this same
+ * commit schedules.
+ *
+ * Per map cycle, not per toplevel. An unmapped-then-remapped surface performs
+ * the initial commit again (wlroots clears `initialized` in
+ * `reset_xdg_surface`), so this runs again and the new configure cycle also
+ * gets its capabilities first. wlroots' own seeding happens once, at toplevel
+ * creation, and its `scheduled.fields` bit is cleared when the first configure
+ * goes out -- so after a remap wlroots alone would send none. */
+static void announce_wm_capabilities(struct vitrin_toplevel *t) {
+	/* wlroots asserts the xdg_shell global's version is at least 5 before
+	 * touching this field. globals.c creates it at 6, so this never fires
+	 * today -- but an assert that takes the realm down with it is not a
+	 * thing to leave resting on a constant in another file. */
+	if (t->shim->xdg_shell->version < XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION) {
+		return;
+	}
+	wlr_xdg_toplevel_set_wm_capabilities(t->toplevel, VITRIN_WM_CAPABILITIES);
+}
+
 static void toplevel_commit(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vitrin_toplevel *t = wl_container_of(listener, t, commit);
 	if (t->toplevel->base->initial_commit) {
+		announce_wm_capabilities(t);
 		configure_to_view(t);
 	}
 }
@@ -170,14 +240,10 @@ static void on_new_toplevel(struct wl_listener *listener, void *data) {
 	 * which is what makes view coordinates land on the right pixels for
 	 * every GTK/Qt app.
 	 *
-	 * NOT popups: `wlr_scene_xdg_surface_create` positions a popup xdg
-	 * surface but does not create scene nodes for popups a client makes
-	 * later -- that needs an `xdg_shell.events.new_popup` listener, which
-	 * this shim does not have yet (tinywl's `server_new_xdg_popup` is the
-	 * shape it will take). Until it does, a menu or tooltip is neither
-	 * rendered nor clickable. The input path is already ready for them:
-	 * seat.c routes by hit-testing this scene, so a popup becomes
-	 * addressable the moment it becomes visible, with no change there. */
+	 * This call covers exactly ONE xdg surface -- this one, plus its
+	 * subsurfaces. A popup the client creates later is a separate xdg
+	 * surface and needs its own node, hung under this one; `on_new_popup`
+	 * makes it and finds this tree through `base->data`, set below. */
 	t->tree = wlr_scene_xdg_surface_create(&s->scene->tree, toplevel->base);
 	if (t->tree == NULL) {
 		wlr_log(WLR_ERROR, "cannot add the toplevel to the scene");
@@ -185,6 +251,13 @@ static void on_new_toplevel(struct wl_listener *listener, void *data) {
 		return;
 	}
 	wlr_scene_node_set_enabled(&t->tree->node, false); /* enabled on map */
+	/* The scene tree, published on the xdg surface itself. tinywl's
+	 * convention, kept for one reason: a popup is handed its parent as a
+	 * bare `wlr_surface`, and the only route from there back to the node it
+	 * must hang under is a pointer the compositor left behind. Nested popups
+	 * (a submenu off a menu) resolve through the same field on the popup's
+	 * own xdg surface, which `on_new_popup` sets. */
+	toplevel->base->data = t->tree;
 
 	t->commit.notify = toplevel_commit;
 	wl_signal_add(&toplevel->base->surface->events.commit, &t->commit);
@@ -200,9 +273,93 @@ static void on_new_toplevel(struct wl_listener *listener, void *data) {
 	wl_signal_add(&toplevel->events.request_fullscreen, &t->request_fullscreen);
 }
 
+/* THE CONFIGURE A POPUP IS OWED, AND WHAT HAPPENS WITHOUT IT.
+ *
+ * `xdg_surface`'s initial-commit/configure/ack contract binds the ROLE object,
+ * not just toplevels: a popup that attaches a buffer having never been
+ * configured is killed with `xdg_surface` error 3 (`unconfigured_buffer`).
+ * wlroots does not send that configure on the compositor's behalf -- for
+ * popups it only rejects a parentless one (`handle_xdg_popup_client_commit`)
+ * -- so a compositor with no `new_popup` listener does not merely fail to
+ * render menus, it DISCONNECTS every app that opens one. Measured against
+ * this shim before this listener existed: `globals-error: seq=13 code=3
+ * message="xdg_surface has never been configured"`, and the client gone.
+ * `tests/xdg_conformance_client.c` FACT 3 is that measurement, kept.
+ *
+ * An empty configure is the right answer here for the same reason the
+ * toplevel's is a fixed one: version 1 has no window manager and the popup's
+ * own positioner already resolved its geometry against the parent. A
+ * compositor with a screen to keep popups on would instead reposition here. */
+static void popup_commit(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vitrin_popup *p = wl_container_of(listener, p, commit);
+	if (p->popup->base->initial_commit) {
+		wlr_xdg_surface_schedule_configure(p->popup->base);
+	}
+}
+
+static void popup_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vitrin_popup *p = wl_container_of(listener, p, destroy);
+	/* Same ownership split as the toplevel: the scene tree belongs to
+	 * wlr_scene_xdg_surface_create and dies with the xdg surface. */
+	wl_list_remove(&p->commit.link);
+	wl_list_remove(&p->destroy.link);
+	free(p);
+}
+
+static void on_new_popup(struct wl_listener *listener, void *data) {
+	/* No `wl_container_of` back to the shim, unlike `on_new_toplevel`: a
+	 * popup's geometry comes from its own positioner and its parent, never
+	 * from the realm view, and it is placed under the parent's scene node
+	 * rather than under the root. Nothing here needs shim state. */
+	(void)listener;
+	struct wlr_xdg_popup *popup = data;
+
+	struct vitrin_popup *p = calloc(1, sizeof(*p));
+	if (p == NULL) {
+		wlr_log(WLR_ERROR, "out of memory tracking a popup");
+		return;
+	}
+	p->popup = popup;
+
+	/* Under the parent's node, never under the scene root: a popup is
+	 * positioned relative to its parent, and `wlr_scene_xdg_surface_create`
+	 * implements exactly that for a popup xdg surface (it tracks
+	 * `popup->current.geometry` on every commit). Hanging it off the root
+	 * would place a menu at the view origin instead of at its anchor. */
+	struct wlr_xdg_surface *parent = popup->parent != NULL
+		? wlr_xdg_surface_try_from_wlr_surface(popup->parent) : NULL;
+	struct wlr_scene_tree *parent_tree = parent != NULL ? parent->data : NULL;
+	if (parent_tree != NULL) {
+		popup->base->data = wlr_scene_xdg_surface_create(parent_tree, popup->base);
+		if (popup->base->data == NULL) {
+			wlr_log(WLR_ERROR, "cannot add the popup to the scene");
+		}
+	} else {
+		/* Only reachable if the parent is a surface this shim never put in
+		 * the scene -- there is no such role in the v0 global set (no
+		 * layer-shell), so this is a "cannot happen" that MUST NOT be an
+		 * assert: tinywl asserts here, and an assert in a shim takes the
+		 * realm down over a client's malformed request. The popup is
+		 * configured anyway, one line below, so the app keeps running with
+		 * an invisible menu rather than being disconnected. */
+		wlr_log(WLR_ERROR, "popup with no parent scene node; not rendered");
+	}
+
+	/* Wired even when the scene node is missing: the configure is what keeps
+	 * the client alive, and it is owed regardless of what gets rendered. */
+	p->commit.notify = popup_commit;
+	wl_signal_add(&popup->base->surface->events.commit, &p->commit);
+	p->destroy.notify = popup_destroy;
+	wl_signal_add(&popup->events.destroy, &p->destroy);
+}
+
 bool vitrin_setup_xdg(struct vitrin_shim *s) {
 	s->new_toplevel.notify = on_new_toplevel;
 	wl_signal_add(&s->xdg_shell->events.new_toplevel, &s->new_toplevel);
+	s->new_popup.notify = on_new_popup;
+	wl_signal_add(&s->xdg_shell->events.new_popup, &s->new_popup);
 	s->xdg_wired = true;
 	return true;
 }

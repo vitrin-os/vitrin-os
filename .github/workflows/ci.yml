@@ -771,7 +771,13 @@ jobs:
           # gtk-entry-probe. The trusted-band property gate
           # (test_real_trust_band.py, issue #139) adds NO new CI wiring at all:
           # it reuses that same click-target and rides the consent-injector
-          # feature the warm build already passes. The Firefox rung (test_real_firefox.py)
+          # feature the warm build already passes. The M1.5 gate
+          # (test_demo.py, #110) is the same story with a fourth sibling:
+          # its app is `form-target`, built unconditionally by the shim build
+          # above -- no toolkit dependency, unlike gtk-entry-probe -- and
+          # resolved as a VITRIN_C_SHIM_BIN sibling. Unlike weston-terminal it
+          # is NOT a distro package, so a missing one is a build error and the
+          # gate fails rather than skipping. The Firefox rung (test_real_firefox.py)
           # does NOT run here -- the pinned ESR is a 75 MB download this step
           # does not fetch -- so it is skipped for this suite and held by its
           # own dedicated step below, which fetches Firefox first. Without this

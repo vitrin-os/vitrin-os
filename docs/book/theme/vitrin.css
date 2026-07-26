@@ -1,0 +1,60 @@
+/* Vitrin OS book theme: pull mdBook's navy toward the brand accent.
+   The accent is #4D9DE0 -- the colour the trusted core paints its own
+   consent card with (crates/vitrin-core/src/consent/render.rs). */
+
+:root {
+  --vitrin-accent: #4d9de0;
+  --vitrin-accent-dim: #3a7cb5;
+  --vitrin-ink: #0c1116;
+}
+
+.navy,
+.coal,
+.ayu {
+  --links: var(--vitrin-accent);
+  --sidebar-active: var(--vitrin-accent);
+  --searchbar-border-color: var(--vitrin-accent-dim);
+}
+
+.light,
+.rust {
+  --links: var(--vitrin-accent-dim);
+  --sidebar-active: var(--vitrin-accent-dim);
+}
+
+.navy {
+  --bg: var(--vitrin-ink);
+  --sidebar-bg: #10171d;
+}
+
+/* Tables carry a lot of this book's meaning -- give them room to breathe
+   and let wide ones scroll rather than pushing the page sideways. */
+.content table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  border-collapse: collapse;
+}
+
+.content table th {
+  text-align: left;
+  font-weight: 600;
+}
+
+.content table td,
+.content table th {
+  padding: 0.42em 0.75em;
+}
+
+/* Blockquotes are used for the load-bearing warnings, not for asides. */
+.content blockquote {
+  border-inline-start: 3px solid var(--vitrin-accent);
+  background: color-mix(in srgb, var(--vitrin-accent) 8%, transparent);
+  padding: 0.6em 1em;
+  margin-inline: 0;
+}
+
+/* ASCII diagrams must not wrap -- they are load-bearing. */
+.content pre > code {
+  white-space: pre;
+}

@@ -315,28 +315,85 @@ block a grant-time hot path on a remote service. Validate at handshake, cache
 the canonical identity for the connection's life, and keep the authorization
 server off the actuation path entirely.
 
-### 7.6 Open questions this raises
+### 7.6 Expiry refreshes; revocation kills — DECIDED
 
-1. **Does token expiry kill a live connection?** An agent may hold a connection
-   for longer than its access token's lifetime. Options: the connection dies at
-   expiry (safe, disruptive); the connection survives on the already-verified
-   identity but may not petition again (probably right, since grants carry
-   their own expiry); or re-presentation is allowed mid-connection (a new
-   message, so a protocol edit). **Undecided, and it must be decided before a
-   verifier ships.**
-2. **What is the scope vocabulary?** `vitrin:observe` / `vitrin:actuate` is the
+The lifecycle question is settled, and the two halves are deliberately
+asymmetric:
+
+| Event | Meaning | Effect |
+|---|---|---|
+| **Access token expires** | routine; the agent is still trusted | **refresh.** The connection survives. |
+| **Token is revoked** | the agent is no longer trusted | **kill the connection.** |
+
+**Expiry → refresh.** Expiry is bookkeeping, not a judgement, and tearing down a
+working session because a clock advanced would make grant lifetime a hostage to
+token lifetime — exactly the conflation §7.2 warns against. The agent's runtime
+refreshes in the ordinary OAuth way and the connection continues.
+
+This is the one part that **does need a wire edit**: the core must be able to
+accept a re-presented credential mid-connection. It arrives as a since-gated
+sibling request, which the IDL already anticipates for credentials ("credentials
+larger than one frame arrive via an fd-borne sibling request in a future
+version"). Being a new message, it regenerates bindings — unlike the rest of §7.
+
+Two rules for that path:
+
+- **The identity must not change across a refresh.** A refreshed token is the
+  same principal with a later expiry. If the verifier canonicalizes a *different*
+  identity, that is not a refresh — it is a different agent, and it must be
+  refused rather than silently adopted. This is the obvious attack.
+- **Failure to refresh is not revocation.** If the token lapses with no valid
+  refresh, the connection may no longer *petition*, but grants a human already
+  approved run to their own expiry. Otherwise an authorization server's latency
+  becomes a revocation, which §7.3(3) forbids.
+
+**Revocation → kill.** Revocation *is* a judgement: this agent should not be
+acting. So the connection dies, and — because grants are sender-constrained and
+`PrincipalServer::teardown` already sweeps them when a connection closes — its
+authority goes with it. That composition is free; no new revocation path is
+needed inside the core.
+
+The fatal code is the existing **`auth_failed`**, which already means "credential
+rejected". Reusing it avoids appending an enum value and regenerating for a case
+the taxonomy already covers. One cost, stated: `auth_failed` is deliberately
+uniform on the wire for identity-probing resistance, so an agent cannot tell
+"revoked" from "expired and unrefreshed". At handshake that uniformity is the
+point; mid-connection there is nothing left to probe, so a distinct code is
+defensible if agent-side diagnostics later justify the enum append.
+
+**How the core learns about revocation is the real open question.** OAuth has no
+universal revocation push. Three options, and they compose:
+
+1. **Short token lifetimes plus refresh** — revocation takes effect within one
+   lifetime, with no extra machinery. The pragmatic floor, and it comes free with
+   the decision above.
+2. **Introspection at refresh** (RFC 7662) — the refresh is already a natural
+   checkpoint, so validating there costs nothing extra and is off the hot path.
+3. **A revocation signal** — OpenID Shared Signals / CAEP defines exactly a
+   "token revoked" event. The standards-correct answer for *immediate* kill, and
+   the only one that closes the window in option 1.
+
+**The honest weakness:** with 1 and 2 alone, revocation is *fail-open* for up to
+one token lifetime, and an unreachable authorization server extends that window.
+That is the deliberate price of §7.3(3) — the dead-man switch must work with the
+authorization server down — and short lifetimes are the mitigation. A human
+holding Escape does not wait for anybody's network.
+
+### 7.7 Open questions this raises
+
+1. **What is the scope vocabulary?** `vitrin:observe` / `vitrin:actuate` is the
    obvious start, but scopes could also bound realms or resources
    (`vitrin:observe:realm-0`), which begins to overlap the `resource` selector
    and #161's `region:` prefix. Two ways to express the same narrowing is a
    design smell; decide which layer owns it.
-3. **Who mints an agent's token, and does the *model* have an identity distinct
+2. **Who mints an agent's token, and does the *model* have an identity distinct
    from the *runtime*?** A token proves which process is connecting. It does not
    prove which model, prompt, or operator is behind it. Vitrin should be honest
    that it authenticates a **workload**, not an intelligence.
-4. **What happens when the authorization server is down?** Fail closed for new
+3. **What happens when the authorization server is down?** Fail closed for new
    handshakes is right. Existing connections and live grants must be unaffected
    — otherwise an outage becomes a revocation, and worse, a dependency of the
-   dead-man switch.
+   dead-man switch. See §7.6 for the revocation-window cost this accepts.
 
 An operational note worth recording because it has already bitten this author
 elsewhere: adding `iss` enforcement or a `jti` denylist to a running

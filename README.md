@@ -102,7 +102,7 @@ are labelled as what they are.
 | **M1.2** — buffer path | [#105](https://github.com/vitrin-os/vitrin-os/issues/105) | `tests/integration/test_real_app.py` — real core + real shim + real `weston-terminal` |
 | **M1.3** — observation | [#107](https://github.com/vitrin-os/vitrin-os/issues/107) | `test_real_capture_fidelity.py` — an agent observes a real app through the enforcement chokepoint |
 | **M1.4** — actuation, consent, dead-man | [#108](https://github.com/vitrin-os/vitrin-os/issues/108) + [#109](https://github.com/vitrin-os/vitrin-os/issues/109) + [#138](https://github.com/vitrin-os/vitrin-os/issues/138) | `test_real_actuation.py`, `test_real_deadman.py`, `test_real_consent.py` |
-| **M1.5** — demo | [#110](https://github.com/vitrin-os/vitrin-os/issues/110) | `test_demo.py` — the demo agent against a real app, asserting the typed text actually landed |
+| **M1.5** — demo | [#110](https://github.com/vitrin-os/vitrin-os/issues/110) | `test_demo.py` — the demo agent is handed a task record it did not author, fills it into a real app and submits it, and the gate demands the confirmation carry *that record's* 36-bit checksum (a positive content check, not a pixel diff) plus the app's own byte-exact report. The app, `form-target`, is repo-authored — a real Wayland client, no mock, but less independent than the `weston-terminal` it replaced; disclosed in [`examples/agent-demo/README.md`](examples/agent-demo/README.md) and the D12 seam table |
 
 What exists today, on `main`:
 
@@ -220,12 +220,18 @@ cargo build --workspace
 meson setup shim/build shim && meson compile -C shim/build
 
 # Run the Phase-1 demo agent headless: boots vitrind --headless, which
-# execs the real shim, which fork/execs a real weston-terminal in its own
-# confined Wayland socket, and drives examples/agent-demo/run_demo.py over
-# a real Unix socket -- connect, request a grant, settle, capture, click,
-# type, capture again, and assert the typed text landed. Exits non-zero on
-# any failure.
+# execs the real shim, which fork/execs a real Wayland client (form-target,
+# co-built with the shim) in its own confined Wayland socket, and drives
+# examples/agent-demo/run_demo.py over a real Unix socket. The agent is
+# handed a task record it did not author, locates each form field by its
+# marker colour in its own captured frame, clicks, types the value, clicks
+# the located submit button, and then decodes the confirmation's three
+# receipt bands -- a 36-bit checksum of the record the app received,
+# computed from the SUPPLIED task at runtime. Exits non-zero on any failure.
 cargo xtask demo --headless
+
+# ... or with a record the agent has never seen:
+cargo xtask demo --headless --task name=Grace --task email=grace@example.net
 ```
 
 Expect output ending in `xtask demo: PASS` and a path to the run's flight

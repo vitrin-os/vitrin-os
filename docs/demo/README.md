@@ -42,9 +42,10 @@ separately choreographed demo:
    card over the Firefox window. A human clicks **Allow** — show the card
    occluding real Firefox pixels underneath, proving it is a compositor
    overlay, not an application dialog.
-4. **Capture → act → capture.** The agent captures a before-frame, locates
-   the URL bar by pixels, clicks it, types a URL, presses Enter, and
-   captures an after-frame. Zoom or pause on the actuation actually landing
+4. **Navigate.** The agent locates the URL bar by pinned geometry (version 1
+   has no semantic tree; `VITRIN_DEMO_URL_BAR=x,y` overrides it), clicks it,
+   types the local form URL, presses Enter, and waits for the served
+   two-field form to appear. Zoom or pause on the actuation actually landing
    in the real Firefox chrome: the **agent's own cursor** — the crosshair
    the core composites at the agent's pointer position (D-019), not your
    desktop's mouse pointer — travels to the URL bar, then text appears
@@ -52,14 +53,32 @@ separately choreographed demo:
    technique, D7. The crosshair is **nested-only**: `vitrind --nested`
    always composites it, a headless run only with `--agent-cursor`, and it
    is drawn into human-visible output alone — the agent's own captured
-   frames never contain it, which is why the before/after frames show the
-   page and no cursor.
-5. **Hold-Esc revocation (bonus rung, if time allows).** Mid-actuation,
+   frames never contain it, which is why the captured frames show the page
+   and no cursor.
+5. **Do the thing.** This is the beat the demo exists for. The agent was
+   handed a **task record it did not author** (`--task K=V`, order-preserving)
+   and now fills it: for each field it locates that field by its **marker
+   colour in its own captured frame**, clicks its centre, types the value,
+   and confirms ink landed inside that field's rectangle. Then it locates and
+   clicks the **yellow submit button** — submission is a click, never an
+   Enter key, so this frame is a pointer-actuation proof too.
+6. **The receipt.** The page repaints as three full-width coloured bands, and
+   the agent decodes them and compares them against bands computed from the
+   supplied task **at runtime**. Caption this honestly: the bands are a 36-bit
+   **checksum** of the record the page received, *not* the agent reading its
+   own text back — see
+   [`examples/agent-demo/README.md`](../../examples/agent-demo/README.md) for
+   the normative encoding. And nothing here is a language model: the agent is
+   deterministic and locates by colour.
+7. **Hold-Esc revocation (bonus rung, if time allows).** Mid-actuation,
    physically hold Esc for one second; show the agent's next `observe()`/
    actuation failing `revoked` in the terminal log, and the recorder's
    flight log confirming it — the dead-man switch from issue #109.
-6. **Wrap.** Show `xtask demo: PASS` (or the interactive equivalent) and the
-   flight-recorder path in the terminal.
+8. **Wrap.** Show the flight-recorder path in the terminal. Note that step 7
+   and `xtask demo: PASS` are mutually exclusive in a single take: a chord
+   fired mid-run revokes the grant, so the demo's next call fails and the
+   command exits non-zero. [`RECORDING.md`](RECORDING.md) sets out the two
+   honest options (one take ending in revocation, or two labelled clips).
 
 Target length: 60–120 seconds. No narration is required — captions or a
 short written walkthrough alongside the video are enough; the point is

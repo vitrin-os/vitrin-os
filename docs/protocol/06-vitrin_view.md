@@ -10,6 +10,18 @@ Capture is a **poll model**: one `capture_frame` request yields exactly one fram
 
 Observation is **concurrent by design**: capture never contends with physical human input or with a pending consent prompt, so the refusal codes `preempted` and `consent_held` are actuation-only and never refuse a capture. The consent overlay is composited into human-visible output only, so a frame captured while a prompt is up simply does not contain it (see [`vitrin_consent`](05-vitrin_consent.md)) — captures keep flowing while a prompt is pending.
 
+### What a capture does not contain
+
+**A captured frame contains no cursor except the human principal's, and that one only for a grant whose effective verb set holds [`observe_cursor`](04-vitrin_grant.md#verb).** Otherwise a capture carries realm content alone; every core-composited cursor — like the consent overlay and the trust indicator — is drawn into human-visible output only. The two halves of the rule are deliberately unequal, and the asymmetry is the decision: agent→agent is closed outright and purchasable at no verb set, ever, while agent→human is closed by default and opens only through a verb the human sees on a consent prompt and can revoke with the grant. A per-grant verb is the only "toggle" that exists; there is deliberately no per-pair one.
+
+| viewer → subject | version 1 | why |
+|---|---|---|
+| agent A → agent B's cursor | **never**, not purchasable by any verb | reveals what another principal is doing — a cross-principal side channel |
+| agent → the human's cursor | off by default; purchasable as the distinct verb `observe_cursor`, which version 1 refuses `unsupported` | reading the human's cursor is surveillance of *attention*: an agent can time its actions to it. Closer to `observe` than to a display preference, hence a verb (D-017). It is meaningful only alongside `observe`; naming it alone resolves `unsupported` |
+| human → agent cursors | on, per-agent toggle | observability is the point, but thirty simultaneous cursors are unreadable. This is a shell/core concern; the human has **no wire presence** in version 0, so it is not agent-expressible |
+
+Version 1 composites **no cursor at all**: in nested operation the host desktop draws the human's cursor outside the realm view entirely, and the core draws none of its own. The rule above is therefore satisfied by construction today and binds the compositor when cursors arrive. See [`vitrin_actuator_pointer`](07-vitrin_actuator_pointer.md) for the cursor model itself (one virtual pointer per principal, core-composited, cursorless by construction).
+
 In the object graph, `vitrin_view` is one of the three authority *facets* co-minted by [`vitrin_realm.request_grant`](03-vitrin_realm.md) alongside the [`vitrin_grant`](04-vitrin_grant.md) handle and its consent observer. The facet is the observation-shaped surface of a single grant-table row; the grant is its authority. `vitrin_view` holds no authority of its own — every capture is checked at the grant's single enforcement chokepoint (grant alive, `observe` in the effective verb set, rate bucket not empty, realm has a surface), and every refusal is voiced not here but on [`vitrin_grant.refused`](04-vitrin_grant.md). The design idea is attenuation by construction: because the facet is minted only by the petition that also minted its grant, an agent can never name — and so never capture through — a view it was not granted.
 
 ## Lifecycle
@@ -206,5 +218,6 @@ Every version-2+ addition below is purely additive: version-1 clients see no sig
 - **Wider formats.** Because [`format`](#format) mirrors the DRM fourcc namespace, new pixel formats append as new enum entries (values immutable) without touching the message.
 - **Streaming capture.** Deliberately deferred (decision D6). If a later version adds it, it arrives as `since`-gated sibling messages (a subscription request and its frame-push event appended after the poll pair); `capture_frame`/`frame_ready` stay valid forever, refusals still voice through [`vitrin_grant.refused`](04-vitrin_grant.md), and each pushed frame would still carry one fd (the one-fd rule holds).
 - **Geometry and multi-view realms.** Version 1's "one view is the whole realm" is a deliberate floor; multi-surface and multi-view realms add their enumeration and geometry surface to [`vitrin_realm`](03-vitrin_realm.md) and its addressing objects, not by re-plumbing `vitrin_view`.
+- **Cursor-bearing captures.** Serving the [`observe_cursor`](04-vitrin_grant.md) verb widens what this *same* `frame_ready` composites for a grant that holds it — the human's cursor appears in the frame. No new message and no changed signature: the verb bit already exists, and version 1 refuses it `unsupported` (D-017). Another *agent* principal's cursor stays out of the frame at every version; that one is not purchasable, which is why the rule above is stated as an asymmetry rather than as a blanket exclusion.
 
 See [conventions § versioning](00-conventions.md) for the append-only growth rules and the additive-safety table naming every reserved seam.

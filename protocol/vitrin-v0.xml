@@ -142,11 +142,15 @@
     bitfield="true" enum argument is checked as a bitmask: any bit set
     outside the union of defined entry values is out-of-range and fatal
     "invalid_argument", while any combination of defined bits is legal.
-    Thus request_grant's verbs accepts observe|actuate_pointer|actuate_text
-    (value 7) but a bit reserved for a future verb (for example value 8) is
-    fatal. This is distinct from a policy refusal: outcome "unsupported"
-    concerns a well-formed, in-range request the deployment declines to
-    serve, never an out-of-range wire value.
+    Thus request_grant's verbs accepts any combination of the six defined
+    verb bits (value 63) but a bit reserved for a future verb (for example
+    value 64) is fatal. This is distinct from a policy refusal: outcome
+    "unsupported" concerns a well-formed, in-range request the deployment
+    declines to serve - including a defined verb bit this deployment does
+    not serve - never an out-of-range wire value. Defining a verb bit
+    before the core serves it is therefore not cosmetic: it converts a
+    petition for that authority from a connection-killing fatal error into
+    a recoverable answer.
 
     ENUM REFERENCES. An enum attribute names the enum a scalar argument
     draws from. A bare name (for example "origin") refers to an enum
@@ -174,6 +178,33 @@
     was registered and its consent initiated; it does NOT wait for that
     petition to resolve. A blocking client therefore reads resolved on its
     own schedule without deadlocking against an unrelated pending prompt.
+
+    SCENE AUTHORITY. Two kinds of authority over the shared scene are kept
+    distinct, and only one of them is purchasable. ARRANGEMENT - which
+    realm view sits where, at what size, and which one holds keyboard
+    focus - is grant-governed, named by the layout_arrange and layout_focus
+    verbs, so the unprivileged shell that eventually arranges realms does
+    so with attenuable, revocable, journaled authority rather than
+    ambiently, and no window-management policy has to enter the core.
+    ORDERING is purchasable by no grant, at any verb set, ever: the consent
+    surface and the trust indicator composite above every principal's
+    content; the core's own hit test, never a client's claimed stacking,
+    decides which surface an input event reaches; no arrangement can
+    occlude, fullscreen over, or resize away the consent surface; and no
+    AGENT principal's cursor is ever composited into another principal's
+    captured frame - the one cursor a capture may ever contain is the
+    human principal's, and only for a grant that holds observe_cursor,
+    which is the single carve-out and is itself grant-governed rather
+    than free. CURSORS are core-composited for the reason the consent
+    surface is: a realm that supplied its own pointer bitmap could paint a
+    decoy and mislead the human about where input is going. Version 1
+    serves neither layout verb and composites no cursor of its own - it has
+    no window manager, and in nested operation the host desktop draws the
+    human's cursor outside the realm view entirely - and refuses
+    layout_arrange, layout_focus and observe_cursor "unsupported"; the
+    verbs exist on the wire before the core serves them so that the model
+    is expressible at version 1 and a petition for it is an answer rather
+    than a connection death.
   </description>
 
   <interface name="vitrin_handshake" version="1">
@@ -419,9 +450,15 @@
         ceiling - never unlimited. persistence is the requested rung; the
         durable rungs (until_revoked, always) exist in the enum from day
         one but resolve "unsupported" in version 1, pending provenance
-        verification in a later phase. Clients MUST send flags 0 in
-        version 1; bit 0 is reserved for the one_shot constraint. flags
-        references no enum and is deliberately not wire-validated, so a set
+        verification in a later phase. verbs obeys the same rule: the bits
+        version 1 does not serve (observe_cursor, layout_arrange,
+        layout_focus) are in-range, so naming one is never fatal, and such
+        a petition resolves "unsupported" WHOLE - the server never quietly
+        drops an unserved bit and grants the remainder, because an agent
+        must never believe it holds authority nothing enforces. Clients
+        MUST send flags 0 in version 1; bit 0 is reserved for the one_shot
+        constraint. flags references no enum and is deliberately not
+        wire-validated, so a set
         reserved bit is not a protocol error: it resolves "unsupported" -
         honest refusal rather than accepted-and-unenforced. Future boolean
         constraints are flags bits;
@@ -475,9 +512,11 @@
       tombstone rule that clients discard events to released ids), an
       asynchronous revoked push event (resolved still fires exactly once,
       ever; refused remains the enforcement-bearing signal), attenuation
-      (minting narrower child grants), restore tokens, and an
+      (minting narrower child grants), restore tokens, an
       epoch-staleness refusal sibling carrying the current epoch for
-      compare-and-swap actuation.
+      compare-and-swap actuation, and a layout facet mint for the
+      layout_arrange and layout_focus verbs (a structural mint here,
+      because request_grant's five new_id arguments are frozen).
     </description>
 
     <event name="resolved">
@@ -520,13 +559,54 @@
     <enum name="verb" bitfield="true">
       <description summary="grantable verbs">
         The verb bitfield. Later phases append entries (key actuation,
-        credential presentation, subtree reads) without touching version-1
-        bits. The SDK-level dotted names (observe, actuate.pointer,
-        actuate.text) are these bits.
+        credential presentation, subtree reads) without touching existing
+        bits, whose values are immutable. Every entry has one SDK-level
+        dotted name, formed by replacing the first underscore of the wire
+        name with a dot: observe, actuate.pointer, actuate.text,
+        observe.cursor, layout.arrange, layout.focus. The spelling is
+        fixed here so a second implementation transcribing this enum has
+        no name to invent.
+
+        DEFINED BUT UNSERVED. observe_cursor, layout_arrange and
+        layout_focus are defined from day one and refused "unsupported" by
+        version 1, exactly as the durable persistence rungs are. Two
+        reasons, both structural rather than cosmetic. First, an
+        out-of-range bit is fatal "invalid_argument" and kills the
+        connection, so a client petitioning for authority a deployment
+        does not serve would die instead of being answered; a defined bit
+        makes that refusal recoverable. Second, the model these bits name
+        - cursor visibility as authority rather than display preference,
+        arrangement as a grant rather than the shell's ambient property -
+        is decided now and would otherwise be unstateable on the wire
+        until a version bump. A deployment MUST NOT grant a verb it does
+        not enforce, and a petition mixing served and unserved verbs is
+        refused whole: narrowing a verb set is the human's move at consent
+        time, never a silent server-side edit that would leave the agent
+        believing it holds authority nobody checks.
+
+        Not every verb has a facet interface. observe_cursor has none by
+        construction - it widens what capture_frame composites rather than
+        adding a request - and the layout verbs' facet arrives as a
+        since-gated mint on vitrin_grant, because request_grant's five
+        new_id arguments are frozen forever.
+
+        COMPOSITION. observe_cursor is meaningful only alongside observe.
+        It widens what a capture contains, so a petition naming it
+        without observe names no capture to widen; such a petition
+        resolves "unsupported" rather than granting a bit that changes
+        nothing, by the same rule that forbids granting a verb the
+        deployment does not enforce. It is not an independent authority
+        and is never inert-but-held. No other verb pair carries a
+        dependency: observe, actuate_pointer, actuate_text,
+        layout_arrange and layout_focus are each independently
+        petitionable.
       </description>
       <entry name="observe" value="1" summary="capture frames of the granted resource"/>
       <entry name="actuate_pointer" value="2" summary="inject pointer motion, buttons, and scroll"/>
       <entry name="actuate_text" value="4" summary="inject Unicode text"/>
+      <entry name="observe_cursor" value="8" summary="capture frames that include the human principal's cursor - reading the human's attention, hence a verb and not a display preference; meaningful only alongside observe, and a petition naming it without observe resolves unsupported; another agent principal's cursor is not purchasable by this or any verb; refused unsupported in version 1"/>
+      <entry name="layout_arrange" value="16" summary="place, resize, raise, and fullscreen the granted realm's views, subject to the ordering invariants no grant can purchase; refused unsupported in version 1"/>
+      <entry name="layout_focus" value="32" summary="direct keyboard focus to a view of the granted realm; separate from layout_arrange because focus theft is the sharpest attack and the most legitimate need, so it must be attenuable alone; refused unsupported in version 1"/>
     </enum>
 
     <enum name="persistence">
@@ -631,7 +711,29 @@
       refusal codes preempted and consent_held are actuation-only and
       never refuse a capture - and the consent overlay is composited into
       human-visible output only, so a frame captured while a prompt is up
-      simply does not contain it. Streaming capture is a deliberate
+      simply does not contain it.
+
+      A captured frame contains no cursor except the human principal's,
+      and that one only for a grant whose effective verb set holds
+      observe_cursor. Otherwise a capture carries realm content alone;
+      every core-composited cursor, like the consent overlay and the
+      trust indicator, is drawn into human-visible output only. The two
+      halves of that rule are deliberately unequal, and the asymmetry is
+      the decision. AGENT-TO-AGENT is closed outright and is purchasable
+      at no verb set, ever: an observer can never watch what another
+      agent principal is pointing at. AGENT-TO-HUMAN is closed by default
+      and opens only through observe_cursor, because reading the human's
+      attention - and timing actions to it - is authority rather than a
+      display preference, so it is bought at the grant, on a prompt the
+      human sees, and is revocable with the grant. A per-grant verb is
+      therefore the only "toggle" that exists, and there is deliberately
+      no per-pair one. Version 1 refuses observe_cursor "unsupported", so
+      no capture contains any cursor today; version 1 also composites no
+      cursor at all - in nested operation the host desktop draws the
+      human's cursor outside the realm view entirely - so the rule is
+      currently satisfied by construction and binds the compositor when
+      cursors arrive.
+      Streaming capture is a deliberate
       deferral, not an omission: if a later version adds it, it arrives
       as since-gated sibling messages beside this poll pair, which stays
       valid forever.
@@ -787,6 +889,38 @@
       release, sync. Later versions add intent-level motion (drag with
       duration and easing, interpolated server-side) as sibling requests;
       these primitives stay valid forever.
+
+      CURSOR MODEL. Each principal has exactly one virtual pointer per
+      realm it holds pointer authority over, and this facet is that
+      pointer's only name on the wire - move moves THIS principal's
+      pointer, never a shared one, which is why per-principal cursors need
+      no new agent-facing vocabulary. A principal is cursorless by
+      construction rather than by declaration: an agent that never
+      petitions for actuate_pointer has no pointer, the headless-fleet
+      case costs nothing, and there is deliberately no request by which a
+      principal declares, disowns, or hides a cursor. The absence of a
+      hide request is a decision, not an omission: a visually distinct
+      agent cursor is a human override, so cursor visibility is never the
+      actuating principal's own choice.
+
+      Cursors are core-composited. A realm may never supply the pointer
+      bitmap - vitrin_shim_surface has no cursor-surface role and will not
+      gain one - because a realm that drew its own could paint a decoy and
+      mislead the human about where input is going, which is the spoofing
+      class the consent surface exists to exclude. A pointer image an app
+      paints is ordinary content inside its realm view, never the pointer
+      the core composites.
+
+      Version-1 limitation, stated rather than implied: the core delivers
+      ONE shared pointer position per realm view to the shim
+      (vitrin_shim_seat events carry origin, not principal identity) and
+      composites no cursor of its own. The consent grab's defensive rule -
+      emulated motion must not relocate the position the human's hit test
+      reads - exists only because that position is shared, and
+      per-principal delivery deletes it. That correction arrives as
+      since-gated sibling events on vitrin_shim_seat; nothing on this
+      interface changes when it does, because this side of the wire is
+      already principal-relative.
     </description>
 
     <request name="move">
@@ -1047,6 +1181,16 @@
       shim-side (a single-surface realm: pointer enter on first motion,
       keyboard focus held on the app); an explicit tagged focus event is
       the multi-surface addition of a later version.
+
+      Version 1 delivers ONE shared pointer position per realm view: these
+      events carry origin, not principal identity, so a realm's app sees a
+      single pointer whoever moved it. That is the version-1 half of the
+      per-principal cursor model (see vitrin_actuator_pointer), and the
+      reason the core needs a defensive rule keeping emulated motion from
+      relocating the position a consent grab hit-tests. Per-principal
+      delivery arrives as since-gated sibling events that also name the
+      principal, each still ending with origin so the B2 rule holds; these
+      five events stay valid forever.
     </description>
 
     <event name="motion">

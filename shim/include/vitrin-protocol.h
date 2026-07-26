@@ -409,9 +409,15 @@ typedef uint32_t vitrin_grant_verb_t;
 #define VITRIN_GRANT_VERB_ACTUATE_POINTER ((vitrin_grant_verb_t)2)
 /* inject Unicode text */
 #define VITRIN_GRANT_VERB_ACTUATE_TEXT ((vitrin_grant_verb_t)4)
+/* capture frames that include the human principal's cursor - reading the human's attention, hence a verb and not a display preference; meaningful only alongside observe, and a petition naming it without observe resolves unsupported; another agent principal's cursor is not purchasable by this or any verb; refused unsupported in version 1 */
+#define VITRIN_GRANT_VERB_OBSERVE_CURSOR ((vitrin_grant_verb_t)8)
+/* place, resize, raise, and fullscreen the granted realm's views, subject to the ordering invariants no grant can purchase; refused unsupported in version 1 */
+#define VITRIN_GRANT_VERB_LAYOUT_ARRANGE ((vitrin_grant_verb_t)16)
+/* direct keyboard focus to a view of the granted realm; separate from layout_arrange because focus theft is the sharpest attack and the most legitimate need, so it must be attenuable alone; refused unsupported in version 1 */
+#define VITRIN_GRANT_VERB_LAYOUT_FOCUS ((vitrin_grant_verb_t)32)
 /* Union of every defined entry's bits; a wire value with any other bit
    set is invalid. */
-#define VITRIN_GRANT_VERB_VALID_MASK ((vitrin_grant_verb_t)(1 | 2 | 4))
+#define VITRIN_GRANT_VERB_VALID_MASK ((vitrin_grant_verb_t)(1 | 2 | 4 | 8 | 16 | 32))
 
 /* Bitmask validity check for `vitrin_grant_verb_t`: rejects any bit outside
    VITRIN_GRANT_VERB_VALID_MASK. */

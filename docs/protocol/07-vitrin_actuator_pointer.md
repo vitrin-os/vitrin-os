@@ -14,6 +14,26 @@ The design idea is coordinate honesty. All coordinates are **realm-view pixels**
 
 The facet is deliberately primitive. It offers `move`, `button`, and `scroll` and nothing else; a client-level click is composed as `move` → `button` press → `button` release → [`sync`](01-vitrin_handshake.md). Intent-level motion (a drag with duration and easing, interpolated server-side) is a later addition that arrives as sibling requests, leaving these primitives valid forever.
 
+## The cursor model
+
+PRD §5.1's P1 promises each principal "its own cursor (or cursorless)". This interface is where that lands on the wire. Decision **D-017** settles it; the summary below is normative prose restating the IDL.
+
+**Identity: the facet is the cursor's name.** Each principal has exactly one virtual pointer per realm it holds pointer authority over, and `vitrin_actuator_pointer` is that pointer's only name on the wire. `move` moves *this principal's* pointer, never a shared one. This is why per-principal cursors need no new agent-facing vocabulary: the agent-facing half of the wire is already principal-relative, and object ids are per-connection and sender-constrained, so a principal structurally cannot address another's pointer.
+
+**Cursorless is by construction, not by declaration.** A principal that never petitions for `actuate_pointer` has no pointer. The headless-fleet case — an agent that only observes — costs nothing and needs no wire message. There is deliberately **no request** by which a principal declares, disowns, or hides a cursor, and the absence of a *hide* request is itself a decision: a visually distinct agent cursor is a **human override** (PRD P10), so cursor visibility is never the actuating principal's own choice.
+
+**Cursors are core-composited.** A realm may never supply the pointer bitmap: [`vitrin_shim_surface`](10-vitrin_shim_surface.md) has no cursor-surface role and will not gain one. A realm that drew its own could paint a **decoy cursor** and mislead the human about where input is going — the same spoofing class the consent surface exists to exclude. A pointer image an app paints is ordinary content inside its realm view, never the pointer the core composites.
+
+**Who may see whose** is a relation, not a flag, and it is settled on the observation side — asymmetrically, on purpose. A captured frame contains no cursor except the human's, and that one only for a grant holding the distinct `observe_cursor` verb (meaningful only alongside `observe`, and refused `unsupported` in version 1). Seeing another *agent's* cursor is not purchasable by any verb, at any verb set, ever. See [`vitrin_view`](06-vitrin_view.md#what-a-capture-does-not-contain) for the table.
+
+### Version-1 limitation, stated rather than implied
+
+Version 1 delivers **one shared pointer position** per realm view to the shim: [`vitrin_shim_seat`](11-vitrin_shim_seat.md) events carry `origin`, not principal identity, so a realm's app sees a single pointer whoever moved it. The core also composites **no cursor of its own** — in nested operation the host desktop draws the human's cursor, outside the realm view entirely.
+
+That shared position is why the core needs a defensive rule in its consent grab: emulated motion must not relocate the position the human's hit test reads, or an agent holding a pointer grant could slide the hit target under the human's finger and turn a click aimed at *Deny* into an *Allow*. **Per-principal delivery deletes that special case rather than complicating it** — the human's hit test follows the human's pointer because they are structurally distinct. It also clarifies preemption: with one pointer, "physical input preempts agent input" is a contention rule; with N+1 pointers there is nothing to contend for on the pointer axis, and preemption is purely about focus and actuation ordering.
+
+Per-principal delivery is **deferred to M2** (spec 1.0-candidate) and arrives as `since`-gated sibling events on `vitrin_shim_seat` that also name the principal. Nothing on *this* interface changes when it does.
+
 ## Lifecycle
 
 Instances of `vitrin_actuator_pointer` come into existence in exactly one way: as one of the five `new_id` arguments of [`vitrin_realm.request_grant`](03-vitrin_realm.md). There is no factory request on this interface and no other path to one. The `new_id` obeys the multi-`new_id` rule (distinct, strictly increasing in argument order, above the connection watermark; see [00-conventions.md](00-conventions.md)).
@@ -143,3 +163,4 @@ Named version-2+ seams, each purely additive (a new message or enum entry, never
 - **Intent-level motion.** A `drag(x0, y0, x1, y1, duration_ms, easing)` family arrives as `since="2"` sibling requests on this interface, interpolated server-side. The version-1 `move`/`button`/`scroll` primitives remain valid forever; intent motion is layered above them, not a replacement.
 - **Epoch-guarded siblings.** The stale-target problem that version 1 answers by clamping is answered precisely in a later phase by an epoch/compare-and-swap mechanism: epoch-carrying sibling requests here, paired with the `since="2"` epoch-staleness refusal sibling documented on [`vitrin_grant`](04-vitrin_grant.md). This lets an actuation assert "act only if the view is still at epoch E", which the version-1 wire cannot express.
 - **Key actuation is a different verb.** Chord and raw-key injection are not added to this pointer facet; they arrive as a distinct `actuate_key` verb (a later entry in the [`vitrin_grant.verb`](04-vitrin_grant.md) bitfield) with its own facet. The pointer facet stays pointer-only.
+- **Per-principal pointer delivery.** The shared-position limitation above is corrected on the *shim* side: `since`-gated sibling events on [`vitrin_shim_seat`](11-vitrin_shim_seat.md) that name the principal, each still ending with `origin` so the schema's B2 rule holds. This interface is unchanged by that correction — `move` has always meant "this principal's pointer" — which is exactly why the wire does not need to change shape when it lands (D-017, deferred to M2).

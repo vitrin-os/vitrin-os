@@ -60,20 +60,24 @@ fn invalid_enum_value_is_rejected() {
 
 #[test]
 fn invalid_bitfield_value_is_rejected() {
-    // `vitrin_grant.verb` is a bitfield with VALID_MASK 1|2|4 = 7; bit 8 is
-    // reserved for a future verb and out of range today.
-    assert_eq!(gen::vitrin_grant::Verb::VALID_MASK, 7);
-    let err = gen::vitrin_grant::Verb::from_bits(8).unwrap_err();
+    // `vitrin_grant.verb` is a bitfield with VALID_MASK 1|2|4|8|16|32 = 63;
+    // bit 64 is reserved for a future verb and out of range today. Bits 8, 16
+    // and 32 (`observe_cursor`, `layout_arrange`, `layout_focus`) are DEFINED
+    // but not served by version 1 -- that is a petition-time `unsupported`
+    // resolution, deliberately not a decode error, so the codec must accept
+    // them (D-017/D-018).
+    assert_eq!(gen::vitrin_grant::Verb::VALID_MASK, 63);
+    let err = gen::vitrin_grant::Verb::from_bits(64).unwrap_err();
     assert_eq!(
         err,
         DecodeError::InvalidBitfieldValue {
             interface: "vitrin_grant",
             enum_name: "verb",
-            value: 8,
+            value: 64,
         }
     );
     // every subset of the defined bits, including all of them together, is legal
-    for v in 0..=7u32 {
+    for v in 0..=63u32 {
         gen::vitrin_grant::Verb::from_bits(v).expect("every subset of defined bits is valid");
     }
 
@@ -81,7 +85,7 @@ fn invalid_bitfield_value_is_rejected() {
     // second argument, after a valid `outcome`.
     let bytes = craft_frame(gen::vitrin_grant::events::Resolved::OPCODE, 0, |out| {
         vitrin_protocol::wire::write_uint(out, gen::vitrin_grant::Outcome::ALL[0].to_wire());
-        vitrin_protocol::wire::write_uint(out, 8); // invalid verbs bit
+        vitrin_protocol::wire::write_uint(out, 64); // invalid verbs bit
         vitrin_protocol::wire::write_uint(out, gen::vitrin_grant::Persistence::ALL[0].to_wire());
         vitrin_protocol::wire::write_uint(out, 0); // expiry_ms
     });
@@ -91,7 +95,7 @@ fn invalid_bitfield_value_is_rejected() {
         DecodeError::InvalidBitfieldValue {
             interface: "vitrin_grant",
             enum_name: "verb",
-            value: 8,
+            value: 64,
         }
     );
 }

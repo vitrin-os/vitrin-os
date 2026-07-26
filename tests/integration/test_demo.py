@@ -632,6 +632,90 @@ class HeadlessGateThresholdsStayDiscriminating(unittest.TestCase):
         )
 
 
+class SettleRequiresProofOfPaint(unittest.TestCase):
+    """`_settle` must not accept a frame the app has never drawn into.
+
+    The defect this class exists for, found on 2026-07-26 by the first CI run
+    ever to execute `_idle_probe`: quiescence alone cannot tell "the app
+    finished painting" from "the app has not started". A blank frame differs
+    from its predecessor by 0 px every interval, indefinitely, so the settle
+    loop would bless it as the control capture -- and weston-terminal's own
+    startup paint (569 px, dense run 81) would then land inside the window the
+    gate measures. That paint already satisfies `actuation_landed` unaided, so
+    the consequence is not only the false FAILURE CI hit (paint inside the
+    idle probe) but a false PASS (paint inside the post-actuation poll), in
+    which the app's own drawing is credited as proof the agent's click and
+    typed text arrived.
+
+    Binary-free: frames are assembled from raw bytes, no display or app.
+    """
+
+    WIDTH, HEIGHT = 64, 8
+    STRIDE = WIDTH * 4
+
+    def _uniform(self, colour: bytes) -> "vitrin_os.Frame":
+        buf = bytearray()
+        for _ in range(self.WIDTH * self.HEIGHT):
+            buf += colour + b"\x00"
+        return vitrin_os.Frame(
+            bytes(buf), format=vitrin_os.Format.XRGB8888,
+            width=self.WIDTH, height=self.HEIGHT, stride=self.STRIDE,
+        )
+
+    def _with_ink(self) -> "vitrin_os.Frame":
+        buf = bytearray(self.STRIDE * self.HEIGHT)
+        buf[0:3] = b"\xff\xff\xff"
+        return vitrin_os.Frame(
+            bytes(buf), format=vitrin_os.Format.XRGB8888,
+            width=self.WIDTH, height=self.HEIGHT, stride=self.STRIDE,
+        )
+
+    def test_an_all_black_frame_is_not_content(self):
+        self.assertFalse(
+            run_demo.frame_has_content(self._uniform(b"\x00\x00\x00")),
+            "an all-black frame is the pre-paint state, not a drawn app",
+        )
+
+    def test_the_shims_opaque_background_is_not_content(self):
+        self.assertFalse(
+            run_demo.frame_has_content(self._uniform(b"\x20\x20\x20")),
+            "a uniform non-black fill is the shim's opaque background or a "
+            "toolkit's pre-chrome fill; treating it as a drawn app is exactly "
+            "how a blank control capture got blessed",
+        )
+
+    def test_one_inked_pixel_is_content(self):
+        self.assertTrue(
+            run_demo.frame_has_content(self._with_ink()),
+            "non-uniform and not all black is the app having drawn something",
+        )
+
+    def test_settle_refuses_a_never_painted_app_instead_of_blessing_it(self):
+        """The regression: a permanently blank app must fail, not settle."""
+
+        class BlankGrant:
+            """Perfectly quiet, and perfectly blank -- the pathological case."""
+
+            def __init__(self, frame):
+                self.frame = frame
+                self.observations = 0
+
+            def observe(self):
+                self.observations += 1
+                return self.frame
+
+        blank = self._uniform(b"\x20\x20\x20")
+        grant = BlankGrant(blank)
+        with self.assertRaises(run_demo.DemoAssertionError) as caught:
+            run_demo._settle(grant, blank, timeout=1.5, poll=0.01, floor=0.0)
+        self.assertIn("never drew anything", str(caught.exception))
+        self.assertGreater(
+            grant.observations, 3,
+            "the loop must have polled well past `quiet_rounds`; if it gave up "
+            "early it is not the paint precondition doing the work",
+        )
+
+
 class ChangeProfileShapeMetrics(unittest.TestCase):
     """What the gate's shape metric accepts and rejects, on frames built here.
 

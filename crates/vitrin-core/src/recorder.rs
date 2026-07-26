@@ -1379,6 +1379,12 @@ fn write_peer(out: &mut String, peer: PeerCred) {
 /// `verbs` (names, for humans) plus `verbs_bits` (the exact bitmask, for
 /// machines): a reader never has to infer one from the other, and an
 /// unknown future bit is still visible in `verbs_bits`.
+///
+/// Every verb the IDL defines is named here, including the ones version 1
+/// refuses `unsupported` at admission (D-017/D-018) -- a journal entry for a
+/// refused petition must say *what was asked for*, and "a defined verb
+/// rendered as no name at all" is exactly the audit gap this pair of fields
+/// exists to close.
 fn write_verbs(out: &mut String, verbs: Verb) {
     key(out, "verbs");
     out.push('[');
@@ -1387,6 +1393,9 @@ fn write_verbs(out: &mut String, verbs: Verb) {
         (Verb::OBSERVE, "observe"),
         (Verb::ACTUATE_POINTER, "actuate_pointer"),
         (Verb::ACTUATE_TEXT, "actuate_text"),
+        (Verb::OBSERVE_CURSOR, "observe_cursor"),
+        (Verb::LAYOUT_ARRANGE, "layout_arrange"),
+        (Verb::LAYOUT_FOCUS, "layout_focus"),
     ] {
         if verbs.contains(bit) {
             if named > 0 {

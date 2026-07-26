@@ -80,9 +80,13 @@ def _parse_verbs(verbs: int | Verb | Iterable[str | Verb]) -> int:
                 bits |= int(verb)
     if bits == 0:
         raise ValueError("a petition's verb set MUST be non-zero")
-    if bits & ~int(Verb.OBSERVE | Verb.ACTUATE_POINTER | Verb.ACTUATE_TEXT):
+    if bits & ~protocol.VERB_MASK:
         # An out-of-range verb bit is fatal invalid_argument server-side.
         raise ValueError(f"verb bits {bits:#x} outside the version-1 bitfield")
+    # Bits inside the mask but unserved (observe.cursor, layout.*) are NOT
+    # refused here: the core answers them "unsupported" on the grant, which is
+    # recoverable and is the answer the caller is entitled to see. Pre-empting
+    # it locally would hide a deployment difference behind a client-side error.
     return bits
 
 

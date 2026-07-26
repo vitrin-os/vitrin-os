@@ -218,7 +218,8 @@
 //!
 //! **Policy-check order at admission** (documented determinism):
 //! `unavailable` (addressing: which realm) precedes `unsupported` (policy:
-//! flags, durable rung, resource granularity) precedes `busy` (admission).
+//! flags, unserved verb bits, durable rung, resource granularity)
+//! precedes `busy` (admission).
 //! Petitions refused by any of these never enter the pending table, never
 //! consume an admission slot, and emit **no** consent transitions -- no
 //! prompt lifecycle ever began (the IDL's busy/unavailable flows show
@@ -667,8 +668,27 @@ impl PetitionRegistry {
         // Policy refusals, each "honest refusal rather than
         // accepted-and-unenforced" (IDL): a set reserved flag bit, a
         // durable rung without provenance, a resource granularity finer
-        // than version 1 serves.
+        // than version 1 serves, a defined verb this core does not serve.
         if req.flags != 0 {
+            return declined(Outcome::Unsupported);
+        }
+        // A verb bit the IDL defines but version 1 does not enforce
+        // (`observe_cursor`, `layout_arrange`, `layout_focus`; D-017 and
+        // D-018). Refused **whole**, never narrowed to the served
+        // remainder: narrowing is the human's move at consent time, and
+        // silently dropping a requested verb would leave the agent
+        // believing it holds authority nothing checks. The wire keeps
+        // these bits in range precisely so this is a recoverable
+        // `unsupported` rather than a fatal `invalid_argument`.
+        //
+        // This also subsumes, today, the one verb-composition rule the IDL
+        // states: `observe_cursor` is meaningful only alongside `observe`,
+        // and naming it alone resolves `unsupported`. Version 1 refuses
+        // `observe_cursor` in every combination, so no separate check can
+        // be distinguished from this one -- whoever begins to serve the
+        // verb (M2) must add the pairing check here, because deleting the
+        // bit from `UNSERVED_VERB_BITS` deletes the only thing enforcing it.
+        if req.verbs.bits() & crate::grants::UNSERVED_VERB_BITS != 0 {
             return declined(Outcome::Unsupported);
         }
         let Ok(rung) = PersistenceRung::try_from(req.persistence) else {
@@ -1239,6 +1259,52 @@ mod tests {
         // None of the refusals entered the pending table (and admission
         // never writes the grant table at all -- rows are minted at
         // delivery).
+        assert_eq!(reg.pending_total(), 0);
+    }
+
+    #[test]
+    fn verbs_defined_but_unserved_resolve_unsupported_never_narrowed() {
+        // D-017/D-018: `observe_cursor`, `layout_arrange` and
+        // `layout_focus` are on the wire so that petitioning for them is
+        // an answer rather than a connection death -- but this core does
+        // not implement any of them, so admission must refuse. The
+        // failure this guards is the silent one: accepting the bit and
+        // enforcing nothing.
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::AutoApprove);
+        let conn = reg.register_connection();
+
+        let mut wire_id = 10;
+        for verb in [
+            Verb::OBSERVE_CURSOR,
+            Verb::LAYOUT_ARRANGE,
+            Verb::LAYOUT_FOCUS,
+        ] {
+            // Alone.
+            let mut req = request(DEMO, conn, wire_id);
+            req.verbs = verb;
+            expect_declined(reg.admit(req, t0, &realms()), Outcome::Unsupported);
+            wire_id += 10;
+
+            // Mixed with served verbs: refused WHOLE. Were it narrowed to
+            // the served remainder, the agent would be granted `observe`
+            // while believing it also holds `verb`.
+            let mut req = request(DEMO, conn, wire_id);
+            req.verbs = Verb::OBSERVE | verb;
+            expect_declined(reg.admit(req, t0, &realms()), Outcome::Unsupported);
+            wire_id += 10;
+        }
+
+        // The served set still admits under the same policy, so the check
+        // above refuses the unserved bits and nothing else.
+        let mut req = request(DEMO, conn, wire_id);
+        req.verbs = Verb::OBSERVE | Verb::ACTUATE_POINTER | Verb::ACTUATE_TEXT;
+        let Admission::Resolved(res) = reg.admit(req, t0, &realms()) else {
+            panic!("auto-approve must resolve a served petition");
+        };
+        assert!(matches!(res.verdict, Verdict::Granted { .. }));
+
+        // No refusal entered the pending table.
         assert_eq!(reg.pending_total(), 0);
     }
 

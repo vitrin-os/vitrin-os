@@ -51,18 +51,50 @@ class ErrorCode(enum.IntEnum):
 
 
 class Verb(enum.IntFlag):
-    """vitrin_grant.verb — the grantable verb bitfield."""
+    """vitrin_grant.verb — the grantable verb bitfield.
+
+    The last three are *defined but unserved*: the IDL defines them from day
+    one and version 1 refuses them "unsupported". That distinction is the
+    whole reason they are here. An out-of-range bit is fatal
+    "invalid_argument" and kills the connection, so an SDK that omitted them
+    would turn a recoverable refusal into a dead socket for any client that
+    petitioned one.
+    """
 
     OBSERVE = 1
     ACTUATE_POINTER = 2
     ACTUATE_TEXT = 4
+    OBSERVE_CURSOR = 8  # resolves "unsupported" in version 1
+    LAYOUT_ARRANGE = 16  # resolves "unsupported" in version 1
+    LAYOUT_FOCUS = 32  # resolves "unsupported" in version 1
 
 
-# The SDK-level dotted names are these bits (per the IDL's verb enum text).
+# Every bit the IDL's verb enum defines. Petitioning a defined-but-unserved
+# bit is legal and answered "unsupported"; a bit outside this mask is fatal.
+VERB_MASK = int(
+    Verb.OBSERVE
+    | Verb.ACTUATE_POINTER
+    | Verb.ACTUATE_TEXT
+    | Verb.OBSERVE_CURSOR
+    | Verb.LAYOUT_ARRANGE
+    | Verb.LAYOUT_FOCUS
+)
+
+# Verbs this deployment's version 1 actually serves. The rest are refused
+# "unsupported", and a petition mixing served and unserved verbs is refused
+# whole — the core never silently narrows a verb set.
+VERBS_SERVED_IN_VERSION_1 = int(Verb.OBSERVE | Verb.ACTUATE_POINTER | Verb.ACTUATE_TEXT)
+
+# The SDK-level dotted names are these bits (per the IDL's verb enum text,
+# which fixes the spelling: the first underscore of the wire name becomes a
+# dot, so a second implementation has no name to invent).
 VERB_BY_DOTTED_NAME: dict[str, Verb] = {
     "observe": Verb.OBSERVE,
     "actuate.pointer": Verb.ACTUATE_POINTER,
     "actuate.text": Verb.ACTUATE_TEXT,
+    "observe.cursor": Verb.OBSERVE_CURSOR,
+    "layout.arrange": Verb.LAYOUT_ARRANGE,
+    "layout.focus": Verb.LAYOUT_FOCUS,
 }
 
 

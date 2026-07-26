@@ -87,6 +87,88 @@ another is fatal `invalid_object`. Because object ids are per-connection and
 never reused (§3), a captured id from one connection is meaningless on
 another.
 
+### 1.4 Scene authority: arrangement, ordering, cursors
+
+Two kinds of authority over the shared scene are kept distinct, and **only one
+of them is purchasable**. This section is normative; decisions D-017 (cursors)
+and D-018 (layout) record the reasoning.
+
+**Arrangement is grant-governed.** Which realm view sits where, at what size,
+and which one holds keyboard focus is named by the
+[`layout_arrange` and `layout_focus`](04-vitrin_grant.md#verb) verbs. An
+unprivileged shell that arranges realms therefore does so with attenuable,
+revocable, journaled authority — *"this shell may arrange realm-7 and realm-9,
+may not steal focus"* — rather than ambiently. This is what keeps
+window-management policy outside the trusted core (PRD §5.1's invariant)
+**without** making the shell trusted: "the shell is trusted" would move exactly
+the code that invariant exiles back into the TCB. Focus is a separate verb from
+placement because focus theft is simultaneously the sharpest attack (it
+redirects keystrokes meant for another realm) and the most legitimate need, so
+it must be attenuable alone.
+
+**Ordering is purchasable by no grant, at any verb set, ever.** The core
+enforces these invariants unconditionally:
+
+1. the consent surface and the trust indicator composite **above** every
+   principal's content;
+2. the core's own hit test — never a client's claimed stacking — decides which
+   surface an input event reaches;
+3. no arrangement may occlude, fullscreen over, or resize away the consent
+   surface;
+4. no **agent** principal's cursor is composited into another principal's
+   captured frame — the one cursor a capture may ever contain is the human
+   principal's, and only for a grant holding `observe_cursor`, which is the
+   single carve-out and is itself grant-governed rather than free.
+
+**Their standing today, stated rather than implied** (D-018 costs; this
+paragraph is the honest reading of "unconditionally", and the two must be read
+together). Invariant 1 holds and is exercised: the overlay composites at the
+output stage, structurally above the scene the capture is taken from, and
+`backend/headless.rs`'s
+`a_prompt_reaches_human_visible_output_but_never_a_capture` asserts exactly
+that — the trust band's colour at pixel (0,0) of the human-visible output where
+the capture at the same pixel still holds realm content, the consent card
+verbatim in the output, and the capture byte-identical to the bare scene
+compose. Invariants 2 and 4 hold **vacuously**: no client can state a stacking
+order, and the core composites no cursor at all. Invariant 3 has nothing to be
+true of, because there is no arrangement mechanism. **None of the four is
+tested *as an invariant*** — against a client trying to violate it — and none
+can be until something outside the core can arrange realms. That test is E3's,
+and D-018 is the reason it must exist.
+
+The shell gets *arrangement*; the core keeps *ordering*. Read the ordinary
+window-manager verbs as authority rather than decoration and the reason is
+plain: `raise` would put a surface over the consent card, `move` would slide a
+different target under the pointer mid-decision, `fullscreen` would impersonate
+the whole session. Invariants 1–3 are what make those attack primitives
+unpurchasable, which is also why `raise`, `move`, `resize`, and `fullscreen`
+are **not** separate verbs — with ordering held by the core, splitting them
+further would be attenuation theatre.
+
+**Cursors.** Each principal has exactly one virtual pointer per realm it holds
+pointer authority over, and
+[`vitrin_actuator_pointer`](07-vitrin_actuator_pointer.md) is that pointer's
+only name on the wire. A principal is **cursorless by construction**: an agent
+that never petitions for `actuate_pointer` has no pointer, so the headless-fleet
+case needs no wire vocabulary, and there is deliberately no request by which a
+principal declares, disowns, or hides a cursor. Cursors are **core-composited**
+— a realm may never supply the pointer bitmap, because a realm that drew its
+own could paint a decoy and mislead the human about where input is going.
+Visibility is a relation, not a flag, and is settled **asymmetrically** by
+invariant 4 plus the `observe_cursor` verb: agent→agent is unpurchasable at any
+verb set, agent→human is closed by default and opens only through that verb,
+which is meaningful only alongside `observe`. See
+[`vitrin_view`](06-vitrin_view.md#what-a-capture-does-not-contain).
+
+**What version 1 actually does.** It serves neither layout verb (it has no
+window manager) and composites no cursor of its own (in nested operation the
+host desktop draws the human's cursor, outside the realm view entirely). It
+delivers **one shared pointer position** per realm view to the shim. All three
+verbs — `observe_cursor`, `layout_arrange`, `layout_focus` — are defined on the
+wire and refused `unsupported`; see
+[§ defined but unserved](04-vitrin_grant.md#defined-but-unserved) for why
+defining them early is structural rather than cosmetic.
+
 ---
 
 ## 2. Wire format
@@ -637,6 +719,9 @@ documented seams so the wire never changes shape when they arrive.
 | realm enumeration events | new `since="2"` events on `vitrin_realm` | `vitrin_realm` is authority-free and carries no version-0 events; multi-realm phases add enumeration/lifecycle here instead of re-plumbing addressing |
 | drag intents | new `since="2"` sibling requests on `vitrin_actuator_pointer` | intent-level motion (drag with duration/easing, interpolated server-side) is added beside `move`/`button`/`scroll`, which stay valid forever |
 | `actuate_key` verb | new appended entry in the `verb` bitfield + a later key-actuation facet | version-0 verb bits are untouched; a new power-of-two bit and its facet are additive |
+| serving `observe_cursor` | no new message: the verb bit already exists and widens what the *existing* `frame_ready` composites for a grant that holds it | version 0 refuses the verb `unsupported`, so beginning to serve it changes no signature and no version-0 client's behavior (a client that never petitions for it sees nothing new) |
+| layout facet | new `since="2"` structural mint on `vitrin_grant` (`get_layout`), exercising the already-defined `layout_arrange`/`layout_focus` bits | `request_grant`'s five `new_id` arguments are frozen, so the facet cannot be co-minted; a mint on the grant follows the existing structural-mint class (no terminal event, not refusable) and the verbs are refused `unsupported` until it lands |
+| per-principal pointer delivery | new `since="2"` sibling events on `vitrin_shim_seat` that name the principal alongside the coordinates | `motion`/`button`/`scroll` signatures are immutable, so delivery grows by sibling; each new event still ends with `origin`, satisfying B2 structurally, and a v0-only shim keeps working |
 | IME physical text | reuse of the existing `origin` tag on `vitrin_shim_seat.text` | human input-method text arrives as `text` with `origin=physical`; the origin tag exists from day one, so the new source is additive with no signature change |
 
 ---
@@ -660,11 +745,25 @@ named here so their absence is understood as a decision, not an omission:
 - **Powerbox** — no system-mediated resource picker; petitions name resources
   by a type-prefixed string vocabulary.
 - **Wallet** — no credential/secret storage or presentation verb.
+- **Layout** — the core has no window manager, and version 0 serves neither
+  `layout_arrange` nor `layout_focus`; both are defined on the wire and refused
+  `unsupported` (§1.4, D-018). What is *not* deferred is the posture: layout is
+  authority, not decoration, and the ordering invariants bind the core from day
+  one — though only the first has anything to bind *against* today, and none is
+  yet tested as an invariant (§1.4, "their standing today").
+- **Per-principal cursor delivery** — version 0 delivers one shared pointer
+  position per realm view and composites no cursor of its own; per-principal
+  delivery is deferred to M2 and arrives as sibling `vitrin_shim_seat` events
+  (§1.4, D-017). The *model* — one pointer per principal, cursorless by
+  construction, core-composited, visibility as a verb — is decided and on the
+  wire now.
 
 Finally: the **human principal has no wire presence** in version 0. Host input
 in nested mode is the implicit human (tagged `origin=physical` on the shim
 seat), and only agents handshake. Physically-originated consent — built on the
-day-one `origin` tag — is a later phase.
+day-one `origin` tag — is a later phase. One consequence worth naming: the
+human→agent cursor-visibility toggles (§1.4) are a shell and core concern, not
+an agent-expressible one, precisely because the human is not on the wire.
 
 ---
 

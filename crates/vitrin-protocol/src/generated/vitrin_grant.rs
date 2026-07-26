@@ -256,10 +256,16 @@ impl Verb {
     pub const ACTUATE_POINTER: Verb = Verb(2);
     /// inject Unicode text
     pub const ACTUATE_TEXT: Verb = Verb(4);
+    /// capture frames that include the human principal's cursor - reading the human's attention, hence a verb and not a display preference; meaningful only alongside observe, and a petition naming it without observe resolves unsupported; another agent principal's cursor is not purchasable by this or any verb; refused unsupported in version 1
+    pub const OBSERVE_CURSOR: Verb = Verb(8);
+    /// place, resize, raise, and fullscreen the granted realm's views, subject to the ordering invariants no grant can purchase; refused unsupported in version 1
+    pub const LAYOUT_ARRANGE: Verb = Verb(16);
+    /// direct keyboard focus to a view of the granted realm; separate from layout_arrange because focus theft is the sharpest attack and the most legitimate need, so it must be attenuable alone; refused unsupported in version 1
+    pub const LAYOUT_FOCUS: Verb = Verb(32);
 
     /// Union of every defined entry's bits; a wire value with any other
     /// bit set is invalid.
-    pub const VALID_MASK: u32 = 1 | 2 | 4;
+    pub const VALID_MASK: u32 = 1 | 2 | 4 | 8 | 16 | 32;
 
     /// Decode a wire value, rejecting any bit outside `VALID_MASK`.
     pub fn from_bits(value: u32) -> Result<Self, crate::error::DecodeError> {

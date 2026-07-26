@@ -153,21 +153,111 @@ it never escalates to a fatal error.
 
 ### verb
 
-Bitfield. The grantable verbs. The SDK-level dotted names (`observe`,
-`actuate.pointer`, `actuate.text`) map to these bits.
+Bitfield. The grantable verbs. Every entry has one SDK-level dotted name,
+formed by replacing the first underscore of the wire name with a dot:
+`observe`, `actuate.pointer`, `actuate.text`, `observe.cursor`,
+`layout.arrange`, `layout.focus`. The spelling is fixed by the IDL so a second
+implementation transcribing this enum has no name to invent.
 
-| entry | value | meaning |
-|---|---|---|
-| `observe` | 0x1 | capture frames of the granted resource |
-| `actuate_pointer` | 0x2 | inject pointer motion, buttons, and scroll |
-| `actuate_text` | 0x4 | inject Unicode text |
+| entry | value | served in version 1 | meaning |
+|---|---|---|---|
+| `observe` | 0x1 | yes | capture frames of the granted resource |
+| `actuate_pointer` | 0x2 | yes | inject pointer motion, buttons, and scroll |
+| `actuate_text` | 0x4 | yes | inject Unicode text |
+| `observe_cursor` | 0x8 | **no** — resolves `unsupported` | capture frames that include the human principal's cursor; meaningful only alongside `observe` |
+| `layout_arrange` | 0x10 | **no** — resolves `unsupported` | place, resize, raise, and fullscreen the granted realm's views |
+| `layout_focus` | 0x20 | **no** — resolves `unsupported` | direct keyboard focus to a view of the granted realm |
 
 This enum is the type of `request_grant`'s `verbs` argument, of
-`resolved.verbs`, and of `refused.verb`. Each bit maps one-to-one to a facet
-interface and to that interface's `@verb` annotation, which drives the
-scanner-generated chokepoint table. Later phases append entries (for example
-key actuation, credential presentation, subtree reads) without touching the
-version-1 bits; values are immutable.
+`resolved.verbs`, and of `refused.verb`. The three version-1 verbs map
+one-to-one to a facet interface and to that interface's `@verb` annotation,
+which drives the scanner-generated chokepoint table. Later phases append
+entries (for example key actuation, credential presentation, subtree reads)
+without touching existing bits; values are immutable.
+
+#### Defined but unserved
+
+`observe_cursor`, `layout_arrange`, and `layout_focus` are defined on the wire
+from day one and **refused `unsupported`** by version 1 — the same posture the
+[`persistence`](#persistence) ladder takes toward its durable rungs. Two
+reasons, both structural:
+
+1. **An out-of-range bit is fatal.** A bitfield argument is validated as a
+   mask, so a bit outside the defined union is `invalid_argument` and the
+   connection dies (see [conventions § error taxonomy](00-conventions.md)). A
+   client petitioning for authority this deployment does not serve would be
+   killed rather than answered. Defining the bit converts that into a
+   recoverable `resolved(unsupported)`.
+2. **The model would otherwise be unstateable.** Decisions D-017 and D-018
+   settle that cursor visibility is *authority* rather than a display
+   preference, and that scene arrangement is a *grant* rather than the shell's
+   ambient property. Neither is expressible without a verb, and adding one
+   after v0 freezes is a version bump against deployed clients.
+
+Two rules hold for every unserved verb:
+
+- **A deployment MUST NOT grant a verb it does not enforce.** `unsupported` is
+  the honest answer; accepting the bit and enforcing nothing is the failure
+  this section exists to prevent.
+- **A mixed petition is refused whole.** `verbs = observe|layout_arrange`
+  resolves `unsupported`; the server does not quietly drop the unserved bit and
+  grant `observe`. Narrowing a verb set is the human's move at consent time —
+  a silent server-side edit would leave the agent believing it holds authority
+  nobody checks.
+
+Not every verb has a facet interface. `observe_cursor` has none by
+construction: it widens what
+[`vitrin_view.capture_frame`](06-vitrin_view.md) composites rather than adding
+a request. The layout verbs' facet arrives as a `since`-gated mint on *this*
+interface, because `request_grant`'s five `new_id` arguments are frozen forever
+(see [Growth](#growth)).
+
+#### Verb composition
+
+One dependency exists, and it is the only one. **`observe_cursor` is meaningful
+only alongside `observe`.** It widens what a capture *contains*, so a petition
+naming it without `observe` names no capture to widen; such a petition resolves
+`unsupported` rather than granting a bit that changes nothing. That follows from
+the rule directly above — a deployment MUST NOT grant a verb it does not
+enforce — and it settles the case the wire would otherwise leave open:
+`observe_cursor` is **not** an independent authority and is never
+inert-but-held. Every other verb (`observe`, `actuate_pointer`, `actuate_text`,
+`layout_arrange`, `layout_focus`) is independently petitionable. Version 1
+refuses `observe_cursor` in any combination, so the rule is not yet
+distinguishable from the blanket unserved refusal; it is stated now because the
+enum entry is frozen now.
+
+#### What no grant can purchase
+
+Layout being grant-governed is only half the answer; the other half is what a
+layout grant can never buy, however permissive the consent decision. The core
+enforces these **ordering invariants** unconditionally:
+
+- the consent surface and the trust indicator composite **above** every
+  principal's content;
+- the core's own hit test — never a client's claimed stacking — decides which
+  surface an input event reaches;
+- no arrangement may occlude, fullscreen over, or resize away the consent
+  surface;
+- no **agent** principal's cursor is composited into another principal's
+  captured frame — the one cursor a capture may ever contain is the human
+  principal's, and only for a grant holding `observe_cursor`.
+
+**What "unconditionally" means today.** The first invariant holds and is
+exercised (the overlay composites at the output stage, above the scene a
+capture is taken from; `backend/headless.rs`'s
+`a_prompt_reaches_human_visible_output_but_never_a_capture` asserts it). The
+second and fourth hold **vacuously** — no client can state a stacking order and
+the core composites no cursor at all. The third has nothing to be true of, there
+being no arrangement mechanism. **None of the four is tested *as an invariant***
+against a client trying to violate it, and none can be until something outside
+the core can arrange realms; that test belongs to the mission-control shell
+(E3), and D-018 is the reason it must exist.
+
+The split is deliberate: a shell gets *arrangement*, the core keeps *ordering*.
+This is what lets window-management policy live outside the TCB (PRD §5.1)
+without making the shell trusted. See [conventions § 1.4](00-conventions.md)
+for the full statement.
 
 ### persistence
 
@@ -198,7 +288,7 @@ All outcomes are recoverable: a denial is an answer, not a protocol violation.
 | `denied` | 1 | the human said no |
 | `timed_out` | 2 | the consent prompt expired unanswered; petitioning again later is legal |
 | `unavailable` | 3 | the realm was unknown, vacant, or closed while the petition was pending |
-| `unsupported` | 4 | well-formed but refused by policy: durable rung without provenance, reserved flag set, unserved resource prefix or verb |
+| `unsupported` | 4 | well-formed but refused by policy: durable rung without provenance, reserved flag set, unserved resource prefix, or a defined verb this deployment does not serve (an *out-of-range* verb bit is instead fatal `invalid_argument`) |
 | `busy` | 5 | the pending-petition admission cap for this verified identity (across all of its connections) was reached |
 
 This enum types `resolved.outcome`.
@@ -341,4 +431,10 @@ rules](00-conventions.md) guarantee.
   epoch. It pairs with clamped-coordinate stale-observation detection.
 - **New verbs.** Appended [`verb`](#verb) bits (for example key actuation,
   credential presentation, subtree reads) extend the bitfield without touching
-  version-1 bits.
+  existing bits.
+- **Layout facet mint.** The `layout_arrange` and `layout_focus` verbs need a
+  facet to be exercised through, and `request_grant`'s five `new_id` arguments
+  are frozen. It therefore arrives as a `since`-gated **structural mint on this
+  interface** (`get_layout(new_id)`), following the same mint-freely,
+  check-at-use pattern as the co-minted facets. Version 1 refuses both verbs
+  `unsupported`, so there is nothing to mint yet.

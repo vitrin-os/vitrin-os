@@ -1,0 +1,84 @@
+name: Bug report
+description: Something behaves differently from what the docs or the IDL say
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        **Not for security issues.** If this is a vulnerability, close this
+        and use
+        [private security advisories](https://github.com/vitrin-os/vitrin-os/security/advisories/new)
+        instead — see `SECURITY.md`.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: >-
+        What you observed, and what you expected instead. If the expectation
+        comes from a specific place — a `docs/protocol/` page, an IDL
+        `<description>`, a README claim — quote it. Where prose and the IDL
+        disagree, the IDL wins.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >-
+        Exact commands. A failing test under `tests/integration/` is the gold
+        standard; a prose walkthrough is fine.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which part
+      multiple: true
+      options:
+        - "vitrind, headless (--headless)"
+        - "vitrind, nested (--nested)"
+        - "The C shim (shim/)"
+        - "The Python SDK (sdk/python/)"
+        - "The protocol / IDL"
+        - "Codegen (cargo xtask codegen)"
+        - "CI or test harness"
+        - "Docs"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit on main
+      description: "`git rev-parse --short HEAD`"
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: >-
+        OS and version, kernel, GPU/driver if the dmabuf path is involved,
+        host compositor if running nested, and the app in the realm.
+      placeholder: |
+        OS:        Arch Linux, kernel 6.12.4
+        Compositor: Hyprland 0.45 (nested mode)
+        GPU:       AMD RX 7900 / mesa 24.3
+        Realm app: firefox-esr 128.5
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Flight recorder / logs
+      description: >-
+        The run's `flight.jsonl` is usually the most useful single artifact.
+        Redact anything sensitive.
+      render: shell

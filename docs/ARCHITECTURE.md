@@ -30,7 +30,9 @@ vitrin-os/
 ├── shim/              # the Wayland shim, C + wlroots, OUTSIDE the Cargo workspace — see §3
 ├── sdk/python/        # the Python agent SDK — see §4
 ├── examples/
-│   ├── agent-demo/run_demo.py   # the Phase-1 demo agent (also the M1.5 integration test)
+│   ├── agent-demo/               # the Phase-1 goal-directed demo agent (also the M1.5 gate)
+│   │   ├── run_demo.py           #   the agent; README.md is the normative receipt encoding
+│   │   └── form.html             #   the nested venue's form (a data file, not a template)
 │   ├── realm.toml                # realm config template + security commentary
 │   └── principals.toml           # identity-registry template
 └── tests/

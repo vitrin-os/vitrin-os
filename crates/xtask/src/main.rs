@@ -640,10 +640,8 @@ fn demo(headless: bool, task: &[String]) -> Result<()> {
         // VALUES are never passed here -- the only way they can reach the app
         // is the agent typing them through the real chokepoint, which is the
         // whole point of the demo.
-        let mut app_args: Vec<String> = vec![
-            "--run-ms".to_string(),
-            HEADLESS_APP_RUN_MS.to_string(),
-        ];
+        let mut app_args: Vec<String> =
+            vec!["--run-ms".to_string(), HEADLESS_APP_RUN_MS.to_string()];
         for key in task_keys(task) {
             app_args.push("--field".to_string());
             app_args.push(key);
@@ -852,10 +850,18 @@ fn toml_string_array<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
 /// FIRST one for exactly that reason, so this must too.
 fn task_keys(task: &[String]) -> Vec<String> {
     if task.is_empty() {
-        return DEFAULT_TASK.iter().map(|(key, _)| (*key).to_string()).collect();
+        return DEFAULT_TASK
+            .iter()
+            .map(|(key, _)| (*key).to_string())
+            .collect();
     }
     task.iter()
-        .map(|pair| pair.split_once('=').map(|(key, _)| key).unwrap_or(pair).to_string())
+        .map(|pair| {
+            pair.split_once('=')
+                .map(|(key, _)| key)
+                .unwrap_or(pair)
+                .to_string()
+        })
         .collect()
 }
 

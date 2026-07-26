@@ -373,11 +373,29 @@ universal revocation push. Three options, and they compose:
    "token revoked" event. The standards-correct answer for *immediate* kill, and
    the only one that closes the window in option 1.
 
-**The honest weakness:** with 1 and 2 alone, revocation is *fail-open* for up to
-one token lifetime, and an unreachable authorization server extends that window.
+**Decided: short lifetimes.** Options 1 and 2 are the posture; option 3 is a
+later optimisation, not a prerequisite.
+
+> **The revocation window equals the access-token lifetime.** That is the whole
+> security argument for keeping it short, so the lifetime is a security
+> parameter and must be chosen deliberately and written down — never inherited
+> from an authorization server's default.
+
+Recommended default **300 s**, matching the grant expiry the demo already uses,
+with deployments free to shorten it. The tradeoff is only refresh traffic: a
+60 s token costs five times the refreshes and buys a five-times-smaller window.
+Nothing in the core changes with the number.
+
+**The weakness this accepts, stated plainly:** revocation is *fail-open* for up
+to one token lifetime, and an unreachable authorization server extends that
+window. So "a revoked token kills the connection" is true but **not immediate**,
+and no document may imply otherwise.
+
 That is the deliberate price of §7.3(3) — the dead-man switch must work with the
-authorization server down — and short lifetimes are the mitigation. A human
-holding Escape does not wait for anybody's network.
+authorization server down. The ordering is the right way round: the immediate,
+local, physical override is the fastest path to zero authority, and the
+administrative one is allowed to be slower. A human holding Escape does not wait
+for anybody's network.
 
 ### 7.7 Open questions this raises
 

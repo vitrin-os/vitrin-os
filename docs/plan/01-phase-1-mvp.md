@@ -234,7 +234,7 @@ retroactively gated.
 | real C shim ↔ `shim/tests/mock_core.c` | `shim/tests/acceptance/*.sh` (`upstream_frame_path.sh`, `seat_input_replay.sh`, `firefox_bringup.sh`) | **Shim-in-isolation smoke tests, not the milestone proof.** `firefox_bringup.sh` says so explicitly in its own header (added at P1.6.6); the equivalent statement now also appears in `shim/README.md`'s Firefox section. |
 | `crates/xtask/src/main.rs` demo venues | `cargo xtask demo` and `cargo xtask demo --headless` both exec the real `vitrin-shim` (`resolve_shim_bin`), which fork/execs a real app — Firefox ESR nested, `weston-terminal`/`foot` headless | **Mock-free, as of #110 / PR #127.** The prior state is worth keeping on the record: nested execed Firefox *as if it were the shim* (structurally impossible — the core hands a shim fd 3 with an unbound `WAYLAND_DISPLAY`), and headless aliased `vitrin-mock-shim` as both the `--shim` binary and the realm's app. Neither is true now; `vitrin-mock-shim` appears in no venue, and `tests/integration/test_demo.py`'s `DemoUsesNoMockShim` grep-proves it against the two launcher files. |
 | The M1.5 gate's own discriminating power | `tests/integration/test_demo.py` + `examples/agent-demo/run_demo.py` | **Was vacuous until the P1.9.8 gate-integrity pass; now real.** Being mock-free was necessary and not sufficient: the headless assertion asked for 24 changed pixels between two captures, and a real `weston-terminal`'s own asynchronous startup paint clears that unaided (measured: 569 changed pixels spanning 81 px), so the gate passed whether or not the agent's click and typed text reached the app. It now takes a settled control capture first, watches the app idle through a window at least as long as the one it later polls, and requires a change carrying the shape a typed line makes. **Read any green M1.5 run from before that change as "the demo completed against a real app", not as "the actuation landed."** The same pass fixed the real-app consent-occlusion proof in `crates/vitrin-core/src/backend/headless.rs`, which was waiting only for the view to differ from the empty-scene test pattern — satisfied by the shim's first commit, before any client attached. **The first attempt at the shape metric was itself wrong in the same family, and that is the more useful lesson:** it measured the *bounding span* of a scanline's changed pixels (last minus first) while its own prose derived a contiguous *run*, so three unrelated one-cell repaints at x=0, x=300 and x=600 — a cursor, a mode indicator, a scrollbar — cleared it with a 608 px "span" and nothing typed. A metric's name is not evidence about the metric; `ChangeProfileShapeMetrics` in `test_demo.py` now asserts that exact frame pair is rejected, in-process and binary-free. |
-| `tests/integration/test_real_app.py` / `test_real_capture_fidelity.py` / `test_real_actuation.py` / `test_real_deadman.py` / `test_real_consent.py` / `test_real_firefox.py` / `test_real_gtk.py` | real `vitrind` → real `vitrin-shim` → real app (weston-terminal / GTK / Firefox / click-target) | **Mock-free.** These are the #105/#107/#108/#109/#138 gates (and their supporting rungs); each boots its `Core` with an explicit real shim path (`shim=str(self.shim_bin)`), grep-provably never the bare `Core()`/`self.core()` call that defaults to `vitrin-mock-shim` (see `tests/integration/README.md`). They *name* `vitrin-mock-shim`/`mock_core` only in disclaiming prose and assertion strings ("no mock in the path") — a plain-text grep for those strings is not the right proof here; check the invocation instead. |
+| `tests/integration/test_real_app.py` / `test_real_capture_fidelity.py` / `test_real_actuation.py` / `test_real_deadman.py` / `test_real_consent.py` / `test_real_trust_band.py` / `test_real_firefox.py` / `test_real_gtk.py` | real `vitrind` → real `vitrin-shim` → real app (weston-terminal / GTK / Firefox / click-target) | **Mock-free.** These are the #105/#107/#108/#109/#138 gates, the #139 property gate, and their supporting rungs; each boots its `Core` with an explicit real shim path (`shim=str(self.shim_bin)`), grep-provably never the bare `Core()`/`self.core()` call that defaults to `vitrin-mock-shim` (see `tests/integration/README.md`). They *name* `vitrin-mock-shim`/`mock_core` only in disclaiming prose and assertion strings ("no mock in the path") — a plain-text grep for those strings is not the right proof here; check the invocation instead. **`test_real_trust_band.py` is mock-free and is not a milestone gate** — see the unspoofability subsection below; being in this row is a statement about its wiring, not about M1.4. |
 
 Grep-proving the rule (run from repo root; both expect no output):
 
@@ -318,27 +318,147 @@ artifact at all.**
 deliberately: the secret is never written to any descriptor or file in any
 build, so the instrumented core exports only the consent card's own footprint,
 which is indicator-free by construction (`consent::ConsentSurface::card_rect`,
-and `the_card_footprint_carries_no_indicator_pixel` which checks it). So issue
-#85's "a confined app cannot forge the frame" property remains
-**component-level** evidence — `consent/mod.rs`'s band and frame tests,
-`backend/headless.rs`'s occlusion tests, and `shim/docs/firefox.md` §9 for a
-human at a real display. **Adjudicated 2026-07-25: unspoofability is not an
-M1.4 criterion, and M1.4 is closed on #108 + #109 + #138.** Neither the
-milestone table above nor this section's verification list for M1.4 names it —
-M1.4 asks for core-rendered consent, pointer+text actuation, mid-prompt
-actuations blocked, hold-Esc revocation, and sender-constraint/expiry
-enforcement, each of which now has a named mock-free gate. Reading an unstated
-criterion in at closing time would be its own kind of dishonesty — the mirror
-of the understated claims this checklist exists to catch — so the gap is
-tracked on its own terms as **#139** rather than absorbed into a closed
-milestone, and a later reader of "M1.4 done" can find exactly what it did and
-did not buy. The physical click itself — the hit
-test, the 500 ms guard interval, press-arms/release-commits, and the origin
+and `the_card_footprint_carries_no_indicator_pixel` which checks it).
+**Adjudicated 2026-07-25: unspoofability is not an M1.4 criterion, and M1.4 is
+closed on #108 + #109 + #138.** Neither the milestone table above nor this
+section's verification list for M1.4 names it — M1.4 asks for core-rendered
+consent, pointer+text actuation, mid-prompt actuations blocked, hold-Esc
+revocation, and sender-constraint/expiry enforcement, each of which now has a
+named mock-free gate. Reading an unstated criterion in at closing time would be
+its own kind of dishonesty — the mirror of the understated claims this
+checklist exists to catch — so the gap was tracked on its own terms as **#139**
+rather than absorbed into a closed milestone. The physical click itself — the
+hit test, the 500 ms guard interval, press-arms/release-commits, and the origin
 check that stops an agent answering its own prompt — is likewise proven only
 by `consent/grab.rs`'s own tests and that nested recipe, exactly as
 `test_real_deadman.py`'s SIGUSR1 stands in for a held Escape. Both scopes are
 stated in `tests/integration/README.md`'s "What the consent gate still does not
 prove" and in the gate's own module docstring.
+
+#### Unspoofability (issue #85): what is gate-proven, and what never will be
+
+**Read this before citing "M1.4 done" for anything about the trusted
+indicator.** #139 split the property in two and closed the half that can be
+closed. The split is permanent, not a staging post — the second half is not
+waiting on a better idea.
+
+| Half | Claim | Status | Where the evidence is |
+|---|---|---|---|
+| **Negative** | A confined app's own rendering can never reach the trusted band's rows on the human-visible output, and never reaches the capture path at all. | **Gate-proven, mock-free** (property gate, **not** a milestone gate) | `tests/integration/test_real_trust_band.py` — shipped `vitrind` → real `vitrin-shim` → real `click-target`, over a real socket |
+| **Positive** | A human who learned the colour off the band can tell a genuine prompt's frame from a forgery. | **Component + human evidence, permanently. Not CI-able, and closed as a CI question.** The human-in-the-loop procedure #139 also asked for is unwritten and unscheduled — see "the fourth direction" below; do not read this row as "nothing left to do". | `consent/mod.rs`'s band and frame tests; `backend/headless.rs`'s `a_prompt_reaches_human_visible_output_but_never_a_capture` and the real-app `c_shim_consent_prompt_occludes_…`; `backend/winit.rs`'s `no_presentation_path_can_drop_the_trusted_band`; `shim/docs/firefox.md` §9, run by a person |
+| **The colour itself** | The indicator is a fresh per-session secret, minted from the CSPRNG before any client could connect. | **Component evidence.** No gate reaches it and none can. | `consent/indicator.rs`'s own tests; `run_session`'s startup ordering |
+
+**Why the positive half is closed rather than open.** Any automated check that
+the band is *the right colour* has to know the colour, and anything that knows
+it is a channel the confined app — same uid, `/proc/<core>/fd` — can use too.
+The three escapes were considered and each fails on its own terms, recorded
+here so the question is not reopened by someone who has not been through it:
+
+1. **Mirror the human-visible frame to a file.** Writes the session secret
+   where a same-uid app reads it. This is what `consent/indicator.rs` forbids
+   outright, and it was already rejected once, during #138.
+2. **A commitment scheme** (#139's own sketch: the core publishes a hash or
+   derived witness). `TrustedIndicator::generate` scales each channel into
+   `[64, 255]`, so the secret has at most `192³ ≈ 7.1 M` values — 22.8 bits.
+   `H(S)` over that space inverts by exhaustive search in well under a second,
+   on the same machine, by the same app. Salting it makes it uncheckable by a
+   harness that holds no band pixel, and publishing the salt collapses it back.
+   And even a scheme immune to both is *replayable*: the human's check is
+   supposed to require seeing the screen, and a witness the app can read is a
+   witness the app can quote.
+3. **An equality oracle** — export one boolean, "the band's rows equal the
+   client's rows beneath them". No pixels, no digest, and it is the worst of
+   the three: a confined app paints candidate colour `C` over its whole
+   surface, reads the bit, and has `S == C`; 7.1 M commits recover the secret.
+   This is the trap worth remembering, because it passes the "export no
+   pixels" rule that looks like the right rule.
+
+So the rule the #139 instrumentation holds to is stricter: **every field the
+core exports must be a constant function of the run, independent of the
+*value* of the indicator** — checked mechanically by `band_witness.rs`'s
+`a_report_does_not_depend_on_the_bands_colour` (and again, over composites
+that also carry the scrim, the card and the trusted ring, by
+`…_with_a_card_up`), which requires two runs identical but for the secret to
+produce byte-identical reports.
+
+**The fourth direction, which those three do not touch: a human in the loop.**
+#139 proposed it first — "a nested-mode gate with a human in the loop,
+extending `shim/docs/firefox.md` §9 into something recorded and repeatable
+(accepts that it is not CI-automatable)" — and the reasoning above is no
+argument against it, because it is the one direction where nothing a program
+can read ever learns the colour: the channel is an eye. It is **not done**, and
+saying "closed" without saying that would be the understatement this checklist
+exists to catch. What is there today is one clause of §9 ("visible in the
+trusted indicator band, issue #85") in a recipe about the dead-man chord;
+there is no written procedure in which a person notes the band's colour at
+startup, is shown a confined app's rasterized counterfeit of a consent card,
+and records that it is unframed or wrong-framed. Writing that — and a fixture
+app that renders the counterfeit, which does not exist either — is real,
+unscheduled work, tracked nowhere as of this edit. It would not make the
+positive half CI-able and would not change the "Not CI-able" verdict in the
+table above; it would move that row's evidence from an incidental mention to a
+signed-off procedure, which is a different and smaller claim than a gate.
+Recorded here so that "closed" reads as *adjudicated* rather than *unmentioned*.
+
+**What the negative gate proves, precisely.** A real `click-target`, clicked by
+the agent through the real chokepoint, repaints its **whole surface** — the
+band's rows included — from black to red; that is the strongest counterfeit
+available to something that cannot observe the colour it would have to match.
+The band's rows are then exactly the app's own colour in **both** capture
+artifacts (the agent's `observe()` frame and `--capture-dump`), before and
+after, and both of those colours carry a channel below the indicator's `[64,
+255]` floor, so "the band is not in this capture" is certainty rather than a
+1-in-7-million coincidence. Meanwhile the core-side witness reports
+`band_changes == 0` across every composite **it evaluated**. Per this
+checklist's own generalisation — an absence needs the artifact's provenance
+asserted, or it is equally satisfied by no artifact at all — that zero is held
+up by counterweights in the same reply: `probe_changes` increases across the
+repaint, so the witness does see change when there is change; `composites` rises
+by **at least two** across a span containing exactly one `band` request, which
+is the load-bearing form of that assertion because `answer_band` recomposites
+before it reports, so each read bumps the counter by one on its own and a bare
+"it went up" would be satisfied by a witness wired only into the reply path;
+`tracks_view` refuses a frozen or erased human-visible framebuffer (which would
+hold its band rows constant for free); `band_uniform` refuses a
+partly-overdrawn or blended band; `refusals == 0`; and `probe_fnv`, a digest of
+*realm-view* rows just below the band, must equal the digest the harness
+computes over its own dump of the same instant.
+
+The gap between "every composite it evaluated" and "every composite of the
+session" is closed by code, not by the gate: `BandWitness::observe` is called
+from `HeadlessOutput::present`, the headless backend's single composition path.
+Say it that way round when citing this — the gate rules out a witness that only
+looks when asked, which is the mistake worth guarding mechanically; it does not
+count the session's composites independently and cannot.
+
+**What it does not prove, stated so a later reader cannot over-read it.** It
+proves a negative. It says nothing about whether the band is the right colour,
+nothing about the per-prompt trusted ring, nothing about the nested backend
+(it is the headless CPU composite; `backend/winit.rs` holds the two nested
+presentation paths against each other at component level), and nothing a human
+would call "unforgeable". **A green run here is not evidence that the trusted
+indicator cannot be forged.**
+
+Watched failing, as item (4) requires: four breakages of the real binary each
+turned it red on a different assertion — `composite_trust_band` made a no-op
+(`band_changes` 1 ≠ 0); the human-visible frame composited into the capture's
+retained image as well (5120 of 5120 band-row pixels off-colour, in one
+colour); `BandWitness::observe` stubbed out (the witness reports nothing and
+the run refuses to believe its zero); and `probe_fnv` computed over a synthetic
+buffer (the digest cross-check fails). The metric itself is additionally pinned
+in-process and binary-free in `band_witness.rs`, against one frame pair it must
+accept and one — the no-op band's — it must reject.
+
+The instrumentation is as narrowly gated as #138's injector, and rides the same
+channel rather than opening a second: the `vitrin-core/consent-injector` cargo
+feature (never a deployment build), `--headless`, and
+`--consent-injector-fd N` naming an inherited socketpair. The witness type is
+compiled under `cfg(any(test, feature = "consent-injector"))` so its arithmetic
+stays unit-tested in a plain `cargo test`; its wiring — the field on
+`HeadlessOutput`, the call in that backend's composite, the `band` reply — is
+under the feature alone. A shipping `vitrind` computes nothing and answers
+nothing, and the request is a *read* that confers nothing, so it adds no
+authority to the channel it rides.
 
 A third scope belongs in that list and is now recorded in both places: the
 gate says nothing about the human-visible frame **outside** the card
@@ -355,9 +475,13 @@ That review found a gap one level up, now closed too: `unittest discover`
 collects whatever `test_*.py` files happen to exist, so a **missing** named
 gate was indistinguishable from a green suite — not a gate that cannot fail,
 but a gate that cannot be noticed. `tests/integration/run.sh` and CI's "Guard
-against milestone-gate drift" step now assert every named milestone-gate
-module is present, and that the two build-feature lists agree, before anything
-else runs.
+against milestone-gate drift" step now assert every named gate module is
+present, and that the two build-feature lists agree, before anything else runs.
+`run.sh` keeps **two** lists for this, `MILESTONE_GATES` and `PROPERTY_GATES`,
+and the split is not bookkeeping: a milestone gate's absence is a claim about
+that milestone's definition of done, and `test_real_trust_band.py` (#139) is
+deliberately not one — it is guarded exactly as hard and cited for its own
+property only.
 
 ### Verification per milestone
 

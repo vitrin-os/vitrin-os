@@ -633,16 +633,28 @@ jobs:
         # failed, exit 0. That is how a milestone gets recorded as done on
         # evidence that does not exist (issue #138).
         #
-        # `run.sh` carries the authoritative list (MILESTONE_GATES) and fails
-        # the same way; this runs BEFORE the build + suite, so the answer
-        # arrives in seconds and does not depend on the toolchain, the C shim,
-        # or a green build.
+        # `run.sh` carries the authoritative lists (MILESTONE_GATES and
+        # PROPERTY_GATES) and fails the same way; this runs BEFORE the build +
+        # suite, so the answer arrives in seconds and does not depend on the
+        # toolchain, the C shim, or a green build.
+        #
+        # test_real_trust_band.py is in the second list on purpose: it is a
+        # mock-free real-app gate, but the property it proves (issue #139, the
+        # negative half of #85) is NOT an M1.4 criterion -- plan §5 adjudicated
+        # that -- so it must not appear in a check whose error text talks about
+        # a milestone's evidence.
         if: hashFiles('tests/integration/run.sh') != ''
         run: |
           missing=0
           for gate in test_real_app.py test_real_capture_fidelity.py test_real_actuation.py test_real_deadman.py test_real_consent.py test_demo.py; do
             if [ ! -f "tests/integration/$gate" ]; then
               echo "::error::named milestone gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with that milestone's evidence contributing nothing. Restore it, or retire it from run.sh's MILESTONE_GATES, this list, and tests/integration/README.md's gate table together."
+              missing=1
+            fi
+          done
+          for gate in test_real_trust_band.py; do
+            if [ ! -f "tests/integration/$gate" ]; then
+              echo "::error::named property gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with issue #139's evidence contributing nothing. Restore it, or retire it from run.sh's PROPERTY_GATES, this list, and tests/integration/README.md's gate table together."
               missing=1
             fi
           done
@@ -756,7 +768,10 @@ jobs:
           # `cargo build --workspace` above -- no extra CI wiring. The M1.4
           # actuation gate (test_real_actuation.py, P1.8.6) also runs here: its
           # click-target is a co-built shim sibling and its text rung reuses
-          # gtk-entry-probe. The Firefox rung (test_real_firefox.py)
+          # gtk-entry-probe. The trusted-band property gate
+          # (test_real_trust_band.py, issue #139) adds NO new CI wiring at all:
+          # it reuses that same click-target and rides the consent-injector
+          # feature the warm build already passes. The Firefox rung (test_real_firefox.py)
           # does NOT run here -- the pinned ESR is a 75 MB download this step
           # does not fetch -- so it is skipped for this suite and held by its
           # own dedicated step below, which fetches Firefox first. Without this

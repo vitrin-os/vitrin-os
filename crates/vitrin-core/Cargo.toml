@@ -246,9 +246,9 @@ scripted-consent = []
 # posture as `scripted-consent`, and for the same reason: a build that cannot
 # even name a test hook cannot be tricked into responding to one.
 dead-man-injector = []
-# Compile the out-of-process consent injector (issue #138): on the HEADLESS
-# backend only, and only when a runtime flag ALSO names it, three things a
-# deployment build cannot even mention --
+# Compile the out-of-process consent injector (issue #138, extended by #139):
+# on the HEADLESS backend only, and only when a runtime flag ALSO names it,
+# four things a deployment build cannot even mention --
 #
 #   1. the real interactive consent round (`session::service_consent_round`)
 #      driven once per dispatch, so a headless core really raises the front
@@ -261,7 +261,33 @@ dead-man-injector = []
 #      a physical click on the card deposits one;
 #   3. `HeadlessView::consent_occlusion_window`, which exports the CARD's
 #      footprint (and nothing else) of the human-visible framebuffer as a
-#      sealed memfd over that same socket.
+#      sealed memfd over that same socket;
+#   4. the trusted-band witness (issue #139) -- `backend::band_witness::
+#      BandWitness` as a field on `HeadlessOutput`, updated on EVERY composite
+#      from the two buffers `HeadlessOutput::present` already holds (the realm
+#      view and the human-visible output), plus a `band` request on that same
+#      socket that reports its ten ASCII counters. What it turns on, stated so
+#      this block is a complete answer to "what does an instrumented build
+#      expose": running counts of composites evaluated, of composites at which
+#      the human-visible band's rows changed (zero in a correct session -- the
+#      property), of composites at which the realm view's rows just BELOW the
+#      band changed, of composites refused for a malformed buffer; three
+#      latest-composite scalars (the band's height and the view's dimensions);
+#      two latest-composite booleans (the output below the band tracks the
+#      realm view; the band's rows are one opaque colour); and an FNV-1a-64
+#      digest of those realm-view rows below the band. No descriptor, no
+#      pixels. Each `band` request costs one extra composite, because
+#      `answer_band` recomposites first so the reply describes the frame on the
+#      virtual display now.
+#
+# (4) rides #138's channel rather than opening a second one because it is a
+# READ that confers nothing: it adds no authority to a socket that already
+# carries the power to answer a consent prompt, and a second unnamed socket
+# would be a second thing to keep right for no gain. Its *wiring* -- the field,
+# the call in `present`, the `band` arm -- is under the feature alone; only the
+# `band_witness` module itself is `cfg(any(test, feature = "consent-injector"))`,
+# so its arithmetic stays unit-tested in a plain `cargo test`. A shipping
+# `vitrind` computes nothing and answers nothing.
 #
 # The decision goes nowhere near `scripted-consent`'s `resolve_scripted`: it
 # is drained by the SAME `service_consent_round` and applied by the SAME
@@ -299,6 +325,19 @@ dead-man-injector = []
 # even read back. `HeadlessView::latest_output_rgba` stays `#[cfg(test)]`: no
 # shipping build and no instrumented build can obtain a whole human-visible
 # frame.
+#
+# The band witness (4) holds to a rule that is STRICTER than "export no
+# pixels", and the difference is the whole reason it is safe: a single boolean
+# "the band's rows equal the client's rows beneath them" exports no pixel and
+# is still an oracle -- a confined app paints candidate colour C, reads the
+# bit, and has `S == C` over a 22.8-bit space it can exhaust. So the rule is
+# that every field it exports must be a constant function of the run,
+# independent of the indicator's VALUE. Checked mechanically by
+# `band_witness.rs`'s `a_report_does_not_depend_on_the_bands_colour`, and again
+# over prompt-up composites (scrim, card and the indicator-coloured trusted
+# ring) by `..._with_a_card_up`: two runs identical but for the secret must
+# produce byte-identical reports. The one field derived from real pixels,
+# `probe_fnv`, digests REALM-VIEW rows, which the indicator is never in.
 #
 # Never enabled in a deployment build -- same posture as the two features
 # above, and for the same reason: a build that cannot even name a test hook

@@ -58,6 +58,18 @@
 //! holds the two paths against each other, including that they paint the one
 //! session secret and not two.
 
+/// The trusted-band witness (issue #139): the *negative* half of issue #85,
+/// measured on the headless backend's own composites.
+///
+/// Present in a `cargo test` build as well as a `consent-injector` feature
+/// build, and only those two — the same posture as
+/// [`crate::consent::injector`]'s parser, for the same reason. Everything in
+/// it is pure arithmetic over two buffers and it confers nothing; what is
+/// gated on the feature alone is the *wiring* (the field on
+/// [`headless::HeadlessOutput`], the call in its composite, and the `band`
+/// reply), so a plain build computes nothing and answers nothing.
+#[cfg(any(test, feature = "consent-injector"))]
+pub(crate) mod band_witness;
 pub mod headless;
 pub mod winit;
 

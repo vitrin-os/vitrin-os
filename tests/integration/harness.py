@@ -105,6 +105,11 @@ class ConsentInjector:
     * a synchronous **snapshot** -- ``describe`` replies with the consent
       surface's geometry and, when a card is up, the card's own footprint of
       the human-visible framebuffer as a sealed memfd over ``SCM_RIGHTS``;
+    * a synchronous **trusted-band witness** (issue #139) -- ``band`` replies
+      with ten scalar fields and no descriptor. It carries no pixels and,
+      more strongly, nothing whose value moves with the session's indicator
+      colour; `crates/vitrin-core/src/backend/band_witness.rs` argues why the
+      weaker "no pixels" rule would not have been enough;
     * **message acceptance** -- ``decide <token> <button>`` replies
       ``decided-ack <queued|...>``.
 
@@ -115,7 +120,14 @@ class ConsentInjector:
 
     #: Everything the core may say, so an unknown verb is a loud failure
     #: rather than a silently ignored line.
-    VERBS = ("vitrin-consent-injector", "raised", "lowered", "prompt", "decided-ack")
+    VERBS = (
+        "vitrin-consent-injector",
+        "raised",
+        "lowered",
+        "prompt",
+        "band",
+        "decided-ack",
+    )
 
     def __init__(self, sock: "socket_mod.socket") -> None:
         self.sock = sock
@@ -247,6 +259,49 @@ class ConsentInjector:
         if len(pixels) != size:
             raise InjectorFailed(f"short occlusion window: {len(pixels)} of {size} bytes")
         return out, pixels
+
+    def band(self, timeout: float = 30.0) -> dict[str, int]:
+        """The trusted-band witness (issue #139), as ten integers.
+
+        Deliberately returns **no pixels and no descriptor**, and that is not
+        a convenience of this method -- it is the shape of the reply. The
+        session's trusted-indicator colour never reaches a file or a
+        descriptor in any build, so a harness cannot be handed the band to
+        look at; what it can be handed is a set of counters and booleans whose
+        values are the same whatever the colour is. See
+        `crates/vitrin-core/src/backend/band_witness.rs` for why an apparently
+        safer field ("do the band's rows equal the client's?") is a
+        brute-force oracle, and `tests/integration/test_real_trust_band.py`
+        for the gate that reads this.
+
+        Raises `InjectorFailed` if the core sent a descriptor with the reply:
+        that would mean pixels travelled, which nothing about this request may
+        ever cause.
+        """
+        fds_before = len(self._fds)
+        self.sock.sendall(b"band\n")
+        fields = self._next_reply("band", timeout)
+        keys = (
+            "composites",
+            "band_changes",
+            "probe_changes",
+            "tracks_view",
+            "band_uniform",
+            "refusals",
+            "band_h",
+            "view_w",
+            "view_h",
+        )
+        if len(fields) != len(keys) + 2:  # verb + scalars + the hex digest
+            raise InjectorFailed(f"malformed `band` reply: {fields!r}")
+        if len(self._fds) != fds_before:
+            raise InjectorFailed(
+                "the core sent a descriptor with a `band` reply; this request must never "
+                "move pixels (issue #85: the indicator reaches no descriptor in any build)"
+            )
+        out = {key: int(value) for key, value in zip(keys, fields[1:])}
+        out["probe_fnv"] = int(fields[-1], 16)
+        return out
 
     def decide(self, token: str, choice: str, timeout: float = 30.0) -> str:
         """Press a button on the prompt `token` names; return the ack word."""
@@ -939,6 +994,28 @@ def locate_colour(frame, hex6: str):
     if count == 0:
         return None, None, 0
     return sum_x // count, sum_y // count, count
+
+
+# -- the P1.7.6 trusted-band witness (issue #139) ---------------------------
+
+#: FNV-1a-64, the digest `crates/vitrin-core/src/backend/band_witness.rs`
+#: reports its probe strip under. Reimplemented here rather than shared,
+#: because this suite takes no dependency (D8) and the Rust side takes none
+#: either -- so the check that the two agree is a check that two independent
+#: readers of the same bytes reach the same number, which is exactly what the
+#: gate wants it for. Nothing about it is a security property: it covers
+#: realm-view pixels an observe grant may capture anyway.
+_FNV_OFFSET = 0xCBF29CE484222325
+_FNV_PRIME = 0x00000100000001B3
+_U64 = (1 << 64) - 1
+
+
+def fnv1a64(data: bytes) -> int:
+    """FNV-1a-64 over `data`, matching `band_witness.rs`'s `fnv1a64`."""
+    hashed = _FNV_OFFSET
+    for byte in data:
+        hashed = ((hashed ^ byte) * _FNV_PRIME) & _U64
+    return hashed
 
 
 def count_changed_pixels(before, after) -> int:

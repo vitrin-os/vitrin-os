@@ -82,6 +82,7 @@ use smithay::reexports::winit::event::{
 use smithay::reexports::winit::event_loop::{ActiveEventLoop, EventLoop as HostEventLoop};
 use smithay::reexports::winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 use smithay::reexports::winit::platform::scancode::PhysicalKeyExtScancode;
+use smithay::reexports::winit::platform::wayland::WindowAttributesExtWayland;
 use smithay::reexports::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use smithay::reexports::winit::window::{Window as WinitWindow, WindowAttributes, WindowId};
 use smithay::utils::{Buffer, Clock, Monotonic, Physical, Rectangle, Size, Transform};
@@ -103,6 +104,15 @@ use crate::session::{self, Runtime, RuntimeSeed};
 /// (`--headless --size 1280x800`, P1.3.2) so nested and headless views of
 /// the same content agree by default.
 const INITIAL_SIZE: (f64, f64) = (1280.0, 800.0);
+
+/// The nested window's Wayland `app_id`.
+///
+/// Part of the operator-facing contract, not an implementation detail:
+/// `docs/demo/RECORDING.md` tells a recording operator to match a
+/// float-and-size window rule on this exact string, because on a tiling
+/// compositor [`INITIAL_SIZE`] is only a request. Changing it breaks those
+/// recipes, so change both together.
+pub(crate) const NESTED_APP_ID: &str = "vitrind";
 
 /// Background behind the composed view; only visible if the blit fails.
 /// Deliberately near [`crate::scene::LETTERBOX_RGBA`] so nothing here reads
@@ -165,6 +175,17 @@ struct TextureKey {
     /// costs to [`HOLD_STEPS`] over its whole duration instead of one per
     /// frame. The visible result is identical at this bar's size.
     hold_bucket: Option<u8>,
+    /// The agent cursor's hotspot in **integer view pixels**, or `None` when
+    /// no sprite is shown (D-019).
+    ///
+    /// Integer for exactly the reason [`Self::hold_bucket`] is bucketed: the
+    /// router's position is an `f64`, and an `f64` in a `PartialEq` cache key
+    /// is a bug waiting for a rounding change. Quantizing through
+    /// [`crate::cursor::hotspot`] — the same function the sprite's geometry
+    /// is derived from — also makes the key exact rather than conservative:
+    /// two positions that would draw byte-identical sprites compare equal and
+    /// cost no re-upload, and two that would not, do not.
+    agent_cursor: Option<(i32, i32)>,
 }
 
 /// How many distinct fill levels the hold indicator has. Twenty steps across
@@ -179,12 +200,14 @@ impl TextureKey {
         scene: &Scene,
         consent: &ConsentSurface,
         hold: Option<f64>,
+        agent_cursor: Option<(f64, f64)>,
     ) -> Self {
         Self {
             size,
             scene_generation: scene.generation(),
             consent_generation: consent.generation(),
             hold_bucket: hold.map(|p| (p.clamp(0.0, 1.0) * HOLD_STEPS) as u8),
+            agent_cursor: agent_cursor.and_then(|(x, y)| crate::cursor::hotspot(x, y)),
         }
     }
 }
@@ -199,8 +222,9 @@ struct SceneTexture {
 
 /// The pixels this backend uploads as its window texture: the shared
 /// human-visible composition ([`super::compose_human_visible`]) — realm view
-/// plus the consent prompt, if one is up — and, above everything, the
-/// dead-man hold indicator (P1.7.3) while the human is mid-gesture.
+/// plus the consent prompt, if one is up — then the agent cursor sprite
+/// (D-019) where an agent is pointing, and, above everything, the dead-man
+/// hold indicator (P1.7.3) while the human is mid-gesture.
 ///
 /// Split out of [`NestedState::try_redraw`] so it can be tested without a
 /// display. Presenting those pixels needs an EGL/GLES context and a host
@@ -221,17 +245,41 @@ struct SceneTexture {
 /// inherits P1.7.1's fork either way: this is downstream of the point where
 /// capture takes the bare realm view, so the indicator can no more reach
 /// `vitrin_view.frame_ready` than the consent card can.
+///
+/// **The agent cursor (D-019) is applied here for the same reason and with
+/// the same argument**: a code-drawn, origin-derived overlay on the
+/// human-visible side of the output stage, so it can no more reach a capture
+/// than the card or the bar can — which is what turns the IDL's ordering
+/// invariant 4 from a vacuous rule into an exercised one. It is *not* here
+/// because headless cannot draw it: headless can, and does when the operator
+/// passes `--agent-cursor`. It is here because the sprite's position is
+/// nested-mode display policy, and because headless's human-visible
+/// framebuffer is measured byte-for-byte by the trusted-band witness
+/// (issue #139) and by `tests/integration/test_real_trust_band.py`, which
+/// assert it tracks the realm view outside the band — so a sprite on by
+/// default there would turn a mock-free milestone gate red for a cosmetic
+/// reason. See [`super::headless::run`]'s `agent_cursor` argument.
+///
+/// Draw order is deliberate: the trusted band goes on inside
+/// [`super::compose_human_visible`], the cursor after it but clipped below it
+/// ([`crate::cursor`]), and the hold indicator last of all — so nothing an
+/// agent positions can cover the strip the human reads the session colour
+/// from, and nothing at all can hide a hold in progress.
 fn window_pixels(
     scene: &Scene,
     consent: &mut ConsentSurface,
     hold: Option<f64>,
+    agent_cursor: Option<(f64, f64)>,
     size: Size<i32, Physical>,
 ) -> Vec<u8> {
     let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
     let mut pixels = super::compose_human_visible(scene, consent, w, h);
+    if let Some((x, y)) = agent_cursor {
+        crate::cursor::composite_agent_cursor(&mut pixels, w, h, x, y);
+    }
     if let Some(progress) = hold {
-        // Last, so a consent card can never hide the fact that the human is
-        // mid-gesture on the off-switch.
+        // Last, so neither a consent card nor an agent's cursor can hide the
+        // fact that the human is mid-gesture on the off-switch.
         crate::deadman::composite_hold_indicator(&mut pixels, w, h, progress);
     }
     pixels
@@ -1094,6 +1142,20 @@ pub(crate) struct NestedView {
     /// GPU to hold this on. `None` on every path that has not imported a
     /// dmabuf: the ordinary shm/CPU-compose path, unchanged.
     dmabuf_content: Option<GpuContent>,
+    /// The agent-owned pointer position this window draws the cursor sprite
+    /// at (D-019), pushed here once per dispatch round by
+    /// [`session::Presenter::set_agent_cursor`] from
+    /// [`crate::input::InputRouter::agent_pointer`].
+    ///
+    /// A copy rather than a borrow of the router because the composite happens
+    /// on the *host's* frame clock, long after the dispatch round that moved
+    /// the pointer has ended: `redraw` here only schedules, and `try_redraw`
+    /// runs from `WinitEvent::Redraw`. Both presentation paths read it — the
+    /// CPU upload through [`window_pixels`], the zero-copy path through
+    /// [`crate::dmabuf::present_human_visible`] — because a path that drew no
+    /// sprite would silently be the one issue #85 was about, one property
+    /// milder.
+    agent_cursor: Option<(f64, f64)>,
 }
 
 /// Per-run state of the nested backend: its presentation half, the session
@@ -1227,7 +1289,17 @@ fn run_inner(
     let (backend, winit_source) = init_nested_winit(
         WinitWindow::default_attributes()
             .with_inner_size(LogicalSize::new(INITIAL_SIZE.0, INITIAL_SIZE.1))
-            .with_title("vitrind (nested)"),
+            .with_title("vitrind (nested)")
+            // The Wayland app_id, and it is not cosmetic. `with_inner_size`
+            // above is a *request*: a tiling compositor (Hyprland, Sway,
+            // river) ignores it and hands the window whatever its tile is,
+            // which silently invalidates any absolute coordinate the demo or
+            // a recording recipe pins to INITIAL_SIZE. The operator's fix is
+            // a float-and-size rule, and every compositor matches those on
+            // app_id -- so without this there is nothing to match and the
+            // rule cannot be written at all. Stable by contract: recipes in
+            // docs/demo/ name this string.
+            .with_name(NESTED_APP_ID, "nested"),
         GlAttributes {
             version: (3, 0),
             profile: None,
@@ -1298,6 +1370,9 @@ fn run_inner(
             indicator,
             texture: None,
             dmabuf_content: None,
+            // No agent has moved a pointer yet; the first emulated motion
+            // establishes it (`InputRouter::agent_pointer`).
+            agent_cursor: None,
         },
         runtime: Runtime::new(
             seed.take().expect("the seed is consumed exactly once"),
@@ -1921,6 +1996,11 @@ impl NestedState {
                 // here — `submit` and `schedule_next_frame` right after need
                 // the whole `self.view`/`self` back.
                 let indicator = self.view.indicator;
+                // Copied out before the mutable borrow, same as the
+                // indicator. The sprite rides in the draw list rather than
+                // being applied by this caller, so the zero-copy path cannot
+                // quietly present without it (`dmabuf::human_visible_frame`).
+                let agent_cursor = self.view.agent_cursor;
                 let (renderer, mut framebuffer) = self.view.backend.bind()?;
                 let content = self.view.dmabuf_content.as_ref().expect("checked above");
                 present_human_visible(
@@ -1932,6 +2012,7 @@ impl NestedState {
                     WINDOW_TRANSFORM,
                     content,
                     indicator,
+                    agent_cursor,
                 )?;
             }
             self.view.backend.submit(None)?;
@@ -1950,7 +2031,18 @@ impl NestedState {
         // scene next happens to change (the trap
         // `the_texture_key_changes_on_every_visible_transition` was written
         // for).
-        let key = TextureKey::current(size, &self.view.scene, &self.view.consent, hold);
+        // The agent cursor folds into the same key, for the same reason the
+        // hold bucket does: without it a sprite would move only when the
+        // scene or the consent surface next happened to change, which for an
+        // agent hovering over a static app is never.
+        let agent_cursor = self.view.agent_cursor;
+        let key = TextureKey::current(
+            size,
+            &self.view.scene,
+            &self.view.consent,
+            hold,
+            agent_cursor,
+        );
         // The scene's own pending damage (P1.3.9, issue #117), drained here
         // at most once per redraw whenever the scene changed — regardless of
         // which branch below ends up using it. `Scene::take_damage_view`'s
@@ -1967,7 +2059,13 @@ impl NestedState {
             None
         };
         if self.view.texture.as_ref().map(|v| v.key) != Some(key) {
-            let pixels = window_pixels(&self.view.scene, &mut self.view.consent, hold, size);
+            let pixels = window_pixels(
+                &self.view.scene,
+                &mut self.view.consent,
+                hold,
+                agent_cursor,
+                size,
+            );
             let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
 
             // Damage-limited upload: if the *only* thing that changed since
@@ -1979,15 +2077,25 @@ impl NestedState {
             // into view-space coordinates; this is the seam that turns it
             // into fewer bytes crossing the GPU bus. Any other cause — the
             // first frame, a resize, unbounded scene damage (a fresh/resized
-            // surface, or a shim that named none), or a consent/hold
-            // transition riding along with this scene change — takes the
-            // full [`ImportMem::import_memory`] path unchanged from before
-            // this.
+            // surface, or a shim that named none), or a consent / hold /
+            // agent-cursor transition riding along with this scene change —
+            // takes the full [`ImportMem::import_memory`] path unchanged from
+            // before this.
+            //
+            // **The agent-cursor term is load-bearing, not symmetry.** The
+            // sprite is drawn wherever the agent is pointing, which in the
+            // general case is outside the scene's damage rectangle — so a
+            // re-upload bounded to that rectangle would leave the *previous*
+            // sprite standing in the texture and put the new one nowhere: the
+            // cursor would smear a trail across the window instead of moving.
+            // The same failure the consent and hold terms exist to stop, one
+            // overlay along.
             let bounded_scene_only_damage = match (&self.view.texture, scene_damage) {
                 (Some(prev), Some(rect))
                     if prev.key.size == key.size
                         && prev.key.consent_generation == key.consent_generation
-                        && prev.key.hold_bucket == key.hold_bucket =>
+                        && prev.key.hold_bucket == key.hold_bucket
+                        && prev.key.agent_cursor == key.agent_cursor =>
                 {
                     Some(rect)
                 }
@@ -2283,6 +2391,30 @@ impl session::Presenter for NestedView {
         self.backend.window().request_redraw();
     }
 
+    /// Take the router's agent-owned position for the sprite this window
+    /// draws (D-019), reporting whether the drawn result would differ.
+    ///
+    /// The comparison is on the **quantized hotspot**, not the raw `f64`:
+    /// two positions inside the same view pixel draw byte-identical sprites,
+    /// so reporting a change for them would request a host frame that
+    /// composited nothing new — the anti-amplification posture the whole
+    /// dirty/`request_present` split exists for. It is the same quantization
+    /// [`TextureKey::agent_cursor`] keys on, so this method and the texture
+    /// cache cannot disagree about what counts as a move.
+    ///
+    /// Nested mode always composites the sprite. It is the mode a human is
+    /// watching, and the reason this change exists at all — an operator was
+    /// told to "watch the cursor move" at a window that drew none.
+    fn set_agent_cursor(&mut self, pos: Option<(f64, f64)>) -> bool {
+        let quantize =
+            |pos: Option<(f64, f64)>| pos.and_then(|(x, y)| crate::cursor::hotspot(x, y));
+        if quantize(self.agent_cursor) == quantize(pos) {
+            return false;
+        }
+        self.agent_cursor = pos;
+        true
+    }
+
     /// The scene, `None` for the retained half, and the dmabuf importer
     /// bound to this backend's live `GlesRenderer` (P1.3.5, issue #117).
     ///
@@ -2383,7 +2515,7 @@ mod tests {
         // the top (issue #85). Below the band it is the realm view byte for
         // byte; the band itself is the session colour, present on the
         // human-visible upload and never in the capture (Scene::compose).
-        let plain = window_pixels(&scene, &mut consent, None, size);
+        let plain = window_pixels(&scene, &mut consent, None, None, size);
         let composed = scene.compose(W as u32, H as u32);
         let band_bytes =
             crate::consent::TRUST_BAND_HEIGHT as usize * W as usize * crate::scene::BYTES_PER_PIXEL;
@@ -2404,8 +2536,17 @@ mod tests {
         );
 
         // Prompt up: the window shows the shared human-visible composition.
+        //
+        // With no hold and no agent cursor, both of which are nested-side
+        // overlays this backend applies *after* the shared step. The equality
+        // below is exactly that case and no wider: a hold in progress, or an
+        // agent pointing at the window, makes nested's output differ from what
+        // headless retains by design (the hold indicator has no meaning on a
+        // backend with no physical input device; the agent cursor is opt-in
+        // there — see `window_pixels` and D-019). What must never drift is the
+        // shared composition underneath, which is what this pins.
         consent.show_for_test(prompt_fixture());
-        let with_prompt = window_pixels(&scene, &mut consent, None, size);
+        let with_prompt = window_pixels(&scene, &mut consent, None, None, size);
         assert_ne!(
             with_prompt, plain,
             "the prompt must change what is uploaded"
@@ -2482,17 +2623,29 @@ mod tests {
         let mut consent = ConsentSurface::new(indicator);
         for hold in [None, Some(0.0), Some(0.5), Some(1.0)] {
             assert_eq!(
-                band_px(&window_pixels(&scene, &mut consent, hold, size)),
+                band_px(&window_pixels(&scene, &mut consent, hold, None, size)),
                 indicator.color(),
                 "the CPU path dropped the trusted band (hold={hold:?})"
             );
         }
         consent.show_for_test(prompt_fixture());
         assert_eq!(
-            band_px(&window_pixels(&scene, &mut consent, None, size)),
+            band_px(&window_pixels(&scene, &mut consent, None, None, size)),
             indicator.color(),
             "a raised prompt must not cover the band it is checked against"
         );
+        // An agent's cursor aimed straight at the band cannot cover it
+        // either, and that one is the sharper case: the position is the
+        // agent's own choice, so an unclipped sprite at row 0 would be a
+        // forgery surface rather than an overlap (`crate::cursor`).
+        let mut idle = ConsentSurface::new(indicator);
+        for aim in [(0.0, 0.0), (W as f64 / 2.0, 0.0), (W as f64 / 2.0, 3.0)] {
+            assert_eq!(
+                band_px(&window_pixels(&scene, &mut idle, None, Some(aim), size)),
+                indicator.color(),
+                "an agent's cursor at {aim:?} painted into the trusted band"
+            );
+        }
 
         // Path 2, the zero-copy dmabuf present: the band is the last thing
         // the frame draws, at the same rectangle, in the same colour. The
@@ -2500,11 +2653,12 @@ mod tests {
         // against `trust_band_rect(size)` — asserting a function's output
         // equals that same function's output is vacuous, and this test used
         // to pass with the band collapsed to zero size.
-        let draws = crate::dmabuf::human_visible_frame(size, (300, 200), indicator);
-        let crate::dmabuf::Draw::TrustBand(band, band_rgba) = draws[2] else {
+        let draws = crate::dmabuf::human_visible_frame(size, (300, 200), indicator, None);
+        let last = crate::dmabuf::HUMAN_VISIBLE_DRAWS - 1;
+        let crate::dmabuf::Draw::TrustBand(band, band_rgba) = draws[last] else {
             panic!(
                 "the zero-copy path presented a frame made only of client pixels: {:?}",
-                draws[2]
+                draws[last]
             )
         };
         assert_eq!(
@@ -2530,6 +2684,85 @@ mod tests {
             probe[..crate::scene::BYTES_PER_PIXEL],
             band_rgba,
             "the GPU band's colour must be the very colour the consent surface paints"
+        );
+    }
+
+    /// **Neither presentation path on this backend drops the agent cursor,
+    /// and they draw the same one** (D-019).
+    ///
+    /// Issue #85's bug, one property milder: the nested backend has two
+    /// human-visible paths, the zero-copy dmabuf branch bypasses the CPU
+    /// output stage entirely, and the first cut of the trusted band was
+    /// painted on only one of them while the whole suite stayed green. A
+    /// cursor that existed on the CPU path alone would vanish the moment a
+    /// client committed a dmabuf — the operator would be told again to watch a
+    /// cursor that is not there, for a reason no test named.
+    ///
+    /// GL presentation needs a display, so what is pinned is the decision each
+    /// path makes: the pixels [`window_pixels`] composes, and the draw list
+    /// [`crate::dmabuf::present_human_visible`] executes. The two are held
+    /// against each other rather than each against its own constants — a
+    /// crosshair of a different size or colour on the GPU path would fail
+    /// here.
+    #[test]
+    fn no_presentation_path_can_drop_the_agent_cursor() {
+        use crate::cursor::{AGENT_CURSOR_CORE, AGENT_CURSOR_HALO};
+
+        const W: i32 = 400;
+        const H: i32 = 300;
+        let size = size_of(W, H);
+        let indicator = TrustedIndicator::for_test();
+        let at = (200.0_f64, 150.0_f64);
+
+        let mut scene = Scene::new();
+        scene
+            .commit(SurfaceContent::from_rgba(client_pixels(400, 300), 400, 300).expect("content"));
+
+        // Path 1, the CPU texture upload: the sprite's colours really appear,
+        // and only when a cursor is shown.
+        let mut consent = ConsentSurface::new(indicator);
+        let without = window_pixels(&scene, &mut consent, None, None, size);
+        let with = window_pixels(&scene, &mut consent, None, Some(at), size);
+        assert_ne!(with, without, "the CPU path dropped the agent cursor");
+        let count = |px: &[u8], rgba: [u8; 4]| {
+            px.chunks_exact(crate::scene::BYTES_PER_PIXEL)
+                .filter(|pixel| *pixel == rgba)
+                .count()
+        };
+        assert_eq!(count(&without, AGENT_CURSOR_CORE), 0);
+        assert!(count(&with, AGENT_CURSOR_CORE) > 0);
+        assert!(count(&with, AGENT_CURSOR_HALO) > 0);
+
+        // Path 2, the zero-copy dmabuf present: the same rectangles, in the
+        // same order, in the same colours — derived from one geometry function
+        // (`crate::cursor::agent_cursor_rects`), which is why this can be an
+        // equality rather than a family of hand-written expectations.
+        let draws = crate::dmabuf::human_visible_frame(size, (400, 300), indicator, Some(at));
+        let gpu: Vec<_> = draws
+            .iter()
+            .filter_map(|draw| match draw {
+                crate::dmabuf::Draw::AgentCursor(rect, rgba) => {
+                    Some((rect.loc.x, rect.loc.y, rect.size.w, rect.size.h, *rgba))
+                }
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<_> = crate::cursor::agent_cursor_rects(W as u32, H as u32, at.0, at.1)
+            .expect("a 400x300 view has room for a sprite")
+            .iter()
+            .map(|r| (r.x, r.y, r.w as i32, r.h as i32, r.rgba))
+            .collect();
+        assert_eq!(
+            gpu, expected,
+            "the zero-copy path draws a different agent cursor than the CPU path"
+        );
+        // ...and a frame with no cursor really has none, so the equality above
+        // is not passing on an unconditional draw.
+        assert!(
+            crate::dmabuf::human_visible_frame(size, (400, 300), indicator, None)
+                .iter()
+                .all(|draw| !matches!(draw, crate::dmabuf::Draw::AgentCursor(..))),
+            "the zero-copy path drew a cursor for a frame that has none"
         );
     }
 
@@ -2592,11 +2825,37 @@ mod tests {
         // mid-hold differs from the capture, which carries neither the trusted
         // band nor the indicator — it is the bare view, unchanged.
         let mut idle = ConsentSurface::new(TrustedIndicator::for_test());
-        let with_hold = window_pixels(&scene, &mut idle, Some(0.5), size);
+        let with_hold = window_pixels(&scene, &mut idle, Some(0.5), None, size);
         assert_ne!(
             capture, with_hold,
             "the dead-man hold indicator must never reach the capture"
         );
+
+        // And so is the agent cursor (D-019, IDL ordering invariant 4): the
+        // window carries it, the capture does not, and not one pixel of either
+        // sprite colour appears in the composed realm view.
+        let with_cursor = window_pixels(&scene, &mut idle, None, Some((400.0, 300.0)), size);
+        assert_ne!(
+            capture, with_cursor,
+            "the agent cursor must never reach the capture"
+        );
+        for colour in [
+            crate::cursor::AGENT_CURSOR_CORE,
+            crate::cursor::AGENT_CURSOR_HALO,
+        ] {
+            assert!(
+                !capture
+                    .chunks_exact(crate::scene::BYTES_PER_PIXEL)
+                    .any(|px| px == colour),
+                "an agent-cursor pixel ({colour:?}) reached a nested capture"
+            );
+            assert!(
+                with_cursor
+                    .chunks_exact(crate::scene::BYTES_PER_PIXEL)
+                    .any(|px| px == colour),
+                "...and the sprite really was drawn on the human-visible side"
+            );
+        }
 
         // A degenerate (minimized) window has no realm view to serve, so the
         // capture meets the chokepoint's `no_surface` refusal.
@@ -2616,47 +2875,73 @@ mod tests {
         let mut scene = Scene::new();
         let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
 
-        let base = TextureKey::current(size, &scene, &consent, None);
+        let base = TextureKey::current(size, &scene, &consent, None, None);
         assert_eq!(
             base,
-            TextureKey::current(size, &scene, &consent, None),
+            TextureKey::current(size, &scene, &consent, None, None),
             "an unchanged output must not force a re-upload"
         );
 
         // A prompt going up, and coming back down, both re-upload.
         consent.show_for_test(prompt_fixture());
-        let shown = TextureKey::current(size, &scene, &consent, None);
+        let shown = TextureKey::current(size, &scene, &consent, None, None);
         assert_ne!(base, shown, "a prompt appearing must re-upload");
         consent.dismiss_for_test();
-        let dismissed = TextureKey::current(size, &scene, &consent, None);
+        let dismissed = TextureKey::current(size, &scene, &consent, None, None);
         assert_ne!(shown, dismissed, "a prompt going away must re-upload");
 
         // The queue advancing to a different petition re-uploads too, so the
         // window cannot keep showing a decided petition's card.
         consent.show_for_test(prompt_fixture());
-        let first = TextureKey::current(size, &scene, &consent, None);
+        let first = TextureKey::current(size, &scene, &consent, None, None);
         let mut next = prompt_fixture();
         next.principal =
             crate::identity::PrincipalIdentity::parse("vitrin://local/agent/other").unwrap();
         consent.show_for_test(next);
         assert_ne!(
             first,
-            TextureKey::current(size, &scene, &consent, None),
+            TextureKey::current(size, &scene, &consent, None, None),
             "a different petition must re-upload"
         );
 
         // And the two pre-existing inputs still matter.
-        let held = TextureKey::current(size, &scene, &consent, None);
+        let held = TextureKey::current(size, &scene, &consent, None, None);
         scene.commit(SurfaceContent::from_rgba(client_pixels(64, 48), 64, 48).expect("content"));
         assert_ne!(
             held,
-            TextureKey::current(size, &scene, &consent, None),
+            TextureKey::current(size, &scene, &consent, None, None),
             "a scene commit must re-upload"
         );
         assert_ne!(
-            TextureKey::current(size, &scene, &consent, None),
-            TextureKey::current(size_of(640, 480), &scene, &consent, None),
+            TextureKey::current(size, &scene, &consent, None, None),
+            TextureKey::current(size_of(640, 480), &scene, &consent, None, None),
             "a resize must re-upload"
+        );
+
+        // The agent cursor is the newest input (D-019) and the same trap: a
+        // sprite left out of the key would move only when something else
+        // happened to change, which for an agent hovering over a static app
+        // is never — the operator watches a frozen crosshair.
+        let no_cursor = TextureKey::current(size, &scene, &consent, None, None);
+        let at_100 = TextureKey::current(size, &scene, &consent, None, Some((100.0, 100.0)));
+        assert_ne!(
+            no_cursor, at_100,
+            "an agent cursor appearing must re-upload"
+        );
+        assert_ne!(
+            at_100,
+            TextureKey::current(size, &scene, &consent, None, Some((140.0, 100.0))),
+            "an agent cursor MOVING must re-upload"
+        );
+        assert_eq!(
+            at_100,
+            TextureKey::current(size, &scene, &consent, None, Some((100.4, 99.8))),
+            "a sub-pixel move draws the same sprite and must not re-upload"
+        );
+        assert_eq!(
+            no_cursor,
+            TextureKey::current(size, &scene, &consent, None, Some((f64::NAN, 0.0))),
+            "a position that is not a number draws no sprite, so it is no transition"
         );
     }
 
@@ -2680,14 +2965,14 @@ mod tests {
 
         // No hold: the window is the ordinary human-visible composition,
         // byte for byte. The indicator costs an idle session nothing.
-        let idle = window_pixels(&scene, &mut consent, None, size);
+        let idle = window_pixels(&scene, &mut consent, None, None, size);
         assert_eq!(
             idle,
             super::super::compose_human_visible(&scene, &mut consent, W as u32, H as u32)
         );
 
         // Mid-hold: the top edge changes, and nothing below the bar does.
-        let holding = window_pixels(&scene, &mut consent, Some(0.5), size);
+        let holding = window_pixels(&scene, &mut consent, Some(0.5), None, size);
         assert_ne!(holding, idle, "a hold in progress must be visible");
         let below = (8 * W * 4) as usize;
         assert_eq!(
@@ -2699,8 +2984,8 @@ mod tests {
         // It is drawn above a consent card, so a prompt cannot hide the fact
         // that the human is mid-gesture on the off-switch.
         consent.show_for_test(prompt_fixture());
-        let prompt_only = window_pixels(&scene, &mut consent, None, size);
-        let prompt_and_hold = window_pixels(&scene, &mut consent, Some(0.9), size);
+        let prompt_only = window_pixels(&scene, &mut consent, None, None, size);
+        let prompt_and_hold = window_pixels(&scene, &mut consent, Some(0.9), None, size);
         assert_ne!(prompt_and_hold, prompt_only);
 
         // And every visible step of the fill re-uploads.
@@ -2711,6 +2996,7 @@ mod tests {
                 &scene,
                 &consent,
                 Some(f64::from(step) / 10.0),
+                None,
             ));
         }
         keys.dedup();
@@ -2720,8 +3006,8 @@ mod tests {
             keys.len()
         );
         assert_ne!(
-            TextureKey::current(size, &scene, &consent, Some(1.0)),
-            TextureKey::current(size, &scene, &consent, None),
+            TextureKey::current(size, &scene, &consent, Some(1.0), None),
+            TextureKey::current(size, &scene, &consent, None, None),
             "the indicator disappearing must re-upload too"
         );
     }

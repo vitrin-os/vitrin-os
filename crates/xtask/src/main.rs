@@ -80,7 +80,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless]\n       cargo xtask bless [--filter SUBSTR]"
+    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]"
 }
 
 fn run() -> Result<()> {
@@ -106,9 +106,26 @@ fn run() -> Result<()> {
         }
         "demo" => {
             let mut headless = false;
-            for arg in &args[1..] {
+            // The task record the agent is handed. Collected here and
+            // forwarded to `run_demo.py` VERBATIM: the demo's assertion is
+            // computed from the supplied task at runtime, so this launcher
+            // must not normalise, reorder or default it silently -- the
+            // canonical string, and every receipt band, depends on the order
+            // these arrive in.
+            let mut task: Vec<String> = Vec::new();
+            let mut rest = args[1..].iter();
+            while let Some(arg) = rest.next() {
                 match arg.as_str() {
                     "--headless" => headless = true,
+                    "--task" => {
+                        let Some(pair) = rest.next() else {
+                            bail!("--task needs a K=V argument\n\n{}", usage());
+                        };
+                        if !pair.contains('=') {
+                            bail!("--task {pair} is not of the form K=V\n\n{}", usage());
+                        }
+                        task.push(pair.clone());
+                    }
                     "-h" | "--help" => {
                         println!("{}", usage());
                         return Ok(());
@@ -116,7 +133,7 @@ fn run() -> Result<()> {
                     other => bail!("unknown flag '{other}' for 'demo'\n\n{}", usage()),
                 }
             }
-            demo(headless)
+            demo(headless, &task)
         }
         "bless" => {
             let mut filter: Option<String> = None;
@@ -509,13 +526,42 @@ const WLR_ENV: [(&str, &str); 4] = [
     ("WLR_LIBINPUT_NO_DEVICES", "1"),
 ];
 
-/// The headless venue's app: a trivial, genuinely real Wayland client with
-/// visible chrome -- the same rung `tests/integration/test_real_app.py` and
-/// the shim's own acceptance scripts (`shim/tests/acceptance/app_spawn.sh`)
-/// use. Never `vitrin-mock-shim` (issue #110): the mock shim is a unit-test
-/// fixture only, and must appear in no demo venue. `VITRIN_DEMO_APP`
-/// overrides the choice; otherwise the first of these found on `PATH` wins.
-const HEADLESS_APP_CANDIDATES: [&str; 2] = ["weston-terminal", "foot"];
+/// The headless venue's app: `form-target` (`shim/tests/form_target.c`), a
+/// bare wl_shm + xdg-shell + wl_pointer + wl_keyboard client co-built with the
+/// shim. It is the app the *goal-directed* demo needs and that no third-party
+/// program provides: two locatable input fields, a locatable submit button,
+/// per-field text accumulation, and -- on submit -- a receipt whose three band
+/// colours are a pure function of the whole record it received, plus a
+/// byte-exact `SUBMIT ... canon=<hex>` line on stdout.
+///
+/// Never `vitrin-mock-shim` (issue #110): the mock shim is a unit-test fixture
+/// only, and must appear in no demo venue. `form-target` is not one -- it is a
+/// real Wayland client -- but it IS repo-authored, which the previous headless
+/// app (`weston-terminal`) was not. That trade is disclosed in
+/// `examples/agent-demo/README.md` and in `docs/plan/01-phase-1-mvp.md`'s D12
+/// seam table rather than left for a reader to notice.
+///
+/// Resolved as a sibling of the real shim binary, exactly as
+/// `tests/integration/test_real_actuation.py` resolves `click-target`;
+/// `VITRIN_DEMO_APP` overrides it.
+const HEADLESS_APP: &str = "form-target";
+
+/// How long the headless app stays up. It must outlive the whole agent flow
+/// (locate/click/type per field, submit, receipt decode) plus the core's boot,
+/// with room for a loaded CI runner; the core SIGTERMs it at teardown long
+/// before this expires.
+const HEADLESS_APP_RUN_MS: &str = "120000";
+
+/// The task record the agent is handed when no `--task K=V` is supplied.
+///
+/// **Must name the same keys, in the same order, as `run_demo.py`'s
+/// `TASK_DEFAULT`** -- this launcher passes the KEYS to the app (`--field
+/// NAME`, so the app can build the same canonical string) while the agent
+/// types the VALUES, so a disagreement would make the receipt unmatchable for
+/// a reason that looks like a delivery failure.
+/// `tests/integration/test_demo.py::DefaultTaskAgreesAcrossLaunchers` pins the
+/// two together.
+const DEFAULT_TASK: [(&str, &str); 2] = [("name", "Ada Lovelace"), ("email", "ada@example.org")];
 
 /// Default Firefox ESR path for the nested venue. Overridable with
 /// `VITRIN_DEMO_FIREFOX` because the binary's name and location vary by distro
@@ -525,7 +571,11 @@ const DEFAULT_FIREFOX: &str = "/usr/bin/firefox-esr";
 
 /// `cargo xtask demo`: launch the shipped core and drive the demo agent
 /// against it, in whichever venue was selected.
-fn demo(headless: bool) -> Result<()> {
+///
+/// `task` is the raw `K=V` strings from the command line, in order, empty when
+/// none were given. They are forwarded to the agent verbatim; only the KEYS are
+/// interpreted here, and only to tell the headless app its field names.
+fn demo(headless: bool, task: &[String]) -> Result<()> {
     let root = workspace_root()?;
     let bin_dir = binary_dir()?;
     let vitrind = bin_dir.join("vitrind");
@@ -584,13 +634,25 @@ fn demo(headless: bool) -> Result<()> {
         // environment may grow by, so it must name exactly the WLR_* set the
         // shim's software-render backend needs (mirrors
         // `tests/integration/test_real_app.py`'s `WLR_ENV`/`env_allow`).
-        let app_bin = resolve_headless_app()?;
+        let app_bin = resolve_headless_app(&shim_bin)?;
+        // `form-target` is told the field NAMES so it can build the same
+        // canonical string the agent computes its expected receipt from. The
+        // VALUES are never passed here -- the only way they can reach the app
+        // is the agent typing them through the real chokepoint, which is the
+        // whole point of the demo.
+        let mut app_args: Vec<String> =
+            vec!["--run-ms".to_string(), HEADLESS_APP_RUN_MS.to_string()];
+        for key in task_keys(task) {
+            app_args.push("--field".to_string());
+            app_args.push(key);
+        }
         fs::write(
             &realm,
             format!(
-                "[[realm]]\nid = \"realm-0\"\ncommand = \"{}\"\nargs = []\n\
+                "[[realm]]\nid = \"realm-0\"\ncommand = \"{}\"\nargs = {}\n\
                  env_allow = {}\n",
                 app_bin.display(),
+                toml_string_array(app_args.iter().map(String::as_str)),
                 toml_string_array(WLR_ENV.iter().map(|(name, _)| *name)),
             ),
         )
@@ -720,6 +782,12 @@ fn demo(headless: bool) -> Result<()> {
     } else {
         demo_cmd.args(["--consent", "interactive"]);
     }
+    // Forwarded VERBATIM, in order. The agent's assertion is computed from the
+    // task it is handed, at runtime, so this launcher must not touch it: a
+    // reordering here would silently change every expected receipt band.
+    for pair in task {
+        demo_cmd.args(["--task", pair]);
+    }
     let status = match demo_cmd.status() {
         Ok(status) => status,
         Err(err) => {
@@ -760,17 +828,41 @@ fn binary_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("xtask binary {} has no parent directory", exe.display()))
 }
 
-/// A TOML inline array of basic string literals, for a realm's `env_allow`.
-/// Mirrors `tests/integration/harness.py`'s `_toml_string_array`; a render
-/// selector's NAME is a fixed literal here (never a program path or anything
-/// else that could carry a quote), so no escaping is needed.
+/// A TOML inline array of basic string literals, for a realm's `env_allow` or
+/// `args`. Mirrors `tests/integration/harness.py`'s `_toml_string_array`,
+/// including its escaping: the render-selector names this used to be the only
+/// caller for are fixed literals, but `args` now carries a task's field NAMES
+/// straight off the command line, and those can contain anything a shell will
+/// pass. An unescaped quote there would produce a realm file the loader
+/// (`crates/vitrin-core/src/toml_subset.rs`) reads as something else entirely.
 fn toml_string_array<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
     let joined = names
         .into_iter()
-        .map(|name| format!("\"{name}\""))
+        .map(|name| format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect::<Vec<_>>()
         .join(", ");
     format!("[{joined}]")
+}
+
+/// The field NAMES of the supplied task, in order, or [`DEFAULT_TASK`]'s keys
+/// when none were supplied. Only the part before the first `=` is a key: a
+/// value may contain `=` freely, and `run_demo.py`'s `parse_task` splits on the
+/// FIRST one for exactly that reason, so this must too.
+fn task_keys(task: &[String]) -> Vec<String> {
+    if task.is_empty() {
+        return DEFAULT_TASK
+            .iter()
+            .map(|(key, _)| (*key).to_string())
+            .collect();
+    }
+    task.iter()
+        .map(|pair| {
+            pair.split_once('=')
+                .map(|(key, _)| key)
+                .unwrap_or(pair)
+                .to_string()
+        })
+        .collect()
 }
 
 /// True if `path` names a regular, executable file.
@@ -780,17 +872,6 @@ fn is_executable(path: &Path) -> bool {
         && fs::metadata(path)
             .map(|meta| meta.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
-}
-
-/// The first directory on `PATH` that holds an executable named `name`, or
-/// `None`. A minimal, dependency-free stand-in for the `which` command --
-/// this crate pulls in no new crate for it (matching its one-dependency
-/// posture: `anyhow` plus the `rustix` this task's own SIGTERM path needs).
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
 }
 
 /// Resolve the real per-app Wayland shim (issue #103/#104): a wlroots
@@ -815,12 +896,15 @@ fn resolve_shim_bin(root: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Resolve the headless venue's app (issue #110): `VITRIN_DEMO_APP` overrides
-/// it; otherwise the first of [`HEADLESS_APP_CANDIDATES`] found on `PATH`
-/// wins. Both are genuinely real Wayland clients -- unlike the shim, whose
-/// path has one supported binary, a demo should not hard-fail a developer who
-/// has `foot` but not `weston`, so this searches rather than picking one name.
-fn resolve_headless_app() -> Result<PathBuf> {
+/// Resolve the headless venue's app: [`HEADLESS_APP`] built beside the real
+/// shim, or an explicit `VITRIN_DEMO_APP`.
+///
+/// Not a `PATH` search any more, and that is the substantive change: the
+/// goal-directed demo's app is `form-target`, which is co-built with the shim
+/// (`shim/meson.build`) rather than installed by a distro, so its absence
+/// beside a built shim is a build misconfiguration to report -- exactly how
+/// `tests/integration/test_real_actuation.py` resolves `click-target`.
+fn resolve_headless_app(shim_bin: &Path) -> Result<PathBuf> {
     if let Some(value) = std::env::var_os("VITRIN_DEMO_APP") {
         let path = PathBuf::from(&value);
         if is_executable(&path) {
@@ -831,15 +915,21 @@ fn resolve_headless_app() -> Result<PathBuf> {
             path.display()
         );
     }
-    for name in HEADLESS_APP_CANDIDATES {
-        if let Some(path) = find_on_path(name) {
-            return Ok(path);
-        }
+    let dir = shim_bin
+        .canonicalize()
+        .unwrap_or_else(|_| shim_bin.to_path_buf())
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("the shim path {} has no parent", shim_bin.display()))?;
+    let sibling = dir.join(HEADLESS_APP);
+    if is_executable(&sibling) {
+        return Ok(sibling);
     }
     bail!(
-        "no headless demo app found on PATH (tried: {}) -- install weston (for \
-         weston-terminal) or foot, or set VITRIN_DEMO_APP to an absolute path",
-        HEADLESS_APP_CANDIDATES.join(", ")
+        "no {HEADLESS_APP} beside the C shim ({}) -- it is co-built with the shim \
+         (shim/meson.build), so rebuild it (`meson setup shim/build shim && meson compile \
+         -C shim/build`) or set VITRIN_DEMO_APP to an absolute path",
+        dir.display()
     );
 }
 

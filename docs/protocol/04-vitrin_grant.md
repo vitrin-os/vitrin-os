@@ -247,12 +247,23 @@ enforces these **ordering invariants** unconditionally:
 exercised (the overlay composites at the output stage, above the scene a
 capture is taken from; `backend/headless.rs`'s
 `a_prompt_reaches_human_visible_output_but_never_a_capture` asserts it). The
-second and fourth hold **vacuously** — no client can state a stacking order and
-the core composites no cursor at all. The third has nothing to be true of, there
-being no arrangement mechanism. **None of the four is tested *as an invariant***
-against a client trying to violate it, and none can be until something outside
-the core can arrange realms; that test belongs to the mission-control shell
-(E3), and D-018 is the reason it must exist.
+fourth **is no longer vacuous** (D-019): the core composites an agent
+principal's own cursor, so there is something the rule can be violated by. What
+enforces it is where the sprite is drawn — at the output stage, downstream of
+the `Scene::compose` a capture is taken from, so a capture cannot carry it by
+construction rather than by a checked flag — and a test does exist:
+`backend/headless.rs`'s
+`the_agent_cursor_reaches_human_visible_output_but_never_a_capture`, which
+asserts both halves on real composited pixels. Two limits, stated: it is a
+**component** test rather than a mock-free integration gate, and it proves the
+core excludes the sprite from a capture rather than exercising a second agent
+trying to obtain the first's cursor — agent-to-agent has no wire surface to try
+it through, so that half stays unpurchasable by construction. The second still
+holds **vacuously** — no client can state a stacking order. The third has
+nothing to be true of, there being no arrangement mechanism. **None of the four
+is tested *as an invariant*** against a client trying to violate it, and none
+can be until something outside the core can arrange realms; that test belongs
+to the mission-control shell (E3), and D-018 is the reason it must exist.
 
 The split is deliberate: a shell gets *arrangement*, the core keeps *ordering*.
 This is what lets window-management policy live outside the TCB (PRD §5.1)

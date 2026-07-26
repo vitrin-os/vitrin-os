@@ -105,6 +105,14 @@ mod consent;
 /// core socket passes through it, and its admitted actuations leave through
 /// `session`'s seat routing toward the realm's shim.
 mod enforcement;
+/// The agent cursor sprite (D-019): the crosshair the core paints at an
+/// agent's own pointer position, into human-visible output only. One geometry
+/// function, read by both human-visible presentation paths (the CPU composite
+/// and the nested zero-copy dmabuf draw list) so they cannot drift; clipped
+/// below the trusted band, because an agent chooses its own position. Drawing
+/// only -- seat delivery to the shim stays one shared position per realm view
+/// (D-017's deferral stands).
+mod cursor;
 /// The dmabuf import path (P1.3.5): the zero-copy mechanics behind the shim
 /// server's `kind=dmabuf` commits — importer seam, hostile-fd probe, GLES
 /// import + probe render, copy instrumentation. Dead-code-allowed outside
@@ -362,6 +370,18 @@ USAGE:
                                 milliseconds. Default: 1000 (accepted range
                                 250..=10000). Nested mode only: headless has
                                 no physical input device, structurally.
+    vitrind --agent-cursor      `--headless` ONLY: also composite the agent
+                                cursor sprite into this run's human-visible
+                                output. Nested mode always composites it (a
+                                human is watching that window), which is why
+                                the flag is refused with `--nested` rather
+                                than accepted as a no-op. Off by default here
+                                because the headless human-visible framebuffer
+                                is measured byte-for-byte against the realm
+                                view by the trusted-band witness (issue #139).
+                                The sprite NEVER reaches a captured frame in
+                                either mode: it is drawn at the output stage,
+                                downstream of the composite a capture reads.
     vitrind --help              Show this help.
     vitrind --version           Show the version.
 ";
@@ -420,6 +440,19 @@ enum Action {
         /// build still reads this to name the synthesized trigger's
         /// chord/hold (issue #109) -- see `backend::headless::run`.
         dead_man: DeadManConfig,
+        /// `--agent-cursor` (D-019): composite the agent cursor sprite into
+        /// this run's human-visible output.
+        ///
+        /// Headless-only, and `false` by default. Nested always composites
+        /// the sprite, so there is no field for it on
+        /// [`Action::RunNested`] -- the flag is refused with `--nested` at
+        /// parse time rather than accepted as a silent no-op, the same
+        /// posture `--size` and `--consent-injector-fd` take. The default is
+        /// off here because this backend's human-visible framebuffer is
+        /// measured against the realm view by the trusted-band witness
+        /// (issue #139) and by `tests/integration/test_real_trust_band.py`;
+        /// see `backend::headless::run`'s `agent_cursor` argument.
+        agent_cursor: bool,
         /// The `--consent-injector-fd N` channel (issue #138): an inherited
         /// `AF_UNIX`/`SOCK_STREAM` socketpair end on which a harness answers
         /// the consent prompts this headless session raises.
@@ -469,6 +502,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut capture_dump: Option<PathBuf> = None;
     let mut chord: Option<deadman::Chord> = None;
     let mut hold_ms: Option<u64> = None;
+    let mut agent_cursor = false;
     #[cfg(feature = "consent-injector")]
     let mut consent_injector_fd: Option<std::os::fd::RawFd> = None;
     let mut args = args.into_iter();
@@ -534,6 +568,10 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 )?;
                 set_hold(&mut hold_ms, value)?;
             }
+            // Idempotent rather than "given more than once" -- a boolean
+            // switch repeated says the same thing twice, unlike a valued flag
+            // where the second value would have to win or lose silently.
+            "--agent-cursor" => agent_cursor = true,
             #[cfg(feature = "consent-injector")]
             "--consent-injector-fd" => {
                 let value = args.next().ok_or(
@@ -618,6 +656,19 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         }
     }
 
+    // `--agent-cursor`'s companion refusal (D-019), at parse time like every
+    // other one here. Nested mode always composites the sprite -- it is the
+    // mode a human watches -- so the flag would be a no-op there, and a flag
+    // that silently does nothing is how an operator comes to believe a run is
+    // configured differently than it is. `--size` sets the precedent.
+    if agent_cursor && matches!(mode, Some(Mode::Nested)) {
+        return Err(
+            "`--agent-cursor` is only valid with `--headless`: nested mode always composites \
+             the agent cursor into the host window, so the flag would do nothing there."
+                .into(),
+        );
+    }
+
     // `--help`/`--version` already returned above, so only the run modes
     // remain to resolve; `--size` is meaningless without `--headless`.
     match (mode, size) {
@@ -671,6 +722,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             shim,
             capture_dump,
             dead_man,
+            agent_cursor,
             #[cfg(feature = "consent-injector")]
             consent_injector_fd,
         }),
@@ -893,6 +945,7 @@ fn main() -> ExitCode {
             // `dead-man-injector` build reads it to name the chord/hold a
             // SIGUSR1-synthesized trigger reports (issue #109).
             dead_man,
+            agent_cursor,
             #[cfg(feature = "consent-injector")]
             consent_injector_fd,
         } => {
@@ -913,6 +966,7 @@ fn main() -> ExitCode {
                     backend::headless::run(
                         size,
                         dead_man,
+                        agent_cursor,
                         #[cfg(feature = "consent-injector")]
                         consent_injector_fd,
                         seed,
@@ -1842,6 +1896,7 @@ mod tests {
             parse_args(["--headless", "--consent=auto-approve"]),
             Ok(Action::RunHeadless {
                 size: (1280, 800),
+                agent_cursor: false,
                 consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: None,
@@ -1864,6 +1919,7 @@ mod tests {
             parse_args(["--headless", "--consent=auto-approve", "--size", "1280x800"]),
             Ok(Action::RunHeadless {
                 size: (1280, 800),
+                agent_cursor: false,
                 consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: None,
@@ -1879,6 +1935,7 @@ mod tests {
             parse_args(["--headless", "--consent=auto-approve", "--size", "640x480"]),
             Ok(Action::RunHeadless {
                 size: (640, 480),
+                agent_cursor: false,
                 consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: None,
@@ -1904,6 +1961,7 @@ mod tests {
                 parse_args(args),
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
+                    agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
                     principals: None,
                     recorder: None,
@@ -2103,6 +2161,7 @@ mod tests {
             parse_args(["--headless", "--consent=auto-approve"]),
             Ok(Action::RunHeadless {
                 size: (1280, 800),
+                agent_cursor: false,
                 consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: None,
@@ -2131,6 +2190,7 @@ mod tests {
                 parse_args(args),
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
+                    agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
                     principals: None,
                     recorder: Some(PathBuf::from("/tmp/run.jsonl")),
@@ -2184,6 +2244,7 @@ mod tests {
                 parse_args(args),
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
+                    agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
                     principals: None,
                     recorder: None,
@@ -2253,6 +2314,7 @@ mod tests {
                 parse_args(args),
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
+                    agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
                     principals: None,
                     recorder: None,
@@ -2315,6 +2377,7 @@ mod tests {
                 parse_args(args),
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
+                    agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
                     principals: None,
                     recorder: None,
@@ -2813,6 +2876,7 @@ mod tests {
                 parse_args(args),
                 Ok(Action::RunHeadless {
                     size: (1280, 800),
+                    agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
                     principals: Some(PathBuf::from("/etc/vitrin/principals.toml")),
                     recorder: None,
@@ -2876,6 +2940,7 @@ mod tests {
             ]),
             Ok(Action::RunHeadless {
                 size: (2147483647, 1),
+                agent_cursor: false,
                 consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: None,
@@ -2893,6 +2958,46 @@ mod tests {
     fn size_without_headless_is_an_error() {
         assert!(parse_args(["--size", "1280x800"]).is_err());
         assert!(parse_args(["--nested", "--size", "1280x800"]).is_err());
+    }
+
+    /// `--agent-cursor` (D-019): off by default on headless, on when asked
+    /// for, and refused with `--nested` rather than accepted as a no-op.
+    ///
+    /// The default matters more than the flag does: this backend's
+    /// human-visible framebuffer is measured against the realm view by the
+    /// trusted-band witness and by `tests/integration/test_real_trust_band.py`,
+    /// so a run that composited the sprite without being asked would turn a
+    /// mock-free milestone gate red.
+    #[test]
+    fn the_agent_cursor_flag_is_headless_only_and_off_by_default() {
+        let cursor_of = |args: Vec<&str>| match parse_args(args.clone()) {
+            Ok(Action::RunHeadless { agent_cursor, .. }) => agent_cursor,
+            other => panic!("{args:?} must parse as a headless run: {other:?}"),
+        };
+        assert!(!cursor_of(vec!["--headless", "--consent=auto-approve"]));
+        assert!(cursor_of(vec![
+            "--headless",
+            "--consent=auto-approve",
+            "--agent-cursor"
+        ]));
+        // A boolean switch repeated says the same thing twice.
+        assert!(cursor_of(vec![
+            "--headless",
+            "--consent=auto-approve",
+            "--agent-cursor",
+            "--agent-cursor"
+        ]));
+
+        // Nested always composites the sprite, so the flag would do nothing
+        // there: refused at parse time, the `--size` precedent.
+        let nested = parse_args(["--nested", "--agent-cursor"])
+            .expect_err("nested composites the agent cursor unconditionally");
+        assert!(nested.contains("--headless"), "{nested}");
+        assert!(nested.contains("--agent-cursor"), "{nested}");
+        // With no mode at all it is still the missing mode that is reported.
+        assert!(parse_args(["--agent-cursor"]).is_err());
+        // The flag is named in the help text, so an operator can find it.
+        assert!(USAGE.contains("--agent-cursor"));
     }
 
     #[test]

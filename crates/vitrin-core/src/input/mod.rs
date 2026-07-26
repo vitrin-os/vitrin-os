@@ -673,6 +673,30 @@ pub(crate) struct InputRouter<H: PreemptionHook> {
     /// Updated at intake (a physical fact), even for events the gate
     /// consumes, so a released grab never hit-tests a stale position.
     pointer: Option<(f64, f64)>,
+    /// Last known **emulated** pointer position, in view coordinates — the
+    /// position the agent cursor sprite is drawn at
+    /// ([`crate::cursor::composite_agent_cursor`]).
+    ///
+    /// **The mirror image of [`ConsentGrab::pointer`], one origin over.** That
+    /// field is deliberately physical-only, so an agent holding a pointer grant
+    /// cannot slide the hit target under the human's finger; this one is
+    /// deliberately emulated-only, for the same kind of reason read the other
+    /// way round: [`Self::pointer`] is written by *both* origins (the app has
+    /// one pointer, which is exactly D-017's deferred per-principal delivery),
+    /// so a sprite drawn on it would follow the human's physical mouse and tell
+    /// the human an agent is pointing where the human is pointing.
+    ///
+    /// Updated at intake beside [`Self::pointer`], before gating, for the same
+    /// reason: where a pointer *is* is a fact, not a delivery outcome. Cleared
+    /// by [`Self::reset`] with the rest of the per-shim-generation state.
+    ///
+    /// **This is display state and nothing else.** It feeds no hit test, no
+    /// routing decision, and no wire event; delivery to the shim remains one
+    /// shared position per realm view (module docs; D-019 supersedes only the
+    /// "composites no cursor" half of D-017, never the delivery half).
+    ///
+    /// [`ConsentGrab::pointer`]: crate::consent::grab::ConsentGrab
+    agent_pointer: Option<(f64, f64)>,
     /// Button codes of delivered-and-unreleased presses, in press order
     /// (a multiset: a pathological double-press pairs with a double-
     /// release). Nonempty means an implicit grab holds the pointer on
@@ -706,9 +730,21 @@ impl<H: PreemptionHook> InputRouter<H> {
         Self {
             hook,
             pointer: None,
+            agent_pointer: None,
             pressed: Vec::new(),
             pressed_keys: Vec::new(),
         }
+    }
+
+    /// Where the **agent's** pointer last was, in view coordinates, or `None`
+    /// before its first motion (and after [`Self::reset`]).
+    ///
+    /// Read only by the presentation side, to draw the sprite: the backends
+    /// pull it once per dispatch round through
+    /// [`crate::session::Presenter::set_agent_cursor`]. See
+    /// [`Self::agent_pointer`] for why this is not [`Self::pointer`].
+    pub fn agent_pointer(&self) -> Option<(f64, f64)> {
+        self.agent_pointer
     }
 
     /// Forget all per-shim-generation seat state: the implicit-grab
@@ -721,10 +757,14 @@ impl<H: PreemptionHook> InputRouter<H> {
     /// fresh seat, and a stale pointer position would let a press hit-test
     /// geometry the new shim never produced. First motion re-establishes
     /// the pointer.
+    ///
+    /// The agent-owned position goes with it, so the sprite does not hover
+    /// over a realm that no longer exists: the next composite draws none.
     pub fn reset(&mut self) {
         self.pressed.clear();
         self.pressed_keys.clear();
         self.pointer = None;
+        self.agent_pointer = None;
     }
 
     /// Release every key the router believes the app is holding **on the
@@ -822,6 +862,14 @@ impl<H: PreemptionHook> InputRouter<H> {
         // physical fact, not a delivery outcome.
         if let SeatInputKind::Motion { x, y } = input.kind {
             self.pointer = Some((x, y));
+            // ...and the agent-owned position beside it, for the display
+            // sprite only, written by this one origin (see
+            // `Self::agent_pointer`). Not an `else` branch: the shared
+            // position keeps taking both origins, because that is what the
+            // app is delivered.
+            if input.origin == Origin::Emulated {
+                self.agent_pointer = Some((x, y));
+            }
         }
 
         // THE preemption hook point: observe unconditionally, then gate.
@@ -1861,6 +1909,62 @@ pub(crate) mod tests {
                 y: Fixed::from_f64(y),
             }
         );
+    }
+
+    /// **The agent-owned position follows the emulated origin alone** (D-019).
+    ///
+    /// This is the whole reason [`InputRouter::agent_pointer`] is a second
+    /// field rather than a read of [`InputRouter::pointer`]: the shared field
+    /// is written by *both* origins, so a sprite drawn on it would track the
+    /// human's physical mouse and tell the human an agent is pointing wherever
+    /// the human is. The mirror image of `ConsentGrab::pointer`, which is
+    /// deliberately physical-only for the mirror-image reason.
+    ///
+    /// It is display state only: nothing here changes what the shim is
+    /// delivered, which stays one shared position per realm view.
+    #[test]
+    fn the_agent_pointer_follows_the_emulated_origin_and_nothing_else() {
+        let mut router = router();
+        let view = (64, 48);
+        let surface = Some((64, 48));
+        assert_eq!(router.agent_pointer(), None, "nothing has moved yet");
+
+        // A human's motion moves the shared position and NOT the agent's.
+        router.route(phys(motion(10.0, 20.0)), view, surface);
+        assert_eq!(
+            router.agent_pointer(),
+            None,
+            "physical motion must never move the agent's cursor"
+        );
+
+        // An agent's motion moves both: the shared one because that is what
+        // the app is delivered, the agent-owned one because that is what the
+        // sprite is drawn at.
+        router.route(SeatInput::emulated(motion(30.0, 40.0)), view, surface);
+        assert_eq!(router.agent_pointer(), Some((30.0, 40.0)));
+
+        // A later human motion does not drag the sprite along with it.
+        router.route(phys(motion(1.0, 2.0)), view, surface);
+        assert_eq!(
+            router.agent_pointer(),
+            Some((30.0, 40.0)),
+            "the agent's cursor moved because the human's mouse did"
+        );
+
+        // Recorded at intake, before gating and before hit-testing: a motion
+        // onto the letterbox matte is not delivered, but the pointer is still
+        // there and the sprite must be drawn there.
+        router.route(
+            SeatInput::emulated(motion(200.0, 200.0)),
+            view,
+            Some((10, 10)),
+        );
+        assert_eq!(router.agent_pointer(), Some((200.0, 200.0)));
+
+        // Realm teardown forgets it, so no sprite hovers over a realm that is
+        // gone.
+        router.reset();
+        assert_eq!(router.agent_pointer(), None);
     }
 
     #[test]

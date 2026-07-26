@@ -27,6 +27,15 @@
 //! argument is in [`crate::consent`]'s module docs). The trusted indicator
 //! (issue #85) — the always-present band and the per-prompt frame — lives on
 //! this side too, and is invisible to a capture for exactly the same reason.
+//! So does the **agent cursor sprite** (D-019, [`crate::cursor`]), which is
+//! why the IDL's ordering invariant 4 — no agent principal's cursor in another
+//! principal's captured frame — is a rule with something to be true of rather
+//! than a vacuous one. It is applied a step past this function (in [`winit`]'s
+//! `window_pixels` and in headless's own composite), for the same
+//! reason the dead-man hold indicator is: it is nested-side display state
+//! headless draws only on request. What excludes it from a capture is
+//! unchanged — it is downstream of [`Scene::compose`], full stop.
+//!
 //!
 //! Both backends reach that one function on the **CPU compositing path**:
 //! the nested backend through [`compose_human_visible`] (compose + overlay in

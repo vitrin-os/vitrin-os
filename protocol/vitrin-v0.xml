@@ -198,9 +198,12 @@
     than free. CURSORS are core-composited for the reason the consent
     surface is: a realm that supplied its own pointer bitmap could paint a
     decoy and mislead the human about where input is going. Version 1
-    serves neither layout verb and composites no cursor of its own - it has
-    no window manager, and in nested operation the host desktop draws the
-    human's cursor outside the realm view entirely - and refuses
+    composites an AGENT principal's cursor, and only into human-visible
+    output - never into any captured frame - so the ordering rule above
+    binds the compositor now rather than vacuously. No HUMAN cursor is
+    composited: in nested operation the host desktop draws the human's
+    cursor outside the realm view entirely. Version 1 serves neither
+    layout verb - it has no window manager - and refuses
     layout_arrange, layout_focus and observe_cursor "unsupported"; the
     verbs exist on the wire before the core serves them so that the model
     is expressible at version 1 and a petition for it is an answer rather
@@ -728,11 +731,13 @@
       human sees, and is revocable with the grant. A per-grant verb is
       therefore the only "toggle" that exists, and there is deliberately
       no per-pair one. Version 1 refuses observe_cursor "unsupported", so
-      no capture contains any cursor today; version 1 also composites no
-      cursor at all - in nested operation the host desktop draws the
-      human's cursor outside the realm view entirely - so the rule is
-      currently satisfied by construction and binds the compositor when
-      cursors arrive.
+      no capture contains any cursor today; version 1 DOES composite an
+      agent principal's own cursor, at the same output stage as the
+      consent overlay and the trust indicator, so the rule binds the
+      compositor NOW rather than vacuously and is exercised by every
+      frame drawn while an agent is pointing. No human cursor is
+      composited at all: in nested operation the host desktop draws it
+      outside the realm view entirely.
       Streaming capture is a deliberate
       deferral, not an omission: if a later version adds it, it arrives
       as since-gated sibling messages beside this poll pair, which stays
@@ -913,8 +918,11 @@
 
       Version-1 limitation, stated rather than implied: the core delivers
       ONE shared pointer position per realm view to the shim
-      (vitrin_shim_seat events carry origin, not principal identity) and
-      composites no cursor of its own. The consent grab's defensive rule -
+      (vitrin_shim_seat events carry origin, not principal identity).
+      Drawing is not delivery: the core does composite this principal's own
+      cursor into human-visible output, from a position only this
+      principal's motion moves, and that changes nothing about what the
+      shim is delivered. The consent grab's defensive rule -
       emulated motion must not relocate the position the human's hit test
       reads - exists only because that position is shared, and
       per-principal delivery deletes it. That correction arrives as

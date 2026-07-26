@@ -13,8 +13,8 @@
  * compiled object that implements that header's ABI is a work based on it,
  * so the resulting shared module is a GPL-3.0 combined work regardless of
  * how the rest of this repository is licensed. That combination is lawful
- * because the shim sources this module links (shim/src/*.c) are MPL-2.0,
- * which names GPL-3.0 a Secondary License (MPL 2.0 section 1.12) and
+ * because the shim sources this module links (the C files under shim/src)
+ * are MPL-2.0, which names GPL-3.0 a Secondary License (MPL 2.0 1.12) and
  * permits distributing the Larger Work under GPL terms (section 3.3) --
  * which is exactly what MPL's Exhibit B switches off, so no file under
  * shim/ may ever carry the Exhibit B notice. (The one Apache-2.0 file that

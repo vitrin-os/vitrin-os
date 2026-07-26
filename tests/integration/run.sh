@@ -32,7 +32,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 
-# ---- Named milestone gates must EXIST ------------------------------------
+# ---- Named gates must EXIST ----------------------------------------------
 #
 # `unittest discover` below enumerates whatever `test_*.py` files happen to be
 # present, so a named gate that was never written -- or one dropped or renamed
@@ -54,17 +54,25 @@ MILESTONE_GATES=(
   test_real_consent.py          # M1.4, consent half (#138)
   test_demo.py                  # M1.5 exit gate (#110)
 )
+# Named PROPERTY gates: mock-free, real-app, and equally invisible if they
+# vanish -- but deliberately NOT milestone gates. Kept in a second list rather
+# than folded into the one above, because a milestone's definition of done is a
+# claim about that milestone and D12 adjudicated this property out of M1.4's
+# criteria (plan §5). Same presence check, different claim.
+PROPERTY_GATES=(
+  test_real_trust_band.py       # trusted-band negative half (#139, refs #85)
+)
 missing=()
-for gate in "${MILESTONE_GATES[@]}"; do
+for gate in "${MILESTONE_GATES[@]}" "${PROPERTY_GATES[@]}"; do
   [ -f "tests/integration/$gate" ] || missing+=("$gate")
 done
 if [ ${#missing[@]} -ne 0 ]; then
-  echo "ERROR: named milestone gate module(s) missing: ${missing[*]}" >&2
+  echo "ERROR: named gate module(s) missing: ${missing[*]}" >&2
   echo "       \`unittest discover\` would simply not collect them and this suite" >&2
-  echo "       would exit 0 with that milestone's evidence contributing nothing." >&2
+  echo "       would exit 0 with that gate's evidence contributing nothing." >&2
   echo "       Restore the file, or -- if a gate is genuinely being retired --" >&2
-  echo "       remove it from MILESTONE_GATES here AND from the gate table in" >&2
-  echo "       tests/integration/README.md, in the same commit." >&2
+  echo "       remove it from MILESTONE_GATES/PROPERTY_GATES here AND from the" >&2
+  echo "       gate table in tests/integration/README.md, in the same commit." >&2
   exit 1
 fi
 

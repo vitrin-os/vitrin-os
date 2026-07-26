@@ -59,12 +59,14 @@
 //!
 //! ```text
 //!   harness -> core   describe
+//!                     band
 //!                     decide <token> <allow-once|allow-while-running|deny>
 //!
 //!   core -> harness   vitrin-consent-injector 1            (banner, once)
 //!                     raised <petition_id> <token>          (unsolicited edge)
 //!                     lowered <petition_id>                 (unsolicited edge)
 //!                     prompt <none|shown> <token|-> ...     (describe reply)
+//!                     band <composites> <band_changes> ...  (band reply)
 //!                     decided-ack <queued|no-prompt|unknown-token
 //!                                 |no-such-button|malformed>
 //! ```
@@ -192,6 +194,19 @@ pub(crate) enum Request {
     /// card is up — the card's own footprint of the human-visible
     /// framebuffer as a sealed memfd.
     Describe,
+    /// Read the trusted-band witness (issue #139):
+    /// [`crate::backend::band_witness::BandReport`] rendered as ten scalar
+    /// fields.
+    ///
+    /// **It carries no authority and no pixels, and it is the one request on
+    /// this channel whose reply is provably independent of the session
+    /// secret** — the rule, and why the weaker "no pixels leave" rule is not
+    /// enough, are argued in that module. It rides this channel rather than a
+    /// second one because this is already the audited, unnamed,
+    /// descriptor-authenticated hole in an instrumented core, and a second
+    /// hole would be a second thing to keep right; it is a *read*, so it adds
+    /// nothing to the authority the channel already carries.
+    Band,
     /// Press a button on the prompt `token` names.
     Decide { token: PromptToken, choice: Choice },
 }
@@ -275,6 +290,7 @@ pub(crate) fn parse_request(line: &str) -> Option<Request> {
     let mut fields = line.split(' ');
     let request = match fields.next()? {
         "describe" => Request::Describe,
+        "band" => Request::Band,
         "decide" => {
             let token = PromptToken::parse_hex(fields.next()?)?;
             let choice = parse_choice(fields.next()?)?;
@@ -1041,8 +1057,9 @@ mod tests {
     }
 
     #[test]
-    fn the_two_requests_parse() {
+    fn the_three_requests_parse() {
         assert_eq!(parse_request("describe"), Some(Request::Describe));
+        assert_eq!(parse_request("band"), Some(Request::Band));
         let token = PromptToken::from_bytes([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
         assert_eq!(token.to_hex(), "0123456789abcdef");
         assert_eq!(
@@ -1083,6 +1100,16 @@ mod tests {
             " describe".into(),
             "DESCRIBE".into(),
             "Describe".into(),
+            "band ".into(),
+            "band 0".into(),
+            "band now".into(),
+            " band".into(),
+            "BAND".into(),
+            "Band".into(),
+            "bands".into(),
+            // The band reply's own shape, echoed back: the core emits ten
+            // fields after `band`, and none of that is a request.
+            "band 1 0 0 1 1 0 8 640 480 cbf29ce484222325".into(),
             "decide".into(),
             "decide ".into(),
             format!("decide {tok}"),

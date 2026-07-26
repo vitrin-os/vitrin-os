@@ -67,6 +67,15 @@
 //!   build any more than in a shipping one. [`HeadlessView::latest_output_rgba`]
 //!   stays `#[cfg(test)]`: **no build that ships, and no instrumented build
 //!   either, can obtain a whole human-visible frame.**
+//! - **A reading of the trusted band that carries no colour** (issue #139).
+//!   `band` reports [`super::band_witness::BandReport`]: how many composites
+//!   happened, how many of them moved a byte of the band's rows (zero), how
+//!   many moved the client's own rows just below it, whether the
+//!   human-visible frame still tracks the realm view outside the band, and a
+//!   digest of *realm-view* pixels the agent may capture anyway. Every field
+//!   is a constant function of the run, independent of the indicator's value
+//!   — which is a stricter rule than "no pixels leave", and
+//!   [`super::band_witness`] explains why the weaker rule is not enough.
 //! - **A way for a human to answer.** An inherited `AF_UNIX`/`SOCK_STREAM`
 //!   socketpair ([`crate::consent::injector`]) on which the peer says
 //!   `decide <token> <button>`; the core deposits one
@@ -537,6 +546,7 @@ impl HeadlessState {
                     );
                 }
                 Some(Request::Describe) => self.answer_describe(),
+                Some(Request::Band) => self.answer_band(),
                 Some(Request::Decide { token, choice }) => self.answer_decide(token, choice),
             }
         }
@@ -601,6 +611,36 @@ impl HeadlessState {
         match &sealed {
             Some(fd) => injector.send_line(&line, Some(fd.as_fd())),
             None => injector.send_line(&line, None),
+        }
+    }
+
+    /// Answer `band`: recomposite, then report the trusted-band witness
+    /// (issue #139).
+    ///
+    /// The recomposite comes first for the same reason [`Self::answer_describe`]
+    /// does one — the reply then describes the frame that is on the virtual
+    /// display *now*, so a harness needs no poll loop and can cross-check
+    /// [`BandReport::probe_fnv`] against the `--capture-dump` of the same
+    /// instant. It costs one extra composite per request, in a build that never
+    /// ships.
+    ///
+    /// **No descriptor, no pixels, and nothing that moves with the session
+    /// secret.** The reply is [`BandReport`]'s ten ASCII fields and nothing
+    /// else; the argument that this is a stricter rule than "no pixels", and
+    /// the near-miss that motivates it, are in [`super::band_witness`]. There
+    /// is deliberately no fail-closed table here because there is nothing to
+    /// fail closed *about*: the request names no resource, takes no argument,
+    /// and confers nothing.
+    ///
+    /// [`BandReport`]: super::band_witness::BandReport
+    /// [`BandReport::probe_fnv`]: super::band_witness::BandReport::probe_fnv
+    fn answer_band(&mut self) {
+        if let Err(err) = self.view.redraw() {
+            tracing::error!("consent-injector: band could not recomposite: {err}");
+        }
+        let report = self.view.output.band_witness.report();
+        if let Some(injector) = self.injector.as_mut() {
+            injector.send_line(&format!("band {report}"), None);
         }
     }
 
@@ -856,6 +896,12 @@ pub(crate) struct HeadlessOutput {
     /// the consent overlay on top. Never read by the capture path.
     output_framebuffer: Image<'static, 'static>,
     size: Size<i32, Physical>,
+    /// The trusted-band witness (issue #139), on a `consent-injector` build
+    /// only. Reads the two buffers [`Self::present`] already holds and keeps
+    /// counters; it exports no pixel and nothing that moves with the session
+    /// secret (see [`super::band_witness`]).
+    #[cfg(feature = "consent-injector")]
+    band_witness: super::band_witness::BandWitness,
 }
 
 impl HeadlessView {
@@ -879,6 +925,8 @@ impl HeadlessView {
                 view_framebuffer,
                 output_framebuffer,
                 size,
+                #[cfg(feature = "consent-injector")]
+                band_witness: super::band_witness::BandWitness::new(),
             },
             loop_signal,
         })
@@ -1060,11 +1108,26 @@ impl HeadlessOutput {
             self.size,
             &view,
         )?;
+        // The realm view is moved into the overlay step below, and the witness
+        // needs both sides of that step; a `consent-injector` build keeps a
+        // copy, a shipping build does not exist to keep one.
+        #[cfg(feature = "consent-injector")]
+        let witnessed_view = view.clone();
         // The human-visible half, through the shared overlay step both
         // backends call. `view` is moved in rather than recomposed, so "the
         // two images differ only by the overlay" is a property of the code
         // and not of a comment.
         let output = super::human_visible_from_view(view, &mut self.consent, w, h);
+        // Issue #139: measured here, on the bytes that are about to be
+        // presented, rather than on a second composition — a witness that
+        // composed its own frame would agree with this one today and could
+        // drift from it tomorrow, which is the whole failure mode it exists to
+        // catch. Before the blit, because the blit consumes nothing but is the
+        // step that could fail, and a frame the witness saw but the display
+        // did not is the safer of the two asymmetries: it can only over-report
+        // composites, never miss one that reached the screen.
+        #[cfg(feature = "consent-injector")]
+        self.band_witness.observe(&witnessed_view, &output, w, h);
         composite(
             &mut self.renderer,
             &mut self.output_framebuffer,

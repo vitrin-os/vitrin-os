@@ -2,58 +2,77 @@
 # SPDX-License-Identifier: Apache-2.0
 """Phase 1's integrating demo agent — and the M1.5 acceptance test.
 
-One script, two venues, exactly the same agent code path in both:
+**The demo is goal-directed.** The agent is handed a *task record it did not
+author* — field names and values — and it fills that record into a form in a
+real app inside ``realm-0``, submits it, and then proves *from pixels alone*
+that the confirmation reflects exactly the values it was told to enter::
 
     connect (the static demo identity)
       -> request the ONE MVP grant (observe + actuate.pointer + actuate.text
          on realm-0, `while-running`)
       -> await consent (a human clicks Allow in nested; a guarded
          auto-approve resolves it headless)
-      -> capture a "before" frame (headless: settle the app first, so the
-         "before" is a real control capture and not a frame racing the app's
-         own startup paint)
-      -> locate the input target by pixels
-      -> click it, type text, press Enter (the trailing "\\n")
-      -> capture an "after" frame
-      -> assert the page changed *because of the actuation*.
+      -> for each (key, value) in the SUPPLIED task:
+             locate the field by its marker colour in the agent's OWN capture
+             click its centroid
+             baseline the field's ink profile   <- after the click, before the type
+             type the value                     (no trailing newline)
+             confirm ink landed INSIDE that field's rectangle
+      -> locate the submit button by its marker colour; click it
+      -> decode the confirmation's three receipt bands and compare them
+         against bands computed from the SUPPLIED task, at runtime
 
-Both venues run the SAME real chain: the shipped `vitrind` execs the real
-per-app Wayland shim (`vitrin-shim`, issue #103/#104), which fork/execs a real
-app inside its own private, confined Wayland socket (issue #110) —
-`vitrin-mock-shim` is a unit-test fixture and stands in for nothing here. The
-two venues differ only in *which real app* stands behind the shim and in *how
-"the page changed" is proven*, never in the agent's protocol conduct:
+Three claims, stated the only way they are true:
 
-* **Nested** (`cargo xtask demo`): a real Firefox ESR runs in realm-0, behind
-  the real shim, on the host's real display. This script serves a
-  deterministic solid-colour page from a stdlib ``http.server`` bound to
-  ``127.0.0.1:0`` on a daemon thread, types that local URL into Firefox's URL
-  bar, and proves the navigation happened by the *dominant colour* of the
-  after-frame matching the colour it served (robust to anti-aliasing via
-  colour bucketing). A human answers the consent prompt. This venue needs a
-  display, a browser, and a built C shim; it is correct-by-construction here
-  but is exercised on a workstation, never in CI.
+* **There is no language model here.** This agent is deterministic. "Locate"
+  means: scan the agent's own captured frame for a known marker colour and
+  click that region's centre. Nothing reasons, plans or interprets — and no
+  sentence in this file, in ``README.md`` or in the gate may imply otherwise.
+* **The receipt is a CHECKSUM, not glyph recognition.** The agent never reads
+  back the characters it typed. It reads back a **36-bit function of the
+  record the app received** and checks it equals the same function of the task
+  it was given. "The agent read back what it typed" would be false.
+* **The task is an input, not a constant.** ``--task K=V`` is repeatable and
+  order-preserving; the expected bands are computed from whatever was supplied.
+  That is what makes the assertion non-vacuous — it cannot be a hardcoded
+  constant that would pass regardless of what landed.
 
-* **Headless** (`cargo xtask demo --headless`, and CI): a real, trivial
-  Wayland client (`weston-terminal`, or `foot`) runs in realm-0, behind the
-  real shim — GPU-free, so CI never depends on Firefox or a GPU (plan risk
-  R6/R1). "The page changed" here has to mean *the typed text landed*, not
-  merely "the app repainted", because a real app is always repainting
-  something. Three things make it mean that: the app is **settled** before the
-  control capture (:func:`_settle`), so its asynchronous first paint and shell
-  prompt are inside the "before" frame rather than straddling it; the settled
-  app is then watched, idle, for at least as long as the gate later polls
-  (:func:`_idle_probe`), so an app that can forge the gate's own signature
-  unaided fails the run instead of passing it; and the change that follows
-  must carry the *shape* a typed line makes — enough pixels to rule out a
-  one-cell repaint AND a densely inked run of them along one scanline, wide
-  enough that only a row of characters could have drawn it
-  (:func:`actuation_landed`).
-  What additionally proves the actuation *causally reached the app* is the
-  flight recorder's ``use_decision`` entries — an allowed ``move`` at the
-  clicked coordinate and an allowed ``type`` whose ``chars`` equals the typed
-  text's length — exactly as ``tests/integration/test_actuation.py``
-  establishes.
+The receipt encoding is **normative in ``examples/agent-demo/README.md``**.
+The Python below is its reference implementation; ``form.html`` (JS) and
+``shim/tests/form_target.c`` (C) restate it and are pinned against this one by
+``tests/integration/test_demo.py``.
+
+Both venues run the SAME real chain: the shipped ``vitrind`` execs the real
+per-app Wayland shim (``vitrin-shim``), which fork/execs a real app inside its
+own private, confined Wayland socket — ``vitrin-mock-shim`` is a unit-test
+fixture and stands in for nothing here. They differ only in *which real app*
+stands behind the shim, plus one nested-only preamble:
+
+* **Headless** (``cargo xtask demo --headless``, and CI): ``form-target``
+  (``shim/tests/form_target.c``), a bare wl_shm + xdg-shell + wl_pointer +
+  wl_keyboard client co-built with the shim. GPU-free, so CI never depends on
+  Firefox or a GPU (plan risk R6/R1). **Disclosure: this app is
+  repo-authored.** It is a real Wayland client and is neither
+  ``vitrin-mock-shim`` nor ``shim/tests/mock_core.c``, so D12 holds literally
+  — but "the app is written by the same repo that asserts on it" is a fair
+  criticism and is answered, not dodged, in ``README.md`` and in
+  ``docs/plan/01-phase-1-mvp.md``'s D12 seam table: the ``click-target``
+  precedent in the M1.4 gate, and the third-party rungs
+  (``test_real_app.py`` / ``test_real_gtk.py`` / ``test_real_firefox.py``)
+  staying green.
+* **Nested** (``cargo xtask demo``): a real Firefox ESR runs in realm-0 on the
+  host's real display. This script serves ``form.html`` from a stdlib
+  ``http.server`` bound to ``127.0.0.1:0`` on a daemon thread, types that
+  local URL into Firefox's URL bar (a pinned geometry constant — version 1 has
+  no semantic tree — overridable with ``VITRIN_DEMO_URL_BAR``), waits for the
+  page's first field marker to appear, and then runs the *identical* field
+  loop and receipt decode. A human answers the consent prompt.
+
+Each venue also produces an **out-of-band, byte-exact ground truth** beside the
+pixels: ``form-target`` prints ``SUBMIT ... canon=<hex>`` to stdout, and the
+nested page fires a ``GET /submitted?...`` beacon this script records in
+:attr:`_LocalPage.submitted`. Neither is pixels; both are what the app says it
+received.
 
 The consent guard (``--consent=auto-approve``) is only sound because the
 principal registry the launcher writes holds *nothing but* the one demo
@@ -71,13 +90,12 @@ import argparse
 import http.server
 import os
 import pathlib
-import socketserver
 import sys
 import tempfile
 import threading
 import time
-from collections import Counter
-from dataclasses import dataclass
+import urllib.parse
+from dataclasses import dataclass, field as dc_field
 
 import vitrin_os
 from vitrin_os import errors
@@ -98,77 +116,234 @@ DEMO_IDENTITY = "vitrin://local/agent/demo"
 DEMO_TOKEN = "a" * 64
 
 
-# --- the served page (nested venue) -----------------------------------------
+# --- the task ---------------------------------------------------------------
 
-#: The solid colour the local page paints, as ``(R, G, B)``. Chosen distinct
-#: from Firefox chrome and from ``about:blank`` white so the dominant-colour
-#: assertion has real signal.
-SERVED_RGB = (0x33, 0x66, 0xCC)
+#: How many fields both venues' forms have. ``form-target``'s layout and
+#: ``form.html`` both draw exactly this many, so a task with any other number
+#: of pairs is rejected at parse time rather than half-filled.
+FIELD_COUNT = 2
 
-#: A deterministic, self-contained page: a full-viewport solid fill, no
-#: external resources, no scrollbars. The whole point is that its dominant
-#: colour is exactly :data:`SERVED_RGB`.
-_SOLID_PAGE = (
-    "<!doctype html><html><head><meta charset='utf-8'>"
-    "<title>vitrin demo</title>"
-    "<style>html,body{{margin:0;padding:0;width:100%;height:100%;"
-    "overflow:hidden;background:#{r:02x}{g:02x}{b:02x}}}</style>"
-    "</head><body></body></html>"
-).format(r=SERVED_RGB[0], g=SERVED_RGB[1], b=SERVED_RGB[2]).encode("utf-8")
+#: The shipped default task, used when no ``--task K=V`` is supplied. Order is
+#: part of the record (:func:`canonical_task`), so this is a tuple of pairs
+#: and never a dict.
+#:
+#: ``crates/xtask``'s ``DEFAULT_TASK`` must name the same keys, because the
+#: launcher passes them to the app as ``--field NAME``;
+#: ``tests/integration/test_demo.py`` pins the two together.
+TASK_DEFAULT: tuple[tuple[str, str], ...] = (
+    ("name", "Ada Lovelace"),
+    ("email", "ada@example.org"),
+)
 
-#: The text the headless venue types into the real terminal app. Not a URL —
-#: there is no browser headless — just a harmless shell line: the real app
-#: renders it (and its shell's response, whatever that is), which is what the
-#: pixel-change assertion needs, and its *length* reaches the flight recorder
-#: (typed text is recorded by shape, never verbatim). A stable literal keeps
-#: the recorder assertion deterministic.
-DEFAULT_HEADLESS_INPUT = "echo vitrin-demo"
+#: The IDL's cap on one ``vitrin_actuator_text.type`` payload
+#: (``protocol/vitrin-v0.xml``): 4096 bytes of UTF-8.
+MAX_TEXT_BYTES = 4096
 
 
-class _SolidPageHandler(http.server.BaseHTTPRequestHandler):
-    """Serve :data:`_SOLID_PAGE` for every GET; stay silent otherwise."""
-
-    def do_GET(self) -> None:  # noqa: N802 (http.server's fixed spelling)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(_SOLID_PAGE)))
-        self.end_headers()
-        self.wfile.write(_SOLID_PAGE)
-
-    def log_message(self, *_args: object) -> None:
-        # A demo's stdout is its transcript; the http server's per-request
-        # noise does not belong in it.
-        pass
+class TaskError(ValueError):
+    """A supplied ``--task K=V`` cannot be delivered as typed text."""
 
 
-class _LocalPage:
-    """A stdlib ``http.server`` on ``127.0.0.1:0``, served from a daemon thread.
+def _reject_control_chars(what: str, value: str) -> None:
+    """Refuse the whole Unicode Cc category, plus ``\\n`` and ``\\t``.
 
-    Bound to an ephemeral port and to loopback only: nothing this demo serves
-    should be reachable off the machine. The thread is a daemon so a crashed
-    demo never wedges the process on a live server, and :meth:`close` is
-    idempotent so every teardown path can call it.
+    The IDL makes every C0 (U+0000-U+001F), DEL (U+007F) and C1
+    (U+0080-U+009F) character except newline and tab a **fatal**
+    ``invalid_argument`` on ``vitrin_actuator_text.type`` — "a correct client
+    never emits them" — so a task carrying one would kill the connection
+    rather than fail an assertion. Newline and tab are legal on the wire (they
+    are delivered as Return and Tab) and are refused here for a different
+    reason: they are *actuations*, not characters a text field holds, so a
+    record containing one could never round-trip through the form and the
+    receipt would correctly refuse to match.
     """
+    for index, ch in enumerate(value):
+        cp = ord(ch)
+        if cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
+            raise TaskError(
+                f"{what} contains U+{cp:04X} at position {index}: control characters "
+                "cannot be delivered as typed text (the IDL makes all of Cc except "
+                "newline/tab a fatal invalid_argument, and newline/tab are Return/Tab "
+                "actuations rather than field content)"
+            )
 
-    def __init__(self) -> None:
-        self._server = socketserver.TCPServer(("127.0.0.1", 0), _SolidPageHandler)
-        self._thread = threading.Thread(
-            target=self._server.serve_forever, name="vitrin-demo-httpd", daemon=True
+
+def parse_task(specs: list[str] | None) -> tuple[tuple[str, str], ...]:
+    """Parse repeated ``K=V`` strings into an ORDER-PRESERVING tuple of pairs.
+
+    Order matters: the canonical string — and therefore every band colour —
+    depends on it, so the same pairs in a different order are a *different*
+    record. ``None`` or an empty list yields :data:`TASK_DEFAULT`.
+    """
+    if not specs:
+        return TASK_DEFAULT
+    pairs: list[tuple[str, str]] = []
+    for spec in specs:
+        key, sep, value = spec.partition("=")
+        if not sep or not key:
+            raise TaskError(f"--task {spec!r} is not of the form K=V")
+        # The key is never typed — it reaches the app as an argv `--field NAME`
+        # and the page as a `?k=` query parameter — so validating it is hygiene
+        # rather than protocol conformance. Said plainly rather than implied.
+        _reject_control_chars(f"the key of --task {spec!r}", key)
+        _reject_control_chars(f"the value of --task {spec!r}", value)
+        encoded = len(value.encode("utf-8"))
+        if encoded > MAX_TEXT_BYTES:
+            raise TaskError(
+                f"the value of --task {key}=... is {encoded} UTF-8 bytes; the IDL caps "
+                f"one vitrin_actuator_text.type payload at {MAX_TEXT_BYTES}"
+            )
+        pairs.append((key, value))
+    if len(pairs) != FIELD_COUNT:
+        raise TaskError(
+            f"the demo's form has exactly {FIELD_COUNT} fields in both venues "
+            f"(shim/tests/form_target.c's layout and examples/agent-demo/form.html), "
+            f"so exactly {FIELD_COUNT} --task K=V pairs are needed; got {len(pairs)}"
         )
-        self._thread.start()
-
-    @property
-    def url(self) -> str:
-        host, port = self._server.server_address[:2]
-        return f"http://{host}:{port}/"
-
-    def close(self) -> None:
-        self._server.shutdown()
-        self._server.server_close()
-        self._thread.join(timeout=2.0)
+    return tuple(pairs)
 
 
-# --- URL-bar locator --------------------------------------------------------
+def canonical_task(task: tuple[tuple[str, str], ...]) -> str:
+    """The normative canonical string: ``"k0=v0\\nk1=v1"``, no trailing newline."""
+    return "\n".join(f"{key}={value}" for key, value in task)
+
+
+# --- the receipt encoding (normative: examples/agent-demo/README.md) --------
+
+#: FNV-1a, 32-bit. Six lines, no library, no ambiguity — chosen for exactly
+#: that reason: the same six lines exist in ``form.html`` (JS) and
+#: ``shim/tests/form_target.c`` (C), and ``tests/integration/test_demo.py``
+#: pins both against this one. Nothing about it is a security property; it is
+#: a checksum over pixels an observe grant may capture anyway.
+_FNV32_OFFSET = 0x811C9DC5
+_FNV32_PRIME = 0x01000193
+_U32 = 0xFFFFFFFF
+
+#: How many receipt bands the confirmation view paints. Three bands are
+#: 3 x 12 = 36 bits, so a *wrong* record whose bands all matched would be a
+#: ~1.5e-11 coincidence. That is the whole strength of the pixel claim.
+BAND_COUNT = 3
+
+#: The row the bands start at in the headless venue's pinned 640x480 view
+#: (``form_target.c``'s ``BAND_TOP``), documented here for readers. The decoder
+#: below deliberately does NOT use it: it finds the bands by *colour*, so the
+#: same code works against Firefox's very different geometry.
+BAND_TOP = 96
+
+
+def fnv1a32(data: bytes) -> int:
+    """FNV-1a-32 over ``data``. The reference for the JS and C restatements."""
+    hashed = _FNV32_OFFSET
+    for byte in data:
+        hashed = ((hashed ^ byte) * _FNV32_PRIME) & _U32
+    return hashed
+
+
+def receipt_bands(task: tuple[tuple[str, str], ...]) -> tuple[tuple[int, int, int], ...]:
+    """The :data:`BAND_COUNT` band colours this task's record must paint.
+
+    Band ``i``'s colour is ``fnv1a32(canon + "#" + str(i))``, taking three
+    nibbles as the channels and scaling each by ``0x11``. Every channel is a
+    multiple of ``0x11`` because that is this repo's established convention
+    for a colour that survives the capture path **and** a 4-bit-per-channel
+    histogram exactly, with no tolerance (``tests/integration/harness.py``'s
+    ``dominant_colour``/``locate_colour``; ``shim/tests/click_target.c``'s
+    three colours). So the band check below is an equality, never a distance.
+    """
+    canon = canonical_task(task).encode("utf-8")
+    bands = []
+    for index in range(BAND_COUNT):
+        hashed = fnv1a32(canon + b"#" + str(index).encode("ascii"))
+        bands.append(
+            (
+                ((hashed >> 8) & 0xF) * 0x11,
+                ((hashed >> 4) & 0xF) * 0x11,
+                (hashed & 0xF) * 0x11,
+            )
+        )
+    return tuple(bands)
+
+
+def rgb_hex(rgb: tuple[int, int, int]) -> str:
+    """``(r, g, b)`` as ``"rrggbb"`` — the form the C app prints and the gate reads."""
+    return "%02x%02x%02x" % rgb
+
+
+# --- the form's marker colours and geometry ---------------------------------
+#
+# The SAME colours and the SAME reading order in both venues
+# (`shim/tests/form_target.c`, `examples/agent-demo/form.html`), which is what
+# makes the locator code below literally identical against a bare wl_shm
+# client and against real Firefox.
+
+#: One marker colour per field, in reading order. Channels are multiples of
+#: 0x11, so the 4-bit histogram reads them back exactly.
+FIELD_MARKERS = ("00ff00", "00ffff")
+
+#: The submit button's marker colour.
+SUBMIT_MARKER = "ffff00"
+
+#: How many pixels of a marker colour must be on screen before the agent
+#: believes it located that feature. ``form-target``'s fields are 560x44 =
+#: 24 640 px and its button 560x56 = 31 360 px, and ``form.html``'s are larger
+#: still, so 8000 clears with >= 3x margin while rejecting a stray pixel or an
+#: anti-aliased edge that happens to quantise to the marker colour.
+MIN_MARKER_PIXELS = 8000
+
+#: Pixels trimmed off every side of a located field before measuring the ink
+#: typed into it.
+#:
+#: This is one of the two mitigations for the focus-ring trap (see
+#: :func:`_baseline_after_click`). A real app draws a focus indicator when a
+#: field is clicked, and that indicator is a change *inside* the field's
+#: bounding box that no typing produced. ``form-target`` draws its ring 2 px
+#: inside the field rectangle *deliberately*, and ``form.html`` uses a 3 px
+#: inset box-shadow, so 4 excludes both geometrically.
+FIELD_RECT_INSET = 4
+
+#: Minimum changed pixels inside a field's (inset) rectangle for "the value I
+#: typed landed in the field I clicked".
+#:
+#: Derivation, at the pinned 640x480 headless view: ``form-target`` rasterises
+#: no font — it draws one filled 4x12 ink cell per received UTF-8 byte — so a
+#: value of N bytes inks exactly 48N px, and 120 is cleared by any value of 3
+#: bytes or more. The shipped default task's values are 12 and 15 bytes
+#: (576 px and 720 px), a >= 4.8x margin. What it rejects: a blinking text
+#: caret (~2x24 = 48 px in either venue) and a focus ring (~2400 px for a
+#: 560x44 field, which the inset above additionally removes from the
+#: measurement entirely). Nested Firefox renders the same values as real
+#: glyphs in a 24 px font, far above this.
+#:
+#: The honest limitation: a task whose value inks fewer than 120 px — under 3
+#: bytes headless — would fail this *localisation* check even though the value
+#: did land. The receipt bands and the app's own byte-exact report are what
+#: prove the content; this check only proves *where* the ink went.
+MIN_FIELD_INK_PIXELS = 120
+
+#: Two consecutive captures whose in-rectangle diff is at or under this count
+#: as "the click's own repaint is finished" (:func:`_baseline_after_click`).
+#: Sized to absorb a blinking caret (~48 px) while staying an order of
+#: magnitude below a focus ring (~2400 px), which is the thing this wait
+#: exists to get *into* the baseline.
+FIELD_QUIET_MAX = 64
+
+#: A scanline counts as part of a band only if at least this fraction of it is
+#: exactly the band's colour. Not 1.0: a real toolkit can leave a sub-pixel
+#: seam or a scrollbar column at an edge, and the claim is "a full-width band
+#: of this colour", not "every last pixel".
+SOLID_ROW_SHARE = 0.90
+
+#: How many consecutive solid rows a band must span to count.
+#:
+#: Derivation: at the pinned 640x480 view the bands fill everything below
+#: :data:`BAND_TOP`, i.e. ``(480 - 96) / 3 = 128`` rows each — so 24 is a
+#: 5.3x margin. Nested, at 1280x800 minus Firefox's chrome, they are ~230 rows
+#: each. And 24 consecutive full-width rows of one *specific* colour is far
+#: more than any incidental strip a toolkit draws.
+MIN_BAND_ROWS = 24
+
+
+# --- nested-only: the URL bar -----------------------------------------------
 
 #: The window size Firefox ESR is pinned to in nested mode — the nested
 #: backend's initial window (``vitrind``'s ``DEFAULT_HEADLESS_SIZE``, which the
@@ -178,401 +353,430 @@ ESR_WINDOW_SIZE = (1280, 800)
 #: Fixed URL-bar target for the pinned ESR at :data:`ESR_WINDOW_SIZE`: the
 #: horizontal centre, in the toolbar band a few dozen pixels below the top.
 #: Deliberately a documented constant, not a vision model — version 1 has no
-#: semantic tree, so a pinned browser is located by geometry.
+#: semantic tree, so a pinned browser is located by geometry. A different
+#: Firefox build lays its toolbar out elsewhere; ``VITRIN_DEMO_URL_BAR=x,y``
+#: overrides it.
 ESR_URL_BAR = (640, 72)
 
 #: Vertical band the URL bar sits in, used by the proportional fallback when
 #: the window is some size other than :data:`ESR_WINDOW_SIZE`.
 ESR_TOOLBAR_Y = 72
 
-#: Headless nominal Y: the real terminal app has no URL bar, so any in-bounds
-#: point serves — what matters headless is that *some* coordinate reaches the
-#: chokepoint and is recorded. Kept near the top for parity with a real
-#: toolbar, and clamped into the frame below.
-HEADLESS_NOMINAL_Y = 16
+#: Environment override for :func:`url_bar_target`, as ``"x,y"``.
+URL_BAR_ENV = "VITRIN_DEMO_URL_BAR"
 
 
-def locate_url_bar(frame: vitrin_os.Frame, *, headless: bool) -> tuple[int, int]:
-    """Pick the pixel to click. Small and honest by construction.
+def url_bar_target(frame: vitrin_os.Frame) -> tuple[int, int]:
+    """The pixel to click to focus Firefox's URL bar (nested venue only).
 
-    Headless: a nominal in-bounds coordinate (the real terminal app models no
-    URL bar). Nested: the fixed geometry of the pinned ESR when the window is
-    the pinned size, with a proportional fallback for any other size.
+    :data:`URL_BAR_ENV` wins when set; otherwise the pinned geometry for the
+    pinned window size, with a proportional fallback for any other size.
     """
-    width, height = frame.width, frame.height
-    if headless:
-        return (width // 2, min(HEADLESS_NOMINAL_Y, height - 1))
-    if (width, height) == ESR_WINDOW_SIZE:
+    override = os.environ.get(URL_BAR_ENV)
+    if override:
+        parts = override.split(",")
+        if len(parts) != 2:
+            raise TaskError(f"{URL_BAR_ENV}={override!r} is not 'x,y'")
+        try:
+            x, y = int(parts[0]), int(parts[1])
+        except ValueError as exc:
+            raise TaskError(f"{URL_BAR_ENV}={override!r} is not 'x,y'") from exc
+        if not (0 <= x < frame.width and 0 <= y < frame.height):
+            raise TaskError(
+                f"{URL_BAR_ENV}={override!r} is outside the "
+                f"{frame.width}x{frame.height} realm view"
+            )
+        return x, y
+    if (frame.width, frame.height) == ESR_WINDOW_SIZE:
         return ESR_URL_BAR
-    # Fallback: centre horizontally, clamp the toolbar band into the frame.
-    return (width // 2, min(ESR_TOOLBAR_Y, height - 1))
+    return (frame.width // 2, min(ESR_TOOLBAR_Y, frame.height - 1))
 
 
-# --- pixel analysis (nested "page changed") ---------------------------------
+# --- the served page (nested venue) -----------------------------------------
 
-def dominant_color(
-    frame: vitrin_os.Frame, *, bucket: int = 16, step: int = 4
-) -> tuple[int, int, int]:
-    """The most common colour in the frame, bucketed to absorb anti-aliasing.
+#: The page is a **data file**, not a Python string literal: 60 lines of HTML
+#: plus JS is where the old ``_SOLID_PAGE`` idiom stops paying. It reads its
+#: field names from its own query string (``?k=name&k=email``), so it stays a
+#: pure data file rather than a template the server rewrites.
+FORM_PATH = pathlib.Path(__file__).resolve().parent / "form.html"
 
-    Reads ``frame.raw`` directly — little-endian xrgb8888, so each pixel is
-    the four bytes ``B, G, R, X`` (the SDK's ``png.xrgb8888_to_rgb`` documents
-    the same layout). Channels are quantised into ``bucket``-wide bins so a
-    solid fill and its anti-aliased edges land in one bucket, and pixels are
-    sub-sampled every ``step`` in each axis to keep this cheap on a 1280x800
-    frame without changing which colour dominates.
+
+class _FormHandler(http.server.BaseHTTPRequestHandler):
+    """Two routes, and 404 for everything else.
+
+    The 404 branch is load-bearing rather than tidy: Firefox *will* request
+    ``/favicon.ico``, and a handler that served the form for every path would
+    answer that request with the form.
+    """
+
+    def do_GET(self) -> None:  # noqa: N802 (http.server's fixed spelling)
+        path, _, query = self.path.partition("?")
+        if path == "/":
+            body = self.server.form_bytes  # type: ignore[attr-defined]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/submitted":
+            # `parse_qsl`, the ORDERED form of `parse_qs`: the record's order
+            # is part of the record (`canonical_task`), and `parse_qs`'s dict
+            # would lose it the moment a key repeated.
+            pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+            self.server.record_submission(pairs)  # type: ignore[attr-defined]
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_error(404)
+
+    def log_message(self, *_args: object) -> None:
+        # A demo's stdout is its transcript; the http server's per-request
+        # noise does not belong in it.
+        pass
+
+
+class _PageServer(http.server.ThreadingHTTPServer):
+    """The form bytes and the recorded submissions, guarded by a lock."""
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, form_bytes: bytes) -> None:
+        super().__init__(address, handler)
+        self.form_bytes = form_bytes
+        self._lock = threading.Lock()
+        self._submitted: list[tuple[str, str]] = []
+
+    def record_submission(self, pairs: list[tuple[str, str]]) -> None:
+        with self._lock:
+            self._submitted.extend(pairs)
+
+    def submissions(self) -> list[tuple[str, str]]:
+        with self._lock:
+            return list(self._submitted)
+
+
+class _LocalPage:
+    """A stdlib ``http.server`` on ``127.0.0.1:0``, served from a daemon thread.
+
+    Bound to an ephemeral port and to loopback only: nothing this demo serves
+    should be reachable off the machine. The thread is a daemon so a crashed
+    demo never wedges the process on a live server, and :meth:`close` is
+    idempotent so every teardown path can call it.
+
+    :attr:`submitted` is the nested venue's **byte-exact ground truth** — the
+    ordered ``(key, value)`` pairs the page's own beacon reported, the
+    analogue of ``gtk-entry-probe``'s ``ENTRY_HEX`` in
+    ``test_real_actuation.py`` and of ``form-target``'s ``SUBMIT`` line.
+    """
+
+    def __init__(self) -> None:
+        self._server = _PageServer(
+            ("127.0.0.1", 0), _FormHandler, FORM_PATH.read_bytes()
+        )
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, name="vitrin-demo-httpd", daemon=True
+        )
+        self._thread.start()
+        self._closed = False
+
+    @property
+    def url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}/"
+
+    def url_for(self, task: tuple[tuple[str, str], ...]) -> str:
+        """The page URL carrying this task's field NAMES (never its values)."""
+        query = urllib.parse.urlencode([("k", key) for key, _ in task])
+        return f"{self.url}?{query}"
+
+    @property
+    def submitted(self) -> list[tuple[str, str]]:
+        return self._server.submissions()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2.0)
+
+
+# --- pixel analysis ---------------------------------------------------------
+#
+# Inlined rather than imported from `tests/integration/harness.py`
+# deliberately: this is a *shipped example* under `examples/`, launched with
+# only `PYTHONPATH=sdk/python/src`. Reaching into the test tree would couple
+# the deliverable to the harness (and its `VITRIN_REPO` assumptions). The
+# quantisation is the same 4-bit-per-channel histogram the harness's
+# `dominant_colour`/`locate_colour` apply, which is why every colour in this
+# demo has channels that are multiples of 0x11.
+
+#: Keep only a byte's top nibble — the 4-bit-per-channel quantisation.
+_TOP_NIBBLE = bytes(i & 0xF0 for i in range(256))
+
+#: ``_eq_table(t)[b]`` is 0xFF iff ``b == t``. Cached because a translate table
+#: is 256 bytes and the same handful of colours are asked for repeatedly.
+_EQ_TABLES: dict[int, bytes] = {}
+
+
+def _eq_table(target: int) -> bytes:
+    table = _EQ_TABLES.get(target)
+    if table is None:
+        table = bytes(0xFF if i == target else 0x00 for i in range(256))
+        _EQ_TABLES[target] = table
+    return table
+
+
+def _packed(frame: vitrin_os.Frame) -> bytes:
+    """``frame.raw`` as tightly-packed 4-byte ``B, G, R, X`` pixels.
+
+    Stride-generic per the IDL (row ``r`` begins at ``r * stride`` and carries
+    ``width * 4`` payload bytes); version 1 pins ``stride == width * 4`` on the
+    wire, so the fast path is the normal one.
     """
     raw = frame.raw
-    stride, width, height = frame.stride, frame.width, frame.height
-    counts: Counter[tuple[int, int, int]] = Counter()
-    for row in range(0, height, step):
-        base = row * stride
-        for px in range(0, width, step):
-            off = base + px * 4
-            b, g, r = raw[off], raw[off + 1], raw[off + 2]
-            counts[(r // bucket, g // bucket, b // bucket)] += 1
-    (rk, gk, bk), _ = counts.most_common(1)[0]
-    half = bucket // 2
-    return (rk * bucket + half, gk * bucket + half, bk * bucket + half)
+    row_len = frame.width * 4
+    if frame.stride == row_len:
+        return raw
+    return b"".join(
+        raw[r * frame.stride : r * frame.stride + row_len] for r in range(frame.height)
+    )
 
 
-def colors_close(a: tuple[int, int, int], b: tuple[int, int, int], *, tol: int = 24) -> bool:
-    """True if every channel is within ``tol`` — the AA/compression slack."""
-    return all(abs(x - y) <= tol for x, y in zip(a, b))
+def _match_rows(frame: vitrin_os.Frame, rgb: tuple[int, int, int]) -> list[bytes]:
+    """One row of ``0xFF``/``0x00`` bytes per scanline: 0xFF where the pixel's
+    quantised colour is exactly ``rgb``.
 
-
-# --- pixel analysis (headless "page changed") -------------------------------
-#
-# The headless venue's whole job is to tell the agent's actuation apart from
-# the app's own repaint, and a bare "some pixels changed" cannot do that: a
-# real app is *always* repainting something. The threshold here used to be 24
-# changed pixels in a 640x480 frame, which weston-terminal clears on its own
-# — its asynchronous first paint alone rewrites the whole view, and it can
-# easily land between the demo's two captures — so the named M1.5 gate passed
-# whether or not the click and the typed text ever reached the app.
-#
-# Three things fix that, and all three are needed:
-#
-#   1. The app is SETTLED before the control capture (:func:`_settle`), so
-#      startup paint is finished and inside the "before" frame, not straddling
-#      it. That removes the race, rather than trying to out-threshold it.
-#   2. The settled app is then left strictly alone for an IDLE PROBE at least
-#      as long as the window the gate later polls (:func:`_idle_probe`). If
-#      the app can draw an actuation-shaped diff with nobody actuating, this
-#      gate cannot discriminate on this runner, and it says so instead of
-#      passing.
-#   3. The change that follows must carry the *shape* the typed text makes:
-#      not merely enough pixels, but a densely inked chain of them along one
-#      scanline that only a row of characters could have drawn.
-#
-# The thresholds below are derived from the input the demo types, not from
-# one lucky measurement, so they do not have to be retuned per runner.
-
-
-#: Minimum changed pixels for the headless "the page changed" claim.
-#:
-#: Justification: a filled character cell in a terminal at any plausible
-#: font size is roughly 8x17 = ~140 pixels, and glyphs ink well under half
-#: of that, so a blinking cursor or a single re-drawn glyph tops out around
-#: one cell. 400 is ~3 cells: unreachable by incidental one-cell repaint,
-#: and far below what the demo's own input produces — typing
-#: ``echo vitrin-demo`` + Enter into a real weston-terminal on a 640x480
-#: pixman view measured 1703 changed pixels across 49 scanlines, i.e. a 4x
-#: margin. Deliberately not tuned close to that measurement: a gate that
-#: fails randomly gets muted, which is how gates die.
-MIN_HEADLESS_CHANGED_PIXELS = 400
-
-#: Two changed pixels on one scanline belong to the same *run* when they lie
-#: no more than this many pixels apart.
-#:
-#: Typed text does not ink a solid bar. Within a line of monospace glyphs the
-#: ink is broken by intra-glyph whitespace and by blank cells (a space
-#: character inks nothing at all), so a *strictly contiguous* run through a
-#: real typed line is only a handful of pixels long — measured 9 px for
-#: ``echo vitrin-demo`` in a real weston-terminal on a 640x480 pixman view. A
-#: contiguous-run threshold would therefore be unreachable by the very thing
-#: this gate demands. What a typed line does guarantee is that its ink never
-#: skips more than about one blank cell: measured maximum gap inside that same
-#: echoed line, 15 px. 24 px covers a blank cell at any plausible terminal
-#: font size in a 640x480 view, while staying far below the distance between
-#: independent widgets — a cursor at the left margin, a mode indicator
-#: mid-line and a scrollbar at the right edge sit hundreds of pixels apart and
-#: can never chain into one run.
-RUN_GAP_TOLERANCE = 24
-
-#: A run counts only if at least this fraction of the pixels it covers
-#: actually changed. Without it the gap tolerance alone would accept a dotted
-#: artefact — one changed pixel every 24 — as a "run". A real row of glyphs
-#: inks far more than a quarter of its own width: measured 96 of 143 px (67%)
-#: on the densest scanline of the real run above, a 2.7x margin.
-MIN_RUN_INK_RATIO = 0.25
-
-#: Minimum width, in pixels, of the widest *dense run* (:data:`RUN_GAP_TOLERANCE`,
-#: :data:`MIN_RUN_INK_RATIO`) on any one scanline.
-#:
-#: This is the discriminating half — the signature only the typed text makes.
-#: The demo types at least 16 characters, a terminal renders them into that
-#: many adjacent monospace cells, and no monospace cell is narrower than
-#: ~4 px, so the echoed line must chain >= 64 px on at least one scanline. A
-#: blinking cursor, a focus ring, or a one-glyph repaint is *one* cell wide
-#: (~8-20 px) and cannot reach it however many times it blinks. Measured dense
-#: run for the real run above: 143 px.
-#:
-#: Note what changed on 2026-07-25 and why: this used to be checked against the
-#: *bounding span* of a scanline's changed pixels (last minus first), which is
-#: not what the paragraph above derives. Three unrelated one-cell repaints at
-#: x=0, x=300 and x=600 have a 608 px bounding span and would have cleared a
-#: 64 px "span" threshold while containing no drawn line at all — the exact
-#: class of change this constant exists to reject. It is now checked against a
-#: run, so those three cells measure 8 px and are rejected.
-MIN_HEADLESS_CHANGED_RUN = 64
-
-#: Two consecutive captures differing by fewer than this many pixels count as
-#: "the app has settled" (:func:`_settle`). Sized to absorb a blinking cursor
-#: (one cell, ~140 px) while staying strictly below
-#: :data:`MIN_HEADLESS_CHANGED_PIXELS`.
-#:
-#: That ordering is necessary but *not* sufficient, and the docstring here
-#: used to claim otherwise ("the settle tolerance can never swallow a change
-#: the gate is supposed to demand"). It cannot: this tolerance is measured per
-#: poll interval, while :data:`MIN_HEADLESS_CHANGED_PIXELS` is measured
-#: cumulatively across the whole post-actuation window. An app repainting 150
-#: px every 150 ms — a spinner, a clock — looks quiet to every consecutive
-#: comparison here and still accumulates well past 400 px later. What actually
-#: rules that out is :func:`_idle_probe`, which measures the *cumulative* diff
-#: from the control capture over a window at least as long as the one the gate
-#: later polls.
-SETTLE_MAX_CHANGED_PIXELS = 200
-
-#: Consecutive quiet captures :func:`_settle` needs before it calls the app
-#: settled. Three at the 0.15 s poll below is ~0.45 s of continuous quiet.
-SETTLE_QUIET_ROUNDS = 3
-
-#: :func:`_settle` never accepts quiescence sooner than this many seconds in,
-#: however quiet the app looks. A terminal can map its window, go quiet, and
-#: only *then* draw its shell prompt; a run of quiet captures taken before
-#: that prompt would produce a control frame the prompt itself later "changes"
-#: — a startup repaint masquerading as the agent's typed text.
-#:
-#: This is now a **backstop, not the guard**. A wall-clock constant cannot
-#: know when a given runner's app has painted, and this one did not: on
-#: 2026-07-26, the first CI run to ever execute :func:`_idle_probe` failed
-#: with 26545 changed pixels across all 480 scanlines and a full-width dense
-#: run, with the agent deliberately idle — the app's own startup paint landing
-#: after a control capture this floor had already blessed. The actual guard is
-#: :func:`frame_has_content`: quiet rounds do not begin accumulating until the
-#: app has demonstrably drawn something. The floor stays as a cheap second
-#: opinion for a paint that arrives in stages.
-SETTLE_FLOOR = 1.0
-
-#: How long :func:`_settle` waits for the app to go quiet before giving up.
-#: It gives up by FAILING: an unsettled app means the control capture would
-#: be racing the app's own paint, which is exactly the vacuity this gate is
-#: being fixed for.
-SETTLE_TIMEOUT = 12.0
-
-#: The post-actuation capture window (:func:`_capture_after_change`): one
-#: initial pause plus this many polls. Named as constants because
-#: :data:`IDLE_PROBE_SECONDS` is derived from them — the idle probe is only
-#: meaningful if it is at least as long as the window it is vouching for.
-AFTER_SETTLE = 0.4
-AFTER_ATTEMPTS = 12
-AFTER_POLL = 0.15
-
-#: The longest a post-actuation diff has to accumulate before the gate gives
-#: up on it: 0.4 + 12 * 0.15 = 2.2 s.
-ACTUATION_POLL_BUDGET = AFTER_SETTLE + AFTER_ATTEMPTS * AFTER_POLL
-
-#: How long :func:`_idle_probe` watches the settled app with nobody actuating.
-#: Tied to :data:`ACTUATION_POLL_BUDGET`, not chosen: the probe's claim is
-#: "over a window at least as long as the one the gate later polls, this app
-#: drew nothing actuation-shaped by itself", and a shorter probe could not
-#: make it. ``HeadlessGateThresholdsStayDiscriminating`` pins the ordering.
-IDLE_PROBE_SECONDS = ACTUATION_POLL_BUDGET
+    The three colour planes are each translated to a match mask and AND-ed
+    together as one big integer, so the whole frame's per-pixel conjunction is
+    done at C speed rather than in a Python loop — which matters because this
+    runs on every polled capture. The padding (``X``) plane is never read: the
+    C shim composites an opaque background whose padding byte is a constant
+    regardless of the client (``harness.colour_bytes`` makes the same point).
+    """
+    packed = _packed(frame)
+    width, height = frame.width, frame.height
+    masks = []
+    for plane_offset, channel in ((2, rgb[0]), (1, rgb[1]), (0, rgb[2])):
+        plane = packed[plane_offset::4].translate(_TOP_NIBBLE)
+        masks.append(plane.translate(_eq_table(channel & 0xF0)))
+    combined = (
+        int.from_bytes(masks[0], "big")
+        & int.from_bytes(masks[1], "big")
+        & int.from_bytes(masks[2], "big")
+    ).to_bytes(len(masks[0]), "big")
+    return [combined[y * width : (y + 1) * width] for y in range(height)]
 
 
 @dataclass(frozen=True)
-class ChangeProfile:
-    """How two same-size frames differ, in the shapes the headless gate needs."""
+class Rect:
+    """A half-open pixel rectangle, ``[x0, x1) x [y0, y1)``."""
 
-    #: Pixels whose colour channels differ.
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+
+    @property
+    def width(self) -> int:
+        return self.x1 - self.x0
+
+    @property
+    def height(self) -> int:
+        return self.y1 - self.y0
+
+    @property
+    def centre(self) -> tuple[int, int]:
+        return ((self.x0 + self.x1) // 2, (self.y0 + self.y1) // 2)
+
+    def inset(self, n: int) -> "Rect":
+        """This rectangle shrunk by ``n`` on every side (never past empty)."""
+        x0, y0 = self.x0 + n, self.y0 + n
+        x1, y1 = max(self.x1 - n, x0), max(self.y1 - n, y0)
+        return Rect(x0, y0, x1, y1)
+
+    def __str__(self) -> str:
+        return f"({self.x0},{self.y0})-({self.x1},{self.y1})"
+
+
+@dataclass(frozen=True)
+class Marker:
+    """A located marker region: where it is, how big it is, where to click."""
+
+    hex6: str
+    rect: Rect
     count: int
-    #: Width of the widest *dense run* on any single scanline: the widest
-    #: stretch whose consecutive changed pixels are never more than
-    #: :data:`RUN_GAP_TOLERANCE` apart AND at least :data:`MIN_RUN_INK_RATIO`
-    #: of whose pixels changed. This is the gate's shape metric — the one
-    #: :func:`actuation_landed` reads.
-    widest_dense_run: int
-    #: How many pixels inside that dense run actually changed (its ink).
-    dense_run_ink: int
-    #: Widest first-to-last changed-pixel distance on any single scanline: a
-    #: *bounding span*, kept for diagnosis and deliberately NOT the gate's
-    #: metric. Three isolated one-cell repaints at x=0, x=300 and x=600 have a
-    #: 608 px bounding span and no run wider than one cell — reading the span
-    #: as if it were a run is precisely the defect this field's name now makes
-    #: impossible to repeat.
-    widest_row_span: int
-    #: Scanlines carrying at least one changed pixel.
+
+    @property
+    def click_point(self) -> tuple[int, int]:
+        return self.rect.centre
+
+    def __str__(self) -> str:
+        return f"#{self.hex6} {self.rect} ({self.count} px)"
+
+
+def locate_marker(frame: vitrin_os.Frame, hex6: str) -> Marker | None:
+    """Find a marker colour's bounding rectangle in the agent's OWN capture.
+
+    This is the whole "locate" story, and it is small on purpose: quantise,
+    match a known colour exactly, take the bounding box. The click point is
+    that box's centre — the marker regions are rectangles in both venues, so
+    the centre is the centroid, and taking the centre additionally keeps the
+    click well inside the region for any convex marker. Returns ``None`` when
+    the colour is absent.
+
+    Same technique the M1.4 gate already uses against ``click-target`` via
+    ``harness.locate_colour`` — see this section's header for why it is
+    restated here rather than imported.
+    """
+    rgb = (int(hex6[0:2], 16), int(hex6[2:4], 16), int(hex6[4:6], 16))
+    rows = _match_rows(frame, rgb)
+    count = 0
+    x0 = y0 = x1 = y1 = None
+    for y, row in enumerate(rows):
+        hits = row.count(0xFF)
+        if hits == 0:
+            continue
+        count += hits
+        first, last = row.find(b"\xff"), row.rfind(b"\xff")
+        x0 = first if x0 is None else min(x0, first)
+        x1 = last + 1 if x1 is None else max(x1, last + 1)
+        if y0 is None:
+            y0 = y
+        y1 = y + 1
+    if count == 0:
+        return None
+    assert x0 is not None and y0 is not None and x1 is not None and y1 is not None
+    return Marker(hex6=hex6, rect=Rect(x0, y0, x1, y1), count=count)
+
+
+def changed_in_rect(
+    before: vitrin_os.Frame, after: vitrin_os.Frame, rect: Rect
+) -> int:
+    """How many pixels inside ``rect`` differ in colour between two frames.
+
+    Compares only the three colour bytes; the fourth, padding, byte carries no
+    content. Raises if the frames are not the same size, which would be a bug
+    in the caller rather than a "changed" frame.
+    """
+    if (before.width, before.height) != (after.width, after.height):
+        raise ValueError(
+            f"frame size mismatch: {before.width}x{before.height} vs "
+            f"{after.width}x{after.height}"
+        )
+    pa, pb = _packed(before), _packed(after)
+    width = before.width
+    x0 = max(rect.x0, 0)
+    x1 = min(rect.x1, width)
+    y0 = max(rect.y0, 0)
+    y1 = min(rect.y1, before.height)
+    changed = 0
+    span = (x1 - x0) * 4
+    for y in range(y0, y1):
+        base = (y * width + x0) * 4
+        row_a = pa[base : base + span]
+        row_b = pb[base : base + span]
+        if row_a == row_b:
+            continue
+        for i in range(0, span, 4):
+            if row_a[i : i + 3] != row_b[i : i + 3]:
+                changed += 1
+    return changed
+
+
+@dataclass(frozen=True)
+class SolidRun:
+    """A maximal run of consecutive scanlines that are one solid colour."""
+
+    rgb: tuple[int, int, int]
+    first_row: int
     rows: int
 
     def __str__(self) -> str:
-        return (
-            f"{self.count} px changed, widest dense run {self.widest_dense_run} px "
-            f"({self.dense_run_ink} px inked), bounding span {self.widest_row_span} px, "
-            f"{self.rows} scanline(s) touched"
-        )
+        return f"#{rgb_hex(self.rgb)} rows {self.first_row}..{self.first_row + self.rows - 1}"
 
 
-def change_profile(before: vitrin_os.Frame, after: vitrin_os.Frame) -> ChangeProfile:
-    """Compare two same-size frames pixel by pixel, row by row.
+def solid_row_runs(
+    frame: vitrin_os.Frame, colours: tuple[tuple[int, int, int], ...]
+) -> list[SolidRun]:
+    """Every maximal run of scanlines that are solidly one of ``colours``.
 
-    Per scanline this measures three things: how many pixels changed, the
-    first-to-last *bounding span* of the changed ones (diagnostic), and the
-    widest *dense run* — a stretch whose consecutive changed pixels are never
-    more than :data:`RUN_GAP_TOLERANCE` apart and at least
-    :data:`MIN_RUN_INK_RATIO` of whose covered pixels changed. Only the dense
-    run feeds :func:`actuation_landed`; see :data:`MIN_HEADLESS_CHANGED_RUN`
-    for why the span cannot.
-
-    Reads ``frame.raw`` directly (little-endian xrgb8888, ``B, G, R, X`` per
-    pixel) and compares only the three colour bytes — the fourth, padding,
-    byte carries no content and the C shim composites an opaque background
-    whose padding plane is a constant regardless of the client (see
-    ``tests/integration/harness.py``'s ``colour_bytes`` for the same
-    reasoning). Walks rows via ``frame.stride`` so inter-row padding is never
-    mistaken for image content. Raises if the two frames are not the same
-    size, which would be a bug in the caller, not a "changed" frame. Inlined
-    rather than imported from the harness — this is a *shipped example*,
-    launched with only ``PYTHONPATH=sdk/python/src`` (see
-    :func:`_capture_when_ready`'s docstring for why the demo stays
-    standalone).
+    Restricted to the colours the caller is looking for, which is what makes
+    this cheap *and* what makes the check a **positive content check**: the
+    question is never "did the frame change" but "does the frame carry these
+    specific colours as full-width bands". Geometry-free on purpose — the same
+    code has to work against ``form-target``'s pinned 640x480 layout and
+    against Firefox's chrome-offset viewport.
     """
-    a, b = before.raw, after.raw
-    if len(a) != len(b) or (before.width, before.height) != (after.width, after.height):
-        raise ValueError(
-            f"frame size mismatch: {before.width}x{before.height} ({len(a)} bytes) "
-            f"vs {after.width}x{after.height} ({len(b)} bytes)"
-        )
-    stride, width, height = before.stride, before.width, before.height
-    gap = RUN_GAP_TOLERANCE
-    count = rows = widest_span = best_run = best_ink = 0
-
-    def _offer(length: int, ink: int) -> None:
-        """Keep the widest run that is inked densely enough to be a drawing."""
-        nonlocal best_run, best_ink
-        if ink >= length * MIN_RUN_INK_RATIO and (length, ink) > (best_run, best_ink):
-            best_run, best_ink = length, ink
-
-    for y in range(height):
-        base = y * stride
-        first = last = -1
-        run_start = run_ink = 0
-        for x in range(width):
-            off = base + x * 4
-            if a[off : off + 3] != b[off : off + 3]:
-                count += 1
-                if first < 0:
-                    first, run_start, run_ink = x, x, 0
-                elif x - last > gap:
-                    # Too far from the previous changed pixel to be the same
-                    # drawing: close the run that ended at `last`, open a new
-                    # one here.
-                    _offer(last - run_start + 1, run_ink)
-                    run_start, run_ink = x, 0
-                run_ink += 1
-                last = x
-        if first >= 0:
-            rows += 1
-            widest_span = max(widest_span, last - first + 1)
-            _offer(last - run_start + 1, run_ink)
-    return ChangeProfile(
-        count=count,
-        widest_dense_run=best_run,
-        dense_run_ink=best_ink,
-        widest_row_span=widest_span,
-        rows=rows,
-    )
+    width, height = frame.width, frame.height
+    need = int(width * SOLID_ROW_SHARE)
+    per_row: list[tuple[int, int, int] | None] = [None] * height
+    seen: set[tuple[int, int, int]] = set()
+    for rgb in colours:
+        if rgb in seen:
+            continue
+        seen.add(rgb)
+        for y, row in enumerate(_match_rows(frame, rgb)):
+            if per_row[y] is None and row.count(0xFF) >= need:
+                per_row[y] = rgb
+    runs: list[list] = []
+    for y, rgb in enumerate(per_row):
+        if rgb is None:
+            continue
+        if runs and runs[-1][0] == rgb and runs[-1][1] + runs[-1][2] == y:
+            runs[-1][2] += 1
+        else:
+            runs.append([rgb, y, 1])
+    return [SolidRun(rgb=r[0], first_row=r[1], rows=r[2]) for r in runs]
 
 
-def actuation_landed(profile: ChangeProfile) -> bool:
-    """True only for a change the demo's own typed line could have drawn.
+def match_bands(
+    runs: list[SolidRun],
+    expected: tuple[tuple[int, int, int], ...],
+    *,
+    min_rows: int = MIN_BAND_ROWS,
+) -> bool:
+    """True iff ``expected`` appears, in order, as bands of ``min_rows`` rows.
 
-    Both conditions, never either alone: enough pixels to rule out a one-cell
-    repaint, *and* a dense run wide enough that only a line of characters
-    explains it. See the constants above for why each number is what it is —
-    in particular :data:`MIN_HEADLESS_CHANGED_RUN` for why this reads a run
-    and not the bounding span it used to read.
+    In-order and greedy. One run may satisfy several *consecutive* expected
+    bands, which is exactly what two adjacent bands of the same colour look
+    like on screen — a single taller run — and which a task whose hash
+    collides between adjacent bands would otherwise fail on for no good
+    reason.
     """
-    return (
-        profile.count >= MIN_HEADLESS_CHANGED_PIXELS
-        and profile.widest_dense_run >= MIN_HEADLESS_CHANGED_RUN
-    )
+    index, rows_left = -1, 0
+    for want in expected:
+        while True:
+            if index >= 0 and rows_left >= min_rows and runs[index].rgb == want:
+                rows_left -= min_rows
+                break
+            index += 1
+            if index >= len(runs):
+                return False
+            rows_left = runs[index].rows
+    return True
 
 
-def frame_has_content(frame: vitrin_os.Frame) -> bool:
-    """True once a frame carries real, non-uniform content from the app.
+# --- capture helpers --------------------------------------------------------
 
-    Content-bearing iff some pixel is not black *and* more than one colour
-    value is present. The shim composites an opaque background before the app
-    has drawn anything, and a toolkit's pre-chrome fill is likewise a single
-    value; both are uniform, and both fail this. So this is the difference
-    between "the app has drawn" and "there is a surface to observe", which
-    :func:`_capture_when_ready` alone cannot tell apart — it returns the first
-    buffer the realm commits, blank or not.
-
-    :func:`_settle` needs exactly that distinction. Its quiet condition is
-    "consecutive captures barely differ", which a frame nobody has drawn into
-    satisfies *perfectly* — 0 px, every interval, indefinitely. Without a
-    positive test for paint, "settled" and "not started" are the same
-    observation.
-
-    Reads ``frame.raw`` the way :func:`change_profile` does — little-endian
-    xrgb8888, walked by ``frame.stride``, comparing only the three colour
-    bytes so inter-row padding and the constant padding byte are never
-    mistaken for content. Returns as soon as the answer is known rather than
-    scanning the whole buffer. Same rule as
-    ``tests/integration/harness.has_real_content``, inlined for the same
-    reason :func:`change_profile` is: this is a *shipped example* launched
-    with only ``PYTHONPATH=sdk/python/src``, and must not reach into the test
-    tree.
-    """
-    raw = frame.raw
-    stride, width, height = frame.stride, frame.width, frame.height
-    first_seen: bytes | None = None
-    any_non_black = False
-    for y in range(height):
-        base = y * stride
-        for x in range(width):
-            off = base + x * 4
-            pixel = raw[off : off + 3]
-            if pixel != b"\x00\x00\x00":
-                any_non_black = True
-            if first_seen is None:
-                first_seen = pixel
-            elif pixel != first_seen and any_non_black:
-                return True
-    return False
+class DemoAssertionError(AssertionError):
+    """The demo's proof did not hold."""
 
 
-# --- the observe-race-tolerant first capture --------------------------------
-
-def _capture_when_ready(
+def _observe(
     grant: vitrin_os.Grant, *, timeout: float = 8.0, poll: float = 0.02
 ) -> vitrin_os.Frame:
-    """First capture of a freshly-served realm, tolerating the startup race.
+    """One capture, tolerating the two honest refusals a poll model produces.
 
-    A realm that has not yet committed its first buffer has no surface, and the
-    core answers ``observe`` with ``NoSurface`` — the honest reply, judged
-    before the rate bucket, so a retry costs no budget. ``await_consent()``
-    can return before the shim has drawn, so the agent's first ``observe()``
-    can lose that race; the poll model (D6) is to retry until a frame lands.
-
-    Inlined rather than imported from ``tests/integration/harness``
-    deliberately: this is a *shipped example* under ``examples/``, launched
-    with only ``PYTHONPATH=sdk/python/src``. Reaching into the test tree would
-    couple the deliverable to the harness (and its ``VITRIN_REPO`` assumptions)
-    for a dozen self-contained lines. The logic is identical to
-    ``harness.capture_when_ready``; keeping it here keeps the demo standalone.
+    ``NoSurface``: a realm that has not committed its first buffer has no
+    surface, and the core says so — judged before the rate bucket, so a retry
+    costs no budget. ``await_consent()`` can return before the shim has drawn,
+    so the agent's first ``observe()`` can lose that race; the poll model (D6)
+    is to retry until a frame lands. ``RateLimited``: honour the core's own
+    ``retry_after_ms`` rather than guessing.
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -582,234 +786,197 @@ def _capture_when_ready(
             if time.monotonic() >= deadline:
                 raise
             time.sleep(poll)
+        except errors.RateLimited as limited:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(max(limited.retry_after_ms / 1000.0, poll))
 
 
-def _settle(
+#: Per-step poll budgets. Deliberately tight: the integration harness kills a
+#: test at 90 s (``harness.TEST_TIMEOUT_S``), and this flow has six polled
+#: steps plus a page load, so a generous timeout in each would blow that
+#: budget before any of them failed.
+LOCATE_TIMEOUT = 15.0
+LOCATE_POLL = 0.1
+FOCUS_SETTLE_TIMEOUT = 2.0
+FOCUS_SETTLE_POLL = 0.06
+FOCUS_QUIET_ROUNDS = 2
+INK_TIMEOUT = 8.0
+INK_POLL = 0.1
+RECEIPT_TIMEOUT = 12.0
+RECEIPT_POLL = 0.15
+PAGE_LOAD_TIMEOUT = 30.0
+
+
+def _locate_with_poll(
     grant: vitrin_os.Grant,
-    first: vitrin_os.Frame,
+    hex6: str,
     *,
-    timeout: float = SETTLE_TIMEOUT,
-    poll: float = 0.15,
-    quiet_rounds: int = SETTLE_QUIET_ROUNDS,
-    floor: float = SETTLE_FLOOR,
-) -> vitrin_os.Frame:
-    """Capture until the app has stopped repainting on its own; return the last.
-
-    The frame this returns is the **control capture**: everything the app was
-    going to draw by itself — its asynchronous first paint, its shell prompt,
-    whatever it does on startup — is already inside it. This is the load-
-    bearing half of the headless proof, more so than either threshold below
-    it: a real weston-terminal's own startup paint has been measured at 569
-    changed pixels spanning 81 px across 19 scanlines, which is a *typed-text-
-    shaped* diff produced by no actuation at all. No threshold can tell that
-    apart from the real thing; only moving it into the "before" frame can.
-
-    "Settled" means the app has **drawn** (:func:`frame_has_content`) and has
-    *then* held still for ``quiet_rounds`` consecutive captures each differing
-    from the one before it by fewer than :data:`SETTLE_MAX_CHANGED_PIXELS`
-    pixels, never sooner than ``floor`` seconds in. The paint precondition is
-    load-bearing and was missing until 2026-07-26: quiescence alone cannot
-    distinguish "the app finished painting" from "the app has not started",
-    because a frame nobody has drawn into differs from its predecessor by 0 px
-    every interval, forever. This loop would return that blank frame as the
-    control capture, and the app's own first paint — measured on a real
-    weston-terminal at 569 px across a dense run of 81, which already
-    satisfies :func:`actuation_landed` on its own — would land afterwards,
-    inside the very window the gate measures. The tolerance is sized to absorb
-    a blinking cursor. It is emphatically *not* sized to make the gate sound: it is a
-    per-interval tolerance and the gate's threshold is cumulative (see
-    :data:`SETTLE_MAX_CHANGED_PIXELS`), so quiescence by this definition is
-    then checked against the gate's own predicate by :func:`_idle_probe`,
-    whose frame — not this loop's last capture — is what this returns. Paced
-    at ``poll`` so a default-rate grant's token bucket (20/s) is never emptied
-    by the settle loop itself.
-
-    Raises :class:`DemoAssertionError` on timeout rather than proceeding with
-    an unsettled control frame: a gate that cannot establish its own baseline
-    must fail, not guess.
-    """
-    started = time.monotonic()
-    deadline = started + timeout
-    previous = first
-    quiet = 0
-    profile = None
-    # Quiescence only means anything *after* the app has drawn. Until then a
-    # run of identical captures is the shim's blank background holding still,
-    # which is indistinguishable from a settled app by every metric this loop
-    # has except this one.
-    painted = frame_has_content(first)
-    while time.monotonic() < deadline:
-        time.sleep(poll)
-        frame = grant.observe()
-        profile = change_profile(previous, frame)
-        previous = frame
-        if not painted:
-            # Nothing has been drawn yet: reset rather than accumulate quiet,
-            # so the paint that eventually lands is followed by a full
-            # `quiet_rounds` of genuine post-paint stillness.
-            painted = frame_has_content(frame)
-            quiet = 0
-            continue
-        quiet = quiet + 1 if profile.count < SETTLE_MAX_CHANGED_PIXELS else 0
-        if quiet >= quiet_rounds and time.monotonic() - started >= floor:
-            return _idle_probe(grant, frame)
-    if not painted:
-        raise DemoAssertionError(
-            f"the real app never drew anything within {timeout:.0f}s: every "
-            "capture was uniform (the shim's opaque background), so there is "
-            "no app paint for this loop to settle. Returning here would make "
-            "the control capture a blank frame, and the app's own first paint "
-            "would then land inside the gate's measuring window and read as "
-            "the agent's click and typed text."
-        )
-    raise DemoAssertionError(
-        f"the real app never went quiet within {timeout:.0f}s (last comparison: "
-        f"{profile}; needed {quiet_rounds} consecutive captures under "
-        f"{SETTLE_MAX_CHANGED_PIXELS} changed pixels). Without a settled control "
-        "capture, a later pixel diff would prove the app finished painting, not "
-        "that the agent's click and typed text reached it."
-    )
-
-
-def _idle_probe(
-    grant: vitrin_os.Grant,
-    control: vitrin_os.Frame,
-    *,
-    seconds: float = IDLE_PROBE_SECONDS,
-    poll: float = 0.15,
-) -> vitrin_os.Frame:
-    """Watch the settled app do nothing, for as long as the gate later polls.
-
-    :func:`_settle`'s quiet condition is per-interval; the gate's is
-    cumulative over the whole post-actuation window. An app repainting just
-    under :data:`SETTLE_MAX_CHANGED_PIXELS` every interval — a spinner, a
-    clock, a progress bar — therefore settles happily and can still pile up a
-    passing diff with nobody actuating anything. This closes that: with the
-    agent deliberately idle, it measures the *cumulative* diff from ``control``
-    over :data:`IDLE_PROBE_SECONDS` (>= :data:`ACTUATION_POLL_BUDGET`, the
-    window :func:`_capture_after_change` is allowed to poll) and fails if that
-    diff ever satisfies :func:`actuation_landed`. If the app can draw the
-    gate's own signature unaided, the gate cannot discriminate on this runner,
-    and saying so is the honest outcome — passing would not be.
-
-    The frame it returns is the new control capture: the last idle observation,
-    so whatever harmless drift the probe did see is behind the "before" frame
-    rather than inside the actuation diff.
-
-    What this does NOT establish: that the app is quiet at *every* future
-    moment. An app quiet during the probe and bursty a second later still
-    slips through, and no pre-actuation probe can exclude that. What it does
-    establish is that a *steady* incidental repaint — the realistic shape of
-    this failure — cannot masquerade as actuation.
-    """
-    deadline = time.monotonic() + seconds
-    frame = control
-    worst = ChangeProfile(
-        count=0, widest_dense_run=0, dense_run_ink=0, widest_row_span=0, rows=0
-    )
-    while time.monotonic() < deadline:
-        time.sleep(poll)
-        frame = grant.observe()
-        profile = change_profile(control, frame)
-        if actuation_landed(profile):
+    what: str,
+    timeout: float = LOCATE_TIMEOUT,
+    poll: float = LOCATE_POLL,
+    hint: str = "",
+) -> tuple[vitrin_os.Frame, Marker]:
+    """Observe until ``hex6`` is on screen with enough pixels to be the feature."""
+    deadline = time.monotonic() + timeout
+    frame = _observe(grant)
+    best = 0
+    while True:
+        marker = locate_marker(frame, hex6)
+        if marker is not None:
+            best = max(best, marker.count)
+            if marker.count >= MIN_MARKER_PIXELS:
+                return frame, marker
+        if time.monotonic() >= deadline:
             raise DemoAssertionError(
-                f"the app drew an actuation-shaped change on its own: {profile} "
-                f"accumulated over a {seconds:.1f}s idle probe with the agent "
-                "deliberately doing nothing (the settled control capture is the "
-                f"baseline; >= {MIN_HEADLESS_CHANGED_PIXELS} px AND a dense run >= "
-                f"{MIN_HEADLESS_CHANGED_RUN} px is exactly what this gate later "
-                "accepts as proof the click and typed text landed). A gate whose "
-                "app can forge its own evidence proves nothing, so this fails "
-                "rather than passing on an unusable baseline."
+                f"{what} (#{hex6}) never reached the agent within {timeout:.0f}s: the "
+                f"largest matching region seen was {best} px, and "
+                f"{MIN_MARKER_PIXELS} px are needed to believe it is the feature."
+                + (f" {hint}" if hint else "")
             )
-        if profile.count > worst.count:
-            worst = profile
-    print(f"demo: idle probe ({seconds:.1f}s, no actuation) worst drift: {worst}")
-    return frame
-
-
-def _capture_after_change(
-    grant: vitrin_os.Grant,
-    before: vitrin_os.Frame,
-    *,
-    headless: bool,
-    settle: float = AFTER_SETTLE,
-    attempts: int = AFTER_ATTEMPTS,
-    poll: float = AFTER_POLL,
-) -> vitrin_os.Frame:
-    """Capture the "after" frame once the change is observable.
-
-    Headless: poll until the diff from ``before`` — which is the *settled*
-    control capture, see :func:`_settle` — carries the signature only the
-    demo's own typed line makes (:func:`actuation_landed`), never merely
-    "some pixels moved". Nested: poll until the dominant colour reaches
-    :data:`SERVED_RGB` (the page loaded). Polling is paced (a settle, then
-    ``attempts`` spaced by ``poll``) so a default-rate grant's token bucket is
-    never emptied by the capture loop itself. The defaults come from the
-    module constants, because :func:`_idle_probe` watches the idle app for at
-    least this whole budget (:data:`ACTUATION_POLL_BUDGET`) — shortening the
-    window here without shortening the probe is safe, lengthening it is not.
-    The last frame is returned regardless, so a genuine failure yields a
-    diagnosable after-frame rather than an exception here.
-    """
-    time.sleep(settle)
-    frame = grant.observe()
-    for _ in range(attempts):
-        if headless:
-            if actuation_landed(change_profile(before, frame)):
-                return frame
-        elif colors_close(dominant_color(frame), SERVED_RGB):
-            return frame
         time.sleep(poll)
-        frame = grant.observe()
+        frame = _observe(grant)
+
+
+def _baseline_after_click(
+    grant: vitrin_os.Grant,
+    rect: Rect,
+    *,
+    timeout: float = FOCUS_SETTLE_TIMEOUT,
+    poll: float = FOCUS_SETTLE_POLL,
+    rounds: int = FOCUS_QUIET_ROUNDS,
+) -> vitrin_os.Frame:
+    """The per-field ink baseline, taken AFTER the click and BEFORE the type.
+
+    **This ordering is the point, and it is the class of defect this repo has
+    already been burned by twice.** A real app draws a focus indicator when a
+    field is clicked. That indicator is a change *inside* the field's bounding
+    box which no typing produced, and it is often *larger* than the typed text
+    (a 2 px ring around a 560x44 field is ~2400 px; the shipped task's value
+    inks ~576 px). A baseline taken before the click would put the ring inside
+    the measured diff, and a naive "did anything change in the field?" check
+    would then pass with nothing typed at all.
+
+    So the baseline is captured after the click, and this loop waits for the
+    in-rectangle diff between consecutive captures to go quiet first — the
+    indicator has to have *arrived* before the baseline is taken, or the
+    ordering buys nothing. On timeout it returns its last capture rather than
+    failing: :data:`FIELD_RECT_INSET` excludes the ring geometrically as the
+    second mitigation, and a text caret that never stops blinking must not
+    fail the run.
+    """
+    frame = _observe(grant)
+    quiet = 0
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(poll)
+        nxt = _observe(grant)
+        quiet = quiet + 1 if changed_in_rect(frame, nxt, rect) <= FIELD_QUIET_MAX else 0
+        frame = nxt
+        if quiet >= rounds:
+            return frame
     return frame
 
 
-# --- result & assertion -----------------------------------------------------
+def _await_ink(
+    grant: vitrin_os.Grant,
+    baseline: vitrin_os.Frame,
+    rect: Rect,
+    *,
+    what: str,
+    timeout: float = INK_TIMEOUT,
+    poll: float = INK_POLL,
+) -> tuple[vitrin_os.Frame, int]:
+    """Observe until enough pixels changed INSIDE ``rect`` to be the typed value."""
+    deadline = time.monotonic() + timeout
+    best = 0
+    while True:
+        frame = _observe(grant)
+        ink = changed_in_rect(baseline, frame, rect)
+        best = max(best, ink)
+        if ink >= MIN_FIELD_INK_PIXELS:
+            return frame, ink
+        if time.monotonic() >= deadline:
+            raise DemoAssertionError(
+                f"nothing the agent typed reached {what}: only {best} px changed inside "
+                f"{rect} within {timeout:.0f}s, and {MIN_FIELD_INK_PIXELS} px are needed. "
+                "The baseline was taken AFTER the click and the rectangle is inset past "
+                f"any focus ring ({FIELD_RECT_INSET} px), so a focus indicator cannot "
+                "account for this either way: the typed text did not land in the field "
+                "the agent clicked."
+            )
+        time.sleep(poll)
 
-class DemoAssertionError(AssertionError):
-    """The venue's "page changed" claim did not hold."""
 
+def _await_receipt(
+    grant: vitrin_os.Grant,
+    bands: tuple[tuple[int, int, int], ...],
+    *,
+    timeout: float = RECEIPT_TIMEOUT,
+    poll: float = RECEIPT_POLL,
+) -> tuple[vitrin_os.Frame, list[SolidRun]]:
+    """Observe until the confirmation carries THIS task's receipt bands, in order."""
+    deadline = time.monotonic() + timeout
+    while True:
+        frame = _observe(grant)
+        runs = solid_row_runs(frame, bands)
+        if match_bands(runs, bands):
+            return frame, runs
+        if time.monotonic() >= deadline:
+            wanted = ", ".join("#" + rgb_hex(b) for b in bands)
+            seen = ", ".join(str(r) for r in runs) or "none"
+            raise DemoAssertionError(
+                f"the confirmation never carried this task's receipt within "
+                f"{timeout:.0f}s. Wanted {BAND_COUNT} full-width bands of >= "
+                f"{MIN_BAND_ROWS} rows, in this order: {wanted}. Solid runs of those "
+                f"colours actually seen: {seen}. These colours are a pure function of "
+                "the SUPPLIED task, computed at runtime, so a frame either carries this "
+                "record's checksum or it does not."
+            )
+        time.sleep(poll)
+
+
+# --- result & reporting -----------------------------------------------------
 
 @dataclass
 class DemoResult:
     """What :func:`run` produced — enough for a caller to re-assert or diff."""
 
     ok: bool
-    url: str
+    headless: bool
+    task: tuple[tuple[str, str], ...]
+    canon: str
+    bands: tuple[tuple[int, int, int], ...]
     before: vitrin_os.Frame
     after: vitrin_os.Frame
     out_dir: pathlib.Path
-    headless: bool
+    #: The realm-view points the agent clicked, in order: one per field, then
+    #: the submit button. The gate recomputes nothing — it reads these back.
+    clicks: list[tuple[int, int]] = dc_field(default_factory=list)
+    #: Per field, how many pixels the CLICK ALONE changed inside that field's
+    #: rectangle, measured between the frame the field was located in and the
+    #: post-click baseline — i.e. the focus indicator's own footprint.
+    #:
+    #: Exported so a gate can assert the focus-ring trap is *real in this run*
+    #: rather than only in an in-process fixture: a venue where this is 0 is a
+    #: venue where the baseline ordering (:func:`_baseline_after_click`) has
+    #: not been exercised at all, and saying so is more useful than quietly
+    #: passing.
+    focus_changes: list[int] = dc_field(default_factory=list)
+    #: The nested venue's out-of-band ground truth (the page's beacon), or
+    #: ``None`` headless, where ``form-target``'s ``SUBMIT`` line on the core's
+    #: stdout plays the same role.
+    submitted: list[tuple[str, str]] | None = None
+    #: The nested page's URL, or ``""`` headless.
+    url: str = ""
 
 
-def _assert_page_changed(before: vitrin_os.Frame, after: vitrin_os.Frame, *, headless: bool) -> None:
-    if headless:
-        profile = change_profile(before, after)
-        if not actuation_landed(profile):
-            raise DemoAssertionError(
-                f"headless: {profile} between the settled control capture and the "
-                f"after-frame — need >= {MIN_HEADLESS_CHANGED_PIXELS} px changed AND a "
-                f"dense run >= {MIN_HEADLESS_CHANGED_RUN} px wide on some scanline "
-                f"(pixels chained at <= {RUN_GAP_TOLERANCE} px, at least "
-                f"{MIN_RUN_INK_RATIO:.0%} of the run inked; the bounding span is "
-                "reported for diagnosis only and is not the criterion). "
-                "The control capture was taken after the app went quiet, so the app's "
-                "own startup paint cannot account for a diff; what is missing is the "
-                "shape a line of typed characters draws. The agent's click and typed "
-                "text did not visibly reach the real app."
-            )
-        return
-    dominant = dominant_color(after)
-    if not colors_close(dominant, SERVED_RGB):
-        raise DemoAssertionError(
-            f"nested: the after-frame's dominant colour {dominant} does not match the "
-            f"served page colour {SERVED_RGB} — the typed URL did not navigate the browser"
-        )
-
-
-def _dump_frames(result_dir: pathlib.Path, before: vitrin_os.Frame | None,
-                 after: vitrin_os.Frame | None, recorder: str | os.PathLike[str] | None) -> None:
+def _dump_frames(
+    result_dir: pathlib.Path,
+    before: vitrin_os.Frame | None,
+    after: vitrin_os.Frame | None,
+    recorder: str | os.PathLike[str] | None,
+) -> None:
     """Save whatever frames we have as PNGs and point at the flight recorder."""
     result_dir.mkdir(parents=True, exist_ok=True)
     saved = []
@@ -833,12 +1000,13 @@ def run(
     *,
     headless: bool,
     consent: str = "auto-approve",
+    task: tuple[tuple[str, str], ...] = TASK_DEFAULT,
     out_dir: str | os.PathLike[str] | None = None,
     url: str | None = None,
     recorder: str | os.PathLike[str] | None = None,
     connect_timeout: float = 30.0,
 ) -> DemoResult:
-    """Drive the full demo against a live core at ``socket``.
+    """Drive the full goal-directed demo against a live core at ``socket``.
 
     The single entry point both venues use. ``consent`` is informational here —
     the agent's conduct is identical (``await_consent`` blocks until the
@@ -848,6 +1016,14 @@ def run(
     typed exceptions) on failure, after dumping frames for diagnosis; returns a
     :class:`DemoResult` on success.
     """
+    task = tuple(task)
+    if len(task) != FIELD_COUNT:
+        raise TaskError(
+            f"the demo's form has exactly {FIELD_COUNT} fields; got {len(task)} pairs"
+        )
+    canon = canonical_task(task)
+    bands = receipt_bands(task)
+
     out_dir = pathlib.Path(out_dir) if out_dir else pathlib.Path(
         tempfile.mkdtemp(prefix="vitrin-demo-")
     )
@@ -855,17 +1031,21 @@ def run(
     conn: vitrin_os.Connection | None = None
     before: vitrin_os.Frame | None = None
     after: vitrin_os.Frame | None = None
+    clicks: list[tuple[int, int]] = []
+    focus_changes: list[int] = []
     try:
-        # Nested serves a real local page for Firefox to load; headless types
-        # a harmless shell line into the real terminal app.
-        if headless:
-            target = url or DEFAULT_HEADLESS_INPUT
-        else:
+        page_url = ""
+        if not headless:
             page = _LocalPage()
-            target = url or page.url
+            page_url = url or page.url_for(task)
 
         print(f"demo: connecting to {socket} as {DEMO_IDENTITY} "
               f"({'headless' if headless else 'nested'} venue, consent={consent})")
+        print(f"demo: task (supplied, not a constant): "
+              + ", ".join(f"{k}={v!r}" for k, v in task))
+        print("demo: this record's receipt is "
+              + " ".join("#" + rgb_hex(b) for b in bands)
+              + " — a 36-bit checksum of the record, NOT the glyphs")
         conn = vitrin_os.connect(
             str(socket), identity=DEMO_IDENTITY, credential=DEMO_TOKEN,
             timeout=connect_timeout,
@@ -883,32 +1063,87 @@ def run(
               + ("(auto-approve, R6-guarded)" if consent == "auto-approve"
                  else "(a human must click Allow in the nested prompt)"))
         grant.await_consent()
-        print("demo: grant resolved; capturing the before-frame")
+        print("demo: grant resolved")
 
-        before = _capture_when_ready(grant)
-        if headless:
-            # The control capture: wait out the real app's own startup paint
-            # BEFORE the actuation, so the diff that follows cannot be
-            # explained by the app finishing what it had already started, and
-            # then watch it idle for the gate's own polling budget so a
-            # steadily-repainting app cannot forge the gate's signature
-            # (`_settle` -> `_idle_probe`; the probe's last frame is the
-            # control). Nested needs no equivalent — its proof is the served
-            # page's dominant colour, which the browser's chrome cannot draw.
-            before = _settle(grant, before)
-            print("demo: the real app is quiet; that frame is the control capture")
-        url_x, url_y = locate_url_bar(before, headless=headless)
-        print(f"demo: clicking ({url_x}, {url_y}); typing {target!r} + Enter")
-        grant.pointer.click(url_x, url_y)
-        grant.text.type(target + "\n")  # the trailing newline presses Enter
+        if not headless:
+            # Nested-only preamble: navigate the real browser to the served
+            # form. Headless needs no equivalent — `form-target` IS the form.
+            frame = _observe(grant)
+            bar_x, bar_y = url_bar_target(frame)
+            print(f"demo: clicking Firefox's URL bar at ({bar_x}, {bar_y}); "
+                  f"typing {page_url!r} + Enter")
+            grant.pointer.click(bar_x, bar_y)
+            grant.text.type(page_url + "\n")  # the trailing newline presses Enter
+            _locate_with_poll(
+                grant, FIELD_MARKERS[0],
+                what="the served form's first field",
+                timeout=PAGE_LOAD_TIMEOUT,
+                hint=(
+                    f"That means THE PAGE DID NOT LOAD, not that the form is missing a "
+                    f"field: the URL bar was clicked at ({bar_x}, {bar_y}), which is a "
+                    f"pinned geometry constant for a {ESR_WINDOW_SIZE[0]}x"
+                    f"{ESR_WINDOW_SIZE[1]} window. If this Firefox build lays its "
+                    f"toolbar out elsewhere, set {URL_BAR_ENV}=x,y and re-run."
+                ),
+            )
+            print("demo: the served form is on screen")
 
-        after = _capture_after_change(grant, before, headless=headless)
-        _assert_page_changed(before, after, headless=headless)
-        print("demo: page changed — acceptance criterion met")
+        # --- the field loop: identical code in both venues -----------------
+        for index, (key, value) in enumerate(task):
+            marker_hex = FIELD_MARKERS[index]
+            frame, marker = _locate_with_poll(
+                grant, marker_hex, what=f"field {index} ({key})"
+            )
+            if before is None:
+                before = frame
+            click_x, click_y = marker.click_point
+            print(f"demo: located field {index} ({key}) at {marker}; "
+                  f"clicking ({click_x}, {click_y})")
+            grant.pointer.click(click_x, click_y)
+            clicks.append((click_x, click_y))
 
+            # AFTER the click, BEFORE the type — see `_baseline_after_click`.
+            baseline = _baseline_after_click(grant, marker.rect)
+            # What the click alone drew inside the field: the focus
+            # indicator's footprint, and the size of the trap this ordering
+            # exists to disarm. Measured on the FULL rectangle, so it is the
+            # honest "what would a naive check have credited to the typing".
+            focus_changes.append(changed_in_rect(frame, baseline, marker.rect))
+            grant.text.type(value)  # no trailing newline: submission is a click
+            measured = marker.rect.inset(FIELD_RECT_INSET)
+            after, ink = _await_ink(
+                grant, baseline, measured, what=f"field {index} ({key})"
+            )
+            print(f"demo: the click alone changed {focus_changes[-1]} px inside "
+                  f"{marker.rect} (the focus indicator, baselined out); "
+                  f"typed {value!r} -> {ink} px of ink inside {measured}")
+
+        # --- submit --------------------------------------------------------
+        frame, submit = _locate_with_poll(
+            grant, SUBMIT_MARKER, what="the submit button"
+        )
+        click_x, click_y = submit.click_point
+        print(f"demo: located the submit button at {submit}; "
+              f"clicking ({click_x}, {click_y})")
+        grant.pointer.click(click_x, click_y)
+        clicks.append((click_x, click_y))
+
+        # --- the receipt ---------------------------------------------------
+        after, runs = _await_receipt(grant, bands)
+        print("demo: receipt decoded from pixels: "
+              + "; ".join(str(r) for r in runs))
+        print("demo: the confirmation carries THIS task's 36-bit checksum — "
+              "acceptance criterion met")
+
+        submitted = page.submitted if page is not None else None
+        if page is not None:
+            print(f"demo: the page's own beacon reported {submitted!r}")
+
+        assert before is not None and after is not None
         return DemoResult(
-            ok=True, url=target, before=before, after=after,
-            out_dir=out_dir, headless=headless,
+            ok=True, headless=headless, task=task, canon=canon, bands=bands,
+            before=before, after=after, out_dir=out_dir, clicks=clicks,
+            focus_changes=focus_changes, submitted=submitted, url=page_url,
         )
     except BaseException:
         _dump_frames(out_dir, before, after, recorder)
@@ -925,20 +1160,25 @@ def run(
 def _parse_argv(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="run_demo.py",
-        description="Vitrin OS Phase-1 demo agent / M1.5 acceptance test.",
+        description="Vitrin OS Phase-1 goal-directed demo agent / M1.5 acceptance test.",
     )
     parser.add_argument("--socket", required=True,
                         help="path to the core's Unix socket (core.sock)")
     parser.add_argument("--headless", action="store_true",
-                        help="headless venue: a real terminal app stands behind the real shim")
+                        help="headless venue: `form-target` stands behind the real shim")
     parser.add_argument("--consent", default="auto-approve",
                         choices=("auto-approve", "interactive"),
                         help="the consent policy the launched core runs (informational)")
+    parser.add_argument("--task", action="append", metavar="K=V", default=None,
+                        help="one field of the task record, repeatable and "
+                             "ORDER-PRESERVING (the canonical string, and so every "
+                             "receipt band, depends on the order). Defaults to "
+                             + ", ".join(f"{k}={v}" for k, v in TASK_DEFAULT))
     parser.add_argument("--out", default=None,
                         help="directory for failure PNGs (a temp dir by default)")
     parser.add_argument("--url", default=None,
-                        help="override the text typed (nested: the URL navigated to, and it "
-                             "serves its own by default; headless: the shell line typed)")
+                        help="nested only: override the URL typed into Firefox's URL "
+                             "bar (this script serves its own page by default)")
     parser.add_argument("--recorder", default=None,
                         help="flight-recorder path, printed on failure for diagnosis")
     return parser.parse_args(argv)
@@ -947,10 +1187,16 @@ def _parse_argv(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_argv(sys.argv[1:] if argv is None else argv)
     try:
+        task = parse_task(args.task)
+    except TaskError as exc:
+        print(f"demo: bad --task — {exc}", file=sys.stderr)
+        return 2
+    try:
         run(
             args.socket,
             headless=args.headless,
             consent=args.consent,
+            task=task,
             out_dir=args.out,
             url=args.url,
             recorder=args.recorder,

@@ -30,6 +30,46 @@ ls -l shim/build/vitrin-shim || {
 }
 ```
 
+### On a tiling compositor, float the window first
+
+**This bites on Hyprland, Sway and river, and it is not optional.** The
+nested window asks for 1280x800 (`INITIAL_SIZE` in
+`crates/vitrin-core/src/backend/winit.rs`), but a size request is only a
+*request*: a tiling compositor ignores it and hands the window whatever its
+tile happens to be. Everything downstream that names an absolute coordinate
+-- the Firefox URL-bar step, and any framing you rehearse in step 1 -- is
+then measured against the wrong geometry.
+
+The window's Wayland `app_id` is **`vitrind`** (`NESTED_APP_ID`, kept stable
+precisely so these recipes can match on it). Hyprland, in
+`~/.config/hypr/hyprland.conf`:
+
+```conf
+# Hyprland >= 0.56: `windowrule` (windowrulev2 was removed) and the
+# `match:` selector spelling. Check yours with `hyprctl version`.
+windowrule = float,          match:class ^(vitrind)$
+windowrule = size 1280 800,  match:class ^(vitrind)$
+windowrule = center,         match:class ^(vitrind)$
+```
+
+Sway or river:
+
+```conf
+for_window [app_id="vitrind"] floating enable, resize set 1280 800
+```
+
+Then confirm it actually took, because Hyprland does not validate matcher
+fields -- a clean `hyprctl configerrors` does **not** prove a rule fires:
+
+```sh
+hyprctl clients | grep -A6 'class: vitrind'   # expect floating: 1, size 1280 800
+```
+
+The form-filling steps themselves do not depend on this: the agent locates
+every field by its marker colour in its own capture, so it is
+resolution-independent by construction. It matters for the Firefox URL-bar
+click and for your framing.
+
 ## 1. Rehearse it once, unrecorded
 
 Do not record the first run. Watch where the consent card appears and where
@@ -47,7 +87,12 @@ Confirm as it runs:
   misrepresentation `README.md` in this directory refuses to make.
 - Firefox renders inside `vitrind`'s window.
 - The consent card appears **over** the Firefox pixels.
-- After you click Allow, text appears in the URL bar character by character.
+- After you click Allow, text appears in the URL bar character by character,
+  the two-field form loads, and the agent then fills **both fields** and
+  clicks the yellow submit button.
+- The page ends as a **coloured receipt**: three full-width horizontal bands.
+  Those colours are a 36-bit checksum of the record the page received — read
+  the honesty note under the take table before you caption them.
 
 ## 2. Set the stage
 

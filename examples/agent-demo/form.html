@@ -1,0 +1,106 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0
+
+     The nested venue's form for the goal-directed demo. Same colours and same
+     reading order as shim/tests/form_target.c, so the agent's locator code is
+     literally identical in both venues. The receipt encoding is normative in
+     examples/agent-demo/README.md; the Python in run_demo.py is the reference
+     and the JS below is pinned against it by tests/integration/test_demo.py.
+
+     Field NAMES come from the query string (?k=name&k=email), so this stays a
+     pure data file rather than a template the server rewrites.
+-->
+<html><head><meta charset="utf-8"><title>vitrin demo form</title><style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#fff;
+  font:24px/1.2 monospace;color:#000}
+#form{position:fixed;inset:0;padding:24px}
+label{display:block;margin:0 0 4px}
+input.f{display:block;width:calc(100% - 56px);height:44px;margin:0 0 24px;padding:0 8px;
+  border:4px solid #000;background-clip:padding-box;font:inherit;color:#000;box-sizing:content-box}
+/* The two field markers and the submit marker. Channels are multiples of 0x11
+   so a 4-bit-per-channel histogram reads them back exactly (README). */
+#f0{background:#00ff00}
+#f1{background:#00ffff}
+#go{display:block;width:calc(100% - 48px);height:56px;border:4px solid #000;
+  background:#ffff00;font:inherit;color:#000}
+/* A focus indicator drawn INSIDE the field's own background box -- i.e. inside
+   the rectangle the agent located. That is deliberate: it is the focus-ring
+   trap the agent must survive (README), and form_target.c springs it the same
+   way with a 2 px inner ring. */
+input.f:focus{outline:none;box-shadow:inset 0 0 0 3px #000}
+#receipt{position:fixed;inset:0;display:none}
+#echo{position:absolute;left:0;right:0;top:0;height:96px;overflow:hidden;padding:8px;
+  box-sizing:border-box;word-break:break-all}
+/* Three equal-height full-width bands filling everything below the echo strip,
+   band 0 topmost -- the same 96 px split form_target.c uses. */
+#bands{position:absolute;left:0;right:0;top:96px;bottom:0;display:flex;flex-direction:column}
+#bands>div{flex:1 1 0}
+</style></head><body>
+<div id="form"></div>
+<div id="receipt"><div id="echo"></div><div id="bands"><div></div><div></div><div></div></div></div>
+<script>
+/* FNV-BEGIN -- the normative receipt encoding (README). Extracted verbatim and
+   pinned against the Python reference by tests/integration/test_demo.py. */
+function fnv1a32(bytes) {
+  var h = 0x811c9dc5;
+  for (var i = 0; i < bytes.length; i++) {
+    h = (h ^ bytes[i]) >>> 0;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+function canonical(pairs) {
+  return pairs.map(function (p) { return p[0] + "=" + p[1]; }).join("\n");
+}
+function bandHex(canon, index) {
+  var h = fnv1a32(new TextEncoder().encode(canon + "#" + index));
+  var ch = [((h >> 8) & 0xF) * 0x11, ((h >> 4) & 0xF) * 0x11, (h & 0xF) * 0x11];
+  return "#" + ch.map(function (v) { return ("0" + v.toString(16)).slice(-2); }).join("");
+}
+/* FNV-END */
+
+var KEYS = new URLSearchParams(location.search).getAll("k");
+if (KEYS.length === 0) { KEYS = ["name", "email"]; }
+var host = document.getElementById("form");
+KEYS.forEach(function (key, i) {
+  var label = document.createElement("label");
+  label.textContent = key;
+  label.setAttribute("for", "f" + i);
+  var input = document.createElement("input");
+  input.id = "f" + i;
+  input.className = "f";
+  input.type = "text";
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  host.appendChild(label);
+  host.appendChild(input);
+});
+var go = document.createElement("button");
+go.id = "go";
+go.type = "button";
+go.textContent = "submit";
+host.appendChild(go);
+
+/* Submission is a click on this button and nothing else -- deliberately NO
+   Enter handler, so per-field typing carries no trailing newline and the
+   submit is itself a pointer-actuation proof (README). */
+go.addEventListener("click", function () {
+  var pairs = KEYS.map(function (key, i) {
+    return [key, document.getElementById("f" + i).value];
+  });
+  var canon = canonical(pairs);
+  document.getElementById("echo").textContent = canon;
+  var bands = document.getElementById("bands").children;
+  for (var i = 0; i < bands.length; i++) {
+    bands[i].style.background = bandHex(canon, i);
+  }
+  document.getElementById("form").style.display = "none";
+  document.getElementById("receipt").style.display = "block";
+  /* The out-of-band ground truth: a GET beacon, never a form POST. A
+     navigation would replace the very receipt the agent is about to read. */
+  var q = pairs.map(function (p) {
+    return encodeURIComponent(p[0]) + "=" + encodeURIComponent(p[1]);
+  }).join("&");
+  new Image().src = "/submitted?" + q;
+});
+</script></body></html>

@@ -375,6 +375,29 @@ click_target = executable(
   dependencies: [wayland_client],
 )
 
+# The M1.5 demo's headless app (issue #110, goal-directed rewrite): a two-field
+# form with a locatable marker colour per field and per button, which
+# accumulates typed text into the focused field and, on a click landing on its
+# submit button, repaints itself as a receipt -- three full-width bands whose
+# colours are a pure function of the whole record it received. That is what
+# lets the demo agent prove FROM PIXELS ALONE that the confirmation reflects
+# exactly the task values it was handed, rather than that "enough pixels
+# moved"; the encoding is normative in examples/agent-demo/README.md. It also
+# prints a byte-exact `SUBMIT ... canon=<hex>` line, the out-of-band ground
+# truth beside the pixels (gtk-entry-probe's ENTRY_HEX role). Needs xkbcommon
+# for the same reason input-echo-client does: resolving the shim's DYNAMICALLY
+# GENERATED keymap is the app's job (D7). Co-built with vitrin-shim so the
+# demo and its gate resolve it as a sibling, exactly as they resolve
+# click-target.
+form_target = executable(
+  'form-target',
+  files('tests/form_target.c'),
+  xdg_shell_client_header,
+  xdg_shell_code,
+  include_directories: inc,
+  dependencies: [wayland_client, xkbcommon],
+)
+
 # --- P1.6.3 acceptance harness -----------------------------------------
 # The input half of the wire, from the app's side: a client that receives
 # seat input and resolves every key through the keymap the shim sent it,

@@ -82,6 +82,7 @@ use smithay::reexports::winit::event::{
 use smithay::reexports::winit::event_loop::{ActiveEventLoop, EventLoop as HostEventLoop};
 use smithay::reexports::winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 use smithay::reexports::winit::platform::scancode::PhysicalKeyExtScancode;
+use smithay::reexports::winit::platform::wayland::WindowAttributesExtWayland;
 use smithay::reexports::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use smithay::reexports::winit::window::{Window as WinitWindow, WindowAttributes, WindowId};
 use smithay::utils::{Buffer, Clock, Monotonic, Physical, Rectangle, Size, Transform};
@@ -103,6 +104,15 @@ use crate::session::{self, Runtime, RuntimeSeed};
 /// (`--headless --size 1280x800`, P1.3.2) so nested and headless views of
 /// the same content agree by default.
 const INITIAL_SIZE: (f64, f64) = (1280.0, 800.0);
+
+/// The nested window's Wayland `app_id`.
+///
+/// Part of the operator-facing contract, not an implementation detail:
+/// `docs/demo/RECORDING.md` tells a recording operator to match a
+/// float-and-size window rule on this exact string, because on a tiling
+/// compositor [`INITIAL_SIZE`] is only a request. Changing it breaks those
+/// recipes, so change both together.
+pub(crate) const NESTED_APP_ID: &str = "vitrind";
 
 /// Background behind the composed view; only visible if the blit fails.
 /// Deliberately near [`crate::scene::LETTERBOX_RGBA`] so nothing here reads
@@ -1279,7 +1289,17 @@ fn run_inner(
     let (backend, winit_source) = init_nested_winit(
         WinitWindow::default_attributes()
             .with_inner_size(LogicalSize::new(INITIAL_SIZE.0, INITIAL_SIZE.1))
-            .with_title("vitrind (nested)"),
+            .with_title("vitrind (nested)")
+            // The Wayland app_id, and it is not cosmetic. `with_inner_size`
+            // above is a *request*: a tiling compositor (Hyprland, Sway,
+            // river) ignores it and hands the window whatever its tile is,
+            // which silently invalidates any absolute coordinate the demo or
+            // a recording recipe pins to INITIAL_SIZE. The operator's fix is
+            // a float-and-size rule, and every compositor matches those on
+            // app_id -- so without this there is nothing to match and the
+            // rule cannot be written at all. Stable by contract: recipes in
+            // docs/demo/ name this string.
+            .with_name(NESTED_APP_ID, "nested"),
         GlAttributes {
             version: (3, 0),
             profile: None,

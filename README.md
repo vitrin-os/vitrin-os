@@ -89,7 +89,14 @@ the pillar-by-pillar requirements.
 
 ## Status
 
-**Phase 1 is complete.** All nine epics (E1–E9) have landed on `main`, and
+**Phase 1 is complete**, and there is a
+[**60-second recording**](https://vitrin-os.github.io/vitrin-os/#demo) of it
+working: the core-drawn consent card over a real Firefox, a human clicking
+Allow, the agent filling a record it was handed, and — in a second take — a
+physically held Escape revoking every grant mid-task so the run exits non-zero.
+Two takes rather than one, because a revoked run cannot also print `PASS`.
+
+All nine epics (E1–E9) have landed on `main`, and
 every milestone's named acceptance gate is closed under the rule this
 project holds itself to — decision **D12**: *a milestone closes only when a
 named integration test passes green against the shipped binaries with no
@@ -364,7 +371,7 @@ The spawn path and every decision above are documented in full in
 | [`protocol/vitrin-v0.rng`](protocol/vitrin-v0.rng) | RELAX NG schema for the IDL dialect |
 | [`docs/protocol/`](docs/protocol/00-conventions.md) | Normative conventions + one prose page per interface, kept in lockstep with the IDL |
 | [`docs/plan/`](docs/plan/README.md) | Phase/epic/task breakdown, decision log, roadmap |
-| [`docs/demo/`](docs/demo/README.md) | Demo screencast: recording plan, and (once recorded) the published artifact |
+| [`docs/demo/`](docs/demo/README.md) | The demo screencast — the recorded artifact, what it shows, and the operator runbook |
 | [`crates/vitrin-core/`](crates/vitrin-core) | `vitrind` — the trusted core (compositor, capability kernel, grant store, realms, consent) |
 | [`crates/vitrin-protocol/`](crates/vitrin-protocol) | Generated message types + codec (no I/O, no sockets) |
 | [`crates/vitrin-scanner/`](crates/vitrin-scanner) | Code generator: IDL XML → Rust + C header |

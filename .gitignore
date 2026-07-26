@@ -22,3 +22,6 @@ __pycache__/
 
 # mdBook build output
 docs/book/book/
+
+# Raw screen-capture source; the encoded artifacts live in docs/demo/
+recording.mkv

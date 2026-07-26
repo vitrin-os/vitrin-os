@@ -61,6 +61,12 @@ jobs:
           cp assets/brand/vitrin-favicon.svg   _site/favicon.svg
           cp assets/brand/apple-touch-icon.png _site/apple-touch-icon.png
           cp assets/brand/social-card.png      _site/social-card.png
+          # The demo recording the landing page embeds. Same-origin on purpose:
+          # a cross-origin <video> for the launch artifact is a needless
+          # dependency on another host being up.
+          cp docs/demo/nested-demo.webm        _site/nested-demo.webm
+          cp docs/demo/nested-demo.mp4         _site/nested-demo.mp4
+          cp docs/demo/nested-demo-poster.png  _site/nested-demo-poster.png
           # Jekyll would otherwise eat mdBook's _-prefixed asset paths.
           touch _site/.nojekyll
 

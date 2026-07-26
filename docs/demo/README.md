@@ -1,11 +1,54 @@
-# Demo screencast — recording plan and current status
+# Demo screencast — the recording, and how it was made
 
-**Status: not yet recorded.** This page is the honest placeholder issue
-[#48](https://github.com/vitrin-os/vitrin-os/issues/48) asks for: a clear
-path and instructions for publishing the nested-mode demo screencast,
-written instead of a faked or stand-in recording.
+**Status: recorded 2026-07-26.** The artifact is in this directory:
 
-## Why there is no recording in this PR
+| File | |
+|---|---|
+| [`nested-demo.webm`](nested-demo.webm) | VP9, 1280×800, 60 s, 4.0 MB — what the site embeds |
+| [`nested-demo.mp4`](nested-demo.mp4) | H.264 fallback, 3.8 MB |
+| [`nested-demo-poster.png`](nested-demo-poster.png) | Poster: the consent card occluding real Firefox |
+
+It is embedded on the [landing page](https://vitrin-os.github.io/vitrin-os/).
+
+## What it shows, and what it does not
+
+**Two takes, unedited, in one file** — nested mode, a real Firefox Developer
+Edition inside `realm-0`, through the real wlroots shim.
+
+1. **The run completes.** The core-drawn consent card goes up over the browser;
+   a human clicks *Allow*; the agent fills the record it was handed
+   (`name=Ada Lovelace`, `email=ada@example.org`), clicks the located submit
+   button, and reads the confirmation back from its own pixels. The terminal
+   beside it carries the evidence — `located field 0 (name) at #00ff00 …`,
+   `typed 'Ada Lovelace' -> 1123 px of ink`, then `xtask demo: PASS`.
+2. **The same demo, interrupted.** A physically held Escape (`held_ms=1328`)
+   fires the dead-man switch: `every grant in this session is revoked and the
+   grant table is sealed`, the agent's next call fails
+   `Revoked (code 2, retry_after_ms 0)`, and the run exits **non-zero**.
+
+**Why two takes rather than one longer one:** a revoked run *cannot* also print
+`PASS`. Splicing them into a single apparent take would be a lie about what the
+binary did, so they sit end to end and the caption says so.
+
+**The small blue crosshair is the agent's cursor** — core-composited into
+human-visible output only (D-019), so it is in the recording and never in the
+agent's captured frames. Your own pointer is drawn by the host desktop, outside
+the realm view.
+
+Three things the recording does **not** show, stated because each is easy to
+read into it:
+
+- **No language model.** The agent is deterministic and locates fields by
+  marker colour in its own capture. It is handed a task record; it does not
+  reason about one. Making an LLM able to do this is
+  [WS-D](../plan/13-workstream-agent-integration.md).
+- **The receipt is a checksum, not glyph recognition.** The coloured bands are a
+  36-bit function of the record the app received. They prove the right values
+  arrived; they do not show the agent reading characters.
+- **The receipt is on screen for well under a second** — the demo asserts and
+  tears down immediately. Pause at ~0:32 to see it.
+
+## Why there was no recording for so long
 
 The screencast's subject is the **nested-mode** demo (`cargo xtask demo`,
 no `--headless`): a real Wayland compositor session drawing `vitrind`'s

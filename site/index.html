@@ -120,6 +120,9 @@ pre .p{color:var(--accent)}
 .demo{background:var(--bg-2);border:1px solid var(--line);border-radius:10px;padding:0;overflow:hidden}
 .demo video{width:100%;display:block;background:#000}
 .demo .cap{padding:14px 18px;font-size:14px;color:var(--fg-dim);border-top:1px solid var(--line)}
+.demo .cap p{margin:0 0 10px}
+.demo .cap p:last-child{margin:0}
+.demo .cap .hon{color:var(--fg-faint);font-size:13.5px}
 
 /* ---- arch ---- */
 .arch{font-family:var(--mono);font-size:12.5px;line-height:1.45;white-space:pre;overflow-x:auto;color:var(--fg-dim);background:var(--bg-2);border:1px solid var(--line);border-radius:8px;padding:20px}
@@ -199,14 +202,36 @@ footer a{color:var(--fg-dim)}
       An agent connects, petitions for a capability, a human approves a prompt
       the core drew itself, and the agent drives a real Firefox inside a realm.
     </p>
-    <!-- DEMO-VIDEO-SLOT: replace this block with the <video> element once
-         docs/demo/nested-demo.webm is recorded. See docs/demo/README.md. -->
     <div class="demo">
+      <video controls preload="metadata" poster="nested-demo-poster.png"
+             width="1280" playsinline>
+        <source src="nested-demo.webm" type="video/webm">
+        <source src="nested-demo.mp4" type="video/mp4">
+        Your browser cannot play embedded video.
+        <a href="nested-demo.mp4">Download the recording</a> (MP4, 3.8&nbsp;MB).
+      </video>
       <div class="cap">
-        <strong>Recording in progress.</strong> Until it lands, the demo is two
-        commands and about five minutes on your own machine —
-        <a href="docs/01-run-the-demo.html">run it yourself</a>. It drives the
-        real wlroots shim and a real application; nothing in the path is mocked.
+        <p><strong>Two takes, unedited, in one recording.</strong> First the run
+        completes: the core-drawn consent card goes up over a real Firefox, a
+        human clicks <em>Allow</em>, and the agent fills the record it was handed
+        — <code>name=Ada&nbsp;Lovelace</code>, <code>email=ada@example.org</code>
+        — then clicks submit and reads the confirmation back out of its own
+        pixels. The small blue crosshair is the <strong>agent's</strong> cursor,
+        composited by the core so you can see where it is acting; your own
+        pointer is drawn by the host, outside the realm.</p>
+        <p>Then the same demo again, interrupted: a physically held Escape
+        (1328&nbsp;ms) revokes every grant in the session, the agent's next call
+        fails <code>Revoked</code>, and the run exits <strong>non-zero</strong>.
+        Nothing is spliced — a revoked run cannot also print <code>PASS</code>,
+        which is why it is a second take rather than a longer one.</p>
+        <p class="hon">Two things this is not. The agent is
+        <strong>deterministic</strong> — it locates fields by marker colour in
+        its own capture; there is no language model anywhere in it. And the
+        coloured bands at the end are a <strong>36-bit checksum</strong> of the
+        record the app received, not the characters read back, so it proves the
+        right values arrived without claiming the agent read them.
+        <a href="docs/01-run-the-demo.html">Run it yourself</a> in about five
+        minutes.</p>
       </div>
     </div>
   </section>

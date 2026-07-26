@@ -265,6 +265,36 @@ impl ResourceRef {
     }
 }
 
+/// The verb bits version 1 actually **serves** -- the exact set this core
+/// enforces at the chokepoint.
+///
+/// The wire bitfield ([`Verb::VALID_MASK`]) is deliberately wider: D-017
+/// and D-018 define `observe_cursor`, `layout_arrange` and `layout_focus`
+/// from day one so the decided cursor and layout models are expressible
+/// before v0 freezes, and so a petition for one is a *recoverable*
+/// `unsupported` rather than an out-of-range bit that kills the
+/// connection. Nothing here implements them.
+///
+/// Same posture as the durable persistence rungs, one rung up: those are
+/// **absent** from [`PersistenceRung`] so a row cannot hold one; these
+/// are present in [`Verb`] (the wire type is generated, so the table
+/// cannot subtract bits from it) and are instead refused at admission
+/// ([`crate::petitions::PetitionRegistry::admit`]). Either way the rule
+/// is the same -- a deployment never grants authority it does not
+/// enforce, and says so with `unsupported` rather than accepting
+/// silently.
+pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4;
+
+/// The verb bits the IDL defines that version 1 does **not** serve. A
+/// petition naming any of these resolves `unsupported` -- whole, never
+/// narrowed to the served remainder (narrowing is the human's move at
+/// consent time, never a silent server-side edit).
+///
+/// Derived from [`Verb::VALID_MASK`] rather than listed, so a verb
+/// appended to the IDL is unserved by default: forgetting to classify a
+/// new bit fails closed.
+pub(crate) const UNSERVED_VERB_BITS: u32 = Verb::VALID_MASK & !SERVED_VERB_BITS;
+
 /// `persistence` (PRD Doc 2 section 5.2): the consent-ladder rung a row
 /// carries. Exactly the two MVP rungs -- the durable rungs
 /// (`until_revoked`, `always`) are **absent, not hidden**: they cannot be
@@ -1126,6 +1156,49 @@ mod tests {
 
     const DEMO: &str = "vitrin://local/agent/demo";
     const OTHER: &str = "vitrin://local/agent/other";
+
+    // -- served vs. defined verbs ------------------------------------------
+
+    #[test]
+    fn served_verb_bits_are_exactly_the_three_facet_verbs() {
+        // Pinned to the generated constants, not to a literal, so a verb
+        // that ever changed value would fail here rather than silently
+        // widening what this core claims to enforce.
+        assert_eq!(
+            SERVED_VERB_BITS,
+            (Verb::OBSERVE | Verb::ACTUATE_POINTER | Verb::ACTUATE_TEXT).bits()
+        );
+        // Every served bit is a defined wire bit.
+        assert_eq!(SERVED_VERB_BITS & !Verb::VALID_MASK, 0);
+    }
+
+    #[test]
+    fn the_layout_and_cursor_verbs_are_defined_on_the_wire_but_unserved() {
+        // The three D-017/D-018 bits: in-range (so naming one is never
+        // fatal) and unserved (so a petition for one resolves
+        // `unsupported`). Both halves matter -- either alone would be a
+        // lie about what this core does.
+        for verb in [
+            Verb::OBSERVE_CURSOR,
+            Verb::LAYOUT_ARRANGE,
+            Verb::LAYOUT_FOCUS,
+        ] {
+            assert!(
+                Verb::from_bits(verb.bits()).is_ok(),
+                "{verb:?} must decode: an out-of-range bit would be fatal, not `unsupported`"
+            );
+            assert_eq!(
+                verb.bits() & SERVED_VERB_BITS,
+                0,
+                "{verb:?} must not be claimed as served"
+            );
+            assert_eq!(verb.bits() & UNSERVED_VERB_BITS, verb.bits());
+        }
+        // The two classifications partition the wire bitfield: a verb
+        // appended to the IDL lands in one of them, never in neither.
+        assert_eq!(SERVED_VERB_BITS | UNSERVED_VERB_BITS, Verb::VALID_MASK);
+        assert_eq!(SERVED_VERB_BITS & UNSERVED_VERB_BITS, 0);
+    }
 
     // -- expiry (injected clock) -------------------------------------------
 

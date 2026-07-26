@@ -169,9 +169,23 @@ const EXPIRY_UNBOUNDED: &str = "no time limit - bounded only by the choice below
 /// the IDL's, so the prompt and the protocol cannot drift apart in what they
 /// call a verb.
 ///
-/// `verb_catalogue_covers_every_wire_verb` asserts this table's union equals
-/// [`Verb::VALID_MASK`], so a verb added to the IDL fails a test here rather
-/// than silently rendering as nothing on a consent prompt.
+/// `the_verb_catalogue_covers_every_servable_verb` asserts this table's union
+/// equals [`crate::grants::SERVED_VERB_BITS`], so a verb this core can
+/// actually grant fails a test here rather than silently rendering as nothing
+/// on a consent prompt. It is deliberately pinned to the *served* set, not to
+/// [`Verb::VALID_MASK`]: the wire defines verbs version 1 refuses
+/// `unsupported` at admission (D-017/D-018), and a verb that can never reach a
+/// prompt must not get prompt copy that implies it can.
+///
+/// A served-set pin alone would let a newly appended IDL verb slip past this
+/// module in silence — [`crate::grants::UNSERVED_VERB_BITS`] is *derived* from
+/// [`Verb::VALID_MASK`], so "served ∪ unserved == the wire bitfield" is an
+/// identity and can never fail. That derivation is the right runtime posture
+/// (an unclassified verb is unserved, so admission fails closed) but it is not
+/// a tripwire. The tripwire is the second assertion in that test: the unserved
+/// set is pinned to the exact bits the IDL defines today, so appending a verb
+/// turns this test red until a human classifies it — served, and given a line
+/// below, or unserved, and added to that pin.
 const VERB_CATALOGUE: [(Verb, &str, &str); 3] = [
     (Verb::OBSERVE, "observe", "capture frames of this realm"),
     (
@@ -621,16 +635,46 @@ mod tests {
     }
 
     #[test]
-    fn the_verb_catalogue_covers_every_wire_verb() {
-        // A verb added to the IDL must gain a line here, or a consent prompt
-        // would ask a human to approve authority it never names.
+    fn the_verb_catalogue_covers_every_servable_verb() {
+        // A verb this core can grant must gain a line here, or a consent
+        // prompt would ask a human to approve authority it never names.
         let union = VERB_CATALOGUE
             .iter()
             .fold(0u32, |acc, (verb, _, _)| acc | verb.bits());
         assert_eq!(
             union,
-            Verb::VALID_MASK,
-            "VERB_CATALOGUE does not cover every verb in vitrin_grant"
+            crate::grants::SERVED_VERB_BITS,
+            "VERB_CATALOGUE does not cover every verb version 1 can grant"
+        );
+        // Verbs the IDL defines but version 1 refuses `unsupported` are
+        // absent on purpose: no petition naming one ever reaches a prompt.
+        assert_eq!(
+            union & crate::grants::UNSERVED_VERB_BITS,
+            0,
+            "VERB_CATALOGUE names a verb version 1 refuses at admission"
+        );
+        // The tripwire. `UNSERVED_VERB_BITS` is derived as `VALID_MASK &
+        // !SERVED_VERB_BITS`, so asserting the two sets partition the mask
+        // would be an identity that no IDL change can break -- it would read
+        // like a guard and guard nothing. Pinning the unserved set to the
+        // bits the IDL defines *today* is the guard: appending a verb widens
+        // `VALID_MASK`, widens the derived unserved set, and turns this red
+        // until a human classifies the new bit (served, plus a catalogue line
+        // above; or unserved, plus an entry here). The runtime posture is
+        // unchanged and stays fail-closed -- an unclassified verb is unserved
+        // and admission refuses it `unsupported`; this only refuses to let
+        // that happen silently.
+        assert_eq!(
+            crate::grants::UNSERVED_VERB_BITS,
+            Verb::OBSERVE_CURSOR.bits() | Verb::LAYOUT_ARRANGE.bits() | Verb::LAYOUT_FOCUS.bits(),
+            "the IDL defines a verb this module has not classified as served \
+             or unserved (D-017/D-018)"
+        );
+        // ...and the two really do partition the wire bitfield. Implied by the
+        // derivation above; asserted so the invariant is written down.
+        assert_eq!(
+            crate::grants::SERVED_VERB_BITS | crate::grants::UNSERVED_VERB_BITS,
+            Verb::VALID_MASK
         );
         // Names match the IDL's spelling, so prompt and protocol cannot drift.
         let names: Vec<&str> = VERB_CATALOGUE.iter().map(|(_, name, _)| *name).collect();

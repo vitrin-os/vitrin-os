@@ -436,6 +436,29 @@ pub(crate) trait Presenter {
     /// default is the headless posture, where a completed composite *is* the
     /// output cadence and nothing further needs scheduling.
     fn request_present(&mut self) {}
+    /// Hand the backend the **agent-owned** pointer position
+    /// ([`InputRouter::agent_pointer`]) for the agent cursor sprite, and say
+    /// whether the sprite the next composite would draw actually changed.
+    ///
+    /// Called once per dispatch round from [`post_dispatch`], *before* the
+    /// dirty gate, because an agent moving its pointer is a visible change
+    /// with nothing else to announce it: the confined app need not commit a
+    /// new frame just because something hovered over it, so without this a
+    /// pointer move would show up whenever the scene next happened to change
+    /// — the same trap `backend::winit`'s `TextureKey` was written for.
+    ///
+    /// This is the **drawing** side of the pointer and nothing more. Delivery
+    /// to the shim stays one shared position per realm view; see
+    /// [`crate::cursor`] for the whole distinction and why the sprite may not
+    /// be drawn on [`InputRouter::pointer`].
+    ///
+    /// `true` means the caller should mark the frame dirty and request a
+    /// present. Backends that composite no agent cursor answer `false`
+    /// forever, which costs the dispatch round nothing.
+    ///
+    /// [`InputRouter::agent_pointer`]: crate::input::InputRouter::agent_pointer
+    /// [`InputRouter::pointer`]: crate::input::InputRouter
+    fn set_agent_cursor(&mut self, pos: Option<(f64, f64)>) -> bool;
 }
 
 /// A backend state type that carries a [`Runtime`], split into provably
@@ -1524,6 +1547,15 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
     host.service_consent(Instant::now());
     let fatal = {
         let (runtime, view) = host.split();
+        // Also before the dirty gate, and for the same shape of reason: an
+        // agent that moved its pointer changed the human-visible output, and
+        // nothing else in this round will say so (the app owes no commit for
+        // a hover). Drawing only — the shim's delivery already happened
+        // inside the round, through `route_seat`, and is unaffected.
+        if view.set_agent_cursor(runtime.router.agent_pointer()) {
+            runtime.dirty = true;
+            view.request_present();
+        }
         if !runtime.dirty {
             return;
         }
@@ -1682,6 +1714,15 @@ mod tests {
         /// the compositor" is only assertable if something counts it.
         fn request_present(&mut self) {
             self.presents += 1;
+        }
+        /// This view composites no agent cursor — it has no framebuffer to
+        /// paint one into — so it answers `false` and the dispatch round is
+        /// unchanged by the sprite existing. Stated as an implementation
+        /// rather than inherited from a trait default so that adding a
+        /// presentation path is a compile error until someone decides
+        /// whether it draws the sprite.
+        fn set_agent_cursor(&mut self, _pos: Option<(f64, f64)>) -> bool {
+            false
         }
         /// No retained image to scrub: this view keeps a counter, not a
         /// framebuffer. No GPU renderer either, so no importer.

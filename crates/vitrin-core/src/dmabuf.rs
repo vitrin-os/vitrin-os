@@ -536,11 +536,22 @@ fn force_sync(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
 /// `every_zero_copy_frame_ends_with_the_trusted_band` fails on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Draw {
+    /// Nothing. The cursor slots of a frame with no agent cursor to draw.
+    ///
+    /// A fixed-length draw list with empty slots rather than a `Vec` whose
+    /// length varies: the list's length is what makes "the trusted band is
+    /// the last draw" a shape a display-free test can assert, and the
+    /// zero-copy path allocates nothing per frame by design.
+    Nothing,
     /// Clear the whole view to the letterbox matte.
     Matte,
     /// Blit the client's imported texture into this destination rectangle,
     /// 1:1 and unscaled ([`layout::place`]).
     Content(Rectangle<i32, Physical>),
+    /// Fill this rectangle with a piece of the agent cursor sprite
+    /// ([`crate::cursor`]). Human-visible only, like everything else here,
+    /// and already clipped below the trusted band by the geometry function.
+    AgentCursor(Rectangle<i32, Physical>, [u8; 4]),
     /// Fill this rectangle with the session's trusted-indicator colour: the
     /// reserved strip along the top edge the human reads this session's
     /// secret colour from.
@@ -564,37 +575,64 @@ pub(crate) fn trust_band_rect(view: Size<i32, Physical>) -> Rectangle<i32, Physi
     Rectangle::new((0, 0).into(), (view.w.max(0), h).into())
 }
 
+/// How many draws one human-visible GPU frame is: the letterbox matte, the
+/// client's content, the agent cursor's slots, and the trusted band.
+pub(crate) const HUMAN_VISIBLE_DRAWS: usize = 3 + crate::cursor::AGENT_CURSOR_RECTS;
+
 /// Everything one human-visible GPU frame draws, in order: the letterbox
-/// matte, the client's content at its [`layout::place`] position, and the
-/// trusted band last.
+/// matte, the client's content at its [`layout::place`] position, the agent
+/// cursor sprite if one is shown, and the trusted band last.
 ///
 /// **The band is not optional and there is no arm of this function that
 /// omits it.** That is the whole point of returning a fixed-size array from
-/// one pure function instead of writing three GL calls inline: the zero-copy
+/// one pure function instead of writing the GL calls inline: the zero-copy
 /// path's frame is composed entirely of pixels the confined client owns, so
 /// a frame that reached the display without the band would let the client
 /// rasterize a counterfeit band into the top of its own buffer with nothing
 /// genuine above it — the forgery the indicator exists to make impossible
 /// (see [`crate::consent::TrustedIndicator`]).
 ///
-/// The band goes on top of the content for the same reason the CPU path
+/// The band goes on top of everything else for the same reason the CPU path
 /// composites it after the client's surface *and* after the consent overlay:
 /// client content in that strip is always overdrawn by the genuine colour.
+/// The cursor slots sit *before* it, and their geometry is clipped below the
+/// band anyway ([`crate::cursor::agent_cursor_rects`]) — belt and braces, on
+/// a sprite whose position an agent chooses.
+///
+/// `agent_cursor` is the agent-owned pointer position for this frame, or
+/// `None` when no sprite is shown; its rectangles are derived from
+/// [`crate::cursor::agent_cursor_rects`] and never restated here, so the CPU
+/// and GPU paths cannot draw different crosshairs — the drift
+/// [`trust_band_rect`] exists to prevent for the band.
 pub(crate) fn human_visible_frame(
     view: Size<i32, Physical>,
     content: (u32, u32),
     indicator: TrustedIndicator,
-) -> [Draw; 3] {
+    agent_cursor: Option<(f64, f64)>,
+) -> [Draw; HUMAN_VISIBLE_DRAWS] {
     let placement = layout::place((view.w.max(0) as u32, view.h.max(0) as u32), content);
     let dst = Rectangle::new(
         (placement.x as i32, placement.y as i32).into(),
         (content.0 as i32, content.1 as i32).into(),
     );
-    [
-        Draw::Matte,
-        Draw::Content(dst),
-        Draw::TrustBand(trust_band_rect(view), indicator.color()),
-    ]
+    let mut draws = [Draw::Nothing; HUMAN_VISIBLE_DRAWS];
+    draws[0] = Draw::Matte;
+    draws[1] = Draw::Content(dst);
+    if let Some(rects) = agent_cursor.and_then(|(x, y)| {
+        crate::cursor::agent_cursor_rects(view.w.max(0) as u32, view.h.max(0) as u32, x, y)
+    }) {
+        for (slot, rect) in draws[2..].iter_mut().zip(rects) {
+            *slot = Draw::AgentCursor(
+                Rectangle::new(
+                    (rect.x, rect.y).into(),
+                    (rect.w as i32, rect.h as i32).into(),
+                ),
+                rect.rgba,
+            );
+        }
+    }
+    draws[HUMAN_VISIBLE_DRAWS - 1] = Draw::TrustBand(trust_band_rect(view), indicator.color());
+    draws
 }
 
 /// Present retained zero-copy content into a bound framebuffer at the view
@@ -631,10 +669,19 @@ pub(crate) fn present_human_visible(
     transform: Transform,
     content: &GpuContent,
     indicator: TrustedIndicator,
+    agent_cursor: Option<(f64, f64)>,
 ) -> Result<(), GlesError> {
     let mut frame = renderer.render(framebuffer, view, transform)?;
-    for draw in human_visible_frame(view, (content.width, content.height), indicator) {
+    for draw in human_visible_frame(
+        view,
+        (content.width, content.height),
+        indicator,
+        agent_cursor,
+    ) {
         match draw {
+            // An empty cursor slot. Nothing to submit, and deliberately not
+            // an error: a frame with no agent cursor has four of them.
+            Draw::Nothing => {}
             Draw::Matte => frame.clear(letterbox_color(), &[Rectangle::from_size(view)])?,
             // Qualified calls: `GlesFrame` has inherent methods of both
             // names (extra custom-shader arguments on one, no blend
@@ -659,6 +706,22 @@ pub(crate) fn present_human_visible(
                 Transform::Normal,
                 1.0,
             )?,
+            // The band clip in `agent_cursor_rects` can empty a rectangle
+            // (a sprite aimed at row 0), and a partially off-view sprite
+            // arrives with off-canvas coordinates the rasterizer clips —
+            // but a zero-extent draw is skipped here rather than submitted,
+            // so no GL call is made with a degenerate rectangle.
+            Draw::AgentCursor(rect, rgba) => {
+                if rect.size.w > 0 && rect.size.h > 0 {
+                    Frame::draw_solid(
+                        &mut frame,
+                        rect,
+                        // Dst-local, exactly as above.
+                        &[Rectangle::from_size(rect.size)],
+                        color32f(rgba),
+                    )?;
+                }
+            }
             Draw::TrustBand(rect, rgba) => Frame::draw_solid(
                 &mut frame,
                 rect,
@@ -802,47 +865,96 @@ mod tests {
             ((800, 4), (800, 4)),
         ] {
             let size: Size<i32, Physical> = (view.0, view.1).into();
-            let draws = human_visible_frame(size, content, indicator);
-            assert_eq!(draws[0], Draw::Matte, "{view:?}/{content:?}");
-            assert!(
-                matches!(draws[1], Draw::Content(_)),
-                "{view:?}/{content:?}: the client's texture must be drawn"
-            );
-            // Last, so the client's own content can never sit over the one
-            // strip the human reads the session colour from.
-            let Draw::TrustBand(rect, rgba) = draws[2] else {
-                panic!(
-                    "{view:?}/{content:?}: every human-visible GPU frame must end with the \
-                     trusted band, got {:?}",
-                    draws[2]
-                )
-            };
-            assert_eq!(
-                rgba,
-                indicator.color(),
-                "{view:?}/{content:?}: the band must carry this session's colour"
-            );
-            assert_eq!(
-                (rect.loc.x, rect.loc.y),
-                (0, 0),
-                "{view:?}/{content:?}: the band hugs the top-left corner"
-            );
-            assert_eq!(
-                rect.size.w, view.0,
-                "{view:?}/{content:?}: a band narrower than the view leaves a strip of \
-                 client-owned pixels where the human reads the session colour"
-            );
-            assert_eq!(
-                rect.size.h,
-                (TRUST_BAND_HEIGHT as i32).min(view.1),
-                "{view:?}/{content:?}: the band is the CPU path's height, clamped only by \
-                 a view shorter than the band itself"
-            );
-            assert!(
-                rect.size.h > 0,
-                "{view:?}/{content:?}: a zero-height band is no band at all"
-            );
+            // Both cursor postures: a frame with no agent cursor, and one
+            // with a sprite parked wherever an agent liked. Neither may cost
+            // the band its slot.
+            for agent_cursor in [None, Some((10.0, 10.0)), Some((0.0, 0.0))] {
+                let draws = human_visible_frame(size, content, indicator, agent_cursor);
+                assert_eq!(draws[0], Draw::Matte, "{view:?}/{content:?}");
+                assert!(
+                    matches!(draws[1], Draw::Content(_)),
+                    "{view:?}/{content:?}: the client's texture must be drawn"
+                );
+                // Last, so neither the client's own content nor the agent's
+                // cursor can sit over the one strip the human reads the
+                // session colour from.
+                let last = *draws.last().expect("the draw list is never empty");
+                let Draw::TrustBand(rect, rgba) = last else {
+                    panic!(
+                        "{view:?}/{content:?}: every human-visible GPU frame must end with the \
+                         trusted band, got {last:?}"
+                    )
+                };
+                assert!(
+                    !draws[..HUMAN_VISIBLE_DRAWS - 1]
+                        .iter()
+                        .any(|draw| matches!(draw, Draw::TrustBand(..))),
+                    "{view:?}/{content:?}: the band is drawn once, and last"
+                );
+                assert_eq!(
+                    rgba,
+                    indicator.color(),
+                    "{view:?}/{content:?}: the band must carry this session's colour"
+                );
+                assert_eq!(
+                    (rect.loc.x, rect.loc.y),
+                    (0, 0),
+                    "{view:?}/{content:?}: the band hugs the top-left corner"
+                );
+                assert_eq!(
+                    rect.size.w, view.0,
+                    "{view:?}/{content:?}: a band narrower than the view leaves a strip of \
+                     client-owned pixels where the human reads the session colour"
+                );
+                assert_eq!(
+                    rect.size.h,
+                    (TRUST_BAND_HEIGHT as i32).min(view.1),
+                    "{view:?}/{content:?}: the band is the CPU path's height, clamped only by \
+                     a view shorter than the band itself"
+                );
+                assert!(
+                    rect.size.h > 0,
+                    "{view:?}/{content:?}: a zero-height band is no band at all"
+                );
+                // No cursor slot may overlap the band's rows, at any position
+                // an agent can ask for.
+                for draw in draws {
+                    if let Draw::AgentCursor(cursor, _) = draw {
+                        assert!(
+                            cursor.size.h == 0 || cursor.loc.y >= rect.size.h,
+                            "{view:?}/{content:?}: an agent's cursor reached the trusted \
+                             band: {cursor:?} against {rect:?}"
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    /// The unused-arm check the fixed-length draw list makes possible: a
+    /// frame with no agent cursor carries exactly four empty slots, and one
+    /// with a cursor carries four filled ones. Written because the alternative
+    /// — a `Vec` whose length varies — makes "the band is the last draw"
+    /// unassertable without also knowing how many cursor rectangles happened
+    /// to be produced.
+    #[test]
+    fn the_cursor_slots_are_filled_only_when_an_agent_cursor_is_shown() {
+        let indicator = TrustedIndicator::from_rgb(0x11, 0x22, 0x33);
+        let size: Size<i32, Physical> = (800, 600).into();
+        let count = |cursor| {
+            human_visible_frame(size, (400, 300), indicator, cursor)
+                .iter()
+                .filter(|draw| matches!(draw, Draw::AgentCursor(..)))
+                .count()
+        };
+        assert_eq!(count(None), 0);
+        assert_eq!(
+            count(Some((100.0, 100.0))),
+            crate::cursor::AGENT_CURSOR_RECTS
+        );
+        // A position that is not a number draws no sprite rather than a
+        // sprite at an arbitrary place.
+        assert_eq!(count(Some((f64::NAN, 100.0))), 0);
     }
 
     /// The GPU band and the CPU band are the same band.
@@ -1081,6 +1193,11 @@ mod gpu_tests {
             Transform::Normal,
             content,
             harness_indicator(),
+            // No agent cursor: these expectations are about the client's own
+            // pixels and the band above them. The sprite's own two-path
+            // equality is pinned without a GPU, in `backend::winit`'s
+            // `no_presentation_path_can_drop_the_agent_cursor`.
+            None,
         )
         .expect("present retained content");
         let mapping = renderer

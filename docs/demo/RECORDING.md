@@ -78,7 +78,7 @@ recording to MP4.
 | 0:05–0:20 | `vitrind`'s window opens; Firefox paints inside it. | A real browser, inside a realm, through the real shim. |
 | 0:20–0:35 | The consent card appears. **Pause here.** | The card is occluding real Firefox pixels — it is a compositor overlay, not an application dialog. Let it sit on screen long enough to read. |
 | 0:35–0:40 | Click **Allow**. | A human decided. |
-| 0:40–1:00 | The agent clicks the URL bar and types. | Watch the cursor move and characters land one at a time. |
+| 0:40–1:00 | The agent clicks the URL bar and types. | Watch the **agent's** cursor move — the crosshair the core composites at the agent's own pointer position (D-019), not your desktop's mouse pointer, which the host draws outside the realm view — and characters land one at a time. Nested-only: `vitrind --nested` always composites it (a headless run needs `--agent-cursor`), and it is drawn into human-visible output alone, so it is in your screen recording and never in the agent's captured frames. |
 | 1:00–1:15 | **Hold Escape for one second.** | The money shot — see below. |
 | 1:15–1:25 | Terminal shows `revoked`; `xtask demo: PASS` and the flight-recorder path. | The evidence. |
 

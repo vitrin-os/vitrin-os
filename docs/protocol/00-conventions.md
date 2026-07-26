@@ -129,12 +129,27 @@ output stage, structurally above the scene the capture is taken from, and
 that — the trust band's colour at pixel (0,0) of the human-visible output where
 the capture at the same pixel still holds realm content, the consent card
 verbatim in the output, and the capture byte-identical to the bare scene
-compose. Invariants 2 and 4 hold **vacuously**: no client can state a stacking
-order, and the core composites no cursor at all. Invariant 3 has nothing to be
-true of, because there is no arrangement mechanism. **None of the four is
-tested *as an invariant*** — against a client trying to violate it — and none
-can be until something outside the core can arrange realms. That test is E3's,
-and D-018 is the reason it must exist.
+compose. Invariant 4 **is no longer vacuous** (D-019): the core now composites
+an agent principal's own cursor, so there is something the rule can be violated
+by. What enforces it is *where* the sprite is drawn — at the output stage,
+downstream of the `Scene::compose` every capture is taken from, so a capture
+cannot carry it by construction rather than by a checked flag — and a test does
+exist for exactly that: `backend/headless.rs`'s
+`the_agent_cursor_reaches_human_visible_output_but_never_a_capture`, which
+asserts the sprite really is on the human-visible framebuffer at the agent's
+own position, that the realm view is unchanged to the byte, and that no sprite
+pixel survives into the frame a `capture_frame` would seal into a memfd. Two
+limits stated rather than left to be found: that test is a **component** test
+against composited pixels in-process, not a mock-free integration gate, and it
+proves the *core* excludes the sprite from a capture — it does not exercise a
+second agent trying to obtain the first's cursor, because agent-to-agent
+observation has no wire surface to try it through (no agent can name another's
+grant), so that half remains unpurchasable by construction rather than by test.
+Invariant 2 still holds **vacuously**: no client can state a stacking order.
+Invariant 3 has nothing to be true of, because there is no arrangement
+mechanism. **None of the four is tested *as an invariant*** — against a client
+trying to violate it — and none can be until something outside the core can
+arrange realms. That test is E3's, and D-018 is the reason it must exist.
 
 The shell gets *arrangement*; the core keeps *ordering*. Read the ordinary
 window-manager verbs as authority rather than decoration and the reason is
@@ -161,9 +176,16 @@ which is meaningful only alongside `observe`. See
 [`vitrin_view`](06-vitrin_view.md#what-a-capture-does-not-contain).
 
 **What version 1 actually does.** It serves neither layout verb (it has no
-window manager) and composites no cursor of its own (in nested operation the
-host desktop draws the human's cursor, outside the realm view entirely). It
-delivers **one shared pointer position** per realm view to the shim. All three
+window manager). It **does** composite an agent principal's own cursor, and
+only into human-visible output — never into a captured frame — at the same
+output stage as the consent overlay and the trust indicator; nested mode draws
+it always, and `--headless --agent-cursor` on request (the headless
+human-visible framebuffer is otherwise measured byte-for-byte against the realm
+view by the trusted-band witness). No *human* cursor is composited: in nested
+operation the host desktop draws it, outside the realm view entirely. Delivery
+is a separate thing from drawing, and delivery has not changed: version 1 still
+delivers **one shared pointer position** per realm view to the shim, and
+per-principal delivery stays deferred to M2 (D-017, D-019). All three
 verbs — `observe_cursor`, `layout_arrange`, `layout_focus` — are defined on the
 wire and refused `unsupported`; see
 [§ defined but unserved](04-vitrin_grant.md#defined-but-unserved) for why
@@ -752,11 +774,15 @@ named here so their absence is understood as a decision, not an omission:
   one — though only the first has anything to bind *against* today, and none is
   yet tested as an invariant (§1.4, "their standing today").
 - **Per-principal cursor delivery** — version 0 delivers one shared pointer
-  position per realm view and composites no cursor of its own; per-principal
-  delivery is deferred to M2 and arrives as sibling `vitrin_shim_seat` events
-  (§1.4, D-017). The *model* — one pointer per principal, cursorless by
-  construction, core-composited, visibility as a verb — is decided and on the
-  wire now.
+  position per realm view; per-principal **delivery** is deferred to M2 and
+  arrives as sibling `vitrin_shim_seat` events (§1.4, D-017). What is *not*
+  deferred, since D-019, is **drawing**: the core composites each actuating
+  agent's own cursor into human-visible output, from a position only that
+  agent's motion moves. The two are independent — a per-agent sprite over a
+  shared delivered position is exactly what v1 ships — so the deferral above
+  is unchanged rather than partially closed. The *model* — one pointer per
+  principal, cursorless by construction, core-composited, visibility as a
+  verb — is decided and on the wire now.
 
 Finally: the **human principal has no wire presence** in version 0. Host input
 in nested mode is the implicit human (tagged `origin=physical` on the shim

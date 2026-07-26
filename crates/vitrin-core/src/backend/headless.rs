@@ -250,9 +250,28 @@ fn readback_region(
 /// feeds lives on this backend. Threading it as a cfg'd parameter rather than
 /// through [`RuntimeSeed`] is deliberate — the seed is kernel state, not a
 /// test channel.
+///
+/// # `agent_cursor`: why this backend's sprite is opt-in and nested's is not
+///
+/// `--agent-cursor` (D-019). The nested backend always composites the agent
+/// cursor sprite: a human is watching that window, and drawing nothing there
+/// is the defect this whole change fixes. Here it is **off unless asked for**,
+/// and the reason is a real gate rather than caution:
+/// [`super::band_witness`] measures this backend's human-visible framebuffer
+/// against the realm view byte for byte, and
+/// `tests/integration/test_real_trust_band.py` asserts `tracks_view == 1`
+/// *after* a real `grant.pointer.click()` — whose move would put a sprite in
+/// the human-visible buffer and nowhere else. A sprite on by default here
+/// turns a mock-free milestone gate red for a cosmetic reason.
+///
+/// The flag exists rather than the feature being simply absent because
+/// headless is the only backend CI can run, so it is the only place the
+/// capture-exclusion property can be *proved* on real composited pixels
+/// (`the_agent_cursor_reaches_human_visible_output_but_never_a_capture`).
 pub fn run(
     size: (u32, u32),
     dead_man: DeadManConfig,
+    agent_cursor: bool,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
     seed: RuntimeSeed,
 ) -> (Recorder, Result<(), Box<dyn Error>>) {
@@ -266,6 +285,7 @@ pub fn run(
     let result = run_inner(
         size,
         dead_man,
+        agent_cursor,
         #[cfg(feature = "consent-injector")]
         consent_injector_fd,
         &mut seed,
@@ -281,6 +301,7 @@ fn run_inner(
     size: (u32, u32),
     #[cfg_attr(not(feature = "dead-man-injector"), allow(unused_variables))]
     dead_man: DeadManConfig,
+    agent_cursor: bool,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
     seed: &mut Option<RuntimeSeed>,
     recovered: &mut Option<Recorder>,
@@ -366,7 +387,19 @@ fn run_inner(
         ),
         None => None,
     };
-    let view = HeadlessView::new(physical_size, event_loop.get_signal(), indicator)?;
+    if agent_cursor {
+        info!(
+            "--agent-cursor: the agent cursor sprite will be composited into this run's \
+             human-visible output (never a capture). Off by default on this backend because \
+             its human-visible framebuffer is measured against the realm view (issue #139)."
+        );
+    }
+    let view = HeadlessView::new(
+        physical_size,
+        event_loop.get_signal(),
+        indicator,
+        agent_cursor,
+    )?;
     let mut state = HeadlessState {
         view,
         // Headless has no physical input device — structurally, not by a
@@ -828,6 +861,34 @@ impl session::Presenter for HeadlessView {
         self.latest_frame_rgba().ok()
     }
 
+    /// Take the router's agent-owned position for the sprite (D-019) — but
+    /// only on a run that asked for one.
+    ///
+    /// With `--agent-cursor` absent this answers `false` and stores nothing,
+    /// so the composite is byte-for-byte what it was before this existed and
+    /// the dispatch round pays nothing. That is what keeps
+    /// `tests/integration/test_real_trust_band.py` green **unchanged**: its
+    /// `tracks_view == 1` assertion is taken after a real
+    /// `grant.pointer.click()`, which sends a move first, so a sprite drawn by
+    /// default here would fail a mock-free milestone gate.
+    ///
+    /// With the flag present it behaves exactly as the nested backend's does,
+    /// which is the point: the opt-in exists so a test can enable the sprite
+    /// on the one backend CI can run and prove it reaches human-visible output
+    /// and never a capture.
+    fn set_agent_cursor(&mut self, pos: Option<(f64, f64)>) -> bool {
+        if !self.output.draw_agent_cursor {
+            return false;
+        }
+        let quantize =
+            |pos: Option<(f64, f64)>| pos.and_then(|(x, y)| crate::cursor::hotspot(x, y));
+        if quantize(self.output.agent_cursor) == quantize(pos) {
+            return false;
+        }
+        self.output.agent_cursor = pos;
+        true
+    }
+
     /// All three, lent to `f`: the scene and retained image from the two
     /// fields the struct was split into for exactly this call (see
     /// [`HeadlessView::output`]); no importer, since this backend has no GPU
@@ -902,6 +963,22 @@ pub(crate) struct HeadlessOutput {
     /// secret (see [`super::band_witness`]).
     #[cfg(feature = "consent-injector")]
     band_witness: super::band_witness::BandWitness,
+    /// Whether this run composites the agent cursor sprite into its
+    /// human-visible output (`--agent-cursor`, D-019). **`false` by default,
+    /// and that default is not laziness** — see [`run`]'s `agent_cursor`
+    /// argument for the whole argument. In short: this backend's
+    /// human-visible framebuffer is *measured*, byte for byte against the
+    /// realm view, by [`super::band_witness`] and by
+    /// `tests/integration/test_real_trust_band.py`, and that gate clicks a
+    /// real pointer. A sprite on by default here would turn a mock-free
+    /// milestone gate red for a cosmetic reason.
+    draw_agent_cursor: bool,
+    /// The agent-owned pointer position the sprite is drawn at, pushed by
+    /// [`session::Presenter::set_agent_cursor`]. Always `None` unless
+    /// [`Self::draw_agent_cursor`] is set: with the flag off nothing is
+    /// stored, so "the flag is absent" is true of the composite and not only
+    /// of the parser.
+    agent_cursor: Option<(f64, f64)>,
 }
 
 impl HeadlessView {
@@ -909,6 +986,7 @@ impl HeadlessView {
         size: Size<i32, Physical>,
         loop_signal: LoopSignal,
         indicator: TrustedIndicator,
+        agent_cursor: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let mut renderer = PixmanRenderer::new()?;
         // `.max(0)` is defensive only: `run` always passes a positive size
@@ -927,6 +1005,8 @@ impl HeadlessView {
                 size,
                 #[cfg(feature = "consent-injector")]
                 band_witness: super::band_witness::BandWitness::new(),
+                draw_agent_cursor: agent_cursor,
+                agent_cursor: None,
             },
             loop_signal,
         })
@@ -1117,7 +1197,24 @@ impl HeadlessOutput {
         // backends call. `view` is moved in rather than recomposed, so "the
         // two images differ only by the overlay" is a property of the code
         // and not of a comment.
-        let output = super::human_visible_from_view(view, &mut self.consent, w, h);
+        let mut output = super::human_visible_from_view(view, &mut self.consent, w, h);
+        // The agent cursor sprite (D-019), opt-in here and only here: the
+        // nested backend always draws it, this one draws it when the run
+        // passed `--agent-cursor` (see [`Self::draw_agent_cursor`]). Applied
+        // to the human-visible buffer only, downstream of the composite the
+        // capture reads — the same fork the consent overlay obeys — so no
+        // `vitrin_view.frame_ready` can carry it.
+        //
+        // **Before the witness, deliberately.** The witness reports on the
+        // bytes that are about to be presented; measuring it before this draw
+        // and presenting after would let the core report a human-visible
+        // frame it did not present, which is the exact class of dishonesty
+        // issue #139's counters exist to remove. With the flag on, the
+        // witness's `tracks_view` reads 0 and that is the truth about the
+        // frame.
+        if let Some((x, y)) = self.agent_cursor {
+            crate::cursor::composite_agent_cursor(&mut output, w, h, x, y);
+        }
         // Issue #139: measured here, on the bytes that are about to be
         // presented, rather than on a second composition — a witness that
         // composed its own frame would agree with this one today and could
@@ -1427,6 +1524,7 @@ mod tests {
             size,
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
+            false,
         )
         .expect("headless state under pixman");
         state
@@ -1483,6 +1581,7 @@ mod tests {
             size,
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
+            false,
         )
         .expect("headless state under pixman");
 
@@ -1570,6 +1669,7 @@ mod tests {
             size,
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
+            false,
         )
         .expect("headless state under pixman");
         state
@@ -1673,9 +1773,13 @@ mod tests {
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
         let event_loop: EventLoop<'static, HeadlessView> =
             EventLoop::try_new().expect("calloop event loop");
-        let mut state =
-            HeadlessView::new(size, event_loop.get_signal(), TrustedIndicator::for_test())
-                .expect("headless state under pixman");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            TrustedIndicator::for_test(),
+            false,
+        )
+        .expect("headless state under pixman");
         state
             .scene
             .commit(SurfaceContent::from_rgba(client_pixels(SW, SH), SW, SH).expect("content"));
@@ -1783,6 +1887,7 @@ mod tests {
             size,
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
+            false,
         )
         .expect("headless state under pixman");
 
@@ -1920,6 +2025,228 @@ mod tests {
         );
     }
 
+    /// **The agent cursor reaches human-visible output and never a capture**
+    /// (D-019) — the sibling of
+    /// [`a_prompt_reaches_human_visible_output_but_never_a_capture`], on real
+    /// composited pixels of the one backend CI can run.
+    ///
+    /// This is the test that makes the IDL's ordering invariant 4 — *no agent
+    /// principal's cursor is composited into another principal's captured
+    /// frame* — a rule with something to be true of. Before this change the
+    /// invariant held **vacuously**: the core drew no cursor at all, so no
+    /// arrangement of the code could have violated it and nothing checked.
+    /// Now a sprite really is composited, and the exclusion is a property of
+    /// where it is composited: at the output stage, downstream of the
+    /// `Scene::compose` a capture reads. This asserts both halves of that
+    /// against the two retained images, and takes the agent-side half all the
+    /// way through [`crate::capture::render_frame`] — the buffer that would
+    /// actually be sealed into a memfd — because anything weaker proves the
+    /// retained image is clean while leaving the delivered artifact untested.
+    ///
+    /// The sprite is enabled here through the same `--agent-cursor` switch an
+    /// operator passes, not through a test-only back door: the flag exists so
+    /// this property can be *proved* on headless, which is why the default
+    /// being off (see [`run`]) does not leave it unproven.
+    #[test]
+    fn the_agent_cursor_reaches_human_visible_output_but_never_a_capture() {
+        use crate::capture::{render_frame, RealmViewFrame};
+        use crate::cursor::{AGENT_CURSOR_CORE, AGENT_CURSOR_HALO};
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+        use crate::session::Presenter;
+
+        let _fd = crate::capture::tests::fd_lock();
+        const VW: u32 = 400;
+        const VH: u32 = 300;
+        const SW: u32 = 400;
+        const SH: u32 = 300;
+        // Well inside the view and well below the trusted band, so the sprite
+        // is drawn whole and lands on client-owned pixels — which is what
+        // makes "it is on the output and not in the capture" a statement about
+        // the same pixels rather than about two different regions.
+        const CX: f64 = 200.0;
+        const CY: f64 = 150.0;
+
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessView> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+            // `--agent-cursor`, the operator's own switch.
+            true,
+        )
+        .expect("headless state under pixman");
+
+        // A realm that has painted, so "the sprite is absent from the
+        // capture" is distinguishable from "nothing was ever drawn".
+        state.scene.commit(
+            SurfaceContent::from_rgba(client_pixels(SW, SH), SW, SH).expect("well-formed content"),
+        );
+        state.redraw().expect("composite the committed surface");
+        let clean_view = state.latest_frame_rgba().expect("readback");
+        let clean_output = state.latest_output_rgba().expect("readback");
+        let count = |px: &[u8], rgba: [u8; 4]| {
+            px.chunks_exact(test_pattern::BYTES_PER_PIXEL)
+                .filter(|pixel| *pixel == rgba)
+                .count()
+        };
+        // The client's test pattern happens to contain neither sprite colour,
+        // so a nonzero count later is the sprite and only the sprite. Asserted
+        // rather than assumed: if the pattern ever changed to include one, this
+        // test would silently stop measuring anything.
+        assert_eq!(count(&clean_output, AGENT_CURSOR_CORE), 0);
+        assert_eq!(count(&clean_output, AGENT_CURSOR_HALO), 0);
+
+        // The agent moves its pointer. Through `set_agent_cursor`, which is
+        // the seam `session::post_dispatch` drives once per dispatch round —
+        // not by writing the field, so the return value's "did this change"
+        // contract is exercised too.
+        assert!(
+            state.set_agent_cursor(Some((CX, CY))),
+            "a first agent position must dirty the frame"
+        );
+        assert!(
+            !state.set_agent_cursor(Some((CX + 0.25, CY))),
+            "a sub-pixel move draws the same sprite and must not dirty the frame"
+        );
+        state.redraw().expect("recomposite with the cursor up");
+
+        // --- Human-visible side: the sprite is really on the display. ---
+        let output = state.latest_output_rgba().expect("readback");
+        assert_ne!(output, clean_output, "the cursor must change the output");
+        let core_px = count(&output, AGENT_CURSOR_CORE);
+        assert!(
+            core_px > 0,
+            "the agent cursor is not on the human-visible output at all"
+        );
+        assert!(count(&output, AGENT_CURSOR_HALO) > 0, "no halo was drawn");
+        // At the hotspot, specifically — not merely somewhere.
+        let at = |px: &[u8], x: u32, y: u32| {
+            let off = (y as usize * VW as usize + x as usize) * test_pattern::BYTES_PER_PIXEL;
+            px[off..off + test_pattern::BYTES_PER_PIXEL].to_vec()
+        };
+        assert_eq!(
+            at(&output, CX as u32, CY as u32),
+            AGENT_CURSOR_CORE.to_vec(),
+            "the sprite is not where the agent's pointer is"
+        );
+        // The trusted band is untouched, and so is everything outside the
+        // sprite's own footprint: the cursor is an overlay, not a repaint.
+        let band_bytes = crate::consent::TRUST_BAND_HEIGHT as usize
+            * VW as usize
+            * test_pattern::BYTES_PER_PIXEL;
+        assert_eq!(
+            output[..band_bytes],
+            clean_output[..band_bytes],
+            "the agent cursor reached the trusted band's rows"
+        );
+        let changed = output
+            .chunks_exact(test_pattern::BYTES_PER_PIXEL)
+            .zip(clean_output.chunks_exact(test_pattern::BYTES_PER_PIXEL))
+            .filter(|(now, before)| now != before)
+            .count();
+        assert_eq!(
+            changed,
+            core_px + count(&output, AGENT_CURSOR_HALO),
+            "the cursor changed pixels that are not part of the sprite"
+        );
+
+        // --- Agent side: the capture is the realm view, unchanged. ---
+        let view = state.latest_frame_rgba().expect("readback");
+        assert_eq!(
+            view, clean_view,
+            "an agent cursor being drawn must not move a single pixel of the realm view"
+        );
+        assert_eq!(
+            view,
+            state.scene.compose(VW, VH),
+            "the capture source must be exactly Scene::compose -- the sprite composites \
+             at the output stage, above this"
+        );
+        assert_eq!(count(&view, AGENT_CURSOR_CORE), 0);
+        assert_eq!(count(&view, AGENT_CURSOR_HALO), 0);
+        assert_ne!(view, output, "...and the two really do differ now");
+
+        // The delivered artifact, not just the retained image: what a
+        // `capture_frame` would seal into a memfd carries no sprite pixel. The
+        // wire frame is XRGB, so the sprite's colours are compared swizzled —
+        // otherwise "absent" would be true of bytes nobody was looking for.
+        let (frame, _digest) = render_frame(&RealmViewFrame {
+            rgba: &view,
+            width: VW,
+            height: VH,
+        })
+        .expect("render the retained view");
+        let served = {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::File::from(frame.fd);
+            let mut buf = vec![0u8; (frame.stride * frame.height) as usize];
+            file.read_exact_at(&mut buf, 0).expect("read served frame");
+            buf
+        };
+        let swizzle = |rgba: [u8; 4]| [rgba[2], rgba[1], rgba[0], 0xff];
+        for colour in [AGENT_CURSOR_CORE, AGENT_CURSOR_HALO] {
+            let wire = swizzle(colour);
+            assert!(
+                !served.chunks_exact(4).any(|px| px == wire),
+                "an agent-cursor pixel ({colour:?}) reached a served capture: \
+                 `vitrin_view.frame_ready` is delivering human-visible output"
+            );
+        }
+
+        // The pointer going away takes the sprite with it, leaving nothing
+        // behind — the realm-teardown case (`InputRouter::reset`).
+        assert!(state.set_agent_cursor(None));
+        state.redraw().expect("recomposite with no cursor");
+        assert_eq!(
+            state.latest_output_rgba().expect("readback"),
+            clean_output,
+            "a cleared agent pointer must leave no sprite pixels behind"
+        );
+    }
+
+    /// **Without `--agent-cursor`, the headless composite is unchanged** — the
+    /// default this backend must keep, because
+    /// `tests/integration/test_real_trust_band.py` asserts the human-visible
+    /// frame tracks the realm view *after* a real `grant.pointer.click()`, and
+    /// that gate is mock-free milestone evidence.
+    #[test]
+    fn without_the_flag_an_agent_pointer_changes_no_headless_pixel() {
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+        use crate::session::Presenter;
+
+        const VW: u32 = 200;
+        const VH: u32 = 150;
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessView> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+            false,
+        )
+        .expect("headless state under pixman");
+        state.scene.commit(
+            SurfaceContent::from_rgba(client_pixels(VW, VH), VW, VH).expect("well-formed content"),
+        );
+        state.redraw().expect("composite");
+        let before = state.latest_output_rgba().expect("readback");
+
+        // The router really does hand a position over; the backend really does
+        // decline it. `false` means `post_dispatch` marks nothing dirty, so a
+        // hovering agent costs a plain headless run no composite at all.
+        assert!(!state.set_agent_cursor(Some((100.0, 75.0))));
+        state.redraw().expect("recomposite");
+        assert_eq!(
+            state.latest_output_rgba().expect("readback"),
+            before,
+            "a plain headless run must composite the same bytes it did before the \
+             agent cursor existed"
+        );
+    }
+
     /// The P1.7.1 occlusion proof (issue #109, M1.4 exit gate), against a
     /// REAL app: the consent overlay really occludes a real app's content on
     /// the human-visible side, and is really absent from the agent-visible
@@ -2037,6 +2364,7 @@ mod tests {
             size,
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
+            false,
         )
         .expect("headless state under pixman");
         server
@@ -2209,6 +2537,7 @@ mod tests {
             size,
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
+            false,
         )
         .expect("headless state under pixman");
         state
@@ -2263,6 +2592,7 @@ mod tests {
             size,
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
+            false,
         )
         .expect("headless state under pixman");
 
@@ -2389,6 +2719,7 @@ mod tests {
                 size,
                 event_loop.get_signal(),
                 crate::consent::TrustedIndicator::for_test(),
+                false,
             )
             .expect("headless state under pixman"),
             server: Some(ShimServer::new(ShimConfig {

@@ -45,8 +45,15 @@ separately choreographed demo:
 4. **Capture → act → capture.** The agent captures a before-frame, locates
    the URL bar by pixels, clicks it, types a URL, presses Enter, and
    captures an after-frame. Zoom or pause on the actuation actually landing
-   in the real Firefox chrome (cursor moving, text appearing character by
-   character per the `text-input-v3`-avoiding keymap technique, D7).
+   in the real Firefox chrome: the **agent's own cursor** — the crosshair
+   the core composites at the agent's pointer position (D-019), not your
+   desktop's mouse pointer — travels to the URL bar, then text appears
+   character by character per the `text-input-v3`-avoiding keymap
+   technique, D7. The crosshair is **nested-only**: `vitrind --nested`
+   always composites it, a headless run only with `--agent-cursor`, and it
+   is drawn into human-visible output alone — the agent's own captured
+   frames never contain it, which is why the before/after frames show the
+   page and no cursor.
 5. **Hold-Esc revocation (bonus rung, if time allows).** Mid-actuation,
    physically hold Esc for one second; show the agent's next `observe()`/
    actuation failing `revoked` in the terminal log, and the recorder's

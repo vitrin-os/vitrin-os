@@ -624,6 +624,40 @@ jobs:
             fi
           fi
 
+      - name: Guard against milestone-gate drift
+        # The guard above asserts the entry point exists. This asserts the
+        # named gates BEHIND it do. `run.sh` runs `unittest discover`, which
+        # collects whatever `test_*.py` files are present -- so a milestone
+        # gate that was never written, or one dropped in a later refactor, is
+        # indistinguishable from a green suite: nothing collected, nothing
+        # failed, exit 0. That is how a milestone gets recorded as done on
+        # evidence that does not exist (issue #138).
+        #
+        # `run.sh` carries the authoritative list (MILESTONE_GATES) and fails
+        # the same way; this runs BEFORE the build + suite, so the answer
+        # arrives in seconds and does not depend on the toolchain, the C shim,
+        # or a green build.
+        if: hashFiles('tests/integration/run.sh') != ''
+        run: |
+          missing=0
+          for gate in test_real_app.py test_real_capture_fidelity.py test_real_actuation.py test_real_deadman.py test_real_consent.py test_demo.py; do
+            if [ ! -f "tests/integration/$gate" ]; then
+              echo "::error::named milestone gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with that milestone's evidence contributing nothing. Restore it, or retire it from run.sh's MILESTONE_GATES, this list, and tests/integration/README.md's gate table together."
+              missing=1
+            fi
+          done
+          # The warm build below always runs before run.sh, so ITS feature
+          # list is the one the suite actually gets. A list that drifts from
+          # run.sh's would hand the gates a binary missing a hook they depend
+          # on, and every symptom of that is a confusing timeout somewhere
+          # else. Assert the two agree, here, in seconds.
+          expected='INJECTORS=vitrin-core/dead-man-injector,vitrin-core/consent-injector'
+          if ! grep -qxF "$expected" tests/integration/run.sh; then
+            echo "::error::tests/integration/run.sh no longer declares '$expected'. The warm-build step in this job hard-codes that same feature list and runs first, so the two must match exactly -- update both together."
+            missing=1
+          fi
+          exit "$missing"
+
       - name: Install Rust (pinned toolchain + components from rust-toolchain.toml)
         if: hashFiles('tests/integration/run.sh') != ''
         run: rustup toolchain install && rustup show active-toolchain
@@ -666,17 +700,25 @@ jobs:
         # this builds -- and, via the cache step above, banks -- the heavy
         # dependency tree before the timed suite step runs.
         #
-        # `vitrin-core/dead-man-injector` (issue #109) rides along: it must
-        # match the flag `tests/integration/run.sh`'s own (idle) fallback
-        # build uses, or this step's binary wins the race (it always runs
-        # first) and `run.sh`'s existence guard skips rebuilding -- silently
-        # shipping a `vitrind` with no SIGUSR1 handler installed to
-        # `test_real_deadman.py`, which sends it one. The feature is purely
-        # additive and never enabled in a deployment build (see the feature's
-        # doc in crates/vitrin-core/Cargo.toml), so it changes nothing else
-        # this job builds or runs.
+        # The two test-only injector features ride along, and the list must
+        # match `tests/integration/run.sh`'s `INJECTORS` EXACTLY -- this step
+        # always runs first, so its binary wins the race and `run.sh`'s
+        # existence guard then skips rebuilding. A list that drifts here
+        # silently ships the suite a `vitrind` missing a hook a gate depends
+        # on (the "Guard against milestone-gate drift" step above asserts the
+        # agreement in seconds):
+        #   - `vitrin-core/dead-man-injector` (issue #109): otherwise no
+        #     SIGUSR1 handler is installed, and `test_real_deadman.py` sends
+        #     the core one.
+        #   - `vitrin-core/consent-injector` (issue #138): otherwise
+        #     `--headless --consent=interactive --consent-injector-fd N` is
+        #     refused at startup and the core `test_real_consent.py` drives
+        #     never binds its socket.
+        # Both features are purely additive and never enabled in a deployment
+        # build (see their docs in crates/vitrin-core/Cargo.toml), so they
+        # change nothing else this job builds or runs.
         if: hashFiles('tests/integration/run.sh') != ''
-        run: cargo build --workspace --features vitrin-core/dead-man-injector
+        run: cargo build --workspace --features vitrin-core/dead-man-injector,vitrin-core/consent-injector
 
       - name: Build the C shim (for the real-app gate)
         # tests/integration/test_real_app.py runs the real core -> real C shim

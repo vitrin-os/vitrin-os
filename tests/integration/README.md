@@ -46,40 +46,89 @@ their value; they are just never a substitute for the named gate.
 | `test_real_gtk.py` | The GTK rung of the real bring-up ladder (P1.6.6, #106): real `vitrind` → real C shim → real `gtk-entry-probe`, reusing `test_real_app.py`'s real-app mode. Supporting evidence for M1.2's render half, alongside `test_real_firefox.py`. | Supporting — M1.2 |
 | `test_real_firefox.py` | The Firefox rung of the real bring-up ladder (P1.6.6, #106): real `vitrind` → real C shim → real pinned Firefox ESR, asserting a real rendered colour and the globals contract, with no mock on any seam. Supporting evidence for M1.2's render half. | Supporting — M1.2 |
 | `test_real_capture_fidelity.py` | The **M1.3 exit gate** (P1.8.5, #107): an agent captures a real `solid-client` frame through the real chokepoint; its dominant colour is the served colour, it agrees with the core-internal capture (`vitrind --capture-dump`) by SSIM + per-pixel tolerance via `vitrin-golden-cmp`, and capture-path rate-limit + expiry refuse as `rate_limited`/`expired`. Same C-shim env contract. | **Yes — M1.3** |
-| `test_real_actuation.py` | The **M1.4 actuation gate** (P1.8.6, #108): an agent's `grant.pointer` click lands on a real `click-target`'s observed feature (dominant colour flips, D10) and `grant.text` types `héllo→世界` intact into a real `gtk-entry-probe` (D7), each confirmed by the agent's own `observe()` and recorded at the chokepoint. Same C-shim env contract; the GTK rung skips without GTK. M1.4 additionally needs #109, whose **hold-Esc half** is the `test_real_deadman.py` row below and whose **consent half is not covered by any gate in this directory** — see "M1.4's open consent gap" below. | **Yes — M1.4 (actuation half)** |
+| `test_real_actuation.py` | The **M1.4 actuation gate** (P1.8.6, #108): an agent's `grant.pointer` click lands on a real `click-target`'s observed feature (dominant colour flips, D10) and `grant.text` types `héllo→世界` intact into a real `gtk-entry-probe` (D7), each confirmed by the agent's own `observe()` and recorded at the chokepoint. Same C-shim env contract; the GTK rung skips without GTK. M1.4 additionally needs #109, whose **hold-Esc half** is the `test_real_deadman.py` row below and whose **consent half** is the `test_real_consent.py` row below it (#138) — with the scope that gate deliberately does *not* cover recorded under "What the consent gate still does not prove". | **Yes — M1.4 (actuation half)** |
 | `test_real_deadman.py` | The **M1.4 dead-man gate** (P1.7.4, #109): a completed hold-Esc chord, applied over a real `click-target` through the real core, revokes a live grant — `observe()` and `grant.pointer.click()` both refuse `Revoked` on the very next check, the real app's target stays unflipped (read from `--capture-dump`, bypassing the now-revoked grant entirely), and the flight recorder journals `dead_man_triggered` then `grant_revoked`. Headless has no physical key to hold, so a `SIGUSR1` to the core (only meaningful on a `dead-man-injector`-feature `vitrind` — see `run.sh`) stands in for the hold; the nested recipe for a *real* held Escape is `shim/docs/firefox.md` §9. Same C-shim env contract as the rest of the real-app ladder. | **Yes — M1.4 (dead-man half)** |
+| `test_real_consent.py` | The **M1.4 consent gate** (P1.7.5, #138): a real petition raises a real core-rendered prompt over a real `click-target`; the prompt occludes the human-visible output (the exported footprint is first shown to *be* a card raster at exactly the rectangle the core named — accent ring on all four edges, exact perimeter count, opaque body, buttons, antialiased text — and then to carry zero of the app's target pixels) and never the capture path (the realm-view dump is **byte-identical** to a settled control taken while the app was watched idle, and the agent's own mid-prompt `observe()` still shows the full target and agrees with that dump through `vitrin-golden-cmp`); a mid-prompt actuation on an *already-granted* grant, on a **second connection of the same principal**, refuses `ConsentHeld` **specifically**, the app's own surface stays green in the core-internal dump, and the chokepoint's `consent_held` record falls strictly between the prompt's `shown` and its resolution in the journal; then the identical click lands after the denial (the positive control, last, because `click-target`'s flip is one-way). The decision is resolved by `PetitionRegistry::resolve_human` — asserted as `issuer: "human_consent"` — and the run brands itself `consent_policy: "interactive+consent-injector"`. Headless has no pointer for a human to click with, so an inherited socketpair named by `--consent-injector-fd N` on a `consent-injector`-feature `vitrind` stands in for the click; see "What the consent gate still does not prove" below. Same C-shim env contract as the rest of the real-app ladder. | **Yes — M1.4 (consent half)** |
+| `test_consent_injector.py` | **Component test.** The `consent-injector` channel's fail-closed matrix (no card up, a button the card does not draw, an unknown or spent token, an unparseable line, an over-long line, the peer disappearing) against the real core + `vitrin-mock-shim`. Explicitly **not** a milestone gate: it exists so the gate above stays about the milestone property rather than about the channel's error handling. | No |
 
-### M1.4's open consent gap
+### What the consent gate still does not prove
 
-Issue #109 has two halves — "consent occlusion over a real app" and
-"hold-Esc revocation over a real app". This directory covers the second
-(`test_real_deadman.py`) and **not the first**. `test_real_deadman.py`
-never raises a consent prompt: it takes a grant, fires the dead-man chord,
-and asserts the refusals. No `test_real_*.py` module in this directory
-puts a consent prompt on screen over a real app at all.
+`test_real_consent.py` closes the gap this section used to describe. Two
+things it deliberately does **not** close, stated here rather than left to
+be discovered:
 
-The consent-occlusion evidence that *does* exist is
+- **Unspoofability (issue #85) is not gate-level evidence, and will not
+  be.** The gate never learns this session's trusted-indicator colour, at
+  all. That secret is never written to any descriptor or file in any
+  build, and the pixels the instrumented core exports are exactly the
+  consent card's own footprint — which `consent/mod.rs`'s `card_rect` and
+  its `the_card_footprint_carries_no_indicator_pixel` test prove is
+  indicator-free, because the trusted ring is stroked strictly *outside*
+  it and the opaque card is blitted last. **So the gate proves occlusion;
+  it does not prove the card is framed in a colour a confined app cannot
+  forge.** That half stays component-level evidence: `consent/mod.rs`'s
+  band and frame tests, `backend/headless.rs`'s
+  `a_prompt_reaches_human_visible_output_but_never_a_capture` and the
+  real-app `c_shim_consent_prompt_occludes_…`, and, for a human,
+  `shim/docs/firefox.md` §9's nested recipe. **Adjudicated 2026-07-25:
+  unspoofability is not an M1.4 criterion** — neither the milestone table
+  nor its verification list in `docs/plan/01-phase-1-mvp.md` §5 names it —
+  **so M1.4 is closed, and this gap is tracked separately as #139** rather
+  than folded into a closed milestone. Do not cite M1.4 as evidence that
+  the trusted indicator is unforgeable; cite #139's status instead.
+  (A whole-frame mirror would have let the gate check the band — and would
+  have written the session secret to a file a same-uid app can read, which
+  is precisely what `consent/indicator.rs` forbids. The smaller claim is
+  the honest one.)
+- **The physical click is not proven here.** The hit test, the 500 ms
+  `GUARD_INTERVAL`, the press-arms/release-commits ladder, and the origin
+  check that stops an agent answering its own prompt are proven only by
+  `crates/vitrin-core/src/consent/grab.rs`'s own tests — which drive the
+  private `judge_parts` with real events, including
+  `an_agent_cannot_answer_the_prompt_it_petitioned_for` — and by
+  `shim/docs/firefox.md` §9 with a human at a mouse. The injector bypasses
+  `judge` completely, and the headless router still stacks `NoopHook`, so
+  no input of any origin can reach that grab. This is the same shape as
+  `test_real_deadman.py`'s SIGUSR1 standing in for a held Escape.
+
+The gate also says nothing about the human-visible frame *outside* the
+card footprint (not the scrim, not the ring), and nothing about whether
+the card is legible or names the right principal — `consent/render.rs`'s
+golden and sourcing tests hold that.
+
+With `click-target` the first of those is **structural, not an omission
+an extra assertion could close**, and it is worth knowing which: the
+export is clamped to the card's footprint and the card is blitted opaque
+last, so those bytes do not depend on the frame beneath them; and the
+realm view *outside* that footprint is, measured on the gate's own
+artifacts, 93 840 px of one colour (black — the app paints black except
+for one centred 160×160 square the card wholly covers). A regression that
+erased the realm view from the human-visible output altogether therefore
+moves no pixel a human sees in this scenario; the exported window comes
+back byte-identical, sha256 and all, which was confirmed by running it.
+That defect is caught, at component level, by `backend/headless.rs`'s
+`a_prompt_reaches_human_visible_output_but_never_a_capture` (full-bleed
+test pattern, bottom-left asserted scrimmed-not-erased) and
+`backend/winit.rs`'s `the_nested_window_uploads_the_consent_overlay`.
+
+What the gate *does* now establish about those exported bytes, and did
+not before the P1.7.5 repair pass, is their **provenance**: they are
+checked to be a raster of vitrind's card at exactly the rectangle the
+core named — accent ring on all four edges, its exact perimeter count,
+`CARD_BG` over most of the body, both button colours present, and enough
+distinct colours to carry antialiased text — *before* the absence of the
+app's green is read out of them. An absence over bytes of unproven origin
+is satisfied just as well by an empty buffer: an export that never read
+the framebuffer at all used to pass this gate, printing its success line
+verbatim, and now fails it on the first edge pixel.
+
 `crates/vitrin-core/src/backend/headless.rs`'s
-`c_shim_consent_prompt_occludes_the_human_visible_output_but_never_the_real_apps_capture`.
-It is genuinely mock-free on the app seam — real C shim, real
-`click-target`, real pixels — and it is a real proof of the property. But
-it is an **in-process Rust test**: it builds a `HeadlessView` and a
-`ShimServer` directly instead of driving the shipped `vitrind` binary,
-which is exactly what the top of this file says no gate here does, and
-what plan §5 D12 disqualifies as milestone evidence. So:
-
-> **M1.4's consent half has component-level evidence, not gate-level
-> evidence.** Do not cite `test_real_deadman.py` for it, and do not cite
-> the Rust test as milestone acceptance. Closing the gap means a
-> `test_real_consent.py` here that drives the shipped binary, raises a
-> prompt over a real app (the build-gated `scripted-consent` feature is
-> the headless stand-in, as `dead-man-injector` is for the hold), and
-> asserts the same split: the prompt in the human-visible output, absent
-> from the agent's capture.
-
-Stated plainly because the previous version of this row claimed the
-consent half was "covered by the `test_real_deadman.py` row below", which
-it never was.
+`c_shim_consent_prompt_occludes_the_human_visible_output_but_never_the_real_apps_capture`
+remains valuable and remains a **component** test: it is mock-free on the
+app seam but builds a `HeadlessView` and a `ShimServer` in-process instead
+of driving the shipped binary, which plan §5 D12 disqualifies as milestone
+evidence. Cite `test_real_consent.py` for the milestone, that test for the
+property in isolation.
 
 Grep-proving the split (run from repo root): every named-gate module boots
 its `Core` with an **explicit real shim path** (`shim=str(self.shim_bin)`,
@@ -154,11 +203,17 @@ cannot silently drift.
   (`test_real_actuation.py`) adds no CI wiring either: its `click-target` app is
   co-built with the shim, and it reuses the `gtk-entry-probe` the GTK rung
   already builds. The M1.4 dead-man gate (`test_real_deadman.py`) reuses
-  `click-target` too, and needs one extra flag on the `vitrind` this job
-  already builds: `cargo build --workspace --features
-  vitrin-core/dead-man-injector` (both the "Warm build" step and `run.sh`'s
-  own fallback build pass it) — the SIGUSR1 handler that stands in for a
-  completed hold-Esc chord on a physical-input-free runner.
+  `click-target` too, and needs one extra cargo feature on the `vitrind` this
+  job already builds. The M1.4 consent gate (`test_real_consent.py`) reuses
+  `click-target` as well and needs a second one, so the list is
+  `cargo build --workspace --features
+  vitrin-core/dead-man-injector,vitrin-core/consent-injector` (both the "Warm
+  build" step and `run.sh`'s own fallback build pass exactly that string, and
+  the milestone-gate-drift guard asserts they agree): the SIGUSR1 handler that
+  stands in for a completed hold-Esc chord, and the socketpair channel that
+  stands in for a human clicking Allow, on a physical-input-free runner.
+  Neither feature does anything by itself at runtime — the consent one is
+  additionally inert unless the invocation carries `--consent-injector-fd N`.
 - **The real-app gate's opt-in knob:** `test_real_app.py` runs only when
   `VITRIN_C_SHIM_BIN` names a built C shim (`shim/build/vitrin-shim`). Unset,
   it **skips** — the local-dev path for anyone without the C toolchain. Set,
@@ -172,6 +227,13 @@ cannot silently drift.
   meson setup shim/build shim && meson compile -C shim/build
   VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" bash tests/integration/run.sh
   ```
+- **The named gates must exist.** `run.sh` carries a `MILESTONE_GATES` list
+  and fails before any test runs if one of those modules is absent, and CI's
+  "Guard against milestone-gate drift" step asserts the same list plus the
+  `INJECTORS=` feature line in seconds. `unittest discover` cannot tell a gate
+  that was never written from a green suite — nothing collected, nothing
+  failed, exit 0 — which is the exact shape issue #138 was filed on. Editing
+  the gate table above means editing that list in the same commit.
 - **Later occupants:** this job also hosts the rest of the M1.5 gates —
   golden frames (P1.9.2), hostile-client tests (P1.9.3) — behind the same
   entry point. The demo gate (P1.8.4/P1.8.7, `test_demo.py`) has landed; it

@@ -161,6 +161,16 @@
 pub(crate) mod canvas;
 pub(crate) mod grab;
 mod indicator;
+/// The `consent-injector` channel's vocabulary (issue #138).
+///
+/// Present in a `cargo test` build as well as a feature build, and *only*
+/// those two: the line parser is a pure function with no authority, and the
+/// mapping from a word on a socket to a button on a consent card is exactly
+/// the kind of thing that rots silently if only an integration test in
+/// another language ever exercises it. Everything in it that carries
+/// authority is gated on the feature alone (see the module's own docs).
+#[cfg(any(test, feature = "consent-injector"))]
+pub(crate) mod injector;
 pub(crate) mod render;
 mod text;
 
@@ -462,6 +472,50 @@ impl ConsentSurface {
     pub fn card_origin(&mut self, view_width: u32, view_height: u32) -> Option<(i32, i32)> {
         let card = self.card()?;
         Some(centered(card.width, card.height, view_width, view_height))
+    }
+
+    /// The card's footprint in the view: `(x, y, w, h)`, or `None` with no
+    /// prompt up.
+    ///
+    /// [`Self::card_origin`] plus the raster's size, from the same
+    /// [`centered`] call [`Self::composite_over`] uses, so the geometry has
+    /// exactly one source. Added for the `consent-injector` build's occlusion
+    /// export (issue #138), which reads back **this rectangle and nothing
+    /// else** of the human-visible framebuffer.
+    ///
+    /// # Why this rectangle in particular is safe to export
+    ///
+    /// [`Self::composite_over`] writes in a fixed order — `darken(scrim)`,
+    /// then `stroke_rect(frame, indicator.color(), t)` on the card *inset by
+    /// `-TRUST_FRAME_THICKNESS`*, then `blit_opaque(card)`. [`Canvas::stroke_rect`]
+    /// strokes **inside** the rect it is given, so the trusted ring occupies
+    /// exactly the `t`-wide border strictly *outside* this rectangle, and the
+    /// opaque card blit is the last write over it. [`render::rasterize`] fills
+    /// the card from fixed palette constants and never touches
+    /// [`TrustedIndicator`]; [`Self::composite_trust_band`] paints rows
+    /// `[0, TRUST_BAND_HEIGHT)` only, afterwards.
+    ///
+    /// So the human-visible output restricted to *this* rectangle is
+    /// byte-identical to `render::rasterize(prompt)`, which is indicator-free
+    /// by construction. `the_card_footprint_carries_no_indicator_pixel` in
+    /// this module's tests turns that structural argument into a checked
+    /// fact, so a future reordering of `composite_over` fails a test rather
+    /// than silently starting to export the session secret.
+    ///
+    /// The complementary crop — "everything below the trust band" — is
+    /// **unsound** and worth recording as checked rather than assumed: at
+    /// 640x480 the ring sits hundreds of rows below the 8-row band, some
+    /// 18 000 pixels of the exact secret in one contiguous shape.
+    #[cfg(any(test, feature = "consent-injector"))]
+    pub(crate) fn card_rect(
+        &mut self,
+        view_width: u32,
+        view_height: u32,
+    ) -> Option<(i32, i32, u32, u32)> {
+        let card = self.card()?;
+        let (w, h) = (card.width, card.height);
+        let (x, y) = centered(w, h, view_width, view_height);
+        Some((x, y, w, h))
     }
 
     /// Composite the prompt over an already-composed realm view, in place.
@@ -1111,6 +1165,83 @@ pub(crate) mod tests {
         assert!(
             !capture.chunks_exact(BYTES_PER_PIXEL).any(|p| p == color),
             "the trust indicator must never appear in a captured frame"
+        );
+    }
+
+    /// **The card's own footprint carries no pixel of the session secret, and
+    /// the ring immediately outside it carries plenty.**
+    ///
+    /// This is the checked form of the argument [`ConsentSurface::card_rect`]
+    /// makes structurally, and it is what the `consent-injector` build's
+    /// occlusion export (issue #138) rests on: that build reads back
+    /// *precisely* this rectangle of the human-visible framebuffer and sends
+    /// it to a peer, so if a future reordering of [`ConsentSurface::composite_over`]
+    /// ever let the trusted ring (or a tint of it) land inside the card, that
+    /// export would start leaking the one value issue #85 says must never
+    /// leave vitrind's own display. Turning the ordering argument into a test
+    /// means such a change fails here rather than silently widening what the
+    /// injector can see.
+    ///
+    /// Asserted on the **full human-visible composite** — scrim, ring, card,
+    /// band, in the order [`crate::backend::human_visible_from_view`] applies
+    /// them — not on `composite_over` alone, so it covers the whole path an
+    /// export would read.
+    #[test]
+    fn the_card_footprint_carries_no_indicator_pixel() {
+        const W: u32 = 640;
+        const H: u32 = 480;
+        let indicator = TrustedIndicator::for_test();
+        let mut consent = ConsentSurface::new(indicator);
+        consent.show_for_test(prompt_fixture());
+
+        let (x, y, cw, ch) = consent
+            .card_rect(W, H)
+            .expect("a prompt is up, so it has a footprint");
+        assert!(
+            x >= 0 && y >= TRUST_BAND_HEIGHT as i32,
+            "the fixture card must fit this view below the band: ({x},{y}) {cw}x{ch}"
+        );
+
+        let human = crate::backend::human_visible_from_view(
+            flat_view(W, H, [40, 40, 40]),
+            &mut consent,
+            W,
+            H,
+        );
+        let secret = indicator.color();
+
+        let mut inside = 0usize;
+        for row in 0..ch {
+            for col in 0..cw {
+                if px(&human, W, x as u32 + col, y as u32 + row) == secret {
+                    inside += 1;
+                }
+            }
+        }
+        assert_eq!(
+            inside, 0,
+            "the consent card's own footprint must carry no pixel of this session's trusted \
+             indicator: the `consent-injector` build exports exactly this rectangle"
+        );
+
+        // ...and the ring immediately outside it does, so the assertion above
+        // is not vacuously true of a composite that drew no frame at all.
+        let ring_x = (x - TRUST_FRAME_THICKNESS as i32 / 2) as u32;
+        let ring_y = (y - TRUST_FRAME_THICKNESS as i32 / 2) as u32;
+        assert_eq!(
+            px(&human, W, ring_x, ring_y),
+            secret,
+            "the trusted ring must be painted immediately outside the exported rectangle"
+        );
+
+        // The complementary crop -- "everything below the trust band" -- is
+        // recorded here as UNSOUND rather than merely unused: the ring sits
+        // hundreds of rows below the 8-row band, so a below-the-band mirror
+        // would leak the indicator far worse than the band itself does.
+        assert!(
+            ring_y > TRUST_BAND_HEIGHT,
+            "the trusted ring is far below the band, which is why 'crop below the band' is not \
+             a safe export"
         );
     }
 

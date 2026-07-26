@@ -420,6 +420,16 @@ enum Action {
         /// build still reads this to name the synthesized trigger's
         /// chord/hold (issue #109) -- see `backend::headless::run`.
         dead_man: DeadManConfig,
+        /// The `--consent-injector-fd N` channel (issue #138): an inherited
+        /// `AF_UNIX`/`SOCK_STREAM` socketpair end on which a harness answers
+        /// the consent prompts this headless session raises.
+        ///
+        /// `#[cfg(feature = "consent-injector")]`, so a deployment build
+        /// cannot even **name** the flag: `parse_args` has no arm for it and
+        /// exits with ``unknown argument `--consent-injector-fd` ``. Pinned by
+        /// `a_plain_build_cannot_name_the_consent_injector_flag`.
+        #[cfg(feature = "consent-injector")]
+        consent_injector_fd: Option<std::os::fd::RawFd>,
     },
     Help,
     Version,
@@ -459,6 +469,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut capture_dump: Option<PathBuf> = None;
     let mut chord: Option<deadman::Chord> = None;
     let mut hold_ms: Option<u64> = None;
+    #[cfg(feature = "consent-injector")]
+    let mut consent_injector_fd: Option<std::os::fd::RawFd> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg {
@@ -522,9 +534,22 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 )?;
                 set_hold(&mut hold_ms, value)?;
             }
+            #[cfg(feature = "consent-injector")]
+            "--consent-injector-fd" => {
+                let value = args.next().ok_or(
+                    "`--consent-injector-fd` requires an inherited descriptor number \
+                     (e.g. `--consent-injector-fd 7`)",
+                )?;
+                set_injector_fd(&mut consent_injector_fd, value)?;
+            }
             "--help" | "-h" => return Ok(Action::Help),
             "--version" | "-V" => return Ok(Action::Version),
             other => {
+                #[cfg(feature = "consent-injector")]
+                if let Some(value) = other.strip_prefix("--consent-injector-fd=") {
+                    set_injector_fd(&mut consent_injector_fd, value)?;
+                    continue;
+                }
                 if let Some(value) = other.strip_prefix("--consent=") {
                     set_consent(&mut consent, parse_consent(value)?)?;
                 } else if let Some(value) = other.strip_prefix("--principals=") {
@@ -564,6 +589,35 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             .map_err(|err| format!("`--dead-man-hold`: {err}"))?;
     }
 
+    // The injector channel's two companion refusals (issue #138), taken at
+    // PARSE time rather than at first use, which is this parser's rule
+    // everywhere else too:
+    //
+    // - `--nested` has a real human at a real mouse, and the
+    //   `service_consent` override the channel feeds lives on the headless
+    //   backend only. A nested run with the flag would silently ignore it.
+    // - `--consent=auto-approve` raises no prompt at all, so the channel
+    //   would be inert and a gate driving it would go green for the wrong
+    //   reason — the exact vacuity class this whole change exists to remove.
+    #[cfg(feature = "consent-injector")]
+    if consent_injector_fd.is_some() {
+        if !matches!(mode, Some(Mode::Headless)) {
+            return Err(
+                "`--consent-injector-fd` requires `--headless`: the consent channel feeds the \
+                 headless backend's consent round, and a nested session has a real human at a \
+                 real pointer to answer its prompts."
+                    .into(),
+            );
+        }
+        if !matches!(consent, ConsentPolicy::Interactive) {
+            return Err(
+                "`--consent-injector-fd` requires `--consent=interactive`: under auto-approve \
+                 no prompt is ever raised, so the channel would never have anything to answer."
+                    .into(),
+            );
+        }
+    }
+
     // `--help`/`--version` already returned above, so only the run modes
     // remain to resolve; `--size` is meaningless without `--headless`.
     match (mode, size) {
@@ -577,21 +631,36 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             dead_man,
         }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
+        // A headless core has no display to draw the consent prompt on and no
+        // physical input device to answer it, so an interactive petition could
+        // only pend until it timed out — no human could ever say yes. Refuse
+        // at startup rather than run a session whose every petition silently
+        // fails closed. `matches!` rather than `==` so this does not lean on
+        // `ConsentPolicy: PartialEq`.
+        //
+        // # The refusal relaxes on a CONJUNCTION, never on the build alone
+        //
+        // A `consent-injector` build supplies both halves the sentence above
+        // says are missing — but only when `--consent-injector-fd N` is also
+        // passed (issue #138). Without the flag the guard arm below is the
+        // original one, byte for byte, so an instrumented build with no flag
+        // behaves *exactly* like a deployment build. That is the point: a
+        // running process must be identifiable as instrumented by inspecting
+        // how it was **invoked** (`/proc/<pid>/cmdline`), not only by knowing
+        // how it was built.
+        #[cfg(not(feature = "consent-injector"))]
         (Some(Mode::Headless), _) if matches!(consent, ConsentPolicy::Interactive) => {
-            // A headless core has no display to draw the consent prompt on and
-            // no physical input device to answer it, so an interactive petition
-            // could only pend until it timed out — no human could ever say yes.
-            // Refuse at startup rather than run a session whose every petition
-            // silently fails closed. `matches!` rather than `==` so this does
-            // not lean on `ConsentPolicy: PartialEq`.
-            Err(
-                "`--headless` cannot serve `--consent=interactive`: a headless core has no \
-                 display to draw the consent prompt and no physical input device to answer it, \
-                 so every petition would pend until it timed out. Use \
-                 `--consent=auto-approve` for a headless run, or `--nested` to answer prompts \
-                 on screen."
-                    .into(),
-            )
+            Err(HEADLESS_INTERACTIVE_REFUSAL.into())
+        }
+        #[cfg(feature = "consent-injector")]
+        (Some(Mode::Headless), _)
+            if matches!(consent, ConsentPolicy::Interactive) && consent_injector_fd.is_none() =>
+        {
+            Err(format!(
+                "{HEADLESS_INTERACTIVE_REFUSAL} This build carries the `consent-injector` test \
+                 hook and can supply one: pass `--consent-injector-fd N` naming an inherited \
+                 socketpair end."
+            ))
         }
         (Some(Mode::Headless), size) => Ok(Action::RunHeadless {
             size: size.unwrap_or(DEFAULT_HEADLESS_SIZE),
@@ -602,10 +671,48 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             shim,
             capture_dump,
             dead_man,
+            #[cfg(feature = "consent-injector")]
+            consent_injector_fd,
         }),
         (None, Some(_)) => Err("`--size` requires `--headless`".into()),
         (None, None) => Err("no mode given (expected `--nested` or `--headless`)".into()),
     }
+}
+
+/// The `--headless --consent=interactive` refusal, in one place so the
+/// deployment build's message and the instrumented build's extended one
+/// cannot drift in their shared sentence (issue #138). A plain build emits
+/// exactly this and nothing more.
+const HEADLESS_INTERACTIVE_REFUSAL: &str =
+    "`--headless` cannot serve `--consent=interactive`: a headless core has no display to draw \
+     the consent prompt and no physical input device to answer it, so every petition would pend \
+     until it timed out. Use `--consent=auto-approve` for a headless run, or `--nested` to \
+     answer prompts on screen.";
+
+/// Record `--consent-injector-fd N` (issue #138), rejecting a repeat flag, a
+/// non-numeric value, and any descriptor number this process's own stdio
+/// occupies.
+///
+/// The number is only *shape*-checked here; whether it is an open
+/// `AF_UNIX`/`SOCK_STREAM` socket is checked at adoption
+/// (`consent::injector::validate_injector_fd`), which is also a startup
+/// error. Both halves fail closed, and neither is a warning.
+#[cfg(feature = "consent-injector")]
+fn set_injector_fd(slot: &mut Option<std::os::fd::RawFd>, value: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--consent-injector-fd` given more than once".into());
+    }
+    let number: std::os::fd::RawFd = value.parse().map_err(|_| {
+        format!("`--consent-injector-fd` `{value}`: not a descriptor number (e.g. `7`)")
+    })?;
+    if number < 3 {
+        return Err(format!(
+            "`--consent-injector-fd {number}`: 0, 1 and 2 are this process's own standard \
+             descriptors; the channel must be inherited on 3 or above"
+        ));
+    }
+    *slot = Some(number);
+    Ok(())
 }
 
 /// Record a path-valued flag (`--recorder`, `--realm`), rejecting a repeat
@@ -765,6 +872,9 @@ fn main() -> ExitCode {
                 realm,
                 shim,
                 capture_dump,
+                // `--consent-injector-fd` is refused with `--nested` at parse
+                // time (issue #138), so a nested run is never instrumented.
+                false,
                 move |seed| backend::winit::run(dead_man, seed),
             )
         }
@@ -783,8 +893,14 @@ fn main() -> ExitCode {
             // `dead-man-injector` build reads it to name the chord/hold a
             // SIGUSR1-synthesized trigger reports (issue #109).
             dead_man,
+            #[cfg(feature = "consent-injector")]
+            consent_injector_fd,
         } => {
             init_tracing();
+            #[cfg(feature = "consent-injector")]
+            let instrumented = consent_injector_fd.is_some();
+            #[cfg(not(feature = "consent-injector"))]
+            let instrumented = false;
             run_session(
                 consent,
                 principals,
@@ -792,7 +908,16 @@ fn main() -> ExitCode {
                 realm,
                 shim,
                 capture_dump,
-                move |seed| backend::headless::run(size, dead_man, seed),
+                instrumented,
+                move |seed| {
+                    backend::headless::run(
+                        size,
+                        dead_man,
+                        #[cfg(feature = "consent-injector")]
+                        consent_injector_fd,
+                        seed,
+                    )
+                },
             )
         }
     }
@@ -933,6 +1058,30 @@ fn block_loop_signals() -> std::io::Result<()> {
 /// the fallback for a prompt a human never answers. `--headless` has no display
 /// or input device for a prompt and is refused with `--consent=interactive` at
 /// startup (above), so no petition pends unanswerably.
+///
+/// # The instrumented-session marker (issue #138)
+///
+/// `consent_injector` says the invocation carried `--consent-injector-fd`, so
+/// this session's consent prompts can be answered over a socket. It is always
+/// `false` in a build without the `consent-injector` feature, because the
+/// flag has no parse arm there. Two things depend on it, and both are honesty
+/// artifacts rather than behaviour:
+///
+/// - the run's `RunStarted.consent_policy` reads `interactive+consent-injector`
+///   instead of `interactive`. This is load-bearing: an injected decision
+///   *correctly* journals `Issuer::HumanConsent` (it really did traverse
+///   `PetitionRegistry::resolve_human`), so without this marker an
+///   instrumented run's journal would be indistinguishable from a
+///   human-answered one.
+/// - a standing, repeating warning ([`InjectorBanner`]), because a one-line
+///   startup notice scrolls off and a session whose "interactive" consent can
+///   be answered over a socket is not what the word normally promises.
+// Eight parameters, one over clippy's default: the run's five configured
+// paths, the consent policy, the instrumented-session marker (issue #138) and
+// the backend closure. Bundling them into a struct would hide the one thing
+// this signature is good for -- every startup input the session has is named
+// here, in the order `run_session`'s doc comment explains them.
+#[allow(clippy::too_many_arguments)]
 fn run_session<R>(
     consent: ConsentPolicy,
     principals_path: Option<PathBuf>,
@@ -940,6 +1089,7 @@ fn run_session<R>(
     realm_path: Option<PathBuf>,
     shim_path: Option<PathBuf>,
     capture_dump: Option<PathBuf>,
+    consent_injector: bool,
     backend: R,
 ) -> ExitCode
 where
@@ -1032,12 +1182,26 @@ where
         }
     };
     tracing::info!(path = %path.display(), run_id = recorder.run_id(), "flight recorder open");
+    // A build that can answer its own prompts must say so, standing, for as
+    // long as it can — R6's auto-approve lesson applied to the other
+    // direction. Started here rather than earlier so it is beside the policy
+    // it qualifies in the log, and after `block_loop_signals` (which must run
+    // while the process is still single-threaded).
+    #[cfg(feature = "consent-injector")]
+    let _injector_banner =
+        consent_injector.then(|| InjectorBanner::start(INJECTOR_BANNER_INTERVAL));
     recorder.record(Event::RunStarted {
         pid: std::process::id(),
         core_version: env!("CARGO_PKG_VERSION"),
-        consent_policy: match consent {
-            ConsentPolicy::Interactive => "interactive",
-            ConsentPolicy::AutoApprove => "auto-approve",
+        // The instrumented-run marker (issue #138, this function's docs).
+        // Not a new recorder variant: a cfg-gated enum variant would make the
+        // journal's schema build-configuration-dependent, which is a worse
+        // audit surface for a TCB than a distinct string in a field that
+        // already exists.
+        consent_policy: match (consent, consent_injector) {
+            (ConsentPolicy::Interactive, false) => "interactive",
+            (ConsentPolicy::Interactive, true) => "interactive+consent-injector",
+            (ConsentPolicy::AutoApprove, _) => "auto-approve",
         },
     });
 
@@ -1535,6 +1699,94 @@ impl Drop for AutoApproveBanner {
     }
 }
 
+/// How often the `consent-injector` standing warning repeats (issue #138).
+///
+/// The same interval and the same reasoning as
+/// [`AUTO_APPROVE_BANNER_INTERVAL`]: an operator glancing at the log of a
+/// session whose "interactive" consent can be answered over a socket must
+/// meet that fact on any screenful, not only in the first.
+#[cfg(feature = "consent-injector")]
+const INJECTOR_BANNER_INTERVAL: Duration = AUTO_APPROVE_BANNER_INTERVAL;
+
+/// The `consent-injector` session's standing warning (issue #138).
+///
+/// A **second instance** of the repeating-warning shape
+/// [`AutoApproveBanner`] already established, deliberately not a
+/// generalisation of that type: R6's consuming-`self` `stop()` tripwire and
+/// the auto-approve message have to survive byte for byte, and rewriting the
+/// one mechanism in the core that prints a standing security warning is not
+/// something to buy inside a test-hook change. The duplication is ~30 lines
+/// of thread plumbing that never ships in a deployment build at all.
+///
+/// Retired by `Drop` at the end of [`run_session`], which is the whole
+/// session — there is no earlier scope it could be dropped in.
+#[cfg(feature = "consent-injector")]
+struct InjectorBanner {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "consent-injector")]
+impl InjectorBanner {
+    fn start(interval: Duration) -> Self {
+        warn_consent_injector();
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("consent-injector-banner".into())
+            .spawn(move || {
+                let (lock, cvar) = &*worker;
+                let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while !*stopped {
+                    let (guard, _timeout) = cvar
+                        .wait_timeout(stopped, interval)
+                        .unwrap_or_else(|e| e.into_inner());
+                    stopped = guard;
+                    if !*stopped {
+                        warn_consent_injector();
+                    }
+                }
+            })
+            .inspect_err(|err| {
+                tracing::error!(
+                    "the consent injector is WIRED but its repeating warning could not be \
+                     started ({err}); the startup banner is the only warning this run will emit"
+                );
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+#[cfg(feature = "consent-injector")]
+impl Drop for InjectorBanner {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.stop;
+        {
+            let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *stopped = true;
+        }
+        cvar.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The `consent-injector` warning text, in one place so the startup emission
+/// and every repeat are literally the same message.
+#[cfg(feature = "consent-injector")]
+fn warn_consent_injector() {
+    tracing::warn!(
+        "CONSENT INJECTOR IS WIRED (--consent-injector-fd, issue #138): the consent prompts \
+         this session raises can be answered by whoever holds the inherited socketpair end, \
+         and every decision so taken is journalled as `human_consent` because it really does \
+         traverse the human decision path. The run's `run_started.consent_policy` reads \
+         `interactive+consent-injector` so this session's journal cannot be read as a \
+         human-answered one. Integration tests ONLY; never a deployed session."
+    );
+}
+
 /// The auto-approve warning text, in one place so the startup emission and
 /// every repeat are literally the same message.
 fn warn_auto_approve(registry: &Path) {
@@ -1596,7 +1848,9 @@ mod tests {
                 realm: None,
                 shim: None,
                 capture_dump: None,
-                dead_man: DeadManConfig::default()
+                dead_man: DeadManConfig::default(),
+                #[cfg(feature = "consent-injector")]
+                consent_injector_fd: None,
             })
         );
     }
@@ -1616,7 +1870,9 @@ mod tests {
                 realm: None,
                 shim: None,
                 capture_dump: None,
-                dead_man: DeadManConfig::default()
+                dead_man: DeadManConfig::default(),
+                #[cfg(feature = "consent-injector")]
+                consent_injector_fd: None,
             })
         );
         assert_eq!(
@@ -1629,7 +1885,9 @@ mod tests {
                 realm: None,
                 shim: None,
                 capture_dump: None,
-                dead_man: DeadManConfig::default()
+                dead_man: DeadManConfig::default(),
+                #[cfg(feature = "consent-injector")]
+                consent_injector_fd: None,
             })
         );
     }
@@ -1652,7 +1910,9 @@ mod tests {
                     realm: None,
                     shim: None,
                     capture_dump: None,
-                    dead_man: DeadManConfig::default()
+                    dead_man: DeadManConfig::default(),
+                    #[cfg(feature = "consent-injector")]
+                    consent_injector_fd: None,
                 })
             );
         }
@@ -1698,6 +1958,142 @@ mod tests {
         assert!(parse_args(["--nested"]).is_ok());
     }
 
+    /// **A deployment build cannot even name the hook** (issue #138, the
+    /// compile-time half of C2).
+    ///
+    /// `--consent-injector-fd` has no parse arm without the feature, so it
+    /// falls through to the unknown-argument error like any typo. A build
+    /// that cannot name a test hook cannot be tricked into responding to one,
+    /// and this is the assertion that keeps that true.
+    #[cfg(not(feature = "consent-injector"))]
+    #[test]
+    fn a_plain_build_cannot_name_the_consent_injector_flag() {
+        for args in [
+            vec!["--headless", "--consent-injector-fd", "7"],
+            vec!["--headless", "--consent-injector-fd=7"],
+            vec!["--nested", "--consent-injector-fd=7"],
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err(&format!("{args:?} must not parse in a deployment build"));
+            assert!(
+                err.contains("unknown argument") && err.contains("--consent-injector-fd"),
+                "the flag must be an unknown argument, not a recognised-and-ignored one: {err}"
+            );
+        }
+    }
+
+    /// **The startup refusal relaxes on the CONJUNCTION of the feature and
+    /// the flag, never on the build alone** (issue #138, the runtime half of
+    /// C2).
+    ///
+    /// The table below is the whole contract, and both directions matter. Row
+    /// 1 is what the first attempt at this change got wrong: it relaxed on
+    /// the cargo feature alone, so a *running* instrumented core was
+    /// indistinguishable from a deployment one by anything short of knowing
+    /// how it had been built.
+    ///
+    /// Row 2 additionally asserts the surviving policy is `Interactive`, so a
+    /// future "make headless quietly auto-approve instead" fails here rather
+    /// than passing as an equivalent relaxation.
+    #[cfg(feature = "consent-injector")]
+    #[test]
+    fn the_injector_flag_and_the_feature_are_both_required() {
+        // 1. Feature build, NO flag -> still refused, and the message still
+        //    carries the deployment build's sentence verbatim.
+        for args in [
+            vec!["--headless"],
+            vec!["--headless", "--consent", "interactive"],
+            vec!["--headless", "--consent=interactive"],
+            vec!["--headless", "--size", "640x480", "--consent=interactive"],
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err(&format!("{args:?} must still refuse without the flag"));
+            assert!(
+                err.starts_with(HEADLESS_INTERACTIVE_REFUSAL),
+                "the deployment refusal must survive byte-for-byte as this message's prefix: \
+                 {err}"
+            );
+            assert!(
+                err.contains("--consent-injector-fd"),
+                "an instrumented build must say how to supply what it is refusing for: {err}"
+            );
+        }
+
+        // 2. Feature build WITH the flag -> accepted, and the fail-closed
+        //    interactive policy survives into the action.
+        for args in [
+            vec![
+                "--headless",
+                "--consent=interactive",
+                "--consent-injector-fd",
+                "7",
+            ],
+            vec![
+                "--headless",
+                "--consent=interactive",
+                "--consent-injector-fd=7",
+            ],
+            vec!["--headless", "--consent-injector-fd=7"],
+        ] {
+            match parse_args(args.clone()) {
+                Ok(Action::RunHeadless {
+                    consent,
+                    consent_injector_fd,
+                    ..
+                }) => {
+                    assert!(
+                        matches!(consent, ConsentPolicy::Interactive),
+                        "{args:?} must keep the fail-closed interactive policy, not silently \
+                         downgrade to auto-approve"
+                    );
+                    assert_eq!(consent_injector_fd, Some(7));
+                }
+                other => panic!("{args:?} must parse as an instrumented headless run: {other:?}"),
+            }
+        }
+
+        // 3. The two companion refusals, taken at parse time rather than at
+        //    first use -- this parser's rule everywhere else too.
+        let nested = parse_args(["--nested", "--consent-injector-fd=7"])
+            .expect_err("nested has a real human at a real pointer");
+        assert!(nested.contains("--headless"), "{nested}");
+        let auto = parse_args([
+            "--headless",
+            "--consent=auto-approve",
+            "--consent-injector-fd=7",
+        ])
+        .expect_err("auto-approve raises no prompt, so the channel would be inert");
+        assert!(auto.contains("--consent=interactive"), "{auto}");
+
+        // 4. The flag's own shape: a repeat, a non-number, and any descriptor
+        //    number this process's own stdio occupies.
+        for bad in [
+            vec![
+                "--headless",
+                "--consent-injector-fd=7",
+                "--consent-injector-fd=8",
+            ],
+            vec!["--headless", "--consent-injector-fd=seven"],
+            vec!["--headless", "--consent-injector-fd="],
+            vec!["--headless", "--consent-injector-fd=-1"],
+            vec!["--headless", "--consent-injector-fd=0"],
+            vec!["--headless", "--consent-injector-fd=1"],
+            vec!["--headless", "--consent-injector-fd=2"],
+        ] {
+            assert!(
+                parse_args(bad.clone()).is_err(),
+                "{bad:?} must be refused at parse time"
+            );
+        }
+        // ...and the missing-value spelling.
+        assert!(parse_args(["--headless", "--consent-injector-fd"]).is_err());
+
+        // 5. Auto-approve without the flag is still legal, and still not the
+        //    default -- the feature changes nothing about the other policies.
+        assert!(parse_args(["--headless", "--consent=auto-approve"]).is_ok());
+        assert!(parse_args(["--nested"]).is_ok());
+    }
+
     #[test]
     fn recorder_path_parses_both_spellings_and_defaults_to_none() {
         // Omitted, the run uses the default path under the core's runtime
@@ -1713,7 +2109,9 @@ mod tests {
                 realm: None,
                 shim: None,
                 capture_dump: None,
-                dead_man: DeadManConfig::default()
+                dead_man: DeadManConfig::default(),
+                #[cfg(feature = "consent-injector")]
+                consent_injector_fd: None,
             })
         );
         for args in [
@@ -1739,7 +2137,9 @@ mod tests {
                     realm: None,
                     shim: None,
                     capture_dump: None,
-                    dead_man: DeadManConfig::default()
+                    dead_man: DeadManConfig::default(),
+                    #[cfg(feature = "consent-injector")]
+                    consent_injector_fd: None,
                 })
             );
         }
@@ -1790,7 +2190,9 @@ mod tests {
                     realm: Some(PathBuf::from("/etc/vitrin/realm.toml")),
                     shim: None,
                     capture_dump: None,
-                    dead_man: DeadManConfig::default()
+                    dead_man: DeadManConfig::default(),
+                    #[cfg(feature = "consent-injector")]
+                    consent_injector_fd: None,
                 })
             );
         }
@@ -1857,7 +2259,9 @@ mod tests {
                     realm: None,
                     shim: Some(PathBuf::from("/usr/lib/vitrin/vitrin-shim")),
                     capture_dump: None,
-                    dead_man: DeadManConfig::default()
+                    dead_man: DeadManConfig::default(),
+                    #[cfg(feature = "consent-injector")]
+                    consent_injector_fd: None,
                 })
             );
         }
@@ -1917,7 +2321,9 @@ mod tests {
                     realm: None,
                     shim: None,
                     capture_dump: Some(PathBuf::from("/tmp/internal.rgba")),
-                    dead_man: DeadManConfig::default()
+                    dead_man: DeadManConfig::default(),
+                    #[cfg(feature = "consent-injector")]
+                    consent_injector_fd: None,
                 })
             );
         }
@@ -2197,6 +2603,9 @@ mod tests {
             Some(realm.clone()),
             None,
             None,
+            // Not an instrumented run: `--consent-injector-fd` is a headless
+            // flag and this fixture drives `run_session` directly.
+            false,
             |seed| {
                 ran.set(true);
                 (seed.recorder, Ok(()))
@@ -2233,6 +2642,7 @@ mod tests {
             Some(realm),
             None,
             None,
+            false,
             |seed| {
                 ran.set(true);
                 (seed.recorder, Ok(()))
@@ -2409,7 +2819,9 @@ mod tests {
                     realm: None,
                     shim: None,
                     capture_dump: None,
-                    dead_man: DeadManConfig::default()
+                    dead_man: DeadManConfig::default(),
+                    #[cfg(feature = "consent-injector")]
+                    consent_injector_fd: None,
                 })
             );
         }
@@ -2470,7 +2882,9 @@ mod tests {
                 realm: None,
                 shim: None,
                 capture_dump: None,
-                dead_man: DeadManConfig::default()
+                dead_man: DeadManConfig::default(),
+                #[cfg(feature = "consent-injector")]
+                consent_injector_fd: None,
             })
         );
     }

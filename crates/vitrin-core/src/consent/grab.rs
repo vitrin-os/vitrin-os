@@ -637,7 +637,22 @@ impl ConsentGrab {
     /// (drain → `resolve_human` → `deliver` → lower → raise-next) be exercised
     /// end to end over the wire without a display or an input device, which no
     /// runner in CI has.
-    #[cfg(test)]
+    ///
+    /// # Why the `consent-injector` build shares it (issue #138)
+    ///
+    /// The out-of-process gate (`tests/integration/test_real_consent.py`)
+    /// needs the same thing one process boundary further out: a real
+    /// `vitrind` raising a real prompt over a real app, answered by something
+    /// that is not a mouse. Its socket source
+    /// ([`crate::backend::headless`]) lands here and nowhere else, so the
+    /// injected answer is drained, validated and applied by the *production*
+    /// path — [`crate::session::service_consent_round`] →
+    /// [`PetitionRegistry::resolve_human`] — rather than by a second
+    /// decision path of its own. **Enqueuing is deliberately all this does:**
+    /// it confers nothing, decides nothing, and a decision naming a petition
+    /// that has since timed out or been withdrawn is refused `NotPending` at
+    /// the registry exactly as a slow human's click is (see [`Decision`]).
+    #[cfg(any(test, feature = "consent-injector"))]
     pub(crate) fn queue_decision(&mut self, decision: Decision) {
         self.decisions.push_back(decision);
     }

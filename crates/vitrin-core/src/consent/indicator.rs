@@ -131,7 +131,15 @@ impl TrustedIndicator {
 /// read the loop cannot complete) propagates so the caller fails closed rather
 /// than shipping a half-random secret. No flags: the kernel pool is long since
 /// initialized this late in a session's life, so the call does not block.
-fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
+///
+/// `pub(crate)` for one further caller and deliberately not more: the
+/// `consent-injector` build's `super::injector::PromptToken::mint` (issue
+/// #138). Sharing this rather than opening a second entropy path keeps the
+/// core to **one** call-site shape for randomness — this module is the one
+/// that has to be right about it — and the visibility is still narrow in
+/// practice, because `crate::consent::indicator` is a private module and so
+/// unnameable outside the consent tree.
+pub(crate) fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
         // SAFETY: `getrandom` writes at most `buf.len() - filled` bytes into

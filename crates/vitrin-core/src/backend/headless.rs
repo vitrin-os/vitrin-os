@@ -45,10 +45,59 @@
 //! the consent prompt into `vitrin_view.frame_ready` and hand agents the
 //! prompt-watching ability `docs/protocol/05-vitrin_consent.md` forbids.
 //!
+//! # The out-of-process consent injector (issue #138, `consent-injector`)
+//!
+//! A plain headless build hosts no consent prompt at all: it inherits
+//! [`session::RuntimeHost::service_consent`]'s no-op, and `main` refuses
+//! `--headless --consent=interactive` at startup because nothing here could
+//! ever answer a prompt. That refusal is *correct*, and it is also why the
+//! M1.4 consent property had no mock-free gate for so long: the only backend
+//! that can raise a prompt is the one no CI runner can run.
+//!
+//! Under the `consent-injector` cargo feature — never a deployment build,
+//! same posture as `dead-man-injector` — **and only when the invocation also
+//! carries `--consent-injector-fd N`**, this backend gains exactly what the
+//! refusal says it lacks, and nothing else:
+//!
+//! - **A display a harness can see the card in.** Not the whole frame:
+//!   [`HeadlessView::consent_occlusion_window`] exports the consent card's
+//!   own footprint, and nothing else, as a sealed memfd. The trust band, the
+//!   trusted ring and the scrim are never even read back, so the session's
+//!   indicator secret (issue #85) reaches no descriptor and no file in this
+//!   build any more than in a shipping one. [`HeadlessView::latest_output_rgba`]
+//!   stays `#[cfg(test)]`: **no build that ships, and no instrumented build
+//!   either, can obtain a whole human-visible frame.**
+//! - **A way for a human to answer.** An inherited `AF_UNIX`/`SOCK_STREAM`
+//!   socketpair ([`crate::consent::injector`]) on which the peer says
+//!   `decide <token> <button>`; the core deposits one
+//!   [`Decision`](crate::consent::grab::Decision) into the round's
+//!   [`ConsentGrab`](crate::consent::grab::ConsentGrab). That is the *only*
+//!   thing it does: the decision is then drained, validated and applied by
+//!   [`session::service_consent_round`] and
+//!   `PetitionRegistry::resolve_human` — the same two calls a real click on
+//!   the nested backend reaches. There is no second decision path and no
+//!   second authority-checking site; there is one funnel, fed by a socket
+//!   instead of a mouse.
+//!
+//! With no flag there is no grab, no channel and no consent round: "the
+//! injector is absent" is true at runtime, not merely at the parser.
+//!
+//! What this still cannot prove, and only nested mode with a human at a mouse
+//! can, is that a *physical click on the button rectangle* produces the
+//! decision — the hit test, the guard interval, the press-arms/release-commits
+//! ladder and the "an agent may not answer its own prompt" origin check. Those
+//! live in [`crate::consent::grab`]'s own tests and in `shim/docs/firefox.md`'s
+//! §9 nested recipe. The router here still stacks [`NoopHook`]: no input of any
+//! origin reaches this grab's `judge`, because there is no intake to tag one
+//! physical.
+//!
 //! [`view_framebuffer`]: HeadlessView::view_framebuffer
 //! [`output_framebuffer`]: HeadlessView::output_framebuffer
 
 use std::error::Error;
+
+#[cfg(feature = "consent-injector")]
+use std::os::fd::AsFd;
 
 use calloop::signals::{Signal, Signals};
 use calloop::{EventLoop, LoopHandle, LoopSignal};
@@ -110,12 +159,33 @@ fn readback(
     size: Size<i32, Physical>,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
     let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
+    readback_region(renderer, framebuffer, Rectangle::from_size(buffer_size))
+}
+
+/// [`readback`] restricted to `region` — the same copy, the same layout, over
+/// a sub-rectangle instead of the whole image.
+///
+/// Smithay's `PixmanRenderer::copy_framebuffer` allocates a `region.size`
+/// image and composites `Src` from `region.loc`, so bytes outside `region`
+/// are **never read into a buffer at all**. That is not a detail here: it is
+/// what lets the `consent-injector` build's occlusion export
+/// ([`HeadlessView::consent_occlusion_window`], issue #138) claim the
+/// session's trusted indicator was never *read*, rather than the weaker
+/// "was redacted after reading" — the difference between a property and a
+/// redactor that could have a bug in it.
+///
+/// The tight-packing assertion is re-derived from the region rather than the
+/// image, so the invariant travels with the caller's rectangle.
+fn readback_region(
+    renderer: &mut PixmanRenderer,
+    framebuffer: &mut Image<'static, 'static>,
+    region: Rectangle<i32, Buffer>,
+) -> Result<Vec<u8>, Box<dyn Error>> {
     let target = renderer.bind(framebuffer)?;
-    let mapping =
-        renderer.copy_framebuffer(&target, Rectangle::from_size(buffer_size), Fourcc::Abgr8888)?;
+    let mapping = renderer.copy_framebuffer(&target, region, Fourcc::Abgr8888)?;
     let pixels = renderer.map_texture(&mapping)?;
 
-    let expected = size.w as usize * size.h as usize * test_pattern::BYTES_PER_PIXEL;
+    let expected = region.size.w as usize * region.size.h as usize * test_pattern::BYTES_PER_PIXEL;
     assert_eq!(
         pixels.len(),
         expected,
@@ -161,9 +231,20 @@ fn readback(
 /// looks at this beyond naming it in the parameter list. See the
 /// `dead-man-injector` block in `run_inner` and [`crate::deadman`]'s module
 /// docs ("the test injector proves the consequence half").
+///
+/// # Why the two backends' `run` signatures now differ
+///
+/// `consent_injector_fd` exists only on a `consent-injector` build (issue
+/// #138) and only here. `--consent-injector-fd` is refused at *parse* time
+/// with `--nested`, so the nested backend can never receive one: nested has a
+/// real human at a real mouse, and the `service_consent` override the channel
+/// feeds lives on this backend. Threading it as a cfg'd parameter rather than
+/// through [`RuntimeSeed`] is deliberate — the seed is kernel state, not a
+/// test channel.
 pub fn run(
     size: (u32, u32),
     dead_man: DeadManConfig,
+    #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
     seed: RuntimeSeed,
 ) -> (Recorder, Result<(), Box<dyn Error>>) {
     // The seed is consumed the moment the state is built; until then it is
@@ -173,7 +254,14 @@ pub fn run(
     // four-line `match` (the nested backend does exactly the same).
     let mut seed = Some(seed);
     let mut recovered = None;
-    let result = run_inner(size, dead_man, &mut seed, &mut recovered);
+    let result = run_inner(
+        size,
+        dead_man,
+        #[cfg(feature = "consent-injector")]
+        consent_injector_fd,
+        &mut seed,
+        &mut recovered,
+    );
     let recorder = recovered
         .or_else(|| seed.take().map(|seed| seed.recorder))
         .expect("the seed is either still unconsumed or its recorder was recovered");
@@ -184,6 +272,7 @@ fn run_inner(
     size: (u32, u32),
     #[cfg_attr(not(feature = "dead-man-injector"), allow(unused_variables))]
     dead_man: DeadManConfig,
+    #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
     seed: &mut Option<RuntimeSeed>,
     recovered: &mut Option<Recorder>,
 ) -> Result<(), Box<dyn Error>> {
@@ -255,6 +344,19 @@ fn run_inner(
         .as_ref()
         .expect("the seed is present until the state is built")
         .indicator;
+    // The out-of-process consent injector's channel (issue #138), adopted
+    // from the descriptor `--consent-injector-fd` named. Validated as an open
+    // `AF_UNIX`/`SOCK_STREAM` socket at or above fd 3 before anything is read
+    // from it, and a failure is a **startup error** rather than a warning: a
+    // session started with a hook that is not there would look instrumented
+    // from the outside and behave as a plain one, which is the worst of both.
+    #[cfg(feature = "consent-injector")]
+    let injector = match consent_injector_fd {
+        Some(number) => Some(
+            crate::consent::injector::Injector::adopt(number).map_err(Box::<dyn Error>::from)?,
+        ),
+        None => None,
+    };
     let view = HeadlessView::new(physical_size, event_loop.get_signal(), indicator)?;
     let mut state = HeadlessState {
         view,
@@ -267,7 +369,41 @@ fn run_inner(
         ),
         loop_handle: event_loop.handle(),
         fatal: None,
+        // An idle grab: nothing is armed until `service_consent` raises the
+        // first pending petition, and nothing feeds it but the channel above
+        // (module docs — the router stacks `NoopHook`, so no input of any
+        // origin can reach `ConsentGrab::judge` here). With no channel,
+        // `service_consent` returns on its first line and this grab is never
+        // touched at all.
+        #[cfg(feature = "consent-injector")]
+        grab: crate::consent::grab::ConsentGrab::new(),
+        #[cfg(feature = "consent-injector")]
+        injector,
     };
+
+    // Readiness for the injector channel. The `Injector` itself lives in the
+    // state (it is written from `service_consent`, which the state owns), so
+    // the source carries a *duplicate* descriptor used for nothing but
+    // `poll`: `Generic` needs an owned `AsFd`, and the alternative — an
+    // `Rc<RefCell<_>>` around a test hook — would put a cell in the
+    // compositor's dispatch path for the sake of a build that never ships.
+    #[cfg(feature = "consent-injector")]
+    if let Some(injector) = state.injector.as_ref() {
+        let poll_fd = rustix::io::fcntl_dupfd_cloexec(injector.as_fd(), 3)?;
+        loop_handle.insert_source(
+            calloop::generic::Generic::new(poll_fd, calloop::Interest::READ, calloop::Mode::Level),
+            |_readiness, _fd, state: &mut HeadlessState| {
+                // EOF or a protocol violation removes the source; the core
+                // keeps running and every pending petition times out, which
+                // is the fail-closed direction.
+                Ok(if state.service_injector() {
+                    calloop::PostAction::Continue
+                } else {
+                    calloop::PostAction::Remove
+                })
+            },
+        )?;
+    }
 
     // Composite once so the retained images are ready before we start idling
     // (see this function's doc comment for why exactly once).
@@ -336,6 +472,206 @@ pub(crate) struct HeadlessState {
     /// as an error (and `main` as a non-zero exit) instead of masking a
     /// mid-run fatal as a clean shutdown.
     fatal: Option<Box<dyn Error>>,
+    /// The `consent-injector` build's input grab (issue #138, module docs),
+    /// present only when `--consent-injector-fd` wired a channel.
+    ///
+    /// A *fourth* disjoint field, deliberately not folded into `view`: it is
+    /// borrowed at the same time as `runtime` and `view.output.consent` by
+    /// [`session::service_consent_round`], which is exactly the borrow shape
+    /// the nested backend reaches for an `Rc<RefCell<_>>` to satisfy. Here it
+    /// needs no `Rc` at all, because no input hook shares it — headless
+    /// stacks [`NoopHook`], so this grab has exactly one feeder, the channel
+    /// below.
+    #[cfg(feature = "consent-injector")]
+    grab: crate::consent::grab::ConsentGrab,
+    /// The adopted injector channel, or `None` when the run named no
+    /// `--consent-injector-fd` (in which case none of the consent machinery
+    /// above runs at all) or when the peer has gone away.
+    #[cfg(feature = "consent-injector")]
+    injector: Option<crate::consent::injector::Injector>,
+}
+
+/// The `consent-injector` build's channel service (issue #138): read the
+/// peer's requests and hand at most one decision to the grab, exactly where a
+/// click deposits one.
+#[cfg(feature = "consent-injector")]
+impl HeadlessState {
+    /// Drain everything the peer has written. Returns `false` once the
+    /// channel is finished, so the caller removes the calloop source.
+    ///
+    /// **Fail-closed on every ambiguity.** A malformed line queues nothing
+    /// (`decided-ack malformed`) rather than synthesising a `Deny`: a denial
+    /// nobody took would be a lie in the flight recorder, whereas letting the
+    /// petition time out is equally refusing and true. An unknown or spent
+    /// token queues nothing. A button the raised prompt does not offer queues
+    /// nothing. A decision arriving with no card up queues nothing.
+    ///
+    /// Nothing here confers anything: [`ConsentGrab::queue_decision`] is an
+    /// enqueue, and [`session::service_consent_round`] — running at the end of
+    /// this same dispatch, through `post_dispatch` — is what applies it, via
+    /// `PetitionRegistry::resolve_human`. Three further latches stand behind
+    /// the token: `ArmedPrompt::decided`, `ConsentGrab::lower`'s
+    /// decision-dropping, and the registry's `NotPending`.
+    ///
+    /// [`ConsentGrab::queue_decision`]: crate::consent::grab::ConsentGrab::queue_decision
+    fn service_injector(&mut self) -> bool {
+        use crate::consent::injector::{DecideAck, Request};
+
+        let Some(injector) = self.injector.as_mut() else {
+            return false;
+        };
+        let Ok(requests) = injector.poll_requests() else {
+            self.injector = None;
+            return false;
+        };
+        for request in requests {
+            match request {
+                None => {
+                    let injector = self.injector.as_mut().expect("still present in this loop");
+                    tracing::warn!(
+                        "consent-injector: unparseable line; nothing queued (issue #138)"
+                    );
+                    injector.send_line(
+                        &format!("decided-ack {}", DecideAck::Malformed.word()),
+                        None,
+                    );
+                }
+                Some(Request::Describe) => self.answer_describe(),
+                Some(Request::Decide { token, choice }) => self.answer_decide(token, choice),
+            }
+        }
+        true
+    }
+
+    /// Answer `describe`: recomposite, then report the consent surface's
+    /// geometry and — when a card is up — export its footprint.
+    ///
+    /// The recomposite comes first so the exported window is synchronously
+    /// consistent with the core's current prompt state. That removes an
+    /// entire class of harness race (no "poll a file until a header flips")
+    /// at the cost of one extra composite per describe, in a build that never
+    /// ships.
+    fn answer_describe(&mut self) {
+        let (view_w, view_h) = {
+            let size = self.view.output.size;
+            (size.w.max(0) as u32, size.h.max(0) as u32)
+        };
+        if let Err(err) = self.view.redraw() {
+            tracing::error!("consent-injector: describe could not recomposite: {err}");
+        }
+        let card = self.view.output.consent.card_rect(view_w, view_h);
+        let window = self.view.consent_occlusion_window();
+        let token = self
+            .injector
+            .as_ref()
+            .and_then(|inj| inj.live_token())
+            .map(|(_, token)| token.to_hex())
+            .unwrap_or_else(|| "-".into());
+        let (state, cx, cy, cw, ch) = match card {
+            Some((x, y, w, h)) => ("shown", x, y, w, h),
+            None => ("none", 0, 0, 0, 0),
+        };
+        let (wx, wy, ww, wh, bytes) = match &window {
+            Some((rect, pixels)) => (
+                rect.loc.x,
+                rect.loc.y,
+                rect.size.w.max(0) as u32,
+                rect.size.h.max(0) as u32,
+                pixels.len(),
+            ),
+            None => (0, 0, 0, 0, 0),
+        };
+        let line = format!(
+            "prompt {state} {token} {cx} {cy} {cw} {ch} {view_w} {view_h} {band} {wx} {wy} \
+             {ww} {wh} {bytes}",
+            band = crate::consent::TRUST_BAND_HEIGHT,
+        );
+        // Seal the pixels only once, and only if there are any: exactly one
+        // way pixels leave this process (`capture::sealed_frame_memfd`).
+        let sealed = window.as_ref().and_then(|(_, pixels)| {
+            crate::capture::sealed_frame_memfd(pixels)
+                .inspect_err(|err| {
+                    tracing::error!("consent-injector: cannot seal the occlusion window: {err}")
+                })
+                .ok()
+        });
+        let Some(injector) = self.injector.as_mut() else {
+            return;
+        };
+        match &sealed {
+            Some(fd) => injector.send_line(&line, Some(fd.as_fd())),
+            None => injector.send_line(&line, None),
+        }
+    }
+
+    /// Answer `decide <token> <button>`: validate, then enqueue at most one
+    /// decision. See [`Self::service_injector`] for the fail-closed table.
+    fn answer_decide(
+        &mut self,
+        token: crate::consent::injector::PromptToken,
+        choice: crate::consent::Choice,
+    ) {
+        use crate::consent::grab::Decision;
+        use crate::consent::injector::DecideAck;
+
+        let armed = self.injector.as_ref().and_then(|inj| inj.armed_petition());
+        let live = self.injector.as_ref().and_then(|inj| inj.live_token());
+        let ack = match (armed, live) {
+            // No card is up at all: there is nothing to press.
+            (None, _) => DecideAck::NoPrompt,
+            // A card is up but this token does not name it -- wrong, stale,
+            // or already spent by an earlier accepted decision. Distinguished
+            // from `no-prompt` on purpose: answering "no card is up" while one
+            // still is would be a false statement about the screen.
+            (Some(_), None) => DecideAck::UnknownToken,
+            (Some(_), Some((_, live_token))) if live_token != token => DecideAck::UnknownToken,
+            (Some(petition), Some(_)) => {
+                // The armed petition is the authority on what is on screen;
+                // the channel's token is only a name for it. A disagreement
+                // is a race with `retire_stale`, and it fails closed.
+                if self.grab.armed_petition() != Some(petition) {
+                    DecideAck::UnknownToken
+                } else if !self
+                    .view
+                    .output
+                    .consent
+                    .prompt()
+                    .map(|prompt| prompt.choices().contains(&choice))
+                    .unwrap_or(false)
+                {
+                    // A button the card does not draw is not a button a human
+                    // could have pressed, so it is not one this channel may
+                    // synthesise either.
+                    DecideAck::NoSuchButton
+                } else {
+                    let (peer_pid, peer_uid) = self
+                        .injector
+                        .as_ref()
+                        .map(|inj| inj.peer_cred())
+                        .unwrap_or((None, 0));
+                    tracing::warn!(
+                        %petition,
+                        choice = choice.label(),
+                        peer_pid = ?peer_pid,
+                        peer_uid,
+                        "consent-injector: synthesizing a human decision on the raised prompt \
+                         (issue #138; this build path never ships)"
+                    );
+                    self.grab.queue_decision(Decision { petition, choice });
+                    if let Some(inj) = self.injector.as_mut() {
+                        // Spend the token: a replay is `unknown-token`, and a
+                        // decision can never land on a petition that advanced
+                        // underneath it.
+                        inj.spend_token();
+                    }
+                    DecideAck::Queued
+                }
+            }
+        };
+        if let Some(injector) = self.injector.as_mut() {
+            injector.send_line(&format!("decided-ack {}", ack.word()), None);
+        }
+    }
 }
 
 impl session::RuntimeHost for HeadlessState {
@@ -353,6 +689,72 @@ impl session::RuntimeHost for HeadlessState {
     fn stop(&mut self, fatal: Option<Box<dyn Error>>) {
         self.fatal = fatal;
         self.view.loop_signal.stop();
+    }
+
+    /// Drive interactive consent for this dispatch round on a
+    /// `consent-injector` build with a wired channel (issue #138) — the
+    /// *same* orchestration the nested backend runs, called with this
+    /// backend's own disjoint fields instead of an `Rc<RefCell<_>>`.
+    ///
+    /// A plain build has no override here and inherits the trait's no-op,
+    /// which is why `main` may keep refusing `--headless
+    /// --consent=interactive` there: with this method absent, a petition
+    /// really could only pend until it timed out. A feature build with **no**
+    /// `--consent-injector-fd` returns on the first line, so the refusal is
+    /// equally correct there, and equally for the same reason.
+    ///
+    /// `set_view` every round rather than once at startup, matching
+    /// [`ConsentGrab::set_view`]'s contract that the grab's view is the same
+    /// one the router hit-tests in. Nothing hit-tests here (the channel names
+    /// its petition outright), but a grab whose view is a lie is exactly the
+    /// state that makes a *later* wiring of real input land its clicks
+    /// somewhere unintended, and the fix costs two integer copies.
+    ///
+    /// The `raised`/`lowered` edges are emitted from the armed-petition
+    /// transition this call produces, **after** `service_consent_round`
+    /// returns — so a `raised` line the harness can read is a guarantee, in
+    /// the core's own ordering, that `ConsentGrab::raise` has already run
+    /// `mark_prompt_shown` and `consent_held` is therefore already in force
+    /// for that principal. A harness that blocks on the line and then acts
+    /// needs no sleep and can observe no half-raised state.
+    ///
+    /// [`ConsentGrab::set_view`]: crate::consent::grab::ConsentGrab::set_view
+    #[cfg(feature = "consent-injector")]
+    fn service_consent(&mut self, now: std::time::Instant) {
+        if self.injector.is_none() {
+            return;
+        }
+        let size = self.view.output.size;
+        self.grab
+            .set_view((size.w.max(0) as u32, size.h.max(0) as u32));
+        let before = self.grab.armed_petition();
+        // Three disjoint field borrows, which is the whole reason `grab` is a
+        // field of the state rather than of the view: `service_consent_round`
+        // needs the registry and the recorder (inside `runtime`) live at the
+        // same time as the surface it draws on.
+        if session::service_consent_round(
+            &mut self.grab,
+            &mut self.runtime,
+            &mut self.view.output.consent,
+            now,
+        ) {
+            // A card went up or came down: the human-visible framebuffer
+            // changed, so the round must recomposite. Headless owns its frame
+            // clock, so marking dirty is the whole of it -- `post_dispatch`
+            // redraws immediately after this returns.
+            self.runtime.dirty = true;
+        }
+        let after = self.grab.armed_petition();
+        if before != after {
+            if let Some(injector) = self.injector.as_mut() {
+                if let Some(gone) = before {
+                    injector.note_lowered(gone);
+                }
+                if let Some(up) = after {
+                    injector.note_raised(up);
+                }
+            }
+        }
     }
 }
 
@@ -559,6 +961,81 @@ impl HeadlessView {
     fn latest_output_rgba(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
         let out = &mut self.output;
         readback(&mut out.renderer, &mut out.output_framebuffer, out.size)
+    }
+
+    /// The **consent card's own footprint** of the human-visible output, and
+    /// nothing else (`consent-injector`, issue #138).
+    ///
+    /// This is the whole of what an instrumented build can see of the human's
+    /// screen, and the restriction is the point. The exported rectangle is
+    /// byte-identical to `render::rasterize(prompt)` — see
+    /// [`ConsentSurface::card_rect`]'s docs for the ordering argument and the
+    /// in-process test that checks it — so the session's trusted indicator
+    /// (issue #85) is not merely redacted, it is **never read**:
+    /// [`readback_region`] hands smithay a sub-rectangle, and
+    /// `copy_framebuffer` composites only from that rectangle's origin.
+    ///
+    /// # Not parameterised by any caller-supplied rectangle
+    ///
+    /// The peer on the injector channel cannot ask for a region. It gets the
+    /// card or it gets nothing, and which one is decided here, from the
+    /// core's own geometry.
+    ///
+    /// # Four fail-closed guards, all pure geometry, before any readback
+    ///
+    /// A prompt is up; the rect is non-empty; the rect is wholly inside the
+    /// view; and the rect is wholly at `y >= TRUST_BAND_HEIGHT`. Any failure
+    /// exports nothing and logs at `error`, and the gate then fails on a
+    /// zero-byte window. The last guard is the machine-checkable statement of
+    /// "the band was never read", and it is *necessary* rather than
+    /// belt-and-braces: the card's height is content-derived
+    /// (`render::rasterize` sums row heights, and
+    /// `card_height_tracks_its_content` proves a longer principal makes a
+    /// taller card), so a tall card in a short view really can clip into the
+    /// band.
+    ///
+    /// [`ConsentSurface::card_rect`]: crate::consent::ConsentSurface::card_rect
+    #[cfg(feature = "consent-injector")]
+    fn consent_occlusion_window(&mut self) -> Option<(Rectangle<i32, Buffer>, Vec<u8>)> {
+        let size = self.output.size;
+        let (view_w, view_h) = (size.w.max(0) as u32, size.h.max(0) as u32);
+        let (x, y, w, h) = self.output.consent.card_rect(view_w, view_h)?;
+        let band = crate::consent::TRUST_BAND_HEIGHT as i32;
+        if w == 0 || h == 0 {
+            tracing::error!("consent-injector: the card has no area; exporting nothing");
+            return None;
+        }
+        if x < 0 || y < 0 || x + w as i32 > view_w as i32 || y + h as i32 > view_h as i32 {
+            tracing::error!(
+                x,
+                y,
+                w,
+                h,
+                view_w,
+                view_h,
+                "consent-injector: the card does not fit the view; exporting nothing"
+            );
+            return None;
+        }
+        if y < band {
+            tracing::error!(
+                y,
+                band,
+                "consent-injector: the card reaches into the trusted band; exporting nothing \
+                 (the band is painted in this session's secret and must never be read back)"
+            );
+            return None;
+        }
+        let region: Rectangle<i32, Buffer> =
+            Rectangle::new((x, y).into(), (w as i32, h as i32).into());
+        let out = &mut self.output;
+        match readback_region(&mut out.renderer, &mut out.output_framebuffer, region) {
+            Ok(pixels) => Some((region, pixels)),
+            Err(err) => {
+                tracing::error!("consent-injector: occlusion-window readback failed: {err}");
+                None
+            }
+        }
     }
 }
 

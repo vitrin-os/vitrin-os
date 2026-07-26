@@ -114,15 +114,25 @@ how much an agent should trust a synthesized tree.
 The SDK's typed exceptions are correct and useless to a model, which needs to
 be told what to *do*. Each refusal has one right behaviour:
 
-| Refusal | What the agent must be told |
-|---|---|
-| `not_granted` | You do not have this verb. Do not retry; petition for it or stop. |
-| `grant_expired` | Your authority ran out. Petition again if the task still stands. |
-| `revoked` | **A human revoked you. Stop. Do not petition again in this session.** |
-| `preempted` | **A human is using the machine. Yield, back off, do not race.** |
-| `consent_held` | A prompt is up; a human is deciding. Wait, do not act. |
-| `rate_limited` | You are too fast. Wait `retry_after_ms`. |
-| `no_surface` | Nothing to act on yet. Cheap to retry. |
+All **eight** entries of the IDL's `refusal` enum, with the SDK class each maps
+to. The enum is exhaustive and the SDK pins one class per wire value with no
+gaps, so any table that omits one — as an earlier revision of this one did,
+dropping `internal` — will fail a test that checks it against the IDL:
+
+| `refusal` (IDL) | SDK class | What the agent must be told |
+|---|---|---|
+| `not_granted` (0) | `NotGranted` | You do not have this verb. Do not retry; petition for it or stop. |
+| `expired` (1) | `GrantExpired` | Your authority ran out. Petition again if the task still stands. |
+| `revoked` (2) | `Revoked` | **A human revoked you. Stop. Do not petition again in this session.** |
+| `rate_limited` (3) | `RateLimited` | You are too fast. Wait `retry_after_ms`. |
+| `preempted` (4) | `Preempted` | **A human is using the machine. Yield, back off, do not race.** |
+| `consent_held` (5) | `ConsentHeld` | A prompt is up; a human is deciding. Wait, do not act. |
+| `no_surface` (6) | `NoSurface` | Nothing to act on yet. Cheap to retry. |
+| `internal` (7) | `OperationFailed` | The core tried and failed on its own side. Not your fault and not a permission problem; retry once, then report rather than loop. |
+
+Note the wire name is **`expired`**, not `grant_expired` — the SDK class is
+`GrantExpired`, and conflating the two is how the earlier revision of this
+table came to name a code that does not exist.
 
 `revoked` and `preempted` are the ones that matter. An agent that treats them
 as transient is the exact failure this project exists to make impossible — and

@@ -64,7 +64,7 @@ Phase 3 network+X11+fleet, Phase 4 horizon).
 A milestone `M1.2`–`M1.5` (see `docs/plan/01-phase-1-mvp.md` §5, D12) is
 **done only when its named integration-gate issue passes green with no mock
 on any seam that milestone claims**: `M1.2` = #105, `M1.3` = #107, `M1.4` =
-#108 + #109, `M1.5` = #110. `vitrin-mock-shim` and `shim/tests/mock_core.c`
+#108 + #109 + #138, `M1.5` = #110. `vitrin-mock-shim` and `shim/tests/mock_core.c`
 are component/unit-test scaffolds — useful, kept, but **never** the evidence
 source for a milestone's definition of done. Tests that use them are
 component tests, not milestone acceptance; see `tests/integration/README.md`

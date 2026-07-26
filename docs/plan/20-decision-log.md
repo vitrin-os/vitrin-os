@@ -129,3 +129,4 @@ Each row: the PRD §20 question (kept verbatim there; summarized here), the epic
 | Q12 | Egress-designation ergonomics (browser realms) | E2.7 (v0), fleet UX | v0 posture (per-realm template allowlists, no blanket grants) at E2.7; full answer by M3 |
 | Q13 | Human factors of the consent ladder | E2.6 prompts; E3.7 durable rungs | first prompt-design review at E2.6; mandatory re-review before durable rungs ship (E3.7) |
 | Q14 | Trust-root governance (logs, issuers) | E3.7 durable rungs | before any durable grant ships; cross-references governance in WS-C |
+| Q15 | Per-principal cursors + the cursor-visibility relation; absent from the IDL (`cursor` appears 0× in `protocol/vitrin-v0.xml`, and the core records "v0 shares one cursor between origins") | **protocol spec (E1)**; input routing (E2.x); mission-control shell (E3) | **IDL vocabulary — cursor identity, visibility, cursorless — before v0 freezes**; full model by spec 1.0-candidate (M2) |

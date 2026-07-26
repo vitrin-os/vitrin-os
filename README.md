@@ -1,6 +1,13 @@
-# Vitrin OS
+<p align="center">
+  <img src="assets/brand/vitrin-lockup.svg#gh-light-mode-only" alt="Vitrin OS" width="380">
+  <img src="assets/brand/vitrin-lockup-dark.svg#gh-dark-mode-only" alt="Vitrin OS" width="380">
+</p>
 
-[![CI](https://github.com/vitrin-os/vitrin-os/actions/workflows/ci.yml/badge.svg)](https://github.com/vitrin-os/vitrin-os/actions/workflows/ci.yml)
+<p align="center">
+  <a href="https://github.com/vitrin-os/vitrin-os/actions/workflows/ci.yml"><img src="https://github.com/vitrin-os/vitrin-os/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="NOTICE"><img src="https://img.shields.io/badge/license-MPL--2.0%20%2B%20Apache--2.0-4D9DE0" alt="License: see NOTICE"></a>
+  <a href="docs/plan/01-phase-1-mvp.md"><img src="https://img.shields.io/badge/phase%201-complete-4D9DE0" alt="Phase 1 complete"></a>
+</p>
 
 Vitrin OS is an open-source, **agent-first display server**: a small trusted
 core (`vitrind`) speaking a new capability-native wire protocol, with every
@@ -15,6 +22,32 @@ The full vision, object model, and technical architecture live in
 [docs/PRD.md](docs/PRD.md). The wire protocol is specified in
 [protocol/vitrin-v0.xml](protocol/vitrin-v0.xml) with prose in
 [docs/protocol/](docs/protocol/00-conventions.md).
+
+## What it looks like
+
+One sentence, no jargon:
+
+> An agent is allowed to fill in one form, in one Firefox window, for the
+> next five minutes. It cannot see the password manager open beside it. The
+> moment you touch the mouse, you have control back. Hold Escape for a
+> second and its authority is gone — mid-click, mid-keystroke, whatever it
+> was doing.
+
+Every clause there is a mechanism, not a policy setting:
+
+| The claim | What makes it true |
+|---|---|
+| *allowed to fill in one form* | A **grant**: (principal × resource × verbs × constraints). Not a role, not a config flag — a row in the grant table the core checks on every single action. |
+| *for the next five minutes* | Expiry is a constraint **on the grant**, enforced at the chokepoint. There is no path that skips it. |
+| *cannot see the password manager* | The agent's Firefox is in a **realm**, talking to its own private nested shim. The other window is not "hidden" from it; it is not in its universe. Scoping is structural. |
+| *you touch the mouse, you have control* | Physical input is origin-tagged at the core and preempts agent input **by construction**, not by a race between two clients. |
+| *hold Escape and its authority is gone* | The **dead-man switch**: the core revokes every live grant, and the agent's next call fails `revoked`. Proven against a real app in `test_real_deadman.py`. |
+
+The prompt that asks you to approve any of this is drawn by the trusted core
+itself — the thing that owns the screen — so no client can paint a fake one
+over it. That property has its own gate (`test_real_consent.py`): the prompt
+is shown to occlude the app's real pixels while the agent's own capture path
+sees the app unchanged.
 
 ## Why
 
@@ -56,13 +89,20 @@ the pillar-by-pillar requirements.
 
 ## Status
 
-**Late Phase 1 — the MVP slice runs end to end, honesty gaps documented
-below.** All nine epics (E1–E9) have landed code on `main`; the remaining
-open work is soak/hardening (fuzzing, an advisory conformance subset,
-nested-mode performance, [dmabuf](https://docs.kernel.org/driver-api/dma-buf.html) zero-copy) and the docs pass this file is
-part of. See the [issue tracker](https://github.com/vitrin-os/vitrin-os/issues)
-for the exact open set — every remaining Phase-1 issue is linked from its
-epic (`#8` SDK, `#9` CI/docs).
+**Phase 1 is complete.** All nine epics (E1–E9) have landed on `main`, and
+every milestone's named acceptance gate is closed under the rule this
+project holds itself to — decision **D12**: *a milestone closes only when a
+named integration test passes green against the shipped binaries with no
+mock on any seam it claims.* Component tests built on
+[`vitrin-mock-shim`](crates/vitrin-mock-shim) are never that evidence, and
+are labelled as what they are.
+
+| Milestone | Gate | Proven by |
+|---|---|---|
+| **M1.2** — buffer path | [#105](https://github.com/vitrin-os/vitrin-os/issues/105) | `tests/integration/test_real_app.py` — real core + real shim + real `weston-terminal` |
+| **M1.3** — observation | [#107](https://github.com/vitrin-os/vitrin-os/issues/107) | `test_real_capture_fidelity.py` — an agent observes a real app through the enforcement chokepoint |
+| **M1.4** — actuation, consent, dead-man | [#108](https://github.com/vitrin-os/vitrin-os/issues/108) + [#109](https://github.com/vitrin-os/vitrin-os/issues/109) + [#138](https://github.com/vitrin-os/vitrin-os/issues/138) | `test_real_actuation.py`, `test_real_deadman.py`, `test_real_consent.py` |
+| **M1.5** — demo | [#110](https://github.com/vitrin-os/vitrin-os/issues/110) | `test_demo.py` — the demo agent against a real app, asserting the typed text actually landed |
 
 What exists today, on `main`:
 
@@ -84,7 +124,12 @@ What exists today, on `main`:
   revocable); the realm/spawn manager (fork/exec the shim with a private
   runtime dir and a scrubbed, allow-listed environment); the core-rendered
   consent prompt with an exclusive input grab; the hold-Esc dead-man
-  revocation switch; and the flight-recorder log. See the
+  revocation switch; the
+  [dmabuf](https://docs.kernel.org/driver-api/dma-buf.html) import path
+  ([`dmabuf.rs`](crates/vitrin-core/src/dmabuf.rs) — zero-copy shim→core
+  frames on a real GPU, with shm as the universal fallback and an explicit
+  `buffer_done(import_failed)` event rather than a silent black frame, so CI
+  stays GPU-free); and the flight-recorder log. See the
   [Architecture at a glance](#architecture-at-a-glance) section and
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full crate↔PRD map.
 - **The Wayland shim** ([`shim/`](shim/README.md)) — a [wlroots](https://gitlab.freedesktop.org/wlroots/wlroots) headless
@@ -107,56 +152,43 @@ What exists today, on `main`:
   drives the real core against real apps (`weston-terminal`, GTK, Firefox
   ESR) with a hard 10-minute budget.
 
-Known, tracked gaps as of this writing (each has an open issue; none are
-silently swallowed):
+### What Phase 1 does *not* give you
 
-- **M1.4's consent half has no integration gate.**
-  [#109](https://github.com/vitrin-os/vitrin-os/issues/109) is two halves;
-  the hold-Esc half is `tests/integration/test_real_deadman.py`, and the
-  consent-occlusion half is **not** covered by any test in that directory —
-  `test_real_deadman.py` never raises a prompt. The property is proven by an
-  in-process Rust test against the real C shim and a real `click-target`
-  (`crates/vitrin-core/src/backend/headless.rs`), which is real evidence but
-  is not a gate against the shipped binary, so it does not close the
-  milestone under D12. See `tests/integration/README.md`'s "M1.4's open
-  consent gap" for what closing it takes.
-- **The M1.5 demo gate only just became able to fail on actuation.**
-  `cargo xtask demo` drives the real wlroots shim in both venues as of
-  [#127](https://github.com/vitrin-os/vitrin-os/pull/127) —
-  [`vitrin-mock-shim`](crates/vitrin-mock-shim) remains in the tree as a
-  unit-test fixture only, and appears in no demo venue — and
-  `tests/integration/test_demo.py` is the named, mock-free M1.5 gate. But
-  until the change that added `run_demo._settle`, that gate asked only for
-  24 changed pixels between its two captures, which weston-terminal's own
-  startup paint clears unaided: it could pass with the agent's click and
-  typed text reaching nothing. It now settles the app, watches it idle for
-  at least as long as it later polls, and demands a change shaped like a
-  typed line — enough changed pixels *and* a densely inked run of them along
-  one scanline. (The first version of that shape check was itself wrong in
-  the same family: it measured the changed pixels' bounding span while
-  claiming to measure a run, so three unrelated one-cell repaints at
-  opposite ends of a scanline satisfied it. Fixed in the same pass, with the
-  rejected frame pair pinned as an in-process test.) Read green runs from
-  before these changes as "the demo completed against a real app", not as
-  "the actuation landed".
-- **No sandbox (decision D9).** No namespaces, [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html), or [Landlock](https://landlock.io/) yet —
-  see [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine)
-  below.
-- **dmabuf zero-copy is not wired at runtime** (both backends pass
-  `importer: None`); frames move as shm copies. Real-GPU zero-copy import is
-  [#117](https://github.com/vitrin-os/vitrin-os/issues/117).
-- **Fuzzing is wired but not soaked; the wlcs subset is still open.**
-  `fuzz/` ships two cargo-fuzz targets (protocol decode, `vitrin-ipc`
-  framing) with a checked-in seed corpus that CI replays on every PR, plus a
-  short per-PR burst
-  ([#46](https://github.com/vitrin-os/vitrin-os/issues/46)). The 24-hour
-  clean run M1.5 exit asks for is still a manual, documented procedure, not
-  a scheduled job — see [fuzz/README.md](fuzz/README.md). The advisory wlcs
-  conformance subset ([#47](https://github.com/vitrin-os/vitrin-os/issues/47))
-  is open. Neither blocks running the demo above.
-- **No published demo screencast yet** — see
-  [docs/demo/README.md](docs/demo/README.md) for the recording plan and why
-  it isn't in this PR.
+Phase 1 being complete is a statement about a defined slice, not about
+readiness for anything real. Read this list before the pitch above
+convinces you of more than it should.
+
+- **No sandbox (decision D9, closes in Phase 2).** No namespaces, no
+  [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html), no
+  [Landlock](https://landlock.io/). A realm's app runs as the core's own uid
+  with the core's full view of the filesystem and network, and the session
+  D-Bus remains reachable. Environment hygiene confines the well-behaved; it
+  does not contain the hostile. This is the big one — see
+  [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine).
+- **The 24-hour fuzz soak has not been run.** `fuzz/` ships two cargo-fuzz
+  targets (protocol decode, `vitrin-ipc` framing) with a checked-in corpus
+  CI replays on every PR plus a short per-PR burst, but the 24-hour clean
+  run the plan asks for is still a manual, documented procedure rather than
+  a scheduled job — [fuzz/README.md](fuzz/README.md) says so in its own
+  words. Nobody has run it end to end.
+- **wlcs conformance is advisory and mostly red:** `total=180 passed=3
+  failed=145 skipped=32` on the 2026-07-25 run. That number is expected and
+  is not a bug count — [wlcs](https://github.com/canonical/wlcs) tests a
+  general-purpose desktop compositor, and the shim deliberately serves a
+  narrow surface (no touch, no full `xdg-shell` policy, no decoration
+  protocols), so most failures are "no such global" rather than misbehaviour.
+  It is still the honest number, it has **not** been re-measured since, and
+  `shim/wlcs/README.md` distinguishes the structural absences from the
+  genuine ones. Never built by default; never gates a PR.
+- **One maintainer.** Governance is a documented BDFL
+  ([plan §5](docs/plan/12-workstream-community.md)); bus factor is tracked
+  as a first-class project risk, not waved away.
+- **v0 protocol, and it will break.** The IDL is frozen for Phase 1, not
+  forever — Phase 2 adds semantic trees and epoch/CAS action semantics, and
+  v0 clients should expect to move.
+
+Nothing above is discovered-by-a-reader; each is a decision with a recorded
+rationale in [docs/plan/20-decision-log.md](docs/plan/20-decision-log.md).
 
 ## Quickstart
 
@@ -401,11 +433,11 @@ Condensed from [docs/PRD.md](docs/PRD.md) §8:
 
 - **Phase 0 — Spec & manifesto.** Vision, object model, wire-protocol draft
   (the PRD in this repo).
-- **Phase 1 — MVP slice** *(current)*. Trusted core (headless + nested), one
+- **Phase 1 — MVP slice** *(complete)*. Trusted core (headless + nested), one
   wlroots Wayland shim, Firefox in a realm, and an agent that captures the
   realm and injects scoped input — gated by a single grant with consent
   rendered by the core.
-- **Phase 2 — Semantic + epochs.** [AccessKit](https://accesskit.dev/)/AT-SPI2 bridge, versioned and
+- **Phase 2 — Semantic + epochs** *(next)*. [AccessKit](https://accesskit.dev/)/AT-SPI2 bridge, versioned and
   diffable semantic trees, epoch/CAS action semantics, VLM fallback for
   treeless surfaces, native semantic demo app, filesystem powerbox v0,
   network authority v0 (per-realm loopback-only netns, egress as a grant).

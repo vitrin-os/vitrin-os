@@ -54,9 +54,14 @@ moving frames and input across the trust boundary.
   nothing more. The **human principal has no wire presence in version 0**;
   host input in nested mode is the implicit human, and only agents handshake.
 - **Realm** — an addressing scope. Grants attach to realms and apps launch
-  into realms. Version 0 serves exactly one well-known realm, `realm-0`. A
-  realm handle is deliberately authority-free: it answers "which realm are you
-  asking about," and holding one only lets the principal petition.
+  into realms. Version 1 serves exactly one well-known realm, `realm-0`;
+  version 2 serves `realm-0` plus however many further realms the deployment
+  configured, up to a limit of its own choosing, and keeps `realm-0`
+  **mandatory** so a version-1 client's `get_realm("realm-0")` never breaks.
+  The further names are not enumerable on the wire at either version (see
+  §1.4's deferrals). A realm handle is deliberately authority-free: it answers
+  "which realm are you asking about," and holding one only lets the principal
+  petition.
 - **Grant** — the wire projection of one grant-table row
   (principal × resource × verbs × constraints). A grant is born **pending**
   and confers nothing; **exactly one** `resolved` event decides its fate. A
@@ -851,15 +856,21 @@ named here so their absence is understood as a decision, not an omission:
   are clamped, and stale-observation detection is a later phase's epoch
   mechanism.
 - **Network** — the protocol is local (Unix domain sockets); no remoting.
-- **Multi-realm** — exactly one well-known realm (`realm-0`); realm enumeration
-  and lifecycle are later phases. Version 2 puts realm *creation* on the wire
-  as the `realm_launch` verb and the [`vitrin_launcher`](16-vitrin_launcher.md)
-  facet, but **serves neither yet**: the verb is admitted and refused
+- **Multi-realm** — version 1 serves exactly one well-known realm (`realm-0`).
+  Version 2 raises the *count*: a deployment may serve `realm-0` plus further
+  realms up to a limit of its own choosing (see
+  [`vitrin_realm`](03-vitrin_realm.md#realm-cardinality-one-at-version-1-a-bounded-set-at-version-2)).
+  What stays deferred is everything *around* that count. **Realm enumeration
+  and lifecycle events** are absent at any verb set, so the further names are
+  undiscoverable on the wire and `realm-0` remains the one name a conformant
+  client can know without being told. Realm *creation* is on the wire as the
+  `realm_launch` verb and the [`vitrin_launcher`](16-vitrin_launcher.md)
+  facet, but **no deployment serves it yet**: the verb is admitted and refused
   `unsupported`, exactly as `observe_cursor` and the layout verbs are. What is
   decided now, and would otherwise be unstateable, is the *shape* — launch is
   an attenuable grant verb rather than a request on the realm handle, and the
-  program name is never on the wire. Enumeration, lifecycle events, and
-  stopping a realm remain absent at any verb set.
+  program name is never on the wire. **Stopping** a realm is not expressible at
+  all.
 - **Powerbox** — no system-mediated resource picker; petitions name resources
   by a type-prefixed string vocabulary.
 - **Wallet** — no credential/secret storage or presentation verb.

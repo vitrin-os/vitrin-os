@@ -1264,7 +1264,7 @@ static inline vitrin_decode_status_t vitrin_handshake_evt_done_decode(
 typedef struct {
     /* the new realm address handle (new_id: vitrin_realm) */
     uint32_t realm;
-    /* well-known realm name (max 64 bytes) */
+    /* realm name (max 64 bytes); "realm-0" is the well-known one */
     vitrin_string_t name;
 } vitrin_principal_req_get_realm_t;
 

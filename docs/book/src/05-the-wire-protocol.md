@@ -82,7 +82,7 @@ authentication, because the core created both ends itself.
 |---|---|
 | `vitrin_handshake` | Version + identity hello, resolving to a bound principal |
 | `vitrin_principal` | The authenticated principal — root of the connection's authority chain |
-| `vitrin_realm` | Realm address; an authority-free scope handle (v0 serves the well-known `realm-0`) |
+| `vitrin_realm` | Realm address; an authority-free scope handle (`realm-0` is the well-known realm and is always served; a deployment may configure more) |
 | `vitrin_grant` | Capability handle — the wire projection of one grant-table row |
 | `vitrin_consent` | Consent-prompt visibility for one petition (events only, no authority) |
 | `vitrin_view` | Observation facet — poll-model frame capture |

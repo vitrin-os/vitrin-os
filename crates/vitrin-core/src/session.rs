@@ -105,7 +105,7 @@ use crate::capture::RealmViewFrame;
 use crate::consent::grab::ConsentGrab;
 use crate::consent::ConsentSurface;
 use crate::dmabuf::DmabufImporter;
-use crate::grants::GrantTable;
+use crate::grants::{GrantTable, RealmId};
 use crate::identity::StaticVerifier;
 use crate::input::{InputRouter, PhysicalPresence, PreemptionHook, SeatInput};
 use crate::lifecycle::{
@@ -192,10 +192,11 @@ pub(crate) struct RuntimeSeed {
 /// Everything one running session owns that is not presentation, living in
 /// the backend's calloop state type.
 ///
-/// Generic over the preemption hook so the realm's input router is the
+/// Generic over the preemption hook so the session's input router is the
 /// backend's own router — the one the consent grab and the dead-man watcher
 /// are already stacked into — rather than a second router the two could drift
-/// apart from.
+/// apart from. One router serves however many realms the session holds; see
+/// [`seat_target`] for which of them a delivery reaches.
 pub(crate) struct Runtime<H: PreemptionHook> {
     /// The capability kernel's long-lived state. Grouped in its own struct so
     /// a [`ServerCtx`] can be built from one disjoint field borrow while the
@@ -207,14 +208,25 @@ pub(crate) struct Runtime<H: PreemptionHook> {
     /// minted at accept — which is also how a deferred [`Resolution`] finds
     /// its way back to the connection that petitioned.
     conns: BTreeMap<ConnectionId, PrincipalConn>,
-    /// The realm's shim session, once [`start_realm_in`] has forked one.
+    /// **The live shim sessions**, keyed by the realm id the wire names —
+    /// one entry per realm [`start_realm_in`] has forked (WS-E.1.2, issue
+    /// #208; this was a bare `Option<RealmRuntime>` while a session held
+    /// exactly one realm).
     ///
-    /// `None` until then, and the ordering behind that is the module's
+    /// Distinct from [`Kernel::realms`], and the two answer different
+    /// questions: the *registry* answers "does this realm exist, and does it
+    /// admit petitions" and holds every configured realm from load to the
+    /// end of the session; this map answers "is there a shim session for it
+    /// right now" and holds only realms that were forked and have not been
+    /// torn down. An `Exited` realm is in the registry and, after
+    /// [`shutdown_realm`], not here.
+    ///
+    /// Empty until the fork, and the ordering behind that is the module's
     /// central invariant rather than an initialization detail: [`install`]
-    /// must have registered the shim socketpair's source *before* the fork,
+    /// must have registered each shim socketpair's source *before* its fork,
     /// because a shim whose connection nothing services blocks on `configure`
     /// forever. Spawning first and wiring after is a permanent, silent hang.
-    pub realm: Option<RealmRuntime>,
+    pub realms: BTreeMap<RealmId, RealmRuntime>,
     /// The realm's input router: chokepoint-admitted agent actuations and
     /// (nested) physical input converge here before delivery to the shim.
     pub router: InputRouter<H>,
@@ -304,7 +316,7 @@ struct PrincipalConn {
 /// merely asked an external frame clock to do so later.
 ///
 /// This distinction exists because the two backends own their cadence
-/// differently, and the realm's `frame_done` must follow the *composite*
+/// differently, and every realm's `frame_done` must follow the *composite*
 /// rather than the request for one. Headless composites synchronously — the
 /// completed composite is the output cadence. Nested hands the request to
 /// the host compositor and is told later, via `WinitEvent::Redraw`.
@@ -325,10 +337,14 @@ pub(crate) enum Presentation {
 }
 
 pub(crate) trait Presenter {
-    /// The realm's scene — what [`ShimServer::handle_message`] commits into.
+    /// The session's one scene — what [`ShimServer::handle_message`] commits
+    /// into, for **every** realm: it holds at most one committed surface, so
+    /// the last realm to commit is the one composited (WS-E.1.3 binds an
+    /// output to a realm).
     fn scene(&mut self) -> &mut Scene;
     /// The size the realm view composes at: the virtual output for headless,
-    /// the host window for nested. The input router maps view coordinates to
+    /// the host window for nested. One output, so one size, handed to every
+    /// realm's shim at `configure`. The input router maps view coordinates to
     /// surface coordinates against it.
     fn view_size(&self) -> (u32, u32);
     /// Recomposite. Called at most once per dispatch round, from
@@ -533,7 +549,7 @@ impl<H: PreemptionHook> Runtime<H> {
             },
             listener: Some(listener),
             conns: BTreeMap::new(),
-            realm: None,
+            realms: BTreeMap::new(),
             router,
             shim,
             dirty: false,
@@ -699,8 +715,8 @@ where
     Ok(())
 }
 
-/// **Spawn the session's realm and put it on the loop.** The other half of
-/// the runtime wiring: before this, a running `vitrind` forked nothing and
+/// **Spawn every configured realm and put each on the loop.** The other half
+/// of the runtime wiring: before this, a running `vitrind` forked nothing and
 /// the whole shim half of the core was reachable only from tests.
 ///
 /// Call this **after** [`install`] and **before** `event_loop.run`. The
@@ -729,14 +745,16 @@ where
 ///    correct on the error paths above, fatal on this one.
 /// 4. `RealmLifecycle::adopt` places the connection into a
 ///    [`ConnectionSource`] and keeps the registration as its [`Hangup`], so
-///    the ladder's first rung really does hang up.
+///    the ladder's first rung really does hang up. The realm's id is carried
+///    **into the source's callback**, which is how [`dispatch_shim`] knows
+///    whose message it is handling once more than one shim is attached.
 /// 5. `mark_running` moves the realm out of `Configured`. Easy to forget and
 ///    **silent** if forgotten — `Configured` still admits petitions, so
 ///    nothing fails; the only symptom is a wrong `RealmState` in the flight
 ///    recorder.
 pub(crate) fn start_realm<H: RuntimeHost>(host: &mut H) -> Result<(), Box<dyn Error>> {
     // The shim binary is a core input (`--shim`), carried in the runtime; the
-    // app it will exec is the realm's `command`. Clone it out before the
+    // app it will exec is each realm's `command`. Clone it out before the
     // `start_realm_in` borrow, which takes `host` again.
     let shim = host.runtime().shim.clone();
     start_realm_in(host, &SpawnPaths::from_env(shim)?)
@@ -748,34 +766,136 @@ pub(crate) fn start_realm<H: RuntimeHost>(host: &mut H) -> Result<(), Box<dyn Er
 /// of every helper: a spawn that reads `$XDG_RUNTIME_DIR` at the moment it
 /// forks cannot be tested against a scratch tree without mutating the
 /// process environment, and this crate's tests run in one process.
+///
+/// # One failure stops the session, deliberately — and takes its siblings
+/// # with it
+///
+/// Any realm that fails to spawn aborts the whole startup. The alternative
+/// — come up with the realms that worked — would hand the operator a
+/// session that is silently missing an app, and the audit posture this core
+/// takes at load time (`realm.toml` refuses rather than defaults) says the
+/// opposite. It does mean one mistyped `command` in the twelfth table stops
+/// the desktop coming up at all; that is the cost, and it is the same one
+/// `RealmRegistry::load` already imposes.
+///
+/// **The realms already forked are torn down here, before the error is
+/// returned.** Not left to the caller: neither backend reaches its
+/// [`shutdown_realm`] on this path — both `return Err(err)` the moment
+/// startup fails, because the loop they would otherwise have run has not
+/// started. Without the teardown, a failure on realm 3 of 5 leaves realms 1
+/// and 2 running: two shim processes with their apps, two runtime trees and
+/// two held `flock`s, outliving the core that forked them and owning
+/// directories the next core will find locked. A caller that *does* reach
+/// its own `shutdown_realm` sees an empty map and does nothing, so the
+/// teardown is idempotent rather than duplicated.
+///
+/// One residual, stated rather than implied — and enumerated by *failure
+/// site*, because "post-spawn" is more than one place and an enumeration
+/// that presents itself as complete had better be:
+///
+/// - **Inside `spawn_realm`.** The realm that failed cleans up its own
+///   spawn: `RuntimeDirGuard` removes the tree, `GuardedChild` kills and
+///   reaps the child. Nothing is left.
+/// - **After the spawn committed** — every later step in
+///   [`start_one_realm_in`]: the `configure` write
+///   (`SpawnedRealm::start_shim_session`), and the connection-placement
+///   sequence that follows it (`into_parts` → [`RealmLifecycle::adopt`] →
+///   `ConnectionSource::with_outbox` → `insert_source`). All of them kill
+///   and reap the child and release the `flock`, and all of them leave
+///   **that one realm's runtime directory** for the next run's stale-tree
+///   purge. The first does it through `SpawnedRealm`'s drop; the second
+///   does it because `adopt` kills and reaps on its own refusal path
+///   (`into_parts` has disarmed `GuardedChild` by then, and a bare `Child`
+///   drops without waiting — so the guarantee is written there rather than
+///   inherited).
+/// - **After the realm is in the map.** Nothing here can fail: the insert
+///   and `mark_running` are infallible, and a registry that does not know
+///   the realm logs rather than returns.
+///
+/// So the leftover is exactly one directory per realm that got as far as
+/// forking and no further — never a process, never a lock, never a
+/// half-registered event source.
 pub(crate) fn start_realm_in<H: RuntimeHost>(
     host: &mut H,
     paths: &SpawnPaths,
 ) -> Result<(), Box<dyn Error>> {
+    // NOT per-realm, and the one claim this loop's predecessor got wrong:
+    // the view size is the *output's*, shared by every realm, because the
+    // scene composites one surface for one output. Binding an output to a
+    // realm is WS-E.1.3; until it lands, every shim is configured with the
+    // same geometry and only the last committer is visible.
     let (width, height) = {
         let (_, view) = host.split();
         view.view_size()
     };
 
-    let (mut spawned, realm_id) = {
+    // Collected before the loop: `spawn_realm` needs `&Realm` out of the
+    // registry while the body below takes `host` mutably again, and the
+    // registry itself is written by `mark_running` on the way out.
+    let configured: Vec<RealmId> = host
+        .runtime()
+        .kernel
+        .realms
+        .iter()
+        .map(|realm| realm.id().clone())
+        .collect();
+    if configured.is_empty() {
+        return Err("no realm is configured for this session".into());
+    }
+
+    for realm_id in configured {
+        if let Err(err) = start_one_realm_in(host, paths, &realm_id, width, height) {
+            // Blocking, and safe to be: the event loop has not started (this
+            // runs between `install` and `event_loop.run`), so there is no
+            // dispatch to stall — and rung 0 still needs the loop *handle*,
+            // which is alive in the backend's scope either way.
+            tracing::error!(
+                realm = %realm_id,
+                %err,
+                "a realm failed to start; tearing down the realms already forked"
+            );
+            shutdown_realm(host);
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// One realm's whole spawn-and-attach sequence — the body [`start_realm_in`]
+/// runs per configured realm.
+///
+/// Every step below really was already per-realm, which is the half of
+/// `realm.rs`'s "a deletion rather than a re-plumbing" claim that held: the
+/// spawn derives its runtime directory, `flock` and socket from the realm id
+/// (`vitrin_ipc::paths`), the lifecycle owns exactly one realm's resources,
+/// and the registry's transition takes the id. What did *not* hold was where
+/// the result is stored — see [`Runtime::realms`].
+fn start_one_realm_in<H: RuntimeHost>(
+    host: &mut H,
+    paths: &SpawnPaths,
+    realm_id: &RealmId,
+    width: u32,
+    height: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mut spawned = {
         let runtime = host.runtime();
         // Disjoint field borrows: `spawn_realm` reads the realm and writes
         // the log, and both live in `Kernel`.
         let Kernel {
             realms, recorder, ..
         } = &mut runtime.kernel;
-        // Phase 1 serves exactly one realm (`RealmRegistry::load` enforces
-        // it), so "the configured realm" is unambiguous. When that stops
-        // being true this becomes a loop, and nothing else here changes:
-        // every piece of state below is already per-realm.
         let realm = realms
-            .iter()
-            .next()
-            .ok_or("no realm is configured for this session")?;
-        let spawned = spawn::spawn_realm(realm, paths, recorder)?;
-        let realm_id = spawned.realm_id().clone();
-        (spawned, realm_id)
+            .get(realm_id.as_str())
+            .ok_or_else(|| format!("realm {realm_id} vanished from the registry mid-startup"))?;
+        spawn::spawn_realm(realm, paths, recorder)?
     };
+    // Read back rather than assumed: this is the id the spawn actually
+    // derived every path it owns from — the realm's runtime directory, its
+    // `flock`, its private `wayland-0` — and the one `configure` carries to
+    // the shim. Keying the runtime map on the lookup id while the
+    // filesystem used another would be invisible until a teardown went
+    // looking for the wrong tree.
+    let realm_id = &spawned.realm_id().clone();
     let pid = spawned.pid();
 
     // Step 2: `configure` on the still-blocking fd, before calloop owns it.
@@ -787,10 +907,15 @@ pub(crate) fn start_realm_in<H: RuntimeHost>(
     // release it again, so there is no window in which the lifecycle holds a
     // realm it cannot hang up on.
     let mut registered = None;
+    let dispatched_realm = realm_id.clone();
     let life = RealmLifecycle::adopt(parts, |connection| {
         let (source, outbox) = ConnectionSource::with_outbox(connection)?;
-        let token = handle.insert_source(source, |event, conn, host: &mut H| {
-            dispatch_shim(host, event, conn)
+        // The realm id rides in the callback's captured state: a
+        // `ConnectionSource` carries no metadata of its own, and without
+        // this `dispatch_shim` would have to guess which of N attached
+        // shims it is servicing — which, with one realm, it never had to.
+        let token = handle.insert_source(source, move |event, conn, host: &mut H| {
+            dispatch_shim(host, &dispatched_realm, event, conn)
         })?;
         registered = Some(outbox);
         let releaser = handle.clone();
@@ -799,12 +924,15 @@ pub(crate) fn start_realm_in<H: RuntimeHost>(
     let outbox = registered.expect("adopt runs `place` exactly once on the success path");
 
     let runtime = host.runtime();
-    runtime.realm = Some(RealmRuntime {
-        life,
-        server: Some(server),
-        outbox,
-    });
-    if !runtime.kernel.realms.mark_running(&realm_id, pid) {
+    runtime.realms.insert(
+        realm_id.clone(),
+        RealmRuntime {
+            life,
+            server: Some(server),
+            outbox,
+        },
+    );
+    if !runtime.kernel.realms.mark_running(realm_id, pid) {
         // A realm the registry does not know is a wiring bug rather than a
         // runtime condition, and it is invisible without this: `Configured`
         // admits petitions exactly as `Running` does, so the session would
@@ -823,42 +951,73 @@ pub(crate) fn start_realm_in<H: RuntimeHost>(
     Ok(())
 }
 
-/// A `SIGCHLD` arrived: poll the realm for an exit.
+/// A `SIGCHLD` arrived: poll **every** live realm for an exit.
 ///
 /// Speculative and cheap by design — `SIGCHLD` says only that *some* child
 /// changed state, so the reaper asks `waitpid` rather than guessing. A realm
 /// already reaped answers immediately.
+///
+/// **Every realm, not the first one that answers.** With one realm a single
+/// `waitpid` was complete; with N it is not, and stopping early is a silent
+/// failure rather than a loud one: the unpolled realm leaves a zombie and
+/// the registry goes on calling it `Running`, so petitions for a dead realm
+/// keep resolving and the only trace is the absent `realm_exited` entry in
+/// the journal. Signals also coalesce — one `SIGCHLD` may stand for several
+/// children — so "one signal, one reap" was never a safe reading even
+/// before this.
 pub(crate) fn reap_realm<H: RuntimeHost>(host: &mut H) {
-    with_realm_teardown(host, |life, teardown| {
-        life.poll_exit(teardown);
-    });
+    for realm_id in live_realm_ids(host) {
+        with_realm_teardown(host, &realm_id, |life, teardown| {
+            life.poll_exit(teardown);
+        });
+    }
 }
 
-/// Tear the realm down on the way out of the session: the shutdown ladder,
-/// then the realm's runtime tree.
+/// Tear every realm down on the way out of the session: the shutdown ladder
+/// per realm, then each realm's runtime tree.
 ///
 /// **Blocks**, deliberately, which is why it must run after `event_loop.run`
 /// has returned and never from inside a dispatch: the ladder waits out a
 /// hangup grace period and then a `SIGTERM` grace period, and doing that
 /// inside a live compositor loop would stall every other peer. It must also
-/// run before the recorder is handed back, so the realm's `realm_died` and
+/// run before the recorder is handed back, so each realm's `realm_died` and
 /// `realm_exited` entries land in the run they belong to.
+///
+/// The ladders run in id order, one after another, so the worst-case exit
+/// time is N realms' grace periods rather than one. Running them
+/// concurrently would mean interleaving blocking waits on a single-threaded
+/// core, and the grace periods only elapse in full for a shim that ignores
+/// both EOF and `SIGTERM` — which is a defect, not the ordinary path.
 pub(crate) fn shutdown_realm<H: RuntimeHost>(host: &mut H) {
-    let rung = with_realm_teardown(host, |life, teardown| {
-        let rung = life.shutdown(ShutdownTiming::default(), teardown);
-        (life.realm_id().clone(), life.pid(), rung)
-    });
-    if let Some((realm, pid, rung)) = rung {
-        tracing::info!(%realm, pid, ?rung, "realm torn down");
+    for realm_id in live_realm_ids(host) {
+        let rung = with_realm_teardown(host, &realm_id, |life, teardown| {
+            let rung = life.shutdown(ShutdownTiming::default(), teardown);
+            (life.pid(), rung)
+        });
+        if let Some((pid, rung)) = rung {
+            tracing::info!(realm = %realm_id, pid, ?rung, "realm torn down");
+        }
     }
-    // Dropped only now: the lifecycle holds the realm `flock`, and releasing
-    // it before the runtime tree is gone would let a second core call a tree
-    // stale while this one is still taking it apart.
-    host.runtime().realm = None;
+    // Dropped only now: each lifecycle holds its realm's `flock`, and
+    // releasing one before its runtime tree is gone would let a second core
+    // call that tree stale while this one is still taking it apart.
+    host.runtime().realms.clear();
 }
 
-/// Run `f` against the realm's lifecycle with a [`RealmTeardown`] built from
-/// the whole session — the one borrow shape every death path needs.
+/// Every realm with a live shim session, in id order.
+///
+/// Materialized into a `Vec` because every caller then takes `host` mutably
+/// per realm — [`with_realm_teardown`] borrows the whole session — so
+/// iterating the map in place would alias it. Id order rather than insertion
+/// order so a shutdown, a reap and a log read the same way twice.
+fn live_realm_ids<H: RuntimeHost>(host: &mut H) -> Vec<RealmId> {
+    host.runtime().realms.keys().cloned().collect()
+}
+
+/// Run `f` against **this realm's** lifecycle with a [`RealmTeardown`] built
+/// from the whole session — the one borrow shape every death path needs.
+/// `None` when the realm has no live shim session (never forked, or already
+/// torn down).
 ///
 /// Every field comes from a distinct place (the presenter's scene, retained
 /// image and dmabuf importer, the realm's shim server, the runtime's router,
@@ -868,19 +1027,36 @@ pub(crate) fn shutdown_realm<H: RuntimeHost>(host: &mut H) {
 /// there is no GPU renderer to have imported anything, so every
 /// `kind=dmabuf` commit already resolved as the designed `import_failed` shm
 /// fallback and there is no zero-copy content to drop.
+///
+/// **The `scene` and `retained` halves are still session-wide**, because
+/// there is one output and one scene: a realm's death therefore clears
+/// whatever surface the scene holds, even if a sibling put it there. That
+/// direction is fail-closed — the survivors' captures refuse `no_surface`
+/// until they commit again, rather than serving a dead realm's pixels — and
+/// it is a consequence of the scene not yet being bound to a realm
+/// (WS-E.1.3), not of the teardown funnel.
+///
+/// The `router` half, by contrast, **is** scoped: it is one router, but its
+/// per-shim-generation state belongs to one realm at a time, and
+/// [`crate::input::InputRouter::reset_for`] clears it only for the realm
+/// that owns it. Clearing it unconditionally is not the same benign
+/// direction as clearing the scene: it forgets a *surviving* app's held
+/// keys, whose releases are then dropped as unpaired and latch down for
+/// good.
 fn with_realm_teardown<H: RuntimeHost, T>(
     host: &mut H,
+    realm_id: &RealmId,
     f: impl FnOnce(&mut RealmLifecycle, &mut RealmTeardown<'_, '_, H::Hook>) -> T,
 ) -> Option<T> {
     let (runtime, view) = host.split();
     view.teardown_view(move |scene, retained, importer| {
         let Runtime {
             kernel,
-            realm,
+            realms,
             router,
             ..
         } = runtime;
-        let realm = realm.as_mut()?;
+        let realm = realms.get_mut(realm_id)?;
         let mut teardown = RealmTeardown {
             scene,
             shim: &mut realm.server,
@@ -1242,35 +1418,60 @@ fn dispatch_principal<H: RuntimeHost>(
                     kernel,
                     conns,
                     view_cache,
-                    realm,
+                    realms,
                     ..
                 } = runtime;
                 // **The single fact behind every `no_surface` refusal.**
                 // `RealmLifecycle::view_is_live` is that fact and this is
-                // the one place the runtime derives `ServerCtx::realm_view`
-                // from it — deliberately not `scene().surface_size()`,
-                // which is only *half* of it: a realm can be dead with its
-                // scene not yet recomposited, and asking the scene would
-                // then photograph a corpse. No realm at all is likewise not
+                // the one place the runtime derives it — deliberately not
+                // `scene().surface_size()`, which is only *half* of it: a
+                // realm can be dead with its scene not yet recomposited,
+                // and asking the scene would then photograph a corpse. A
+                // realm the runtime has no shim session for is likewise not
                 // live.
+                //
+                // **Asked per realm, never "is any realm live".** With one
+                // realm those were the same question; with several they are
+                // not, and `any` is fail-**open** across realms — realm A's
+                // grant would clear the gate because sibling B is alive, and
+                // then capture the scene B committed into. So the answer is
+                // a *function of the realm id*, and
+                // `PrincipalServer::serve_facet_use` applies it to the realm
+                // the grant row names.
+                //
+                // What is still session-wide is the frame itself: one scene,
+                // one committed surface, one view cache, so a live realm's
+                // capture can carry a live *sibling's* pixels while both are
+                // running. That is the scene's single-surface model, owned by
+                // WS-E.1.3 and published as a limit
+                // (`docs/book/src/limits.md`). A **dead** realm's grant is
+                // not part of that exposure and never was meant to be: it
+                // refuses `no_surface` here.
                 //
                 // The cache itself is refreshed at redraw time, never here,
                 // so capture stays a pure read of the last completed frame.
-                let live = realm
-                    .as_ref()
-                    .is_some_and(|realm| realm.life.view_is_live(view.scene()));
+                let scene = &*view.scene();
+                let realm_is_live = |realm_id: &RealmId| {
+                    realms
+                        .get(realm_id)
+                        .is_some_and(|realm| realm.life.view_is_live(scene))
+                };
+                // **The write-side half of the same question** ([`route_seat`]
+                // is where an admitted actuation actually goes). Resolved here
+                // for the same reason the frame is: only the embedder knows
+                // it, and the chokepoint must be handed the *comparison*, not
+                // the machinery. `seat_target` is asked once per dispatch turn
+                // because it is one answer for the whole session — unlike
+                // liveness, which is a question per realm.
+                let seat_target_realm = seat_target(realms).map(|(realm_id, _)| realm_id);
                 let Some(state) = conns.get_mut(&id) else {
                     return;
                 };
-                let realm_view =
-                    view_cache
-                        .as_deref()
-                        .filter(|_| live)
-                        .map(|rgba| RealmViewFrame {
-                            rgba,
-                            width,
-                            height,
-                        });
+                let realm_view = view_cache.as_deref().map(|rgba| RealmViewFrame {
+                    rgba,
+                    width,
+                    height,
+                });
                 let mut actuations = |input: SeatInput| seat.push(input);
                 let mut ctx = ServerCtx {
                     verifier: &kernel.verifier,
@@ -1279,6 +1480,8 @@ fn dispatch_principal<H: RuntimeHost>(
                     grants: &mut kernel.grants,
                     now,
                     realm_view,
+                    realm_is_live: &realm_is_live,
+                    seat_target_realm,
                     presence: &kernel.presence,
                     actuations: &mut actuations,
                     recorder: &mut kernel.recorder,
@@ -1326,8 +1529,52 @@ fn dispatch_principal<H: RuntimeHost>(
     }
 }
 
-/// Route chokepoint-admitted actuations through the realm's router toward the
-/// shim's seat.
+/// **The realm every seat delivery goes to.** The first still-serving realm
+/// in id order — and a **placeholder rather than a routing policy**.
+///
+/// Addressing seat events to a realm is two questions no delivery site is
+/// allowed to answer on its own — which realm a grant's actuation targets,
+/// and which realm physical input follows — and both are WS-E.1.6's,
+/// alongside the per-realm [`PhysicalPresence`] the preemption judgement
+/// reads. Until then there is one router and one shared scene, so "the
+/// realm" is as meaningful as it was when there was only one; naming the
+/// choice in **one** function is what stops it being mistaken for a
+/// decision, and what keeps the agent path ([`route_seat`]), the physical
+/// path (`backend::winit::route_physical_inputs`) and the router's
+/// generation binding from disagreeing about the target. The eventual
+/// policy replaces this body and nothing else.
+///
+/// "Still serving" rather than plain "first": a dead realm keeps its map
+/// entry until shutdown (the registry and the runtime both outlive the
+/// process), so skipping to the first realm that still holds a
+/// [`ShimServer`] is what keeps one realm's death from silently swallowing
+/// every actuation aimed at the session.
+///
+/// # An agent never crosses realms on this placeholder
+///
+/// Being a placeholder is survivable for *physical* input, which no grant
+/// addresses: a human types into whatever this names, and mis-aiming it is
+/// a usability bug. It is **not** survivable for an agent's actuation,
+/// which is authorized against a named realm — delivering it here when the
+/// grant names another realm would actuate an app the grant confers no
+/// authority over, which is an authority bug and a write.
+///
+/// So the actuation path does not reach this function trusting it: the
+/// chokepoint compares this target with the grant's own realm
+/// ([`enforcement::UseEnv::seat_reaches_grant_realm`], fed from
+/// [`dispatch_principal`]) and **refuses** `internal` when they differ, so
+/// nothing crosses. That guard and this placeholder are removed together
+/// by WS-E.1.6 (issue #212), which routes per realm instead.
+///
+/// [`enforcement::UseEnv::seat_reaches_grant_realm`]: crate::enforcement::UseEnv::seat_reaches_grant_realm
+pub(crate) fn seat_target(
+    realms: &BTreeMap<RealmId, RealmRuntime>,
+) -> Option<(&RealmId, &RealmRuntime)> {
+    realms.iter().find(|(_, realm)| realm.server.is_some())
+}
+
+/// Route chokepoint-admitted actuations through the session's router toward
+/// the target realm's shim seat.
 ///
 /// The router is the same one the backend's physical input flows through, so
 /// implicit grabs and pointer state are shared between an agent's actuations
@@ -1341,6 +1588,18 @@ fn dispatch_principal<H: RuntimeHost>(
 /// investigable after an incident if the flight recorder wrote it down.
 /// Shape only — the kind and the tag, never coordinates, keysym, or typed
 /// bytes — so the audit entry can never become a keylogger.
+///
+/// # Which realm, with more than one attached
+///
+/// Whichever [`seat_target`] names — the first still-serving realm in id
+/// order, a **placeholder rather than a routing policy** (see that
+/// function).
+///
+/// This function is therefore reached only by actuations whose grant names
+/// **that** realm: the chokepoint refuses the rest before they become
+/// `SeatInput`s at all (`enforcement`, step 5d). Nothing here re-checks it,
+/// and nothing here should — a delivery site that made its own authority
+/// judgement would be the second enforcement site this crate does not have.
 fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
     if seat.is_empty() {
         return;
@@ -1350,16 +1609,22 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
     let surface = view.scene().surface_size();
     let Runtime {
         router,
-        realm,
+        realms,
         kernel,
         ..
     } = runtime;
-    let Some(realm) = realm.as_mut() else {
+    let Some((realm_id, realm)) = seat_target(realms) else {
         return;
     };
     let Some(server) = realm.server.as_ref() else {
         return;
     };
+    // Before the first `route`: the router's pairing table and implicit
+    // grab are a record of what *this realm's app* was told, so the realm
+    // has to be on record before anything is added to them. It is what
+    // makes a sibling realm's death leave this state alone
+    // ([`crate::input::InputRouter::reset_for`]).
+    router.bind_to(realm_id);
     let outbox = &realm.outbox;
     for input in seat {
         let Some(delivery) = router.route(input, view_size, surface) else {
@@ -1372,7 +1637,7 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
             // audited as delivered). One funnel with the physical path.
             Ok(sent) => {
                 if sent {
-                    crate::input::record_seat_delivery(&mut kernel.recorder, &delivery);
+                    crate::input::record_seat_delivery(&mut kernel.recorder, realm_id, &delivery);
                 }
             }
             Err(err) => {
@@ -1380,24 +1645,32 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
                 // transport's own slow-reader policy kills the connection on
                 // the next dispatch, through the one funnel that classifies
                 // deaths.
-                tracing::warn!(%err, "seat delivery to the realm failed");
+                tracing::warn!(realm = %realm_id, %err, "seat delivery to the realm failed");
                 break;
             }
         }
     }
 }
 
-/// Dispatch one event from the realm's shim connection.
+/// Dispatch one event from **this realm's** shim connection.
+///
+/// `realm_id` is not derivable from anything else here: a
+/// `ConnectionSource` hands the callback its event and the connection, and
+/// nothing that identifies the peer. It is carried in the closure the
+/// source was registered with ([`start_one_realm_in`]), which is the whole
+/// of "carry a RealmId in the callback data" — and the seam that did not
+/// exist while a session held exactly one shim.
 fn dispatch_shim<H: RuntimeHost>(
     host: &mut H,
+    realm_id: &RealmId,
     event: ConnectionEvent,
     conn: &mut calloop::generic::NoIoDrop<Connection>,
 ) {
     match event {
         ConnectionEvent::Message(msg) => {
             let (runtime, view) = host.split();
-            let Runtime { realm, dirty, .. } = runtime;
-            let Some(realm) = realm.as_mut() else {
+            let Runtime { realms, dirty, .. } = runtime;
+            let Some(realm) = realms.get_mut(realm_id) else {
                 return;
             };
             let Some(server) = realm.server.as_mut() else {
@@ -1433,18 +1706,18 @@ fn dispatch_shim<H: RuntimeHost>(
                     // The core is closing, not the transport: the source is
                     // still registered, and the `Hangup` the lifecycle holds
                     // is what retires it.
-                    close_realm(host, DeathCause::of_shim_fault(fault));
+                    close_realm(host, realm_id, DeathCause::of_shim_fault(fault));
                 }
             }
         }
         ConnectionEvent::Disconnected => {
-            tracing::info!("shim connection closed");
-            close_realm(host, DeathCause::ConnectionClosed);
+            tracing::info!(realm = %realm_id, "shim connection closed");
+            close_realm(host, realm_id, DeathCause::ConnectionClosed);
         }
         ConnectionEvent::Fault(reason) => {
-            tracing::warn!(%reason, "shim connection terminated");
+            tracing::warn!(realm = %realm_id, %reason, "shim connection terminated");
             // The transport's classification, not a second opinion of it.
-            close_realm(host, DeathCause::from(&reason));
+            close_realm(host, realm_id, DeathCause::from(&reason));
         }
     }
 }
@@ -1468,8 +1741,8 @@ fn dispatch_shim<H: RuntimeHost>(
 /// those. It would also be a *second* death path beside the latched one,
 /// which is how a realm ends up dead in one place and alive in the one still
 /// serving frames.
-fn close_realm<H: RuntimeHost>(host: &mut H, cause: DeathCause) {
-    with_realm_teardown(host, |life, teardown| {
+fn close_realm<H: RuntimeHost>(host: &mut H, realm_id: &RealmId, cause: DeathCause) {
+    with_realm_teardown(host, realm_id, |life, teardown| {
         life.note_connection_closed(cause, teardown);
     });
     // Recomposite without the dead realm's surface. The scene is already
@@ -1502,7 +1775,7 @@ fn close_realm<H: RuntimeHost>(host: &mut H, cause: DeathCause) {
 /// readback, and one [`ShimServer::presented`] — which still emits one
 /// `frame_done` per commit, in commit order, so the shim's pacing sees the
 /// true output cadence and only the *composites* are coalesced.
-/// Discharge the realm's owed frame callbacks against a composite that has
+/// Discharge every realm's owed frame callbacks against a composite that has
 /// **actually happened**.
 ///
 /// Two callers, one per frame-clock posture, and the split is the whole
@@ -1520,22 +1793,30 @@ fn close_realm<H: RuntimeHost>(host: &mut H, cause: DeathCause) {
 /// commit gets the callback it is owed. Coalescing the composites is the
 /// anti-amplification defense; coalescing the *callbacks* would break pacing,
 /// which is why `ShimServer::presented` batches rather than collapses.
+///
+/// **Every attached realm is paid, not the first.** One composite discharges
+/// whatever each realm is owed: a realm skipped here is a shim that paces on
+/// `frame_done` and never hears one, which is a permanent stall of that app
+/// with nothing in the log to say so.
 pub(crate) fn emit_presented<H: PreemptionHook>(runtime: &mut Runtime<H>) {
-    let Runtime { realm, epoch, .. } = runtime;
-    let Some(realm) = realm.as_mut() else {
-        return;
-    };
-    let Some(server) = realm.server.as_mut() else {
-        return;
-    };
-    if !server.wants_presentation() {
-        return;
-    }
+    let Runtime { realms, epoch, .. } = runtime;
     let time_ms = epoch.elapsed().as_millis() as u32;
-    let outbox = &realm.outbox;
-    let mut send = |frame: &[u8]| outbox.send(frame);
-    if let Err(err) = server.presented(time_ms, &mut send) {
-        tracing::warn!(%err, "frame_done delivery to the realm failed");
+    for (realm_id, realm) in realms.iter_mut() {
+        let Some(server) = realm.server.as_mut() else {
+            continue;
+        };
+        if !server.wants_presentation() {
+            continue;
+        }
+        let outbox = &realm.outbox;
+        let mut send = |frame: &[u8]| outbox.send(frame);
+        if let Err(err) = server.presented(time_ms, &mut send) {
+            // One realm's dead socket must not cost the others their
+            // callbacks: the transport's own slow-reader policy kills that
+            // connection on its next dispatch, through the one funnel that
+            // classifies deaths.
+            tracing::warn!(realm = %realm_id, %err, "frame_done delivery to the realm failed");
+        }
     }
 }
 
@@ -1889,16 +2170,61 @@ mod tests {
         /// (issue #103). The point is that the test drives the production spawn
         /// path rather than a hand-assembled `RealmRuntime`.
         fn start_realm(&mut self, args: &[&str]) {
+            self.start_realms(&[(crate::realm::WELL_KNOWN_REALM_ID, args)]);
+        }
+
+        /// The same, for **N** realms in one session (WS-E.1.2): each id
+        /// gets its own mock shim with its own fixture flags, and one
+        /// `start_realm_in` forks them all — the production loop, not N
+        /// calls to a single-realm path.
+        fn start_realms(&mut self, realms: &[(&str, &[&str])]) {
             let mock = crate::spawn::tests::mock_shim_bin();
-            self.host.runtime.kernel.realms =
-                crate::realm::tests::registry_of(vec![crate::realm::tests::realm_with_spawn(
-                    crate::realm::WELL_KNOWN_REALM_ID,
-                    &mock,
-                    &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-                    &[],
-                )]);
+            let spec: Vec<(&str, PathBuf, &[&str])> = realms
+                .iter()
+                .map(|(id, args)| (*id, mock.clone(), *args))
+                .collect();
+            self.configure_realms(&spec);
+            self.spawn_configured()
+                .expect("every realm must spawn and attach");
+        }
+
+        /// Put exactly these realms in the registry, each with its **own**
+        /// program — the seam [`Self::start_realms`] does not need and the
+        /// partial-startup test does: a realm whose `command` does not
+        /// resolve is refused by `spawn_realm`'s program audit, which is how
+        /// a mid-loop spawn failure is produced deterministically rather
+        /// than by racing something.
+        fn configure_realms(&mut self, realms: &[(&str, PathBuf, &[&str])]) {
+            self.host.runtime.kernel.realms = crate::realm::tests::registry_of(
+                realms
+                    .iter()
+                    .map(|(id, command, args)| {
+                        crate::realm::tests::realm_with_spawn(
+                            id,
+                            command,
+                            &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                            &[],
+                        )
+                    })
+                    .collect(),
+            );
+        }
+
+        /// Run the production startup loop against this rig's scratch tree.
+        fn spawn_configured(&mut self) -> Result<(), Box<dyn Error>> {
+            let mock = crate::spawn::tests::mock_shim_bin();
             start_realm_in(&mut self.host, &SpawnPaths::under(&self.dir, &mock))
-                .expect("the realm must spawn and attach");
+        }
+
+        /// This rig's live shim session for `id`, or panic naming it —
+        /// the successor of `runtime.realm.as_ref().expect(..)`, which
+        /// could only ever mean one realm.
+        fn realm(&self, id: &str) -> &RealmRuntime {
+            self.host
+                .runtime
+                .realms
+                .get(&RealmId::new(id))
+                .unwrap_or_else(|| panic!("realm {id} is attached"))
         }
 
         /// Drive the real loop for `budget`, exactly as `run` does — every
@@ -2168,14 +2494,7 @@ mod tests {
             },
         );
         rig.start_realm(&["--serve", "--animate", "100000"]);
-        let shim = rig
-            .host
-            .runtime
-            .realm
-            .as_ref()
-            .expect("the realm is attached")
-            .life
-            .pid();
+        let shim = rig.realm(crate::realm::WELL_KNOWN_REALM_ID).life.pid();
         let realm_dir = rig
             .dir
             .join("vitrin-0")
@@ -2286,14 +2605,7 @@ mod tests {
         );
         rig.start_realm(&["--serve", "--animate", &FRAMES.to_string()]);
 
-        let pid = rig
-            .host
-            .runtime
-            .realm
-            .as_ref()
-            .expect("the realm is attached")
-            .life
-            .pid();
+        let pid = rig.realm(crate::realm::WELL_KNOWN_REALM_ID).life.pid();
 
         // Every frame the shim was asked for must come back as a composite.
         // It paces on `frame_done`, so it cannot start frame N+1 until the
@@ -2347,6 +2659,446 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Multi-realm (WS-E.1.2, issue #208)
+    // ------------------------------------------------------------------
+
+    /// **Three configured realms become three forked shims, three runtime
+    /// trees and three private sockets** — the paths half of `realm.rs`'s
+    /// "a deletion rather than a re-plumbing" claim, which really was a
+    /// deletion: `vitrin_ipc::paths` derives every path from the realm id,
+    /// so N realms are N trees with no new path code.
+    ///
+    /// Driven through [`start_realm_in`]'s own loop, so what is asserted is
+    /// the production spawn path with more than one realm in the registry
+    /// rather than three calls to a single-realm path.
+    #[test]
+    fn three_configured_realms_spawn_three_shims_with_three_private_trees() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "multi-spawn",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let serve: &[&str] = &["--serve", "--animate", "100000"];
+        rig.start_realms(&[("realm-0", serve), ("editor", serve), ("browser", serve)]);
+
+        // Three live shim sessions, three distinct pids, three distinct ids.
+        let ids: Vec<String> = rig
+            .host
+            .runtime
+            .realms
+            .keys()
+            .map(|id| id.as_str().to_string())
+            .collect();
+        assert_eq!(ids, ["browser", "editor", "realm-0"]);
+        let pids: std::collections::BTreeSet<u32> = ["realm-0", "editor", "browser"]
+            .iter()
+            .map(|id| rig.realm(id).life.pid())
+            .collect();
+        assert_eq!(pids.len(), 3, "three realms must be three processes");
+        for pid in &pids {
+            assert!(process_is_alive(*pid), "every spawned shim must be alive");
+        }
+
+        // Three distinct `$XDG_RUNTIME_DIR/vitrin-0/<id>/` trees, and three
+        // distinct `wayland-0` paths injected as each shim's own
+        // `WAYLAND_DISPLAY`.
+        //
+        // **What the per-realm socket buys is addressing, not
+        // confinement.** Every realm's shim and app run with the core's own
+        // uid and the core's whole filesystem view (D9, no sandbox:
+        // `docs/book/src/limits.md`), so an app that ignores
+        // `WAYLAND_DISPLAY` and opens a sibling realm's `wayland-0` by a
+        // path it guessed is stopped by nothing here — and this change made
+        // that worse by multiplying the number of such paths. What the
+        // separate address *does* guarantee is that a well-behaved client
+        // reaches its own shim, and that a shim's Wayland universe contains
+        // only its own app: there is nothing to enumerate over the protocol.
+        // Structural scoping is that; it is not filesystem isolation, and
+        // this test asserts only the former.
+        //
+        // Asserted from `/proc/<pid>/environ` rather than from the string
+        // the core would have built, because the claim is about what the
+        // child actually got. The socket *file* is bound by the shim, and
+        // `vitrin-mock-shim` binds none — that half belongs to the C shim
+        // and to `tests/integration/test_real_app.py`; what the core owns is
+        // the per-realm tree and the per-realm address, and that is what
+        // this asserts.
+        let mut sockets = std::collections::BTreeSet::new();
+        for id in ["realm-0", "editor", "browser"] {
+            let dir = rig.dir.join("vitrin-0").join(id);
+            assert!(dir.is_dir(), "{id} must have its own runtime tree");
+            assert_eq!(
+                rig.realm(id).life.runtime_dir(),
+                dir,
+                "{id}'s lifecycle must own the tree its id names"
+            );
+            let env = environ_of(rig.realm(id).life.pid());
+            let display = env
+                .iter()
+                .find_map(|kv| kv.strip_prefix("WAYLAND_DISPLAY="))
+                .unwrap_or_else(|| panic!("{id}'s shim must be handed a WAYLAND_DISPLAY"));
+            assert_eq!(
+                std::path::Path::new(display),
+                dir.join("wayland-0"),
+                "{id} must be pointed at its own socket, not a shared one"
+            );
+            sockets.insert(display.to_string());
+        }
+        assert_eq!(sockets.len(), 3, "the sockets must not be shared");
+
+        // Every realm is journalled as spawned, with its own id.
+        shutdown_realm(&mut rig.host);
+        let entries = rig.entries();
+        let spawned: std::collections::BTreeSet<String> =
+            crate::recorder::tests::of_kind(&entries, "realm_spawned")
+                .iter()
+                .map(|e| e.str("realm").to_string())
+                .collect();
+        assert_eq!(
+            spawned,
+            ["browser", "editor", "realm-0"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "each realm must produce its own realm_spawned record"
+        );
+        // ...and the shutdown ladder ran once per realm, not once.
+        for pid in &pids {
+            assert!(
+                !process_is_alive(*pid),
+                "the shutdown ladder must leave no shim behind, in any realm"
+            );
+        }
+    }
+
+    /// **A realm that fails to spawn takes the already-forked ones with
+    /// it** (WS-E.1.2 review, HIGH 3).
+    ///
+    /// Startup is a loop now, so it has a partial state that a single spawn
+    /// never had: realms 1..k running when realm k+1 fails. Neither backend
+    /// reaches its own `shutdown_realm` from there — both `return Err(err)`
+    /// before the event loop starts — so if [`start_realm_in`] does not tear
+    /// down what it started, the failure leaves shim processes, runtime
+    /// trees and held `flock`s outliving the core that forked them, and the
+    /// next core finds those directories locked by nobody.
+    ///
+    /// The failure is produced by a `command` that does not resolve, which
+    /// `spawn_realm`'s program audit refuses before it creates anything —
+    /// deterministic, and it leaves the *failing* realm with nothing of its
+    /// own to clean up, so what the assertions below see is exactly the
+    /// sibling teardown.
+    #[test]
+    fn a_realm_that_fails_to_spawn_tears_down_the_realms_already_forked() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "partial-start",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let mock = crate::spawn::tests::mock_shim_bin();
+        let missing = rig.dir.join("no-such-program");
+        assert!(!missing.exists());
+        // Id order is spawn order (`BTreeMap`), so "aaa" and "bbb" fork and
+        // attach before "zzz" is refused.
+        let serve: &[&str] = &["--serve", "--animate", "100000"];
+        rig.configure_realms(&[
+            ("aaa", mock.clone(), serve),
+            ("bbb", mock.clone(), serve),
+            ("zzz", missing.clone(), &[]),
+        ]);
+
+        let err = rig
+            .spawn_configured()
+            .expect_err("a realm whose command does not resolve must abort startup")
+            .to_string();
+        assert!(
+            err.contains("no-such-program"),
+            "the error must name the program that could not be spawned: {err}"
+        );
+
+        // Two realms really were forked -- otherwise this test would pass
+        // vacuously on a loop that never got that far.
+        let entries = rig.entries();
+        let spawned = crate::recorder::tests::of_kind(&entries, "realm_spawned");
+        let pids: Vec<(String, u32)> = spawned
+            .iter()
+            .map(|e| (e.str("realm").to_string(), e.u64("pid") as u32))
+            .collect();
+        assert_eq!(
+            pids.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["aaa", "bbb"],
+            "the two realms before the failure must have been forked"
+        );
+
+        // ...and none of them is still running, still holding a tree, or
+        // still in the runtime map.
+        for (id, pid) in &pids {
+            assert!(
+                !process_is_alive(*pid),
+                "{id}'s shim must not outlive the core that forked it"
+            );
+            let dir = rig.dir.join("vitrin-0").join(id);
+            assert!(
+                !dir.exists(),
+                "{id}'s runtime tree must be gone, not left for the next core to find locked"
+            );
+        }
+        assert!(
+            rig.host.runtime.realms.is_empty(),
+            "the runtime must hold no realm after a failed startup"
+        );
+        // Idempotent: the backend's own shutdown path finds nothing to do,
+        // rather than running a second ladder over torn-down realms.
+        shutdown_realm(&mut rig.host);
+    }
+
+    /// **Killing one realm's app leaves the others `Running`** — issue
+    /// #208's third acceptance criterion, and the one the re-plumbing is
+    /// most likely to get wrong: `SIGCHLD` says only that *some* child
+    /// changed state, so a reaper that stopped at the first exit would leave
+    /// a zombie and a realm the registry still called `Running`.
+    ///
+    /// Asserted through [`reap_realm`], the function the backends' `SIGCHLD`
+    /// source calls, rather than by poking the lifecycle directly.
+    #[test]
+    fn killing_one_realm_leaves_its_siblings_running_and_petitionable() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "multi-death",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        // `--seat` so a routed event can actually land, which is how the
+        // survivors' *serving* is asserted below rather than only their
+        // registry state.
+        let serve: &[&str] = &["--serve", "--seat", "--animate", "100000"];
+        rig.start_realms(&[("realm-0", serve), ("editor", serve), ("browser", serve)]);
+        // Deliberately the FIRST realm in id order ("browser" < "editor" <
+        // "realm-0"): `route_seat` and the nested backend's delivery sink
+        // both take the first still-serving realm, so killing the first is
+        // what would expose a skip that only tolerated the *last* realm
+        // dying.
+        let victim = rig.realm("browser").life.pid();
+        let survivors = [
+            rig.realm("realm-0").life.pid(),
+            rig.realm("editor").life.pid(),
+        ];
+        rig.pump_until(Duration::from_secs(10), |host: &TestHost| {
+            host.runtime
+                .realms
+                .values()
+                .filter_map(|realm| realm.server.as_ref())
+                .filter(|server| server.seat_minted())
+                .count()
+                == 3
+        });
+
+        // A real kill, not a simulated one: the shim dies, the kernel closes
+        // its end of the socketpair, and both death signals (EOF and
+        // SIGCHLD) become available to the loop.
+        assert_eq!(
+            unsafe { libc::kill(victim as libc::pid_t, libc::SIGKILL) },
+            0,
+            "the victim must be signalable"
+        );
+        rig.pump_until(Duration::from_secs(10), |host: &TestHost| {
+            !host
+                .runtime
+                .kernel
+                .realms
+                .get("browser")
+                .expect("browser is registered")
+                .admits_petitions()
+        });
+        // The SIGCHLD source's own entry point, over every live realm.
+        reap_realm(&mut rig.host);
+
+        // Exactly one realm died, and it is the one that was killed.
+        assert!(
+            !rig.host
+                .runtime
+                .kernel
+                .realms
+                .get("browser")
+                .unwrap()
+                .admits_petitions(),
+            "the killed realm must be vacant"
+        );
+        for id in ["realm-0", "editor"] {
+            let realm = rig.host.runtime.kernel.realms.get(id).unwrap();
+            assert!(
+                matches!(realm.state(), crate::realm::RealmState::Running { .. }),
+                "{id} must still be Running, got {:?}",
+                realm.state()
+            );
+            assert!(realm.admits_petitions(), "{id} must still answer petitions");
+        }
+        for pid in survivors {
+            assert!(
+                process_is_alive(pid),
+                "a sibling's death must not touch a survivor's process"
+            );
+        }
+        // No zombie: the reaper polled every realm, so the victim is gone
+        // from /proc entirely rather than left unwaited.
+        assert!(
+            !process_is_alive(victim),
+            "the killed shim must be reaped, not left a zombie -- which is what a \
+             reaper that stopped at the first realm would leave behind"
+        );
+
+        // ...and a routed actuation still reaches a surviving realm. The
+        // delivery target is "the first realm that still holds a shim
+        // server", so a naive `.next()` would have handed every event to the
+        // corpse and dropped it silently — the exact class of failure this
+        // change's placeholder routing could hide.
+        route_seat(
+            &mut rig.host,
+            vec![SeatInput::emulated(crate::input::SeatInputKind::Text {
+                text: "after".into(),
+            })],
+        );
+
+        shutdown_realm(&mut rig.host);
+        let entries = rig.entries();
+        let died = crate::recorder::tests::of_kind(&entries, "realm_died");
+        let for_victim: Vec<_> = died
+            .iter()
+            .filter(|e| e.str("realm") == "browser")
+            .collect();
+        assert_eq!(
+            for_victim.len(),
+            1,
+            "exactly one realm_died for the killed realm (the death latch); got {died:#?}"
+        );
+        assert_eq!(
+            crate::recorder::tests::of_kind(&entries, "seat_delivered").len(),
+            1,
+            "an actuation after a realm's death must still be delivered to a survivor"
+        );
+    }
+
+    /// **A sibling realm's death does not disturb the surviving realm's
+    /// seat state** (WS-E.1.2 review, HIGH 2) — driven through the real
+    /// death path, not through [`InputRouter::reset_for`] directly.
+    ///
+    /// One router serves the session; a realm dying used to clear it
+    /// unconditionally, so realm A's exit forgot that realm B's app was
+    /// holding a key down. The release then arrives unpaired at B's seat and
+    /// is dropped, and the key latches in a live app with nothing in the
+    /// journal to say so — no delivery happened, so nothing was recorded.
+    ///
+    /// The victim is deliberately **not** the delivery target: ids sort
+    /// `browser` < `realm-0`, so [`seat_target`] binds the router to
+    /// `browser` and `realm-0` is the sibling whose death must be
+    /// inconsequential. Killing the target instead would prove nothing —
+    /// clearing *is* right there.
+    #[test]
+    fn a_realms_death_does_not_clear_a_surviving_realms_held_key() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "multi-router",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let serve: &[&str] = &["--serve", "--seat", "--animate", "100000"];
+        rig.start_realms(&[("realm-0", serve), ("browser", serve)]);
+        let sibling = rig.realm("realm-0").life.pid();
+        rig.pump_until(Duration::from_secs(10), |host: &TestHost| {
+            host.runtime
+                .realms
+                .values()
+                .filter_map(|realm| realm.server.as_ref())
+                .filter(|server| server.seat_minted())
+                .count()
+                == 2
+        });
+
+        // A key press through the production actuation route, so the router
+        // records the delivery debt exactly as a live agent would make it.
+        const SHIFT_L: u32 = 0xffe1;
+        route_seat(
+            &mut rig.host,
+            vec![SeatInput::emulated(crate::input::SeatInputKind::Key {
+                keysym: SHIFT_L,
+                state: vitrin_protocol::generated::vitrin_shim_seat::KeyState::Pressed,
+            })],
+        );
+        assert_eq!(
+            rig.host.runtime.router.bound_realm(),
+            Some(&RealmId::new("browser")),
+            "the delivery target owns the router's generation"
+        );
+        assert_eq!(
+            rig.host.runtime.router.held_keys().len(),
+            1,
+            "the press was delivered, so its release is owed"
+        );
+
+        // The *other* realm dies, through the real funnel: a real kill, the
+        // socketpair EOF the loop dispatches, `close_realm`, the death latch,
+        // `ShimServer::connection_closed`.
+        assert_eq!(
+            unsafe { libc::kill(sibling as libc::pid_t, libc::SIGKILL) },
+            0,
+            "the sibling must be signalable"
+        );
+        rig.pump_until(Duration::from_secs(10), |host: &TestHost| {
+            !host
+                .runtime
+                .kernel
+                .realms
+                .get("realm-0")
+                .expect("realm-0 is registered")
+                .admits_petitions()
+        });
+        reap_realm(&mut rig.host);
+
+        assert_eq!(
+            rig.host.runtime.router.held_keys().len(),
+            1,
+            "a sibling's death must not forget what the survivor's app is holding -- a \
+             session-wide reset here latches the key down in a live app forever"
+        );
+        assert_eq!(
+            rig.host.runtime.router.bound_realm(),
+            Some(&RealmId::new("browser")),
+            "and the surviving generation still belongs to the realm that owns it"
+        );
+
+        // The proof at the app: the release still pairs, so it is still
+        // delivered rather than dropped as unpaired.
+        route_seat(
+            &mut rig.host,
+            vec![SeatInput::emulated(crate::input::SeatInputKind::Key {
+                keysym: SHIFT_L,
+                state: vitrin_protocol::generated::vitrin_shim_seat::KeyState::Released,
+            })],
+        );
+        assert!(
+            rig.host.runtime.router.held_keys().is_empty(),
+            "the release paired with the press"
+        );
+
+        shutdown_realm(&mut rig.host);
+        let entries = rig.entries();
+        assert_eq!(
+            crate::recorder::tests::of_kind(&entries, "seat_delivered").len(),
+            2,
+            "both the press and its release reached the survivor's seat"
+        );
+    }
+
     /// Issue #83: an event the core delivers to the shim's seat is journaled
     /// with the origin intake bound (backward requirement B2). Until this
     /// landed the flight recorder wrote nothing about seat delivery, so the
@@ -2366,12 +3118,12 @@ mod tests {
         // `Ok(false)` and nothing is journaled — the negative half of the
         // contract, which is why the record sits behind `if sent`.
         rig.start_realm(&["--serve", "--seat"]);
-        rig.pump_until(Duration::from_secs(10), |host| {
+        rig.pump_until(Duration::from_secs(10), |host: &TestHost| {
             host.runtime
-                .realm
-                .as_ref()
-                .and_then(|r| r.server.as_ref())
-                .is_some_and(|s| s.seat_minted())
+                .realms
+                .values()
+                .filter_map(|r| r.server.as_ref())
+                .any(|s| s.seat_minted())
         });
 
         // Two agent-originated events through the production route. Text never
@@ -2428,14 +3180,7 @@ mod tests {
         // `--spawn-app` makes the third tier real rather than described.
         rig.start_realm(&["--serve", "--spawn-app"]);
         let core = std::process::id();
-        let shim = rig
-            .host
-            .runtime
-            .realm
-            .as_ref()
-            .expect("the realm is attached")
-            .life
-            .pid();
+        let shim = rig.realm(crate::realm::WELL_KNOWN_REALM_ID).life.pid();
 
         // Let the shim come up and fork its app.
         let app = {
@@ -2522,6 +3267,17 @@ mod tests {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 
+    /// One process's environment as `NAME=value` strings, from
+    /// `/proc/<pid>/environ` (NUL-separated). Read from the kernel rather
+    /// than reconstructed, so what is asserted is what the child got.
+    fn environ_of(pid: u32) -> Vec<String> {
+        let raw = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+        raw.split(|b| *b == 0)
+            .filter(|kv| !kv.is_empty())
+            .map(|kv| String::from_utf8_lossy(kv).into_owned())
+            .collect()
+    }
+
     /// A dispatch round costs at most one composite, however dirty it got.
     ///
     /// This is the trap `backend::headless`'s TEST-ONLY warning names: a
@@ -2582,12 +3338,12 @@ mod tests {
         // during the pump and the assertion below would race.)
         rig.host.view.posture = Presentation::Scheduled;
         rig.start_realm(&["--serve", "--animate", "1"]);
-        rig.pump_until(Duration::from_secs(10), |host| {
+        rig.pump_until(Duration::from_secs(10), |host: &TestHost| {
             host.runtime
-                .realm
-                .as_ref()
-                .and_then(|realm| realm.server.as_ref())
-                .is_some_and(|server| server.wants_presentation())
+                .realms
+                .values()
+                .filter_map(|realm| realm.server.as_ref())
+                .any(|server| server.wants_presentation())
         });
 
         assert!(
@@ -2595,11 +3351,9 @@ mod tests {
             "the rounds still cost their composite requests"
         );
         assert!(
-            rig.host
-                .runtime
-                .realm
+            rig.realm(crate::realm::WELL_KNOWN_REALM_ID)
+                .server
                 .as_ref()
-                .and_then(|realm| realm.server.as_ref())
                 .is_some_and(|server| server.wants_presentation()),
             "a scheduled composite leaves the frame callbacks owed -- emitting them here \
              is the silent pacing bug: the shim would be told a frame it never saw was presented"
@@ -2610,11 +3364,9 @@ mod tests {
         // never dropped.
         emit_presented(&mut rig.host.runtime);
         assert!(
-            !rig.host
-                .runtime
-                .realm
+            !rig.realm(crate::realm::WELL_KNOWN_REALM_ID)
+                .server
                 .as_ref()
-                .and_then(|realm| realm.server.as_ref())
                 .is_some_and(|server| server.wants_presentation()),
             "a real composite must pay every owed callback"
         );
@@ -2662,7 +3414,11 @@ mod tests {
 
         rig.host.runtime.dirty = false;
         let presents_before = rig.host.view.presents;
-        close_realm(&mut rig.host, DeathCause::ConnectionClosed);
+        close_realm(
+            &mut rig.host,
+            &RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
+            DeathCause::ConnectionClosed,
+        );
 
         assert!(
             rig.host.view.scene.surface_size().is_none(),

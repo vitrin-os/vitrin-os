@@ -357,6 +357,7 @@ class Core:
         animate: int = ANIMATE_FRAMES,
         seat: bool = False,
         runtime_dir: str | os.PathLike[str] | None = None,
+        realms: tuple[str, ...] = (),
         wait: bool = True,
         write_config: bool = True,
         shim: str | os.PathLike[str] | None = None,
@@ -413,13 +414,23 @@ class Core:
                 # rather than dropping undelivered — what the #43 demo needs
                 # to exercise the seat path. Default off, so every existing
                 # caller's argv is unchanged.
+                #
+                # `realms` names EXTRA realms beside `realm-0` (WS-E.1.2):
+                # each becomes another `[[realm]]` table running the same
+                # mock shim. Default empty, so every existing caller still
+                # writes the single-table file it always did — which is the
+                # test that this change was additive rather than merely
+                # compatible-looking. `realm-0` is written unconditionally
+                # because the core requires it in every configuration.
                 seat_arg = ', "--seat"' if seat else ""
-                self.realm.write_text(
+                tables = "".join(
                     "[[realm]]\n"
-                    'id = "realm-0"\n'
+                    f'id = "{rid}"\n'
                     f'command = "{MOCK_SHIM}"\n'
                     f'args = ["--serve"{seat_arg}, "--animate", "{animate}"]\n'
+                    for rid in ("realm-0", *realms)
                 )
+                self.realm.write_text(tables)
             else:
                 # The real-app path: `command` names a genuine app the C shim
                 # fork/execs after the `--` tail, and `env_allow` is the only
@@ -427,12 +438,21 @@ class Core:
                 # grow by — the headless/software-render WLR_* names travel
                 # this way, exactly as the c_shim conformance test threads
                 # them (crates/vitrin-core/src/shim.rs).
+                #
+                # `realms` names EXTRA realms here too, each running the same
+                # app under its own shim — what a real-app multi-realm gate
+                # needs (the cross-realm actuation guard, WS-E.1.2). Default
+                # empty, so every existing real-app caller still writes the
+                # single table it always did.
                 self.realm.write_text(
-                    "[[realm]]\n"
-                    'id = "realm-0"\n'
-                    f"command = {_toml_string(os.fspath(command))}\n"
-                    f"args = {_toml_string_array(args or [])}\n"
-                    f"env_allow = {_toml_string_array(list(env_allow))}\n"
+                    "".join(
+                        "[[realm]]\n"
+                        f'id = "{rid}"\n'
+                        f"command = {_toml_string(os.fspath(command))}\n"
+                        f"args = {_toml_string_array(args or [])}\n"
+                        f"env_allow = {_toml_string_array(list(env_allow))}\n"
+                        for rid in ("realm-0", *realms)
+                    )
                 )
 
         argv = [
@@ -772,17 +792,22 @@ def require_binaries() -> None:
 ALL_VERBS = ("observe", "actuate.pointer", "actuate.text")
 
 
-def whole_realm_grant(conn, verbs=ALL_VERBS):
+def whole_realm_grant(conn, verbs=ALL_VERBS, realm="realm-0"):
     """Petition for the MVP's one grant shape and wait it out.
 
     `resource` is left empty deliberately: version 0 serves whole-realm grants
     only and refuses any finer granularity as `Unsupported` — an honest refusal
     rather than accepted-and-unenforced.
+
+    `realm` defaults to the well-known one, so every existing caller is
+    unchanged; a multi-realm test names another (WS-E.1.2). The realm the
+    grant row carries is what the core judges that grant's *liveness* against,
+    so "which realm" is not cosmetic here.
     """
     import vitrin_os
 
     return conn.request_grant(
-        verbs=verbs, persistence=vitrin_os.Persistence.WHILE_RUNNING
+        realm=realm, verbs=verbs, persistence=vitrin_os.Persistence.WHILE_RUNNING
     ).await_consent()
 
 

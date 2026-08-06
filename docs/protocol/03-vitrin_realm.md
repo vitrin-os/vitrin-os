@@ -14,12 +14,43 @@ realm is unknown, vacant, or closed simply produces petitions that resolve
 `unavailable` rather than a protocol error.
 
 In the object graph the realm handle sits one hop below the principal: a
-[`vitrin_principal`](./02-vitrin_principal.md) mints realm handles by
-well-known name, and each realm handle in turn mints grant petitions. Grants
-attach to realms, and apps launch into realms, so the realm is the join point
-between the authority chain (principal → grant → facets) and the composition
-model (realm view → shim surface). In version 1 there is a single well-known
-realm, `realm-0`.
+[`vitrin_principal`](./02-vitrin_principal.md) mints realm handles by name, and
+each realm handle in turn mints grant petitions. Grants attach to realms, and
+apps launch into realms, so the realm is the join point between the authority
+chain (principal → grant → facets) and the composition model (realm view → shim
+surface).
+
+### Realm cardinality: one at version 1, a bounded set at version 2
+
+Version 1 fixes the count as well as the name: **exactly one realm, `realm-0`.**
+
+Version 2 lifts the count to a **deployment-chosen limit** and keeps `realm-0`
+**mandatory**. A version-2 server serves `realm-0` and however many further
+realms its operator configured or [`vitrin_launcher`](./16-vitrin_launcher.md)
+created, up to that limit; a deployment already at the limit refuses a *launch*
+`capacity`, and never refuses `get_realm`, which mints a handle for any name at
+all.
+
+Keeping `realm-0` mandatory is what makes the widening **additive** rather than
+merely compatible-looking. Every conformant version-1 client petitions
+`realm-0`, so a deployment that renamed its realms would answer all of them
+`unavailable` forever — and the IDL specifies that absence as a *race* against
+realm lifecycle, not as a permanent property of a correctly configured session.
+A version-1 connection to a version-2 server is unaffected in every other
+respect too: nothing about `get_realm` or `request_grant` changed.
+
+**The other names are not discoverable on the wire, at either version.**
+Enumeration is a reserved `since="2"` seam on this interface and is deliberately
+unbuilt (see [Growth](#growth)), so a client learns a realm name from
+[`vitrin_launcher.launched`](./16-vitrin_launcher.md#launched) or out of band.
+That is why `realm-0` remains the *one* realm name a conformant client can know
+without being told.
+
+**Two authorities name realms, and they do not overlap.** An operator names
+**templates**, in the server's own configuration; the server names **instances**
+it creates from them, and those ids are opaque
+([`launched`](./16-vitrin_launcher.md#launched)). A client MUST NOT construct or
+predict either kind of name.
 
 ### Launching is deliberately not a request here
 
@@ -308,4 +339,4 @@ existing argument.
 | Version | Change |
 |---|---|
 | 1 | `request_grant`; no events |
-| 2 | *(none — this interface is unchanged at version 2; `realm_launch` is a grant verb, not a request here)* |
+| 2 | *(no message change — this interface's wire surface is unchanged at version 2; `realm_launch` is a grant verb, not a request here. What version 2 changes about realms is the **cardinality** stated above: more than one realm may exist, `realm-0` stays mandatory, and enumeration stays unbuilt)* |

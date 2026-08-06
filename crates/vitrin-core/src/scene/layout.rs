@@ -7,11 +7,18 @@
 //! §5.1 invariant; PRD Doc 2 §2, the Nitpicker/Qubes lesson): the core does
 //! mediation, not window management, and shell UX lives in unprivileged
 //! components outside the TCB (e.g. the horizon-tier mission-control
-//! shell). This module exists only because the MVP has exactly one realm
-//! with exactly one surface, so the "policy" degenerates to *center the
-//! surface, unscaled* — plan P1.3.3's "trivial layout". It must never
-//! grow: tiling, stacking order, focus policy, decorations, or any second
-//! placement rule are a design smell here and belong outside the core.
+//! shell). This module exists only because the scene holds exactly one
+//! surface, so the "policy" degenerates to *center the surface, unscaled*
+//! — plan P1.3.3's "trivial layout". It must never grow: tiling, stacking
+//! order, focus policy, decorations, or any second placement rule are a
+//! design smell here and belong outside the core.
+//!
+//! **A session can now hold more than one realm** (WS-E.1.2), and this
+//! module has not moved with it: every realm's shim commits into the same
+//! single-surface [`crate::scene::Scene`], so the last committer is the one
+//! placed and the rest are invisible. Binding an output to a realm is
+//! WS-E.1.3's, and it is the task that decides *which* surface reaches
+//! here — not a second placement rule added below.
 //!
 //! No decorations by construction: the shim disables server-side
 //! decorations via xdg-decoration (P1.6.1) and the core draws nothing

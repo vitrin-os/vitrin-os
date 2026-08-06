@@ -217,7 +217,8 @@ impl fmt::Display for GrantId {
 }
 
 /// `realm_id` (PRD Doc 2 section 5.2): the realm a grant attaches to,
-/// by well-known name (`"realm-0"` is the single realm of version 1;
+/// by name (`"realm-0"` is the single realm of version 1 and a mandatory
+/// member at version 2, where a deployment may serve more;
 /// `vitrin_realm` carries names, max 64 bytes). A light newtype so realm
 /// and principal strings cannot be swapped at the query boundary; the
 /// realm manager (P1.5) may take ownership of this type when realms grow
@@ -934,6 +935,28 @@ impl GrantTable {
             }
             None => Err(refusal.unwrap_or(RefusalReason::NotGranted)),
         }
+    }
+
+    /// **Which realm a row is over**, or `None` if the row is gone.
+    ///
+    /// The `realm_id` column has always been there; nothing read it at use
+    /// time while a session held exactly one realm, because "the realm" and
+    /// "this grant's realm" could not differ. With several realms they can,
+    /// and the use path has to ask it twice -- once per direction:
+    ///
+    /// - **read**: a grant over a dead realm must not observe a *sibling's*
+    ///   pixels (`session::dispatch_principal`,
+    ///   `principal::PrincipalServer::serve_facet_use`);
+    /// - **write**: an actuation admitted under this grant must not be
+    ///   delivered into a *sibling's* app (the same two sites, feeding
+    ///   `enforcement::UseEnv::seat_reaches_grant_realm`).
+    ///
+    /// Deliberately not an authority judgement -- it reports the row's
+    /// target so the caller can resolve the *environment* for it. Whether a
+    /// use is permitted stays [`Self::check_use_grant`]'s, at the one
+    /// chokepoint.
+    pub fn realm_of(&self, grant: GrantId) -> Option<&RealmId> {
+        self.entries.get(&grant).map(|entry| &entry.row.realm_id)
     }
 
     /// **The chokepoint query** (P1.4.4): may this use of `grant` --

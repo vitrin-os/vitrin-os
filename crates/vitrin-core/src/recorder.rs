@@ -768,6 +768,14 @@ pub(crate) enum Event<'a> {
     /// keylogger, which the secrecy contract [`ActuationDetail`] documents
     /// forbids.
     SeatDelivered {
+        /// **Which realm's app received it** -- the one fact that makes this
+        /// entry answerable rather than merely present. The delivery target
+        /// is chosen at *runtime* (`session::seat_target`), so it is not
+        /// derivable from the grant row [`Event::UseDecision`] names, and
+        /// with several realms attached the two can differ. Without it the
+        /// journal can say a keystroke was delivered and not which app got
+        /// it, which is not an audit trail.
+        realm: &'a RealmId,
         /// The seat event kind -- `motion`/`button`/`scroll`/`key`/`text`,
         /// from [`crate::input::SeatDelivery::event_label`].
         event: &'static str,
@@ -1195,7 +1203,12 @@ impl Event<'_> {
                 field_u64(out, "repeats", repeats);
                 field_u64(out, "total_in_run", total);
             }
-            Event::SeatDelivered { event, origin } => {
+            Event::SeatDelivered {
+                realm,
+                event,
+                origin,
+            } => {
+                field_display(out, "realm", realm);
                 field_str(out, "event", event);
                 field_str(out, "origin", origin);
             }
@@ -2699,11 +2712,15 @@ pub(crate) mod tests {
         // recorder that wrote keysyms or the typed string here would be a
         // keylogger, so the entry has no field that could hold either.
         let (mut rec, path) = scratch_recorder("seat-delivered");
+        let editor = crate::grants::RealmId::new("editor");
+        let browser = crate::grants::RealmId::new("browser");
         rec.record(Event::SeatDelivered {
+            realm: &editor,
             event: "text",
             origin: "emulated",
         });
         rec.record(Event::SeatDelivered {
+            realm: &browser,
             event: "button",
             origin: "physical",
         });
@@ -2713,8 +2730,12 @@ pub(crate) mod tests {
         assert_eq!(entries[0].str("kind"), "seat_delivered");
         assert_eq!(entries[0].str("event"), "text");
         assert_eq!(entries[0].str("origin"), "emulated");
+        // Which app received it -- the question the entry could not answer
+        // before, and the one an incident starts from.
+        assert_eq!(entries[0].str("realm"), "editor");
         assert_eq!(entries[1].str("event"), "button");
         assert_eq!(entries[1].str("origin"), "physical");
+        assert_eq!(entries[1].str("realm"), "browser");
 
         // Shape only: no member that could carry a coordinate, keysym, scroll
         // delta, or the typed string's bytes/digest.

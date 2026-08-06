@@ -400,12 +400,19 @@ pub(crate) fn origin_label(origin: Origin) -> &'static str {
     }
 }
 
-/// Journal one delivered seat event with its origin (issue #83).
+/// Journal one delivered seat event with its origin and **the realm whose app
+/// received it** (issue #83).
 ///
 /// The **single funnel** both delivery paths call — `session::route_seat` for
 /// agent actuations and the nested backend's physical input — so the two
 /// cannot record the B2 audit differently, and one test (in this module)
 /// covers the code both run.
+///
+/// `realm` is a parameter rather than something this function derives: both
+/// call sites pick the delivery target themselves (today from
+/// `session::seat_target`, tomorrow from WS-E.1.6's router) and the journal
+/// has to record the realm that was actually addressed, not one this funnel
+/// re-derived and could disagree about.
 ///
 /// Pointer **motion is deliberately not journaled**. On the physical path it
 /// arrives at raw device rate with no chokepoint token bucket to bound it (an
@@ -417,12 +424,14 @@ pub(crate) fn origin_label(origin: Origin) -> &'static str {
 /// B2 exists for is carried in full by those discrete events.
 pub(crate) fn record_seat_delivery(
     recorder: &mut crate::recorder::Recorder,
+    realm: &crate::grants::RealmId,
     delivery: &SeatDelivery,
 ) {
     if matches!(delivery.kind(), SeatDeliveryKind::Motion { .. }) {
         return;
     }
     recorder.record(crate::recorder::Event::SeatDelivered {
+        realm,
         event: delivery.event_label(),
         origin: delivery.origin_label(),
     });
@@ -552,8 +561,14 @@ pub(crate) const PHYSICAL_HOLD_CEILING: std::time::Duration = std::time::Duratio
 /// caller's `now`, `owns_target` judges at the caller's `now`, and the
 /// chokepoint samples one instant per request for both.
 ///
-/// One tracker serves the process in v0 (one realm, one seat, one human);
-/// per-realm presence is the Phase-2 multi-realm generalization.
+/// One tracker serves the process: one seat, one human, and — until
+/// WS-E.1.6 — one presence answer shared by every realm a session holds,
+/// even though a session may now hold several (WS-E.1.2). So a human
+/// touching the physical keyboard preempts agent actuation in *every*
+/// realm, not only the one they are working in. That is the conservative
+/// direction (it refuses more, never less) and it is a placeholder, not a
+/// design: per-realm presence is WS-E.1.6's, alongside the routing question
+/// it cannot be answered separately from.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default)]
 pub(crate) struct PhysicalPresence {
@@ -663,11 +678,30 @@ impl<H: PreemptionHook> PreemptionHook for PresenceHook<H> {
     }
 }
 
-/// The per-realm input router: the one path from tagged intake events to
+/// The session's input router: the one path from tagged intake events to
 /// wire-ready seat deliveries. Holds the seat's pointer state (v0: one
 /// seat, one cursor, shared by both origins) and the preemption hook.
+///
+/// **One router, one realm at a time.** A session may now hold several
+/// realms (WS-E.1.2), and this is still one instance — but the state below
+/// is *per shim generation*, and a shim generation belongs to exactly one
+/// realm: every delivery goes to a single realm, the one
+/// [`crate::session::seat_target`] picks. [`Self::bound`] records which,
+/// and it exists for one reason: a realm's death must clear that realm's
+/// delivery debt and **must not** clear a surviving sibling's, or a key the
+/// survivor's app is holding latches down forever with nothing in the log
+/// to say why.
 pub(crate) struct InputRouter<H: PreemptionHook> {
     hook: H,
+    /// The realm the state below is owed to: whichever realm
+    /// [`Self::bind_to`] last named, or `None` before the first delivery
+    /// and after the bound realm's death.
+    ///
+    /// Not a routing decision and not a second copy of one — the target is
+    /// chosen in `session::seat_target` and merely *recorded* here, so the
+    /// eventual per-realm routing policy (WS-E.1.6) changes one function
+    /// and this field follows it.
+    bound: Option<crate::grants::RealmId>,
     /// Last known pointer position in view coordinates — buttons and
     /// scroll carry no position of their own and hit-test against this.
     /// Updated at intake (a physical fact), even for events the gate
@@ -729,6 +763,7 @@ impl<H: PreemptionHook> InputRouter<H> {
     pub fn new(hook: H) -> Self {
         Self {
             hook,
+            bound: None,
             pointer: None,
             agent_pointer: None,
             pressed: Vec::new(),
@@ -747,8 +782,33 @@ impl<H: PreemptionHook> InputRouter<H> {
         self.agent_pointer
     }
 
-    /// Forget all per-shim-generation seat state: the implicit-grab
-    /// bookkeeping, the key pairing, and the last known pointer position.
+    /// **Adopt `realm`'s shim generation**, called by each delivery site
+    /// with the realm it is about to deliver to
+    /// ([`crate::session::seat_target`]).
+    ///
+    /// Re-binding to the realm already bound is a no-op — the ordinary case,
+    /// once per delivery round. Binding to a *different* realm forgets the
+    /// previous one's state first, and that is the fail-closed direction
+    /// rather than tidiness: the pairing table is a record of presses **this
+    /// app** saw, so carrying it across a target change would send the new
+    /// realm's seat a release whose press it never received, and let a
+    /// pointer position hit-test geometry a different shim produced. The
+    /// only way the target changes today is the previous one dying, which
+    /// has already reset through [`Self::reset_for`]; this is the backstop
+    /// for the day routing stops being a placeholder (WS-E.1.6).
+    pub fn bind_to(&mut self, realm: &crate::grants::RealmId) {
+        if self.bound.as_ref() == Some(realm) {
+            return;
+        }
+        self.reset();
+        self.bound = Some(realm.clone());
+    }
+
+    /// Forget `realm`'s per-shim-generation seat state — the implicit-grab
+    /// bookkeeping, the key pairing, and the last known pointer position —
+    /// **if that is the realm this router's state belongs to**. Returns
+    /// whether it cleared anything.
+    ///
     /// Invoked by the realm teardown funnel
     /// ([`ShimServer::connection_closed`](crate::shim::ShimServer::connection_closed)),
     /// so no state can survive into the next shim generation: a stale
@@ -760,11 +820,51 @@ impl<H: PreemptionHook> InputRouter<H> {
     ///
     /// The agent-owned position goes with it, so the sprite does not hover
     /// over a realm that no longer exists: the next composite draws none.
-    pub fn reset(&mut self) {
+    ///
+    /// **Scoped, and that scoping is the whole of this method.** One router
+    /// serves a session that may hold several realms, so an unconditional
+    /// clear on *any* realm's death is one realm reaching into another's
+    /// state: the survivor's app keeps holding a key whose release the
+    /// router has just forgotten it owes, and the key latches down with
+    /// nothing in the journal to say why. A realm that never held the
+    /// router's generation therefore clears nothing when it dies.
+    pub fn reset_for(&mut self, realm: &crate::grants::RealmId) -> bool {
+        if self.bound.as_ref() != Some(realm) {
+            return false;
+        }
+        self.reset();
+        self.bound = None;
+        true
+    }
+
+    /// The unconditional clear the two scoped entry points above share.
+    /// Private on purpose: an embedder that could reach it would be able to
+    /// wipe one realm's seat state on another realm's event, which is
+    /// exactly the bug [`Self::reset_for`] exists to make unwritable.
+    fn reset(&mut self) {
         self.pressed.clear();
         self.pressed_keys.clear();
         self.pointer = None;
         self.agent_pointer = None;
+    }
+
+    /// The realm this router's delivery debt is owed to, if any. Test-only:
+    /// production code names the realm rather than asking which one is
+    /// bound.
+    #[cfg(test)]
+    pub fn bound_realm(&self) -> Option<&crate::grants::RealmId> {
+        self.bound.as_ref()
+    }
+
+    /// The presses the router believes the bound realm's app is holding, as
+    /// `(keysym, origin)` in press order. Test-only read of
+    /// [`Self::pressed_keys`]: the pairing table is the state a sibling
+    /// realm's death must not disturb, and nothing outside this module can
+    /// otherwise observe it without consuming it
+    /// ([`Self::release_physical_keys`] drains).
+    #[cfg(test)]
+    pub fn held_keys(&self) -> &[(u32, Origin)] {
+        &self.pressed_keys
     }
 
     /// Release every key the router believes the app is holding **on the
@@ -1925,6 +2025,8 @@ pub(crate) mod tests {
     #[test]
     fn the_agent_pointer_follows_the_emulated_origin_and_nothing_else() {
         let mut router = router();
+        let realm = crate::grants::RealmId::new("realm-0");
+        router.bind_to(&realm);
         let view = (64, 48);
         let surface = Some((64, 48));
         assert_eq!(router.agent_pointer(), None, "nothing has moved yet");
@@ -1962,8 +2064,9 @@ pub(crate) mod tests {
         assert_eq!(router.agent_pointer(), Some((200.0, 200.0)));
 
         // Realm teardown forgets it, so no sprite hovers over a realm that is
-        // gone.
-        router.reset();
+        // gone -- through the scoped entry point the teardown funnel uses,
+        // so the private clear has no caller outside this module's own API.
+        assert!(router.reset_for(&realm));
         assert_eq!(router.agent_pointer(), None);
     }
 
@@ -2342,10 +2445,12 @@ pub(crate) mod tests {
     #[test]
     fn reset_forgets_grab_and_pointer_across_shim_generations() {
         // Issue #24 review: a grab held at shim death must not become a
-        // phantom grab against the next shim generation. `reset` is what
+        // phantom grab against the next shim generation. `reset_for` is what
         // the realm teardown funnel (`ShimServer::connection_closed`)
         // invokes alongside `Scene::clear_surface`.
         let mut router = router();
+        let realm = crate::grants::RealmId::new("realm-0");
+        router.bind_to(&realm);
         let view = (100, 80);
         let surface = Some((40, 20)); // placed at (30, 30)
 
@@ -2354,7 +2459,7 @@ pub(crate) mod tests {
             .is_some());
         assert!(router.route(phys(press()), view, surface).is_some());
 
-        router.reset();
+        assert!(router.reset_for(&realm), "the bound realm's death clears");
 
         // The stale release from the dead generation is unpaired at the
         // fresh seat: dropped.
@@ -2374,6 +2479,86 @@ pub(crate) mod tests {
             .is_some());
         assert!(router.route(phys(press()), view, surface).is_some());
         assert!(router.route(phys(release()), view, surface).is_some());
+    }
+
+    /// **A sibling realm's death must not clear the bound realm's state**
+    /// (WS-E.1.2 review, HIGH 2).
+    ///
+    /// One router serves a session that may now hold several realms, so an
+    /// unconditional `reset` on *any* realm's death is one realm reaching
+    /// into another's. The consequence is not abstract: the router's pairing
+    /// table is the record of which presses the app was told about, and
+    /// forgetting an entry means the matching release is dropped as unpaired
+    /// — the key stays down in a surviving app forever, and the journal
+    /// records nothing, because nothing was delivered.
+    ///
+    /// Both directions are asserted. A `reset_for` that cleared nothing at
+    /// all would satisfy the first half and lose the phantom-grab guarantee
+    /// [`reset_forgets_grab_and_pointer_across_shim_generations`] pins.
+    #[test]
+    fn a_siblings_death_leaves_the_bound_realms_held_key_alone() {
+        use crate::grants::RealmId;
+        let mut router = router();
+        let view = (100, 80);
+        let surface = Some((40, 20));
+        let bound = RealmId::new("browser");
+        let sibling = RealmId::new("realm-0");
+
+        // The generation belongs to `browser`: everything below is what
+        // *its* app was told.
+        router.bind_to(&bound);
+        assert!(router
+            .route(phys(motion(35.0, 35.0)), view, surface)
+            .is_some());
+        assert!(router.route(phys(press()), view, surface).is_some());
+        let key_down = || SeatInputKind::Key {
+            keysym: 0xffe1, // Shift_L: the modifier a latch is worst for
+            state: KeyState::Pressed,
+        };
+        assert!(router.route(phys(key_down()), view, surface).is_some());
+        assert_eq!(router.held_keys(), [(0xffe1, Origin::Physical)]);
+
+        // An unrelated realm dies. Nothing of this generation is its to
+        // forget.
+        assert!(
+            !router.reset_for(&sibling),
+            "a realm that never held the generation clears nothing"
+        );
+        assert_eq!(
+            router.bound_realm(),
+            Some(&bound),
+            "and it does not steal the binding either"
+        );
+        assert_eq!(
+            router.held_keys(),
+            [(0xffe1, Origin::Physical)],
+            "the survivor's app is still holding this key, so the router still owes its release"
+        );
+        // The proof that matters at the app: the release still pairs and is
+        // still delivered. Under an unscoped reset it would be dropped as
+        // unpaired and Shift would latch down for good.
+        let key_up = SeatInputKind::Key {
+            keysym: 0xffe1,
+            state: KeyState::Released,
+        };
+        assert!(
+            router.route(phys(key_up), view, surface).is_some(),
+            "the held key's release must still be deliverable"
+        );
+        // ...and the implicit grab survived too, so an off-surface release
+        // still reaches the app that saw the press.
+        assert!(router
+            .route(phys(motion(0.0, 0.0)), view, surface)
+            .is_some());
+        assert!(router.route(phys(release()), view, surface).is_some());
+
+        // The bound realm's own death still clears everything, which is the
+        // half `reset_forgets_grab_and_pointer_across_shim_generations`
+        // covers in full.
+        assert!(router.route(phys(key_down()), view, surface).is_some());
+        assert!(router.reset_for(&bound), "its own realm's death clears");
+        assert_eq!(router.bound_realm(), None);
+        assert!(router.held_keys().is_empty());
     }
 
     // ------------------------------------------------------------------
@@ -2513,14 +2698,18 @@ pub(crate) mod tests {
         let button_delivery = router
             .route(SeatInput::physical(press()), view, surface)
             .expect("button routes");
-        super::record_seat_delivery(&mut rec, &motion_delivery);
-        super::record_seat_delivery(&mut rec, &button_delivery);
+        let realm = crate::grants::RealmId::new("realm-7");
+        super::record_seat_delivery(&mut rec, &realm, &motion_delivery);
+        super::record_seat_delivery(&mut rec, &realm, &button_delivery);
 
         let entries = crate::recorder::tests::read_log(&path);
         let delivered = crate::recorder::tests::of_kind(&entries, "seat_delivered");
         assert_eq!(delivered.len(), 1, "motion is not journaled; the button is");
         assert_eq!(delivered[0].str("event"), "button");
         assert_eq!(delivered[0].str("origin"), "physical");
+        // Which app received it: not derivable from the grant row, because
+        // the delivery target is chosen at runtime.
+        assert_eq!(delivered[0].str("realm"), "realm-7");
         crate::recorder::tests::cleanup(&path);
     }
 
@@ -3210,6 +3399,9 @@ pub(crate) mod tests {
                     UseEnv {
                         realm_view: Some(&frame),
                         presence: &presence,
+                        // One realm, and it is this grant's: the cross-realm
+                        // guard has nothing to say here.
+                        seat_reaches_grant_realm: true,
                         actuations: &mut |input| routed.push(input),
                     },
                     now,

@@ -21,7 +21,7 @@ pub mod requests {
     pub struct GetRealm {
         /// the new realm address handle (new_id: vitrin_realm)
         pub realm: u32,
-        /// well-known realm name (max 64 bytes)
+        /// realm name (max 64 bytes); "realm-0" is the well-known one
         pub name: String,
     }
 

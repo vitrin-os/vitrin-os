@@ -156,6 +156,41 @@ pub fn shim_socket_path_in(xdg_runtime_dir: &Path, realm_id: &str) -> Result<Pat
     Ok(shim_runtime_dir_in(xdg_runtime_dir, realm_id)?.join(SHIM_SOCKET_NAME))
 }
 
+/// The two names realm `realm_id` claims inside [`runtime_dir`]: its private
+/// directory `<id>` and its ownership lock `<id>.lock`.
+///
+/// **The runtime directory is a flat namespace**, and every entry in it is
+/// claimed by exactly one owner: the listener takes [`CORE_SOCKET_NAME`] and
+/// its guard, and each realm takes these two. Nothing in the *path* helpers
+/// can detect a clash -- `realm_lock_path_in("foo")` and
+/// `shim_runtime_dir_in("foo.lock")` are both individually well-formed and
+/// name the same byte string -- so the clash has to be refused where the set
+/// of realm ids is known, which is the core's configuration validator. This
+/// function and [`reserved_runtime_names`] exist so that validator asks
+/// *this* module what the tree holds rather than restating the layout and
+/// drifting from it.
+///
+/// Deliberately names, not paths: a comparison over `PathBuf`s would invite
+/// a caller to compare against a path built with a different runtime base
+/// and always disagree.
+pub fn runtime_names_claimed_by(realm_id: &str) -> [String; 2] {
+    [realm_id.to_string(), format!("{realm_id}{LOCK_SUFFIX}")]
+}
+
+/// The names [`runtime_dir`] holds for the tree itself, which therefore
+/// belong to no realm: the principal-facing socket and its `flock` guard.
+///
+/// A realm id equal to either one would make its own private directory
+/// collide with the core's listener -- and the listener binds first, so the
+/// realm's `mkdir` is what fails, at startup, with an error about the wrong
+/// thing.
+pub fn reserved_runtime_names() -> [String; 2] {
+    [
+        CORE_SOCKET_NAME.to_string(),
+        format!("{CORE_SOCKET_NAME}{LOCK_SUFFIX}"),
+    ]
+}
+
 /// `$XDG_RUNTIME_DIR` itself, validated: set, non-empty, and absolute.
 ///
 /// Public because the core's realm spawn manager (P1.5.2) has to hold the
@@ -251,6 +286,31 @@ mod tests {
         }
         // Dots inside an id are fine; only the traversal names are not.
         shim_runtime_dir_in(base, "realm.0").unwrap();
+    }
+
+    /// The names a realm claims are exactly the paths the helpers build, and
+    /// the reserved pair is exactly what the listener owns -- so a validator
+    /// comparing these strings is comparing the real tree, not a restated
+    /// one that can drift from it.
+    #[test]
+    fn the_claimed_names_are_the_paths_the_helpers_build() {
+        let base = Path::new("/run/user/1000");
+        let dir = runtime_dir_in(base);
+        for id in ["realm-0", "foo", "foo.lock", "core.sock"] {
+            let [directory, lock] = runtime_names_claimed_by(id);
+            assert_eq!(dir.join(&directory), shim_runtime_dir_in(base, id).unwrap());
+            assert_eq!(dir.join(&lock), realm_lock_path_in(base, id).unwrap());
+        }
+        let [socket, guard] = reserved_runtime_names();
+        assert_eq!(dir.join(&socket), core_socket_path_in(base));
+        assert_eq!(guard, format!("{socket}.lock"));
+
+        // ...and the collision this exists to expose: realm `foo`'s lock
+        // file and realm `foo.lock`'s directory are the same entry.
+        assert_eq!(
+            realm_lock_path_in(base, "foo").unwrap(),
+            shim_runtime_dir_in(base, "foo.lock").unwrap()
+        );
     }
 
     #[test]

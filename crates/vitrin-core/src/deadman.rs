@@ -2102,6 +2102,10 @@ mod tests {
                     UseEnv {
                         realm_view: Some(&frame),
                         presence: &presence,
+                        // The seat serves this grant's realm: the
+                        // cross-realm guard is not this test's subject and
+                        // must not silently supply its refusals.
+                        seat_reaches_grant_realm: true,
                         actuations: &mut |_input| {},
                     },
                     now,

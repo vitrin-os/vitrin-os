@@ -384,6 +384,18 @@ USAGE:
                                 downstream of the composite a capture reads.
     vitrind --help              Show this help.
     vitrind --version           Show the version.
+    vitrind --print-isolation   Probe this kernel's confinement facilities --
+                                namespaces, the Landlock ABI, seccomp filter
+                                mode, no_new_privs, the distro sysctls that
+                                restrict user namespaces, and whether a
+                                per-uid tier is provisioned -- then exit.
+                                Every row is what the kernel answered to the
+                                exact request the realm spawn will make; none
+                                is inferred from a version string. The output
+                                is deterministic and is the source of the
+                                checked-in per-kernel matrix, so it carries no
+                                timestamp, hostname or pid. This flag reports;
+                                it changes nothing and confines nothing.
 ";
 
 /// Base name of the default flight-recorder log inside the core's runtime
@@ -466,6 +478,15 @@ enum Action {
     },
     Help,
     Version,
+    /// Probe this kernel's confinement facilities and exit (P2.6.1, #185).
+    ///
+    /// Print-and-exit like [`Action::Help`] and [`Action::Version`], and
+    /// deliberately **mode-independent**: it must answer identically whether
+    /// or not this machine can host a session, because its whole purpose is to
+    /// report what a machine *would* grant. That is also why it carries no
+    /// fields and takes no companion refusal -- there is no configuration for
+    /// it to disagree with.
+    PrintIsolation,
 }
 
 /// The presentation mode selected on the command line, before it is paired
@@ -582,6 +603,11 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             }
             "--help" | "-h" => return Ok(Action::Help),
             "--version" | "-V" => return Ok(Action::Version),
+            // Returns immediately, on the `--help`/`--version` precedent, so
+            // it wins over mode selection and over any later parse error. A
+            // probe of what this kernel offers must not be answerable only on
+            // a command line that would otherwise have run.
+            "--print-isolation" => return Ok(Action::PrintIsolation),
             other => {
                 #[cfg(feature = "consent-injector")]
                 if let Some(value) = other.strip_prefix("--consent-injector-fd=") {
@@ -905,6 +931,14 @@ fn main() -> ExitCode {
         }
         Action::Version => {
             println!("vitrind {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Action::PrintIsolation => {
+            // Deliberately upstream of `init_tracing`, exactly as `Help` and
+            // `Version` are: this output is byte-compared against a checked-in
+            // matrix, and tracing interleaved into stdout would make the
+            // comparison depend on the log level.
+            print!("{}", spawn::isolation::Report::probe().render());
             ExitCode::SUCCESS
         }
         Action::RunNested {
@@ -3005,6 +3039,30 @@ mod tests {
         assert_eq!(parse_args(["--nested", "--help"]), Ok(Action::Help));
         assert_eq!(parse_args(["--headless", "--help"]), Ok(Action::Help));
         assert_eq!(parse_args(["--version"]), Ok(Action::Version));
+    }
+
+    #[test]
+    fn print_isolation_is_answerable_from_any_command_line() {
+        // The point of the flag is to report what a machine *would* grant, so
+        // it must not require a command line that would otherwise have run.
+        // Three cases, each a different way a run-configuring parse could
+        // otherwise have swallowed it.
+        assert_eq!(
+            parse_args(["--print-isolation"]),
+            Ok(Action::PrintIsolation)
+        );
+        assert_eq!(
+            parse_args(["--nested", "--print-isolation"]),
+            Ok(Action::PrintIsolation)
+        );
+        // It wins over a later parse error, exactly as `--help` does: a
+        // machine with a typo in its flags can still be probed.
+        assert_eq!(
+            parse_args(["--print-isolation", "--size"]),
+            Ok(Action::PrintIsolation)
+        );
+        // The flag is named in the help text, so an operator can find it.
+        assert!(USAGE.contains("--print-isolation"));
     }
 
     #[test]

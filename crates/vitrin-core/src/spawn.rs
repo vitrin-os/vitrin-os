@@ -356,6 +356,18 @@
 //! pid -- which is exactly the pid-reuse race a `Child` exists to avoid.
 //! Nothing here decides when a realm dies or what that means.
 
+/// The runtime isolation preflight (P2.6.1, #185): what confinement *this
+/// kernel* will grant, measured rather than assumed.
+///
+/// It sits under `spawn` because it measures precisely the requests the spawn
+/// path will make -- but nothing in this file calls it yet. The D9 section
+/// above still describes what a realm child actually gets today, and it stays
+/// accurate until P2.6.2 (#186) replaces the environment-only confinement.
+/// The preflight lands first because Phase 2's R2.9 -- unprivileged user
+/// namespaces restricted on major distros -- is the one risk that can
+/// invalidate two whole epics, and it retires only by measuring real kernels.
+pub mod isolation;
+
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;

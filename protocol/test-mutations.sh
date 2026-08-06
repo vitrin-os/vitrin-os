@@ -69,11 +69,17 @@ check_rejected allow-null-on-uint \
 
 # protocol/@version is required.
 check_rejected no-protocol-version \
-  's|<protocol name="vitrin" version="1">|<protocol name="vitrin">|'
+  's|<protocol name="vitrin" version="2">|<protocol name="vitrin">|'
 
-# interface/@verb is a closed three-value set.
+# interface/@verb is a closed four-value set.
 check_rejected bad-verb-value \
   's|verb="observe"|verb="observe_frames"|'
+
+# ... and a verb name that reads like a grant verb but names no facet
+# interface is rejected too: the set is the facet-bearing verbs, not the
+# whole vitrin_grant.verb bitfield.
+check_rejected verb-without-facet \
+  's|verb="realm_launch"|verb="layout_arrange"|'
 
 # Descriptions are required on every interface.
 check_rejected drop-interface-description \

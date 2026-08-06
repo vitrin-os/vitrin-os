@@ -173,9 +173,10 @@ const EXPIRY_UNBOUNDED: &str = "no time limit - bounded only by the choice below
 /// equals [`crate::grants::SERVED_VERB_BITS`], so a verb this core can
 /// actually grant fails a test here rather than silently rendering as nothing
 /// on a consent prompt. It is deliberately pinned to the *served* set, not to
-/// [`Verb::VALID_MASK`]: the wire defines verbs version 1 refuses
-/// `unsupported` at admission (D-017/D-018), and a verb that can never reach a
-/// prompt must not get prompt copy that implies it can.
+/// [`Verb::VALID_MASK`]: the wire defines verbs this core refuses
+/// `unsupported` at admission (D-017/D-018, and `realm_launch`, whose facet
+/// this core does not yet serve), and a verb that can never reach a prompt
+/// must not get prompt copy that implies it can.
 ///
 /// A served-set pin alone would let a newly appended IDL verb slip past this
 /// module in silence — [`crate::grants::UNSERVED_VERB_BITS`] is *derived* from
@@ -644,14 +645,14 @@ mod tests {
         assert_eq!(
             union,
             crate::grants::SERVED_VERB_BITS,
-            "VERB_CATALOGUE does not cover every verb version 1 can grant"
+            "VERB_CATALOGUE does not cover every verb this core can grant"
         );
-        // Verbs the IDL defines but version 1 refuses `unsupported` are
+        // Verbs the IDL defines but this core refuses `unsupported` are
         // absent on purpose: no petition naming one ever reaches a prompt.
         assert_eq!(
             union & crate::grants::UNSERVED_VERB_BITS,
             0,
-            "VERB_CATALOGUE names a verb version 1 refuses at admission"
+            "VERB_CATALOGUE names a verb this core refuses at admission"
         );
         // The tripwire. `UNSERVED_VERB_BITS` is derived as `VALID_MASK &
         // !SERVED_VERB_BITS`, so asserting the two sets partition the mask
@@ -666,7 +667,10 @@ mod tests {
         // that happen silently.
         assert_eq!(
             crate::grants::UNSERVED_VERB_BITS,
-            Verb::OBSERVE_CURSOR.bits() | Verb::LAYOUT_ARRANGE.bits() | Verb::LAYOUT_FOCUS.bits(),
+            Verb::OBSERVE_CURSOR.bits()
+                | Verb::LAYOUT_ARRANGE.bits()
+                | Verb::LAYOUT_FOCUS.bits()
+                | Verb::REALM_LAUNCH.bits(),
             "the IDL defines a verb this module has not classified as served \
              or unserved (D-017/D-018)"
         );

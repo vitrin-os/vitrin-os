@@ -265,15 +265,18 @@ impl ResourceRef {
     }
 }
 
-/// The verb bits version 1 actually **serves** -- the exact set this core
-/// enforces at the chokepoint.
+/// The verb bits this core actually **serves** -- the exact set it
+/// enforces at the chokepoint. Deliberately not labelled by wire version:
+/// the served set is a property of *this build*, and it did not widen
+/// when the wire went from 1 to 2.
 ///
 /// The wire bitfield ([`Verb::VALID_MASK`]) is deliberately wider: D-017
 /// and D-018 define `observe_cursor`, `layout_arrange` and `layout_focus`
 /// from day one so the decided cursor and layout models are expressible
-/// before v0 freezes, and so a petition for one is a *recoverable*
-/// `unsupported` rather than an out-of-range bit that kills the
-/// connection. Nothing here implements them.
+/// before v0 freezes, and version 2 adds `realm_launch` on exactly the
+/// same terms -- so a petition for one is a *recoverable* `unsupported`
+/// rather than an out-of-range bit that kills the connection. Nothing
+/// here implements any of the four.
 ///
 /// Same posture as the durable persistence rungs, one rung up: those are
 /// **absent** from [`PersistenceRung`] so a row cannot hold one; these
@@ -285,7 +288,7 @@ impl ResourceRef {
 /// silently.
 pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4;
 
-/// The verb bits the IDL defines that version 1 does **not** serve. A
+/// The verb bits the IDL defines that this core does **not** serve. A
 /// petition naming any of these resolves `unsupported` -- whole, never
 /// narrowed to the served remainder (narrowing is the human's move at
 /// consent time, never a silent server-side edit).

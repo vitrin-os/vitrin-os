@@ -29,14 +29,14 @@ principal-facing interface (`vitrin_realm`, `vitrin_grant`, and the facets) desc
 principal. The handshake object itself is never derived from a grant and never goes inert; only the
 connection's death ends it.
 
-The human principal has **no wire presence** in version 1: host input in nested mode is the
+The human principal has **no wire presence** at any version yet: host input in nested mode is the
 implicit human, and only agents handshake. There is no `hello` for humans and no interface through
 which one authenticates.
 
 ## Lifecycle
 
 `vitrin_handshake` is object 1 on every principal connection, implicit at connect. It is never
-minted by a message and never destroyed by one — version 1 defines no destructors. It lives for the
+minted by a message and never destroyed by one — no version defines destructors. It lives for the
 entire connection and is torn down only when the connection closes (whether after an `error` event,
 after `auth_failed`, or by ordinary disconnect).
 
@@ -75,16 +75,16 @@ Two properties of the machine are load-bearing for security:
   requests pipelined behind a `hello` that **succeeds** are queued and then served after `bound`.
   They were *sent* before the handshake completed yet are deliberately not dropped, because the
   security property the criterion protects is zero pre-BOUND **execution**, not zero pre-BOUND
-  bytes. The queue rule scopes to requests outside the handshake exchange itself: in version 1
-  the exchange is `hello` alone; a later version's proof-of-possession response request is part
-  of the exchange and is processed inside VERIFYING (see [Growth](#growth)).
+  bytes. The queue rule scopes to requests outside the handshake exchange itself: at both
+  defined versions the exchange is `hello` alone; a later version's proof-of-possession response
+  request is part of the exchange and is processed inside VERIFYING (see [Growth](#growth)).
 - **The unauthenticated phase is bounded in time.** The server SHOULD impose a
   deployment-configurable deadline on every unauthenticated interval spent waiting on the
   client. A connection that exhausts the deadline — nothing sent, or a partial frame dribbled —
   is closed **administratively**: no `error` event, because nothing was violated; the close is
-  indistinguishable from an ordinary disconnect. In version 1 the client-attributable interval
-  is exactly CONNECTED: once a complete `hello` has arrived, remaining VERIFYING time is the
-  server's own verifier latency. A later version's proof-of-possession exchange keeps the
+  indistinguishable from an ordinary disconnect. At both defined versions the client-attributable
+  interval is exactly CONNECTED: once a complete `hello` has arrived, remaining VERIFYING time is
+  the server's own verifier latency. A later version's proof-of-possession exchange keeps the
   deadline armed inside VERIFYING while the server awaits the client's response (see
   [Growth](#growth)); a BOUND connection may idle indefinitely (e.g. awaiting a pending consent
   resolution).
@@ -105,7 +105,7 @@ hello(version: uint, principal: new_id<vitrin_principal>, identity: string, cred
 
 | arg | type | description |
 | --- | --- | --- |
-| `version` | uint | The protocol version this connection will speak — the **negotiated version**. A version the server does not implement (above its maximum) is fatal `version_unsupported`. |
+| `version` | uint | The protocol version this connection will speak — the **negotiated version**. Two versions are defined, `1` and `2`; a version the server does not implement is fatal `version_unsupported`. Offer the highest your client speaks — and read [what this server actually accepts](#what-the-shipped-core-accepts-today) before hard-coding `1`. |
 | `principal` | new_id → [`vitrin_principal`](./02-vitrin_principal.md) | The principal object pre-allocated by this request and bound on success. |
 | `identity` | string | The claimed identity URI, SPIFFE-shaped (e.g. `vitrin://local/agent/demo`). Max 2048 bytes — the SPIFFE-ID maximum (a 255-byte trust domain plus path). |
 | `credential_type` | string | Credential scheme discriminator naming how `credential` is interpreted (e.g. `static-token`, `spiffe-jwt-svid`, `oidc`, `ssh-cert`). Max 32 bytes. |
@@ -113,8 +113,8 @@ hello(version: uint, principal: new_id<vitrin_principal>, identity: string, cred
 
 `hello` is the only pre-authentication message: **credential presentation is folded into `hello`**
 rather than split across an exchange, so the whole handshake is one client message and one server
-terminal — one round trip, no partially-authenticated wire state between them. Version 1's
-credential schemes are bearer-shaped (a pre-shared token under D5; JWT-SVID/OIDC tokens are the
+terminal — one round trip, no partially-authenticated wire state between them. Every credential
+scheme defined so far is bearer-shaped (a pre-shared token under D5; JWT-SVID/OIDC tokens are the
 same shape), so nothing needs a server turn before the credential can be presented;
 proof-of-possession schemes that do need one arrive as an appended exchange in a later version
 (see [Growth](#growth)). `hello` presents the credential to the core's **pluggable verifier** and
@@ -124,7 +124,19 @@ carries is the verifier-canonical value, **not** an echo of the `identity` strin
 
 The version accepted here becomes the connection's **negotiated version** for its whole life:
 messages introduced by a later `since` are not defined on the connection, and using one is fatal
-`invalid_opcode` (see [version semantics](./00-conventions.md#73-version-semantics)).
+`invalid_opcode` (see [version semantics](./00-conventions.md#73-version-semantics)). Concretely,
+the three messages version 2 appended — [`vitrin_grant.get_launcher`](./04-vitrin_grant.md) and
+[`vitrin_launcher`](./16-vitrin_launcher.md)'s `launch` and `launched` — are undefined on a
+connection that negotiated `1`, so sending `get_launcher` there is fatal `invalid_opcode`. Version 2
+changes nothing else: every version-1 signature is byte-identical at version 2, which is why a
+client that speaks 1 needs no new code to speak 2 beyond the integer it offers.
+
+One thing is deliberately **not** version-gated: a **verb bit**. `request_grant`'s `verbs` bitfield
+is a single mask, validated identically on every negotiated version, so a version-1 connection may
+petition for `realm_launch` (512) and is answered a recoverable `resolved(unsupported)` rather than
+killed. That asymmetry — messages gated, verb bits not — is stated once in
+[conventions § 7.3](./00-conventions.md#73-version-semantics) and is the whole reason a bit is
+defined before it is served.
 
 Checks run in a **fixed order**: frame grammar first (fatal decode errors as usual), then the
 `version` integer, then — only for a version-accepted `hello` — credential verification.
@@ -154,13 +166,15 @@ close. There is no `hello`-specific event on `vitrin_handshake` itself.
 **Failure modes (all fatal — the connection dies):**
 
 - `version_unsupported` — the server does not implement the offered `version`. Because growth is
-  strictly additive, a server implements every version up to its maximum, so this means the
-  client offered a version **above the server's maximum** (in version 1 exactly one version
-  exists, so acceptance degenerates to an exact match). Downgrade is refusal, not negotiation:
-  the server never counters with a different version and the error carries no supported-version
-  hint (`error.message` is never machine-parsed); a newer client willing to speak an older
-  version reconnects offering a lower integer — convergence by descending reoffer, bounded by
-  the client's own maximum.
+  strictly additive, a server implements every version up to its maximum, so this normatively
+  means the client offered a version **above the server's maximum**. Downgrade is refusal, not
+  negotiation: the server never counters with a different version and the error carries no
+  supported-version hint (`error.message` is never machine-parsed); a newer client willing to
+  speak an older version reconnects offering a lower integer — convergence by descending reoffer,
+  bounded by the client's own maximum. On the shipped core the reoffer walk terminates
+  immediately, because that core accepts only its maximum: an offer *below* it is refused with
+  this same code (see [what the shipped core accepts
+  today](#what-the-shipped-core-accepts-today)), so descending from 2 to 1 finds nothing.
 - `auth_failed` — the credential was rejected (unknown identity, bad token, verifier failure, or
   `SO_PEERCRED` mismatch — never distinguished on the wire; see below).
 - `invalid_object` — the `new_id` for `principal` violated id allocation rules (at or below the
@@ -170,6 +184,22 @@ close. There is no `hello`-specific event on `vitrin_handshake` itself.
 
 There are **no recoverable refusals** of `hello`: a rejected credential is a client-known failure
 (the client chose the credential), so it is fatal, not an event on a living connection.
+
+#### What the shipped core accepts today
+
+> **Implementation status, stated rather than implied.** Everything above describes the
+> *protocol*: a server whose maximum is N implements every version from 1 to N, so a maximum-2
+> server serves 1 and 2 alike. The shipped `vitrind` **does not do this yet**. It accepts exactly
+> its maximum and refuses every other integer, so today it serves **version 2 alone** and answers
+> a version-1 `hello` with fatal `version_unsupported` — the inverse of what a reader of the
+> rules above would predict, which is why it is written here rather than left to be discovered.
+> Serving both concurrently needs a per-connection version matrix (which opcodes a connection may
+> send, which events it may receive); that work is P2.1.2's, and half of it would be worse than
+> none — a version-1 connection able to reach a `since="2"` opcode. Refusing is the fail-closed
+> answer until the matrix lands. Nothing outside this repo speaks version 1, so the gap costs no
+> deployed client. **Write your client to offer `2`.** The same note, from the normative side, is
+> in [conventions § 7.3](./00-conventions.md#73-version-semantics); the single site that decides
+> it is `crates/vitrin-core/src/principal.rs`'s `handle_hello`.
 
 #### What a refused handshake reveals (identity-probing resistance)
 
@@ -236,9 +266,10 @@ error(object_id: uint, code: uint, message: string)
 | `message` | string | Free-form debugging text. Never machine-parsed. |
 
 `error` is the connection-fatal error channel for a principal connection. `object_id` names where
-the fault occurred; `code` is namespaced by that object's interface `error` enum — and in version 1
-the only interface that defines an `error` enum is this one, so **every fatal code is
-connection-global**. `message` is human-facing debug text and MUST NOT be parsed by clients; for
+the fault occurred; `code` is namespaced by that object's interface `error` enum — and at both
+defined versions this is the only interface that defines an `error` enum (version 2 added an
+interface but no second enum), so **every fatal code is connection-global**. `message` is
+human-facing debug text and MUST NOT be parsed by clients; for
 `auth_failed` it is a fixed, cause-free phrase (see
 [identity-probing resistance](#what-a-refused-handshake-reveals-identity-probing-resistance)).
 
@@ -299,13 +330,14 @@ later versions append entries and mark deprecations, never renumber (see
 
 Direction key: **A→C** agent→core, **C→A** core→agent. Sequences are corrected for the final XML
 shapes (`bound` is on [`vitrin_principal`](./02-vitrin_principal.md); `hello` gained the
-`credential_type` discriminator).
+`credential_type` discriminator). Every flow below offers `version=2`, the current maximum and
+[the only integer the shipped core accepts](#what-the-shipped-core-accepts-today).
 
 ### Flow 1 — Successful handshake (walking skeleton, opening steps)
 
 ```
 1. [A connects to $XDG_RUNTIME_DIR/vitrin-0/core.sock; core records SO_PEERCRED at accept]
-2. A→C  vitrin_handshake.hello(version=1, principal=new_id, identity="vitrin://local/agent/demo",
+2. A→C  vitrin_handshake.hello(version=2, principal=new_id, identity="vitrin://local/agent/demo",
                                credential_type="static-token", credential=<token bytes>)
 3. C→A  vitrin_principal.bound(identity=<verifier-canonical identity>)
         — verifier checked the credential; the pre-allocated principal is now live
@@ -317,7 +349,7 @@ the principal to obtain realms and petition for grants.
 ### Flow 2 — Pipelining across verification
 
 ```
-2. A→C  vitrin_handshake.hello(version=1, principal=new_id, identity=…, credential_type=…, credential=…)
+2. A→C  vitrin_handshake.hello(version=2, principal=new_id, identity=…, credential_type=…, credential=…)
 3. A→C  vitrin_principal.get_realm(realm=new_id, name="realm-0")     [queued during verification]
 4. A→C  vitrin_realm.request_grant(…)                                [queued during verification]
 5. C→A  vitrin_principal.bound(identity=…)                            [verification succeeded]
@@ -347,13 +379,22 @@ Pre-handshake traffic:
   A→C  <any non-hello message before hello>
   C→A  vitrin_handshake.error(object_id=1, code=pre_handshake, message="…")   → close
 
-Version mismatch (this version-1 server's maximum is 1):
-  A→C  vitrin_handshake.hello(version=2, …)
+Version above the server's maximum (the normative case; here the maximum is 2):
+  A→C  vitrin_handshake.hello(version=3, …)        [3 is undefined; any integer > the maximum is the same]
   C→A  vitrin_handshake.error(object_id=1, code=version_unsupported, message="…")   → close
-        — a client willing to speak version 1 reconnects and offers the lower integer
+        — no supported-version hint; a client that also speaks 2 reconnects and offers the
+          lower integer, and on this server that reoffer succeeds
+
+Version below the server's maximum (implementation status, not the protocol's rule):
+  A→C  vitrin_handshake.hello(version=1, …)
+  C→A  vitrin_handshake.error(object_id=1, code=version_unsupported, message="…")   → close
+        — normatively a maximum-2 server implements 1 as well; the shipped core accepts only
+          its maximum, so offering 1 is refused with the same fatal code. Descending reoffer
+          therefore does NOT converge below 2 here. See "what the shipped core accepts today"
+          above; closing this gap is P2.1.2's version matrix, not a wire change
 
 Bad credential (any cause — unknown identity, bad token, verifier failure, peercred mismatch):
-  A→C  vitrin_handshake.hello(version=1, …, credential=<rejected>)
+  A→C  vitrin_handshake.hello(version=2, …, credential=<rejected>)
   C→A  vitrin_handshake.error(object_id=1, code=auth_failed, message="authentication refused")   → close
         — same code, same fixed phrase for every cause; the cause is logged server-side only
 
@@ -374,22 +415,30 @@ Every seam below is purely additive under the protocol's Wayland-style growth ru
 appended with `since` attributes, enum entries are appended with immutable values, and existing
 message signatures never change (see [versioning](./00-conventions.md)).
 
+The `since="2"` markers below were written when 2 was the next unclaimed version. **Version 2 has
+since landed and carried none of them** — it appended only the launch facet
+([conventions Appendix A](./00-conventions.md#appendix-a--additive-safety-table)) — so each marker
+now names *the first version that lands that seam*, whichever integer that turns out to be. Nothing
+about the seams themselves changes: the mechanism, and the reason each is purely additive, are what
+this list records.
+
 - **fd-borne credential sibling (`since="2"`).** `hello`'s `credential` string is capped by the
   single-frame limit. A future fd-carrying sibling request lets credentials that exceed one frame
   (large certificate chains) arrive out of band. `hello` itself stays frozen; the new message is the
   escape hatch, not a changed signature.
 - **New credential families.** The `credential_type` discriminator already lets new schemes be
   introduced without any wire change — only the verifier learns to interpret new bytes.
-- **Proof-of-possession credential exchange (`since="2"`).** Version 1 schemes are bearer-shaped,
-  which is what lets the whole handshake be a single `hello`. A scheme whose `credential_type`
-  demands proof of possession (e.g. X.509-SVID with a private-key challenge) arrives as an
+- **Proof-of-possession credential exchange (`since="2"`).** Every scheme defined so far is
+  bearer-shaped, which is what lets the whole handshake be a single `hello`. A scheme whose
+  `credential_type` demands proof of possession (e.g. X.509-SVID with a private-key challenge) arrives as an
   appended server-driven exchange inside VERIFYING — a new challenge event plus a new response
   request on this interface. The exchange is part of the handshake itself: the response request
   is exempt from the queued-until-BOUND rule (which scopes to requests outside the handshake
   exchange), and the unauthenticated deadline stays armed while the server awaits the client's
-  response. `hello` and `bound` stay frozen; version-1 connections and bearer schemes never see
-  the new messages.
-- **Interface-namespaced error codes.** In version 1 this interface owns the only `error` enum, so
-  all fatal codes are connection-global. When a later version gives another interface its own `error`
-  enum, `error.object_id` already routes the namespacing: `code` is read against the cited object's
-  interface. New `error` entries are appended with fixed values.
+  response. `hello` and `bound` stay frozen; connections at any version predating the exchange, and
+  bearer schemes at any version, never see the new messages.
+- **Interface-namespaced error codes.** This interface still owns the only `error` enum — version 2
+  added an interface but no second enum — so all fatal codes are connection-global. When a later
+  version gives another interface its own `error` enum, `error.object_id` already routes the
+  namespacing: `code` is read against the cited object's interface. New `error` entries are
+  appended with fixed values.

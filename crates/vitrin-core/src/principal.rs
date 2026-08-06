@@ -118,7 +118,8 @@
 //! (P1.4.4, issue #28).** The five co-minted objects enter the object
 //! table with their roles (the facets carrying their co-minted grant's
 //! wire id -- the chokepoint's key). Every facet request -- `capture_frame`,
-//! `move`, `button`, `scroll`, `type` -- is decoded here (grammar and
+//! `move`, `button`, `scroll`, `type`, and since version 2 `launch` -- is
+//! decoded here (grammar and
 //! argument validation stay connection-scoped: `type`'s forbidden-control-
 //! character rule is fatal `invalid_argument`, like the zero-verb rule),
 //! then handed as one [`UseKind`] to the **single enforcement function**,
@@ -128,9 +129,23 @@
 //! origin-tagged actuation intake). This module never answers an authority
 //! question itself -- no second enforcement voice exists, and
 //! [`enforcement`]'s single-path test greps this file to prove it.
-//! Requests on the grant and consent objects are fatal `invalid_opcode`
-//! (their interfaces define no requests in version 1 -- grammar, not
-//! authority).
+//!
+//! **The version-2 launch facet is minted here, not co-minted.**
+//! `request_grant`'s five `new_id` arguments are frozen forever, so
+//! [`get_launcher`](PrincipalServer::handle_get_launcher) is a structural
+//! mint **on the grant** -- the route every facet added after version 1
+//! must take. The mint is always legal (object-graph rules only: the
+//! live-object cap and the watermark rule, both fatal); the *use* is what
+//! refuses, and today it always does: `realm_launch` is unserved, so
+//! `launch` funnels through the same `serve_facet_use` as every other
+//! facet and comes back a recoverable `refused(realm_launch,
+//! not_granted)` with the connection intact. Answering the mint itself
+//! with `invalid_opcode` -- the shape this dispatch had before the facet
+//! existed -- would kill a conformant client for sending a documented
+//! request, which is the razor's fatal-vs-recoverable line exactly. Every
+//! *other* opcode on a grant, and every opcode at all on a consent
+//! object (which defines no requests at any version), stays fatal
+//! `invalid_opcode`: grammar, not authority.
 //!
 //! **Teardown contract.** The embedder MUST call
 //! [`teardown`](PrincipalServer::teardown) when the connection closes: it
@@ -220,6 +235,7 @@ use vitrin_protocol::generated::vitrin_grant as grant;
 use vitrin_protocol::generated::vitrin_grant::{Outcome, Persistence as WirePersistence, Verb};
 use vitrin_protocol::generated::vitrin_handshake as handshake;
 use vitrin_protocol::generated::vitrin_handshake::Error as WireError;
+use vitrin_protocol::generated::vitrin_launcher as launcher;
 use vitrin_protocol::generated::vitrin_principal as principal;
 use vitrin_protocol::generated::vitrin_realm as realm;
 use vitrin_protocol::generated::vitrin_view as view;
@@ -269,6 +285,17 @@ pub(crate) const MAX_LIVE_REALMS: usize = 16;
 /// `resource_exhausted`, confining the DoS to the offending connection.
 pub(crate) const MAX_LIVE_PETITIONS: usize = 256;
 
+/// Cap on launch facets per connection -- the live-object cap's
+/// `get_launcher` half. The IDL permits minting a second, equivalent
+/// facet on the same grant (no destructors, ids never reused, each
+/// checked against the same grant at use time, so a duplicate confers no
+/// authority); what bounds the repetition is this cap, and the IDL says
+/// so. Derived rather than invented: a compliant client needs exactly one
+/// launcher per grant, and a connection can hold no more grants than
+/// [`MAX_LIVE_PETITIONS`]. Breach is fatal `resource_exhausted`, the same
+/// denial-of-service confinement every other bound uses.
+pub(crate) const MAX_LIVE_LAUNCHERS: usize = MAX_LIVE_PETITIONS;
+
 /// Burst capacity of the per-connection petition-rate token bucket (the
 /// conventions' "server-side petition-rate ceiling"; breach is fatal
 /// `resource_exhausted`). A compliant client sends a handful of petitions
@@ -291,8 +318,16 @@ pub(crate) const PETITION_REFILL_PER_SEC: u32 = 1;
 pub(crate) enum PrincipalViolation {
     /// `pre_handshake`: parsed traffic before a first `hello`.
     PreHandshake { object_id: u32, opcode: u8 },
-    /// `version_unsupported`: `hello` offered a version above this
-    /// server's maximum (exactly [`PROTOCOL_VERSION`] in version 0).
+    /// `version_unsupported`: `hello` offered a version this server does
+    /// not implement. The protocol reserves the code for a version
+    /// **above** the server's maximum (conventions section 7.3: additive
+    /// growth means a maximum-N server implements 1..=N), but this core
+    /// accepts exactly [`PROTOCOL_VERSION`] and nothing else, so it also
+    /// raises this for version 1 -- *below* the maximum. That divergence
+    /// is the disclosed gap in conventions section 7.3's implementation-
+    /// status note, not a second reading of the code's meaning; the
+    /// wire-visible behavior is identical either way (fatal, no
+    /// supported-version hint).
     VersionUnsupported { offered: u32 },
     /// `auth_failed`: the verifier did not bind the credential. Uniform on
     /// the wire; the fields exist for the server log only and never carry
@@ -684,6 +719,12 @@ enum ObjectKind {
     Pointer { grant: u32 },
     /// The text facet (see [`ObjectKind::View`]).
     Text { grant: u32 },
+    /// The launch facet (see [`ObjectKind::View`]), minted **on** the
+    /// grant by `get_launcher` rather than co-minted by `request_grant`,
+    /// whose five `new_id` arguments are frozen forever. Inert on exactly
+    /// the same terms as the co-minted three: it carries its grant's wire
+    /// id and nothing else, and the chokepoint judges every use.
+    Launcher { grant: u32 },
 }
 
 /// A grant handle's lifecycle on the wire: born pending, flipped exactly
@@ -778,6 +819,11 @@ pub(crate) struct PrincipalServer {
     /// [`MAX_LIVE_PETITIONS`] (never decremented: version 1 has no
     /// destructors, so every petition's five objects are permanent).
     petition_count: usize,
+    /// Launch facets ever minted on this connection, against
+    /// [`MAX_LIVE_LAUNCHERS`] -- `get_launcher` is the one mint a bound
+    /// principal can repeat on an object it already holds, so it needs
+    /// the same bound `get_realm` has.
+    launcher_count: usize,
     /// Petition-rate token bucket: remaining burst tokens.
     petition_tokens: u32,
     /// The bucket's refill anchor (the instant up to which refill has been
@@ -808,6 +854,7 @@ impl PrincipalServer {
             objects: BTreeMap::new(),
             realm_count: 0,
             petition_count: 0,
+            launcher_count: 0,
             petition_tokens: PETITION_RATE_BURST,
             petition_refill_anchor: None,
             chokepoint: Chokepoint::new(),
@@ -949,11 +996,19 @@ impl PrincipalServer {
                                 Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
                             }
                         },
-                        // vitrin_grant and vitrin_consent define no
-                        // requests in version 1: any opcode on them is
-                        // grammar (invalid_opcode), never an authority
-                        // judgement.
-                        ObjectKind::Grant(_) | ObjectKind::Consent => {
+                        // vitrin_grant carries exactly one request, the
+                        // since="2" structural mint `get_launcher`; every
+                        // other opcode on it, and every opcode at all on
+                        // vitrin_consent (which defines no requests at any
+                        // version), is grammar (invalid_opcode), never an
+                        // authority judgement.
+                        ObjectKind::Grant(_) => match opcode {
+                            grant::requests::GetLauncher::OPCODE => self.handle_get_launcher(msg),
+                            _ => {
+                                Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
+                            }
+                        },
+                        ObjectKind::Consent => {
                             Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
                         }
                         // Facet use (module docs): decode is grammar and
@@ -1069,6 +1124,20 @@ impl PrincipalServer {
                                     ctx,
                                     send,
                                 )
+                            }
+                            _ => {
+                                Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
+                            }
+                        },
+                        ObjectKind::Launcher { grant } => match opcode {
+                            launcher::requests::Launch::OPCODE => {
+                                let (_, _req) =
+                                    launcher::requests::Launch::decode(&msg.bytes, msg.fd)
+                                        .map_err(|source| PrincipalViolation::Malformed {
+                                            object_id,
+                                            source,
+                                        })?;
+                                self.serve_facet_use(object_id, grant, UseKind::Launch, ctx, send)
                             }
                             _ => {
                                 Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
@@ -1204,9 +1273,23 @@ impl PrincipalServer {
         let (_, hello) = handshake::requests::Hello::decode(&msg.bytes, msg.fd)
             .map_err(|source| PrincipalViolation::Malformed { object_id, source })?;
         if hello.version != PROTOCOL_VERSION {
-            // Additive growth: this server implements exactly wire version
-            // 1, so any other offer (a later version, or the never-issued
-            // integer 0) is a version it does not implement.
+            // This core accepts **exactly** its maximum
+            // ([`PROTOCOL_VERSION`], 2 today) and refuses every other
+            // integer -- a later version, the never-issued 0, and also
+            // version 1, which is *below* the maximum.
+            //
+            // Refusing 1 is a deliberate, disclosed gap rather than the
+            // protocol's rule: conventions section 7.3 says a server
+            // whose maximum is N implements every version from 1 to N,
+            // and its "Implementation status" note records that the
+            // shipped core does not yet do so. Serving 1 and 2
+            // concurrently needs a per-connection version matrix (which
+            // messages each connection may send, which events it may
+            // receive); that is P2.1.2's deliverable, and inventing half
+            // of it here would leave a version-1 connection able to reach
+            // `since="2"` opcodes. Refusing is the honest fail-closed
+            // answer until the matrix lands; nothing outside this repo
+            // speaks version 1, so it costs no deployed client.
             return Err(PrincipalViolation::VersionUnsupported {
                 offered: hello.version,
             }
@@ -1290,6 +1373,46 @@ impl PrincipalServer {
         self.objects
             .insert(req.realm, ObjectKind::Realm { name: req.name });
         self.realm_count += 1;
+        Ok(())
+    }
+
+    /// `vitrin_grant.get_launcher` (since version 2): a structural mint,
+    /// exactly like `get_realm` and like `request_grant`'s co-minted
+    /// facets -- no reply, no refusal, no wire acknowledgement.
+    ///
+    /// **The mint is always legal; the use is what refuses.** This
+    /// request is defined for every grant whatever verbs it holds and
+    /// whether or not it has resolved, because mint-freely-and-check-at-
+    /// use is the pattern the co-minted facets already establish, and
+    /// because refusing at mint time would turn the mint into an
+    /// authority oracle -- it would tell the petitioner something about
+    /// its own pending petition that only `resolved` may say. The facet
+    /// is born inert and every `launch` is judged at the single
+    /// enforcement chokepoint, which today refuses `not_granted` on all
+    /// of them: `realm_launch` is not in
+    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no row
+    /// can carry the bit.
+    ///
+    /// Only the object-graph rules can fail here: the live-object cap
+    /// ([`MAX_LIVE_LAUNCHERS`]) and the watermark rule, both fatal.
+    fn handle_get_launcher(&mut self, msg: Message) -> Result<(), PrincipalFault> {
+        // The request's target object *is* the grant (dispatch resolved
+        // it to an `ObjectKind::Grant` before calling), so the facet's
+        // chokepoint key is the frame's own object id -- no second
+        // lookup, and no way for the two to disagree.
+        let object_id = msg.header.object_id;
+        let (_, req) = grant::requests::GetLauncher::decode(&msg.bytes, msg.fd)
+            .map_err(|source| PrincipalViolation::Malformed { object_id, source })?;
+        // The cap precedes the mint (the `get_realm` precedent): no
+        // version defines destructors, so every launcher is a permanent
+        // per-connection allocation.
+        if self.launcher_count >= MAX_LIVE_LAUNCHERS {
+            return Err(PrincipalViolation::ResourceExhausted("live-launcher cap exceeded").into());
+        }
+        self.allocate_id(req.launcher)?;
+        self.objects
+            .insert(req.launcher, ObjectKind::Launcher { grant: object_id });
+        self.launcher_count += 1;
         Ok(())
     }
 
@@ -2464,8 +2587,16 @@ pub(crate) mod tests {
         );
         let err = expect_error(&mut client, WireError::VersionUnsupported);
         assert_eq!(calls.get(), 0, "the verifier must never see the credential");
-        // No supported-version hint: downgrade is refusal, not negotiation.
-        assert!(!err.message.contains('1'));
+        // No supported-version hint: downgrade is refusal, not
+        // negotiation. Pinned to the maximum this build actually accepts
+        // rather than to a literal digit -- the assertion was written
+        // when that maximum was 1, and a literal would have kept passing
+        // while guarding nothing after the bump.
+        assert!(
+            !err.message.contains(&PROTOCOL_VERSION.to_string()),
+            "error.message must not name the server's maximum version: {:?}",
+            err.message
+        );
     }
 
     #[test]
@@ -4047,12 +4178,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn grant_and_consent_objects_define_no_requests() {
+    fn a_consent_defines_no_requests_and_a_grant_defines_only_get_launcher() {
         let _fd = crate::capture::tests::fd_lock();
-        // Any opcode on the co-minted grant or consent object is grammar
-        // (invalid_opcode), never an authority judgement.
+        // vitrin_consent defines no requests at any version, and
+        // vitrin_grant defines exactly one (opcode 0, `get_launcher`,
+        // since=2). Everything else on either object is grammar
+        // (invalid_opcode), never an authority judgement -- including
+        // opcode 0 on the consent object, which is `get_launcher`'s
+        // opcode on the *other* interface and must not be routed by
+        // number alone.
         let verifier = demo_verifier();
-        for object_id in [4u32, 5] {
+        for (object_id, opcode) in [(4u32, 1u8), (4, 9), (5, 0), (5, 1)] {
             let (mut server, mut core, mut client, mut shared) = setup();
             bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
             client
@@ -4064,7 +4200,7 @@ pub(crate) mod tests {
             vitrin_protocol::wire::FrameHeader {
                 object_id,
                 size: 0,
-                opcode: 0,
+                opcode,
                 fd_count: 0,
             }
             .encode_with_placeholder_size(&mut frame);
@@ -4076,6 +4212,253 @@ pub(crate) mod tests {
             );
             expect_error(&mut client, WireError::InvalidOpcode);
         }
+    }
+
+    // -- acceptance: the version-2 launch facet (WS-E.1.1, issue #207) -----
+
+    /// Encode one `get_launcher(launcher)` on the standard grant handle
+    /// (id 4) -- the version-2 structural mint.
+    fn get_launcher(launcher_id: u32) -> Vec<u8> {
+        grant::requests::GetLauncher {
+            launcher: launcher_id,
+        }
+        .encode(4)
+    }
+
+    /// Encode one `launch` on a launch facet.
+    fn launch(launcher_id: u32) -> Vec<u8> {
+        launcher::requests::Launch {}.encode(launcher_id)
+    }
+
+    #[test]
+    fn get_launcher_mints_an_inert_facet_and_never_kills_the_connection() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The regression this test exists for: before the facet was
+        // routed, EVERY opcode on a grant was fatal invalid_opcode, so a
+        // conformant client sending the newly-documented `get_launcher`
+        // had its socket killed. A structural mint answers nothing and
+        // must leave the connection alive (conventions §6: no terminal
+        // event, no wire acknowledgement).
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+        client.send_message(&get_launcher(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).expect("the mint is legal");
+        assert_eq!(
+            server.objects.get(&9),
+            Some(&ObjectKind::Launcher { grant: 4 }),
+            "the facet remembers its grant's wire id -- the chokepoint's key"
+        );
+        // Minting twice on the same grant is explicitly legal (IDL): a
+        // second, equivalent facet, conferring nothing extra.
+        client.send_message(&get_launcher(10), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).expect("a second mint");
+        assert_eq!(
+            server.objects.get(&10),
+            Some(&ObjectKind::Launcher { grant: 4 })
+        );
+        // The mint is silent and the connection is alive: `done` is the
+        // very next event on the wire.
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            11,
+        );
+    }
+
+    #[test]
+    fn minting_the_launch_facet_is_legal_before_the_petition_resolves() {
+        let _fd = crate::capture::tests::fd_lock();
+        // Mint-freely, check-at-use: refusing the mint while the petition
+        // is pending would make it an authority oracle, telling the
+        // petitioner something only `resolved` may say.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+
+        client.send_message(&get_launcher(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1)
+            .expect("the mint is legal on a pending grant");
+        assert_eq!(
+            server.objects.get(&9),
+            Some(&ObjectKind::Launcher { grant: 4 })
+        );
+        // ...and the inert facet refuses recoverably on use, exactly as
+        // the co-minted three do while pending.
+        client.send_message(&launch(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).expect("a launch is admitted");
+        expect_refused(&mut client, 4, Verb::REALM_LAUNCH, Refusal::NotGranted);
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            12,
+        );
+    }
+
+    #[test]
+    fn launching_an_unserved_verb_refuses_recoverably_and_leaves_the_socket_alive() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The staging `realm_launch` ships in: the bit is absent from
+        // SERVED_VERB_BITS, so no row can carry it and the chokepoint
+        // refuses every launch `not_granted`. Note *which* code: there is
+        // no `refused(verb, unsupported)` on the wire -- `unsupported` is
+        // a petition OUTCOME, and the refusal enum's `not_granted` entry
+        // covers "the verb is outside its effective set" by name. The
+        // property that matters is the razor's: a well-formed request the
+        // deployment will not serve is RECOVERABLE.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+        client.send_message(&get_launcher(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+
+        // Two launches, two refusals: a launch is reply-bearing, so its
+        // refusals are never coalesced (conventions §6.1), unlike an
+        // actuation's.
+        client.send_message(&launch(9), None).unwrap();
+        client.send_message(&launch(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 2)
+            .expect("launches are admitted");
+        expect_refused(&mut client, 4, Verb::REALM_LAUNCH, Refusal::NotGranted);
+        expect_refused(&mut client, 4, Verb::REALM_LAUNCH, Refusal::NotGranted);
+        assert!(
+            shared.actuations.is_empty(),
+            "a launch is not an actuation and reaches no seat"
+        );
+        // ALIVE: the fence is the assertion. It proves both that the
+        // connection survived and that no `launched` was queued behind
+        // the refusals.
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            13,
+        );
+    }
+
+    #[test]
+    fn petitioning_for_realm_launch_resolves_unsupported_without_dying() {
+        let _fd = crate::capture::tests::fd_lock();
+        // The other half of the staging, and where `unsupported` actually
+        // appears: the verb bit is in range (so not fatal
+        // invalid_argument) but unserved, so the whole petition resolves
+        // `unsupported` -- never narrowed to the served remainder.
+        // No consent transitions: an admission refusal never begins the
+        // prompt lifecycle, so `resolved` is the first event.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        let mut req = petition_frame();
+        req.verbs = all_verbs() | Verb::REALM_LAUNCH;
+        client.send_message(&req.encode(3), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        let resolved = expect_resolved(&mut client, 4);
+        assert_eq!(resolved.outcome, Outcome::Unsupported);
+        assert_eq!(
+            resolved.verbs.bits(),
+            0,
+            "a non-granted outcome carries no authority"
+        );
+
+        // A launcher minted on that grant is still legal to mint, and
+        // still refuses on use.
+        client.send_message(&get_launcher(9), None).unwrap();
+        client.send_message(&launch(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 2).unwrap();
+        expect_refused(&mut client, 4, Verb::REALM_LAUNCH, Refusal::NotGranted);
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            14,
+        );
+    }
+
+    #[test]
+    fn get_launcher_mints_under_the_watermark_rule() {
+        let _fd = crate::capture::tests::fd_lock();
+        // A structural mint's only failure mode is the object graph
+        // (conventions §3.1/§6): a `new_id` at or below the watermark is
+        // fatal invalid_object, exactly as `get_realm`'s is. The rig's
+        // watermark is 8 (the petition's fifth co-minted id).
+        let verifier = demo_verifier();
+        for bad_id in [8u32, 4, 1] {
+            let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+            client.send_message(&get_launcher(bad_id), None).unwrap();
+            expect_violation(
+                process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+                "invalid_object",
+            );
+            expect_error(&mut client, WireError::InvalidObject);
+        }
+    }
+
+    #[test]
+    fn launch_facets_are_bounded_by_the_live_object_cap() {
+        let _fd = crate::capture::tests::fd_lock();
+        // `get_launcher` is the one mint a bound principal can repeat on
+        // an object it already holds, so the IDL's "the per-connection
+        // live-object cap is what bounds it" needs a cap to be true.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+        for i in 0..MAX_LIVE_LAUNCHERS as u32 {
+            client.send_message(&get_launcher(9 + i), None).unwrap();
+        }
+        process_n(
+            &mut server,
+            &mut core,
+            &verifier,
+            &mut shared,
+            MAX_LIVE_LAUNCHERS,
+        )
+        .expect("every mint up to the cap is legal");
+        client
+            .send_message(&get_launcher(9 + MAX_LIVE_LAUNCHERS as u32), None)
+            .unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "live-launcher cap",
+        );
+        expect_error(&mut client, WireError::ResourceExhausted);
+    }
+
+    #[test]
+    fn unknown_opcodes_on_a_launch_facet_stay_grammar_errors() {
+        let _fd = crate::capture::tests::fd_lock();
+        // `launch` is opcode 0 and the interface defines nothing else, so
+        // opcode 1 is invalid_opcode -- grammar, like every other facet's.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+        client.send_message(&get_launcher(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        let mut frame = Vec::new();
+        vitrin_protocol::wire::FrameHeader {
+            object_id: 9,
+            size: 0,
+            opcode: 1,
+            fd_count: 0,
+        }
+        .encode_with_placeholder_size(&mut frame);
+        vitrin_protocol::wire::patch_size(&mut frame);
+        client.send_message(&frame, None).unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "invalid_opcode",
+        );
+        expect_error(&mut client, WireError::InvalidOpcode);
     }
 
     // -- acceptance: the enforcement chokepoint (P1.4.4, issue #28) --------

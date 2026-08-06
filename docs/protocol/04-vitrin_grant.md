@@ -1,6 +1,6 @@
 # vitrin_grant — capability handle and enforcement voice
 
-**Interface version:** 1 · **Connection class:** principal · **Messages:** 0 requests + 2 events
+**Interface version:** 2 · **Connection class:** principal · **Messages:** 1 request *(since 2)* + 2 events
 
 ## Purpose
 
@@ -35,6 +35,13 @@ handle is not something the agent commands; it is something the agent observes.
 Authority is exercised through the facets, and the grant merely reports how the
 petition resolved and, thereafter, why any use was refused.
 
+Version 2 adds exactly one request, and it is not a command either:
+[`get_launcher`](#get_launcher) is a **structural mint** that hands back a
+facet. The grant still answers no authority question itself. This is where
+*every* facet added after version 1 must be minted, for one mechanical reason:
+`request_grant`'s five `new_id` arguments are frozen forever, so a sixth
+co-minted facet does not exist and never will.
+
 ## Lifecycle
 
 A grant is born **pending** by `vitrin_realm.request_grant`, conferring
@@ -63,8 +70,54 @@ MUST tolerate and discard them.
 Version 1 has **no grant persistence**: every grant dies with the connection,
 and there are no restore tokens (a future version's addition). A pending
 petition is withdrawn if the connection closes — consent is in-context, so the
-prompt disappears with the petitioner. Version 1 defines **no destructors** on
-this interface; see [Growth](#growth).
+prompt disappears with the petitioner. Neither version defines a **destructor**
+on this interface; see [Growth](#growth).
+
+## Requests
+
+### get_launcher
+
+`get_launcher(launcher: new_id)` — **since version 2**
+
+| arg | type | description |
+|---|---|---|
+| `launcher` | `new_id` → [`vitrin_launcher`](16-vitrin_launcher.md) | the launch facet, born **inert** |
+
+A **structural mint**: it creates the facet through which
+[`realm_launch`](#verb) is exercised, and nothing else. Like every structural
+mint it is neither reply-bearing nor refusable — no terminal event, no wire
+acknowledgement — and a malformed mint (an id at or below the watermark, in
+the server-reserved range, or otherwise illegal) is a fatal `invalid_object`,
+an object-graph error rather than an authority answer.
+
+**Minting is always legal.** The request is defined for every grant, whatever
+verbs it holds and whether or not it has resolved. That is deliberate and
+follows the pattern `request_grant`'s co-minted facets already establish: mint
+freely, check at use. A launcher minted from a grant without `realm_launch`
+refuses `not_granted` on its first `launch`; a launcher minted while the
+petition is still pending does the same. Neither is a protocol error, and
+neither leaks anything about the petition — refusing at mint time would make
+the mint an authority oracle, which is exactly what the inert-birth rule
+avoids.
+
+**Why here and not on `request_grant`.** `request_grant`'s five `new_id`
+arguments are frozen forever, like every message signature, so no facet added
+after version 1 can be co-minted. A mint on the grant that authorizes the
+facet is the documented route (see [Growth](#growth)); the layout facet is
+specified to arrive the same way.
+
+**Calling it twice** mints a second, equivalent facet. This is not a special
+case: no version defines a destructor, ids are never reused, and each minted
+object is checked against the *same* grant at use time, so a duplicate confers
+no additional authority. The per-connection live-object cap is what bounds it,
+and breaching that cap is fatal `resource_exhausted` like any other.
+
+**Version gating.** `get_launcher` is `since="2"`: it is not defined on a
+version-1 connection, where sending its opcode is fatal `invalid_opcode`. The
+[`realm_launch`](#verb) *verb bit*, by contrast, is not version-gated at all —
+a version-1 connection may name it in a petition and is answered
+`unsupported`, because a bitfield is one mask checked identically on every
+version (see [conventions § 7.3](00-conventions.md)).
 
 ## Events
 
@@ -156,10 +209,10 @@ it never escalates to a fatal error.
 Bitfield. The grantable verbs. Every entry has one SDK-level dotted name,
 formed by replacing the first underscore of the wire name with a dot:
 `observe`, `actuate.pointer`, `actuate.text`, `observe.cursor`,
-`layout.arrange`, `layout.focus`. The spelling is fixed by the IDL so a second
-implementation transcribing this enum has no name to invent.
+`layout.arrange`, `layout.focus`, `realm.launch`. The spelling is fixed by the
+IDL so a second implementation transcribing this enum has no name to invent.
 
-| entry | value | served in version 1 | meaning |
+| entry | value | served | meaning |
 |---|---|---|---|
 | `observe` | 0x1 | yes | capture frames of the granted resource |
 | `actuate_pointer` | 0x2 | yes | inject pointer motion, buttons, and scroll |
@@ -167,20 +220,41 @@ implementation transcribing this enum has no name to invent.
 | `observe_cursor` | 0x8 | **no** — resolves `unsupported` | capture frames that include the human principal's cursor; meaningful only alongside `observe` |
 | `layout_arrange` | 0x10 | **no** — resolves `unsupported` | place, resize, raise, and fullscreen the granted realm's views |
 | `layout_focus` | 0x20 | **no** — resolves `unsupported` | direct keyboard focus to a view of the granted realm |
+| `realm_launch` | 0x200 | **no** — resolves `unsupported` | launch the realm template this grant addresses into a new realm instance, through the [`vitrin_launcher`](16-vitrin_launcher.md) facet |
+
+`VALID_MASK` is therefore `0x23f` (575), not `0x7f`.
 
 This enum is the type of `request_grant`'s `verbs` argument, of
-`resolved.verbs`, and of `refused.verb`. The three version-1 verbs map
-one-to-one to a facet interface and to that interface's `@verb` annotation,
-which drives the scanner-generated chokepoint table. Later phases append
-entries (for example key actuation, credential presentation, subtree reads)
-without touching existing bits; values are immutable.
+`resolved.verbs`, and of `refused.verb`. Four verbs map one-to-one to a facet
+interface and to that interface's `@verb` annotation, which drives the
+scanner-generated chokepoint table. Later phases append entries (for example
+key actuation, credential presentation, subtree reads) without touching
+existing bits; values are immutable.
+
+#### The gap between 0x20 and 0x200 is allocation, not free space
+
+`realm_launch` is 512 rather than 64 because **64, 128 and 256 are already
+spoken for** — allocated to verbs (`designate_file`, `egress`,
+`publish_tree`) that have not landed in the IDL yet. Bits are allocated once,
+repo-wide, in `docs/plan/02-phase-2-semantic-epochs.md` §5, and anything
+adding a verb allocates there first, whatever document schedules the work.
+
+This matters because a verb value is **immutable once landed**: a collision is
+not a rename, it is two authorities permanently sharing one bit. Reading the
+IDL and taking the next unused-looking power of two is exactly how that
+happens — and it nearly did here, which is why the rule is written down rather
+than assumed.
+
+A reserved-but-undefined bit is still **out of range on the wire**, so
+petitioning for 64 today is fatal `invalid_argument`, not `unsupported`.
 
 #### Defined but unserved
 
-`observe_cursor`, `layout_arrange`, and `layout_focus` are defined on the wire
-from day one and **refused `unsupported`** by version 1 — the same posture the
-[`persistence`](#persistence) ladder takes toward its durable rungs. Two
-reasons, both structural:
+`observe_cursor`, `layout_arrange`, `layout_focus` and `realm_launch` are
+defined on the wire ahead of being served and **refused `unsupported`** — the
+same posture the [`persistence`](#persistence) ladder takes toward its durable
+rungs. The first three were defined from day one; `realm_launch` arrived with
+version 2 and ships in the same staged state. Two reasons, both structural:
 
 1. **An out-of-range bit is fatal.** A bitfield argument is validated as a
    mask, so a bit outside the defined union is `invalid_argument` and the
@@ -191,8 +265,12 @@ reasons, both structural:
 2. **The model would otherwise be unstateable.** Decisions D-017 and D-018
    settle that cursor visibility is *authority* rather than a display
    preference, and that scene arrangement is a *grant* rather than the shell's
-   ambient property. Neither is expressible without a verb, and adding one
-   after v0 freezes is a version bump against deployed clients.
+   ambient property. `realm_launch` settles the same kind of question for
+   process creation: starting an app is authority, so it is a verb rather than
+   a request on the authority-free realm handle, and the program it starts is
+   named by operator configuration rather than by the wire. None of that is
+   expressible without a verb, and adding one later is a version bump against
+   deployed clients.
 
 Two rules hold for every unserved verb:
 
@@ -210,7 +288,11 @@ construction: it widens what
 [`vitrin_view.capture_frame`](06-vitrin_view.md) composites rather than adding
 a request. The layout verbs' facet arrives as a `since`-gated mint on *this*
 interface, because `request_grant`'s five `new_id` arguments are frozen forever
-(see [Growth](#growth)).
+(see [Growth](#growth)). `realm_launch` **does** have one —
+[`vitrin_launcher`](16-vitrin_launcher.md), minted the same way by
+[`get_launcher`](#get_launcher) — so it is defined-but-unserved with the facet
+already on the wire rather than still pending: the deployment refuses the
+verb, not the mint.
 
 #### Verb composition
 
@@ -222,10 +304,17 @@ the rule directly above — a deployment MUST NOT grant a verb it does not
 enforce — and it settles the case the wire would otherwise leave open:
 `observe_cursor` is **not** an independent authority and is never
 inert-but-held. Every other verb (`observe`, `actuate_pointer`, `actuate_text`,
-`layout_arrange`, `layout_focus`) is independently petitionable. Version 1
+`layout_arrange`, `layout_focus`, `realm_launch`) is independently
+petitionable. Version 1
 refuses `observe_cursor` in any combination, so the rule is not yet
 distinguishable from the blanket unserved refusal; it is stated now because the
 enum entry is frozen now.
+
+`realm_launch` in particular does **not** imply `observe`. Authority to start
+an app is not authority to watch it, and an agent that wants both petitions
+for both — separately, so the human sees both. This is worth stating because
+the convenient shape (launching hands back an observable realm) is exactly the
+one that would smuggle observation in behind a single prompt.
 
 #### What no grant can purchase
 
@@ -307,9 +396,9 @@ This enum types `resolved.outcome`.
 ### refusal
 
 Use-time refusal codes, emitted by the enforcement chokepoint on every refused
-capture or actuation. Each code maps to a distinct typed SDK exception
-(NotGranted, GrantExpired, Revoked, RateLimited, Preempted, ConsentHeld,
-NoSurface, OperationFailed).
+*use* of a grant — capture, actuation and launch alike. Each code maps to a
+distinct typed SDK exception (NotGranted, GrantExpired, Revoked, RateLimited,
+Preempted, ConsentHeld, NoSurface, OperationFailed, AtCapacity).
 
 | entry | value | meaning |
 |---|---|---|
@@ -321,8 +410,50 @@ NoSurface, OperationFailed).
 | `consent_held` | 5 | the principal's **own** pending petition has a prompt up; that principal's actuation is refused (never delivered to the app) until the prompt closes — other principals' grants are unaffected |
 | `no_surface` | 6 | the realm has no surface (its shim crashed or exited); never a stale frame |
 | `internal` | 7 | server-side failure during this use (renderer, memfd, delivery) |
+| `capacity` | 8 | the deployment is at its realm capacity, so no new realm can be created |
 
 This enum types `refused.code`.
+
+**Why `capacity` is not `internal`.** `internal` means the server tried and
+something broke — a renderer, a memfd, a delivery path. A session at its realm
+limit is a **policy answer**: nothing failed, the deployment declines. Folding
+it into `internal` would make an agent retry a bug report and would make a
+real bug indistinguishable from a configured limit in the journal.
+`retry_after_ms` is 0, because the core cannot know when a realm will exit —
+this is not a rate limit wearing a different code, and an agent that treats it
+as one will spin.
+
+**Not every code is reachable by every verb.** `no_surface` answers "the realm
+has no live surface", which is the state `realm_launch` exists to leave, so a
+launch is never refused `no_surface`. `preempted` and `consent_held` are
+actuation-only and refuse neither a capture nor a launch. `capacity` concerns
+creating a realm and so reaches only `realm_launch`. A code's absence from a
+verb's reachable set is a property of the operation, never a promise the code
+is unused.
+
+**`capacity` is a cross-principal side channel, and the only one here.** Every
+other code in this table answers from the asking principal's *own* grant:
+whether it resolved, whether it expired, whether it was revoked, whether *its*
+bucket is empty, whether *its* realm has a surface. `capacity` answers from
+**deployment-wide** state. So a principal holding one launch grant can call
+[`launch`](16-vitrin_launcher.md#launch) on a timer and watch the answer flip
+between `capacity` and something else — learning that *some* other principal
+created or exited a realm. It learns no identity, no template, and no count;
+the leak is one bit, at whatever rate its `max_event_rate` allows.
+
+This is inherent to answering the question at all — "the deployment is full"
+is not a fact that can be scoped to one principal — so it is stated rather
+than fixed. Three consequences worth being explicit about:
+
+- **No attenuation removes it.** It is not a separate verb, so a narrower
+  launch grant still carries it; the only way to withhold it is to withhold
+  `realm_launch`.
+- **The rate ceiling is the only bound.** `max_event_rate` bounds the polling
+  frequency, hence the channel's bandwidth. It is not a fix.
+- **A deployment that cannot afford it must not serve the verb.** No
+  deployment serves `realm_launch` today, so the channel is currently
+  unreachable; this paragraph is what the first deployment to serve it has to
+  weigh, written now while the enum entry is being frozen rather than after.
 
 ## Flows
 
@@ -442,10 +573,28 @@ rules](00-conventions.md) guarantee.
   epoch. It pairs with clamped-coordinate stale-observation detection.
 - **New verbs.** Appended [`verb`](#verb) bits (for example key actuation,
   credential presentation, subtree reads) extend the bitfield without touching
-  existing bits.
+  existing bits. Bit *values* come from the repo-wide allocation registry, not
+  from the next unused-looking power of two — see [the gap between 0x20 and
+  0x200](#the-gap-between-0x20-and-0x200-is-allocation-not-free-space).
 - **Layout facet mint.** The `layout_arrange` and `layout_focus` verbs need a
   facet to be exercised through, and `request_grant`'s five `new_id` arguments
   are frozen. It therefore arrives as a `since`-gated **structural mint on this
   interface** (`get_layout(new_id)`), following the same mint-freely,
-  check-at-use pattern as the co-minted facets. Version 1 refuses both verbs
+  check-at-use pattern as the co-minted facets. Both verbs are refused
   `unsupported`, so there is nothing to mint yet.
+- **Launch facet mint — landed at version 2.**
+  [`get_launcher`](#get_launcher) is the first facet minted this way rather
+  than co-minted, and it is the worked example the layout mint follows: a
+  structural mint on the grant, an inert facet, and a verb
+  (`realm_launch`) that stays refused `unsupported` until a deployment serves
+  it. The row stays here because *how it arrived* is what the next seam
+  copies.
+
+## Version history
+
+| Version | Change |
+|---|---|
+| 1 | `resolved`, `refused`; no requests |
+| 2 | `get_launcher` (structural mint, request opcode 0); `verb` gains `realm_launch` = 512; `refusal` gains `capacity` = 8 |
+
+Neither version-1 event's signature changed, and no existing enum value moved.

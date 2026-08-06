@@ -1,10 +1,18 @@
 # Vitrin protocol — conventions (normative)
 
 This is the normative reference for the Vitrin OS wire protocol, version 0
-(the `hello`/document version integer is `1`). Every interface page links
-here; this page defines the rules those pages assume. Where this page and the
-IDL (`protocol/vitrin-v0.xml`) disagree, **the IDL wins** — its
-`<description>` text is the source of truth and this page restates it.
+(the `hello`/document version integer starts at `1` and is `2` today). Every
+interface page links here; this page defines the rules those pages assume.
+Where this page and the IDL (`protocol/vitrin-v0.xml`) disagree, **the IDL
+wins** — its `<description>` text is the source of truth and this page
+restates it.
+
+Two wire versions exist. Version 2 appends exactly three things — the
+`realm_launch` verb bit, the structural mint `vitrin_grant.get_launcher`, and
+the [`vitrin_launcher`](16-vitrin_launcher.md) interface it mints — and
+changes nothing else: every version-1 signature is byte-identical at version
+2. Statements below that say "version 1" are statements about version 1 and
+stay accurate; where version 2 differs, it is named.
 
 The words MUST, MUST NOT, SHOULD, and MAY are used in the RFC 2119 sense.
 
@@ -21,6 +29,12 @@ Interface pages:
 - [09 — vitrin_shim_session](09-vitrin_shim_session.md)
 - [10 — vitrin_shim_surface](10-vitrin_shim_surface.md)
 - [11 — vitrin_shim_seat](11-vitrin_shim_seat.md)
+- [16 — vitrin_launcher](16-vitrin_launcher.md) *(since version 2)*
+
+The gap from 11 to 16 is deliberate: pages 12–15 are allocated to interfaces
+that have not landed yet (`docs/plan/02-phase-2-semantic-epochs.md` §5), and
+taking an allocated number would be the collision that registry exists to
+prevent.
 
 ---
 
@@ -48,11 +62,17 @@ moving frames and input across the trust boundary.
   and confers nothing; **exactly one** `resolved` event decides its fate. A
   grant that later expires or is revoked goes **dead**.
 - **Facet** — a capability object (`vitrin_view`, `vitrin_actuator_pointer`,
-  `vitrin_actuator_text`) through which a granted verb is exercised. Facets
-  are **co-minted with the grant** and born **inert**: they confer nothing
+  `vitrin_actuator_text`, and since version 2 `vitrin_launcher`) through which
+  a granted verb is exercised. Facets are born **inert**: they confer nothing
   until the grant resolves `granted`, and every use is checked at a single
   server-side enforcement chokepoint. When the grant dies, its facets go
-  inert; their requests are **refused recoverably, never fatally**.
+  inert; their requests are **refused recoverably, never fatally**. The first
+  three are **co-minted with the grant** by `request_grant`; every facet added
+  after version 1 is instead minted **on the grant**, because
+  `request_grant`'s five `new_id` arguments are frozen forever —
+  `vitrin_launcher` is the first, minted by
+  [`get_launcher`](04-vitrin_grant.md#get_launcher). Inert birth and
+  check-at-use are identical either way.
 - **Consent** — the prompt-visibility lifecycle of exactly one petition,
   minted by `request_grant` and visible only to its petitioner. It carries no
   requests and no authority: the authoritative decision arrives on the grant
@@ -185,11 +205,14 @@ view by the trusted-band witness). No *human* cursor is composited: in nested
 operation the host desktop draws it, outside the realm view entirely. Delivery
 is a separate thing from drawing, and delivery has not changed: version 1 still
 delivers **one shared pointer position** per realm view to the shim, and
-per-principal delivery stays deferred to M2 (D-017, D-019). All three
-verbs — `observe_cursor`, `layout_arrange`, `layout_focus` — are defined on the
-wire and refused `unsupported`; see
-[§ defined but unserved](04-vitrin_grant.md#defined-but-unserved) for why
-defining them early is structural rather than cosmetic.
+per-principal delivery stays deferred to M2 (D-017, D-019). All three of the
+verbs this section governs — `observe_cursor`, `layout_arrange`,
+`layout_focus` — are defined on the wire and refused `unsupported`. They are
+not the whole unserved set: version 2's `realm_launch` takes the same staged
+posture for a different question, which is why
+[§ defined but unserved](04-vitrin_grant.md#defined-but-unserved) lists four
+verbs rather than these three. See it for why defining a verb early is
+structural rather than cosmetic.
 
 ---
 
@@ -265,6 +288,7 @@ Every `string` argument documents a maximum byte length. A violation is fatal
 | `vitrin_actuator_text.type` | `text` | 4096 |
 | `vitrin_shim_session.configure` | `realm` | 64 |
 | `vitrin_shim_seat.text` | `text` | 4096 |
+| `vitrin_launcher.launched` | `realm` | 64 (same bound as every other realm id, so it passes back through `get_realm` unchanged) |
 
 ### 2.4 The one-fd-per-message invariant
 
@@ -288,7 +312,7 @@ Object ids are **per-connection `u32` values**.
 | `0` | the **null** object; legal only for arguments marked `allow-null` |
 | `1` | the **bootstrap** object, implicit at connect, never created by a message (`vitrin_handshake` on principal connections, `vitrin_shim_session` on shim connections) |
 | `[2, 0xfeffffff]` | client-allocated ids |
-| `[0xff000000, 0xffffffff]` | reserved to the server; **unused in version 0** (no event carries a `new_id`, so the server never allocates) |
+| `[0xff000000, 0xffffffff]` | reserved to the server; **unused at every version so far** (no event carries a `new_id`, so the server never allocates — `vitrin_launcher.launched` names the realm it created by *string*, not by a server-allocated object) |
 
 ### 3.1 Watermark rule (strictly increasing, never reused)
 
@@ -312,9 +336,9 @@ Any violation is fatal `invalid_object`.
 
 ### 3.3 No destructors; inert objects; tolerate-dead events
 
-- **Zero destructors in version 0.** Objects live for the connection. There is
-  no `delete_id` machinery. Per-connection object population is bounded
-  (O(grants + facets)).
+- **Zero destructors at every version so far.** Objects live for the
+  connection. There is no `delete_id` machinery. Per-connection object
+  population is bounded (O(grants + facets)).
 - **Inert-object rule.** Objects derived from a grant become **inert** when the
   grant dies (expiry or revocation). Requests on inert objects are **refused
   recoverably** (`vitrin_grant.refused`), never fatally. This is the corollary
@@ -431,8 +455,13 @@ arguments carry the *effective* authority the human chose (which may be
 narrower than requested); on any other outcome they are zero.
 
 **Use-time refusals** — `vitrin_grant.refused(verb, code, retry_after_ms)` from
-the single enforcement chokepoint, covering capture and actuation alike.
-`retry_after_ms` is greater than zero only for `rate_limited`.
+the single enforcement chokepoint, covering capture, actuation and launch
+alike. `retry_after_ms` is greater than zero only for `rate_limited`.
+Which codes a given use can draw is not uniform: `preempted` and
+`consent_held` are actuation-only, `capacity` is launch-only, and a launch is
+never refused `no_surface` (a vacant realm is the state `realm_launch` exists
+to leave). The single voice is the invariant; the applicable set is per-verb
+and is stated on each facet's page.
 
 **Shim fallback** — `vitrin_shim_surface.buffer_done(buffer_id, status)` with a
 non-`released` status is the recoverable dmabuf-import-fallback path
@@ -462,6 +491,17 @@ success), so a blocking SDK can translate the wire directly.
 | `consent_held` (5) | `ConsentHeld` |
 | `no_surface` (6) | `NoSurface` |
 | `internal` (7) | `OperationFailed` |
+| `capacity` (8) | `AtCapacity` |
+
+`capacity` is reachable only through `realm_launch`: it says the deployment is
+at its realm limit, which is a **policy answer** rather than the server-side
+failure `internal` names. `retry_after_ms` is 0 — the core cannot know when a
+realm will exit — so it is not a rate-limit hint in disguise. It is also the
+one refusal answered from **deployment-wide** state rather than from the
+asking principal's own grant, and therefore a one-bit cross-principal side
+channel a launch grant cannot be attenuated out of; see
+[`vitrin_grant`](04-vitrin_grant.md#refusal) for the full statement and what a
+deployment has to weigh before serving the verb.
 
 ### 5.4 Backpressure deaths
 
@@ -479,11 +519,12 @@ Every request is **reply-bearing**, **fire-and-forget**, or a **structural
 mint**. This classification, together with the ordering guarantee (§4), is what
 lets the SDK stay single-threaded and blocking.
 
-The structural mints are `get_realm`, `create_surface`, and `get_seat`: the
-request only mints an object, so it is neither reply-bearing nor refusable —
-no terminal event, no wire acknowledgement. A malformed mint is a fatal
-object-graph error; a mint whose target is unknown or vacant surfaces that on
-first *use* (e.g. petitions resolving `unavailable`), never at mint time.
+The structural mints are `get_realm`, `create_surface`, `get_seat`, and (since
+version 2) `get_launcher`: the request only mints an object, so it is neither
+reply-bearing nor refusable — no terminal event, no wire acknowledgement. A
+malformed mint is a fatal object-graph error; a mint whose target is unknown
+or vacant surfaces that on first *use* (e.g. petitions resolving
+`unavailable`, or an inert facet refusing `not_granted`), never at mint time.
 
 ### 6.1 Reply-bearing requests
 
@@ -493,12 +534,16 @@ first *use* (e.g. petitions resolving `unavailable`), never at mint time.
 | `vitrin_handshake.sync` | `vitrin_handshake.done` |
 | `vitrin_realm.request_grant` | `vitrin_grant.resolved` (delivered when the petition resolves — exempt from cross-request order, §4) |
 | `vitrin_view.capture_frame` | `vitrin_view.frame_ready` **or** `vitrin_grant.refused(observe, …)` |
+| `vitrin_launcher.launch` *(since 2)* | `vitrin_launcher.launched` **or** `vitrin_grant.refused(realm_launch, …)` |
 
 **Exactly-one-terminal rule.** Every reply-bearing request receives **exactly
 one** terminal event, in request order (petition resolution excepted — §4), and
 such terminals are **never
 coalesced**. For `capture_frame` the one-of pairing is forced by the type
 system: `fd` arguments have no null form, so failure must be a distinct event.
+`launch`'s pairing is the same shape for a different reason: a realm id has no
+"no realm" value that would not also be a legal id, so failure is again a
+distinct event rather than a sentinel string.
 
 ### 6.2 Fire-and-forget requests
 
@@ -640,19 +685,52 @@ negotiation: the server never counters with a different version and the
 refusal carries no supported-version hint (`error.message` is never
 machine-parsed); a newer client willing to speak an older version reconnects
 offering a lower integer — convergence by descending reoffer, bounded by the
-client's own maximum. In version 0 (wire integer `1`) exactly one version
-exists, so acceptance degenerates to an exact match.
+client's own maximum.
+
+**The two versions, and what separates them.** Version 1 is the original wire.
+Version 2 appends the `realm_launch` verb bit, `vitrin_grant.get_launcher`,
+and `vitrin_launcher`'s `launch`/`launched` — nothing else. A version-1
+connection is served exactly as before: it never sees a `since="2"` event, and
+sending a `since="2"` opcode on it is fatal `invalid_opcode`. One thing is
+deliberately *not* version-gated: a **verb bit**. The `verb` bitfield is a
+single mask checked identically on every negotiated version, so a version-1
+connection may petition for `realm_launch` and is answered `unsupported`
+rather than killed — which is the entire reason a bit is defined before it is
+served (§5.1's razor: a well-formed request the deployment will not serve is
+recoverable).
+
+> **Implementation status, stated rather than implied.** The rule above binds
+> the *protocol*. The shipped core does not yet implement it: `vitrind`
+> accepts exactly its maximum version and refuses everything else, so today it
+> serves version 2 alone and answers a version-1 `hello` with fatal
+> `version_unsupported`. That is a gap between this document and the
+> implementation, not a second reading of the document — serving 1 and 2
+> concurrently is WS-E.1.1's core half and has not landed. Nothing outside the
+> repo speaks version 1, so the gap costs no deployed client; it is recorded
+> here so nobody reads "a server whose maximum is N implements every version
+> from 1 to N" as a description of what runs today.
 
 ### 7.4 Growth rules (Wayland-style)
 
 - **New messages** are appended with `since` attributes. Opcodes are implicit
   document order; **requests and events are numbered separately from 0**.
 - **Enum entries** are appended (values are immutable; a `deprecated-since`
-  mark never removes).
+  mark never removes). Entries carry **no `since`**: an enum's wire validation
+  is one mask or membership table with no version dimension, so a
+  version-gated entry would be accepted at every version regardless — the
+  scanner rejects `since` on an `enum` or `entry` for exactly that reason.
 - **A message signature is immutable forever** — extension is a *new* message,
   never a changed one.
 - **Interface `version`** carries per-interface growth; the protocol-level
-  version integer governs the wire/handshake compatibility.
+  version integer governs the wire/handshake compatibility. A message's
+  `since` names the **protocol document's** version integer, not the
+  interface's own counter — every seam in Appendix A is a `since="2"` message
+  on an interface whose own `version` was 1 when the seam was written.
+- **A verb bit's value is allocated once, repo-wide, and is immutable.** The
+  gap between 32 and 512 in the `verb` bitfield is reserved allocation, not
+  free space: a bit absent from the IDL may still be spoken for. The registry
+  is `docs/plan/02-phase-2-semantic-epochs.md` §5, and anything adding a verb
+  allocates there first, whatever document schedules the work.
 
 ---
 
@@ -696,11 +774,19 @@ The dialect adds exactly two attributes beyond the Wayland shape:
 | Attribute | Where | Why |
 |---|---|---|
 | `protocol/@version` (`positiveInteger`) | root element | single source of truth for the `hello` version integer |
-| `interface/@verb` ∈ {`observe`, `actuate_pointer`, `actuate_text`} | `vitrin_view`, `vitrin_actuator_pointer`, `vitrin_actuator_text` | declares that **every request on the interface exercises the named grant verb**; the scanner derives the enforcement chokepoint's `(interface, opcode) → required-verb` table from it |
+| `interface/@verb` ∈ {`observe`, `actuate_pointer`, `actuate_text`, `realm_launch`} | `vitrin_view`, `vitrin_actuator_pointer`, `vitrin_actuator_text`, `vitrin_launcher` | declares that **every request on the interface exercises the named grant verb**; the scanner derives the enforcement chokepoint's `(interface, opcode) → required-verb` table from it |
 
 `@verb` is the codegen chokepoint: one attribute per capability interface
 generates the single-site authority check, so there is no second enforcement
 location to keep in sync.
+
+The `@verb` value set is **closed by the schema**, so widening it is a
+**dialect** change: `protocol/vitrin-v0.rng` moves in the same commit as the
+IDL, and `xmllint --relaxng` gates the pair. The set tracks the
+*facet-bearing* verbs, not the whole `verb` bitfield — `observe_cursor`,
+`layout_arrange` and `layout_focus` have no interface to annotate, so naming
+one here is rejected by the schema (`protocol/test-mutations.sh` covers both
+directions: an invented verb name and a real-but-facetless one).
 
 ### 8.3 Scanner lints
 
@@ -720,11 +806,14 @@ Beyond schema validation, the CI scanner enforces:
 
 Every version-2+ growth seam named in the IDL is listed with its arrival
 mechanism and why it is **purely additive** (no existing signature changes, no
-existing behavior breaks). Version 0 ships none of these; they exist as
-documented seams so the wire never changes shape when they arrive.
+existing behavior breaks). Version 1 shipped none of these; they exist as
+documented seams so the wire never changes shape when they arrive. A seam that
+has **landed** says so in its row and stays in the table — the row is the
+record of *how* it arrived, which is what a later seam copies.
 
 | Seam | Arrival mechanism | Why purely additive |
 |---|---|---|
+| **realm launch** *(landed at version 2)* | new `since="2"` structural mint on `vitrin_grant` (`get_launcher`), a new `vitrin_launcher` interface carrying reply-bearing `launch` + terminal `launched`, a new `realm_launch` verb bit (512), and a new `capacity` entry on `refusal` | `request_grant`'s five `new_id` arguments are frozen, so the facet is minted on the grant instead — the same route the layout facet is documented to take. The verb bit appends without touching existing bits and the refusal entry appends without touching existing values. Nothing on `vitrin_realm` changed: launch is a **grant verb**, never a request on the authority-free realm handle, because holding a *name* must not confer the power to start a process. The command never crosses the wire — `launch` has no arguments; the realm names a template and the template names the program — so a launch grant is authority over operator-written configuration, never over an arbitrary command line |
 | `grant.release` + tombstone rule | new `since="2"` destructor request on `vitrin_grant` | new opcode appended; the tombstone rule (clients discard events to released ids) is the existing tolerate-dead-events rule (§3.3) applied to a new id state — no signature changes |
 | `revoked` push + `resolved`-exactly-once pinning | new `since="2"` event on `vitrin_grant` | `resolved` still fires exactly once ever; `revoked` is a *different* event and `refused` remains the enforcement-bearing signal, so no existing event double-fires |
 | `attenuate` (narrower child grants) | new `since="2"` request minting a child grant | new opcode + new co-minted ids follow the existing multi-`new_id` rule; parent grant unchanged |
@@ -740,7 +829,7 @@ documented seams so the wire never changes shape when they arrive.
 | capture streaming | new `since="2"` sibling messages on `vitrin_view` (a subscription request and its frame-push event, appended after the poll pair) | `capture_frame`/`frame_ready` stay valid forever; refusals still voice through `vitrin_grant.refused`, and each pushed frame carries one fd, so the one-fd rule holds |
 | realm enumeration events | new `since="2"` events on `vitrin_realm` | `vitrin_realm` is authority-free and carries no version-0 events; multi-realm phases add enumeration/lifecycle here instead of re-plumbing addressing |
 | drag intents | new `since="2"` sibling requests on `vitrin_actuator_pointer` | intent-level motion (drag with duration/easing, interpolated server-side) is added beside `move`/`button`/`scroll`, which stay valid forever |
-| `actuate_key` verb | new appended entry in the `verb` bitfield + a later key-actuation facet | version-0 verb bits are untouched; a new power-of-two bit and its facet are additive |
+| `actuate_key` verb | new appended entry in the `verb` bitfield + a later key-actuation facet | version-0 verb bits are untouched; a new power-of-two bit and its facet are additive — see the landed `realm_launch` row for the shape, including that the bit's *value* comes from the repo-wide allocation registry rather than from the next unused-looking power of two |
 | serving `observe_cursor` | no new message: the verb bit already exists and widens what the *existing* `frame_ready` composites for a grant that holds it | version 0 refuses the verb `unsupported`, so beginning to serve it changes no signature and no version-0 client's behavior (a client that never petitions for it sees nothing new) |
 | layout facet | new `since="2"` structural mint on `vitrin_grant` (`get_layout`), exercising the already-defined `layout_arrange`/`layout_focus` bits | `request_grant`'s five `new_id` arguments are frozen, so the facet cannot be co-minted; a mint on the grant follows the existing structural-mint class (no terminal event, not refusable) and the verbs are refused `unsupported` until it lands |
 | per-principal pointer delivery | new `since="2"` sibling events on `vitrin_shim_seat` that name the principal alongside the coordinates | `motion`/`button`/`scroll` signatures are immutable, so delivery grows by sibling; each new event still ends with `origin`, satisfying B2 structurally, and a v0-only shim keeps working |
@@ -763,7 +852,14 @@ named here so their absence is understood as a decision, not an omission:
   mechanism.
 - **Network** — the protocol is local (Unix domain sockets); no remoting.
 - **Multi-realm** — exactly one well-known realm (`realm-0`); realm enumeration
-  and lifecycle are later phases.
+  and lifecycle are later phases. Version 2 puts realm *creation* on the wire
+  as the `realm_launch` verb and the [`vitrin_launcher`](16-vitrin_launcher.md)
+  facet, but **serves neither yet**: the verb is admitted and refused
+  `unsupported`, exactly as `observe_cursor` and the layout verbs are. What is
+  decided now, and would otherwise be unstateable, is the *shape* — launch is
+  an attenuable grant verb rather than a request on the realm handle, and the
+  program name is never on the wire. Enumeration, lifecycle events, and
+  stopping a realm remain absent at any verb set.
 - **Powerbox** — no system-mediated resource picker; petitions name resources
   by a type-prefixed string vocabulary.
 - **Wallet** — no credential/secret storage or presentation verb.

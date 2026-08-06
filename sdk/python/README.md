@@ -118,12 +118,18 @@ VitrinError
 │   └── GrantUnsupported ─ Busy                      (one per outcome, §5.3)
 └── GrantRefused                vitrin_grant.refused (use-time, recoverable)
     ├── NotGranted ─ GrantExpired ─ Revoked ─ RateLimited ─
-    └── Preempted ─ ConsentHeld ─ NoSurface ─ OperationFailed  (one per code, §5.3)
+    ├── Preempted ─ ConsentHeld ─ NoSurface ─ OperationFailed ─
+    └── AtCapacity                                       (one per code, §5.3)
 ```
 
 The mapping is exhaustive by construction (module-level assertions in
 `errors.py`, plus a test): every fatal code, every petition outcome, and
-every refusal code maps to exactly one distinct exception class.
+every refusal code maps to exactly one distinct exception class. `AtCapacity`
+is the wire's `capacity` (8), added at version 2 and reachable only through
+`realm_launch` — which no deployment serves yet, so nothing raises it today.
+It is carried anyway, for the reason the whole hierarchy exists: an unmapped
+refusal code is a `ServerContractViolation`, so omitting it would turn a
+recoverable refusal into a fatal client-side error the day the verb is served.
 
 ## Test-vector sharing (decision)
 

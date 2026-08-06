@@ -515,7 +515,13 @@ impl ActuationDetail {
     /// chokepoint keeps knowing nothing about a log existing.
     pub fn of(kind: &UseKind) -> Option<Self> {
         match kind {
-            UseKind::Capture => None,
+            // A capture has a `frame` instead; a launch has no payload at
+            // all -- `vitrin_launcher.launch` takes no arguments, which is
+            // the security property rather than an economy (the template
+            // names the program and no command ever crosses the wire), so
+            // there is nothing for the log to summarize beyond the verb
+            // the `use_decision` entry already names.
+            UseKind::Capture | UseKind::Launch => None,
             UseKind::Pointer(input) | UseKind::Text(input) => match input {
                 // The wire carries `i32` and the intake widens it, so the
                 // narrowing is exact for every value that can reach here.
@@ -1380,11 +1386,13 @@ fn write_peer(out: &mut String, peer: PeerCred) {
 /// machines): a reader never has to infer one from the other, and an
 /// unknown future bit is still visible in `verbs_bits`.
 ///
-/// Every verb the IDL defines is named here, including the ones version 1
-/// refuses `unsupported` at admission (D-017/D-018) -- a journal entry for a
-/// refused petition must say *what was asked for*, and "a defined verb
-/// rendered as no name at all" is exactly the audit gap this pair of fields
-/// exists to close.
+/// Every verb the IDL defines is named here, including the ones this core
+/// refuses `unsupported` at admission (D-017/D-018, plus `realm_launch`) -- a
+/// journal entry for a refused petition must say *what was asked for*, and "a
+/// defined verb rendered as no name at all" is exactly the audit gap this pair
+/// of fields exists to close. Appending a verb to the IDL means appending it
+/// here in the same change; the unserved-set catalogue test in
+/// [`crate::consent::render`] is what notices a new bit at all.
 fn write_verbs(out: &mut String, verbs: Verb) {
     key(out, "verbs");
     out.push('[');
@@ -1396,6 +1404,7 @@ fn write_verbs(out: &mut String, verbs: Verb) {
         (Verb::OBSERVE_CURSOR, "observe_cursor"),
         (Verb::LAYOUT_ARRANGE, "layout_arrange"),
         (Verb::LAYOUT_FOCUS, "layout_focus"),
+        (Verb::REALM_LAUNCH, "realm_launch"),
     ] {
         if verbs.contains(bit) {
             if named > 0 {
@@ -1456,6 +1465,11 @@ fn refusal_label(code: Refusal) -> &'static str {
         Refusal::ConsentHeld => "consent_held",
         Refusal::NoSurface => "no_surface",
         Refusal::Internal => "internal",
+        // Reachable only through `realm_launch`, which this core does not
+        // serve yet -- the label exists because the match is deliberately
+        // exhaustive (an appended IDL code must fail the build here rather
+        // than journal as something else), not because anything emits it.
+        Refusal::Capacity => "capacity",
     }
 }
 

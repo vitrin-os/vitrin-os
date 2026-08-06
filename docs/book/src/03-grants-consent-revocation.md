@@ -31,8 +31,10 @@ A row in the core's grant table:
   requester afterwards.
 - **resource** — what. A realm, or a specific surface within it.
 - **verbs** — which actions. `observe`, `actuate.pointer`, `actuate.text`
-  today; `observe.cursor` and the two `layout.*` verbs are defined but
-  refuse `unsupported` in version 1.
+  today; four more are defined but refuse `unsupported` — `observe.cursor`,
+  the two `layout.*` verbs, and `realm.launch` (added at wire version 2).
+  Defining a verb before serving it is deliberate: it makes asking for one a
+  recoverable refusal instead of a fatal out-of-range bit.
 - **constraints** — under what limits: expiry, event-rate ceiling, focus
   conditions, persistence.
 

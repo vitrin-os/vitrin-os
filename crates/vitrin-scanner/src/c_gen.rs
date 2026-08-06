@@ -171,12 +171,28 @@ fn header_contents(protocol: &Protocol) -> Result<String> {
         "/* The `{}` protocol's single wire version integer (`protocol/@version`); */",
         protocol.name
     ));
-    buf.line("/* also the first argument of vitrin_handshake's hello request. An exact */");
-    buf.line("/* match is required -- downgrade is refusal, not negotiation. */");
+    buf.line("/* also the first argument of vitrin_handshake's hello request, whose */");
+    buf.line("/* accepted value becomes the connection's negotiated version. A server */");
+    buf.line("/* implements every version up to its maximum and refuses anything above */");
+    buf.line("/* it -- downgrade is refusal, not negotiation. */");
     buf.line(format!(
         "#define VITRIN_PROTOCOL_VERSION {}u",
         protocol.version
     ));
+
+    buf.blank();
+    let message_count: usize = protocol
+        .interfaces
+        .iter()
+        .map(|i| i.requests.len() + i.events.len())
+        .sum();
+    buf.line("/* Total number of messages (requests + events) across every interface. */");
+    buf.line("/* Exists so exhaustiveness can be *asserted* rather than assumed: a C */");
+    buf.line("/* translation unit enumerating every message (shim/tests/ */");
+    buf.line("/* test_header_compiles.c) checks its own list length against this with */");
+    buf.line("/* _Static_assert, so a message added to the IDL cannot ship without a */");
+    buf.line("/* compile-time proof that its marshal functions type-check. */");
+    buf.line(format!("#define VITRIN_MESSAGE_COUNT {message_count}"));
 
     buf.blank();
     buf.line("/* ==================================================================== */");
@@ -750,6 +766,10 @@ fn gen_c_message(
         "#define {macro_prefix}_HAS_FD {}",
         i32::from(has_fd)
     ));
+    buf.line("/* First protocol version at which this message is defined (`message/@since`); */");
+    buf.line("/* this opcode is not defined on a connection whose negotiated version is    */");
+    buf.line("/* lower, where using it is fatal `invalid_opcode`.                          */");
+    buf.line(format!("#define {macro_prefix}_SINCE {}u", msg.since));
     buf.blank();
 
     gen_c_encode(buf, protocol, msg, &type_name, &macro_prefix, &base);

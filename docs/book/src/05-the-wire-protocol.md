@@ -145,12 +145,12 @@ retry helps, because the bug is in your client.
 try something else.
 
 `not_granted` · `grant_expired` · `revoked` · `rate_limited` · `preempted` ·
-`consent_held` · `no_surface` · `operation_failed`
+`consent_held` · `no_surface` · `operation_failed` · `at_capacity`
 
 The line is: *did the client send something incoherent, or did a coherent
 request get refused?* Setting an out-of-range verb bit is incoherent —
 fatal. Asking for a verb the core does not serve is coherent — refused,
-`unsupported`. This is exactly why the Python SDK carries the three
+`unsupported`. This is exactly why the Python SDK carries the four
 defined-but-unserved verbs: an SDK that omitted them would turn a
 recoverable refusal into a dead socket.
 
@@ -167,8 +167,11 @@ Wayland-style. Interfaces grow by appending messages and appending enum
 values; existing opcodes never change meaning. The negotiated version comes
 out of the handshake, and each side serves only what that version defines.
 
-Version 0 is frozen for Phase 1 — **not forever**. Phase 2 brings semantic
-trees and epoch/CAS action semantics. Expect to move.
+Version 0 is frozen for Phase 1 — **not forever**. The wire integer is now
+**2**: it appends the `realm_launch` verb, `vitrin_grant.get_launcher`, and
+the `vitrin_launcher` interface, and changes nothing else — every version-1
+signature is byte-identical at version 2. Phase 2 brings semantic trees and
+epoch/CAS action semantics. Expect to move.
 
 ## Validating your understanding
 

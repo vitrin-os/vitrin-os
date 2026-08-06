@@ -21,6 +21,38 @@ between the authority chain (principal → grant → facets) and the composition
 model (realm view → shim surface). In version 1 there is a single well-known
 realm, `realm-0`.
 
+### Launching is deliberately not a request here
+
+Starting an app is authority, and this handle has none. A `launch` request on
+`vitrin_realm` would make **holding a name** confer the power to start a
+process — the exact thing "naming is not authority" denies, and a shape no
+attenuation could later undo, since a message signature is immutable forever.
+
+Launch is instead the grant verb
+[`realm_launch`](./04-vitrin_grant.md#verb), exercised through the
+[`vitrin_launcher`](./16-vitrin_launcher.md) facet that
+[`vitrin_grant.get_launcher`](./04-vitrin_grant.md#get_launcher) mints. Going
+through a grant is what would buy consent, expiry, revocation, journaling and
+the rate ceiling with no new machinery: a launch petition is the shape that
+puts a prompt naming the principal and the template in front of the human, and
+that ties the authority's death to the grant's.
+
+**Served status.** No such prompt happens today, and none can: `realm_launch`
+is defined but **unserved**, like `observe_cursor` and the layout verbs, so a
+petition naming it is refused `unsupported` at admission — before a prompt
+exists to show. What is decided now is the *design*; what is served is
+nothing. See [defined but
+unserved](./04-vitrin_grant.md#defined-but-unserved).
+
+A realm handle *is* still how such a petition is addressed — it names a realm
+**template** rather than a live realm, and `launch` creates an instance from
+it. The template names the program, so no command ever crosses the wire.
+Choosing *which* program to run is therefore done by petitioning over a
+different realm, in front of the human at consent time, rather than by an
+argument after the fact. A template is addressable but never itself paints: an
+`observe` grant over one refuses `no_surface` forever, which is authority over
+nothing rather than authority over something dangerous.
+
 The interface is deliberately minimal. It exists in the protocol from day one
 so that later multi-realm phases can add enumeration and lifecycle **events**
 to *this* interface — additively, behind `since` attributes — instead of
@@ -174,7 +206,9 @@ that are **defined on [`vitrin_grant`](./04-vitrin_grant.md)** and documented
 there:
 
 - `verbs` uses the bitfield [`vitrin_grant.verb`](./04-vitrin_grant.md#verb)
-  (`observe` = 1, `actuate_pointer` = 2, `actuate_text` = 4).
+  (`observe` = 1, `actuate_pointer` = 2, `actuate_text` = 4, plus the
+  defined-but-unserved `observe_cursor` = 8, `layout_arrange` = 16,
+  `layout_focus` = 32 and `realm_launch` = 512).
 - `persistence` uses the enum
   [`vitrin_grant.persistence`](./04-vitrin_grant.md#persistence) (`once` = 0,
   `while_running` = 1, `until_revoked` = 2, `always` = 3).
@@ -258,6 +292,20 @@ additive-safety appendix on the [conventions page](./00-conventions.md)):
 - **Additional resource granularities.** The type-prefixed `resource`
   vocabulary (`surface:…`, `node:…`) grows by version without a new request;
   unserved prefixes resolve `unsupported` today.
+- **New facets, minted elsewhere.** A verb added after version 1 cannot get a
+  co-minted facet, because `request_grant`'s five `new_id` arguments are
+  frozen. It arrives as a `since`-gated structural mint on
+  [`vitrin_grant`](./04-vitrin_grant.md) instead —
+  [`get_launcher`](./04-vitrin_grant.md#get_launcher) is the first, landed at
+  version 2, and the layout facet is documented to follow the same route. This
+  interface is untouched by any of it.
 
 None of these change `request_grant`'s existing signature or the meaning of any
 existing argument.
+
+## Version history
+
+| Version | Change |
+|---|---|
+| 1 | `request_grant`; no events |
+| 2 | *(none — this interface is unchanged at version 2; `realm_launch` is a grant verb, not a request here)* |

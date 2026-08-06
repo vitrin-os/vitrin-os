@@ -60,25 +60,37 @@ fn invalid_enum_value_is_rejected() {
 
 #[test]
 fn invalid_bitfield_value_is_rejected() {
-    // `vitrin_grant.verb` is a bitfield with VALID_MASK 1|2|4|8|16|32 = 63;
-    // bit 64 is reserved for a future verb and out of range today. Bits 8, 16
-    // and 32 (`observe_cursor`, `layout_arrange`, `layout_focus`) are DEFINED
-    // but not served by version 1 -- that is a petition-time `unsupported`
-    // resolution, deliberately not a decode error, so the codec must accept
-    // them (D-017/D-018).
-    assert_eq!(gen::vitrin_grant::Verb::VALID_MASK, 63);
-    let err = gen::vitrin_grant::Verb::from_bits(64).unwrap_err();
-    assert_eq!(
-        err,
-        DecodeError::InvalidBitfieldValue {
-            interface: "vitrin_grant",
-            enum_name: "verb",
-            value: 64,
+    // `vitrin_grant.verb` is a bitfield with VALID_MASK 1|2|4|8|16|32|512 =
+    // 575. Bits 8, 16, 32 and 512 (`observe_cursor`, `layout_arrange`,
+    // `layout_focus`, `realm_launch`) are DEFINED but not served -- that is a
+    // petition-time `unsupported` resolution, deliberately not a decode
+    // error, so the codec must accept them (D-017/D-018).
+    //
+    // The 64/128/256 gap is not free space: those bits are allocated (to
+    // `designate_file`, `egress`, `publish_tree`) but not yet defined in the
+    // IDL, so today they are still out of range and fatal. That is exactly
+    // why `realm_launch` took 512 rather than the next unused-looking bit.
+    assert_eq!(gen::vitrin_grant::Verb::VALID_MASK, 575);
+    for reserved in [64u32, 128, 256] {
+        let err = gen::vitrin_grant::Verb::from_bits(reserved).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::InvalidBitfieldValue {
+                interface: "vitrin_grant",
+                enum_name: "verb",
+                value: reserved,
+            }
+        );
+    }
+    // every subset of the defined bits, including all of them together, is
+    // legal -- enumerated as (low six bits) x (bit 512 present or not) rather
+    // than a flat `0..=575` range, which would sweep through the reserved
+    // bits above.
+    for low in 0..=63u32 {
+        for high in [0u32, 512] {
+            gen::vitrin_grant::Verb::from_bits(low | high)
+                .expect("every subset of defined bits is valid");
         }
-    );
-    // every subset of the defined bits, including all of them together, is legal
-    for v in 0..=63u32 {
-        gen::vitrin_grant::Verb::from_bits(v).expect("every subset of defined bits is valid");
     }
 
     // ... and through the generated decode: `resolved` carries `verbs` as its

@@ -14,8 +14,11 @@ import enum
 
 # protocol/@version — the wire version integer offered in hello. The "v0"
 # in the document family's name is the spec generation; the wire integer
-# starts at 1 (the schema forbids 0).
-PROTOCOL_VERSION = 1
+# starts at 1 (the schema forbids 0) and is 2 today. Version 2 appends the
+# realm_launch verb, vitrin_grant.get_launcher and the vitrin_launcher
+# interface; every version-1 signature is byte-identical at version 2, so
+# this SDK offering 2 changes nothing about the messages it already sends.
+PROTOCOL_VERSION = 2
 
 # --- object-id ranges (conventions section 3) ------------------------------
 
@@ -53,12 +56,17 @@ class ErrorCode(enum.IntEnum):
 class Verb(enum.IntFlag):
     """vitrin_grant.verb — the grantable verb bitfield.
 
-    The last three are *defined but unserved*: the IDL defines them from day
-    one and version 1 refuses them "unsupported". That distinction is the
-    whole reason they are here. An out-of-range bit is fatal
+    The last four are *defined but unserved*: the IDL defines them ahead of
+    the core serving them and refuses them "unsupported". That distinction
+    is the whole reason they are here. An out-of-range bit is fatal
     "invalid_argument" and kills the connection, so an SDK that omitted them
     would turn a recoverable refusal into a dead socket for any client that
     petitioned one.
+
+    The 64/128/256 gap is deliberate and must not be filled by guesswork:
+    those bits are allocated repo-wide to verbs the IDL does not define yet,
+    so they are still *out of range* and fatal. `realm_launch` took 512 for
+    exactly that reason.
     """
 
     OBSERVE = 1
@@ -67,6 +75,7 @@ class Verb(enum.IntFlag):
     OBSERVE_CURSOR = 8  # resolves "unsupported" in version 1
     LAYOUT_ARRANGE = 16  # resolves "unsupported" in version 1
     LAYOUT_FOCUS = 32  # resolves "unsupported" in version 1
+    REALM_LAUNCH = 512  # resolves "unsupported" until a deployment serves it
 
 
 # Every bit the IDL's verb enum defines. Petitioning a defined-but-unserved
@@ -78,11 +87,15 @@ VERB_MASK = int(
     | Verb.OBSERVE_CURSOR
     | Verb.LAYOUT_ARRANGE
     | Verb.LAYOUT_FOCUS
+    | Verb.REALM_LAUNCH
 )
 
-# Verbs this deployment's version 1 actually serves. The rest are refused
-# "unsupported", and a petition mixing served and unserved verbs is refused
-# whole — the core never silently narrows a verb set.
+# The verbs a deployment actually serves. Named for version 1 because that
+# is the version whose served set this is, and the set did not widen at
+# version 2 — `realm_launch` arrived defined-but-unserved, like the three
+# before it. The rest are refused "unsupported", and a petition mixing
+# served and unserved verbs is refused whole — the core never silently
+# narrows a verb set.
 VERBS_SERVED_IN_VERSION_1 = int(Verb.OBSERVE | Verb.ACTUATE_POINTER | Verb.ACTUATE_TEXT)
 
 # The SDK-level dotted names are these bits (per the IDL's verb enum text,
@@ -95,6 +108,7 @@ VERB_BY_DOTTED_NAME: dict[str, Verb] = {
     "observe.cursor": Verb.OBSERVE_CURSOR,
     "layout.arrange": Verb.LAYOUT_ARRANGE,
     "layout.focus": Verb.LAYOUT_FOCUS,
+    "realm.launch": Verb.REALM_LAUNCH,
 }
 
 
@@ -119,7 +133,15 @@ class Outcome(enum.IntEnum):
 
 
 class Refusal(enum.IntEnum):
-    """vitrin_grant.refusal — use-time refusal codes."""
+    """vitrin_grant.refusal — use-time refusal codes.
+
+    ``CAPACITY`` arrived with wire version 2 and is reachable only through
+    ``realm_launch``. It is here even though no deployment serves that verb
+    yet, for the same reason the unserved verb bits are: a code the SDK does
+    not know decodes to ``ServerContractViolation``, which is an accusation
+    that the *server* broke the contract — the wrong answer for a refusal
+    the IDL defines.
+    """
 
     NOT_GRANTED = 0
     EXPIRED = 1
@@ -129,6 +151,7 @@ class Refusal(enum.IntEnum):
     CONSENT_HELD = 5
     NO_SURFACE = 6
     INTERNAL = 7
+    CAPACITY = 8
 
 
 class ConsentState(enum.IntEnum):

@@ -63,7 +63,7 @@ Each capture passes the grant's single enforcement chokepoint. Captures are rate
 | `no_surface` | the realm has no surface (its shim crashed or exited) — a refusal, never a stale frame |
 | `internal` | server-side failure during this capture (renderer, memfd, delivery) |
 
-Two refusal codes are deliberately absent from this table: `preempted` and `consent_held` are **actuation-only** and never refuse a capture. Observation is concurrent with physical input by design (concurrent observers are a documented non-error — [conventions § delivery classification](00-conventions.md)), and the consent overlay is never part of the realm view, so there is nothing a pending prompt would need to hide from capture.
+Three refusal codes are deliberately absent from this table. `preempted` and `consent_held` are **actuation-only** and never refuse a capture: observation is concurrent with physical input by design (concurrent observers are a documented non-error — [conventions § delivery classification](00-conventions.md)), and the consent overlay is never part of the realm view, so there is nothing a pending prompt would need to hide from capture. `capacity` (added at version 2) is **launch-only** — it answers "this deployment is at its realm limit", which no capture can ever provoke; see [`vitrin_launcher`](16-vitrin_launcher.md).
 
 (Fatal errors — bad opcode, an unsolicited fd, a foreign object id — belong to the framing and object-graph layers documented in [conventions § error taxonomy](00-conventions.md), not to `capture_frame`'s semantics.)
 

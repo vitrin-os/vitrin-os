@@ -219,6 +219,10 @@ from vitrin_os import (NotGranted, GrantExpired, Revoked, RateLimited,
 | `NoSurface` | Nothing to act on yet. | Yes, cheaply. |
 | `OperationFailed` | The core tried and could not. | Maybe. |
 
+There is a ninth, `AtCapacity`, and it is missing from the list above on
+purpose: it is only ever produced by `realm_launch`, which no deployment
+serves, so an actuation can never see it.
+
 `Revoked` and `Preempted` are the two that matter for behaving well. Both
 mean a human intervened, and an agent that hammers through them is exactly
 the failure mode this project exists to make structurally impossible — so it

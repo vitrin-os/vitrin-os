@@ -12,12 +12,15 @@
 //! the alternative is a confusing compile error deep inside generated code,
 //! or worse, generated marshal code that is silently wrong on the wire.
 //!
-//! It also *rejects* (rather than silently drops) the RNG dialect's
-//! version-growth vocabulary -- `since`, `deprecated-since`,
-//! `type="destructor"` -- which the conventions doc plans for version 2 but
-//! no backend implements yet. Accepting-and-ignoring those attributes would
-//! emit a `since="2"` message as an unconditional version-1 one with zero
-//! warnings, which is exactly the failure mode this module exists to prevent.
+//! It parses `since` **on requests and events** into the IR, and both
+//! backends emit it as a per-message constant, so a server can gate a
+//! later-`since` opcode on the connection's negotiated version. The rest of
+//! the RNG dialect's version-growth vocabulary -- `deprecated-since`
+//! anywhere, `since` on an `enum` or `entry`, `type="destructor"` -- is
+//! still *rejected* rather than silently dropped, because no backend
+//! implements it. Accepting-and-ignoring one of those attributes would emit
+//! the item as an unconditional version-1 one with zero warnings, which is
+//! exactly the failure mode this module exists to prevent.
 
 use std::sync::LazyLock;
 
@@ -80,8 +83,38 @@ pub fn parse(xml: &str) -> Result<Protocol> {
 
     validate_enum_refs(&protocol)?;
     validate_interface_refs(&protocol)?;
+    validate_since(&protocol)?;
 
     Ok(protocol)
+}
+
+/// Every message's `since` must name a version the document actually
+/// defines: at least 1 (version 0 of the wire integer does not exist -- the
+/// schema forbids it) and at most `protocol/@version`. A `since` above the
+/// document version would describe a message no negotiated version can ever
+/// reach, which is a typo rather than a plan; catching it here is why the
+/// attribute is parsed rather than ignored.
+fn validate_since(protocol: &Protocol) -> Result<()> {
+    for iface in &protocol.interfaces {
+        for (msg, kind) in iface
+            .requests
+            .iter()
+            .map(|m| (m, "request"))
+            .chain(iface.events.iter().map(|m| (m, "event")))
+        {
+            if msg.since == 0 || msg.since > protocol.version {
+                bail!(
+                    "interface '{}', {kind} '{}': since=\"{}\" is outside [1, {}] \
+                     (protocol/@version) -- no negotiated version could ever reach it",
+                    iface.name,
+                    msg.name,
+                    msg.since,
+                    protocol.version
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_interface(node: Node) -> Result<Interface> {
@@ -153,12 +186,18 @@ fn checked_opcode(iface_name: &str, kind: &str, index: usize) -> Result<u8> {
     })
 }
 
-/// Reject the RNG dialect's version-growth attributes until a backend
-/// actually implements them. Silently dropping `since="2"` would emit the
-/// item as an unconditional version-1 one -- see the module doc comment.
-fn reject_unsupported_growth_attrs(node: Node, what: &str) -> Result<()> {
-    for attr in ["since", "deprecated-since"] {
-        if let Some(v) = node.attribute(attr) {
+/// Reject the RNG dialect's version-growth attributes that no backend
+/// implements. Silently dropping one would emit the item as an
+/// unconditional version-1 one -- see the module doc comment.
+///
+/// `since` on a *message* is deliberately absent from every caller's list:
+/// it is implemented (see [`parse_since`]). `since` on an `enum` or `entry`
+/// is still rejected -- an enum's wire validation is a single mask/membership
+/// table with no version dimension, so a version-gated entry would be
+/// accepted at every version regardless of the attribute.
+fn reject_unsupported_growth_attrs(node: Node, what: &str, attrs: &[&str]) -> Result<()> {
+    for attr in attrs {
+        if let Some(v) = node.attribute(*attr) {
             bail!(
                 "{what} carries {attr}=\"{v}\": version-gated growth is not implemented \
                  by any codegen backend yet, and silently ignoring it would emit this \
@@ -167,6 +206,24 @@ fn reject_unsupported_growth_attrs(node: Node, what: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A message's `since`: the first protocol version at which the message is
+/// defined. Absent means 1 (present from the first version), which is what
+/// every message written before growth began carries implicitly.
+///
+/// Emitted by both backends as a per-message constant. It is the fact a
+/// dispatcher needs to answer "is this opcode defined on *this* connection's
+/// negotiated version" -- a later-`since` opcode on an earlier connection is
+/// fatal `invalid_opcode` (conventions 7.3), and that check cannot be made
+/// from a table that has forgotten the attribute.
+fn parse_since(node: Node, what: &str) -> Result<u32> {
+    match node.attribute("since") {
+        None => Ok(1),
+        Some(raw) => raw
+            .parse::<u32>()
+            .with_context(|| format!("{what}: since=\"{raw}\" is not a valid integer")),
+    }
 }
 
 /// One argument's worst-case contribution to an encoded frame, in bytes:
@@ -182,7 +239,8 @@ fn arg_worst_case_wire_size(arg: &Arg) -> u64 {
 
 fn parse_message(node: Node, opcode: u8, own_interface: &str) -> Result<Message> {
     let name = req_attr(node, "name")?.to_string();
-    reject_unsupported_growth_attrs(node, &format!("message '{name}'"))?;
+    reject_unsupported_growth_attrs(node, &format!("message '{name}'"), &["deprecated-since"])?;
+    let since = parse_since(node, &format!("message '{name}'"))?;
     if let Some(ty) = node.attribute("type") {
         bail!(
             "message '{name}' declares type=\"{ty}\": destructor semantics are not \
@@ -245,6 +303,7 @@ fn parse_message(node: Node, opcode: u8, own_interface: &str) -> Result<Message>
     Ok(Message {
         name,
         opcode,
+        since,
         summary,
         args,
     })
@@ -389,7 +448,11 @@ fn parse_enum_ref(node: Node, own_interface: &str) -> Result<Option<EnumRef>> {
 
 fn parse_enum(node: Node) -> Result<EnumDef> {
     let name = req_attr(node, "name")?.to_string();
-    reject_unsupported_growth_attrs(node, &format!("enum '{name}'"))?;
+    reject_unsupported_growth_attrs(
+        node,
+        &format!("enum '{name}'"),
+        &["since", "deprecated-since"],
+    )?;
     let bitfield = node.attribute("bitfield") == Some("true");
     let summary = description_summary(node).with_context(|| format!("enum '{name}'"))?;
 
@@ -441,7 +504,11 @@ fn parse_enum(node: Node) -> Result<EnumDef> {
 
 fn parse_entry(node: Node) -> Result<EnumEntry> {
     let name = req_attr(node, "name")?.to_string();
-    reject_unsupported_growth_attrs(node, &format!("entry '{name}'"))?;
+    reject_unsupported_growth_attrs(
+        node,
+        &format!("entry '{name}'"),
+        &["since", "deprecated-since"],
+    )?;
     let value_str = req_attr(node, "value")?;
     let value = parse_enum_value(value_str).with_context(|| {
         format!("entry '{name}': value {value_str:?} is not valid decimal or 0x-hex")

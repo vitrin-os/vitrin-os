@@ -71,6 +71,20 @@ pub struct Message {
     /// 0-indexed position within its own kind (requests or events) in document
     /// order. Requests and events are numbered independently from 0.
     pub opcode: u8,
+    /// The first protocol version at which this message is defined
+    /// (`message/@since`), defaulting to 1 when the attribute is absent.
+    ///
+    /// This is the protocol *document* version, not the interface's own
+    /// `version` counter: `docs/protocol/00-conventions.md` Appendix A names
+    /// every growth seam as a `since="2"` message on an interface whose own
+    /// version attribute tracks that interface's growth separately.
+    ///
+    /// A connection speaks exactly its negotiated version for its whole life,
+    /// so an opcode whose `since` is above that version is not defined on it
+    /// and is fatal `invalid_opcode`. Both backends emit this so a dispatcher
+    /// can make that check from the generated table rather than a hand-kept
+    /// list.
+    pub since: u32,
     pub summary: String,
     /// Arguments in document order (also the wire order).
     pub args: Vec<Arg>,

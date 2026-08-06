@@ -129,6 +129,7 @@ dropping `internal` — will fail a test that checks it against the IDL:
 | `consent_held` (5) | `ConsentHeld` | A prompt is up; a human is deciding. Wait, do not act. |
 | `no_surface` (6) | `NoSurface` | Nothing to act on yet. Cheap to retry. |
 | `internal` (7) | `OperationFailed` | The core tried and failed on its own side. Not your fault and not a permission problem; retry once, then report rather than loop. |
+| `capacity` (8) | `AtCapacity` | The deployment is full and cannot start another realm. Reachable only through `realm_launch`, which nothing serves yet. Not a rate limit: `retry_after_ms` is 0 and the core cannot know when a realm exits, so a retry timer will spin. |
 
 Note the wire name is **`expired`**, not `grant_expired` — the SDK class is
 `GrantExpired`, and conflating the two is how the earlier revision of this

@@ -109,7 +109,7 @@ Task IDs are `P2.<epic>.<task>` — `P2.6.1` is E2.6's first task. Every task ca
 
 | ID | Task | Key decisions | Depends on | Acceptance criteria | Track |
 |---|---|---|---|---|---|
-| **P2.4.1** | Extend E2.2's tree vocabulary in `protocol/vitrin-v0.xml` plus its prose page with the synthetic-publish path: a `vitrin_tree_publisher` facet minted by `vitrin_realm.request_grant` under a new `vitrin_grant.verb` bit `publish_tree` (0x40) carrying `publish_tree(surface, tree, observed_epoch)`; a tree-level `synthetic` flag | Q3's v0 posture becomes wire vocabulary, not sidecar convention — a convention cannot bind a lying publisher. Confidence is a per-node byte rather than a float: it must survive the codec unambiguously and be comparable across backends. `accept_synthetic` is a request flag, NOT a verb | P2.1.1, P2.1.2 | `xmllint --relaxng protocol/vitrin-v0.rng protocol/vitrin-v0.xml` green and `cargo xtask codegen --check` idempotent; the two existing verb tripwires go red until a human classifies the new bit — `crates/vitrin-protocol/tests/decode_errors.rs`'s `Verb::VALID_MASK == 63` pin and `crates/vitrin-core/src/consent/render.rs`'s unserved-set catalogue test | `protocol` |
+| **P2.4.1** | Extend E2.2's tree vocabulary in `protocol/vitrin-v0.xml` plus its prose page with the synthetic-publish path: a `vitrin_tree_publisher` facet minted by `vitrin_realm.request_grant` under a new `vitrin_grant.verb` bit `publish_tree` (0x40) carrying `publish_tree(surface, tree, observed_epoch)`; a tree-level `synthetic` flag | Q3's v0 posture becomes wire vocabulary, not sidecar convention — a convention cannot bind a lying publisher. Confidence is a per-node byte rather than a float: it must survive the codec unambiguously and be comparable across backends. `accept_synthetic` is a request flag, NOT a verb | P2.1.1, P2.1.2 | `xmllint --relaxng protocol/vitrin-v0.rng protocol/vitrin-v0.xml` green and `cargo xtask codegen --check` idempotent; the two existing verb tripwires go red until a human classifies the new bit — `crates/vitrin-protocol/tests/decode_errors.rs`'s `Verb::VALID_MASK == 575` pin and `crates/vitrin-core/src/consent/render.rs`'s unserved-set catalogue test | `protocol` |
 | **P2.4.2** | Serve `publish_tree` in the core: admit the verb at `crates/vitrin-core/src/enforcement.rs`'s single chokepoint, store the published tree on the scene node beside the shim-sourced one in `crates/vitrin-core/src/scene/mod.rs`, stamp it with the core's own tree epoch, tag it with the publishing principal's identity, and refuse a publish whose… | A synthetic tree confers zero authority: actuation still passes the same chokepoint against the ACTING agent's own verbs, so a lying publisher can only mis-aim a click that agent was already permitted to make — stated in the interface prose so node addressing is never read as an authority path. | P2.4.1, P2.1.6 | Unit tests: publish without `observe` on the resource refuses at mint; publish with a stale `observed_epoch` refuses recoverably and never kills the connection (fatal-vs-recoverable razor, docs/protocol/00-conventions.md) | `rust-core` |
 | **P2.4.3** | Build the sidecar process itself under a new `services/vlm-parser/` (does not exist today): a Python service that connects to the core as the ordinary principal `vitrin://local/service/vlm-parser`, holds `observe + publish_tree` on a realm under its own consented grant, loops capture → parse → publish, and dies cleanly when its grant is revoked or… | Deployment shape is a sibling process, never in-core and never a child of `vitrind` (PRD 17: the parser's memory-unsafety must be irrelevant to the TCB). It uses `sdk/python/src/vitrin_os/client.py` unmodified — if the sidecar needs an SDK change, that is evidence the agent-facing API is wrong, not that the sidecar is special. | P2.4.2, P2.6.1 | `pstree` in an integration run shows the sidecar as a sibling of the agent under the harness, never a descendant of `vitrind`; `grep -rniE 'vlm\|omniparser\|sidecar\|parser' crates/vitrin-core/src` returns nothing (the TCB does not know it exists) | `sdk` |
 | **P2.4.4** | Define a pluggable `Parser` interface in `services/vlm-parser/` and ship two implementations behind it — a deterministic classical-CV reference backend that runs in CI with no model download and no network, and an OmniParser-class model backend selected by env | Pluggability is the epic's stated design decision, so the CONTRACT TEST, not either implementation, is the deliverable. The deterministic backend exists because a model-dependent CI job would make every number in P2.4.5/P2.4.6 unreproducible; it is explicitly the floor, not the recommendation. | P2.4.3, P2.1.1 | A checked-in fixture corpus (`services/vlm-parser/tests/corpus/`, at least 12 frames covering canvas, WebGL, game and custom-widget surfaces) with hand-labelled ground-truth control rectangles in JSON | `sdk` |
@@ -361,7 +361,7 @@ Two further obligations, both inherited from the P1.9.8 gate-integrity pass: a g
 
 Three clusters decomposing in parallel independently claimed the same verb bit, the same prose-page number and the same message name — each an **immutable** choice once landed ([00-conventions.md](../protocol/00-conventions.md) §7.4, and D-017's note that `deprecated-since` marks but never removes). The allocations below are therefore made **once, here, before any of the tasks open**, and belong in a `20-decision-log.md` entry rather than in whichever task lands first.
 
-**Verb bits** (`Verb::VALID_MASK` is 63 today). Re-pin the mask **once per epic**, never once per task, in its three sites: `crates/vitrin-protocol/tests/decode_errors.rs`, `crates/vitrin-core/src/consent/render.rs`'s unserved-set catalogue test, and `sdk/python/tests/test_verb_parity.py`.
+**Verb bits** (`Verb::VALID_MASK` is **575** today — `1|2|4|8|16|32|512`, the six original bits plus `realm_launch`; it read 63 until WS-E.1.1 landed the 512 row below). Re-pin the mask **once per epic**, never once per task, in its three sites: `crates/vitrin-protocol/tests/decode_errors.rs`, `crates/vitrin-core/src/consent/render.rs`'s unserved-set catalogue test, and `sdk/python/tests/test_verb_parity.py`.
 
 | Bit | Verb | Epic | Task |
 |---|---|---|---|
@@ -387,7 +387,12 @@ actually matters is unchanged — **one bump, and every later addition at
 a signature*, which are immutable, not the calendar order of two additive
 landings. Nothing may bump to version 3.
 
-**Prose pages** (`docs/protocol/` ends at `11-vitrin_shim_seat.md`; three tasks claimed 12):
+**Prose pages.** When this table was written `docs/protocol/` ended at
+`11-vitrin_shim_seat.md` and three tasks had each claimed 12 — the collision it
+exists to stop. WS-E.1.1 then landed page **16**, skipping the four numbers
+allocated below rather than taking one, which is the rule working: 12–15 stay
+reserved for tasks that have not opened yet, and `docs/protocol/` now ends at
+`16-vitrin_launcher.md` with a deliberate gap.
 
 | Page | Content | Task |
 |---|---|---|
@@ -395,6 +400,7 @@ landings. Nothing may bump to version 3.
 | `13-vitrin_powerbox.md` | Powerbox facet | P2.6.5 |
 | `14-vitrin_shim_text_input.md` | IME | P2.8.1 |
 | `15-vitrin-semantic-v1.md` | Native app-facing extension | P2.5.1 |
+| `16-vitrin_launcher.md` | Realm-launch facet (**landed**) | WS-E.1.1 (#207) |
 
 **Two rules the merge had to settle, both normative for the phase:**
 

@@ -2458,8 +2458,23 @@ mod tests {
 
     #[test]
     fn connection_teardown_clears_the_scene_and_leaks_no_fd() {
-        let _fd = crate::capture::tests::fd_lock();
-        let baseline = { std::fs::read_dir("/proc/self/fd").unwrap().count() };
+        // Process-isolated, not merely `fd_lock`-serialized: the measured
+        // quantity is the process-global open-fd count, which a
+        // *non-measuring* test on the harness pool perturbs whether or not
+        // it holds the lock (`capture::tests::run_fd_isolated`'s docs, the
+        // #74/#80 race). This test used to read `/proc/self/fd` directly,
+        // which is exactly the pattern `open_fd_count`'s debug_assert
+        // exists to forbid -- and reading it directly is how it evaded
+        // that guard. It went red the moment an unrelated test was added
+        // and the thread schedule shifted.
+        crate::capture::tests::run_fd_isolated(
+            "shim::tests::connection_teardown_clears_the_scene_and_leaks_no_fd",
+            connection_teardown_clears_the_scene_and_leaks_no_fd_body,
+        );
+    }
+
+    fn connection_teardown_clears_the_scene_and_leaks_no_fd_body() {
+        let baseline = crate::capture::tests::open_fd_count();
         let (mut server, mut scene, mut core, shim) = setup();
         let mut mock = MockShim::start(shim).expect("bring-up");
         mock.attach_frame(0).unwrap();
@@ -2518,7 +2533,7 @@ mod tests {
         );
         // Every held buffer fd (including the staged pending one) closed.
         assert_eq!(
-            std::fs::read_dir("/proc/self/fd").unwrap().count(),
+            crate::capture::tests::open_fd_count(),
             baseline,
             "no fd may leak on shim teardown"
         );

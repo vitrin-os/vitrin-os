@@ -668,13 +668,14 @@ impl PetitionRegistry {
         // Policy refusals, each "honest refusal rather than
         // accepted-and-unenforced" (IDL): a set reserved flag bit, a
         // durable rung without provenance, a resource granularity finer
-        // than version 1 serves, a defined verb this core does not serve.
+        // than this core serves, a defined verb this core does not serve.
         if req.flags != 0 {
             return declined(Outcome::Unsupported);
         }
-        // A verb bit the IDL defines but version 1 does not enforce
-        // (`observe_cursor`, `layout_arrange`, `layout_focus`; D-017 and
-        // D-018). Refused **whole**, never narrowed to the served
+        // A verb bit the IDL defines but this core does not enforce
+        // (`observe_cursor`, `layout_arrange`, `layout_focus` from D-017
+        // and D-018, plus `realm_launch` since version 2). Refused
+        // **whole**, never narrowed to the served
         // remainder: narrowing is the human's move at consent time, and
         // silently dropping a requested verb would leave the agent
         // believing it holds authority nothing checks. The wire keeps
@@ -683,7 +684,7 @@ impl PetitionRegistry {
         //
         // This also subsumes, today, the one verb-composition rule the IDL
         // states: `observe_cursor` is meaningful only alongside `observe`,
-        // and naming it alone resolves `unsupported`. Version 1 refuses
+        // and naming it alone resolves `unsupported`. This core refuses
         // `observe_cursor` in every combination, so no separate check can
         // be distinguished from this one -- whoever begins to serve the
         // verb (M2) must add the pairing check here, because deleting the

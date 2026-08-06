@@ -209,6 +209,13 @@ fn gen_message(
     buf.line(format!("impl {struct_name} {{"));
     buf.line(format!("    pub const OPCODE: u8 = {};", msg.opcode));
     buf.line(format!("    pub const HAS_FD: bool = {has_fd};"));
+    buf.line(
+        "    /// First protocol version at which this message is defined \
+         (`message/@since`);",
+    );
+    buf.line("    /// this opcode is not defined on a connection whose negotiated version is");
+    buf.line("    /// lower, where using it is fatal `invalid_opcode`.");
+    buf.line(format!("    pub const SINCE: u32 = {};", msg.since));
     buf.blank();
     gen_encode(buf, protocol, msg);
     buf.blank();

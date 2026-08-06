@@ -8,6 +8,13 @@
   every request on the interface exercises the named grant verb; the scanner
   derives the enforcement chokepoint's opcode-to-verb table from it).
 
+  interface/@verb is a closed value set, and widening it is a DIALECT change
+  that moves with the IDL: a verb name the schema does not admit is rejected
+  here rather than reaching a backend that would emit an unenforceable
+  chokepoint entry. The set tracks the facet-bearing verbs of
+  vitrin_grant.verb, not the whole bitfield; observe_cursor, layout_arrange
+  and layout_focus have no facet interface to annotate.
+
   Structural rules this schema enforces beyond wayland.dtd:
     - argument types are a closed set of seven (no array);
     - new_id and object arguments MUST name their interface (no untyped
@@ -121,6 +128,7 @@
           <value>observe</value>
           <value>actuate_pointer</value>
           <value>actuate_text</value>
+          <value>realm_launch</value>
         </choice>
       </attribute>
     </optional>

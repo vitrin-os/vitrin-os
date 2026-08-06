@@ -308,7 +308,7 @@ pub(crate) mod tests {
     /// `run_fd_isolated` rather than silently reintroducing the #74/#80
     /// race. Because `run_fd_isolated` is the only setter of the sentinel,
     /// the isolation cannot be bypassed by accident.
-    fn open_fd_count() -> usize {
+    pub(crate) fn open_fd_count() -> usize {
         debug_assert!(
             std::env::var_os(FD_ISOLATED_SENTINEL).is_some(),
             "open_fd_count() measures the process-global /proc/self/fd and \
@@ -344,7 +344,7 @@ pub(crate) mod tests {
     /// ran). On the isolated invocation (sentinel set) it runs `body` for
     /// real — this is `exec`, not `fork`, so there is no async-signal-safety
     /// hazard, and no other test is selected, so no recursion occurs.
-    fn run_fd_isolated(test_path: &str, body: impl FnOnce()) {
+    pub(crate) fn run_fd_isolated(test_path: &str, body: impl FnOnce()) {
         if std::env::var_os(FD_ISOLATED_SENTINEL).is_some() {
             body();
             // Printed only on the true measurement path, after the body's

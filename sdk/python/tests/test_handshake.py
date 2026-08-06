@@ -13,6 +13,7 @@ from vitrin_os import (
     VersionUnsupported,
     connect,
 )
+from vitrin_os import protocol
 from vitrin_os.client import Connection
 from vitrin_os.messages import encode_sync
 from vitrin_os.transport import Transport
@@ -41,15 +42,19 @@ def test_successful_handshake_binds_canonical_identity(server) -> None:
 
 
 def test_version_mismatch_is_typed_and_fatal(server) -> None:
+    # A version above the SDK's own maximum, derived rather than written
+    # down: refusal means exactly "above the server's maximum", so a literal
+    # here would stop being a refusable version the moment the wire grows.
+    too_new = protocol.PROTOCOL_VERSION + 1
     server.run(
         [
-            ("expect", flows.hello_frame(version=2)),
+            ("expect", flows.hello_frame(version=too_new)),
             ("send", flows.error_frame(1, 6, "unsupported protocol version")),
             ("close",),
         ]
     )
     with pytest.raises(VersionUnsupported) as excinfo:
-        _connect(server, version=2)
+        _connect(server, version=too_new)
     assert excinfo.value.code == 6
     assert excinfo.value.object_id == 1
 

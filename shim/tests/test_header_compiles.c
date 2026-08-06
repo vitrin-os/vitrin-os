@@ -13,9 +13,9 @@
  * declares to be fully type-checked by the compiler:
  *
  *   - every message's encode and decode function pointer is assigned into a
- *     precisely-typed local (via the CHECK_ENCODE/CHECK_DECODE macros
- *     below), which only compiles if the function's real signature matches
- *     exactly what this file expects;
+ *     precisely-typed local (via the CHECK_MESSAGE macro below), which only
+ *     compiles if the function's real signature matches exactly what this
+ *     file expects;
  *   - every enum's validity predicate likewise (CHECK_IS_VALID);
  *   - the frame-header and raw little-endian helpers are checked directly;
  *   - a handful of representative messages (a plain zero-argument request,
@@ -24,6 +24,17 @@
  *     dummy buffers, end to end (encode then decode), to prove the API is
  *     genuinely callable from an external C translation unit, not merely
  *     syntactically present.
+ *
+ * "Every message" is asserted, not trusted: VITRIN_EVERY_MESSAGE below is
+ * counted at compile time and _Static_assert'd against the generated
+ * VITRIN_MESSAGE_COUNT, so a message appended to protocol/vitrin-v0.xml
+ * fails this build until it is listed here. Without that gate the list is
+ * a hand-maintained copy that silently falls behind the IDL -- which is
+ * exactly what happened when version 2 added get_launcher, launch and
+ * launched: the file kept compiling while type-checking 29 of 32 messages.
+ * It mirrors crates/vitrin-protocol/tests/roundtrip.rs's
+ * `every_idl_message_is_in_the_roundtrip_table`, which gates the Rust
+ * round-trip table on the same generated constant.
  *
  * Build/check exactly as CI does:
  *
@@ -43,23 +54,72 @@
  * has a well-defined, if meaningless, return value. */
 static int sink = 0;
 
-/* One macro per message-function *shape* (every *_encode shares the same
- * parameter list modulo the struct type; likewise every *_decode and every
- * *_is_valid), so each message below is two lines instead of two full
- * function-pointer declarations. */
-#define CHECK_ENCODE(struct_type, fn_name)                                   \
-    do {                                                                     \
-        int32_t (*p)(const struct_type *, uint32_t, uint8_t *, size_t) =     \
-            fn_name;                                                         \
-        sink += (p != NULL) ? 1 : 0;                                         \
-    } while (0)
+/* Every message the IDL defines, in header (document) order: interfaces in
+ * document order, and within an interface requests then events, each in
+ * document order. One entry per message, naming its marshal-function *base*
+ * -- the generator spells the struct <base>_t and the two functions
+ * <base>_encode / <base>_decode, so one token drives the type-check, and
+ * the same list is what the count below is taken from. */
+#define VITRIN_EVERY_MESSAGE(X)                                              \
+    X(vitrin_handshake_req_hello)                                            \
+    X(vitrin_handshake_req_sync)                                             \
+    X(vitrin_handshake_evt_error)                                            \
+    X(vitrin_handshake_evt_done)                                             \
+    X(vitrin_principal_req_get_realm)                                        \
+    X(vitrin_principal_evt_bound)                                            \
+    X(vitrin_realm_req_request_grant)                                        \
+    X(vitrin_grant_req_get_launcher)                                         \
+    X(vitrin_grant_evt_resolved)                                             \
+    X(vitrin_grant_evt_refused)                                              \
+    X(vitrin_consent_evt_state)                                              \
+    X(vitrin_view_req_capture_frame)                                         \
+    X(vitrin_view_evt_frame_ready)                                           \
+    X(vitrin_actuator_pointer_req_move)                                      \
+    X(vitrin_actuator_pointer_req_button)                                    \
+    X(vitrin_actuator_pointer_req_scroll)                                    \
+    X(vitrin_actuator_text_req_type)                                         \
+    X(vitrin_shim_session_req_create_surface)                                \
+    X(vitrin_shim_session_req_get_seat)                                      \
+    X(vitrin_shim_session_evt_configure)                                     \
+    X(vitrin_shim_surface_req_attach)                                        \
+    X(vitrin_shim_surface_req_damage)                                        \
+    X(vitrin_shim_surface_req_commit)                                        \
+    X(vitrin_shim_surface_evt_frame_done)                                    \
+    X(vitrin_shim_surface_evt_buffer_done)                                   \
+    X(vitrin_shim_seat_evt_motion)                                           \
+    X(vitrin_shim_seat_evt_button)                                           \
+    X(vitrin_shim_seat_evt_scroll)                                           \
+    X(vitrin_shim_seat_evt_key)                                              \
+    X(vitrin_shim_seat_evt_text)                                             \
+    X(vitrin_launcher_req_launch)                                            \
+    X(vitrin_launcher_evt_launched)
 
-#define CHECK_DECODE(struct_type, fn_name)                                   \
+/* The exhaustiveness gate. VITRIN_MESSAGE_COUNT is generated from the IDL,
+ * so an appended message makes this a compile error here rather than a
+ * silent hole in the coverage the file's banner comment claims. */
+#define VITRIN_COUNT_ONE(base) +1
+enum { vitrin_messages_listed = 0 VITRIN_EVERY_MESSAGE(VITRIN_COUNT_ONE) };
+_Static_assert((int)vitrin_messages_listed == (int)VITRIN_MESSAGE_COUNT,
+               "protocol/vitrin-v0.xml defines a message missing from (or "
+               "extra in) VITRIN_EVERY_MESSAGE, so this file no longer "
+               "type-checks every generated marshal function");
+
+/* One macro per function *shape* (every *_encode shares the same parameter
+ * list modulo the struct type; likewise every *_decode and every
+ * *_is_valid), so each message is one list entry rather than two full
+ * function-pointer declarations. The trailing semicolon lives inside
+ * CHECK_MESSAGE because VITRIN_EVERY_MESSAGE expands to a bare sequence of
+ * invocations with no separators. */
+#define CHECK_MESSAGE(base)                                                  \
     do {                                                                     \
-        vitrin_decode_status_t (*p)(const uint8_t *, size_t, int, uint32_t *, \
-                                     struct_type *) = fn_name;                \
-        sink += (p != NULL) ? 1 : 0;                                         \
-    } while (0)
+        int32_t (*enc)(const base##_t *, uint32_t, uint8_t *, size_t) =      \
+            base##_encode;                                                   \
+        vitrin_decode_status_t (*dec)(const uint8_t *, size_t, int,          \
+                                       uint32_t *, base##_t *) =             \
+            base##_decode;                                                   \
+        sink += (enc != NULL) ? 1 : 0;                                       \
+        sink += (dec != NULL) ? 1 : 0;                                       \
+    } while (0);
 
 #define CHECK_IS_VALID(fn_name)                                              \
     do {                                                                     \
@@ -123,74 +183,7 @@ static void check_every_symbol_type_checks(void) {
     CHECK_IS_VALID(vitrin_shim_seat_origin_is_valid);
 
     /* ---- every message's encode + decode, in header (document) order ---- */
-    CHECK_ENCODE(vitrin_handshake_req_hello_t, vitrin_handshake_req_hello_encode);
-    CHECK_DECODE(vitrin_handshake_req_hello_t, vitrin_handshake_req_hello_decode);
-    CHECK_ENCODE(vitrin_handshake_req_sync_t, vitrin_handshake_req_sync_encode);
-    CHECK_DECODE(vitrin_handshake_req_sync_t, vitrin_handshake_req_sync_decode);
-    CHECK_ENCODE(vitrin_handshake_evt_error_t, vitrin_handshake_evt_error_encode);
-    CHECK_DECODE(vitrin_handshake_evt_error_t, vitrin_handshake_evt_error_decode);
-    CHECK_ENCODE(vitrin_handshake_evt_done_t, vitrin_handshake_evt_done_encode);
-    CHECK_DECODE(vitrin_handshake_evt_done_t, vitrin_handshake_evt_done_decode);
-
-    CHECK_ENCODE(vitrin_principal_req_get_realm_t, vitrin_principal_req_get_realm_encode);
-    CHECK_DECODE(vitrin_principal_req_get_realm_t, vitrin_principal_req_get_realm_decode);
-    CHECK_ENCODE(vitrin_principal_evt_bound_t, vitrin_principal_evt_bound_encode);
-    CHECK_DECODE(vitrin_principal_evt_bound_t, vitrin_principal_evt_bound_decode);
-
-    CHECK_ENCODE(vitrin_realm_req_request_grant_t, vitrin_realm_req_request_grant_encode);
-    CHECK_DECODE(vitrin_realm_req_request_grant_t, vitrin_realm_req_request_grant_decode);
-
-    CHECK_ENCODE(vitrin_grant_evt_resolved_t, vitrin_grant_evt_resolved_encode);
-    CHECK_DECODE(vitrin_grant_evt_resolved_t, vitrin_grant_evt_resolved_decode);
-    CHECK_ENCODE(vitrin_grant_evt_refused_t, vitrin_grant_evt_refused_encode);
-    CHECK_DECODE(vitrin_grant_evt_refused_t, vitrin_grant_evt_refused_decode);
-
-    CHECK_ENCODE(vitrin_consent_evt_state_t, vitrin_consent_evt_state_encode);
-    CHECK_DECODE(vitrin_consent_evt_state_t, vitrin_consent_evt_state_decode);
-
-    CHECK_ENCODE(vitrin_view_req_capture_frame_t, vitrin_view_req_capture_frame_encode);
-    CHECK_DECODE(vitrin_view_req_capture_frame_t, vitrin_view_req_capture_frame_decode);
-    CHECK_ENCODE(vitrin_view_evt_frame_ready_t, vitrin_view_evt_frame_ready_encode);
-    CHECK_DECODE(vitrin_view_evt_frame_ready_t, vitrin_view_evt_frame_ready_decode);
-
-    CHECK_ENCODE(vitrin_actuator_pointer_req_move_t, vitrin_actuator_pointer_req_move_encode);
-    CHECK_DECODE(vitrin_actuator_pointer_req_move_t, vitrin_actuator_pointer_req_move_decode);
-    CHECK_ENCODE(vitrin_actuator_pointer_req_button_t, vitrin_actuator_pointer_req_button_encode);
-    CHECK_DECODE(vitrin_actuator_pointer_req_button_t, vitrin_actuator_pointer_req_button_decode);
-    CHECK_ENCODE(vitrin_actuator_pointer_req_scroll_t, vitrin_actuator_pointer_req_scroll_encode);
-    CHECK_DECODE(vitrin_actuator_pointer_req_scroll_t, vitrin_actuator_pointer_req_scroll_decode);
-
-    CHECK_ENCODE(vitrin_actuator_text_req_type_t, vitrin_actuator_text_req_type_encode);
-    CHECK_DECODE(vitrin_actuator_text_req_type_t, vitrin_actuator_text_req_type_decode);
-
-    CHECK_ENCODE(vitrin_shim_session_req_create_surface_t, vitrin_shim_session_req_create_surface_encode);
-    CHECK_DECODE(vitrin_shim_session_req_create_surface_t, vitrin_shim_session_req_create_surface_decode);
-    CHECK_ENCODE(vitrin_shim_session_req_get_seat_t, vitrin_shim_session_req_get_seat_encode);
-    CHECK_DECODE(vitrin_shim_session_req_get_seat_t, vitrin_shim_session_req_get_seat_decode);
-    CHECK_ENCODE(vitrin_shim_session_evt_configure_t, vitrin_shim_session_evt_configure_encode);
-    CHECK_DECODE(vitrin_shim_session_evt_configure_t, vitrin_shim_session_evt_configure_decode);
-
-    CHECK_ENCODE(vitrin_shim_surface_req_attach_t, vitrin_shim_surface_req_attach_encode);
-    CHECK_DECODE(vitrin_shim_surface_req_attach_t, vitrin_shim_surface_req_attach_decode);
-    CHECK_ENCODE(vitrin_shim_surface_req_damage_t, vitrin_shim_surface_req_damage_encode);
-    CHECK_DECODE(vitrin_shim_surface_req_damage_t, vitrin_shim_surface_req_damage_decode);
-    CHECK_ENCODE(vitrin_shim_surface_req_commit_t, vitrin_shim_surface_req_commit_encode);
-    CHECK_DECODE(vitrin_shim_surface_req_commit_t, vitrin_shim_surface_req_commit_decode);
-    CHECK_ENCODE(vitrin_shim_surface_evt_frame_done_t, vitrin_shim_surface_evt_frame_done_encode);
-    CHECK_DECODE(vitrin_shim_surface_evt_frame_done_t, vitrin_shim_surface_evt_frame_done_decode);
-    CHECK_ENCODE(vitrin_shim_surface_evt_buffer_done_t, vitrin_shim_surface_evt_buffer_done_encode);
-    CHECK_DECODE(vitrin_shim_surface_evt_buffer_done_t, vitrin_shim_surface_evt_buffer_done_decode);
-
-    CHECK_ENCODE(vitrin_shim_seat_evt_motion_t, vitrin_shim_seat_evt_motion_encode);
-    CHECK_DECODE(vitrin_shim_seat_evt_motion_t, vitrin_shim_seat_evt_motion_decode);
-    CHECK_ENCODE(vitrin_shim_seat_evt_button_t, vitrin_shim_seat_evt_button_encode);
-    CHECK_DECODE(vitrin_shim_seat_evt_button_t, vitrin_shim_seat_evt_button_decode);
-    CHECK_ENCODE(vitrin_shim_seat_evt_scroll_t, vitrin_shim_seat_evt_scroll_encode);
-    CHECK_DECODE(vitrin_shim_seat_evt_scroll_t, vitrin_shim_seat_evt_scroll_decode);
-    CHECK_ENCODE(vitrin_shim_seat_evt_key_t, vitrin_shim_seat_evt_key_encode);
-    CHECK_DECODE(vitrin_shim_seat_evt_key_t, vitrin_shim_seat_evt_key_decode);
-    CHECK_ENCODE(vitrin_shim_seat_evt_text_t, vitrin_shim_seat_evt_text_encode);
-    CHECK_DECODE(vitrin_shim_seat_evt_text_t, vitrin_shim_seat_evt_text_decode);
+    VITRIN_EVERY_MESSAGE(CHECK_MESSAGE)
 }
 
 /* Encodes then decodes a zero-argument request (vitrin_view.capture_frame),

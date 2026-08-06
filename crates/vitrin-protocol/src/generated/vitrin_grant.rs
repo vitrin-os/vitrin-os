@@ -5,12 +5,109 @@
 // Source: protocol/vitrin-v0.xml
 // Regenerate with: cargo xtask codegen
 
-//! Interface `vitrin_grant`, version 1.
+//! Interface `vitrin_grant`, version 2.
 //!
 //! capability handle
 
 pub const INTERFACE_NAME: &str = "vitrin_grant";
-pub const INTERFACE_VERSION: u32 = 1;
+pub const INTERFACE_VERSION: u32 = 2;
+
+pub mod requests {
+
+    /// Request `get_launcher` (opcode 0) on `vitrin_grant`.
+    ///
+    /// mint the launch facet for this grant
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GetLauncher {
+        /// the launch facet, born inert (confers nothing until this grant is granted with realm_launch) (new_id: vitrin_launcher)
+        pub launcher: u32,
+    }
+
+    impl GetLauncher {
+        pub const OPCODE: u8 = 0;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_uint(&mut out, self.launcher);
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let launcher = crate::wire::read_uint(bytes, &mut pos)?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((header.object_id, GetLauncher { launcher }))
+        }
+    }
+}
 
 pub mod events {
 
@@ -32,6 +129,10 @@ pub mod events {
     impl Resolved {
         pub const OPCODE: u8 = 0;
         pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 1;
 
         /// Encode into a complete frame (header + argument payload). The fd
         /// argument, if this message has one, is not written here -- send it
@@ -146,6 +247,10 @@ pub mod events {
     impl Refused {
         pub const OPCODE: u8 = 1;
         pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 1;
 
         /// Encode into a complete frame (header + argument payload). The fd
         /// argument, if this message has one, is not written here -- send it
@@ -262,10 +367,12 @@ impl Verb {
     pub const LAYOUT_ARRANGE: Verb = Verb(16);
     /// direct keyboard focus to a view of the granted realm; separate from layout_arrange because focus theft is the sharpest attack and the most legitimate need, so it must be attenuable alone; refused unsupported in version 1
     pub const LAYOUT_FOCUS: Verb = Verb(32);
+    /// launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64, 128 and 256 are allocated to verbs not yet defined here and were skipped rather than reused; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it
+    pub const REALM_LAUNCH: Verb = Verb(512);
 
     /// Union of every defined entry's bits; a wire value with any other
     /// bit set is invalid.
-    pub const VALID_MASK: u32 = 1 | 2 | 4 | 8 | 16 | 32;
+    pub const VALID_MASK: u32 = 1 | 2 | 4 | 8 | 16 | 32 | 512;
 
     /// Decode a wire value, rejecting any bit outside `VALID_MASK`.
     pub fn from_bits(value: u32) -> Result<Self, crate::error::DecodeError> {
@@ -431,6 +538,8 @@ pub enum Refusal {
     NoSurface = 6,
     /// server-side failure during this use (renderer, memfd, delivery)
     Internal = 7,
+    /// the deployment is at its realm capacity, so no new realm can be created; a policy answer rather than a server-side failure, which is why it is not internal - retrying is legal once a realm exits, and retry_after_ms is 0 because the core cannot know when that will be. NOTE, a deliberate exception: every other code answers from the asking principal's OWN grant, but this one answers from deployment-wide state, so a principal holding one launch grant can poll launch and watch the answer flip - observing that SOME other principal created or exited a realm. That is a low-bandwidth cross-principal side channel, inherent to answering the question at all, and it is named here rather than left to be discovered; a deployment that cannot afford it must not serve realm_launch, because no attenuation of a launch grant removes it
+    Capacity = 8,
 }
 
 impl Refusal {
@@ -446,6 +555,7 @@ impl Refusal {
         Refusal::ConsentHeld,
         Refusal::NoSurface,
         Refusal::Internal,
+        Refusal::Capacity,
     ];
 
     /// Decode a wire value, by whole-value membership in the defined entries.
@@ -459,6 +569,7 @@ impl Refusal {
             5 => Ok(Refusal::ConsentHeld),
             6 => Ok(Refusal::NoSurface),
             7 => Ok(Refusal::Internal),
+            8 => Ok(Refusal::Capacity),
             _ => Err(crate::error::DecodeError::InvalidEnumValue {
                 interface: "vitrin_grant",
                 enum_name: "refusal",

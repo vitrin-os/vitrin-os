@@ -11,7 +11,7 @@
 //! the two encoded byte buffers are identical.
 //!
 //! Coverage is driven by one generic checker (`assert_roundtrip`) plus one
-//! per-message arbitrary-value strategy, rather than 29 hand-duplicated test
+//! per-message arbitrary-value strategy, rather than 32 hand-duplicated test
 //! bodies: the round-trip *logic* (encode -> decode -> re-encode -> compare)
 //! appears exactly once, so it cannot silently drift per-message as the IDL
 //! grows. Every message needs its own strategy regardless (its fields
@@ -52,8 +52,12 @@ type Bound = gen::vitrin_principal::events::Bound;
 
 type RequestGrant = gen::vitrin_realm::requests::RequestGrant;
 
+type GetLauncher = gen::vitrin_grant::requests::GetLauncher;
 type Resolved = gen::vitrin_grant::events::Resolved;
 type Refused = gen::vitrin_grant::events::Refused;
+
+type Launch = gen::vitrin_launcher::requests::Launch;
+type Launched = gen::vitrin_launcher::events::Launched;
 
 type ConsentStateEvent = gen::vitrin_consent::events::State;
 
@@ -190,6 +194,7 @@ impl_message!(
     GetRealm,
     Bound,
     RequestGrant,
+    GetLauncher,
     Resolved,
     Refused,
     ConsentStateEvent,
@@ -212,6 +217,8 @@ impl_message!(
     SeatScroll,
     SeatKey,
     SeatText,
+    Launch,
+    Launched,
 );
 
 /// Exhaustiveness gate: the `impl_message!` table must cover every message
@@ -350,6 +357,10 @@ fn request_grant() -> impl Strategy<Value = RequestGrant> {
                 }
             },
         )
+}
+
+fn get_launcher() -> impl Strategy<Value = GetLauncher> {
+    any_u32().prop_map(|launcher| GetLauncher { launcher })
 }
 
 fn resolved() -> impl Strategy<Value = Resolved> {
@@ -560,6 +571,14 @@ fn seat_text() -> impl Strategy<Value = SeatText> {
         .prop_map(|(text, origin)| SeatText { text, origin })
 }
 
+fn launch() -> impl Strategy<Value = Launch> {
+    Just(Launch {})
+}
+
+fn launched() -> impl Strategy<Value = Launched> {
+    bounded_string(64).prop_map(|realm| Launched { realm })
+}
+
 // ---------------------------------------------------------------------------
 // One `#[test]` per message, generated from the table below. Each expands to
 // exactly: generate an object_id and a value, run `assert_roundtrip`. Adding
@@ -588,6 +607,7 @@ roundtrip_test!(roundtrip_vitrin_principal_bound, bound());
 
 roundtrip_test!(roundtrip_vitrin_realm_request_grant, request_grant());
 
+roundtrip_test!(roundtrip_vitrin_grant_get_launcher, get_launcher());
 roundtrip_test!(roundtrip_vitrin_grant_resolved, resolved());
 roundtrip_test!(roundtrip_vitrin_grant_refused, refused());
 
@@ -620,6 +640,9 @@ roundtrip_test!(roundtrip_vitrin_shim_seat_button, seat_button());
 roundtrip_test!(roundtrip_vitrin_shim_seat_scroll, seat_scroll());
 roundtrip_test!(roundtrip_vitrin_shim_seat_key, seat_key());
 roundtrip_test!(roundtrip_vitrin_shim_seat_text, seat_text());
+
+roundtrip_test!(roundtrip_vitrin_launcher_launch, launch());
+roundtrip_test!(roundtrip_vitrin_launcher_launched, launched());
 
 // ---------------------------------------------------------------------------
 // The two fd-bearing messages in v0.xml (grep for an `fd`-typed arg):

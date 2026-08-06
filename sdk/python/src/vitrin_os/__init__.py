@@ -2,12 +2,13 @@
 """vitrin_os — the pure-Python agent SDK for the Vitrin OS wire protocol.
 
 A deliberately independent second implementation of the wire format
-(spec v0, wire version 1): pure Python >= 3.11, stdlib only, no threads,
+(spec v0, wire version 2): pure Python >= 3.11, stdlib only, no threads,
 no async runtime, no C extension. See sdk/python/README.md.
 """
 
 from .client import Connection, Frame, Grant, Realm, connect
 from .errors import (
+    AtCapacity,
     AuthFailed,
     Busy,
     ConnectionClosed,
@@ -95,6 +96,7 @@ __all__ = [
     "ConsentHeld",
     "NoSurface",
     "OperationFailed",
+    "AtCapacity",
     # protocol constants
     "PROTOCOL_VERSION",
     "Verb",

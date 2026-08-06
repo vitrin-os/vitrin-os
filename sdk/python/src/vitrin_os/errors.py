@@ -54,6 +54,7 @@ __all__ = [
     "ConsentHeld",
     "NoSurface",
     "OperationFailed",
+    "AtCapacity",
     "fatal_error_by_code",
     "resolution_error_by_outcome",
     "refusal_error_by_code",
@@ -194,10 +195,10 @@ _FATAL_BY_CODE: dict[int, type[FatalError]] = {
 def fatal_error_by_code(object_id: int, code: int, wire_message: str) -> FatalError:
     """Build the typed :class:`FatalError` for one ``error`` event.
 
-    An unknown code is itself a server contract violation on a version-1
-    connection (enum values are immutable and the negotiated version defines
-    exactly these ten), so it raises rather than collapsing into a generic
-    error.
+    An unknown code is itself a server contract violation at either defined
+    version (enum values are immutable, and both 1 and 2 define exactly these
+    ten fatal codes — version 2 appended an interface, not an ``error``
+    entry), so it raises rather than collapsing into a generic error.
     """
     cls = _FATAL_BY_CODE.get(code)
     if cls is None:
@@ -349,6 +350,20 @@ class OperationFailed(GrantRefused):
     REFUSAL = 7
 
 
+class AtCapacity(GrantRefused):
+    """The deployment is at its realm capacity, so no new realm can start.
+
+    Reachable only through ``realm_launch`` (wire version 2). A **policy**
+    answer, not a server-side failure: nothing broke, the deployment
+    declines — which is why it is not :class:`OperationFailed`.
+    ``retry_after_ms`` is 0 because the core cannot know when a realm will
+    exit, so this is not a rate limit in disguise and a caller that retries
+    on a timer will spin.
+    """
+
+    REFUSAL = 8
+
+
 _REFUSAL_BY_CODE: dict[int, type[GrantRefused]] = {
     cls.REFUSAL: cls
     for cls in (
@@ -360,6 +375,7 @@ _REFUSAL_BY_CODE: dict[int, type[GrantRefused]] = {
         ConsentHeld,
         NoSurface,
         OperationFailed,
+        AtCapacity,
     )
 }
 
@@ -384,4 +400,4 @@ assert sorted(_FATAL_BY_CODE) == list(range(10)), "fatal code mapping not exhaus
 assert sorted(_RESOLUTION_BY_OUTCOME) == list(range(1, 6)), (
     "resolution outcome mapping not exhaustive"
 )
-assert sorted(_REFUSAL_BY_CODE) == list(range(8)), "refusal code mapping not exhaustive"
+assert sorted(_REFUSAL_BY_CODE) == list(range(9)), "refusal code mapping not exhaustive"

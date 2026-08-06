@@ -12,14 +12,14 @@
 /// becomes the connection's negotiated version. A server implements every
 /// version up to its maximum and refuses anything above it with
 /// `version_unsupported` -- downgrade is refusal, not negotiation.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Total number of messages (requests + events) across every interface.
 /// Exists so exhaustiveness can be *asserted* rather than assumed: a test
 /// enumerating every message (e.g. the round-trip table) checks its own
 /// length against this, so a message added to the IDL cannot ship silently
 /// untested.
-pub const MESSAGE_COUNT: usize = 29;
+pub const MESSAGE_COUNT: usize = 32;
 
 pub mod vitrin_handshake;
 pub mod vitrin_principal;
@@ -32,3 +32,4 @@ pub mod vitrin_actuator_text;
 pub mod vitrin_shim_session;
 pub mod vitrin_shim_surface;
 pub mod vitrin_shim_seat;
+pub mod vitrin_launcher;

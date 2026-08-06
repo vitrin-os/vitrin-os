@@ -158,7 +158,7 @@ def test_typed_exception_mappings_are_exhaustive() -> None:
     refusal_classes = {
         type(errors.refusal_error_by_code(1, code, 0)) for code in Refusal
     }
-    assert len(refusal_classes) == len(Refusal) == 8
+    assert len(refusal_classes) == len(Refusal) == 9
 
     # Unknown codes are a server contract violation, never a silent collapse.
     with pytest.raises(errors.ServerContractViolation):
@@ -166,4 +166,29 @@ def test_typed_exception_mappings_are_exhaustive() -> None:
     with pytest.raises(errors.ServerContractViolation):
         errors.resolution_error_by_outcome(6)
     with pytest.raises(errors.ServerContractViolation):
-        errors.refusal_error_by_code(1, 8, 0)
+        errors.refusal_error_by_code(1, 9, 0)
+
+
+def test_capacity_decodes_to_at_capacity_not_a_contract_violation() -> None:
+    """Refusal code 8 is ``AtCapacity`` — a refusal, not an accusation.
+
+    Four surfaces (the IDL entry, conventions §5.3's mapping table, prose
+    page 04, and the launcher page) promise this class by name. Before it
+    existed, code 8 fell through ``_REFUSAL_BY_CODE`` and raised
+    ``ServerContractViolation`` — telling the caller the *server* broke the
+    contract, for a code the server is documented to send.
+    """
+    from vitrin_os import AtCapacity
+    from vitrin_os.protocol import Refusal
+
+    err = errors.refusal_error_by_code(
+        int(protocol_verb := 512), Refusal.CAPACITY, 0, grant_id=4
+    )
+    assert isinstance(err, AtCapacity)
+    assert isinstance(err, errors.GrantRefused)
+    assert err.code == Refusal.CAPACITY == 8
+    assert err.verb == protocol_verb
+    assert err.grant_id == 4
+    # retry_after_ms is 0 by the IDL: the core cannot know when a realm
+    # exits, so this is not a rate limit in disguise.
+    assert err.retry_after_ms == 0

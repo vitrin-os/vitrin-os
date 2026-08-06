@@ -38,6 +38,10 @@ pub mod requests {
     impl Attach {
         pub const OPCODE: u8 = 0;
         pub const HAS_FD: bool = true;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 1;
 
         /// Encode into a complete frame (header + argument payload). The fd
         /// argument, if this message has one, is not written here -- send it
@@ -160,6 +164,10 @@ pub mod requests {
     impl Damage {
         pub const OPCODE: u8 = 1;
         pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 1;
 
         /// Encode into a complete frame (header + argument payload). The fd
         /// argument, if this message has one, is not written here -- send it
@@ -261,6 +269,10 @@ pub mod requests {
     impl Commit {
         pub const OPCODE: u8 = 2;
         pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 1;
 
         /// Encode into a complete frame (header + argument payload). The fd
         /// argument, if this message has one, is not written here -- send it
@@ -352,6 +364,10 @@ pub mod events {
     impl FrameDone {
         pub const OPCODE: u8 = 0;
         pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 1;
 
         /// Encode into a complete frame (header + argument payload). The fd
         /// argument, if this message has one, is not written here -- send it
@@ -444,6 +460,10 @@ pub mod events {
     impl BufferDone {
         pub const OPCODE: u8 = 1;
         pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 1;
 
         /// Encode into a complete frame (header + argument payload). The fd
         /// argument, if this message has one, is not written here -- send it

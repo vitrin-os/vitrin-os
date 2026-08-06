@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from vectors import frame, string, u32
 
+from vitrin_os import protocol
+
 IDENTITY = "vitrin://local/agent/demo"
 # Deliberately different from the claimed identity: bound carries the
 # verifier-canonical string, never an echo, and tests assert the canonical
@@ -30,7 +32,14 @@ TEXT_ID = 8
 ALL_VERBS = 7  # observe | actuate_pointer | actuate_text
 
 
-def hello_frame(version: int = 1) -> bytes:
+def hello_frame(version: int = protocol.PROTOCOL_VERSION) -> bytes:
+    """The bytes the SDK's own ``hello`` produces.
+
+    The version defaults to the SDK's ``PROTOCOL_VERSION`` rather than a
+    literal: this fixture asserts what the client sends, and the client
+    sends its maximum. Pass an explicit integer where the *point* of the
+    test is a specific offered version.
+    """
     return frame(
         1,
         0,

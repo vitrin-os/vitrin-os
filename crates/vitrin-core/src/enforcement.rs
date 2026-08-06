@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: MPL-2.0
 //! The enforcement chokepoint (P1.4.4, issue #28): the **single function**
-//! through which every capture and every actuation passes --
+//! through which every capture, every actuation and every launch passes --
 //! [`Chokepoint::enforce_use`] -- checking `connection -> principal ->
 //! grant -> verbs -> constraints` in exactly that order (PRD Doc 2 §5) and
 //! voicing every refusal as `vitrin_grant.refused` from one emission site.
+//!
+//! `vitrin_launcher.launch` (since version 2) joins the funnel on the same
+//! terms as the rest, and joining it is what makes the verb's staging
+//! honest: `realm_launch` is not in
+//! [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no grant row
+//! can hold the bit and step 4 refuses every launch **`not_granted`** --
+//! recoverably, connection intact. The mint that produces the facet
+//! ([`vitrin_grant.get_launcher`](crate::principal)) is structural and
+//! always legal; the *use* is what refuses.
 //!
 //! # The one-path property (grep-provable)
 //!
@@ -51,16 +60,18 @@
 //!    authority reaches these, so a transient hold can never mask the
 //!    honest authority answer (`consent_held` on an ungranted facet would
 //!    tell the agent to wait for a prompt that changes nothing):
-//!    a. `no_surface` (capture and actuation alike): the realm has no
-//!       live view. A capture must serve "never a stale frame", and an
-//!       actuation into a dead realm must be refused audibly, never
-//!       swallowed -- the IDL's refusal entry is verb-neutral, prose
-//!       pages 07/08 list `no_surface` in both actuators' applicable
-//!       sets, and the sync-barrier discovery idiom (IDL `sync`) relies
-//!       on every enforcement failure being voiced as an event. Judged
-//!       first among the use-context gates and before the bucket, so a
-//!       vacant realm never drains quota and a transient hold never
-//!       masks the realm's death.
+//!    a. `no_surface` (capture and actuation alike, but **never a
+//!       launch**): the realm has no live view. A capture must serve
+//!       "never a stale frame", and an actuation into a dead realm must
+//!       be refused audibly, never swallowed -- the IDL's refusal entry
+//!       is verb-neutral, prose pages 07/08 list `no_surface` in both
+//!       actuators' applicable sets, and the sync-barrier discovery idiom
+//!       (IDL `sync`) relies on every enforcement failure being voiced as
+//!       an event. Judged first among the use-context gates and before
+//!       the bucket, so a vacant realm never drains quota and a transient
+//!       hold never masks the realm's death. A launch is exempt because a
+//!       vacant realm is the state `realm_launch` exists to leave (IDL
+//!       `refusal`: "a launch is never refused no_surface").
 //!    b. `consent_held` (actuation only): the principal's own prompt is
 //!       up ([`PetitionRegistry::prompt_up_for`] -- the mapping is
 //!       documented in [`crate::petitions`]).
@@ -200,7 +211,8 @@ pub(crate) struct UseRequest<'a> {
 
 /// The operation a facet use performs. The variant *is* the verb: a
 /// capture exercises `observe`, pointer events `actuate_pointer`, text
-/// `actuate_text` -- one facet, one verb bit (IDL `request_grant`).
+/// `actuate_text`, a launch `realm_launch` -- one facet, one verb bit
+/// (IDL `request_grant`).
 pub(crate) enum UseKind {
     /// `vitrin_view.capture_frame` (reply-bearing).
     Capture,
@@ -208,6 +220,13 @@ pub(crate) enum UseKind {
     Pointer(SeatInputKind),
     /// `vitrin_actuator_text.type` (fire-and-forget).
     Text(SeatInputKind),
+    /// `vitrin_launcher.launch` (reply-bearing, since version 2). The
+    /// facet is mintable on any grant, but `realm_launch` is not in
+    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no row
+    /// can carry the bit and every launch is refused `not_granted` at
+    /// step 4 -- recoverably, which is the entire point of admitting the
+    /// request rather than killing the connection.
+    Launch,
 }
 
 impl UseKind {
@@ -219,14 +238,15 @@ impl UseKind {
             UseKind::Capture => Verb::OBSERVE,
             UseKind::Pointer(_) => Verb::ACTUATE_POINTER,
             UseKind::Text(_) => Verb::ACTUATE_TEXT,
+            UseKind::Launch => Verb::REALM_LAUNCH,
         }
     }
 
     /// Whether refusals of this use MAY be coalesced (fire-and-forget
-    /// actuations) or are per-request terminals (reply-bearing captures)
-    /// -- the delivery classification, conventions §6.
+    /// actuations) or are per-request terminals (reply-bearing captures
+    /// and launches) -- the delivery classification, conventions §6.
     fn coalescible(&self) -> bool {
-        !matches!(self, UseKind::Capture)
+        !matches!(self, UseKind::Capture | UseKind::Launch)
     }
 }
 
@@ -458,8 +478,12 @@ impl Chokepoint {
             };
             // Step 5, use-context on live authority.
             // 5a, no_surface -- capture and actuation alike: never a
-            // stale frame, and never input swallowed by a dead realm.
-            if live_view(env.realm_view).is_none() {
+            // stale frame, and never input swallowed by a dead realm. A
+            // launch is exempt by the IDL's own reachability note: a
+            // vacant realm is the state `realm_launch` exists to leave,
+            // so refusing a launch `no_surface` would refuse it for
+            // being asked to do its job.
+            if !matches!(req.kind, UseKind::Launch) && live_view(env.realm_view).is_none() {
                 break 'decide Err(Refuse::code(Refusal::NoSurface));
             }
             if let UseKind::Pointer(_) | UseKind::Text(_) = &req.kind {
@@ -581,14 +605,42 @@ impl Chokepoint {
                     spent_once,
                 })
             }
+            UseKind::Launch => {
+                // Unreachable in this build, and by construction rather
+                // than by luck: `realm_launch` is absent from
+                // `SERVED_VERB_BITS`, so petition admission resolves any
+                // petition naming it `unsupported` and no row can carry
+                // the bit -- step 4 above refused `not_granted` before
+                // anything reached here. Spawning a realm is the core
+                // half of WS-E.1.1 and does not exist yet, so this arm
+                // fails closed with the IDL's `internal` rather than
+                // fabricating a `launched` naming a realm nothing
+                // created. Typed, never a panic, exactly like the
+                // capture path's unreachable readback failure.
+                tracing::warn!("launch admitted with no spawn path; refusing internal");
+                let voiced = self.voice_refusal(
+                    req.grant_wire_id,
+                    verb,
+                    Refuse::code(Refusal::Internal),
+                    false,
+                    now,
+                    send,
+                )?;
+                Ok(UseOutcome::Refused {
+                    code: Refusal::Internal,
+                    voiced,
+                })
+            }
         }
     }
 
     /// The single site where every `vitrin_grant.refused` is built and
-    /// sent -- capture and actuation alike, one refusal voice (IDL). For
-    /// coalescible (actuation) refusals it applies the delivery
-    /// classification's two MAY-bounds and returns whether the event was
-    /// actually voiced; capture refusals are always voiced. Defensively
+    /// sent -- capture, actuation and launch alike, one refusal voice
+    /// (IDL). For coalescible (actuation) refusals it applies the
+    /// delivery classification's two MAY-bounds and returns whether the
+    /// event was actually voiced; refusals of the reply-bearing requests
+    /// (capture and launch) are always voiced, because a terminal that
+    /// coalesced away would leave the client waiting forever. Defensively
     /// re-enforces the IDL invariant that `retry_after_ms` is nonzero
     /// only for `rate_limited`, in release builds too.
     fn voice_refusal<F>(

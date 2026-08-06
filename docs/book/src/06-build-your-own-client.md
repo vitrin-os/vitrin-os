@@ -48,11 +48,14 @@ writing a Go, TypeScript or C++ SDK forks it.
 **Three things to get right, because they are what a naïve port breaks:**
 
 - **Carry the defined-but-unserved verbs** (`observe.cursor`,
-  `layout.arrange`, `layout.focus`). An out-of-range verb bit is fatal
-  `invalid_argument` and kills the connection. Omitting them turns a
+  `layout.arrange`, `layout.focus`, `realm.launch`). An out-of-range verb bit
+  is fatal `invalid_argument` and kills the connection. Omitting them turns a
   recoverable `unsupported` refusal into a dead socket for any user who
-  petitions one. The Python SDK's `test_verb_parity.py` pins this against
-  the IDL; write the equivalent.
+  petitions one. Transcribe the *values* from the IDL rather than assuming
+  consecutive bits — `realm.launch` is 512, because 64/128/256 are allocated
+  to verbs the IDL does not define yet and are still out of range. The Python
+  SDK's `test_verb_parity.py` pins this against the IDL; write the
+  equivalent.
 - **Model fatal versus recoverable in your type system.** If your users can
   catch a fatal error and retry, your API is lying to them. The Python SDK
   makes them separate hierarchies for this reason.

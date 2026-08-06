@@ -5,33 +5,31 @@
 // Source: protocol/vitrin-v0.xml
 // Regenerate with: cargo xtask codegen
 
-//! Interface `vitrin_principal`, version 1.
+//! Interface `vitrin_launcher`, version 1.
 //!
-//! the authenticated principal
+//! realm-launch facet
 
-pub const INTERFACE_NAME: &str = "vitrin_principal";
+pub const INTERFACE_NAME: &str = "vitrin_launcher";
 pub const INTERFACE_VERSION: u32 = 1;
+
+/// Every request on this interface exercises the grant verb `realm_launch`.
+pub const VERB: &str = "realm_launch";
 
 pub mod requests {
 
-    /// Request `get_realm` (opcode 0) on `vitrin_principal`.
+    /// Request `launch` (opcode 0) on `vitrin_launcher`.
     ///
-    /// mint an address handle for a realm
+    /// launch the granted template into a new realm
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct GetRealm {
-        /// the new realm address handle (new_id: vitrin_realm)
-        pub realm: u32,
-        /// well-known realm name (max 64 bytes)
-        pub name: String,
-    }
+    pub struct Launch {}
 
-    impl GetRealm {
+    impl Launch {
         pub const OPCODE: u8 = 0;
         pub const HAS_FD: bool = false;
         /// First protocol version at which this message is defined (`message/@since`);
         /// this opcode is not defined on a connection whose negotiated version is
         /// lower, where using it is fatal `invalid_opcode`.
-        pub const SINCE: u32 = 1;
+        pub const SINCE: u32 = 2;
 
         /// Encode into a complete frame (header + argument payload). The fd
         /// argument, if this message has one, is not written here -- send it
@@ -45,8 +43,6 @@ pub mod requests {
                 fd_count: Self::HAS_FD as u8,
             }
             .encode_with_placeholder_size(&mut out);
-            crate::wire::write_uint(&mut out, self.realm);
-            crate::wire::write_string(&mut out, &self.name, 64);
             crate::wire::patch_size(&mut out);
             out
         }
@@ -100,37 +96,35 @@ pub mod requests {
             }
             #[allow(unused_mut)]
             let mut pos = crate::wire::HEADER_LEN;
-            let realm = crate::wire::read_uint(bytes, &mut pos)?;
-            let name = crate::wire::read_string(bytes, &mut pos, 64)?;
             if pos != bytes.len() {
                 return Err(crate::error::DecodeError::TrailingBytes {
                     consumed: pos,
                     total: bytes.len(),
                 });
             }
-            Ok((header.object_id, GetRealm { realm, name }))
+            Ok((header.object_id, Launch {}))
         }
     }
 }
 
 pub mod events {
 
-    /// Event `bound` (opcode 0) on `vitrin_principal`.
+    /// Event `launched` (opcode 0) on `vitrin_launcher`.
     ///
-    /// handshake succeeded
+    /// the realm the launch created
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct Bound {
-        /// verifier-canonical principal identity (max 2048 bytes)
-        pub identity: String,
+    pub struct Launched {
+        /// id of the newly created realm instance, usable as get_realm's name (max 64 bytes)
+        pub realm: String,
     }
 
-    impl Bound {
+    impl Launched {
         pub const OPCODE: u8 = 0;
         pub const HAS_FD: bool = false;
         /// First protocol version at which this message is defined (`message/@since`);
         /// this opcode is not defined on a connection whose negotiated version is
         /// lower, where using it is fatal `invalid_opcode`.
-        pub const SINCE: u32 = 1;
+        pub const SINCE: u32 = 2;
 
         /// Encode into a complete frame (header + argument payload). The fd
         /// argument, if this message has one, is not written here -- send it
@@ -144,7 +138,7 @@ pub mod events {
                 fd_count: Self::HAS_FD as u8,
             }
             .encode_with_placeholder_size(&mut out);
-            crate::wire::write_string(&mut out, &self.identity, 2048);
+            crate::wire::write_string(&mut out, &self.realm, 64);
             crate::wire::patch_size(&mut out);
             out
         }
@@ -198,14 +192,14 @@ pub mod events {
             }
             #[allow(unused_mut)]
             let mut pos = crate::wire::HEADER_LEN;
-            let identity = crate::wire::read_string(bytes, &mut pos, 2048)?;
+            let realm = crate::wire::read_string(bytes, &mut pos, 64)?;
             if pos != bytes.len() {
                 return Err(crate::error::DecodeError::TrailingBytes {
                     consumed: pos,
                     total: bytes.len(),
                 });
             }
-            Ok((header.object_id, Bound { identity }))
+            Ok((header.object_id, Launched { realm }))
         }
     }
 }

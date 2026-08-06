@@ -303,9 +303,19 @@ static inline vitrin_decode_status_t vitrin_frame_header_decode(
 }
 
 /* The `vitrin` protocol's single wire version integer (`protocol/@version`); */
-/* also the first argument of vitrin_handshake's hello request. An exact */
-/* match is required -- downgrade is refusal, not negotiation. */
-#define VITRIN_PROTOCOL_VERSION 1u
+/* also the first argument of vitrin_handshake's hello request, whose */
+/* accepted value becomes the connection's negotiated version. A server */
+/* implements every version up to its maximum and refuses anything above */
+/* it -- downgrade is refusal, not negotiation. */
+#define VITRIN_PROTOCOL_VERSION 2u
+
+/* Total number of messages (requests + events) across every interface. */
+/* Exists so exhaustiveness can be *asserted* rather than assumed: a C */
+/* translation unit enumerating every message (shim/tests/ */
+/* test_header_compiles.c) checks its own list length against this with */
+/* _Static_assert, so a message added to the IDL cannot ship without a */
+/* compile-time proof that its marshal functions type-check. */
+#define VITRIN_MESSAGE_COUNT 32
 
 /* ==================================================================== */
 /* Section 1: per-interface metadata and enums.                          */
@@ -385,11 +395,11 @@ static inline bool vitrin_handshake_error_is_valid(uint32_t v) {
 #define VITRIN_REALM_INTERFACE_NAME "vitrin_realm"
 #define VITRIN_REALM_INTERFACE_VERSION 1u
 
-/* ==== vitrin_grant (version 1) ==== */
+/* ==== vitrin_grant (version 2) ==== */
 /* capability handle */
 
 #define VITRIN_GRANT_INTERFACE_NAME "vitrin_grant"
-#define VITRIN_GRANT_INTERFACE_VERSION 1u
+#define VITRIN_GRANT_INTERFACE_VERSION 2u
 
 /* Enum `verb` on `vitrin_grant` (bitfield).
  *
@@ -415,9 +425,11 @@ typedef uint32_t vitrin_grant_verb_t;
 #define VITRIN_GRANT_VERB_LAYOUT_ARRANGE ((vitrin_grant_verb_t)16)
 /* direct keyboard focus to a view of the granted realm; separate from layout_arrange because focus theft is the sharpest attack and the most legitimate need, so it must be attenuable alone; refused unsupported in version 1 */
 #define VITRIN_GRANT_VERB_LAYOUT_FOCUS ((vitrin_grant_verb_t)32)
+/* launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64, 128 and 256 are allocated to verbs not yet defined here and were skipped rather than reused; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it */
+#define VITRIN_GRANT_VERB_REALM_LAUNCH ((vitrin_grant_verb_t)512)
 /* Union of every defined entry's bits; a wire value with any other bit
    set is invalid. */
-#define VITRIN_GRANT_VERB_VALID_MASK ((vitrin_grant_verb_t)(1 | 2 | 4 | 8 | 16 | 32))
+#define VITRIN_GRANT_VERB_VALID_MASK ((vitrin_grant_verb_t)(1 | 2 | 4 | 8 | 16 | 32 | 512))
 
 /* Bitmask validity check for `vitrin_grant_verb_t`: rejects any bit outside
    VITRIN_GRANT_VERB_VALID_MASK. */
@@ -513,6 +525,8 @@ typedef enum {
     VITRIN_GRANT_REFUSAL_NO_SURFACE = 6,
     /* server-side failure during this use (renderer, memfd, delivery) */
     VITRIN_GRANT_REFUSAL_INTERNAL = 7,
+    /* the deployment is at its realm capacity, so no new realm can be created; a policy answer rather than a server-side failure, which is why it is not internal - retrying is legal once a realm exits, and retry_after_ms is 0 because the core cannot know when that will be. NOTE, a deliberate exception: every other code answers from the asking principal's OWN grant, but this one answers from deployment-wide state, so a principal holding one launch grant can poll launch and watch the answer flip - observing that SOME other principal created or exited a realm. That is a low-bandwidth cross-principal side channel, inherent to answering the question at all, and it is named here rather than left to be discovered; a deployment that cannot afford it must not serve realm_launch, because no attenuation of a launch grant removes it */
+    VITRIN_GRANT_REFUSAL_CAPACITY = 8,
 } vitrin_grant_refusal_t;
 
 /* Whole-value membership check for `vitrin_grant_refusal_t` (decode a wire value by
@@ -527,6 +541,7 @@ static inline bool vitrin_grant_refusal_is_valid(uint32_t v) {
         case VITRIN_GRANT_REFUSAL_CONSENT_HELD:
         case VITRIN_GRANT_REFUSAL_NO_SURFACE:
         case VITRIN_GRANT_REFUSAL_INTERNAL:
+        case VITRIN_GRANT_REFUSAL_CAPACITY:
             return true;
         default:
             return false;
@@ -808,6 +823,14 @@ static inline bool vitrin_shim_seat_origin_is_valid(uint32_t v) {
     }
 }
 
+/* ==== vitrin_launcher (version 1) ==== */
+/* realm-launch facet */
+
+#define VITRIN_LAUNCHER_INTERFACE_NAME "vitrin_launcher"
+#define VITRIN_LAUNCHER_INTERFACE_VERSION 1u
+/* Every request on this interface exercises the grant verb `realm_launch`. */
+#define VITRIN_LAUNCHER_VERB "realm_launch"
+
 /* ==================================================================== */
 /* Section 2: message structs and marshal functions, in document order   */
 /* (interfaces in document order; within an interface, requests then     */
@@ -836,6 +859,10 @@ typedef struct {
 
 #define VITRIN_HANDSHAKE_REQ_HELLO_OPCODE ((uint8_t)0)
 #define VITRIN_HANDSHAKE_REQ_HELLO_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_HANDSHAKE_REQ_HELLO_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -946,6 +973,10 @@ typedef struct {
 
 #define VITRIN_HANDSHAKE_REQ_SYNC_OPCODE ((uint8_t)1)
 #define VITRIN_HANDSHAKE_REQ_SYNC_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_HANDSHAKE_REQ_SYNC_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -1038,6 +1069,10 @@ typedef struct {
 
 #define VITRIN_HANDSHAKE_EVT_ERROR_OPCODE ((uint8_t)0)
 #define VITRIN_HANDSHAKE_EVT_ERROR_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_HANDSHAKE_EVT_ERROR_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -1139,6 +1174,10 @@ typedef struct {
 
 #define VITRIN_HANDSHAKE_EVT_DONE_OPCODE ((uint8_t)1)
 #define VITRIN_HANDSHAKE_EVT_DONE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_HANDSHAKE_EVT_DONE_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -1231,6 +1270,10 @@ typedef struct {
 
 #define VITRIN_PRINCIPAL_REQ_GET_REALM_OPCODE ((uint8_t)0)
 #define VITRIN_PRINCIPAL_REQ_GET_REALM_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_PRINCIPAL_REQ_GET_REALM_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -1325,6 +1368,10 @@ typedef struct {
 
 #define VITRIN_PRINCIPAL_EVT_BOUND_OPCODE ((uint8_t)0)
 #define VITRIN_PRINCIPAL_EVT_BOUND_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_PRINCIPAL_EVT_BOUND_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -1437,6 +1484,10 @@ typedef struct {
 
 #define VITRIN_REALM_REQ_REQUEST_GRANT_OPCODE ((uint8_t)0)
 #define VITRIN_REALM_REQ_REQUEST_GRANT_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_REALM_REQ_REQUEST_GRANT_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -1564,6 +1615,98 @@ static inline vitrin_decode_status_t vitrin_realm_req_request_grant_decode(
 
 /* ==== vitrin_grant messages ==== */
 
+/* Request `get_launcher` (opcode 0) on `vitrin_grant`.
+ *
+ * mint the launch facet for this grant
+ */
+typedef struct {
+    /* the launch facet, born inert (confers nothing until this grant is granted with realm_launch) (new_id: vitrin_launcher) */
+    uint32_t launcher;
+} vitrin_grant_req_get_launcher_t;
+
+#define VITRIN_GRANT_REQ_GET_LAUNCHER_OPCODE ((uint8_t)0)
+#define VITRIN_GRANT_REQ_GET_LAUNCHER_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_GRANT_REQ_GET_LAUNCHER_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_grant_req_get_launcher_encode(const vitrin_grant_req_get_launcher_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_GRANT_REQ_GET_LAUNCHER_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_GRANT_REQ_GET_LAUNCHER_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, msg->launcher);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_grant_req_get_launcher_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_grant_req_get_launcher_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_GRANT_REQ_GET_LAUNCHER_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_GRANT_REQ_GET_LAUNCHER_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_GRANT_REQ_GET_LAUNCHER_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_launcher = vitrin_raw_read_u32(in, in_len, &pos, &out->launcher);
+    if (st_launcher != VITRIN_DECODE_OK) { return st_launcher; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
 /* Event `resolved` (opcode 0) on `vitrin_grant`.
  *
  * the petition's terminal outcome
@@ -1581,6 +1724,10 @@ typedef struct {
 
 #define VITRIN_GRANT_EVT_RESOLVED_OPCODE ((uint8_t)0)
 #define VITRIN_GRANT_EVT_RESOLVED_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_GRANT_EVT_RESOLVED_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -1694,6 +1841,10 @@ typedef struct {
 
 #define VITRIN_GRANT_EVT_REFUSED_OPCODE ((uint8_t)1)
 #define VITRIN_GRANT_EVT_REFUSED_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_GRANT_EVT_REFUSED_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -1798,6 +1949,10 @@ typedef struct {
 
 #define VITRIN_CONSENT_EVT_STATE_OPCODE ((uint8_t)0)
 #define VITRIN_CONSENT_EVT_STATE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_CONSENT_EVT_STATE_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -1891,6 +2046,10 @@ typedef struct {
 
 #define VITRIN_VIEW_REQ_CAPTURE_FRAME_OPCODE ((uint8_t)0)
 #define VITRIN_VIEW_REQ_CAPTURE_FRAME_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_VIEW_REQ_CAPTURE_FRAME_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -1986,6 +2145,10 @@ typedef struct {
 
 #define VITRIN_VIEW_EVT_FRAME_READY_OPCODE ((uint8_t)0)
 #define VITRIN_VIEW_EVT_FRAME_READY_HAS_FD 1
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_VIEW_EVT_FRAME_READY_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -2102,6 +2265,10 @@ typedef struct {
 
 #define VITRIN_ACTUATOR_POINTER_REQ_MOVE_OPCODE ((uint8_t)0)
 #define VITRIN_ACTUATOR_POINTER_REQ_MOVE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_ACTUATOR_POINTER_REQ_MOVE_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -2200,6 +2367,10 @@ typedef struct {
 
 #define VITRIN_ACTUATOR_POINTER_REQ_BUTTON_OPCODE ((uint8_t)1)
 #define VITRIN_ACTUATOR_POINTER_REQ_BUTTON_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_ACTUATOR_POINTER_REQ_BUTTON_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -2297,6 +2468,10 @@ typedef struct {
 
 #define VITRIN_ACTUATOR_POINTER_REQ_SCROLL_OPCODE ((uint8_t)2)
 #define VITRIN_ACTUATOR_POINTER_REQ_SCROLL_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_ACTUATOR_POINTER_REQ_SCROLL_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -2396,6 +2571,10 @@ typedef struct {
 
 #define VITRIN_ACTUATOR_TEXT_REQ_TYPE_OPCODE ((uint8_t)0)
 #define VITRIN_ACTUATOR_TEXT_REQ_TYPE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_ACTUATOR_TEXT_REQ_TYPE_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -2488,6 +2667,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SESSION_REQ_CREATE_SURFACE_OPCODE ((uint8_t)0)
 #define VITRIN_SHIM_SESSION_REQ_CREATE_SURFACE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SESSION_REQ_CREATE_SURFACE_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -2576,6 +2759,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SESSION_REQ_GET_SEAT_OPCODE ((uint8_t)1)
 #define VITRIN_SHIM_SESSION_REQ_GET_SEAT_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SESSION_REQ_GET_SEAT_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -2668,6 +2855,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SESSION_EVT_CONFIGURE_OPCODE ((uint8_t)0)
 #define VITRIN_SHIM_SESSION_EVT_CONFIGURE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SESSION_EVT_CONFIGURE_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -2780,6 +2971,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SURFACE_REQ_ATTACH_OPCODE ((uint8_t)0)
 #define VITRIN_SHIM_SURFACE_REQ_ATTACH_HAS_FD 1
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SURFACE_REQ_ATTACH_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -2902,6 +3097,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SURFACE_REQ_DAMAGE_OPCODE ((uint8_t)1)
 #define VITRIN_SHIM_SURFACE_REQ_DAMAGE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SURFACE_REQ_DAMAGE_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -3010,6 +3209,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SURFACE_REQ_COMMIT_OPCODE ((uint8_t)2)
 #define VITRIN_SHIM_SURFACE_REQ_COMMIT_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SURFACE_REQ_COMMIT_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -3095,6 +3298,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SURFACE_EVT_FRAME_DONE_OPCODE ((uint8_t)0)
 #define VITRIN_SHIM_SURFACE_EVT_FRAME_DONE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SURFACE_EVT_FRAME_DONE_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -3185,6 +3392,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SURFACE_EVT_BUFFER_DONE_OPCODE ((uint8_t)1)
 #define VITRIN_SHIM_SURFACE_EVT_BUFFER_DONE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SURFACE_EVT_BUFFER_DONE_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -3286,6 +3497,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SEAT_EVT_MOTION_OPCODE ((uint8_t)0)
 #define VITRIN_SHIM_SEAT_EVT_MOTION_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SEAT_EVT_MOTION_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -3393,6 +3608,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SEAT_EVT_BUTTON_OPCODE ((uint8_t)1)
 #define VITRIN_SHIM_SEAT_EVT_BUTTON_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SEAT_EVT_BUTTON_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -3499,6 +3718,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SEAT_EVT_SCROLL_OPCODE ((uint8_t)2)
 #define VITRIN_SHIM_SEAT_EVT_SCROLL_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SEAT_EVT_SCROLL_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -3607,6 +3830,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SEAT_EVT_KEY_OPCODE ((uint8_t)3)
 #define VITRIN_SHIM_SEAT_EVT_KEY_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SEAT_EVT_KEY_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -3711,6 +3938,10 @@ typedef struct {
 
 #define VITRIN_SHIM_SEAT_EVT_TEXT_OPCODE ((uint8_t)4)
 #define VITRIN_SHIM_SEAT_EVT_TEXT_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SEAT_EVT_TEXT_SINCE 1u
 
 /* Encodes into a complete frame (header + argument payload). Returns the
    number of bytes written (fits in an int32_t: the wire format's own u16
@@ -3790,6 +4021,191 @@ static inline vitrin_decode_status_t vitrin_shim_seat_evt_text_decode(
     if (st_origin != VITRIN_DECODE_OK) { return st_origin; }
     if (!vitrin_shim_seat_origin_is_valid(origin_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
     out->origin = (vitrin_shim_seat_origin_t)origin_raw;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* ==== vitrin_launcher messages ==== */
+
+/* Request `launch` (opcode 0) on `vitrin_launcher`.
+ *
+ * launch the granted template into a new realm
+ */
+typedef struct {
+    /* no arguments -- a truly empty struct is not portable standard C */
+    char reserved;
+} vitrin_launcher_req_launch_t;
+
+#define VITRIN_LAUNCHER_REQ_LAUNCH_OPCODE ((uint8_t)0)
+#define VITRIN_LAUNCHER_REQ_LAUNCH_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_LAUNCHER_REQ_LAUNCH_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_launcher_req_launch_encode(const vitrin_launcher_req_launch_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_LAUNCHER_REQ_LAUNCH_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_LAUNCHER_REQ_LAUNCH_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    (void)msg;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_launcher_req_launch_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_launcher_req_launch_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_LAUNCHER_REQ_LAUNCH_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_LAUNCHER_REQ_LAUNCH_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_LAUNCHER_REQ_LAUNCH_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    out->reserved = 0;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `launched` (opcode 0) on `vitrin_launcher`.
+ *
+ * the realm the launch created
+ */
+typedef struct {
+    /* id of the newly created realm instance, usable as get_realm's name (max 64 bytes) */
+    vitrin_string_t realm;
+} vitrin_launcher_evt_launched_t;
+
+#define VITRIN_LAUNCHER_EVT_LAUNCHED_OPCODE ((uint8_t)0)
+#define VITRIN_LAUNCHER_EVT_LAUNCHED_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_LAUNCHER_EVT_LAUNCHED_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_launcher_evt_launched_encode(const vitrin_launcher_evt_launched_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    if (msg->realm.len > 64u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->realm.len);
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_LAUNCHER_EVT_LAUNCHED_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_LAUNCHER_EVT_LAUNCHED_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    pos += vitrin_raw_write_string(out + pos, msg->realm);
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_launcher_evt_launched_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_launcher_evt_launched_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_LAUNCHER_EVT_LAUNCHED_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_LAUNCHER_EVT_LAUNCHED_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_LAUNCHER_EVT_LAUNCHED_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_realm = vitrin_raw_read_string(in, in_len, &pos, 64u, &out->realm);
+    if (st_realm != VITRIN_DECODE_OK) { return st_realm; }
     if (pos != in_len) {
         return VITRIN_DECODE_ERR_TRAILING_BYTES;
     }

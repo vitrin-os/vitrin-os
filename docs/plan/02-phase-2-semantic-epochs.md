@@ -368,6 +368,24 @@ Three clusters decomposing in parallel independently claimed the same verb bit, 
 | 64 | `designate_file` | E2.6 (earliest-starting) | P2.6.5 |
 | 128 | `egress` | E2.7 | P2.7.2 |
 | 256 | `publish_tree` | E2.4 | P2.4.1 |
+| 512 | `realm_launch` | **WS-E** ([14-workstream-session-mode.md](14-workstream-session-mode.md)) | WS-E.1.1 (#207) |
+
+**The registry is repo-wide, not Phase-2-only.** The 512 row is the proof: WS-E is
+a workstream, not a Phase-2 epic, and its first task drafted `realm_launch` at
+**64** — already `designate_file`'s. A verb value is immutable once landed
+([00-conventions.md](../protocol/00-conventions.md) §7.4), so a parallel
+workstream allocating against a stale reading of the IDL is exactly the collision
+this table exists to stop, and it caught one. Anything that adds a verb bit
+allocates it here first, whatever document schedules the work.
+
+**The 1→2 version bump is owned by whoever lands first, not by P2.1.2 by name.**
+§3's second serialization point says P2.1.2 owns "the single bump for the whole
+phase". WS-E.1.1 needs version 2 to carry a new request and may land before Track
+A opens. If it does, it performs the bump and P2.1.2 rides it; the invariant that
+actually matters is unchanged — **one bump, and every later addition at
+`since="2"`** — because the "everything at once" rule binds the *arguments within
+a signature*, which are immutable, not the calendar order of two additive
+landings. Nothing may bump to version 3.
 
 **Prose pages** (`docs/protocol/` ends at `11-vitrin_shim_seat.md`; three tasks claimed 12):
 

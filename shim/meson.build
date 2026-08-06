@@ -104,6 +104,9 @@ foreach p : protocols
   if name == 'xdg-shell'
     xdg_shell_code = code
   endif
+  if name == 'xdg-decoration'
+    xdg_decoration_code = code
+  endif
 endforeach
 
 # --- P1.6.4 probe catalogue --------------------------------------------
@@ -221,6 +224,16 @@ xdg_shell_client_header = custom_target(
   'xdg-shell-client-header',
   input: wl_protocol_dir / 'stable/xdg-shell/xdg-shell.xml',
   output: 'xdg-shell-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+
+# Client-side xdg-decoration stubs, for the conformance client's FACT 4: the
+# shim's decoration reply is scheduled relative to the initial commit, and
+# only the client end can observe that ordering.
+xdg_decoration_client_header = custom_target(
+  'xdg-decoration-client-header',
+  input: wl_protocol_dir / 'unstable/xdg-decoration/xdg-decoration-unstable-v1.xml',
+  output: 'xdg-decoration-unstable-v1-client-protocol.h',
   command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
 )
 
@@ -432,6 +445,8 @@ xdg_conformance_client = executable(
   files('tests/xdg_conformance_client.c'),
   xdg_shell_client_header,
   xdg_shell_code,
+  xdg_decoration_client_header,
+  xdg_decoration_code,
   include_directories: inc,
   dependencies: [wayland_client],
 )

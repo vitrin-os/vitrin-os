@@ -57,6 +57,7 @@
 
 #include <wayland-client.h>
 
+#include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
 /* The shim advertises xdg_wm_base v6; wm_capabilities needs v5. Binding at
@@ -76,6 +77,12 @@ struct probe {
 	struct wl_shm *shm;
 	struct xdg_wm_base *wm_base;
 	uint32_t wm_base_version;
+	struct zxdg_decoration_manager_v1 *deco_manager;
+
+	/* FACT 4. The mode the shim pinned, and whether it had arrived by the
+	 * time the initial commit's round trips finished. */
+	int deco_configure_count;
+	uint32_t deco_mode;
 
 	int configure_count;
 	int wm_capabilities_count;
@@ -118,8 +125,23 @@ static void registry_global(void *data, struct wl_registry *registry,
 			? WANT_WM_BASE_VERSION : version;
 		p->wm_base = wl_registry_bind(registry, name,
 			&xdg_wm_base_interface, v);
+	} else if (strcmp(iface, zxdg_decoration_manager_v1_interface.name) == 0) {
+		p->deco_manager = wl_registry_bind(registry, name,
+			&zxdg_decoration_manager_v1_interface, 1);
 	}
 }
+
+static void deco_configure(void *data,
+		struct zxdg_toplevel_decoration_v1 *deco, uint32_t mode) {
+	(void)deco;
+	struct probe *p = data;
+	p->deco_configure_count++;
+	p->deco_mode = mode;
+}
+
+static const struct zxdg_toplevel_decoration_v1_listener deco_listener = {
+	.configure = deco_configure,
+};
 
 static void registry_global_remove(void *data, struct wl_registry *registry,
 		uint32_t name) {
@@ -293,16 +315,36 @@ int main(void) {
 	xdg_toplevel_set_title(toplevel, "vitrin-xdg-conformance");
 	xdg_toplevel_set_app_id(toplevel, "org.vitrin.xdg-conformance");
 
+	/* FACT 4, first half: ask for a decoration HERE -- before the initial
+	 * commit -- because that is what xdg-decoration requires and what every
+	 * real toolkit does. A shim that answers immediately schedules a
+	 * configure on an uninitialized xdg_surface, which is a wlroots
+	 * assertion, not a protocol error: the shim ABORTS and the client sees
+	 * only a broken pipe. So the round trip below is itself the assertion. */
+	struct zxdg_toplevel_decoration_v1 *deco = NULL;
+	check(p.deco_manager != NULL, "zxdg_decoration_manager_v1 is advertised");
+	if (p.deco_manager != NULL) {
+		deco = zxdg_decoration_manager_v1_get_toplevel_decoration(
+			p.deco_manager, toplevel);
+		zxdg_toplevel_decoration_v1_add_listener(deco, &deco_listener, &p);
+	}
+
 	/* FACT 1, first half: the role exists and the client has said everything
 	 * it means to say about it -- and still has not committed. Two round
 	 * trips, because a configure scheduled on the compositor's idle loop
 	 * would land on the second one, not the first. */
 	if (wl_display_roundtrip(display) < 0 || wl_display_roundtrip(display) < 0) {
-		fprintf(stderr, "FAIL roundtrip after get_toplevel\n");
+		fprintf(stderr, "FAIL roundtrip after get_toplevel "
+			"(a shim that answered the decoration eagerly has "
+			"already aborted by here)\n");
 		return 2;
 	}
 	check(p.configure_count == 0,
 		"no xdg_surface.configure before the initial commit");
+	/* FACT 4, second half. The decoration's own configure is bound by the
+	 * same rule as the surface's, for the same reason. */
+	check(p.deco_configure_count == 0,
+		"no decoration configure before the initial commit");
 
 	/* The initial commit: no buffer attached, as xdg-shell requires. */
 	wl_surface_commit(surface);
@@ -312,6 +354,17 @@ int main(void) {
 	}
 	check(p.configure_count >= 1,
 		"xdg_surface.configure arrives on the initial commit");
+
+	/* FACT 4, third half: the answer arrives, and it is the one v0 gives.
+	 * Both directions -- a shim that never answers leaves the client
+	 * guessing, and a shim that answers SERVER_SIDE has silently taken on
+	 * drawing decorations it does not draw. */
+	if (deco != NULL) {
+		check(p.deco_configure_count >= 1,
+			"decoration configure arrives on the initial commit");
+		check(p.deco_mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE,
+			"decoration mode is client-side (v0 draws no decorations)");
+	}
 
 	/* FACT 2. */
 	check(p.wm_capabilities_count == 1,

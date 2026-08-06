@@ -36,6 +36,8 @@
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h> /* WL_SEAT_CAPABILITY_* */
 
+#include <stdlib.h>
+
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_data_device.h>
@@ -50,12 +52,78 @@
 #include "server.h"
 
 /* Decline server-side decorations: whenever a client asks for a decoration
- * object, immediately pin it to client-side (D3/E6: no SSD in v0). */
+ * object, pin it to client-side (D3/E6: no SSD in v0).
+ *
+ * THE ANSWER CANNOT BE GIVEN WHEN THE QUESTION ARRIVES, which is why this is
+ * three functions rather than one. `wlr_xdg_toplevel_decoration_v1_set_mode`
+ * schedules a configure, and `wlr_xdg_surface_schedule_configure` asserts
+ * `surface->initialized` -- but xdg-decoration REQUIRES the client to create
+ * its decoration object before the surface's first commit, so at
+ * `new_toplevel_decoration` time the surface is, correctly, not yet
+ * initialized. Answering immediately therefore aborts the shim on
+ * protocol-correct clients: every real toolkit terminal (alacritty, kitty)
+ * dies at startup with
+ *
+ *     wlr_xdg_surface_schedule_configure: Assertion `surface->initialized'
+ *
+ * Firefox never binds `zxdg_decoration_manager_v1` at all, which is the only
+ * reason the acceptance gates never saw this.
+ *
+ * So the mode is set at the initial commit instead, exactly where
+ * `toplevel_commit` in xdg.c already sends this surface's first configure.
+ * A client that creates its decoration AFTER the initial commit -- also legal
+ * -- is answered inline, since the assertion's precondition already holds. */
+struct vitrin_decoration {
+	struct wlr_xdg_toplevel_decoration_v1 *deco;
+	struct wl_listener commit;
+	struct wl_listener destroy;
+};
+
+static void decline_ssd(struct wlr_xdg_toplevel_decoration_v1 *deco) {
+	wlr_xdg_toplevel_decoration_v1_set_mode(
+		deco, WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+}
+
+static void deco_commit(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vitrin_decoration *d = wl_container_of(listener, d, commit);
+	/* Only the initial commit: the mode is pinned once, and a later commit
+	 * must not re-send a configure the client did not ask for. */
+	if (d->deco->toplevel->base->initial_commit) {
+		decline_ssd(d->deco);
+	}
+}
+
+static void deco_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vitrin_decoration *d = wl_container_of(listener, d, destroy);
+	wl_list_remove(&d->commit.link);
+	wl_list_remove(&d->destroy.link);
+	free(d);
+}
+
 static void on_new_deco(struct wl_listener *listener, void *data) {
 	(void)listener;
 	struct wlr_xdg_toplevel_decoration_v1 *deco = data;
-	wlr_xdg_toplevel_decoration_v1_set_mode(
-		deco, WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+
+	if (deco->toplevel->base->initialized) {
+		decline_ssd(deco);
+		return;
+	}
+
+	struct vitrin_decoration *d = calloc(1, sizeof(*d));
+	if (d == NULL) {
+		/* Out of memory. Say nothing rather than aborting: the client's
+		 * own default is client-side decorations, so the window still
+		 * comes up correctly-drawn; it merely never hears it from us. */
+		wlr_log(WLR_ERROR, "decoration record allocation failed");
+		return;
+	}
+	d->deco = deco;
+	d->commit.notify = deco_commit;
+	wl_signal_add(&deco->toplevel->base->surface->events.commit, &d->commit);
+	d->destroy.notify = deco_destroy;
+	wl_signal_add(&deco->events.destroy, &d->destroy);
 }
 
 bool vitrin_create_globals(struct vitrin_shim *s) {

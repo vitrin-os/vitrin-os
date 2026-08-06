@@ -258,6 +258,12 @@ impl Report {
     /// `_exit`, so a multi-threaded caller is not *unsound*, but the
     /// discipline is stated so nobody later adds an allocation to the child.
     pub fn probe() -> Self {
+        // Every namespace row below reads its answer out of a child's exit
+        // status, so the probes are only measurable while this process
+        // actually reaps its own children. See [`SigchldDefault`] for the
+        // launcher state that would otherwise void all seven rows at once.
+        let _sigchld = SigchldDefault::install();
+
         let namespaces = vec![
             NamespaceProbe {
                 key: "ns.user",
@@ -374,6 +380,69 @@ impl Report {
     }
 }
 
+/// Hold `SIGCHLD` at `SIG_DFL` for as long as the probes run, restoring
+/// whatever was there on drop.
+///
+/// # The failure this exists to stop
+///
+/// Under `SIGCHLD = SIG_IGN` the kernel reaps children itself, and a
+/// subsequent `waitpid` on the child returns `-1`/`ECHILD` instead of its exit
+/// status. Every namespace row is *encoded in* that exit status, so the whole
+/// set would come back `unmeasured` and [`Report::tier`] would report
+/// [`Tier::None`] — on a machine that grants every namespace it was asked for.
+/// Once P2.6.2 wires D-020(6)'s floor onto [`Tier::meets`], the same launcher
+/// state would make `vitrind` *refuse to start* on a fully capable kernel.
+///
+/// This is not a hypothetical disposition. `execve(2)` resets *caught* signals
+/// to `SIG_DFL` but deliberately **preserves `SIG_IGN`** — a rule
+/// [`super`]'s own module docs already state, for the mirror-image reason
+/// (every disposition the core inherits survives into the shim). And
+/// `signal(SIGCHLD, SIG_IGN)` is the standard zombie-avoidance idiom in
+/// supervisors, service wrappers, shells (`trap "" CHLD`) and CI runners, so
+/// the core can plausibly be launched under it.
+///
+/// Resetting is the only available fix rather than the tidy one: under
+/// `SIG_IGN` the exit status is *destroyed*, not merely hard to read, so no
+/// amount of care in the parent can recover a measurement taken under it.
+struct SigchldDefault {
+    previous: libc::sigaction,
+    /// False when the save itself failed, in which case restoring would write
+    /// a zeroed disposition over a live one — worse than leaving it alone.
+    restore: bool,
+}
+
+impl SigchldDefault {
+    fn install() -> Self {
+        // SAFETY: both structs are fully initialized before use and outlive
+        // the calls; `sigaction` writes the previous disposition into
+        // `previous` and reads `desired`.
+        unsafe {
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            let mut desired: libc::sigaction = std::mem::zeroed();
+            desired.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut desired.sa_mask);
+            let rc = libc::sigaction(libc::SIGCHLD, &desired, &mut previous);
+            SigchldDefault {
+                previous,
+                restore: rc == 0,
+            }
+        }
+    }
+}
+
+impl Drop for SigchldDefault {
+    fn drop(&mut self) {
+        if !self.restore {
+            return;
+        }
+        // SAFETY: `previous` was written by a successful `sigaction` above and
+        // is still a valid disposition for this process.
+        unsafe {
+            libc::sigaction(libc::SIGCHLD, &self.previous, std::ptr::null_mut());
+        }
+    }
+}
+
 /// Measure one `unshare` request in a forked child.
 ///
 /// The child calls exactly two syscalls. Success is encoded as exit status 0
@@ -394,9 +463,11 @@ fn probe_unshare(flags: libc::c_int) -> Support {
 fn probe_unshare_reporting_pid(flags: libc::c_int) -> (libc::pid_t, Support) {
     // SAFETY: `fork` in a multi-threaded process is safe as long as the child
     // reaches `_exit` through async-signal-safe calls only. The child below
-    // calls `unshare`, `__errno_location` (via `Error::last_os_error`'s
-    // absence — we read errno directly) and `_exit`: all syscalls or
-    // thread-local reads, no allocation, no locks, no Rust destructors.
+    // calls exactly three things: `unshare`, `__errno_location` (a
+    // thread-local address, read directly rather than through
+    // `io::Error::last_os_error` so that no `std` machinery sits between the
+    // fork and the exit at all), and `_exit`. No allocation, no locks, no
+    // Rust destructor in scope.
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => (-1, Support::Unmeasured("fork failed")),
@@ -406,7 +477,7 @@ fn probe_unshare_reporting_pid(flags: libc::c_int) -> (libc::pid_t, Support) {
             let code = if rc == 0 {
                 0
             } else {
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                let errno = unsafe { *libc::__errno_location() };
                 // Errnos are small positive integers; clamp defensively rather
                 // than truncating silently into a different errno.
                 errno.clamp(1, 255)
@@ -418,7 +489,21 @@ fn probe_unshare_reporting_pid(flags: libc::c_int) -> (libc::pid_t, Support) {
             // SAFETY: `pid` is our own child and `status` is a valid pointer.
             let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
             if waited != pid {
-                return (pid, Support::Unmeasured("waitpid failed"));
+                // `ECHILD` here means the child was auto-reaped before we could
+                // read it, which happens only under `SIGCHLD = SIG_IGN`.
+                // [`SigchldDefault`] is installed for exactly this reason, so
+                // reaching this arm means something re-ignored `SIGCHLD`
+                // underneath the probe. Named separately from a generic
+                // failure because the exit status is *destroyed* in that case
+                // and no retry can recover it — the operator needs the cause,
+                // not a shrug.
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                let why = if errno == libc::ECHILD {
+                    "probe child auto-reaped (SIGCHLD ignored); exit status unrecoverable"
+                } else {
+                    "waitpid failed"
+                };
+                return (pid, Support::Unmeasured(why));
             }
             let support = if libc::WIFEXITED(status) {
                 match libc::WEXITSTATUS(status) {
@@ -588,7 +673,11 @@ fn has_subuid_range() -> bool {
 fn current_user_name() -> Option<String> {
     let uid = unsafe { libc::getuid() };
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut buf = vec![0_i8; 1024];
+    // `libc::c_char`, never a literal `i8`: `c_char` is *unsigned* on aarch64,
+    // arm, riscv64, powerpc64 and s390x, so `Vec<i8>` here is a hard build
+    // break on every one of them. CI runs x86_64 only, which is exactly why
+    // this has to be right by construction rather than by test.
+    let mut buf = vec![0 as libc::c_char; 1024];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
     // SAFETY: `getpwuid_r` writes into the caller's `pwd` and `buf`; `result`
     // is set to `&pwd` on success and left null when no entry exists. The
@@ -817,6 +906,98 @@ mod tests {
             let (key, value) = line.split_once('=').expect("every row is key=value");
             assert!(!key.is_empty() && !value.is_empty(), "empty row: {line}");
         }
+    }
+
+    /// The child half of [`a_launcher_that_ignores_sigchld_still_measures`].
+    ///
+    /// `#[ignore]`d so a normal run never picks it up; the parent invokes it
+    /// by exact name.
+    #[test]
+    #[ignore]
+    fn probe_under_ignored_sigchld() {
+        assert_eq!(
+            std::env::var("VITRIN_TEST_SIGCHLD_IGNORED").as_deref(),
+            Ok("1"),
+            "this test is only meaningful when its parent set up the disposition"
+        );
+        // Confirm the premise before asserting anything about the fix: we must
+        // really have inherited SIG_IGN across exec, or the test proves nothing.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) };
+        assert_eq!(
+            current.sa_sigaction,
+            libc::SIG_IGN,
+            "SIG_IGN was not inherited across exec, so this run tests nothing"
+        );
+
+        let report = Report::probe();
+        for probe in &report.namespaces {
+            assert!(
+                !matches!(probe.support, Support::Unmeasured(_)),
+                "{} came back {} under an ignored SIGCHLD",
+                probe.key,
+                probe.support
+            );
+        }
+        assert!(
+            !matches!(report.namespaces_combined, Support::Unmeasured(_)),
+            "ns.all came back {} under an ignored SIGCHLD",
+            report.namespaces_combined
+        );
+
+        // And the guard must put back what it found rather than leaving the
+        // process on SIG_DFL.
+        let mut after: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut after) };
+        assert_eq!(
+            after.sa_sigaction,
+            libc::SIG_IGN,
+            "the probe left SIGCHLD changed instead of restoring it"
+        );
+    }
+
+    #[test]
+    fn a_launcher_that_ignores_sigchld_still_measures() {
+        // Under `SIGCHLD = SIG_IGN` the kernel auto-reaps, `waitpid` returns
+        // ECHILD, and every namespace row would come back `unmeasured` on a
+        // machine that grants all of them -- with `tier=none` following. The
+        // idiom is ordinary (`trap "" CHLD`, `signal(SIGCHLD, SIG_IGN)` in
+        // supervisors) and `execve` preserves SIG_IGN, so the core can be
+        // launched into it.
+        //
+        // Run in a SUBPROCESS on purpose. Setting SIG_IGN in this process
+        // would change a disposition the whole test binary shares, and other
+        // tests here spawn real realms and reap them with `Child::wait` -- so
+        // an in-process version of this test would flake them.
+        use std::os::unix::process::CommandExt;
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "--exact",
+            "spawn::isolation::tests::probe_under_ignored_sigchld",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("VITRIN_TEST_SIGCHLD_IGNORED", "1");
+
+        // SAFETY: `signal` is async-signal-safe and is the only thing between
+        // fork and exec; the disposition is set in the CHILD, so this parent's
+        // own reaping (`output()` below) is untouched.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+
+        let out = cmd.output().expect("re-exec of the test binary");
+        assert!(
+            out.status.success(),
+            "probe under ignored SIGCHLD failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
     }
 
     #[test]

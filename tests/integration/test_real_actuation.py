@@ -116,6 +116,43 @@ def _require_shim(test: IntegrationTest) -> pathlib.Path:
     return shim_bin
 
 
+#: How long the cross-realm gate waits for an app to report a click that must
+#: never arrive. Generous by two orders of magnitude on purpose — a delivered
+#: click reaches its app in milliseconds — and the test *measures* a real
+#: delivery in the same run and fails if it took longer than this, so the
+#: number cannot quietly stop being evidence.
+_NO_HIT_WINDOW_S = 3.0
+
+
+def _hits(log: pathlib.Path) -> list[str]:
+    """Every `HIT` line a `click-target` has printed into the core's log so far.
+
+    The **app's own receipt** of a click: `click-target` prints and `fflush`es
+    it from its `wl_pointer.button` handler and latches, so a line here is one
+    app saying it was pressed on. Read live — the log is a file, not a pipe —
+    so a test can assert an actuation reached nobody *while the session is
+    still up*, which is when that fact is worth anything.
+    """
+    return [
+        ln for ln in log.read_text(errors="replace").splitlines() if ln.startswith("HIT ")
+    ]
+
+
+def _require_click_target(test: IntegrationTest, shim_bin: pathlib.Path) -> str:
+    """The `click-target` app built beside the C shim, or a loud failure."""
+    app = _resolve_sibling(shim_bin, "click-target", "VITRIN_CLICK_TARGET_APP")
+    if app is None:
+        # click-target is co-built with the shim unconditionally (a bare
+        # wl_shm client, no optional dep), so its absence beside a built
+        # shim is a build misconfiguration to FAIL on, not a machine state.
+        test.fail(
+            f"no click-target beside the C shim ({shim_bin.resolve().parent}), and "
+            "VITRIN_C_SHIM_BIN is set. It is co-built with the shim (shim/meson.build); "
+            "rebuild the shim, or set VITRIN_CLICK_TARGET_APP."
+        )
+    return str(pathlib.Path(app).resolve())
+
+
 def _allowed_inputs(entries, action: str):
     """The `input` payloads of allowed `use_decision`s with the given action.
 
@@ -148,17 +185,7 @@ class RealActuationPointer(IntegrationTest):
     def setUp(self) -> None:
         super().setUp()
         self.shim_bin = _require_shim(self)
-        app = _resolve_sibling(self.shim_bin, "click-target", "VITRIN_CLICK_TARGET_APP")
-        if app is None:
-            # click-target is co-built with the shim unconditionally (a bare
-            # wl_shm client, no optional dep), so its absence beside a built
-            # shim is a build misconfiguration to FAIL on, not a machine state.
-            self.fail(
-                f"no click-target beside the C shim ({self.shim_bin.resolve().parent}), and "
-                "VITRIN_C_SHIM_BIN is set. It is co-built with the shim (shim/meson.build); "
-                "rebuild the shim, or set VITRIN_CLICK_TARGET_APP."
-            )
-        self.app_bin = str(pathlib.Path(app).resolve())
+        self.app_bin = _require_click_target(self, self.shim_bin)
         self.work = pathlib.Path(tempfile.mkdtemp(prefix="vitrin-click-"))
         self.addCleanup(_rmtree, self.work)
 
@@ -297,6 +324,234 @@ class RealActuationPointer(IntegrationTest):
         print(
             f"\n[real-actuation] agent located the target at view ({cx}, {cy}); clicked; the app "
             f"received surface ({sx}, {sy}); the surface flipped to #{self.HIT} at {hit_pct}%"
+        )
+
+
+class RealActuationCrossRealm(IntegrationTest):
+    """WS-E.1.2 (#208) review, HIGH 1: a grant naming realm A cannot actuate
+    into realm B's app — proved by **the app's own receipt**, not by the core
+    agreeing with itself.
+
+    Two realms, each a real `click-target` under the real C shim. The session
+    has one input router and one delivery target (`session::seat_target`, the
+    first still-serving realm in id order — `realm-0` here, since `realm-0` <
+    `second`), so an actuation admitted under a grant over `second` would be
+    delivered into `realm-0`'s app: an agent driving an app it holds no
+    authority over. The core refuses it instead (`internal`, the IDL's
+    "server-side failure during this use … delivery"), and WS-E.1.6 (#212)
+    replaces the refusal with per-realm routing.
+
+    **The evidence is `click-target`'s own `HIT sx=… sy=…` line**, which it
+    prints when a press lands inside its target — the app saying it was
+    clicked, on the app's own stdout, inherited by the core and captured
+    here. Both clicks use the *same* coordinates, in this order:
+
+    1. under the grant over `second` (not the seat's realm) → must refuse,
+    2. under the grant over `realm-0` (the seat's realm) → must land.
+
+    So `HIT` appearing exactly **once** is the whole claim: the second click
+    proves the coordinates really are inside a target and that the guard did
+    not simply break actuation, and the first therefore delivered nothing.
+    A guard-less core prints it twice.
+
+    The line carries no realm id, which is why the count carries the proof
+    rather than the identity. Nothing here asserts *which* app is on screen:
+    one scene, one surface, last committer wins (the published WS-E.1.3
+    limit), and this test deliberately does not depend on it.
+    """
+
+    TARGET = RealActuationPointer.TARGET
+    MIN_TARGET_PIXELS = RealActuationPointer.MIN_TARGET_PIXELS
+
+    #: The extra realm. Ordered *after* `realm-0`, so the seat target is
+    #: `realm-0` and a grant over this one is the cross-realm case. When
+    #: #212 lands, routing stops being id-ordered and this setup is what has
+    #: to be revisited — the claim above does not.
+    OTHER = "second"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.shim_bin = _require_shim(self)
+        self.app_bin = _require_click_target(self, self.shim_bin)
+        self.work = pathlib.Path(tempfile.mkdtemp(prefix="vitrin-xrealm-"))
+        self.addCleanup(_rmtree, self.work)
+
+    def _two_realm_core(self):
+        return self.core(
+            size=REALM_SIZE,
+            shim=str(self.shim_bin),
+            command=self.app_bin,
+            args=["--run-ms", "40000"],
+            realms=(self.OTHER,),
+            env_allow=tuple(WLR_ENV),
+            extra_env=WLR_ENV,
+            log_file=str(self.work / "core.log"),
+        )
+
+    def _two_live_apps(self, core):
+        """Both realms really are running an app, before anything is clicked.
+
+        Load-bearing for the negative half: a refusal is only evidence if
+        there was an app on the other side that a delivered click would have
+        reached.
+        """
+        deadline = time.monotonic() + 20.0
+        shims: list[int] = []
+        while time.monotonic() < deadline:
+            shims = [p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]
+            if len(shims) >= 2:
+                break
+            time.sleep(0.05)
+        self.assertEqual(
+            len(shims), 2, f"two realms must be two C shims; core's children: {shims}"
+        )
+        apps = []
+        while time.monotonic() < deadline:
+            apps = [
+                kid
+                for shim in shims
+                for kid in children_of(shim)
+                if comm_of(kid).startswith("click-target")
+            ]
+            if len(apps) >= 2:
+                break
+            time.sleep(0.05)
+        self.assertEqual(
+            len(apps), 2, f"each shim must have fork/exec'd its own click-target; got {apps}"
+        )
+        return shims, apps
+
+    def _locate_target(self, grant, timeout=20.0):
+        """Observe until the green target is on screen; return `(cx, cy)`."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                frame = grant.observe()
+            except errors.NoSurface:
+                time.sleep(0.05)
+                continue
+            except errors.RateLimited as rl:
+                time.sleep(max(rl.retry_after_ms / 1000.0, 0.05))
+                continue
+            cx, cy, count = locate_colour(frame, self.TARGET)
+            if count >= self.MIN_TARGET_PIXELS:
+                return cx, cy
+            time.sleep(0.1)
+        self.fail("no click-target ever painted a locatable target; there is nothing to click")
+
+    def test_a_grant_over_one_realm_cannot_click_into_a_siblings_app(self):
+        core = self._two_realm_core()
+        self._two_live_apps(core)
+
+        conn = core.connect()
+        # The seat's realm and the other one. Both grants are whole-realm and
+        # identical in every way except the realm they name — which is the
+        # only variable this test has.
+        served = whole_realm_grant(conn, realm="realm-0")
+        unserved = whole_realm_grant(conn, realm=self.OTHER)
+
+        cx, cy = self._locate_target(served)
+
+        # No app has been clicked yet, so no app has latched a HIT. That is
+        # what makes step (1)'s silence readable: the FIRST hit line to
+        # appear names whichever click reached an app.
+        log = self.work / "core.log"
+        self.assertEqual(_hits(log), [])
+
+        # (1) The cross-realm click. `click()` sends move + press + release
+        # and then syncs, so all three are on the wire before the barrier
+        # raises the refusal they were coalesced into — the whole click was
+        # refused, not merely its first event.
+        with self.assertRaises(errors.OperationFailed):
+            unserved.pointer.click(cx, cy)
+        # Nothing queued behind it: the connection is still serving, which is
+        # what "recoverable" means.
+        conn.sync(unserved)
+
+        # **The app's receipt, read live.** `click-target` prints and
+        # `fflush`es `HIT` the moment a press lands inside its target, so if
+        # this actuation were delivered anywhere, an app would say so within
+        # milliseconds. Step (2) below measures how fast that actually is on
+        # this machine, and asserts it — so this window is not a guess about
+        # timing, it is bounded by a measurement taken in the same run.
+        time.sleep(_NO_HIT_WINDOW_S)
+        self.assertEqual(
+            _hits(log),
+            [],
+            "an app reported being clicked after an actuation whose grant names a realm the "
+            "seat does not serve: the click was delivered into an app the grant confers no "
+            "authority over",
+        )
+
+        # (2) The same click under the grant over the realm the seat serves.
+        # It lands — which is what makes (1)'s silence mean something rather
+        # than meaning the guard broke actuation, and which times the window
+        # above.
+        #
+        # The pause first refills `served`'s token bucket (20/s, one second
+        # of burst) after the observe loop, so a click that must land is
+        # never refused `rate_limited` for reasons this test is not about.
+        time.sleep(1.2)
+        started = time.monotonic()
+        served.pointer.click(cx, cy)
+        conn.sync(served)
+        deadline = started + 15.0
+        landed = None
+        while time.monotonic() < deadline:
+            if _hits(log):
+                landed = time.monotonic() - started
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(
+            landed,
+            "the click under the grant over the seat's own realm never reached an app: the "
+            "guard has broken actuation rather than confined it",
+        )
+        self.assertLess(
+            landed,
+            _NO_HIT_WINDOW_S,
+            f"a delivered click took {landed:.2f}s to reach its app, which is longer than the "
+            f"{_NO_HIT_WINDOW_S}s window step (1) waited before concluding nothing was "
+            "delivered — that window is now too short to be evidence",
+        )
+
+        conn.close()
+        core.terminate()
+        out = core.output()
+
+        hits = [ln for ln in out.splitlines() if ln.startswith("HIT ")]
+        self.assertEqual(
+            len(hits),
+            1,
+            "exactly one click-target may report a HIT: the one clicked through the grant "
+            f"over the realm the seat serves. Got {hits}.",
+        )
+
+        # The journal's side of the same fact, and the reason it can state it
+        # at all: `seat_delivered` now names the realm that received the
+        # event (the second review's MEDIUM 4). Every delivery in this run
+        # went to the seat's realm.
+        delivered = [e for e in core.entries() if e["kind"] == "seat_delivered"]
+        self.assertTrue(delivered, f"the admitted click must be journalled; kinds={core.kinds()}")
+        self.assertEqual(
+            {e["realm"] for e in delivered},
+            {"realm-0"},
+            f"no delivery may name a realm other than the seat's: {delivered}",
+        )
+        refusals = [
+            e
+            for e in core.entries()
+            if e["kind"] == "use_decision" and e.get("refusal") == "internal"
+        ]
+        self.assertTrue(
+            refusals, f"the cross-realm actuation must be recorded as refused; got {refusals}"
+        )
+
+        print(
+            f"\n[real-actuation] two realms, two click-targets; a grant over {self.OTHER!r} "
+            f"clicked ({cx}, {cy}) and no app reported a HIT within {_NO_HIT_WINDOW_S}s; the "
+            f"same click under the grant over 'realm-0' was received by its app in "
+            f"{landed:.2f}s"
         )
 
 

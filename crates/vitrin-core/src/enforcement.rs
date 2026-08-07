@@ -78,7 +78,14 @@
 //!    c. `preempted` (actuation only): physical human input owns the
 //!       target ([`PhysicalPresence::owns_target`], fed at the input
 //!       router's hook point).
-//!    d. `rate_limited`: the per-grant token bucket -- deliberately the
+//!    d. `internal` (actuation only), the **cross-realm delivery guard**:
+//!       the session's one seat does not serve the realm this grant names
+//!       ([`UseEnv::seat_reaches_grant_realm`]). A stopgap that refuses,
+//!       so a multi-realm session cannot deliver one realm's authorized
+//!       keystroke into another realm's app; WS-E.1.6 (issue #212)
+//!       replaces it with per-realm routing rather than a refusal. See
+//!       the branch's own comment for why `internal` is the true code.
+//!    e. `rate_limited`: the per-grant token bucket -- deliberately the
 //!       **last** gate, so a token is consumed if and only if the use is
 //!       otherwise admitted: quota meters what would actually happen, and
 //!       an agent blocked by a prompt, a human hand, or a dead realm is
@@ -262,6 +269,19 @@ pub(crate) struct UseEnv<'a> {
     /// Physical-input presence, fed at the input router's hook point:
     /// the `preempted` judgement.
     pub presence: &'a PhysicalPresence,
+    /// **Would an admitted actuation actually reach the realm this grant
+    /// names?** The write-side mirror of [`Self::realm_view`]'s liveness
+    /// gate, resolved the same way and at the same place
+    /// (`principal::PrincipalServer::serve_facet_use` compares
+    /// `GrantTable::realm_of` against the realm the embedder says the seat
+    /// currently delivers into, `session::seat_target`).
+    ///
+    /// `false` refuses the actuation rather than delivering it somewhere
+    /// else -- see the chain's step 5d for why the code is `internal` and
+    /// why this is a stopgap WS-E.1.6 removes. Irrelevant to a capture (a
+    /// read addresses no seat) and to a launch (it creates a realm rather
+    /// than actuating into one); only the actuation arms consult it.
+    pub seat_reaches_grant_realm: bool,
     /// Where admitted actuations go, already origin-tagged `emulated`
     /// (at runtime: the realm's input router toward the shim seat, reached
     /// through `session::route_seat`; tests: a capture buffer). Delivery beyond this sink -- including
@@ -497,8 +517,63 @@ impl Chokepoint {
                 if env.presence.owns_target(now) {
                     break 'decide Err(Refuse::code(Refusal::Preempted));
                 }
+                // 5d, the cross-realm delivery guard (actuation only) --
+                // **a stopgap that refuses, not a routing policy**, and
+                // WS-E.1.6 (issue #212) deletes it along with the
+                // placeholder it defends.
+                //
+                // The session has one input router and one delivery target
+                // (`session::seat_target`, the first still-serving realm in
+                // id order). Since WS-E.1.2 raised `MAX_REALMS` above 1 a
+                // grant can name a realm that is *not* that target, and
+                // this branch is the difference between refusing such an
+                // actuation and delivering an agent's keystroke into a
+                // **different app than the one it holds authority over**.
+                // At `MAX_REALMS = 1` the situation was unreachable, so
+                // nothing here is a behaviour change for a single-realm
+                // deployment; with several realms it is the write-side
+                // mirror of the `no_surface` gate above (which stops a
+                // grant *reading* a sibling's pixels).
+                //
+                // **Why `internal`.** Its IDL summary is "server-side
+                // failure during this use (renderer, memfd, **delivery**)",
+                // and that is exactly what has happened: authority was
+                // real, and this core cannot carry out the delivery the
+                // grant names. No other code is true here. `no_surface`
+                // would claim the grant's realm has no surface when it may
+                // be painting; `preempted` would blame a human who is not
+                // there; `not_granted` would deny an authority the human
+                // did confer. Inventing a code is not an option either --
+                // the wire's refusal vocabulary is closed, and
+                // `unsupported` is a *petition* outcome, not a refusal.
+                // The same reasoning already put `internal` under the
+                // `Launch` arm below: a verb whose implementation this
+                // build cannot perform fails closed rather than pretending.
+                //
+                // Ordered after the judgements that are about the
+                // principal (consent, preemption) so the client is told the
+                // actionable truth first, and before the rate gate so a
+                // refusal costs no token and no `once` rung.
+                //
+                // `debug!`, not `warn!`, and not because it is unimportant:
+                // an agent can drive this branch at its own rate, so a
+                // per-event `warn` would be a log-flood vector on a path a
+                // caller controls. The audited channel is the recorder's
+                // `use_decision`, which coalesces and counts (the two
+                // refusals the other actuation gates raise log nothing at
+                // all, for the same reason).
+                if !env.seat_reaches_grant_realm {
+                    tracing::debug!(
+                        grant = req.grant_wire_id,
+                        "actuation refused: the session's seat does not serve this grant's \
+                         realm, and delivering it to the realm that is served would actuate \
+                         an app this grant confers no authority over (WS-E.1.6 replaces this \
+                         with per-realm routing)"
+                    );
+                    break 'decide Err(Refuse::code(Refusal::Internal));
+                }
             }
-            // Step 5d, the rate constraint -- the final gate, so a token
+            // Step 5e, the rate constraint -- the final gate, so a token
             // is spent iff the use is otherwise admitted.
             let state = self.states.entry(req.grant_wire_id).or_default();
             let bucket = state

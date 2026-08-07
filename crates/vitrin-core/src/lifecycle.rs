@@ -680,24 +680,59 @@ impl RealmLifecycle {
     /// [`Hangup`]).
     ///
     /// Fallible because placing the connection generally is -- registering
-    /// an event source can fail. On `Err` the closure has already consumed
-    /// the connection, so the shim gets its EOF and the caller is left with
-    /// a realm it must tear down by process signal alone; the `SpawnedParts`
-    /// are dropped here, which kills and reaps the child (`GuardedChild` has
-    /// already been disarmed, so this is `Child`'s own drop -- the caller
-    /// owns the refusal path).
+    /// an event source can fail.
+    ///
+    /// **The refusal path kills and reaps here, explicitly.** On `Err` the
+    /// closure has already consumed the connection, so the shim gets its EOF
+    /// and would in all likelihood exit on its own -- but "in all
+    /// likelihood" is not a teardown guarantee, and dropping the parts is
+    /// not one either: [`SpawnedRealm::into_parts`] disarms
+    /// `spawn::GuardedChild` on the way here, and a bare
+    /// [`std::process::Child`] has no `Drop` that kills or waits. Without
+    /// the two lines below, a failure to register the source would leave a
+    /// shim (and its app) running with no core, unreaped, for a caller that
+    /// no longer holds a handle to it. Same policy as `GuardedChild`'s own
+    /// drop: a realm that never came up is a refusal, and a refusal must not
+    /// leave a process behind.
+    ///
+    /// What it does *not* clean up is the realm's runtime directory -- the
+    /// same residual the `configure` failure above it leaves, purged by the
+    /// next start's stale-tree sweep. `session::start_one_realm_in`
+    /// enumerates it.
+    ///
+    /// [`SpawnedRealm::into_parts`]: crate::spawn::SpawnedRealm::into_parts
     pub fn adopt<E>(
         parts: SpawnedParts,
         place: impl FnOnce(Connection) -> Result<Hangup, E>,
     ) -> Result<Self, E> {
-        let hangup = place(parts.connection)?;
+        let SpawnedParts {
+            realm_id,
+            mut child,
+            runtime_dir,
+            connection,
+            realm_lock,
+        } = parts;
+        let hangup = match place(connection) {
+            Ok(hangup) => hangup,
+            Err(err) => {
+                tracing::warn!(
+                    realm = %realm_id,
+                    pid = child.id(),
+                    "a spawned shim could not be placed on the event loop; SIGKILLing and \
+                     reaping it so the refusal leaves no runaway process and no zombie"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err);
+            }
+        };
         Ok(Self {
-            realm_id: parts.realm_id,
-            pid: parts.child.id(),
-            child: Some(parts.child),
+            realm_id,
+            pid: child.id(),
+            child: Some(child),
             hangup: Some(hangup),
-            runtime_dir: parts.runtime_dir,
-            _realm_lock: parts.realm_lock,
+            runtime_dir,
+            _realm_lock: realm_lock,
             death: None,
             exit: None,
             core_signals: Vec::new(),
@@ -967,16 +1002,24 @@ impl RealmLifecycle {
         // 1. The surface leaves the scene -- through the pre-existing
         //    teardown funnel, never a second one. This is what makes the
         //    chokepoint's `no_surface` true: after it there is no committed
-        //    surface, no retained zero-copy content, and no seat state.
+        //    surface, no retained zero-copy content, and no seat state *of
+        //    this realm's*. The seat half is scoped by realm id, the scene
+        //    half is not, and the asymmetry is the truth about the runtime
+        //    rather than an oversight: there is one router whose state
+        //    belongs to one realm at a time (`InputRouter::reset_for`) and
+        //    one scene shared by every realm until WS-E.1.3.
         match teardown.shim.take() {
             // `importer.take()`, not a reborrow: the importer is cleared
             // exactly once, with the realm, and this body runs exactly once
             // by the latch above. (A reborrow would also not compile --
             // `&mut` is invariant, so shortening the borrow inside a
             // `&mut RealmTeardown` is not allowed.)
-            Some(shim) => {
-                shim.connection_closed(teardown.scene, teardown.importer.take(), teardown.router)
-            }
+            Some(shim) => shim.connection_closed(
+                &self.realm_id,
+                teardown.scene,
+                teardown.importer.take(),
+                teardown.router,
+            ),
             None => {
                 // The realm died before its shim session came up, so there
                 // is no server to run the funnel through. Do the same
@@ -984,7 +1027,7 @@ impl RealmLifecycle {
                 // surface is the invariant, not a side effect of having
                 // had a server.
                 teardown.scene.clear_surface();
-                teardown.router.reset();
+                teardown.router.reset_for(&self.realm_id);
             }
         }
 
@@ -2543,6 +2586,51 @@ mod tests {
              have had something composited for it"
         );
         let _ = life.shutdown(quick_timing(), &mut rig.teardown());
+    }
+
+    /// **A realm whose connection cannot be placed leaves no process
+    /// behind** -- the `adopt` refusal path, and the second of the two
+    /// post-spawn failure sites `session::start_one_realm_in` enumerates.
+    ///
+    /// Not covered before, and the enumeration was wrong about it: this
+    /// path used to rely on dropping `SpawnedParts`, but `into_parts`
+    /// disarms `GuardedChild` and a bare `Child` neither kills nor waits,
+    /// so the shim was left running with no core and unreaped. The shim
+    /// here is `sleep 300`, which would happily outlive the session on its
+    /// own -- and *not* reading its EOF is the point: a fixture that exited
+    /// by itself would pass whether or not `adopt` did anything.
+    #[test]
+    fn a_realm_whose_connection_cannot_be_placed_leaves_no_process_behind() {
+        let _fd = fd_lock();
+        let mut rig = Rig::new("lifecycle-adopt-refused");
+        let realm = realm_with_spawn("realm-0", &mock_shim_bin(), &[], &[]);
+        let paths = SpawnPaths::under_with_shim_argv(
+            &rig.base,
+            vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("exec sleep 300"),
+            ],
+        );
+        let spawned = spawn_realm_with_env(&realm, &paths, &mut rig.recorder, |_| None)
+            .expect("spawn must succeed against a scratch runtime tree");
+        let pid = spawned.pid();
+        assert!(proc_state(pid).is_some(), "the shim really started");
+
+        let placed: Result<RealmLifecycle, &str> =
+            RealmLifecycle::adopt(spawned.into_parts(), |_conn| Err("no event loop for you"));
+        assert!(placed.is_err(), "the placement was refused");
+
+        // Neither alive nor a zombie: `adopt` killed it and collected it.
+        // `is_zombie` matters more than "the directory is gone" here --
+        // reaping is the half a bare `Child` drop would have skipped.
+        assert!(
+            proc_state(pid).is_none(),
+            "a shim whose realm never came up must be killed and reaped, not left running \
+             or left a zombie; /proc state is {:?}",
+            proc_state(pid)
+        );
+        assert!(!is_zombie(pid));
     }
 
     #[test]

@@ -70,11 +70,25 @@ dmabuf behind `--dmabuf`.
 
 None of these is DRM work. The backend is not the binding constraint.
 
-1. **One app at a time.** `MAX_REALMS = 1`
-   (`crates/vitrin-core/src/realm.rs:265`), and `Scene` holds at most one
-   client surface, single-maximized (`scene/mod.rs:232`). The realm registry
-   says raising it is *"a deletion here rather than a re-plumbing"*; the scene
-   is the real work.
+1. **One app at a time — half closed by WS-E.1.2 (#208).** `MAX_REALMS` is now
+   **16** and a session runs every realm its `realm.toml` declares, each with
+   its own shim, runtime tree and socket. The `Scene` still holds at most one
+   client surface, single-maximized (`scene/mod.rs:232`), so several realms
+   run and only the last committer is visible. **The registry's claim that
+   raising the cap was *"a deletion here rather than a re-plumbing"* turned
+   out to be half true**, and `crates/vitrin-core/src/realm.rs`'s module docs
+   now carry the audit: the registry, grant keying, path derivation, lifecycle
+   and recorder really were deletions; `session.rs`'s single
+   `Option<RealmRuntime>`, its ten call sites there, the nested backend's
+   delivery sink, the input router's per-generation state and the runtime
+   tree's flat namespace were not. Four of those were behavioural bugs that
+   only a second realm could express — a dead realm's grant capturing a live
+   sibling's scene, an agent's actuation being *delivered into a sibling's
+   app*, one realm's death resetting the session-wide input router, and a
+   failed spawn orphaning the realms already forked — which is the honest
+   measure of how wrong "a deletion" was. All four were caught by review
+   rather than by a test, which is its own finding. The scene remains the
+   real work, and it is WS-E.1.3's.
 2. **No way to launch an app.** `vitrin_realm` has exactly **one** request
    (`request_grant`). Realms exist only from `realm.toml` at startup, so
    changing app means restarting `vitrind`. This is new protocol, and it is an
@@ -98,7 +112,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 
 | Stage | Delivers | Est. |
 |---|---|---|
-| **1 — multi-app, nested** | Runtime app launch · `MAX_REALMS` > 1 · Scene binds the output to a focused realm · `layout_focus`/`layout_arrange` served · a shell client (switcher + launcher) · input routed to the focused realm | 7–9 w |
+| **1 — multi-app, nested** | Runtime app launch · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · Scene binds the output to a focused realm · `layout_focus`/`layout_arrange` served · a shell client (switcher + launcher) · input routed to the focused realm | 7–9 w |
 | **2 — livable** | Cross-realm clipboard · core-drawn lock screen on the consent stack · status in the trusted band · human screenshot | 4–6 w |
 | **3 — bare metal** | The keymap decision · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
 | **4 — long tail** | X11 (defers to E3.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |
@@ -159,6 +173,50 @@ this workstream owns, not inherits:
 - **No touch, gestures, tablet, switches or relative motion**: v0's seat
   vocabulary is pointer + keyboard only, so on a laptop that means no touchpad
   gestures and no lid switch.
+- **Several realms run, one is visible, and a capture cannot tell them
+  apart** (created by WS-E.1.2, closed by WS-E.1.3). Raising the cap landed
+  before the scene binds an output to a realm, so a multi-realm session
+  composites one output from one single-surface scene: the last committer is
+  what is on screen, and an agent's capture is of that output rather than of
+  the realm its grant names. While two realms are **live**, a capture under a
+  grant over one can carry the other's pixels. The exposure stops at *live*
+  realms: liveness is judged per realm, against the realm the grant row
+  names, so a grant over a dead realm refuses `no_surface` whatever its
+  siblings are doing. (Judging it against *any* live realm was the obvious
+  rewrite and would have been fail-**open** across realms — an authority bug,
+  not a fidelity one; the review of WS-E.1.2 caught it before merge.) The
+  remaining exposure is real, it is published in `docs/book/src/limits.md`,
+  and it exists **only** in a configuration that declares more than one
+  realm. Landing the cap first was the right order (WS-E.1.3 needs more than
+  one realm to bind an output *to*); shipping the gap silently would not have
+  been.
+- **Only one realm can be actuated, and the rest are refused rather than
+  misdelivered** (created by WS-E.1.2, closed by WS-E.1.6). The write-side
+  twin of the item above, and the one the same review found second. There is
+  one input router and one delivery target (`session::seat_target`, the
+  first still-serving realm in id order), so an actuation admitted under a
+  grant naming *another* realm would have been delivered into a sibling's
+  app — an agent driving an app it holds no authority over, which is a
+  **write**, and worse than the read the item above describes. It was
+  unreachable while `MAX_REALMS` was 1; raising the cap is what made it
+  reachable.
+
+  The fix is deliberately **not** routing. Routing — focus, per-realm
+  `PhysicalPresence`, which realm physical input follows — is WS-E.1.6's
+  whole deliverable and #208's Key decision 5 defers it there; building half
+  of it under a bug fix would be the same mistake in the other direction.
+  So the chokepoint compares the grant's realm with the realm the seat
+  actually serves and **refuses** `internal` when they differ, delivering
+  nothing. `internal` because the IDL already defines it as "server-side
+  failure during this use (renderer, memfd, **delivery**)", which is exactly
+  true here: the authority was real and this core cannot carry out the
+  delivery. Nothing in the refusal vocabulary is invented, and `unsupported`
+  is a petition outcome rather than a refusal code, so it was never a
+  candidate.
+
+  Published in `docs/book/src/limits.md`. WS-E.1.6 deletes the guard and the
+  placeholder together; a real router makes the comparison unnecessary
+  rather than merely passing.
 
 ## 7. Safety rule, non-negotiable
 

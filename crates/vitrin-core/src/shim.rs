@@ -577,17 +577,30 @@ impl ShimServer {
     /// (the importer's texture — and with it the dmabuf-backed buffer — is
     /// dropped; no `released` event exists to send on a dead connection, per
     /// the IDL's "on connection death the core closes every attach fd it
-    /// still holds"), reset the realm's input router so no implicit-grab or
-    /// pointer state leaks into the next shim generation (a stale grab
-    /// would route off-surface input to an app that never saw the press —
-    /// a phantom grab), and release every staged buffer fd (they close as
-    /// `self` drops — no fd leak). The embedder calls this exactly once,
-    /// with the connection's importer and the realm's router, then forgets
-    /// server, importer state, and connection. Taking the router here keeps
-    /// realm teardown a single funnel: an embedder (P1.5.2) cannot reset
-    /// the scene but forget the seat state.
+    /// still holds"), reset **this realm's** input-router state so no
+    /// implicit-grab or pointer state leaks into the next shim generation (a
+    /// stale grab would route off-surface input to an app that never saw the
+    /// press — a phantom grab), and release every staged buffer fd (they
+    /// close as `self` drops — no fd leak). The embedder calls this exactly
+    /// once, with the connection's importer and the session's router, then
+    /// forgets server, importer state, and connection. Taking the router
+    /// here keeps realm teardown a single funnel: an embedder (P1.5.2)
+    /// cannot reset the scene but forget the seat state.
+    ///
+    /// `realm` is why the router reset is [`InputRouter::reset_for`] and not
+    /// a bare clear: one router serves a session that may hold several
+    /// realms (WS-E.1.2), so a realm dying must forget its **own** seat
+    /// state and leave a sibling's alone — otherwise a key the sibling's app
+    /// is holding latches down when an unrelated realm exits. The scene half
+    /// above is still session-wide, and deliberately so: there is one scene
+    /// with one committed surface until WS-E.1.3 binds an output to a realm,
+    /// and clearing it is the fail-closed direction (survivors' captures
+    /// refuse `no_surface` until they commit again).
+    ///
+    /// [`InputRouter::reset_for`]: crate::input::InputRouter::reset_for
     pub fn connection_closed<H: crate::input::PreemptionHook>(
         self,
+        realm: &crate::grants::RealmId,
         scene: &mut Scene,
         importer: Option<&mut dyn DmabufImporter>,
         router: &mut crate::input::InputRouter<H>,
@@ -596,7 +609,7 @@ impl ShimServer {
         if let Some(importer) = importer {
             importer.clear();
         }
-        router.reset();
+        router.reset_for(realm);
         // `self` drops here: every `PendingBuffer.fd` closes with it.
     }
 
@@ -2211,7 +2224,12 @@ mod tests {
         assert!(importer.holds_content);
 
         let mut router = crate::input::InputRouter::new(crate::input::NoopHook);
-        server.connection_closed(&mut scene, Some(&mut importer), &mut router);
+        server.connection_closed(
+            &crate::grants::RealmId::new("realm-0"),
+            &mut scene,
+            Some(&mut importer),
+            &mut router,
+        );
         assert_eq!(importer.clears, 1);
         assert!(
             !importer.holds_content,
@@ -2490,7 +2508,13 @@ mod tests {
         // are origin-blind) so the teardown funnel's reset is observable.
         use crate::input::{InputRouter, NoopHook, SeatInput, SeatInputKind};
         use vitrin_protocol::generated::vitrin_actuator_pointer::ButtonState;
+        let realm = crate::grants::RealmId::new("realm-0");
         let mut router = InputRouter::new(NoopHook);
+        // The router's state is per shim generation, and a generation
+        // belongs to one realm: bind before routing, exactly as the two
+        // delivery sites do, or the scoped reset below has nothing of this
+        // realm's to forget.
+        router.bind_to(&realm);
         let view = (VIEW_W, VIEW_H);
         let surface = Some((VIEW_W, VIEW_H));
         let button = |state| SeatInputKind::Button {
@@ -2513,8 +2537,9 @@ mod tests {
             .is_some());
 
         // Shim death: the embedder tears the server down — one funnel for
-        // all realm state (scene, buffer fds, and seat/router state).
-        server.connection_closed(&mut scene, None, &mut router);
+        // all realm state (scene, buffer fds, and this realm's seat/router
+        // state).
+        server.connection_closed(&realm, &mut scene, None, &mut router);
         // No grab survived the generation: the stale release is unpaired
         // at the next shim's seat and dropped.
         assert!(router

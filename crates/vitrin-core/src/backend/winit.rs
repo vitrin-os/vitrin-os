@@ -1635,13 +1635,19 @@ pub(crate) fn route_turn<H: input::PreemptionHook>(
 /// releases a focus change owes it through *this* funnel — same outbox, same
 /// journal entry — instead of a second delivery path that could drift from
 /// it.
+///
+/// **Which realm, with more than one attached:** whichever
+/// [`session::seat_target`] names, which is the same function the agent half
+/// (`session::route_seat`) and the router's generation binding ask — routing
+/// physical input to a realm is WS-E.1.6's question, and answering it here
+/// would be answering it a second time, differently.
 fn deliver_physical(
-    realm: &Option<session::RealmRuntime>,
+    realms: &std::collections::BTreeMap<crate::grants::RealmId, session::RealmRuntime>,
     recorder: &mut Recorder,
     delivery: input::SeatDelivery,
 ) {
-    let Some(realm) = realm.as_ref() else {
-        trace!(origin = ?delivery.origin(), "routed input dropped: no realm attached");
+    let Some((realm_id, realm)) = session::seat_target(realms) else {
+        trace!(origin = ?delivery.origin(), "routed input dropped: no serving realm attached");
         return;
     };
     let Some(server) = realm.server.as_ref() else {
@@ -1651,11 +1657,11 @@ fn deliver_physical(
     match server.deliver_seat_event(&delivery, &mut send) {
         Ok(sent) => {
             if sent {
-                input::record_seat_delivery(recorder, &delivery);
+                input::record_seat_delivery(recorder, realm_id, &delivery);
             }
         }
         Err(err) => {
-            tracing::warn!(%err, "seat delivery to the realm failed");
+            tracing::warn!(realm = %realm_id, %err, "seat delivery to the realm failed");
         }
     }
 }
@@ -1761,17 +1767,27 @@ impl NestedState {
         // reached through `&mut self` twice.
         let session::Runtime {
             router,
-            realm,
+            realms,
             kernel,
             ..
         } = &mut self.runtime;
+        // Before the routing, not after: `route_turn` writes this turn's
+        // presses into the router's pairing table, and that debt has to be
+        // on record as *this realm's* from the first one — otherwise a
+        // sibling realm dying mid-session would clear a key this app is
+        // still holding (`input::InputRouter::reset_for`). Same target the
+        // sink below picks, from the same function, so the two cannot
+        // disagree about whose generation this is.
+        if let Some((realm_id, _)) = session::seat_target(realms) {
+            router.bind_to(realm_id);
+        }
         route_turn(
             router,
             &self.deadman,
             inputs,
             view,
             surface,
-            &mut |delivery| deliver_physical(realm, &mut kernel.recorder, delivery),
+            &mut |delivery| deliver_physical(realms, &mut kernel.recorder, delivery),
         );
         // Backstop 2 of 3 for the elapse check (`crate::deadman`): the
         // switch is already being asked about this turn's events, so ask it
@@ -1835,13 +1851,13 @@ impl NestedState {
         // the realm's shim session.
         let session::Runtime {
             router,
-            realm,
+            realms,
             kernel,
             ..
         } = &mut self.runtime;
         for delivery in router.release_physical_keys() {
             debug!("releasing a key held across focus loss so it cannot latch in the app");
-            deliver_physical(realm, &mut kernel.recorder, delivery);
+            deliver_physical(realms, &mut kernel.recorder, delivery);
         }
     }
 

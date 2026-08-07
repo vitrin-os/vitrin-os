@@ -533,7 +533,7 @@ CI): boot the nested realm as in the capture variant above, focus the Firefox
 window inside it, and type a `file://` URL into the address bar followed by
 Enter. The typed characters should appear in the URL bar and the page should
 navigate — the flight recorder (JSON lines) carries
-`"kind":"seat_delivered","event":"key","origin":"physical"` for every key, text
+`"kind":"seat_delivered","realm":"realm-0","event":"key","origin":"physical"` for every key, text
 and layout-invariant alike. Click on another window to move host focus away
 and back: `WindowEvent::Focused(false)`/`(true)` should log at `debug` (host
 window lost/gained keyboard focus) with no crash and no stuck dead-man hold —

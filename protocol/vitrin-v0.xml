@@ -429,9 +429,34 @@
         unknown or vacant yields a handle whose petitions resolve
         "unavailable" - realm absence is a race, not a protocol error,
         because realms are dynamic in later phases.
+
+        REALM CARDINALITY. Version 1 fixes the count as well as the name:
+        exactly one realm, "realm-0". Version 2 lifts the count to a
+        deployment-chosen limit and keeps "realm-0" MANDATORY - a
+        version-2 server serves it and however many further realms its
+        operator configured or vitrin_launcher created. Keeping it
+        mandatory is what makes the widening additive rather than merely
+        compatible-looking: every conformant version-1 client's
+        get_realm("realm-0") still names a realm that exists, and a
+        version-1 connection to a version-2 server is unaffected in every
+        respect.
+
+        The further names are not discoverable on the wire at either
+        version. There is still no enumeration - that is a reserved
+        since="2" seam on vitrin_realm, deliberately unbuilt - so a client
+        learns a name from vitrin_launcher.launched or out of band, and
+        "realm-0" remains the ONE realm name a conformant client can know
+        without being told. A deployment at its realm limit refuses a
+        launch "capacity"; it never refuses this request, which mints a
+        handle for any name at all.
+
+        Two authorities name realms, and they do not overlap: an operator
+        names TEMPLATES in the server's configuration, and the server names
+        INSTANCES it creates from them (see vitrin_launcher.launched, whose
+        ids are opaque). A client MUST NOT construct or predict either.
       </description>
       <arg name="realm" type="new_id" interface="vitrin_realm" summary="the new realm address handle"/>
-      <arg name="name" type="string" summary="well-known realm name (max 64 bytes)"/>
+      <arg name="name" type="string" summary="realm name (max 64 bytes); &quot;realm-0&quot; is the well-known one"/>
     </request>
   </interface>
 

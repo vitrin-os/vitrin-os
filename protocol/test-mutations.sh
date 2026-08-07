@@ -95,7 +95,7 @@ check_rejected drop-arg-summary \
 
 # Every string argument's summary carries its "(max N bytes)" bound token.
 check_rejected string-summary-without-bound \
-  's|summary="well-known realm name (max 64 bytes)"|summary="well-known realm name"|'
+  's|summary="realm name (max 64 bytes); |summary="realm name; |'
 
 if [ "$fail" -ne 0 ]; then
   echo "test-mutations: FAILURES"

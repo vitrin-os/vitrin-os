@@ -148,6 +148,22 @@ env_allow = [
 environment grows. [`examples/realm.toml`](https://github.com/vitrin-os/vitrin-os/blob/main/examples/realm.toml)
 carries the security rules inline.
 
+**A second realm is a second `[[realm]]` table**, up to 16, and one of them
+must be `realm-0` — the one realm name a client can know without being told,
+since there is still no way to enumerate realms on the wire. Each gets its
+own shim, its own private runtime tree and its own socket, exactly as the
+diagram above shows. Ids are otherwise free-form, with one refusal worth
+knowing: a realm's lock file sits *beside* its directory as `<id>.lock`, so
+a realm named `foo.lock` would collide with realm `foo`, and startup refuses
+that naming both.
+
+What a second realm does *not* get yet is its own view: the core composites
+one output from one scene, so with several realms running only the last one
+to paint is visible, and a capture is of that output rather than of the
+realm a grant names — for realms that are **live**. A grant over a realm
+whose app has died refuses `no_surface` regardless of what its siblings are
+doing. Read [Known limits](limits.md) before configuring more than one.
+
 `--no-remote` in that example is load-bearing, not hygiene: without it, a
 `firefox --new-window` on a machine already running Firefox hands the window
 to the *existing* instance over its remoting protocol — never touching the

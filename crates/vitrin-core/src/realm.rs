@@ -20,32 +20,37 @@
 //! Before this task, [`crate::petitions`] answered "does this realm exist?"
 //! with a hardcoded comparison against the well-known name; it now asks the
 //! registry, so the answer comes from configuration and from realm state
-//! rather than from a constant. Version 0 holds exactly one realm, but the
-//! registry is a keyed collection, so Phase 3's fleet adds rows and
-//! lifecycle events rather than replacing the addressing model -- exactly
-//! the IDL's reason for putting realm ids on the wire from day one.
+//! rather than from a constant. The registry is a keyed collection, so
+//! raising the realm count added rows and lifecycle events rather than
+//! replacing the addressing model -- exactly the IDL's reason for putting
+//! realm ids on the wire from day one. What that did and did not buy is
+//! audited in full below ("Deletion or re-plumbing").
 //!
 //! # `realm.toml` schema (decided here, per issue #30)
 //!
 //! An array of `[[realm]]` tables in the core's strict TOML subset
 //! ([`crate::toml_subset`] -- the same dialect as `principals.toml`; see
-//! `examples/realm.toml` for a commented template). Version 0 requires
-//! **exactly one** table. Keys:
+//! `examples/realm.toml` for a commented template). At least one table, at
+//! most [`MAX_REALMS`], and one of them **must** be `realm-0`. Keys:
 //!
 //! | key | type | required | meaning |
 //! |---|---|---|---|
-//! | `id` | string | no (default [`WELL_KNOWN_REALM_ID`]) | the realm's stable, wire-visible name: what `vitrin_principal.get_realm` addresses, what grant rows state, and the directory name of the realm's private runtime tree. Version 0 accepts **only** `"realm-0"` -- see below |
+//! | `id` | string | no (default [`WELL_KNOWN_REALM_ID`]) | the realm's stable, wire-visible name: what `vitrin_principal.get_realm` addresses, what grant rows state, and the directory name of the realm's private runtime tree. Free-form within the transport's id rule, but the **set** must contain `"realm-0"` -- see below |
 //! | `command` | string | **yes** | absolute path of the program the realm launches (P1.5.2 execs it); audited at load, see below |
 //! | `args` | array of strings | no (default `[]`) | arguments **after** `argv[0]`; the core supplies `argv[0]` itself from `command` |
 //! | `env_allow` | array of strings | no (default `[]`) | names of environment variables passed through from the core's own environment; see below |
 //!
-//! ## The realm's name is the IDL's, not the operator's (version 0)
+//! ## `realm-0` is the IDL's name and stays mandatory (WS-E.1.2)
 //!
-//! `id` is in the schema, but version 0 refuses every value but
-//! [`WELL_KNOWN_REALM_ID`]. The IDL settles this: `get_realm`'s description
-//! declares `"realm-0"` **the single well-known realm of version 1** -- the
-//! one realm name a conformant client of this protocol version can know
-//! without being told. A session that renamed its only realm would still be
+//! `id` was once pinned: version 0 refused every value but
+//! [`WELL_KNOWN_REALM_ID`]. That pin is gone, and the reasoning it rested
+//! on is not -- it changed shape rather than being retired.
+//!
+//! The IDL settles the name. `get_realm`'s description declares `"realm-0"`
+//! **the single well-known realm of version 1** and, at version 2, a
+//! *required* member of every deployment: the one realm name a conformant
+//! client can know without being told, because the wire still carries no
+//! enumeration. A session that renamed its only realm would still be
 //! *structurally* legal (`get_realm` always mints a handle, and an unknown
 //! name resolves `unavailable` at petition time), but every conformant
 //! client would petition `realm-0` and be told, forever, that the realm is
@@ -54,16 +59,26 @@
 //! session, so a core that manufactured it from a config key would be lying
 //! in the protocol's own vocabulary.
 //!
-//! This is the same shape as the [`MAX_REALMS`] rule, and it lives in the
-//! same place for the same reason: a *validator* limit on what version-0
-//! configuration may declare, never a narrowing of the model underneath.
-//! [`RealmRegistry`] stays a keyed lookup over whatever it holds
-//! ([`RealmRegistry::resolve_for_petition`] does a real map lookup, not a
-//! constant comparison), so the phase that puts operator-chosen realm names
-//! on the wire deletes this one check and the schema, the registry, and the
-//! addressing path do not move. Widening it sooner is a **protocol** change
-//! first: the IDL description has to stop naming `realm-0` as *the*
-//! version-1 realm before a loader may.
+//! So the loader now enforces *membership* where it used to enforce
+//! *identity*: any shape-legal id may appear, and `realm-0` must be among
+//! them ([`RealmRegistry::from_specs`]). That is what makes widening the id
+//! rule **additive** rather than merely compatible-looking -- no conformant
+//! version-1 client's `get_realm("realm-0")` assumption breaks.
+//!
+//! Widening it at all was a **protocol** change first, and that half landed
+//! before this one: the IDL description had to stop naming `realm-0` as
+//! *the* version-1 realm and no more, which it now does (issue #225 put
+//! `realm_launch` and the version-2 wire in place; this task's paired edit
+//! states version 2's realm cardinality on `get_realm` and in
+//! `docs/protocol/03-vitrin_realm.md`).
+//!
+//! **Two naming authorities, cleanly split.** Configuration names
+//! *templates* (operator-chosen); the core names *instances*
+//! (`<template>.<n>`, WS-E.1.1, minted by `vitrin_launcher.launch`). This
+//! file therefore never names an instance: letting it would make
+//! uniqueness across a session a property of a text file, which is one
+//! authority too many for something that also names a private runtime
+//! directory.
 //!
 //! ## The environment allowlist: names, not pairs, and default-deny
 //!
@@ -128,15 +143,23 @@
 //! - **a `command` that does not resolve, or that a wider set of people
 //!   than root and the core can replace** -- the transitive half of the
 //!   not-writable policy below;
-//! - **zero or more than one `[[realm]]` table** -- version 0 serves exactly
-//!   one realm. This is a *cardinality* rule in the validator, not a
-//!   grammar limit: the file format is already an array of tables, so Phase
-//!   3 raises [`MAX_REALMS`] and the schema does not move;
-//! - **an `id` that is not the IDL's well-known realm name** -- version 0's
-//!   counterpart of the cardinality rule, argued above;
+//! - **zero `[[realm]]` tables, or more than [`MAX_REALMS`]** -- a
+//!   *cardinality* rule in the validator, not a grammar limit: the file
+//!   format is an array of tables and always was, so raising the cap moved
+//!   a number and the schema did not move. The cap is argued from memory at
+//!   [`MAX_REALMS`], not from taste;
+//! - **a set of tables that does not include `realm-0`** -- the membership
+//!   rule that replaced the old id pin, argued above;
 //! - **a duplicate key, a duplicate realm id, a duplicate or reserved
 //!   `env_allow` name, or an ill-shaped id** -- each names the offending
-//!   text and why.
+//!   text and why. Two tables that both omit `id` collide on the
+//!   `realm-0` default and are refused as duplicates, which is the honest
+//!   answer: the second one did not ask for a second realm, it asked for
+//!   the same one twice;
+//! - **two ids that would fight over one entry in the runtime tree** --
+//!   `foo` and `foo.lock`, or any id that claims the listener's `core.sock`
+//!   / `core.sock.lock`. Free-form ids made this expressible for the first
+//!   time; [`reject_runtime_name_collisions`] refuses it and names both.
 //!
 //! Every refusal is a hard startup error carrying the file path, the line
 //! where a line is meaningful, and the specific problem. A core that comes
@@ -226,6 +249,97 @@
 //! and a realm whose shim is gone in a build with no restart policy is the
 //! second one.
 //!
+//! # Deletion or re-plumbing: the audit (WS-E.1.2, issue #208)
+//!
+//! [`WELL_KNOWN_REALM_ID`]'s doc comment used to end by calling the
+//! multi-realm phase *"a deletion here rather than a re-plumbing"*. **That
+//! sentence is half true, and this section says which half**, because read
+//! from a tracker it sounds like a claim about the session and an estimate
+//! built on that reading is wrong by the size of `session.rs`.
+//!
+//! The true half is the half it is scoped to: `realm.rs`, and everything
+//! that was already keyed by [`RealmId`]. The false half is the runtime
+//! that owns the *live* realms, which held exactly one and said so in its
+//! types.
+//!
+//! ## Genuinely a deletion: already keyed, nothing moved
+//!
+//! | Site | Why it was already multi-realm |
+//! |---|---|
+//! | [`RealmRegistry::realms`] | a `BTreeMap<RealmId, Realm>` from the start; [`RealmRegistry::resolve_for_petition`] and [`RealmRegistry::get`] are real map lookups, not constant comparisons wearing a lookup's clothes |
+//! | [`RealmRegistry::mark_running`] / [`RealmRegistry::mark_exited`] / [`RealmRegistry::iter`] / [`RealmRegistry::len`] | already take or yield per-realm values |
+//! | [`Realm`], [`RealmState`], [`SpawnConfig`], [`Realm::admits_petitions`] | per-realm objects; a second realm is a second value, not a second code path |
+//! | [`crate::grants`]' `realm_id` column and `RealmId` newtype | grant rows keyed on the realm from day one |
+//! | [`crate::petitions`]' `unavailable` judgement | asks the registry, so it answered correctly for names it had never seen |
+//! | `vitrin_ipc::paths::{shim_runtime_dir_in, realm_lock_path_in, shim_socket_path_in}` | every path is a function of the realm id: N realms are N trees, N locks, N `wayland-0` sockets with no new code |
+//! | [`crate::spawn`]'s `spawn_realm` / `SpawnPaths` | takes one `&Realm` and derives everything from its id; called N times it spawns N realms |
+//! | [`crate::lifecycle`]'s `RealmLifecycle` | one instance owns one realm's child, runtime dir and `flock`, with its own death latch |
+//! | [`crate::recorder`]'s `realm_spawned` / `realm_died` / `realm_exited` | already carry the realm id |
+//! | `vitrin_shim_session.configure(realm, …)` | already tells each shim which realm it is |
+//!
+//! Two things really were deleted here: the `id != realm-0` pin in
+//! [`validate_realm`], and the *"exactly one"* reading of [`MAX_REALMS`].
+//! The constant itself survives with a new value and a new argument -- a
+//! cap is not the rule it replaced.
+//!
+//! ## Re-plumbing the sentence does not cover
+//!
+//! | Site | What had to change |
+//! |---|---|
+//! | `session::Runtime::realm: Option<RealmRuntime>` | became `realms: BTreeMap<RealmId, RealmRuntime>` -- the single field the claim missed |
+//! | `session::start_realm_in` | one spawn became a loop, and with it a *partial* startup state that one spawn could not have: a realm failing to attach now tears down the realms already forked, because neither backend reaches its own `shutdown_realm` on that path |
+//! | `session::dispatch_shim` / `close_realm` | had no idea *which* realm they served; a `RealmId` is now carried in the shim `ConnectionSource`'s callback data |
+//! | `session::with_realm_teardown` | keyed by realm id instead of reaching for "the" realm |
+//! | `session::reap_realm` | one `poll_exit` became one per live realm: a reaper that stopped at the first exit would leave zombies and a realm the registry still called `Running` |
+//! | `session::shutdown_realm` | one ladder became one ladder per realm |
+//! | `session::emit_presented` | one shim server became every shim server |
+//! | `session::dispatch_principal`'s liveness derivation | `is_some_and` over "the" realm became a **per-realm** question (`ServerCtx::realm_is_live`), applied by `principal::serve_facet_use` to the realm the grant row names. "Is *any* realm live" was the obvious rewrite and is fail-**open** across realms: a dead realm's grant would clear `no_surface` on a living sibling's account and photograph the shared scene |
+//! | `session::route_seat` | reached for "the" realm; now takes `session::seat_target`, the one function that names the delivery target, and binds the input router's generation to it |
+//! | `crate::input::InputRouter` | one router serves the session, so its per-shim-generation state had to learn *whose* generation it is (`bind_to` / `reset_for`): an unconditional reset on any realm's death latches a key down in a surviving realm's app |
+//! | `crate::shim::ShimServer::connection_closed` | takes the dying realm's id, for that scoped reset |
+//! | `backend::winit::deliver_physical` / `route_physical_inputs` | took `&Option<RealmRuntime>`; now share `seat_target` with the agent path and bind the same generation |
+//! | `vitrin_ipc::paths` | still derives every path from the id, but the runtime directory is *flat*, so free-form ids made two realms able to claim one entry (`foo` vs `foo.lock`); the tree's namespace is now stated there and enforced by `reject_runtime_name_collisions` |
+//! | `tests/integration/harness.py`, `examples/realm.toml` | wrote and taught the exactly-one rule at length |
+//!
+//! ### The comment that promised "nothing else here changes", claim by claim
+//!
+//! `session::start_realm_in` carried *"when that stops being true this
+//! becomes a loop, and nothing else here changes: every piece of state
+//! below is already per-realm"*. Checked line by line: the spawn, the
+//! `configure` send, `into_parts`, `RealmLifecycle::adopt` and
+//! `mark_running` are all per-realm and needed no change -- **but four
+//! things did.**
+//!
+//! 1. **The storage.** The destination the result is stored into was a
+//!    single `Option`. This is what the sentence was most wrong about.
+//! 2. **The source registration**, inside `adopt`'s `place` closure. A
+//!    `ConnectionSource` carries no metadata of its own, so the callback
+//!    had to become `move` and capture a `RealmId`; without it
+//!    `dispatch_shim` cannot tell which of N attached shims it is
+//!    servicing. `adopt` itself did not move -- the closure handed to it
+//!    did, which is why an earlier draft of this audit miscounted it as
+//!    unchanged.
+//! 3. **The geometry**, which the sentence was silent on: the view size
+//!    handed to `start_shim_session` is one output's size shared by every
+//!    realm, not a per-realm geometry, so it is hoisted out of the loop and
+//!    every shim is configured identically (WS-E.1.3 owns fixing that).
+//! 4. **The failure path**, which did not exist: with one spawn there was
+//!    no partial startup to unwind. With a loop there is, and the loop owns
+//!    it -- see the table above.
+//!
+//! ## Not per-realm at all, and deliberately not fixed here
+//!
+//! | Site | State | Owner |
+//! |---|---|---|
+//! | [`crate::scene::Scene`] -- one scene, at most one committed surface | every realm's shim commits into the same scene, so the last committer wins and only one realm is ever visible | WS-E.1.3 (bind the output to a realm) |
+//! | `session::Runtime::view_cache` / `principal::ServerCtx::realm_view` | one frame for the whole session, not one per realm: while two realms are **live**, a capture under a grant over realm A can carry realm B's pixels, because there is one scene and the last committer wins. Published as a limit (`docs/book/src/limits.md`). A **dead** realm is not part of this: `realm_is_live` is asked per realm, so its grant refuses `no_surface` however busy its siblings are | WS-E.1.3 |
+//! | [`crate::input::InputRouter`], `PhysicalPresence` | one router and one presence tracker for the session, so `session::seat_target` picks one realm to deliver to and a human at the keyboard preempts agent actuation in *every* realm at once. The router's *state* is scoped to the realm it was bound to, so a realm's death no longer clears a sibling's; what is still shared is the router itself | WS-E.1.6 |
+//! | [`crate::scene::layout`] | single-maximized placement, the MVP's whole layout policy | WS-E.1.3 / D-018 |
+//!
+//! Naming these is the point of the table. A reader who takes "a deletion
+//! rather than a re-plumbing" at face value would budget none of the work
+//! in the second table and would not know the third exists.
+//!
 //! # Where the config path comes from
 //!
 //! `vitrind --realm PATH` (the `--consent` / `--recorder` spelling: both
@@ -243,26 +357,133 @@ use std::path::{Path, PathBuf};
 use crate::grants::RealmId;
 use crate::toml_subset::{self, SubsetError};
 
-/// The realm name the IDL fixes for version 1: `get_realm`'s description
-/// declares `"realm-0"` "the single well-known realm of version 1". Both
-/// the default when `realm.toml` omits `id` and -- in version 0 -- the only
-/// value it may carry (module docs: a session serving some other name
-/// answers every conformant client's `get_realm("realm-0")` petition
-/// `unavailable`, forever).
+/// The realm name the IDL fixes: `get_realm`'s description declares
+/// `"realm-0"` "the single well-known realm of version 1", and a required
+/// member of every version-2 deployment. Both the default when `realm.toml`
+/// omits `id` and a **mandatory member** of whatever set it declares
+/// (module docs: a session with no `realm-0` answers every conformant
+/// client's `get_realm("realm-0")` petition `unavailable`, forever).
 ///
 /// A *validator* constraint, not a model one: [`RealmRegistry`] serves
 /// whatever it holds and looks names up in a map, which is what keeps the
 /// petition-time existence check a real lookup rather than a constant
-/// comparison wearing a lookup's clothes -- and what makes the later
-/// multi-realm phase a deletion here rather than a re-plumbing.
+/// comparison wearing a lookup's clothes.
+///
+/// It used to be the *only* value `id` could carry, and the sentence that
+/// justified widening it -- "a deletion here rather than a re-plumbing" --
+/// is audited in the module docs, which say exactly which half of it held.
 pub(crate) const WELL_KNOWN_REALM_ID: &str = "realm-0";
 
 /// Conventional file name under the core's configuration directory.
 pub(crate) const CONFIG_FILE_NAME: &str = "realm.toml";
 
-/// How many realms version 0 serves. The cardinality rule the loader
-/// enforces; Phase 3's fleet raises it without touching the schema.
-pub(crate) const MAX_REALMS: usize = 1;
+/// **How many realms one session may hold, and why the number is 16.**
+///
+/// A cap, not a cardinality rule -- it used to be `1`, which was the
+/// version-0 statement "this version serves exactly one realm" wearing a
+/// constant's clothes. Raising it is WS-E.1.2 (issue #208); what follows is
+/// the argument for the value, because a limit chosen by taste is a limit
+/// nobody can revise on evidence.
+///
+/// **This justification has now been wrong twice, and the number below is
+/// the third one.** The first argued 16 from a per-realm scene copy that
+/// does not exist; the second corrected that and then undercounted the
+/// descriptors, saying 2 permanent per realm when there are 3. Both were
+/// caught by review, neither by a test, and the pattern is worth naming:
+/// this is a constant whose argument is an *inventory*, and an inventory
+/// written from memory is wrong. So the count below is enumerated against
+/// the code that opens each descriptor **and** measured against a running
+/// core (`/proc/<pid>/fd`, which is where the third number came from).
+///
+/// # What a realm actually costs the core
+///
+/// | Cost | Per realm | At the cap |
+/// |---|---|---|
+/// | Processes | one `vitrin-shim`, which execs one app | 32 |
+/// | Runtime tree | one directory, one `<id>.lock`, one `wayland-0` inode | 16 of each |
+/// | **Core-side descriptors** | **3** permanent + at most [`crate::shim::MAX_LIVE_SURFACES`] = 16 staged attach fds, so **≤ 19** | **≤ 304** |
+/// | Core-side bytes | the transport's bounded queues: `MAX_SEND_QUEUE_BYTES` (256 KiB) + one 64 KiB read scratch + at most one partial frame -- well under a MiB | low tens of MiB |
+/// | Core-side pixels | **none that scale with the realm count** -- see below | -- |
+///
+/// The three permanent ones, each against the line that opens it:
+///
+/// | # | Descriptor | Opened by | Held by |
+/// |---|---|---|---|
+/// | 1 | the core's end of the identity socketpair | `Connection::pair` in [`crate::spawn::spawn_realm`] | the realm's `ConnectionSource` |
+/// | 2 | the realm's `<id>.lock` `flock` | `RuntimeDirGuard::create`, same function | `RealmLifecycle::_realm_lock`, released only at teardown |
+/// | 3 | the **outbox ping eventfd** | `calloop::ping::make_ping` inside `ConnectionSource::with_outbox` | the same source, for the life of the realm |
+///
+/// The third is the one both earlier drafts missed, and it is not optional:
+/// every realm gets an outbox, because seat events and `frame_done` are
+/// pushed at a shim that is sitting in a blocking read (`vitrin-ipc`'s
+/// `Outbox` docs). On Linux calloop's ping is a *single* eventfd shared by
+/// both halves, so it is one descriptor and not two.
+///
+/// Measured, not only argued: a headless core with N realms holds 11 + 3N
+/// descriptors at rest (11 session-wide: stdio, `core.sock` + its lock, the
+/// recorder, the epoll, the loop's own eventfd and timerfd, two signalfds),
+/// counted at N = 1, 2, 3, 4 and differing by exactly 3.
+///
+/// **So the binding constraint is descriptors, not memory.** 304 is ~30% of
+/// the 1024 soft `RLIMIT_NOFILE` this repo already sizes against
+/// ([`vitrin_ipc::MAX_SEND_QUEUE_FDS`]'s rationale) -- ~31% counting the
+/// session-wide 11 -- which leaves the listener, its lock, every principal
+/// connection and every in-flight capture memfd comfortable room. **The
+/// corrected number does not change the verdict**: the worst case moves
+/// from 28% to 31% of the limit, well inside the same order of magnitude,
+/// so 16 remains a sensible cap and nothing downstream of it needs
+/// revisiting. It would have mattered at a cap around 50, where the staged
+/// attach fds alone would approach the limit -- which is the number to
+/// re-derive from, not to inherit, if the cap is ever raised. `EMFILE` is a
+/// whole-process failure, so the margin is what keeps one realm's surface
+/// churn from costing an unrelated agent its `accept`. Sixteen is also a
+/// human-scale ceiling for "apps on one desktop", which is what this cap is
+/// for: it is
+/// a *policy* on how many shims one configuration file may make the trusted
+/// core fork, not a memory computation.
+///
+/// **The corrections, kept rather than deleted.**
+///
+/// 1. *The scene that does not exist.* This constant used to argue 16 from
+///    "a realm's scene holds a full RGBA copy of its client's buffer ...
+///    ~262 MB at sixteen realms". **There is no per-realm scene.** The core
+///    holds exactly one [`crate::scene::Scene`] with at most one
+///    [`crate::scene::SurfaceContent`], shared by every realm -- the module
+///    docs' own "not per-realm at all" table says so -- so the core's pixel
+///    footprint does not grow with the realm count at all, and the number
+///    that looked like the argument was describing a data structure this
+///    core does not have. WS-E.1.3 binds an output to a realm and may well
+///    make a per-realm surface copy real; **when it does, this constant has
+///    to be re-derived, not inherited**, because at 2560x1600 one such copy
+///    is ~16.4 MB and sixteen of them would move the binding constraint
+///    back to memory.
+/// 2. *The descriptor that was not counted.* The replacement argument said
+///    "2 permanently (the shim socketpair end, the realm `flock`)" and
+///    derived ≤ 18 per realm, ≤ 288 at the cap, ~28% of `RLIMIT_NOFILE`.
+///    It omitted the outbox ping eventfd, which every realm has. The table
+///    above is the corrected count, and it is measured rather than
+///    remembered -- which is the only reason to trust the third attempt
+///    more than the first two.
+///
+/// **What no number here bounds.** The shim's own memory and its app's --
+/// the dominant cost of a realm by a wide margin, since that is where the
+/// client's buffers actually live. That is the operator's to manage; the
+/// core neither measures nor limits it, and pretending a cap on realm
+/// *count* constrains it would be the same class of false claim as the
+/// paragraph above.
+///
+/// **Unbounded is not the alternative.** A deployment that served
+/// `realm_launch` with no cap would turn one launch grant into an
+/// fd-exhaustion and process-exhaustion primitive with no protocol
+/// violation anywhere in the trace. The wire already has the vocabulary for
+/// the refusal -- `vitrin_grant.refusal.capacity`, "the deployment is at its
+/// realm capacity" -- which exists precisely because the answer is a policy,
+/// not a fault.
+///
+/// It is a *startup* bound today: realms come only from `realm.toml`, so
+/// the cap is enforced by the loader ([`too_many_realms`]) rather than at
+/// launch time.
+pub(crate) const MAX_REALMS: usize = 16;
 
 /// Environment variable names `env_allow` may not carry, each paired with
 /// the reason its refusal states. Two kinds, one rule: **configuration does
@@ -474,8 +695,9 @@ impl Realm {
 /// owner of every realm's spawn configuration. One instance per core
 /// process, beside the one grant table and the one petition registry.
 ///
-/// Version 0 holds exactly one realm ([`MAX_REALMS`]); the map keying is
-/// what makes Phase 3's multiplicity additive.
+/// Holds between one and [`MAX_REALMS`] realms, one of which is always
+/// `realm-0`; the map keying is what made that multiplicity additive
+/// (module docs, "Deletion or re-plumbing").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RealmRegistry {
     /// Keyed by id, so lookup is by the name the wire carries and
@@ -510,8 +732,8 @@ impl RealmRegistry {
     }
 
     /// Build a registry from parsed tables, enforcing the cross-table
-    /// invariants (cardinality, unique ids). Shared by [`load`](Self::load)
-    /// and tests, so no constructor can bypass them.
+    /// invariants (the cap, unique ids, and `realm-0`'s membership). Shared
+    /// by [`load`](Self::load) and tests, so no constructor can bypass them.
     ///
     /// Deliberately *not* the filesystem audit of each realm's `command`:
     /// that one needs a real filesystem, so it belongs to loading (module
@@ -540,6 +762,26 @@ impl RealmRegistry {
                 )));
             }
         }
+        // The membership rule that replaced the version-0 id pin (module
+        // docs). Checked on the assembled set rather than per table,
+        // because it is a property of the *file*, not of any one entry:
+        // pointing at a table would name an innocent one.
+        if !realms.contains_key(&RealmId::new(WELL_KNOWN_REALM_ID)) {
+            return Err(ErrorKind::Invalid(format!(
+                "no realm is named {WELL_KNOWN_REALM_ID:?}, which every configuration must \
+                 include: the IDL declares it the single well-known realm of version 1 and \
+                 the wire carries no way to enumerate the others, so it is the one realm \
+                 name a conformant client can know without being told. A session without it \
+                 answers every such client's get_realm({WELL_KNOWN_REALM_ID:?}) petition \
+                 `unavailable`, forever. Declared realms: {}",
+                realms
+                    .keys()
+                    .map(RealmId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        reject_runtime_name_collisions(&realms)?;
         Ok(Self { realms })
     }
 
@@ -932,10 +1174,11 @@ fn parse_config(text: &str) -> Result<Vec<RealmSpec>, ErrorKind> {
 
     // Cardinality before per-table semantics: how many realms this file
     // declares is a property of its shape, and complaining about what is
-    // *inside* the second table buries the answer the operator needs (that
-    // there should not be a second table). [`RealmRegistry::from_specs`]
-    // re-checks it as the invariant no constructor can bypass; this one is
-    // here for the message an operator reads.
+    // *inside* the seventeenth table buries the answer the operator needs
+    // (that there should not be a seventeenth table).
+    // [`RealmRegistry::from_specs`] re-checks it as the invariant no
+    // constructor can bypass; this one is here for the message an operator
+    // reads.
     if raw.len() > MAX_REALMS {
         return Err(too_many_realms(raw.len()));
     }
@@ -943,13 +1186,74 @@ fn parse_config(text: &str) -> Result<Vec<RealmSpec>, ErrorKind> {
     raw.into_iter().map(validate_realm).collect()
 }
 
-/// The one wording for "this version serves exactly one realm", shared by
-/// the parser and the registry so the two cannot drift.
+/// The one wording for "this session may not hold that many realms",
+/// shared by the parser and the registry so the two cannot drift.
+///
+/// Names the count and the cap, because an operator who hit it needs to
+/// know both numbers and the reason -- the shape the old `exactly one`
+/// refusal had, kept when the rule became a cap ([`MAX_REALMS`]).
 fn too_many_realms(found: usize) -> ErrorKind {
     ErrorKind::Invalid(format!(
-        "{found} [[realm]] tables, but this version serves exactly {MAX_REALMS} \
-         (multi-realm is Phase 3)"
+        "{found} [[realm]] tables, but this session serves at most {MAX_REALMS}: each realm is \
+         a shim process, a private runtime tree, a lock and up to 18 descriptors in the core, \
+         so the cap bounds how much of the trusted core's fd table one configuration file can \
+         claim (see MAX_REALMS in crates/vitrin-core/src/realm.rs for the accounting)"
     ))
+}
+
+/// **Refuse a set of realm ids that would fight over an entry in the
+/// runtime tree** (WS-E.1.2 review).
+///
+/// `$XDG_RUNTIME_DIR/vitrin-0/` is a **flat namespace**, and each realm
+/// claims two entries in it: its private directory `<id>/` and its
+/// ownership lock `<id>.lock`, a *sibling* of that directory rather than a
+/// file inside it (`vitrin_ipc::paths` explains why). Realm ids are
+/// free-form now that the `realm-0` pin is gone, so two of those claims can
+/// name the same byte string:
+///
+/// - realm `foo.lock`'s **directory** is realm `foo`'s **lock file**. Each
+///   path is individually well-formed, so neither `paths` helper can see
+///   the clash -- only the set can. Left unchecked, whichever realm spawns
+///   second finds the other's entry in the way and fails with a `mkdir` or
+///   `flock` error naming a path but not the reason, and if it did somehow
+///   succeed the two would be purging each other's state.
+/// - a realm named `core.sock` (or `core.sock.lock`) collides with the
+///   **listener's** entries, which are not any realm's to take.
+///
+/// Checked on the assembled set, like `realm-0`'s membership, and for the
+/// same reason: it is a property of the *file*. The message names both ids,
+/// because "these two entries are the same" is unactionable without them.
+fn reject_runtime_name_collisions(realms: &BTreeMap<RealmId, Realm>) -> Result<(), ErrorKind> {
+    // name -> the realm that claims it, in id order so the refusal is
+    // reproducible.
+    let mut claimed: BTreeMap<String, &RealmId> = BTreeMap::new();
+    for reserved in vitrin_ipc::paths::reserved_runtime_names() {
+        for id in realms.keys() {
+            if vitrin_ipc::paths::runtime_names_claimed_by(id.as_str()).contains(&reserved) {
+                return Err(ErrorKind::Invalid(format!(
+                    "realm {:?} claims {reserved:?} in the session's runtime directory, which \
+                     belongs to the core's own listener ($XDG_RUNTIME_DIR/vitrin-0/{reserved}). \
+                     Rename the realm",
+                    id.as_str()
+                )));
+            }
+        }
+    }
+    for id in realms.keys() {
+        for name in vitrin_ipc::paths::runtime_names_claimed_by(id.as_str()) {
+            if let Some(other) = claimed.insert(name.clone(), id) {
+                return Err(ErrorKind::Invalid(format!(
+                    "realms {:?} and {:?} would both own {name:?} in the session's runtime \
+                     directory ($XDG_RUNTIME_DIR/vitrin-0/): every realm gets a private \
+                     directory <id>/ and, beside it, a lock file <id>.lock, so an id ending in \
+                     .lock names another realm's lock. Rename one of them",
+                    other.as_str(),
+                    id.as_str()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Turn one parsed table into a validated spec, applying the documented
@@ -957,25 +1261,14 @@ fn too_many_realms(found: usize) -> ErrorKind {
 fn validate_realm(raw: RawRealm) -> Result<RealmSpec, ErrorKind> {
     let parse_err = |line: usize, detail: String| ErrorKind::Parse { line, detail };
 
+    // Shape only. *Which* names a configuration must contain is a
+    // cross-table property and lives in [`RealmRegistry::from_specs`]
+    // (module docs): the version-0 pin that refused every id but
+    // `realm-0` was deleted here, and the membership rule that replaced
+    // it cannot be answered from one table.
     let id = match raw.id {
         Some((text, line)) => {
             validate_realm_id(&text).map_err(|detail| parse_err(line, detail))?;
-            // The IDL, not this file, names the version-1 realm (module
-            // docs). Refused *after* the shape check so a malformed id is
-            // reported as malformed rather than as the wrong name.
-            if text != WELL_KNOWN_REALM_ID {
-                return Err(parse_err(
-                    line,
-                    format!(
-                        "`id` {text:?} is not {WELL_KNOWN_REALM_ID:?}, the single well-known \
-                         realm this protocol version defines: a session serving any other \
-                         name answers every conformant client's \
-                         get_realm({WELL_KNOWN_REALM_ID:?}) petition `unavailable`, forever. \
-                         Omit `id` or write id = {WELL_KNOWN_REALM_ID:?}; operator-chosen \
-                         realm names arrive with the wire's multi-realm phase"
-                    ),
-                ));
-            }
             RealmId::new(text)
         }
         None => RealmId::new(WELL_KNOWN_REALM_ID),
@@ -1088,17 +1381,17 @@ pub(crate) mod tests {
     /// The minimal valid file: one realm, one absolute command.
     const MINIMAL: &str = "[[realm]]\ncommand = \"/usr/bin/true\"\n";
 
-    /// A registry holding exactly the named realms, all `Configured` --
-    /// what a `realm.toml` naming them would produce. The fixture other
-    /// modules' tests build their realm environment from, so no test
-    /// invents a realm the loader could not have produced.
+    /// A registry holding exactly these realms, all `Configured` -- what a
+    /// `realm.toml` naming them would produce. The fixture other modules'
+    /// tests build their realm environment from, so no test invents a realm
+    /// the loader could not have produced.
     ///
-    /// Bypasses [`MAX_REALMS`] deliberately: callers that need two realms
-    /// are testing addressing, not the version-0 cardinality rule (which
-    /// [`RealmRegistry::from_specs`] enforces and this module's own tests
-    /// cover).
-    /// A registry holding exactly these realms, however they were built.
-    /// [`registry_with`] is the id-only shorthand over it.
+    /// Bypasses the loader's **cross-table** rules deliberately (the
+    /// [`MAX_REALMS`] cap and `realm-0`'s mandatory membership): a caller
+    /// that needs a registry serving only `"kiosk"` is testing addressing,
+    /// not configuration validity, and [`RealmRegistry::from_specs`] plus
+    /// this module's own tests are where those rules are enforced and
+    /// checked. [`registry_with`] is the id-only shorthand over it.
     pub(crate) fn registry_of(realms: Vec<Realm>) -> RealmRegistry {
         RealmRegistry {
             realms: realms.into_iter().map(|r| (r.id.clone(), r)).collect(),
@@ -1242,14 +1535,15 @@ pub(crate) mod tests {
     #[test]
     fn realm_existence_is_a_registry_lookup_not_a_constant() {
         // Existence is whatever the registry holds -- a real keyed lookup,
-        // which is what makes the later multi-realm phase additive. Asserted
-        // on a registry serving a name that is *not* the well-known one: a
+        // which is what made the multi-realm phase additive on this side of
+        // the module (module docs, "Deletion or re-plumbing"). Asserted on a
+        // registry serving a name that is *not* the well-known one: a
         // hardcoded "realm-0" comparison would pass this backwards.
         //
-        // Version-0 *config* cannot produce this registry (the id is pinned
-        // to the IDL's well-known name, asserted just below); the model
-        // underneath is deliberately not narrowed to match, so the check
-        // that opens up is one line in the validator.
+        // The loader would refuse this *file* -- `realm-0` is a mandatory
+        // member, asserted just below -- and the model underneath is
+        // deliberately not narrowed to match, which is what let the pin come
+        // out without the registry moving.
         let registry = registry_with(&["kiosk"]);
         assert_eq!(
             registry.resolve_for_petition("kiosk"),
@@ -1258,21 +1552,22 @@ pub(crate) mod tests {
         assert_eq!(registry.resolve_for_petition(WELL_KNOWN_REALM_ID), None);
     }
 
+    /// **Replaces `the_realm_id_is_the_one_the_idl_fixes_for_this_version`**
+    /// (WS-E.1.2, issue #208). The old rule was "`id` may only be
+    /// `realm-0`"; the new one is "`realm-0` must be among the ids, and the
+    /// rest are free-form". The IDL argument did not go away -- a session
+    /// with no `realm-0` still answers every conformant client's
+    /// `get_realm("realm-0")` petition `unavailable` forever -- so the test
+    /// that carried it is rewritten rather than deleted.
     #[test]
-    fn the_realm_id_is_the_one_the_idl_fixes_for_this_version() {
-        // The IDL declares "realm-0" the single well-known realm of version
-        // 1. A session serving some other name is structurally legal and
-        // practically useless: every conformant client petitions "realm-0"
-        // and is told `unavailable` forever, which the IDL specifies as a
-        // *race*, not as a permanent fact about a configured session.
+    fn realm_0_is_required_and_every_other_id_is_free_form() {
+        // A configuration with no realm-0 is refused, and the refusal makes
+        // the same argument the old one did.
         let err = registry_from("[[realm]]\nid = \"kiosk\"\ncommand = \"/usr/bin/true\"\n")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("kiosk"), "must name the value: {err}");
-        assert!(
-            err.contains("realm-0"),
-            "must name what it should be: {err}"
-        );
+        assert!(err.contains("kiosk"), "must list what was declared: {err}");
+        assert!(err.contains("realm-0"), "must name what is missing: {err}");
         assert!(
             err.contains("get_realm"),
             "must say what breaks, in the client's terms: {err}"
@@ -1287,6 +1582,91 @@ pub(crate) mod tests {
             assert_eq!(
                 registry.resolve_for_petition(WELL_KNOWN_REALM_ID),
                 Some(&RealmId::new(WELL_KNOWN_REALM_ID))
+            );
+        }
+
+        // ...and with realm-0 present, an operator-chosen name beside it is
+        // ordinary: the pin is gone, not merely relaxed.
+        let registry = registry_from(
+            "[[realm]]\ncommand = \"/usr/bin/true\"\n\
+             [[realm]]\nid = \"kiosk\"\ncommand = \"/usr/bin/true\"\n",
+        )
+        .unwrap();
+        assert_eq!(registry.len(), 2);
+        assert_eq!(
+            registry.resolve_for_petition("kiosk"),
+            Some(&RealmId::new("kiosk"))
+        );
+        assert_eq!(
+            registry.resolve_for_petition(WELL_KNOWN_REALM_ID),
+            Some(&RealmId::new(WELL_KNOWN_REALM_ID))
+        );
+
+        // Two tables that both default their id ask for the same realm
+        // twice, and are refused as the duplicate they are.
+        let dup = registry_from(&format!("{MINIMAL}{MINIMAL}"))
+            .unwrap_err()
+            .to_string();
+        assert!(dup.contains("duplicate realm id"), "unexpected: {dup}");
+    }
+
+    /// **A four-table `realm.toml` loads every realm** -- acceptance
+    /// criterion 1 of issue #208, and the shape the runtime's per-realm
+    /// spawn loop consumes.
+    #[test]
+    fn a_four_table_config_loads_four_distinct_realms() {
+        let registry = registry_from(
+            "[[realm]]\ncommand = \"/usr/bin/true\"\n\
+             [[realm]]\nid = \"editor\"\ncommand = \"/usr/bin/false\"\nargs = [\"-e\"]\n\
+             [[realm]]\nid = \"browser\"\ncommand = \"/usr/bin/true\"\nenv_allow = [\"HOME\"]\n\
+             [[realm]]\nid = \"term.1\"\ncommand = \"/usr/bin/true\"\n",
+        )
+        .unwrap();
+        assert_eq!(registry.len(), 4);
+
+        // Enumeration is deterministic (BTreeMap, id order), which is what
+        // makes the runtime's spawn order and this assertion stable.
+        assert_eq!(
+            registry.iter().map(|r| r.id().as_str()).collect::<Vec<_>>(),
+            ["browser", "editor", "realm-0", "term.1"]
+        );
+
+        // Each realm owns its own spawn configuration -- the per-realm
+        // ownership the registry always had, now exercised by more than one.
+        assert_eq!(
+            registry.get("editor").unwrap().spawn().command(),
+            Path::new("/usr/bin/false")
+        );
+        assert_eq!(registry.get("editor").unwrap().spawn().args(), ["-e"]);
+        assert_eq!(
+            registry.get("browser").unwrap().spawn().env_allow(),
+            ["HOME"]
+        );
+        assert!(registry.get("term.1").unwrap().spawn().args().is_empty());
+
+        // And every one of them is independently addressable and
+        // petitionable -- a real map lookup per name, not one realm wearing
+        // four labels.
+        for id in ["realm-0", "editor", "browser", "term.1"] {
+            assert_eq!(
+                registry.resolve_for_petition(id),
+                Some(&RealmId::new(id)),
+                "{id} must resolve"
+            );
+        }
+        assert_eq!(registry.resolve_for_petition("absent"), None);
+
+        // State is per realm: marking one exited leaves the others
+        // petitionable, which is the registry half of "killing one realm
+        // does not disturb the others".
+        let mut registry = registry;
+        assert!(registry.mark_exited(&RealmId::new("editor"), 4242));
+        assert_eq!(registry.resolve_for_petition("editor"), None);
+        for id in ["realm-0", "browser", "term.1"] {
+            assert_eq!(
+                registry.resolve_for_petition(id),
+                Some(&RealmId::new(id)),
+                "{id} must survive a sibling's death"
             );
         }
     }
@@ -1624,39 +2004,125 @@ pub(crate) mod tests {
                  name -- the shape check runs first: {err}"
             );
         }
-        // Shape-legal but not the well-known name: the *other* refusal, so
-        // the two checks are visibly distinct and ordered.
-        let err = registry_from("[[realm]]\nid = \"realm.0\"\ncommand = \"/a\"\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("single well-known realm"), "unexpected: {err}");
+        // Shape-legal and not the well-known name: no longer a refusal at
+        // all, provided `realm-0` is also present. The id pin used to fire
+        // here; the shape check is what survives, and this is the pair that
+        // shows the two were always distinct.
+        let registry = registry_from(
+            "[[realm]]\ncommand = \"/a\"\n[[realm]]\nid = \"realm.0\"\ncommand = \"/a\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            registry.resolve_for_petition("realm.0"),
+            Some(&RealmId::new("realm.0"))
+        );
     }
 
+    /// **Ids that would fight over one entry in the runtime tree are
+    /// refused, naming both** (WS-E.1.2 review, MEDIUM 5).
+    ///
+    /// Deleting the `realm-0` pin left only a *shape* check on ids, and the
+    /// runtime directory is flat: a realm's lock is `<id>.lock`, a sibling
+    /// of its directory `<id>/`, so realm `foo.lock` and realm `foo` name
+    /// the same entry. Individually both ids are well-formed and both paths
+    /// are well-formed; only the set can see it, which is why the refusal
+    /// lives on the assembled registry.
     #[test]
-    fn the_cardinality_rule_is_exactly_one_realm_in_v0() {
-        // Zero realms: the core has nothing to serve.
-        let none = registry_from("# just a comment\n").unwrap_err().to_string();
-        assert!(none.contains("no [[realm]] table"), "unexpected: {none}");
-
-        // Two realms: refused by *cardinality*, with the Phase-3 pointer --
-        // the file format already carries an array, so raising MAX_REALMS
-        // is the whole change. Counted before the tables are validated, so
-        // this is the answer the operator gets whatever is inside the
-        // second one: that there should not be a second one.
-        let two = registry_from(
-            "[[realm]]\nid = \"a\"\ncommand = \"/a\"\n[[realm]]\nid = \"b\"\ncommand = \"/b\"\n",
+    fn realm_ids_that_collide_in_the_runtime_tree_are_refused_naming_both() {
+        // A realm's directory against another realm's lock file.
+        let err = registry_from(
+            "[[realm]]\ncommand = \"/a\"\n\
+             [[realm]]\nid = \"foo\"\ncommand = \"/a\"\n\
+             [[realm]]\nid = \"foo.lock\"\ncommand = \"/a\"\n",
         )
         .unwrap_err()
         .to_string();
-        assert!(two.contains("exactly 1"), "unexpected: {two}");
-        assert!(two.contains("Phase 3"), "unexpected: {two}");
+        assert!(err.contains("\"foo\""), "must name the first id: {err}");
+        assert!(
+            err.contains("\"foo.lock\""),
+            "must name the second id: {err}"
+        );
+        assert!(
+            err.contains("runtime directory"),
+            "must say where they collide: {err}"
+        );
+
+        // ...and the same class against the entries the listener owns,
+        // which belong to no realm at all.
+        for reserved in ["core.sock", "core.sock.lock"] {
+            let err = registry_from(&format!(
+                "[[realm]]\ncommand = \"/a\"\n\
+                 [[realm]]\nid = \"{reserved}\"\ncommand = \"/a\"\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(reserved) && err.contains("listener"),
+                "a realm named {reserved:?} must be refused as the listener's: {err}"
+            );
+        }
+
+        // The near misses stay legal: dots are ordinary id characters, and
+        // only the *derived* pair may not clash. `foo.lock` alone is fine --
+        // there is no realm `foo` for it to collide with.
+        for extra in ["foo", "foo.lock", "core.socket", "lock", "a.b.c"] {
+            registry_from(&format!(
+                "[[realm]]\ncommand = \"/a\"\n\
+                 [[realm]]\nid = \"{extra}\"\ncommand = \"/a\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("{extra:?} must stay legal: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_cardinality_rule_is_a_cap_and_it_names_both_numbers() {
+        // Zero realms: the core has nothing to serve. Unchanged.
+        let none = registry_from("# just a comment\n").unwrap_err().to_string();
+        assert!(none.contains("no [[realm]] table"), "unexpected: {none}");
+
+        // Exactly the cap loads -- the boundary on the legal side, so a
+        // future off-by-one in either direction is visible here.
+        let mut at_cap = String::new();
+        for n in 0..MAX_REALMS {
+            at_cap.push_str(&format!(
+                "[[realm]]\nid = \"realm-{n}\"\ncommand = \"/usr/bin/true\"\n"
+            ));
+        }
+        assert_eq!(registry_from(&at_cap).unwrap().len(), MAX_REALMS);
+
+        // One over: refused by *cardinality*, naming the file's count and
+        // the cap -- the refusal shape the old `exactly one` message had.
+        // Counted before the tables are validated, so this is the answer the
+        // operator gets whatever is inside the last one.
+        let over = format!("{at_cap}[[realm]]\nid = \"one-too-many\"\ncommand = \"/x\"\n");
+        let err = registry_from(&over).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("{} [[realm]] tables", MAX_REALMS + 1)),
+            "must name the count: {err}"
+        );
+        assert!(
+            err.contains(&format!("at most {MAX_REALMS}")),
+            "must name the cap: {err}"
+        );
+        assert!(
+            err.contains("descriptors in the core"),
+            "must say why there is a cap at all, from something true: {err}"
+        );
 
         // And enforced again by the constructor, so a caller that skips the
-        // parser cannot build a registry the wire could not describe.
-        assert!(RealmRegistry::from_specs(vec![
-            parse_config(MINIMAL).unwrap().remove(0),
-            parse_config(MINIMAL).unwrap().remove(0),
-        ])
+        // parser cannot build a registry over the cap.
+        let specs: Vec<RealmSpec> = parse_config(&at_cap)
+            .unwrap()
+            .into_iter()
+            .chain(parse_config("[[realm]]\nid = \"extra\"\ncommand = \"/x\"\n").unwrap())
+            .collect();
+        assert!(RealmRegistry::from_specs(specs).is_err());
+
+        // The membership rule is likewise re-checked by the constructor, so
+        // no path builds a registry a conformant client cannot address.
+        assert!(RealmRegistry::from_specs(
+            parse_config("[[realm]]\nid = \"kiosk\"\ncommand = \"/x\"\n").unwrap()
+        )
         .is_err());
     }
 
@@ -1718,6 +2184,58 @@ pub(crate) mod tests {
         // observable to the program).
         assert_eq!(realm.spawn().command(), program);
         assert_eq!(registry.iter().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn every_realm_in_a_multi_table_file_is_audited_from_disk() {
+        // The spawn-target audit is per realm, not per file: three tables
+        // mean three `audit_spawn_target` walks, and any one of them failing
+        // aborts startup. That posture is deliberate (module docs) and it is
+        // what makes a mistyped path in the *third* table stop the desktop
+        // coming up rather than producing a realm that cannot start.
+        let _fd = crate::capture::tests::fd_lock();
+        let dir = scratch_dir();
+        let good = program_in(&dir, "app", 0o755);
+        let wide = program_in(&dir, "wide", 0o757);
+
+        let ok = config_in(
+            &dir,
+            &format!(
+                "[[realm]]\ncommand = \"{p}\"\n\
+                 [[realm]]\nid = \"editor\"\ncommand = \"{p}\"\n\
+                 [[realm]]\nid = \"browser\"\ncommand = \"{p}\"\n",
+                p = good.display()
+            ),
+            0o600,
+        );
+        let registry = RealmRegistry::load(&ok).unwrap();
+        assert_eq!(registry.len(), 3);
+        for id in ["realm-0", "editor", "browser"] {
+            assert_eq!(registry.get(id).unwrap().spawn().command(), good);
+        }
+
+        // The third table's program is group/other-writable: the whole load
+        // fails, and the message names *that* program rather than the file's
+        // first one.
+        let bad = config_in(
+            &dir,
+            &format!(
+                "[[realm]]\ncommand = \"{good}\"\n\
+                 [[realm]]\nid = \"editor\"\ncommand = \"{good}\"\n\
+                 [[realm]]\nid = \"browser\"\ncommand = \"{wide}\"\n",
+                good = good.display(),
+                wide = wide.display()
+            ),
+            0o600,
+        );
+        let err = RealmRegistry::load(&bad).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Insecure(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains(&wide.display().to_string()),
+            "must name the offending realm's program: {text}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

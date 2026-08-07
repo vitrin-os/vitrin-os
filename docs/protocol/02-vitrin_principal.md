@@ -66,12 +66,24 @@ get_realm(realm: new_id<vitrin_realm>, name: string)
 | arg | type | description |
 |---|---|---|
 | `realm` | `new_id<vitrin_realm>` | the new realm address handle; MUST obey the [id-allocation rules](00-conventions.md#3-object-ids) (strictly increasing, above the watermark, never reused) |
-| `name` | `string` | well-known realm name (max 64 bytes). `"realm-0"` is the single well-known realm of version 1 |
+| `name` | `string` | realm name (max 64 bytes); `"realm-0"` is the well-known one — the single well-known realm of version 1, and a required member of every version-2 deployment |
 
 Creates a [`vitrin_realm`](03-vitrin_realm.md) address object for a realm known
 by name. This request **always succeeds structurally**: minting the handle is an
 addressing operation, not an authority check. Holding a realm handle lets the
 principal petition and nothing more.
+
+**Realm cardinality.** Version 1 fixes the count as well as the name: exactly
+one realm, `"realm-0"`. Version 2 lifts the count to a deployment-chosen limit
+and keeps `"realm-0"` **mandatory**, so a conformant version-1 client's
+`get_realm("realm-0")` still names a realm that exists whatever else the
+deployment serves. The other names are not discoverable on the wire at either
+version — enumeration is a reserved `since="2"` seam on
+[`vitrin_realm`](03-vitrin_realm.md#growth) and is deliberately unbuilt — so a
+client learns one from
+[`vitrin_launcher.launched`](16-vitrin_launcher.md#launched) or out of band.
+The full argument, including the two naming authorities, is on
+[`vitrin_realm`](03-vitrin_realm.md#realm-cardinality-one-at-version-1-a-bounded-set-at-version-2).
 
 Realm absence is deliberately not surfaced here. A name that is unknown or vacant
 still yields a well-formed handle; the absence is discovered later, as a

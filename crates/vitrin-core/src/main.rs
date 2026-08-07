@@ -218,8 +218,9 @@ mod petitions;
 /// rather than reading this as the module still being unreachable.
 #[cfg_attr(not(test), allow(dead_code))]
 mod principal;
-/// The realm object and realm registry (P1.5.1): exactly one realm,
-/// `realm-0`, built at startup from `realm.toml` -- the stable wire-visible
+/// The realm object and realm registry (P1.5.1, widened by WS-E.1.2): one
+/// to `MAX_REALMS` realms, always including `realm-0`, built at startup from
+/// `realm.toml` -- the stable wire-visible
 /// id `get_realm` addresses, the whole-realm grant scope grants attach to,
 /// and the owner of the app's spawn configuration (which P1.5.2 executes;
 /// nothing here forks). Also the single source of realm existence, which

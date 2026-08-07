@@ -2794,6 +2794,7 @@ mod tests {
                     // reset the realm's seat state, and stop the loop.
                     if let Some(server) = state.server.take() {
                         server.connection_closed(
+                            &crate::grants::RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
                             &mut state.headless.scene,
                             None,
                             &mut state.router,

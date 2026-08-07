@@ -72,13 +72,20 @@
 //!       hold never masks the realm's death. A launch is exempt because a
 //!       vacant realm is the state `realm_launch` exists to leave (IDL
 //!       `refusal`: "a launch is never refused no_surface").
-//!    b. `consent_held` (actuation only): the principal's own prompt is
+//!    b. `consent_held` (attention-shaped -- actuation *and* layout, see
+//!       [`UseKind::attention_shaped`]): the principal's own prompt is
 //!       up ([`PetitionRegistry::prompt_up_for`] -- the mapping is
-//!       documented in [`crate::petitions`]).
-//!    c. `preempted` (actuation only): physical human input owns the
-//!       target ([`PhysicalPresence::owns_target`], fed at the input
-//!       router's hook point).
-//!    d. `internal` (actuation only), the **cross-realm delivery guard**:
+//!       documented in [`crate::petitions`]). Layout joined at WS-E.1.4
+//!       because a principal that could fullscreen over its own pending
+//!       card would be arranging the decision it is waiting on.
+//!    c. `preempted` (attention-shaped, same set): physical human input
+//!       owns the target ([`PhysicalPresence::owns_target`], fed at the
+//!       input router's hook point). Moving the output out from under a
+//!       hand already on the keyboard is the hazard a synthetic click
+//!       poses, one step larger.
+//!    d. `internal` (actuation only -- this one really is, because
+//!       [`UseKind::delivered_through_the_seat`] is pointer and text
+//!       alone), the **cross-realm delivery guard**:
 //!       the session's one seat does not serve the realm this grant names
 //!       ([`UseEnv::seat_reaches_grant_realm`]). A stopgap that refuses,
 //!       so a multi-realm session cannot deliver one realm's authorized
@@ -234,6 +241,45 @@ pub(crate) enum UseKind {
     /// step 4 -- recoverably, which is the entire point of admitting the
     /// request rather than killing the connection.
     Launch,
+    /// `vitrin_layout_focus.focus` (fire-and-forget, since version 2):
+    /// bind the output to this grant's realm and send the human's own
+    /// physical input there. One act, never two -- see the IDL interface.
+    LayoutFocus,
+    /// `vitrin_layout_arrange.set_fullscreen` (fire-and-forget, since
+    /// version 2): whether this grant's realm view tracks the output's
+    /// size or keeps its own and is letterboxed.
+    LayoutArrange(LayoutMode),
+}
+
+/// The arrangement a `set_fullscreen` asks for, re-stated in core terms so
+/// the chokepoint and the session do not both import the wire enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayoutMode {
+    /// The realm's view size tracks the output's: `configure` is re-sent
+    /// with the output size now and on every later output resize.
+    Fullscreen,
+    /// The core imposes no size: nothing is sent, the realm keeps the size
+    /// it has, and `Scene::compose` letterboxes it.
+    Windowed,
+}
+
+/// A layout act the chokepoint **admitted**, handed to the embedder's
+/// layout sink exactly as an admitted actuation is handed to
+/// [`UseEnv::actuations`].
+///
+/// The realm is resolved by the caller from the grant row (never from an
+/// argument -- neither layout request carries one), so a layout act can
+/// only ever name the realm the human saw on the consent prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LayoutAct {
+    /// Bind the output to this realm, and move the human's physical input
+    /// with it.
+    Focus { realm: crate::grants::RealmId },
+    /// Put this realm in the named arrangement.
+    Arrange {
+        realm: crate::grants::RealmId,
+        mode: LayoutMode,
+    },
 }
 
 impl UseKind {
@@ -246,14 +292,46 @@ impl UseKind {
             UseKind::Pointer(_) => Verb::ACTUATE_POINTER,
             UseKind::Text(_) => Verb::ACTUATE_TEXT,
             UseKind::Launch => Verb::REALM_LAUNCH,
+            UseKind::LayoutFocus => Verb::LAYOUT_FOCUS,
+            UseKind::LayoutArrange(_) => Verb::LAYOUT_ARRANGE,
         }
     }
 
     /// Whether refusals of this use MAY be coalesced (fire-and-forget
-    /// actuations) or are per-request terminals (reply-bearing captures
-    /// and launches) -- the delivery classification, conventions §6.
+    /// actuations and layout requests) or are per-request terminals
+    /// (reply-bearing captures and launches) -- the delivery
+    /// classification, conventions §6.
     fn coalescible(&self) -> bool {
         !matches!(self, UseKind::Capture | UseKind::Launch)
+    }
+
+    /// Whether this use is **attention-shaped**: it moves, or competes
+    /// for, the thing the human is looking at or touching. The two
+    /// actuations are; so are both layout requests, which is why they meet
+    /// `consent_held` and `preempted` on the same terms (IDL
+    /// `vitrin_grant.refusal`). A capture is not (observation is
+    /// concurrent by design) and neither is a launch (it creates a realm
+    /// rather than competing for one).
+    fn attention_shaped(&self) -> bool {
+        matches!(
+            self,
+            UseKind::Pointer(_)
+                | UseKind::Text(_)
+                | UseKind::LayoutFocus
+                | UseKind::LayoutArrange(_)
+        )
+    }
+
+    /// Whether this use is **delivered through the session's one seat**,
+    /// and so subject to the cross-realm delivery guard (step 5d).
+    ///
+    /// Only the two actuations are. A layout request is emphatically not:
+    /// `focus` exists precisely to *move* the seat target, so gating it on
+    /// the seat already being there would make the verb unable to do the
+    /// one thing it is for, and `set_fullscreen` addresses a shim's
+    /// `configure`, which is not the seat at all.
+    fn delivered_through_the_seat(&self) -> bool {
+        matches!(self, UseKind::Pointer(_) | UseKind::Text(_))
     }
 }
 
@@ -288,6 +366,27 @@ pub(crate) struct UseEnv<'a> {
     /// dropping events for a seatless realm -- is the delivery edge's
     /// business, never an authority question.
     pub actuations: &'a mut dyn FnMut(SeatInput),
+    /// **The realm this grant names**, resolved by the caller from the
+    /// grant row -- the same resolution that produced
+    /// [`Self::realm_view`] and [`Self::seat_reaches_grant_realm`], from
+    /// the same row, on the same line.
+    ///
+    /// Needed only by the layout arms, which must name a realm to the
+    /// embedder and must never take one from the wire: neither layout
+    /// request carries a realm argument, precisely so that a holder can
+    /// only ever move the realm the human saw on its consent prompt.
+    /// `None` when the row is gone, which is unreachable past step 3.
+    pub grant_realm: Option<&'a crate::grants::RealmId>,
+    /// Where admitted **layout** acts go (at runtime:
+    /// `session::apply_layout`, which binds the output and re-sends
+    /// `configure`; tests: a log).
+    ///
+    /// A second sink beside [`Self::actuations`] rather than a widened
+    /// one, because the two are different kinds of thing: an actuation is
+    /// an input event with an origin tag that the delivery edge may drop,
+    /// and a layout act is a change to the session's presentation that
+    /// nothing downstream may reinterpret.
+    pub layout: &'a mut dyn FnMut(LayoutAct),
 }
 
 /// How one use was decided -- the chokepoint's summary of its own
@@ -506,25 +605,40 @@ impl Chokepoint {
             if !matches!(req.kind, UseKind::Launch) && live_view(env.realm_view).is_none() {
                 break 'decide Err(Refuse::code(Refusal::NoSurface));
             }
-            if let UseKind::Pointer(_) | UseKind::Text(_) = &req.kind {
-                // 5b, consent_held (actuation only): the principal's own
-                // prompt is up.
+            if req.kind.attention_shaped() {
+                // 5b, consent_held (attention-shaped uses only): the
+                // principal's own prompt is up. A layout request meets
+                // this on the same terms an actuation does, and for a
+                // sharper reason: the prompt IS the human's attention, and
+                // a principal that could fullscreen a realm over its own
+                // pending prompt's card -- or move the output away from
+                // it -- would be arranging the very decision it is waiting
+                // on. (Invariant 3 makes the card itself untouchable
+                // whatever this gate does; this gate is the layer above,
+                // and both exist.)
                 if petitions.prompt_up_for(req.principal) {
                     break 'decide Err(Refuse::code(Refusal::ConsentHeld));
                 }
-                // 5c, preempted (actuation only): physical human input
-                // owns the target right now.
+                // 5c, preempted (attention-shaped uses only): physical
+                // human input owns the target right now. A focus request
+                // yields to a hand on the keyboard for the same reason a
+                // synthetic click does -- moving the output out from under
+                // a human mid-keystroke is the theft this verb is
+                // separately attenuable in order to bound.
                 if env.presence.owns_target(now) {
                     break 'decide Err(Refuse::code(Refusal::Preempted));
                 }
-                // 5d, the cross-realm delivery guard (actuation only) --
+            }
+            if req.kind.delivered_through_the_seat() {
+                // 5d, the cross-realm delivery guard (seat-delivered uses
+                // only) --
                 // **a stopgap that refuses, not a routing policy**, and
                 // WS-E.1.6 (issue #212) deletes it along with the
                 // placeholder it defends.
                 //
                 // The session has one input router and one delivery target
-                // (`session::seat_target`, the first still-serving realm in
-                // id order). Since WS-E.1.2 raised `MAX_REALMS` above 1 a
+                // (`session::seat_target`). Since WS-E.1.2 raised
+                // `MAX_REALMS` above 1 a
                 // grant can name a realm that is *not* that target, and
                 // this branch is the difference between refusing such an
                 // actuation and delivering an agent's keystroke into a
@@ -534,6 +648,21 @@ impl Chokepoint {
                 // deployment; with several realms it is the write-side
                 // mirror of the `no_surface` gate above (which stops a
                 // grant *reading* a sibling's pixels).
+                //
+                // **WS-E.1.4 armed this branch; it did not create it.**
+                // Until layout_focus was served, `seat_target` was the
+                // first still-serving realm in id order and no client could
+                // move it, so which grants this refused was a fixed
+                // property of the deployment. It now follows the output
+                // binding, so a principal holding `layout_focus` chooses
+                // which *other* principals' actuations land here. That is a
+                // real cross-principal denial-of-service surface, created
+                // by serving the verb, and it is bounded rather than
+                // absent: the refusal is recoverable, journaled, spends no
+                // token and burns no `once` rung. It closes when #212
+                // routes per realm and a hidden realm's actuation is
+                // *delivered* instead of refused. Published in
+                // `docs/book/src/limits.md`.
                 //
                 // **Why `internal`.** Its IDL summary is "server-side
                 // failure during this use (renderer, memfd, **delivery**)",
@@ -676,6 +805,50 @@ impl Chokepoint {
                 Ok(UseOutcome::Admitted {
                     grant: allowed.grant_id,
                     // An actuation delivers no observation to identify.
+                    frame: None,
+                    spent_once,
+                })
+            }
+            UseKind::LayoutFocus | UseKind::LayoutArrange(_) => {
+                // The realm comes from the **grant row**, resolved by the
+                // caller, never from the wire: neither layout request
+                // carries a realm argument, so a holder can only move the
+                // realm the human saw named on its consent prompt.
+                //
+                // `None` is unreachable past step 3 (a missing row was
+                // refused `not_granted`) and is surfaced as the IDL's
+                // `internal` rather than a panic or a silent drop, exactly
+                // as the capture path's unreachable readback failure is.
+                let Some(realm) = env.grant_realm else {
+                    tracing::warn!("layout use admitted with no grant realm; refusing internal");
+                    let voiced = self.voice_refusal(
+                        req.grant_wire_id,
+                        verb,
+                        Refuse::code(Refusal::Internal),
+                        coalescible,
+                        now,
+                        send,
+                    )?;
+                    return Ok(UseOutcome::Refused {
+                        code: Refusal::Internal,
+                        voiced,
+                    });
+                };
+                let act = match req.kind {
+                    UseKind::LayoutFocus => LayoutAct::Focus {
+                        realm: realm.clone(),
+                    },
+                    UseKind::LayoutArrange(mode) => LayoutAct::Arrange {
+                        realm: realm.clone(),
+                        mode,
+                    },
+                    // The outer match already narrowed to these two.
+                    _ => unreachable!("layout arm reached with a non-layout kind"),
+                };
+                (env.layout)(act);
+                Ok(UseOutcome::Admitted {
+                    grant: allowed.grant_id,
+                    // A layout act delivers no observation to identify.
                     frame: None,
                     spent_once,
                 })

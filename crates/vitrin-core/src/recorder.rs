@@ -494,6 +494,17 @@ pub(crate) enum ActuationDetail {
     Button { button: u32, pressed: bool },
     /// `vitrin_actuator_pointer.scroll`: axis plus high-resolution value.
     Scroll { axis: Axis, value120: i32 },
+    /// `vitrin_layout_arrange.set_fullscreen`: which of the two
+    /// arrangements was asked for. The audit question a reader brings to a
+    /// layout entry is "what did this principal do to the human's screen",
+    /// and the verb alone cannot distinguish filling the output from
+    /// giving it back.
+    ///
+    /// `vitrin_layout_focus.focus` has **no** variant here on purpose: it
+    /// takes no argument and names no realm, so the `use_decision` entry's
+    /// verb and the grant row it already carries say everything there is
+    /// to say. A variant with no fields would be noise in every entry.
+    Arrange { fullscreen: bool },
     /// `vitrin_actuator_text.type` -- shape only, never the string.
     Text {
         /// Unicode scalar values, the unit a human reasons in.
@@ -521,7 +532,10 @@ impl ActuationDetail {
             // names the program and no command ever crosses the wire), so
             // there is nothing for the log to summarize beyond the verb
             // the `use_decision` entry already names.
-            UseKind::Capture | UseKind::Launch => None,
+            UseKind::Capture | UseKind::Launch | UseKind::LayoutFocus => None,
+            UseKind::LayoutArrange(mode) => Some(Self::Arrange {
+                fullscreen: matches!(mode, crate::enforcement::LayoutMode::Fullscreen),
+            }),
             UseKind::Pointer(input) | UseKind::Text(input) => match input {
                 // The wire carries `i32` and the intake widens it, so the
                 // narrowing is exact for every value that can reach here.
@@ -573,6 +587,10 @@ fn write_input(out: &mut String, detail: Option<ActuationDetail>) {
             field_str(out, "action", "scroll");
             field_str(out, "axis", axis_label(axis));
             field_i64(out, "value120", i64::from(value120));
+        }
+        ActuationDetail::Arrange { fullscreen } => {
+            field_str(out, "action", "set_fullscreen");
+            field_bool(out, "fullscreen", fullscreen);
         }
         ActuationDetail::Text {
             chars,
@@ -1494,6 +1512,7 @@ fn outcome_label(outcome: Outcome) -> &'static str {
         Outcome::Unavailable => "unavailable",
         Outcome::Unsupported => "unsupported",
         Outcome::Busy => "busy",
+        Outcome::LayoutHeld => "layout_held",
     }
 }
 

@@ -10,6 +10,7 @@ import vectors
 from vitrin_os import (
     ConsentState,
     GrantDenied,
+    LayoutHeld,
     Persistence,
     RateLimited,
     Revoked,
@@ -277,6 +278,92 @@ def test_encode_failure_burns_no_ids_and_registers_no_proxies(server) -> None:
     assert conn._objects == objects_before  # no dead proxies registered
     conn.request_grant().await_consent()
     conn.close()
+
+
+def test_layout_held_outcome_decodes_and_keeps_the_connection(server) -> None:
+    """Outcome 6 is a *recoverable admission answer*, not a dead socket.
+
+    `layout_held` says another live grant already holds `layout_arrange` for
+    this output. It is the whole reason the IDL stages an outcome ahead of a
+    client knowing it: an SDK that did not carry it would decode 6 into
+    `ServerContractViolation`, which **closes the connection** — turning the
+    recoverable answer into the connection death the staging exists to
+    prevent. So both halves are asserted: the typed exception, and the live
+    socket after it.
+    """
+    server.run(
+        [
+            *flows.handshake_steps(),
+            ("expect", flows.get_realm_frame()),
+            ("expect", flows.request_grant_frame(verbs=int(Verb.LAYOUT_ARRANGE))),
+            ("send", flows.resolved_frame(outcome=6)),
+            # The connection is still usable afterwards, proved by a real
+            # round trip rather than by `not conn.closed` alone.
+            ("expect", encode_sync(1)),
+            ("send", flows.done_frame(1)),
+        ]
+    )
+    conn = _connect(server)
+    grant = conn.request_grant(verbs=Verb.LAYOUT_ARRANGE)
+    with pytest.raises(LayoutHeld) as excinfo:
+        grant.await_consent()
+    assert excinfo.value.outcome == 6
+    assert not isinstance(excinfo.value, ServerContractViolation)
+    assert not conn.closed
+    conn.sync()
+    conn.close()
+
+
+def test_layout_requests_mint_their_facets_and_reach_the_wire(server) -> None:
+    """`focus` and `set_fullscreen` are encoded exactly as the IDL defines them.
+
+    Both facets are minted lazily and separately — `request_grant`'s five
+    `new_id` arguments are frozen forever, so every facet added after version
+    1 arrives as its own structural mint on the grant — and each mint is
+    sent exactly once however many times the request is used.
+    """
+    layout_verbs = int(Verb.LAYOUT_ARRANGE | Verb.LAYOUT_FOCUS)
+    server.run(
+        [
+            *flows.handshake_steps(),
+            ("expect", flows.get_realm_frame()),
+            ("expect", flows.request_grant_frame(verbs=layout_verbs)),
+            ("send", flows.resolved_frame(outcome=0, verbs=layout_verbs)),
+            ("expect", flows.get_layout_focus_frame()),
+            ("expect", flows.focus_frame()),
+            ("expect", flows.get_layout_arrange_frame()),
+            ("expect", flows.set_fullscreen_frame(mode=1)),
+            ("expect", flows.set_fullscreen_frame(mode=0)),
+            # No second mint: the facet is remembered.
+            ("expect", flows.focus_frame()),
+            ("expect", encode_sync(1)),
+            ("send", flows.done_frame(1)),
+        ]
+    )
+    conn = _connect(server)
+    grant = conn.request_grant(
+        verbs=Verb.LAYOUT_ARRANGE | Verb.LAYOUT_FOCUS
+    ).await_consent()
+    grant.focus()
+    grant.set_fullscreen(True)
+    grant.set_fullscreen(False)
+    grant.focus()
+    conn.sync()
+    conn.close()
+
+
+def test_set_fullscreen_rejects_a_mode_outside_the_enum() -> None:
+    """A bad `mode` is caught client-side, before it costs the connection.
+
+    `vitrin_layout_arrange.mode` is a plain enum, so an out-of-range value is
+    fatal `invalid_argument` server-side. A client-side bug must not be paid
+    for with a dead socket, so the encoder refuses first.
+    """
+    from vitrin_os.messages import encode_set_fullscreen
+
+    for mode in (2, -1, 255):
+        with pytest.raises(ValueError, match="vitrin_layout_arrange.mode"):
+            encode_set_fullscreen(flows.LAYOUT_ARRANGE_ID, mode=mode)
 
 
 def test_second_petition_ids_keep_increasing(server) -> None:

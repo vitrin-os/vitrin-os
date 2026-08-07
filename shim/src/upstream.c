@@ -546,19 +546,35 @@ static void handle_configure(struct vitrin_shim *s, const uint8_t *frame, size_t
 		return;
 	}
 	/* `configure` MAY be re-sent when the realm view resizes, and a
-	 * version-1 core is explicitly permitted to letterbox a fixed-size
-	 * buffer instead -- which is what the core in this tree does (it sends
-	 * `configure` exactly once, at connection setup). Live resize is
-	 * therefore reported and not acted on: acting on it means re-moding the
-	 * headless output and re-configuring the toplevel mid-stream, which is
-	 * its own task, and silently ignoring it would hide the day the core
-	 * starts sending it. */
-	if (ev.width != s->up.view_width || ev.height != s->up.view_height) {
-		wlr_log(WLR_INFO,
-			"core re-configured the realm view to %ux%u; version 1 letterboxes "
-			"(live resize is a later task)",
-			ev.width, ev.height);
+	 * version-1 core was explicitly permitted to letterbox a fixed-size
+	 * buffer instead -- which is what the core in this tree used to do, since
+	 * it sent `configure` exactly once, at connection setup.
+	 *
+	 * That changed when the core began serving `layout_arrange` (WS-E.1.4):
+	 * `set_fullscreen(fullscreen)` means "this realm's view size tracks the
+	 * output's", and the core carries it out by re-sending this event. A shim
+	 * that logged and letterboxed would make that verb silently do less than
+	 * its name, which is precisely what the IDL refuses to ship. So live
+	 * resize is now *acted on*: re-mode the headless output, re-configure
+	 * every toplevel, and let the app answer with a buffer of the new size.
+	 *
+	 * A degenerate size is dropped rather than acted on. The core does not
+	 * send one -- its own view is never zero-sized -- but a zero-mode commit
+	 * is a wlroots-level error and the realm surviving a malformed message
+	 * from its own core is worth the two lines. */
+	if (ev.width == s->up.view_width && ev.height == s->up.view_height) {
+		return;
 	}
+	if (ev.width == 0 || ev.height == 0) {
+		wlr_log(WLR_ERROR, "core re-configured the realm view to %ux%u; ignoring a "
+			"degenerate size", ev.width, ev.height);
+		return;
+	}
+	wlr_log(WLR_INFO, "core re-configured the realm view: %ux%u -> %ux%u",
+		s->up.view_width, s->up.view_height, ev.width, ev.height);
+	s->up.view_width = ev.width;
+	s->up.view_height = ev.height;
+	vitrin_output_resize(s, ev.width, ev.height);
 }
 
 /* One complete frame from the core. Routing is by object id, exactly as the

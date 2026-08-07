@@ -276,8 +276,15 @@ impl ResourceRef {
 /// from day one so the decided cursor and layout models are expressible
 /// before v0 freezes, and version 2 adds `realm_launch` on exactly the
 /// same terms -- so a petition for one is a *recoverable* `unsupported`
-/// rather than an out-of-range bit that kills the connection. Nothing
-/// here implements any of the four.
+/// rather than an out-of-range bit that kills the connection.
+///
+/// **Two of those four are now served** (WS-E.1.4, issue #210):
+/// `layout_arrange` (16) and `layout_focus` (32) each have a facet
+/// interface, a chokepoint arm and consent-prompt copy, so this core
+/// enforces them and may therefore grant them. `observe_cursor` (8) and
+/// `realm_launch` (512) are still refused `unsupported` --
+/// per-principal cursor delivery is M2's and realm spawning is
+/// WS-E.1.1's core half, neither of which exists here.
 ///
 /// Same posture as the durable persistence rungs, one rung up: those are
 /// **absent** from [`PersistenceRung`] so a row cannot hold one; these
@@ -287,7 +294,7 @@ impl ResourceRef {
 /// is the same -- a deployment never grants authority it does not
 /// enforce, and says so with `unsupported` rather than accepting
 /// silently.
-pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4;
+pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4 | 16 | 32;
 
 /// The verb bits the IDL defines that this core does **not** serve. A
 /// petition naming any of these resolves `unsupported` -- whole, never
@@ -959,6 +966,35 @@ impl GrantTable {
         self.entries.get(&grant).map(|entry| &entry.row.realm_id)
     }
 
+    /// **Does any live row confer `verb` right now?** D-018(4)'s
+    /// single-holder rule, asked at petition admission by
+    /// [`crate::petitions::PetitionRegistry::admit`] for `layout_arrange`.
+    ///
+    /// Deliberately **not** an authority judgement and deliberately not
+    /// scoped to a principal: the question is "is this authority already
+    /// held anywhere in this session", because at most one holder may carry
+    /// `layout_arrange` per output and there is exactly one output.
+    ///
+    /// **Half the rule, and only half.** A *pending* petition naming the verb
+    /// is a holder-in-waiting and takes the slot too — that half is the
+    /// petition registry's own state, so it is checked there
+    /// ([`crate::petitions::PetitionRegistry::admit`]) and this answers the
+    /// live-row half. Both are stated on the wire (IDL `vitrin_grant.outcome`,
+    /// `layout_held`).
+    /// Scoping it per principal would let one agent hold N arrangement
+    /// grants and defeat the rule by fragmenting itself, and would leave
+    /// the core arbitrating between the fragments -- which is the
+    /// window-management policy PRD §5.1 exiles.
+    ///
+    /// `Active` only, at `now`, through the same [`Entry::state_at`] every
+    /// other read surface uses: a revoked, expired or spent holder is not
+    /// holding anything, so re-petitioning after one dies must succeed.
+    pub fn any_live_holder_of(&self, verb: Verb, now: Instant) -> bool {
+        self.entries.values().any(|entry| {
+            entry.row.verbs.contains(verb) && entry.state_at(now) == GrantState::Active
+        })
+    }
+
     /// **The chokepoint query** (P1.4.4): may this use of `grant` --
     /// arriving through a facet co-minted with exactly that grant --
     /// perform `verb` at `now`, on behalf of `principal` (the verified
@@ -1186,29 +1222,43 @@ mod tests {
     // -- served vs. defined verbs ------------------------------------------
 
     #[test]
-    fn served_verb_bits_are_exactly_the_three_facet_verbs() {
+    fn served_verb_bits_are_exactly_the_five_facet_verbs() {
         // Pinned to the generated constants, not to a literal, so a verb
         // that ever changed value would fail here rather than silently
         // widening what this core claims to enforce.
+        //
+        // Five since WS-E.1.4 (issue #210): the two layout verbs joined the
+        // three original facet verbs, each with an interface declaring it,
+        // a chokepoint arm exercising it and a consent-prompt line naming
+        // it. `observe_cursor` and `realm_launch` are the two defined verbs
+        // that stay out -- see the sibling test.
         assert_eq!(
             SERVED_VERB_BITS,
-            (Verb::OBSERVE | Verb::ACTUATE_POINTER | Verb::ACTUATE_TEXT).bits()
+            (Verb::OBSERVE
+                | Verb::ACTUATE_POINTER
+                | Verb::ACTUATE_TEXT
+                | Verb::LAYOUT_ARRANGE
+                | Verb::LAYOUT_FOCUS)
+                .bits()
         );
         // Every served bit is a defined wire bit.
         assert_eq!(SERVED_VERB_BITS & !Verb::VALID_MASK, 0);
     }
 
     #[test]
-    fn the_layout_and_cursor_verbs_are_defined_on_the_wire_but_unserved() {
-        // The three D-017/D-018 bits: in-range (so naming one is never
-        // fatal) and unserved (so a petition for one resolves
+    fn the_cursor_and_launch_verbs_are_defined_on_the_wire_but_unserved() {
+        // The two bits that are still staged: in-range (so naming one is
+        // never fatal) and unserved (so a petition for one resolves
         // `unsupported`). Both halves matter -- either alone would be a
         // lie about what this core does.
-        for verb in [
-            Verb::OBSERVE_CURSOR,
-            Verb::LAYOUT_ARRANGE,
-            Verb::LAYOUT_FOCUS,
-        ] {
+        //
+        // `observe_cursor` stays because per-principal cursor *delivery* is
+        // M2's (D-017, D-019): serving the verb would promise a capture
+        // widened with a cursor this core does not have. `realm_launch`
+        // stays because this core has no spawn path, which the chokepoint's
+        // `Launch` arm says at its own site. Neither is a placeholder for
+        // "not got to yet" -- each names a specific missing mechanism.
+        for verb in [Verb::OBSERVE_CURSOR, Verb::REALM_LAUNCH] {
             assert!(
                 Verb::from_bits(verb.bits()).is_ok(),
                 "{verb:?} must decode: an out-of-range bit would be fatal, not `unsupported`"

@@ -75,11 +75,12 @@ discovered.
 
 **No deployment serves `realm_launch` today.** The verb is defined,
 petitionable, and refused `unsupported` at admission — the same staging
-[`observe_cursor`, `layout_arrange` and
-`layout_focus`](04-vitrin_grant.md#defined-but-unserved) already use, and for
-the same structural reason: an *out-of-range* bit is fatal `invalid_argument`
-and kills the connection, so a client asking for authority a deployment does
-not serve must get an answer rather than a dead socket.
+[`observe_cursor`](04-vitrin_grant.md#defined-but-unserved) still uses, and
+that `layout_arrange` and `layout_focus` used until the reference core began
+serving them. The structural reason is the same in every case: an
+*out-of-range* bit is fatal `invalid_argument` and kills the connection, so a
+client asking for authority a deployment does not serve must get an answer
+rather than a dead socket.
 
 This interface's messages are `since="2"`, so they do not exist on a
 version-1 connection at all; sending one there is fatal `invalid_opcode`. The
@@ -163,7 +164,7 @@ these arrives as `vitrin_grant.refused(realm_launch, code, retry_after_ms)`:
 Three codes are **never** produced for a launch, and their absence is a
 property of the operation rather than a promise they are unused:
 `no_surface` (a realm with no surface is what launch exists to fix),
-`preempted` and `consent_held` (both actuation-only).
+`preempted` and `consent_held` (both attention-shaped: they reach actuation and the layout verbs, never a launch).
 
 `capacity` is the one refusal in that table answered from **deployment-wide**
 state rather than from this grant, so polling `launch` observes one bit about

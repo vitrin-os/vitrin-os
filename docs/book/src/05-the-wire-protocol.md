@@ -150,9 +150,9 @@ try something else.
 The line is: *did the client send something incoherent, or did a coherent
 request get refused?* Setting an out-of-range verb bit is incoherent —
 fatal. Asking for a verb the core does not serve is coherent — refused,
-`unsupported`. This is exactly why the Python SDK carries the four
-defined-but-unserved verbs: an SDK that omitted them would turn a
-recoverable refusal into a dead socket.
+`unsupported`. This is exactly why the Python SDK carries every defined verb
+bit, served or not, and every defined outcome and refusal code: one it did not
+know would turn a recoverable answer into a dead socket.
 
 ## Ordering
 
@@ -168,10 +168,19 @@ values; existing opcodes never change meaning. The negotiated version comes
 out of the handshake, and each side serves only what that version defines.
 
 Version 0 is frozen for Phase 1 — **not forever**. The wire integer is now
-**2**: it appends the `realm_launch` verb, `vitrin_grant.get_launcher`, and
-the `vitrin_launcher` interface, and changes nothing else — every version-1
-signature is byte-identical at version 2. Phase 2 brings semantic trees and
-epoch/CAS action semantics. Expect to move.
+**2**, and it appends, in full:
+
+- the `realm_launch` verb;
+- three structural mints on `vitrin_grant` — `get_launcher`,
+  `get_layout_focus`, `get_layout_arrange`;
+- the three interfaces they mint — `vitrin_launcher` (`launch`/`launched`),
+  `vitrin_layout_focus` (`focus`), `vitrin_layout_arrange`
+  (`set_fullscreen`) — and the `vitrin_layout_arrange.mode` enum;
+- the `capacity` refusal code and the `layout_held` outcome.
+
+It changes nothing else: every version-1 signature is byte-identical at
+version 2. Phase 2 brings semantic trees and epoch/CAS action semantics.
+Expect to move.
 
 ## Validating your understanding
 

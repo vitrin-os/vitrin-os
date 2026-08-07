@@ -59,6 +59,11 @@ type Refused = gen::vitrin_grant::events::Refused;
 type Launch = gen::vitrin_launcher::requests::Launch;
 type Launched = gen::vitrin_launcher::events::Launched;
 
+type GetLayoutFocus = gen::vitrin_grant::requests::GetLayoutFocus;
+type GetLayoutArrange = gen::vitrin_grant::requests::GetLayoutArrange;
+type LayoutFocusFocus = gen::vitrin_layout_focus::requests::Focus;
+type SetFullscreen = gen::vitrin_layout_arrange::requests::SetFullscreen;
+
 type ConsentStateEvent = gen::vitrin_consent::events::State;
 
 type CaptureFrame = gen::vitrin_view::requests::CaptureFrame;
@@ -219,6 +224,10 @@ impl_message!(
     SeatText,
     Launch,
     Launched,
+    GetLayoutFocus,
+    GetLayoutArrange,
+    LayoutFocusFocus,
+    SetFullscreen,
 );
 
 /// Exhaustiveness gate: the `impl_message!` table must cover every message
@@ -579,6 +588,22 @@ fn launched() -> impl Strategy<Value = Launched> {
     bounded_string(64).prop_map(|realm| Launched { realm })
 }
 
+fn get_layout_focus() -> impl Strategy<Value = GetLayoutFocus> {
+    any_u32().prop_map(|layout_focus| GetLayoutFocus { layout_focus })
+}
+
+fn get_layout_arrange() -> impl Strategy<Value = GetLayoutArrange> {
+    any_u32().prop_map(|layout_arrange| GetLayoutArrange { layout_arrange })
+}
+
+fn layout_focus_focus() -> impl Strategy<Value = LayoutFocusFocus> {
+    Just(LayoutFocusFocus {})
+}
+
+fn set_fullscreen() -> impl Strategy<Value = SetFullscreen> {
+    plain_enum(gen::vitrin_layout_arrange::Mode::ALL).prop_map(|mode| SetFullscreen { mode })
+}
+
 // ---------------------------------------------------------------------------
 // One `#[test]` per message, generated from the table below. Each expands to
 // exactly: generate an object_id and a value, run `assert_roundtrip`. Adding
@@ -643,6 +668,16 @@ roundtrip_test!(roundtrip_vitrin_shim_seat_text, seat_text());
 
 roundtrip_test!(roundtrip_vitrin_launcher_launch, launch());
 roundtrip_test!(roundtrip_vitrin_launcher_launched, launched());
+roundtrip_test!(roundtrip_vitrin_grant_get_layout_focus, get_layout_focus());
+roundtrip_test!(
+    roundtrip_vitrin_grant_get_layout_arrange,
+    get_layout_arrange()
+);
+roundtrip_test!(roundtrip_vitrin_layout_focus_focus, layout_focus_focus());
+roundtrip_test!(
+    roundtrip_vitrin_layout_arrange_set_fullscreen,
+    set_fullscreen()
+);
 
 // ---------------------------------------------------------------------------
 // The two fd-bearing messages in v0.xml (grep for an `fd`-typed arg):

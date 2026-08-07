@@ -105,6 +105,7 @@ use crate::capture::RealmViewFrame;
 use crate::consent::grab::ConsentGrab;
 use crate::consent::ConsentSurface;
 use crate::dmabuf::DmabufImporter;
+use crate::enforcement::{LayoutAct, LayoutMode};
 use crate::grants::{GrantTable, RealmId};
 use crate::identity::StaticVerifier;
 use crate::input::{InputRouter, PhysicalPresence, PreemptionHook, SeatInput};
@@ -303,6 +304,30 @@ pub(crate) struct RealmRuntime {
     pub server: Option<ShimServer>,
     /// Pushes seat events and `frame_done` at a shim that is not talking.
     pub outbox: Outbox,
+    /// **This realm's arrangement** (WS-E.1.4, issue #210): whether its view
+    /// size tracks the output's or is left alone.
+    ///
+    /// Born [`LayoutMode::Fullscreen`], because that is the state
+    /// [`start_realm_in`] already puts a realm in — it configures every shim
+    /// with the output's size — and a field whose initial value did not
+    /// describe the world would be a lie a later `set_fullscreen(fullscreen)`
+    /// would silently correct.
+    ///
+    /// Lives here rather than in the scene set because it is a fact about
+    /// what the *shim* was told, not about pixels: the scene composes the
+    /// same way in both arrangements, and the whole difference is whether
+    /// `configure` is re-sent. Dying with the realm is correct — an exited
+    /// realm is never relaunched (IDL `vitrin_launcher.launch`), so there is
+    /// no arrangement to carry forward.
+    ///
+    /// **Written by [`apply_layout`], read by [`apply_output_resize`]**, and
+    /// the read is the whole reason the field exists rather than the write.
+    /// `set_fullscreen` normatively promises that a fullscreen realm's view
+    /// size *tracks* the output's — `configure` on entry "and again whenever
+    /// the output resizes while the realm is in it" — so a resize has to know
+    /// which realms are in it. A write-only version of this field would leave
+    /// that second half stated on four surfaces and implemented on none.
+    pub arrangement: LayoutMode,
 }
 // The shim connection's calloop registration is deliberately **not** a field
 // here. Removing that token is how the core hangs up on a live shim — the
@@ -390,15 +415,19 @@ pub(crate) trait Presenter {
     fn focused(&self) -> Option<&RealmId>;
     /// Bind the output to `realm`: the mechanism, not the policy.
     ///
-    /// **Who** may call this is WS-E.1.4's question (issue #210) and **where
-    /// input goes as a result** is WS-E.1.6's (issue #212). The runtime's two
-    /// callers today both take the first still-serving realm in id order —
+    /// **Who** may call this was WS-E.1.4's question (issue #210) and is now
+    /// answered: a principal holding the `layout_focus` grant verb, through
+    /// the `vitrin_layout_focus` facet, the enforcement chokepoint and
+    /// [`apply_layout`]. **Where the human's input goes as a result** is
+    /// answered on the same line — [`seat_target`] follows this binding, which
+    /// is D-018(2)'s fifth ordering rule. Where an *agent's* actuation goes
+    /// is still WS-E.1.6's (issue #212).
+    ///
+    /// Two other callers remain and neither is a policy:
     /// [`start_one_realm_in`] at first attach and
-    /// [`rebind_output_after_death`] when the bound realm dies — which is a
-    /// placeholder in exactly the sense [`seat_target`] is one, and
-    /// deliberately the *same* rule so the visible realm and the seat's
-    /// target agree while the chokepoint's step-5d stopgap is still refusing
-    /// the mismatch.
+    /// [`rebind_output_after_death`] when the bound realm dies, both taking
+    /// the first still-serving realm in id order — the placeholder that
+    /// answers when no client has chosen.
     fn bind_output(&mut self, realm: &RealmId);
     /// Bind the output to **no realm**, so it composites the deterministic
     /// background and [`Self::focused`] answers `None`.
@@ -408,8 +437,10 @@ pub(crate) trait Presenter {
     /// only when no realm is still serving — the moment one is,
     /// [`Self::bind_output`] moves the output there instead. Separate from
     /// `bind_output` rather than folded into it as an `Option` argument so
-    /// that WS-E.1.4's question ("which principal may bind, under what verb")
-    /// stays a question about one named verb.
+    /// that "which principal may bind, under what verb" stays a question about
+    /// one named verb — which is exactly the shape the answer took: a
+    /// `layout_focus` holder binds, and there is no request through which one
+    /// unbinds.
     fn unbind_output(&mut self);
     /// The size the realm view composes at: the virtual output for headless,
     /// the host window for nested. One output, so one size, shared by every
@@ -418,6 +449,20 @@ pub(crate) trait Presenter {
     /// overlap, no resize). The input router maps view coordinates to
     /// surface coordinates against it.
     fn view_size(&self) -> (u32, u32);
+    /// **Record a new output size.** The backend that owns the output has
+    /// already changed it — this is the propagation, not the resize itself:
+    /// it hands the new size to the scene registry, which bumps every realm's
+    /// `layout_generation` (D-018(5)).
+    ///
+    /// Reached only through [`apply_output_resize`], which is also what
+    /// re-configures every fullscreen realm's shim. That pairing is the whole
+    /// reason this is a trait method rather than a line in each backend's own
+    /// resize handler: a backend that propagated the size without the
+    /// re-configure would leave `set_fullscreen`'s normative promise —
+    /// `configure` re-sent "whenever the output resizes while the realm is in
+    /// it" — false, silently, and only on the backend whose output can
+    /// actually resize.
+    fn set_view_size(&mut self, size: (u32, u32));
     /// Recomposite. Called at most once per dispatch round, from
     /// [`post_dispatch`] and never from a message callback.
     ///
@@ -1030,10 +1075,10 @@ fn start_one_realm_in<H: RuntimeHost>(
     let outbox = registered.expect("adopt runs `place` exactly once on the success path");
 
     // **The output's first binding**, and a placeholder in exactly the sense
-    // [`seat_target`] is one: the first realm to attach gets the output. Who
-    // *may* move it is WS-E.1.4's question (issue #210) and this issue
-    // deliberately answers none of it — it lands the mechanism
-    // (`Presenter::bind_output`) and its callers.
+    // [`seat_target`]'s fallback is one: the first realm to attach gets the
+    // output. Who *may* move it deliberately is answered by the `layout_focus`
+    // verb (WS-E.1.4, issue #210, reaching the presenter through
+    // [`apply_layout`]); this is what answers when nobody has.
     //
     // Only *this* caller is conditional on nothing being bound yet. The other
     // one, [`rebind_output_after_death`], moves the output when the realm
@@ -1064,6 +1109,9 @@ fn start_one_realm_in<H: RuntimeHost>(
             life,
             server: Some(server),
             outbox,
+            // The spawn `configure` above carried the output's size, so the
+            // realm really is in the fullscreen arrangement here.
+            arrangement: LayoutMode::Fullscreen,
         },
     );
     if !runtime.kernel.realms.mark_running(realm_id, pid) {
@@ -1241,11 +1289,12 @@ fn with_realm_teardown<H: RuntimeHost, T>(
 /// when there is none.** That is [`seat_target`]'s rule, letter for letter,
 /// and choosing it is the whole of the argument:
 ///
-/// - It is not a focus *policy*. Who may move the output is WS-E.1.4's
-///   question (issue #210) and this answers none of it — it is the same
-///   placeholder [`start_one_realm_in`] already applies at first attach, now
-///   also applied when the realm it picked stops existing. A policy that
-///   arrives later replaces both call sites and this function with it.
+/// - It is not a focus *policy*. Who may move the output deliberately is the
+///   `layout_focus` verb's answer (WS-E.1.4, issue #210), and this is not that
+///   path: it is the same placeholder [`start_one_realm_in`] applies at first
+///   attach, now also applied when the realm it picked stops existing. A realm
+///   dying is not a principal exercising authority, so it must not consult
+///   one.
 /// - It keeps the step-5d stopgap **fail-closed rather than relaxed**. The
 ///   chokepoint refuses an actuation whose grant names a realm other than the
 ///   one [`seat_target`] serves (`enforcement.rs` step 5d, owned by issue
@@ -1277,13 +1326,17 @@ fn rebind_output_after_death<H: RuntimeHost>(host: &mut H) {
     if !bound_is_gone {
         return;
     }
-    match seat_target(&runtime.realms).map(|(realm_id, _)| realm_id.clone()) {
+    // `None` for the binding, deliberately: the bound realm is the one that
+    // just died, so asking `seat_target` to follow it would answer with the
+    // corpse's own id. This is the fallback half of that function — the
+    // first still-serving realm in id order — asked for explicitly.
+    match seat_target(&runtime.realms, None).map(|(realm_id, _)| realm_id.clone()) {
         Some(next) => {
             view.bind_output(&next);
             tracing::info!(
                 realm = %next,
-                "the realm holding the output died; the output follows the seat to the first \
-                 still-serving realm in id order"
+                "the realm holding the output died; the output moves to the first \
+                 still-serving realm in id order, and the human's input with it"
             );
         }
         None => {
@@ -1641,6 +1694,12 @@ fn dispatch_principal<H: RuntimeHost>(
             // the borrows end costs one small allocation per actuating
             // message and keeps the borrow structure honest.
             let mut seat: Vec<SeatInput> = Vec::new();
+            // Chokepoint-admitted layout acts, collected for exactly the
+            // reason `seat` is: applying one needs `&mut` on the presenter
+            // and on a realm's outbox, and `ServerCtx` already holds the
+            // kernel mutably. Applied by `apply_layout` once the borrows
+            // end, in the order the chokepoint admitted them.
+            let mut layout_acts: Vec<LayoutAct> = Vec::new();
             let now = Instant::now();
             let outcome = {
                 let (runtime, view) = host.split();
@@ -1725,11 +1784,13 @@ fn dispatch_principal<H: RuntimeHost>(
                 // the machinery. `seat_target` is asked once per dispatch turn
                 // because it is one answer for the whole session — unlike
                 // liveness, which is a question per realm.
-                let seat_target_realm = seat_target(realms).map(|(realm_id, _)| realm_id);
+                let seat_target_realm =
+                    seat_target(realms, view.focused()).map(|(realm_id, _)| realm_id);
                 let Some(state) = conns.get_mut(&id) else {
                     return;
                 };
                 let mut actuations = |input: SeatInput| seat.push(input);
+                let mut layout = |act: LayoutAct| layout_acts.push(act);
                 let mut ctx = ServerCtx {
                     verifier: &kernel.verifier,
                     petitions: &mut kernel.petitions,
@@ -1741,6 +1802,7 @@ fn dispatch_principal<H: RuntimeHost>(
                     seat_target_realm,
                     presence: &kernel.presence,
                     actuations: &mut actuations,
+                    layout: &mut layout,
                     recorder: &mut kernel.recorder,
                 };
                 let mut send =
@@ -1771,6 +1833,14 @@ fn dispatch_principal<H: RuntimeHost>(
                 close_principal(host, id, CloseCause::CoreInitiated);
                 return;
             }
+            // Layout first, then input. A `focus` in the same dispatch turn
+            // as an actuation must have moved the binding before
+            // `route_seat` asks `seat_target` where input goes — otherwise
+            // the round in which a shell focuses a realm would still deliver
+            // that round's input to the realm it focused away from, which is
+            // the split the fifth ordering rule forbids, one dispatch turn
+            // wide.
+            apply_layout(host, layout_acts);
             route_seat(host, seat);
         }
         // Both terminal variants: the source has already removed itself, so
@@ -1786,9 +1856,27 @@ fn dispatch_principal<H: RuntimeHost>(
     }
 }
 
-/// **The realm every seat delivery goes to.** The first still-serving realm
-/// in id order — and a **placeholder rather than a routing policy**.
+/// **The realm every seat delivery goes to.** The realm the output is bound
+/// to, when one is bound and still serving; otherwise the first
+/// still-serving realm in id order.
 ///
+/// # The binding half is not a placeholder — it is D-018's fifth ordering rule
+///
+/// A `layout_focus` holder moves the output binding
+/// ([`Presenter::bind_output`]), and this function is what makes the human's
+/// own keyboard and pointer move with it. Serving the verb without this
+/// would let a holder show realm A while the human's keystrokes kept
+/// reaching realm B, which is focus theft in its sharpest form and is
+/// exactly what "focus is one act" exists to forbid (IDL
+/// `vitrin_layout_focus`, SCENE AUTHORITY's fifth rule). So the binding is
+/// consulted **first**, and no verb set separates the two halves.
+///
+/// # The fallback half still is a placeholder
+///
+/// With nothing bound — before the first realm attaches, or after the bound
+/// one died with no sibling to take the output — this still answers "the
+/// first still-serving realm in id order", and that is
+/// WS-E.1.6's to replace along with the rest of the routing model.
 /// Addressing seat events to a realm is two questions no delivery site is
 /// allowed to answer on its own — which realm a grant's actuation targets,
 /// and which realm physical input follows — and both are WS-E.1.6's,
@@ -1808,12 +1896,12 @@ fn dispatch_principal<H: RuntimeHost>(
 /// binding from disagreeing about it. The eventual policy — a router per
 /// realm — replaces this body and nothing else.
 ///
-/// It is also the rule the **output** binding follows, deliberately:
-/// [`start_one_realm_in`] and [`rebind_output_after_death`] both bind the
-/// first still-serving realm in id order, so the realm a human is watching
-/// and the realm an actuation reaches agree. They stay two independent
-/// choices in three functions, which is why the chokepoint's step-5d
-/// comparison below is still made rather than assumed.
+/// The relationship with the output binding is now the reverse of what it
+/// was: [`start_one_realm_in`] and [`rebind_output_after_death`] pick a
+/// realm and *bind* it, and this function follows that binding rather than
+/// re-deriving the same rule beside it. Both orders keep "the realm a human
+/// is watching" and "the realm the human's input reaches" equal; only this
+/// one keeps them equal after a client moves the binding.
 ///
 /// "Still serving" rather than plain "first": a dead realm keeps its map
 /// entry until shutdown (the registry and the runtime both outlive the
@@ -1837,11 +1925,379 @@ fn dispatch_principal<H: RuntimeHost>(
 /// nothing crosses. That guard and this placeholder are removed together
 /// by WS-E.1.6 (issue #212), which routes per realm instead.
 ///
+/// # What serving `layout_focus` did to that guard
+///
+/// It armed it. Before, the target was a fixed property of the deployment
+/// and no client could move it; now a `layout_focus` holder chooses it, and
+/// so chooses which *other* principals' actuations step 5d refuses. That
+/// cross-principal denial-of-service surface is created here, is bounded
+/// (recoverable, journaled, no token spent, no `once` rung burnt), and is
+/// published in `docs/book/src/limits.md`. It closes when #212 delivers to
+/// a hidden realm instead of refusing.
+///
+/// # Private, and that is the fifth ordering rule's enforcement
+///
+/// `focused` is an `Option` because [`rebind_output_after_death`] genuinely
+/// has no binding to consult — it runs *because* the bound realm just died,
+/// so following the old binding would answer with the corpse. That argument
+/// is therefore a real one, and it is also the exact shape a reverting edit
+/// takes: passing `None` at a delivery site silently restores "type into
+/// whichever realm sorts first". So this function is private to this module,
+/// and the only thing outside it may call is [`physical_seat_target`], which
+/// takes the scene registry and has no such argument to get wrong.
+///
 /// [`enforcement::UseEnv::seat_reaches_grant_realm`]: crate::enforcement::UseEnv::seat_reaches_grant_realm
-pub(crate) fn seat_target(
-    realms: &BTreeMap<RealmId, RealmRuntime>,
-) -> Option<(&RealmId, &RealmRuntime)> {
+fn seat_target<'r>(
+    realms: &'r BTreeMap<RealmId, RealmRuntime>,
+    focused: Option<&RealmId>,
+) -> Option<(&'r RealmId, &'r RealmRuntime)> {
+    // The bound realm first, and only if it is still serving: a realm whose
+    // shim died keeps its map entry, and following the binding into a corpse
+    // would swallow every actuation aimed at the session — the exact failure
+    // "still serving" was added to prevent on the fallback path.
+    if let Some(bound) = focused {
+        if let Some((id, realm)) = realms.get_key_value(bound) {
+            if realm.server.is_some() {
+                return Some((id, realm));
+            }
+        }
+    }
     realms.iter().find(|(_, realm)| realm.server.is_some())
+}
+
+/// Carry out chokepoint-admitted layout acts (WS-E.1.4, issue #210).
+///
+/// **This function makes no authority judgement**, exactly as [`route_seat`]
+/// makes none: an act reached here only by being admitted at the single
+/// enforcement chokepoint, and a delivery site that re-decided would be the
+/// second enforcement site this crate does not have. What it does re-check
+/// is *liveness*, which is not authority: a realm's shim can be torn down
+/// between admission and application, and binding the output to a corpse or
+/// writing `configure` into a dead outbox is a runtime condition rather than
+/// a refusal to voice.
+///
+/// # Why the output binding is (almost) the whole of "focus"
+///
+/// `Presenter::bind_output` is what a `focus` *decides*, and it is enough for
+/// the routing half because [`seat_target`] follows the binding — so the
+/// human's own keyboard and pointer move with the picture, in one act, per
+/// SCENE AUTHORITY's fifth ordering rule.
+///
+/// It is not enough for the realm being left. The router's pairing table is a
+/// record of the presses **that app** was told about, and the next delivery
+/// round calls [`InputRouter::bind_to`] with the new target, which forgets
+/// that table without a word. Every entry in it is then a press whose release
+/// the app can never receive — a latched `Ctrl` in an app the human can no
+/// longer even see, since the output has moved. So the losing realm is paid
+/// what it is owed *here*, before the binding moves, through the same seat
+/// funnel an ordinary release takes.
+///
+/// This is the same failure WS-E.1.2 fixed one layer down (a sibling realm's
+/// death resetting the shared router and latching a key in the survivor), and
+/// [`InputRouter::bind_to`]'s own docs used to be able to say "the only way
+/// the target changes today is the previous one dying, which has already
+/// reset". Serving `layout_focus` made that false, which is what makes this
+/// arm's drain load-bearing rather than defensive.
+///
+/// # What no layout act can reach
+///
+/// The consent surface, the trust indicator and the agent-cursor sprite are
+/// composited at the **output stage**, downstream of the `Scene::compose`
+/// this function's binding selects (P1.7.1, D-019(3)). So invariants 1 and 3
+/// of D-018(2) are not checks performed here — there is no expressible act
+/// whose application could reach them, which is a stronger property than a
+/// guard and is why no guard appears below.
+fn apply_layout<H: RuntimeHost>(host: &mut H, acts: Vec<LayoutAct>) {
+    if acts.is_empty() {
+        return;
+    }
+    let (runtime, view) = host.split();
+    let view_size = view.view_size();
+    let mut rebound = false;
+    for act in acts {
+        match act {
+            LayoutAct::Focus { realm } => {
+                // Liveness, not authority (see above). A realm whose shim
+                // died after admission would otherwise take the output into
+                // the state `rebind_output_after_death` exists to leave.
+                if runtime
+                    .realms
+                    .get(&realm)
+                    .is_none_or(|r| r.server.is_none())
+                {
+                    tracing::debug!(
+                        %realm,
+                        "focus admitted for a realm whose shim is gone; the output stays put"
+                    );
+                    continue;
+                }
+                if view.focused() == Some(&realm) {
+                    continue;
+                }
+                // The releases the realm losing the seat is owed, delivered
+                // before the binding moves (see above). The router names its
+                // own debtor — that is exactly what `bound_realm` is — so
+                // nothing here has to guess which app saw the presses.
+                let Runtime {
+                    router,
+                    realms,
+                    kernel,
+                    ..
+                } = &mut *runtime;
+                if let Some(losing) = router.bound_realm().cloned() {
+                    if losing != realm {
+                        for delivery in router.release_held() {
+                            tracing::debug!(
+                                realm = %losing,
+                                "releasing a press held across a focus change so it cannot latch \
+                                 in an app the human can no longer see"
+                            );
+                            deliver_seat_to(realms, &mut kernel.recorder, &losing, &delivery);
+                        }
+                    }
+                }
+                tracing::info!(%realm, "layout_focus: the output and the human's input move here");
+                view.bind_output(&realm);
+                rebound = true;
+            }
+            LayoutAct::Arrange { realm, mode } => {
+                let Some(entry) = runtime.realms.get_mut(&realm) else {
+                    continue;
+                };
+                entry.arrangement = mode;
+                // Only fullscreen imposes a size. Windowed is an *absence*:
+                // the core sends nothing and the realm keeps whatever size
+                // it has, which is what "the core never invents a window
+                // size" means in code (IDL `set_fullscreen`).
+                if mode != LayoutMode::Fullscreen {
+                    continue;
+                }
+                reconfigure_realm(&realm, entry, view_size);
+            }
+        }
+    }
+    if rebound {
+        // The output shows a different realm now, and on a backend whose
+        // frame clock is external the dirty flag alone composites nothing —
+        // the same pairing `rebind_output_after_death` documents.
+        runtime.dirty = true;
+        view.request_present();
+    }
+}
+
+/// Re-send `configure` at `size` to one realm's shim, if that changes what
+/// the shim was last told.
+///
+/// The one place a realm's view size is imposed. Two callers, and the pair is
+/// exactly what `set_fullscreen`'s normative wire semantics say: entering the
+/// fullscreen arrangement ([`apply_layout`]) and every later output resize
+/// while the realm is still in it ([`apply_output_resize`]). A failure is a
+/// runtime condition, not an authority answer — the shim's death is the
+/// transport's to classify — so it is logged and swallowed here, exactly as
+/// the seat delivery path does.
+fn reconfigure_realm(realm: &RealmId, entry: &mut RealmRuntime, size: (u32, u32)) {
+    let Some(server) = entry.server.as_mut() else {
+        return;
+    };
+    let outbox = &entry.outbox;
+    let mut send = |frame: &[u8]| outbox.send(frame);
+    match server.reconfigure(size.0, size.1, &mut send) {
+        Ok(true) => tracing::info!(
+            %realm, w = size.0, h = size.1,
+            "the realm's view now tracks the output"
+        ),
+        // Already that size: the two arrangements are indistinguishable
+        // here and the IDL says so.
+        Ok(false) => {}
+        Err(err) => tracing::warn!(
+            %realm, %err,
+            "re-configuring the realm failed; the shim's death is the transport's to classify"
+        ),
+    }
+}
+
+/// **The output resized.** Propagate the new size to every realm's scene
+/// geometry, and re-configure every realm currently in the fullscreen
+/// arrangement.
+///
+/// The second half is the normative half. `vitrin_layout_arrange.set_fullscreen`
+/// says, in the IDL's own words, that fullscreen means the realm's view size
+/// *tracks* the output's: `configure` carries the output's size on entering
+/// the mode "and again whenever the output resizes while the realm is in it".
+/// Entering the mode is [`apply_layout`]'s; this function is the "and again",
+/// and without it [`RealmRuntime::arrangement`] would be a field nothing ever
+/// read and four surfaces would be describing behaviour that did not exist.
+///
+/// **Every fullscreen realm, not just the bound one.** Hidden realms compose
+/// at the output's size too (one output, one size — `Presenter::view_size`),
+/// so a hidden realm left at the old size would be letterboxed the moment it
+/// was focused, which is precisely what `windowed` means and precisely what
+/// it did not ask for. A windowed realm is skipped: the core imposes no size
+/// on it at all, and `Scene::compose` letterboxes whatever it keeps
+/// committing.
+///
+/// Called by the backend that owns the output, on its own resize event — the
+/// nested backend's `Resized` handler is the only production caller, because
+/// the headless virtual output never resizes.
+pub(crate) fn apply_output_resize<H: RuntimeHost>(host: &mut H, size: (u32, u32)) {
+    let (runtime, view) = host.split();
+    // The scene registry first: it bumps every realm's `layout_generation`
+    // (D-018(5), decision 4) — deliberately not `Scene::generation`, which
+    // the damage path keys on and which a resize is not a repaint of.
+    view.set_view_size(size);
+    for (realm_id, entry) in runtime.realms.iter_mut() {
+        if entry.arrangement != LayoutMode::Fullscreen {
+            continue;
+        }
+        reconfigure_realm(realm_id, entry, size);
+    }
+}
+
+/// Hand one already-routed seat delivery to **this named realm's** shim, and
+/// journal it.
+///
+/// The funnel for every *single* delivery, whatever produced it: the human's
+/// own physical input ([`deliver_physical`]) and the releases a focus change
+/// owes the realm it moved away from ([`apply_layout`]). [`route_seat`]'s
+/// batch loop takes the same three steps in the same order and additionally
+/// stops producing for a shim that has stopped reading, which is a property
+/// of a batch and has no meaning for one event. Sharing this keeps the flight
+/// recorder's `seat_delivered` entry — the only place the unforgeable
+/// physical-vs-emulated distinction is investigable after an incident — from
+/// being written by sites that could drift.
+///
+/// Recorded only when the frame actually went out: a seat the shim has not
+/// minted yet drops the event, and nothing was delivered, so nothing is
+/// audited as delivered.
+fn deliver_seat_to(
+    realms: &BTreeMap<RealmId, RealmRuntime>,
+    recorder: &mut crate::recorder::Recorder,
+    realm_id: &RealmId,
+    delivery: &crate::input::SeatDelivery,
+) {
+    let Some(realm) = realms.get(realm_id) else {
+        return;
+    };
+    let Some(server) = realm.server.as_ref() else {
+        return;
+    };
+    let mut send = |frame: &[u8]| realm.outbox.send(frame);
+    match server.deliver_seat_event(delivery, &mut send) {
+        Ok(sent) => {
+            if sent {
+                crate::input::record_seat_delivery(recorder, realm_id, delivery);
+            }
+        }
+        Err(err) => {
+            tracing::warn!(realm = %realm_id, %err, "seat delivery to the realm failed");
+        }
+    }
+}
+
+/// **Where the human's own physical input goes**, and the only way anything
+/// outside this module may ask.
+///
+/// [`seat_target`] is private precisely so this is the only answer available
+/// to a backend: it takes the scene registry rather than an
+/// `Option<&RealmId>`, so "supply the binding yourself" — and in particular
+/// "supply `None`" — is not expressible at a call site. That is D-018(2)'s
+/// fifth ordering rule made structural: reverting a backend to the
+/// pre-WS-E.1.4 behaviour of typing into whichever realm sorts first is a
+/// compile error rather than a one-character edit, and the only remaining
+/// place the binding could be dropped is this function's own body, which
+/// `the_humans_input_follows_the_realm_a_focus_holder_bound` drives over a
+/// real wire.
+///
+/// Fed by the nested backend at all three of its seat sites — the surface
+/// geometry it maps with, the router generation it binds, and the shim it
+/// delivers to — so the three cannot disagree about which realm this turn is
+/// about.
+pub(crate) fn physical_seat_target<'r>(
+    realms: &'r BTreeMap<RealmId, RealmRuntime>,
+    scenes: &crate::scene::realms::RealmScenes,
+) -> Option<(&'r RealmId, &'r RealmRuntime)> {
+    seat_target(realms, scenes.focused())
+}
+
+/// Hand one routed **physical** seat event to the realm the output is bound
+/// to, and journal it.
+///
+/// Physical input reaches the realm's seat over the same outbox an agent's
+/// chokepoint-admitted actuation uses; the origin tag bound at intake rides
+/// the wire unchanged (B2). This is the *only* site that produces
+/// `origin="physical"` at runtime — a human's input reaching the app is the
+/// half of the physical-vs-emulated audit that never crosses a chokepoint —
+/// so sharing [`deliver_seat_to`] with the agent path keeps the two from
+/// silently diverging.
+///
+/// A free function here rather than a method on the nested backend for two
+/// reasons. It is the physical twin of [`route_seat`] and belongs beside it;
+/// and the backend's own methods need a display, so a test can reach this and
+/// cannot reach them — which is the difference between the fifth ordering
+/// rule being *tested* and being asserted about a function nobody calls.
+pub(crate) fn deliver_physical(
+    realms: &BTreeMap<RealmId, RealmRuntime>,
+    scenes: &crate::scene::realms::RealmScenes,
+    recorder: &mut crate::recorder::Recorder,
+    delivery: crate::input::SeatDelivery,
+) {
+    let Some((realm_id, _)) = physical_seat_target(realms, scenes) else {
+        tracing::trace!(
+            origin = ?delivery.origin(),
+            "routed input dropped: no serving realm attached"
+        );
+        return;
+    };
+    deliver_seat_to(realms, recorder, realm_id, &delivery);
+}
+
+/// One turn of the human's own physical input: bind the router's generation,
+/// map through the target realm's geometry, route, and deliver.
+///
+/// **The display-free tail of the nested backend's input handler**, split out
+/// for the reason [`crate::backend::winit::route_turn`] and `deadman_tick`
+/// were: CI has no display (D-019(4)), so anything left inside a
+/// `NestedState` method is unreachable by every test in this workspace. That
+/// is how D-018(2)'s fifth ordering rule came to have production wiring a
+/// reviewer could revert with the suite still green.
+///
+/// All three seat questions this turn asks are answered by
+/// [`physical_seat_target`] — the surface geometry to map with, the router
+/// generation to bind, and the shim to deliver to — so they cannot disagree
+/// about which realm the human is typing into.
+pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    scenes: &crate::scene::realms::RealmScenes,
+    switch: &std::cell::RefCell<crate::deadman::DeadManSwitch>,
+    inputs: impl IntoIterator<Item = SeatInput>,
+    view: (u32, u32),
+) {
+    let Runtime {
+        router,
+        realms,
+        kernel,
+        ..
+    } = runtime;
+    // **The seat target's own surface geometry** (WS-E.1.3): the router maps
+    // view coordinates to surface coordinates through `layout::place`, so it
+    // must be handed the geometry of the surface the event is about. With one
+    // scene those were the same thing; with several, a hidden realm's
+    // committed size would silently place a human's click for the app being
+    // typed into.
+    let surface = physical_seat_target(realms, scenes)
+        .and_then(|(realm_id, _)| scenes.scene(realm_id))
+        .and_then(|scene| scene.surface_size());
+    // Before the routing, not after: the routing writes this turn's presses
+    // into the router's pairing table, and that debt has to be on record as
+    // *this realm's* from the first one — otherwise a sibling realm dying
+    // mid-session would clear a key this app is still holding
+    // (`crate::input::InputRouter::reset_for`).
+    if let Some((realm_id, _)) = physical_seat_target(realms, scenes) {
+        router.bind_to(realm_id);
+    }
+    crate::backend::winit::route_turn(router, switch, inputs, view, surface, &mut |delivery| {
+        deliver_physical(realms, scenes, &mut kernel.recorder, delivery)
+    });
 }
 
 /// Route chokepoint-admitted actuations through the session's router toward
@@ -1862,9 +2318,10 @@ pub(crate) fn seat_target(
 ///
 /// # Which realm, with more than one attached
 ///
-/// Whichever [`seat_target`] names — the first still-serving realm in id
-/// order, a **placeholder rather than a routing policy** (see that
-/// function).
+/// Whichever [`seat_target`] names — the realm the output is bound to when
+/// one is, and otherwise the first still-serving realm in id order (see that
+/// function for which half is D-018's fifth ordering rule and which half is
+/// still WS-E.1.6's placeholder).
 ///
 /// This function is therefore reached only by actuations whose grant names
 /// **that** realm: the chokepoint refuses the rest before they become
@@ -1883,7 +2340,8 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
         kernel,
         ..
     } = runtime;
-    let Some((realm_id, realm)) = seat_target(realms) else {
+    let focused = view.focused().cloned();
+    let Some((realm_id, realm)) = seat_target(realms, focused.as_ref()) else {
         return;
     };
     let Some(server) = realm.server.as_ref() else {
@@ -2364,6 +2822,14 @@ mod tests {
 
     const TOKEN: &str = "9b2f4c1d8a7e5f30619b2f4c1d8a7e5f30619b2f4c1d8a7e5f30619b2f4c1d8a";
     const DEMO_IDENTITY: &str = "vitrin://local/agent/demo";
+    /// A **second** principal, so a test can put one principal's consent
+    /// prompt on screen while a *different* principal drives layout at it.
+    /// With one identity that scenario is unreachable: the chokepoint's
+    /// `consent_held` gate refuses a principal's own uses while its own
+    /// prompt is up, so a single-identity rig could only ever test the gate,
+    /// never the invariant behind it.
+    const OTHER_IDENTITY: &str = "vitrin://local/agent/other";
+    const OTHER_TOKEN: &str = "1a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5e6f7081";
     const VIEW: (u32, u32) = (64, 40);
     /// The wire id the rig's petition mints for its `vitrin_grant`.
     const GRANT_ID: u32 = 4;
@@ -2389,6 +2855,14 @@ mod tests {
         /// but only exercised when a grab is attached; the consent tests
         /// assert a card was raised on it.
         consent: ConsentSurface,
+        /// The output's size. A **field** rather than the `VIEW` constant
+        /// since WS-E.1.4: the two arrangements `set_fullscreen` chooses
+        /// between are indistinguishable while the output's size and the
+        /// realm's size are equal (IDL `set_fullscreen`), so a rig that
+        /// could not resize its output could not tell them apart at all.
+        /// The nested backend's `Resized` handler is what moves this in
+        /// production.
+        size: (u32, u32),
         /// The last position [`Presenter::set_agent_cursor`] was **offered**,
         /// `None` when it has not been called since a test cleared it.
         ///
@@ -2406,6 +2880,32 @@ mod tests {
         /// that the teardown funnel really took *its* surface away.
         fn surface_of(&self, realm: &RealmId) -> Option<(u32, u32)> {
             self.scenes.scene(realm).and_then(|s| s.surface_size())
+        }
+
+        /// **One frame of human-visible output**, through the very function
+        /// both shipped backends compose theirs with
+        /// ([`crate::backend::compose_human_visible`]).
+        ///
+        /// Not a second compositor. The D-018(2) invariant tests need real
+        /// composited bytes and this rig otherwise has none; reimplementing
+        /// the overlay stack here would test a copy of the compositor
+        /// against itself, which is the drift D-019's cost note names. What
+        /// this adds is the *call*, on the scene the output binding selects
+        /// — the one thing a `layout_focus` holder can move.
+        fn human_visible(&mut self) -> Vec<u8> {
+            let (w, h) = self.size;
+            crate::backend::compose_human_visible(self.scenes.bound(), &mut self.consent, w, h)
+        }
+
+        /// The bare realm view a capture of `realm` is taken from — the
+        /// upstream half of the same pair, so a test can say "the overlay is
+        /// in one and not the other" about two real buffers.
+        fn capture_view(&self, realm: &RealmId) -> Vec<u8> {
+            let (w, h) = self.size;
+            self.scenes
+                .scene(realm)
+                .map(|scene| scene.compose(w, h))
+                .unwrap_or_else(|| crate::test_pattern::render(w, h))
         }
     }
 
@@ -2426,7 +2926,15 @@ mod tests {
             self.scenes.unbind();
         }
         fn view_size(&self) -> (u32, u32) {
-            VIEW
+            self.size
+        }
+        /// This rig's output size is a plain field (the nested backend reads
+        /// its host window instead), so this records it as well as
+        /// propagating it — the same two facts, from the one call
+        /// [`apply_output_resize`] makes.
+        fn set_view_size(&mut self, size: (u32, u32)) {
+            self.size = size;
+            self.scenes.set_view_size(size);
         }
         /// Counts composites and reports whichever posture the test asked
         /// for: `Completed` (headless, the default) or `Scheduled` (nested,
@@ -2542,11 +3050,18 @@ mod tests {
 
     fn demo_verifier() -> StaticVerifier {
         StaticVerifier::from_rows(
-            vec![StaticPrincipal {
-                identity: PrincipalIdentity::parse(DEMO_IDENTITY).unwrap(),
-                token: TOKEN.as_bytes().to_vec(),
-                uid: None,
-            }],
+            vec![
+                StaticPrincipal {
+                    identity: PrincipalIdentity::parse(DEMO_IDENTITY).unwrap(),
+                    token: TOKEN.as_bytes().to_vec(),
+                    uid: None,
+                },
+                StaticPrincipal {
+                    identity: PrincipalIdentity::parse(OTHER_IDENTITY).unwrap(),
+                    token: OTHER_TOKEN.as_bytes().to_vec(),
+                    uid: None,
+                },
+            ],
             rustix::process::geteuid().as_raw(),
         )
         .unwrap()
@@ -2589,6 +3104,7 @@ mod tests {
                     presents: 0,
                     posture: Presentation::Completed,
                     consent: ConsentSurface::new(crate::consent::TrustedIndicator::for_test()),
+                    size: VIEW,
                     cursor_offered: None,
                 },
                 handle: handle.clone(),
@@ -4658,7 +5174,8 @@ mod tests {
             "the output must not stay bound to a realm whose shim session is gone"
         );
         assert_eq!(
-            seat_target(&rig.host.runtime.realms).map(|(realm_id, _)| realm_id),
+            seat_target(&rig.host.runtime.realms, rig.host.view.focused())
+                .map(|(realm_id, _)| realm_id),
             Some(&survivor),
             "and it must land on the realm the seat serves, or the step-5d stopgap starts \
              refusing every actuation the human can see the effect of"
@@ -4679,7 +5196,8 @@ mod tests {
         close_realm(&mut rig.host, &survivor, DeathCause::ConnectionClosed);
         assert_eq!(rig.host.view.focused(), None);
         assert_eq!(
-            seat_target(&rig.host.runtime.realms).map(|(realm_id, _)| realm_id),
+            seat_target(&rig.host.runtime.realms, rig.host.view.focused())
+                .map(|(realm_id, _)| realm_id),
             None
         );
         assert_eq!(
@@ -4749,5 +5267,1223 @@ mod tests {
             Some(None),
             "an agent pointing inside a HIDDEN realm must draw no sprite on the output"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // WS-E.1.4 (issue #210): the served layout verbs, and D-018(2)'s
+    // ordering invariants tested AS invariants
+    // ---------------------------------------------------------------------
+    //
+    // D-018's own cost note says of its four unpurchasable ordering rules
+    // that "none of the four is tested *as an invariant* against a client
+    // trying to violate it, and none can be until something outside the core
+    // can arrange realms". Serving `layout_focus` and `layout_arrange` is
+    // that moment, so these tests are the discharge of that note.
+    //
+    // Two disciplines they all keep, because a test that keeps neither is
+    // the kind that has already been caught vacuous in this workstream:
+    //
+    // 1. **The arrangement is driven through the wire**, on a real socket,
+    //    by a real client holding a real grant, through `request_grant` ->
+    //    the consent path -> `get_layout_*` -> `focus`/`set_fullscreen` ->
+    //    the enforcement chokepoint -> `apply_layout`. Nothing calls
+    //    `Presenter::bind_output` by hand to manufacture the precondition.
+    // 2. **The verb set is the maximum this core serves**, so a passing
+    //    assertion says "no grant buys this" rather than "the grant I
+    //    happened to construct did not".
+
+    /// Every verb this core serves, in one petition — the widest authority
+    /// a grant can carry here. A property proved against this set is proved
+    /// against every subset, which is what makes these tests statements
+    /// about *no grant* rather than about one.
+    fn max_verbs() -> Verb {
+        Verb::OBSERVE
+            | Verb::ACTUATE_POINTER
+            | Verb::ACTUATE_TEXT
+            | Verb::LAYOUT_ARRANGE
+            | Verb::LAYOUT_FOCUS
+    }
+
+    /// Wire ids a layout client uses, above the five `request_grant` mints.
+    const FOCUS_FACET: u32 = 9;
+    const ARRANGE_FACET: u32 = 10;
+
+    /// The `hello` + `get_realm` preamble for an arbitrary identity and
+    /// realm, so a test can put **two** principals on one session (the
+    /// single-identity `send_preamble` cannot: the chokepoint's
+    /// `consent_held` gate would refuse the layout holder's every request
+    /// while the prompt under test was up).
+    fn send_preamble_as(client: &mut Connection, identity: &str, token: &str, realm: &str) {
+        let hello = vitrin_handshake::requests::Hello {
+            version: PROTOCOL_VERSION,
+            principal: 2,
+            identity: identity.into(),
+            credential_type: STATIC_TOKEN_SCHEME.into(),
+            credential: token.into(),
+        };
+        client
+            .send_message(&hello.encode(HANDSHAKE_ID), None)
+            .expect("hello");
+        let get_realm = vitrin_principal::requests::GetRealm {
+            realm: 3,
+            name: realm.into(),
+        };
+        client
+            .send_message(&get_realm.encode(2), None)
+            .expect("get_realm");
+    }
+
+    /// Petition for `verbs` over the realm handle at id 3.
+    fn send_petition_for(client: &mut Connection, verbs: Verb) {
+        let req = vitrin_realm::requests::RequestGrant {
+            grant: 4,
+            consent: 5,
+            view: 6,
+            pointer: 7,
+            text: 8,
+            resource: String::new(),
+            verbs,
+            expiry_ms: 0,
+            max_event_rate: 0,
+            persistence: Persistence::WhileRunning,
+            flags: 0,
+        };
+        client
+            .send_message(&req.encode(3), None)
+            .expect("request_grant");
+    }
+
+    /// A **second** petition on the same connection, above the ids the first
+    /// one and the two layout facets took. The watermark never rewinds, so
+    /// the ids are simply the next five; nothing reads the resolution, which
+    /// is the point — this exists to leave a prompt on screen for *this*
+    /// principal, which is the fact the chokepoint's step 5b reads.
+    fn send_second_petition_for(client: &mut Connection, verbs: Verb) {
+        let req = vitrin_realm::requests::RequestGrant {
+            grant: 11,
+            consent: 12,
+            view: 13,
+            pointer: 14,
+            text: 15,
+            resource: String::new(),
+            verbs,
+            expiry_ms: 0,
+            max_event_rate: 0,
+            persistence: Persistence::WhileRunning,
+            flags: 0,
+        };
+        client
+            .send_message(&req.encode(3), None)
+            .expect("second request_grant");
+    }
+
+    /// Mint both layout facets on the grant at [`GRANT_ID`]. Structural
+    /// mints: legal whatever the grant holds, no reply to wait for.
+    fn mint_layout_facets(client: &mut Connection) {
+        use vitrin_protocol::generated::vitrin_grant::requests::{
+            GetLayoutArrange, GetLayoutFocus,
+        };
+        client
+            .send_message(
+                &GetLayoutFocus {
+                    layout_focus: FOCUS_FACET,
+                }
+                .encode(GRANT_ID),
+                None,
+            )
+            .expect("get_layout_focus");
+        client
+            .send_message(
+                &GetLayoutArrange {
+                    layout_arrange: ARRANGE_FACET,
+                }
+                .encode(GRANT_ID),
+                None,
+            )
+            .expect("get_layout_arrange");
+    }
+
+    fn send_focus(client: &mut Connection) {
+        use vitrin_protocol::generated::vitrin_layout_focus::requests::Focus;
+        client
+            .send_message(&Focus {}.encode(FOCUS_FACET), None)
+            .expect("focus");
+    }
+
+    fn send_set_fullscreen(
+        client: &mut Connection,
+        mode: vitrin_protocol::generated::vitrin_layout_arrange::Mode,
+    ) {
+        use vitrin_protocol::generated::vitrin_layout_arrange::requests::SetFullscreen;
+        client
+            .send_message(&SetFullscreen { mode }.encode(ARRANGE_FACET), None)
+            .expect("set_fullscreen");
+    }
+
+    /// A client that holds [`max_verbs`] over `realm`, auto-approved, with both
+    /// layout facets minted — the "worst case holder" every invariant test
+    /// below is written against.
+    fn layout_holder(rig: &mut Rig, identity: &str, token: &str, realm: &str) -> Connection {
+        let mut client = agent(&rig.socket);
+        send_preamble_as(&mut client, identity, token, realm);
+        send_petition_for(&mut client, max_verbs());
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(
+            await_resolution(&mut client),
+            Outcome::Granted,
+            "the rig's auto-approve policy must grant the maximum served verb set; \
+             a refusal here means a verb left SERVED_VERB_BITS and this whole test file \
+             is no longer testing what it claims"
+        );
+        mint_layout_facets(&mut client);
+        rig.pump(Duration::from_millis(200));
+        client
+    }
+
+    /// The rig every invariant test below uses: auto-approve (so the holder's
+    /// own grant needs no human), two realms with real forked mock shims, and
+    /// the holder's grant over `realm-a`.
+    fn two_realm_rig(label: &str) -> (Rig, RealmId, RealmId) {
+        let mut rig = Rig::new(
+            label,
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        rig.start_realms(&[
+            ("realm-a", &["--serve", "--seat"]),
+            ("realm-b", &["--serve"]),
+        ]);
+        rig.pump(Duration::from_millis(400));
+        (rig, RealmId::new("realm-a"), RealmId::new("realm-b"))
+    }
+
+    /// Commit a distinguishable surface into `realm`'s scene at `(w, h)`.
+    ///
+    /// This is the **app's** behaviour, not the client's: an app answers a
+    /// `configure` with a buffer of some size, and the arrangement under test
+    /// is what the core does with that buffer. Driving it here is the same
+    /// accommodation every scene test in this crate makes.
+    fn commit_into(rig: &mut Rig, realm: &RealmId, w: u32, h: u32, tint: u8) {
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[tint, (i % 251) as u8, 0x40, 0xff]);
+        }
+        rig.host.view.scenes.scene_mut(realm).commit(
+            crate::scene::SurfaceContent::from_rgba(rgba, w, h).expect("well-formed content"),
+        );
+        // One dirty round refreshes every live realm's cache entry off the
+        // same completed composite, which is what makes the realm *live* for
+        // the chokepoint's `no_surface` gate. Without it every layout request
+        // below would be refused `no_surface` — correctly, and for a reason
+        // that has nothing to do with what these tests are about.
+        rig.host.runtime.dirty = true;
+        post_dispatch(&mut rig.host);
+    }
+
+    /// **Every arrangement the two served verbs can express**, as a sequence
+    /// of wire requests. Finite and small by construction — that is the whole
+    /// of decision 3's "the only arrangement this scene model can express" —
+    /// so a test can sweep the *entire* space rather than sample it.
+    fn every_arrangement() -> Vec<&'static str> {
+        vec![
+            "focus",
+            "fullscreen",
+            "windowed",
+            "focus",
+            "windowed",
+            "fullscreen",
+            "fullscreen",
+            "focus",
+            "windowed",
+        ]
+    }
+
+    fn drive_arrangement(rig: &mut Rig, client: &mut Connection, step: &str) {
+        match step {
+            "focus" => send_focus(client),
+            "fullscreen" => send_set_fullscreen(
+                client,
+                vitrin_protocol::generated::vitrin_layout_arrange::Mode::Fullscreen,
+            ),
+            "windowed" => send_set_fullscreen(
+                client,
+                vitrin_protocol::generated::vitrin_layout_arrange::Mode::Windowed,
+            ),
+            other => panic!("unknown arrangement step {other}"),
+        }
+        rig.pump(Duration::from_millis(200));
+    }
+
+    /// **D-018(2) invariants 1 and 3, as invariants.** A client holding the
+    /// maximum verb set drives every arrangement it can express while another
+    /// principal's consent prompt is on screen; the card and the trust band
+    /// come out byte-identical every time.
+    ///
+    /// What makes this a test of the *invariant* rather than of a happy path:
+    /// the sweep covers the whole expressible arrangement space (see
+    /// [`every_arrangement`]) at the widest verb set this core grants, and the
+    /// comparison is against the card rasterized independently — so a card
+    /// that moved, shrank, was scrolled off, or was covered by realm content
+    /// fails, and so does a trust band a fullscreened realm painted over.
+    #[test]
+    fn no_arrangement_at_the_maximum_verb_set_can_touch_the_consent_card() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rig, a, b) = two_realm_rig("layout-inv-card");
+        // An output the 560px consent card actually fits inside, with realm
+        // view around it — so "the card is intact" is a statement about
+        // composition and not an artifact of cropping. Applied through the
+        // production resize path.
+        const OUT: (u32, u32) = (800, 600);
+        apply_output_resize(&mut rig.host, OUT);
+        commit_into(&mut rig, &a, OUT.0, OUT.1, 0x11);
+        commit_into(&mut rig, &b, OUT.0 / 2, OUT.1 / 2, 0x99);
+        let mut holder = layout_holder(&mut rig, DEMO_IDENTITY, TOKEN, "realm-b");
+
+        // A *different* principal's prompt goes up and stays up. Different,
+        // because `consent_held` refuses a principal's own uses while its own
+        // prompt is up — so a single-identity rig would test that gate and
+        // never reach the invariant behind it.
+        rig.host
+            .view
+            .consent
+            .show_for_test(crate::consent::tests::prompt_fixture());
+        let card = crate::consent::render::rasterize(&crate::consent::tests::prompt_fixture());
+        let (cx, cy) = rig
+            .host
+            .view
+            .consent
+            .card_origin(OUT.0, OUT.1)
+            .expect("a prompt is up, so the card has an origin");
+        assert!(
+            cx >= 0 && cy >= 0,
+            "the card must fit in the {OUT:?} output"
+        );
+        let band = crate::consent::TrustedIndicator::for_test().color();
+
+        let mut checked = 0;
+        for step in every_arrangement() {
+            drive_arrangement(&mut rig, &mut holder, step);
+            let output = rig.host.view.human_visible();
+
+            // Invariant 1: the trust indicator composites above every
+            // principal's content, whatever is arranged under it.
+            assert_eq!(
+                &output[..4],
+                &band[..],
+                "after `{step}` the trust band no longer owns pixel (0,0): an arrangement \
+                 reached above the one strip the human reads the session colour from"
+            );
+
+            // Invariant 3: no arrangement occludes, fullscreens over, or
+            // resizes away the consent surface. Byte-exact, row by row,
+            // against an independently rasterized card.
+            assert_eq!(
+                rig.host.view.consent.card_origin(OUT.0, OUT.1),
+                Some((cx, cy)),
+                "after `{step}` the card moved: its geometry must not be a function of \
+                 anything a layout holder can set"
+            );
+            for row in 0..card.height {
+                let d = ((cy as u32 + row) as usize * OUT.0 as usize + cx as usize) * 4;
+                let s = row as usize * card.width as usize * 4;
+                let run = card.width as usize * 4;
+                assert_eq!(
+                    &output[d..d + run],
+                    &card.rgba[s..s + run],
+                    "after `{step}`, card row {row} is not the card: realm content reached \
+                     over the consent surface"
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            every_arrangement().len(),
+            "the sweep must cover the whole expressible arrangement space"
+        );
+    }
+
+    /// **D-018(2) invariant 2, as an invariant.** Which surface an input
+    /// event reaches is decided by the core's own geometry, and a layout
+    /// holder has no vocabulary for saying otherwise.
+    ///
+    /// Two halves, because the invariant has two:
+    ///
+    /// - **There is no stacking to claim.** Neither served facet defines any
+    ///   request beyond the one it ships, so "a client's claimed stacking"
+    ///   is not merely ignored, it is unstateable. This half is the guard
+    ///   against the partial-verb hazard issue #210 names as its most
+    ///   fragile point ("nothing structurally stops a later issue adding a
+    ///   `place` request while the scene still cannot honour it"): adding
+    ///   one turns this red.
+    /// - **What a holder *can* move, it moves wholly.** A `focus` moves the
+    ///   output binding, and the realm input reaches follows it — never
+    ///   diverging, in either direction, at any point in the sweep. A
+    ///   divergence is precisely the state SCENE AUTHORITY's fifth ordering
+    ///   rule forbids: keys reaching a realm the human cannot see.
+    #[test]
+    fn the_core_not_the_client_decides_which_surface_input_reaches() {
+        use vitrin_protocol::generated::{vitrin_layout_arrange, vitrin_layout_focus};
+
+        let _fd = crate::capture::tests::fd_lock();
+
+        // Half one: the vocabulary. Opcodes are implicit document order and
+        // append-only, so "the last defined opcode is 0" is exactly "there is
+        // one request".
+        assert_eq!(
+            vitrin_layout_focus::requests::Focus::OPCODE,
+            0,
+            "focus must be vitrin_layout_focus's first request"
+        );
+        assert_eq!(
+            vitrin_layout_arrange::requests::SetFullscreen::OPCODE,
+            0,
+            "set_fullscreen must be vitrin_layout_arrange's first request"
+        );
+        // ...and the count. `MESSAGE_COUNT` is generated from the IDL, so a
+        // `place`, `raise` or `resize` request appended to either interface
+        // moves it and fails here with a message naming why that is not a
+        // free addition.
+        assert_eq!(
+            vitrin_protocol::generated::MESSAGE_COUNT,
+            36,
+            "a message was added to the IDL. If it is a request on \
+             vitrin_layout_arrange or vitrin_layout_focus, D-018(2) invariant 2 is at \
+             stake: this scene shows one realm, unstacked and unoverlapped, so it cannot \
+             honour place/resize/raise/stacking, and a granted verb whose requests the \
+             server cannot carry out breaks the IDL's own 'a deployment MUST NOT grant a \
+             verb it does not enforce'. Re-pin this number only after deciding that."
+        );
+
+        // Half two: the behaviour, over the wire.
+        let (mut rig, a, b) = two_realm_rig("layout-inv-hittest");
+        commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
+        commit_into(&mut rig, &b, VIEW.0, VIEW.1, 0x99);
+        let mut holder = layout_holder(&mut rig, DEMO_IDENTITY, TOKEN, "realm-b");
+
+        for step in every_arrangement() {
+            drive_arrangement(&mut rig, &mut holder, step);
+            let shown = rig.host.view.focused().cloned();
+            // Through the production entry point, not `seat_target` with a
+            // binding this test supplied: the whole claim is that the two
+            // cannot come apart, and asking a function for the answer you
+            // handed it proves nothing.
+            let reached = physical_seat_target(&rig.host.runtime.realms, &rig.host.view.scenes)
+                .map(|(realm_id, _)| realm_id.clone());
+            assert_eq!(
+                reached, shown,
+                "after `{step}` the realm the output shows and the realm the human's input \
+                 reaches are different realms; that split is focus theft in its sharpest \
+                 form and no verb set may produce it"
+            );
+        }
+        // ...and the holder really did move it: it holds a grant over
+        // realm-b, and realm-a is the first still-serving realm in id order,
+        // so a binding that never moved would still name realm-a.
+        assert_eq!(
+            rig.host.view.focused(),
+            Some(&b),
+            "the sweep's focus requests must have moved the output to the granted realm; \
+             `realm-a` sorts first, so this failing means nothing moved at all"
+        );
+        assert_ne!(a, b);
+    }
+
+    /// **D-018(2) invariant 4, as an invariant.** No arrangement puts an
+    /// agent principal's cursor into any principal's captured frame.
+    ///
+    /// D-019 made this invariant non-vacuous by compositing an agent's own
+    /// cursor at all; serving `layout_focus` makes it *purchasable-looking*,
+    /// because a holder now chooses which realm the sprite is drawn over
+    /// (D-019's WS-E.1.3 amendment: the sprite draws only for the realm on
+    /// the output). Two principals here, which is the shape the invariant is
+    /// about: one actuates in `realm-b` and drives the sprite, the other only
+    /// observes `realm-a`.
+    ///
+    /// **The sprite is proved live before anything is asserted about it.**
+    /// The first draft of this test set `set_agent_cursor` by hand and swept;
+    /// the very next `post_dispatch` cleared the offer, so every capture was
+    /// compared against a sprite that had never existed — a mutation that
+    /// leaked the sprite into captures still passed. What makes it real is
+    /// driving an actual `vitrin_actuator_pointer.move` over the wire and
+    /// asserting the presenter was *offered* a position, every round.
+    #[test]
+    fn no_arrangement_puts_an_agent_cursor_into_any_realms_capture() {
+        use vitrin_protocol::generated::vitrin_actuator_pointer::requests::Move;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rig, a, b) = two_realm_rig("layout-inv-cursor");
+        commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
+        commit_into(&mut rig, &b, VIEW.0 / 2, VIEW.1 / 2, 0x99);
+
+        // The actuating principal, holding everything, over realm-b.
+        let mut holder = layout_holder(&mut rig, DEMO_IDENTITY, TOKEN, "realm-b");
+        // A *different* principal that only watches realm-a. Its capture is
+        // the "another principal's captured frame" the invariant names.
+        let mut watcher = agent(&rig.socket);
+        send_preamble_as(&mut watcher, OTHER_IDENTITY, OTHER_TOKEN, "realm-a");
+        send_petition_for(&mut watcher, Verb::OBSERVE);
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(await_resolution(&mut watcher), Outcome::Granted);
+
+        // Focus first: the holder's actuation is refused unless the seat
+        // serves its realm (the chokepoint's step-5d stopgap), and the sprite
+        // is drawn only for the realm on the output (D-019, amended).
+        send_focus(&mut holder);
+        rig.pump(Duration::from_millis(300));
+        assert_eq!(rig.host.view.focused(), Some(&b));
+
+        // The bare truth each capture must keep equalling, in the wire's own
+        // pixel order (`capture::render_frame` converts; comparing a readback
+        // against a wire frame without this compares two encodings).
+        let bare_a = crate::capture::tests::xrgb_of(&rig.host.view.capture_view(&a));
+        let bare_b = crate::capture::tests::xrgb_of(&rig.host.view.capture_view(&b));
+        assert_ne!(
+            bare_a, bare_b,
+            "the two realms must differ, or this proves nothing"
+        );
+
+        for step in every_arrangement() {
+            // A real agent pointer move, over the wire, every round: this is
+            // what puts a sprite on the human-visible output at all.
+            rig.host.view.cursor_offered = None;
+            holder
+                .send_message(&Move { x: 7, y: 5 }.encode(7), None)
+                .expect("move");
+            rig.pump(Duration::from_millis(200));
+            assert_eq!(
+                rig.host.view.cursor_offered,
+                Some(Some((7.0, 5.0))),
+                "the presenter must have been offered a sprite position, or the assertions \
+                 below compare captures against a cursor that never existed"
+            );
+
+            drive_arrangement(&mut rig, &mut holder, step);
+
+            // Through the wire and the sealed memfd — the buffer that would
+            // actually be handed over SCM_RIGHTS, not a readback beside it.
+            // Diagnosed rather than dumped: two frames in an `assert_eq!`
+            // message is a wall of bytes nobody reads. The fact that matters
+            // is *which* byte moved.
+            let differs = |got: &[u8], want: &[u8]| {
+                got.iter()
+                    .zip(want)
+                    .position(|(g, w)| g != w)
+                    .map(|at| format!("first differing byte at {at} (pixel {})", at / 4))
+            };
+            assert_eq!(
+                differs(&capture_bytes(&mut rig, &mut watcher, 6), &bare_a),
+                None,
+                "after `{step}`, the watching principal's capture of realm-a is no longer \
+                 realm-a's own bare scene: an agent's cursor reached a captured frame"
+            );
+            assert_eq!(
+                differs(&capture_bytes(&mut rig, &mut holder, 6), &bare_b),
+                None,
+                "after `{step}`, the actuating principal's own capture of realm-b carries \
+                 its own cursor; the one cursor a capture may contain is the human's, and \
+                 only under observe_cursor"
+            );
+        }
+    }
+
+    /// **The fifth ordering rule, end to end over the wire.** A `layout_focus`
+    /// holder moves the output, and the human's own physical input moves with
+    /// it — never one without the other.
+    ///
+    /// Separate from the invariant sweep above because it asserts the
+    /// *direction* of the move rather than the equality: before the request
+    /// the output and the seat are both on `realm-a` (first in id order),
+    /// after it both are on the granted `realm-b`. A binding that moved with
+    /// a seat that did not is the exact defect, and it passes the equality
+    /// test's precondition trivially if nothing ever moves.
+    ///
+    /// **Real keystrokes, and the production entry point.** The first draft
+    /// of this test called `seat_target` directly and handed it the binding
+    /// itself, which asks a function for the answer it was given: a reviewer
+    /// reverted all three of the nested backend's own call sites to ignore
+    /// the binding and the whole suite stayed green. So this drives actual
+    /// physical key events through [`route_physical_turn`] — the same
+    /// function `NestedState::route_physical_inputs` calls, with the same
+    /// arguments — and reads out of the flight recorder **which realm's shim
+    /// they reached**. `seat_target` itself is now private to this module
+    /// precisely so no backend can supply a binding at all
+    /// ([`physical_seat_target`]).
+    #[test]
+    fn the_humans_input_follows_the_realm_a_focus_holder_bound() {
+        use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+
+        let _fd = crate::capture::tests::fd_lock();
+        // Both realms mint a seat here: a realm whose shim has no seat drops
+        // the event silently, which would make "it did not reach realm-b"
+        // true for a reason that has nothing to do with the binding.
+        let mut rig = Rig::new(
+            "layout-focus-seat",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let serve: &[&str] = &["--serve", "--seat"];
+        rig.start_realms(&[("realm-a", serve), ("realm-b", serve)]);
+        rig.pump(Duration::from_millis(400));
+        let (a, b) = (RealmId::new("realm-a"), RealmId::new("realm-b"));
+        commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
+        commit_into(&mut rig, &b, VIEW.0, VIEW.1, 0x99);
+        rig.pump_until(Duration::from_secs(5), |host| {
+            host.runtime
+                .realms
+                .values()
+                .filter_map(|r| r.server.as_ref())
+                .filter(|s| s.seat_minted())
+                .count()
+                == 2
+        });
+
+        let before = physical_seat_target(&rig.host.runtime.realms, &rig.host.view.scenes)
+            .map(|(realm_id, _)| realm_id.clone());
+        assert_eq!(
+            before,
+            Some(a.clone()),
+            "the session starts with the output and the seat on the first realm"
+        );
+
+        // One tap of a layout-invariant key, pressed and released so nothing
+        // is left held (the strand this test is not about).
+        let switch = std::cell::RefCell::new(crate::deadman::DeadManSwitch::new(
+            crate::deadman::DeadManConfig::default(),
+        ));
+        const EVDEV_A: u32 = 30;
+        const KEYSYM_A: u32 = 0x61;
+        let tap = |rig: &mut Rig| {
+            for state in [KeyState::Pressed, KeyState::Released] {
+                route_physical_turn(
+                    &mut rig.host.runtime,
+                    &rig.host.view.scenes,
+                    &switch,
+                    crate::input::physical_key(EVDEV_A, Some(KEYSYM_A), state),
+                    VIEW,
+                );
+            }
+        };
+        tap(&mut rig);
+
+        let mut holder = layout_holder(&mut rig, DEMO_IDENTITY, TOKEN, "realm-b");
+        send_focus(&mut holder);
+        rig.pump(Duration::from_millis(300));
+
+        assert_eq!(
+            rig.host.view.focused(),
+            Some(&b),
+            "the focus request must move the output to the granted realm"
+        );
+        assert_eq!(
+            physical_seat_target(&rig.host.runtime.realms, &rig.host.view.scenes)
+                .map(|(realm_id, _)| realm_id.clone()),
+            Some(b.clone()),
+            "and the human's own keyboard and pointer must move with it: a session that \
+             shows realm-b while typing into realm-a is the split layout_focus is one act \
+             in order to prevent"
+        );
+
+        // ...and the keystrokes really land there. Same tap, same function,
+        // the other side of the binding.
+        tap(&mut rig);
+
+        let entries = rig.entries();
+        let reached: Vec<String> = crate::recorder::tests::of_kind(&entries, "seat_delivered")
+            .into_iter()
+            .filter(|e| e.str("event") == "key" && e.str("origin") == "physical")
+            .map(|e| e.str("realm").to_string())
+            .collect();
+        assert_eq!(
+            reached,
+            vec![a.to_string(), a.to_string(), b.to_string(), b.to_string()],
+            "the human's own keys must reach realm-a while realm-a is on the output and \
+             realm-b afterwards — press and release each, in order. A run that shows four \
+             `realm-a` entries is the pre-WS-E.1.4 behaviour of typing into whichever realm \
+             sorts first, which is the fifth ordering rule violated end to end"
+        );
+    }
+
+    /// **D-018(4)'s single-holder rule.** A second principal petitioning for
+    /// `layout_arrange` while the verb is already spoken for — by a live
+    /// grant carrying it, or by a petition still pending for it — resolves
+    /// `layout_held`, and the flight recorder journals it.
+    #[test]
+    fn a_second_layout_arrange_petition_resolves_layout_held() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rig, _a, _b) = two_realm_rig("layout-held");
+        let _holder = layout_holder(&mut rig, DEMO_IDENTITY, TOKEN, "realm-a");
+
+        // A different principal asks for the same verb.
+        let mut second = agent(&rig.socket);
+        send_preamble_as(&mut second, OTHER_IDENTITY, OTHER_TOKEN, "realm-b");
+        send_petition_for(&mut second, Verb::LAYOUT_ARRANGE);
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(
+            await_resolution(&mut second),
+            Outcome::LayoutHeld,
+            "a second live layout_arrange holder must be refused layout_held, not busy \
+             (the consent-fatigue valve) and not granted"
+        );
+
+        // ...while the verb the rule says nothing about is still available to
+        // that same principal, so this refuses contention and not the
+        // principal.
+        let mut third = agent(&rig.socket);
+        send_preamble_as(&mut third, OTHER_IDENTITY, OTHER_TOKEN, "realm-b");
+        send_petition_for(&mut third, Verb::LAYOUT_FOCUS);
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(
+            await_resolution(&mut third),
+            Outcome::Granted,
+            "layout_focus carries no single-holder rule: focus is a momentary act, not a \
+             standing arrangement, and several principals may hold it"
+        );
+
+        let entries = rig.entries();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.str("kind") == "petition_resolved" && e.str("outcome") == "layout_held"),
+            "the run must journal the layout_held resolution; got outcomes {:?}",
+            entries
+                .iter()
+                .filter(|e| e.str("kind") == "petition_resolved")
+                .map(|e| e.str("outcome"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// **A layout request is attention-shaped, so it yields to the human.**
+    ///
+    /// Three cases, one per chokepoint gate WS-E.1.4 widened from "actuation
+    /// only" to "actuation and layout":
+    ///
+    /// - **(a) `preempted`** (step 5c) — the human's own hand is on the
+    ///   input, so a holder may not move the output out from under it.
+    /// - **(b) `consent_held`** (step 5b) — this principal's own consent
+    ///   prompt is up, so it may not arrange the screen around the very
+    ///   decision it is waiting on.
+    /// - **(c) `no_surface`** (step 5a) — the granted realm has no live view,
+    ///   so focusing it would bind the output to nothing and arranging it
+    ///   would have no geometry to arrange. D-022(6) makes this load-bearing
+    ///   for layout specifically, and the asymmetry with `realm_launch` —
+    ///   exempt, because a vacant realm is the state launch exists to *leave*
+    ///   — is the reason it is not a blanket rule.
+    ///
+    /// None of the three is invariant 3: the consent card is untouchable
+    /// whatever these gates do. They are the layer above, and both layers
+    /// exist. Each case names its refusal exactly, so a gate that stopped
+    /// firing fails here rather than silently admitting the request.
+    #[test]
+    fn a_layout_request_yields_to_the_humans_own_hand_and_to_its_own_prompt() {
+        use crate::input::SeatInputKind;
+        use vitrin_protocol::generated::vitrin_grant::{events::Refused, Refusal};
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "layout-yields",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let grab = rig.attach_grab();
+        // `realm-c` serves and never commits: case (c)'s realm with no live
+        // view. It is a third realm rather than realm-b uncommitted because
+        // cases (a) and (b) need a realm that *does* have one, or they would
+        // be refused `no_surface` before ever reaching the gate under test.
+        rig.start_realms(&[
+            ("realm-a", &["--serve", "--seat"]),
+            ("realm-b", &["--serve"]),
+            ("realm-c", &["--serve"]),
+        ]);
+        rig.pump(Duration::from_millis(400));
+        let b = RealmId::new("realm-b");
+        commit_into(&mut rig, &RealmId::new("realm-a"), VIEW.0, VIEW.1, 0x11);
+        commit_into(&mut rig, &b, VIEW.0, VIEW.1, 0x99);
+
+        let mut client = agent(&rig.socket);
+        send_preamble_as(&mut client, DEMO_IDENTITY, TOKEN, "realm-b");
+        send_petition_for(&mut client, max_verbs());
+        let petition = pump_until_armed(&mut rig, &grab);
+        grab.borrow_mut().queue_decision(Decision {
+            petition,
+            choice: Choice::Allow(PersistenceRung::WhileRunning),
+        });
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(await_resolution(&mut client), Outcome::Granted);
+        mint_layout_facets(&mut client);
+        rig.pump(Duration::from_millis(200));
+
+        // Bounded by a `sync` fence rather than by a read count: a `done`
+        // always comes back, so an *admitted* request — the thing a
+        // regression would produce — surfaces as `None` instead of a
+        // blocking read that hangs the suite.
+        //
+        // **A distinct cookie per call, and the fence is drained to it.** The
+        // three cases below share one connection, and a `done` left in the
+        // stream by an earlier case would end the next case's read on its
+        // first iteration and report `None` — an admitted request — for a
+        // request that was in fact refused. Matching the cookie is what makes
+        // each case's answer its own.
+        let cookie = std::cell::Cell::new(4242u32);
+        let next_refusal = |rig: &mut Rig, client: &mut Connection| -> Option<Refusal> {
+            let fence = cookie.get() + 1;
+            cookie.set(fence);
+            client
+                .send_message(
+                    &vitrin_handshake::requests::Sync { cookie: fence }.encode(HANDSHAKE_ID),
+                    None,
+                )
+                .expect("sync");
+            rig.pump(Duration::from_millis(300));
+            let mut found = None;
+            for _ in 0..256 {
+                let Ok(Some(msg)) = client.recv_message() else {
+                    break;
+                };
+                if msg.header.object_id == GRANT_ID && msg.header.opcode == Refused::OPCODE {
+                    let (_, e) = Refused::decode(&msg.bytes, msg.fd).expect("decode refused");
+                    found.get_or_insert(e.code);
+                    continue;
+                }
+                if msg.header.object_id == HANDSHAKE_ID
+                    && msg.header.opcode == vitrin_handshake::events::Done::OPCODE
+                {
+                    let (_, done) = vitrin_handshake::events::Done::decode(&msg.bytes, msg.fd)
+                        .expect("decode done");
+                    if done.cookie == fence {
+                        break;
+                    }
+                }
+            }
+            found
+        };
+
+        // (a) The human's own hand owns the target: a focus is preempted.
+        // Fed at the router's hook point, exactly as the backends feed it.
+        rig.host.runtime.kernel.presence.note(
+            vitrin_protocol::generated::vitrin_shim_seat::Origin::Physical,
+            &SeatInputKind::Motion { x: 1.0, y: 1.0 },
+            Instant::now(),
+        );
+        send_focus(&mut client);
+        assert_eq!(
+            next_refusal(&mut rig, &mut client),
+            Some(Refusal::Preempted),
+            "a focus request must yield to a hand already on the input: moving the output \
+             out from under a human mid-keystroke is the theft this verb is separately \
+             attenuable in order to bound"
+        );
+        assert_ne!(
+            rig.host.view.focused(),
+            Some(&b),
+            "and the refused request must not have moved anything"
+        );
+
+        // (b) This principal's own prompt is up: a layout request is refused
+        // `consent_held`. The presence fed above is let go stale first
+        // (`PHYSICAL_HOLD_WINDOW` is 500ms and step 5c runs *after* 5b), so
+        // this case is proved on its own gate rather than inheriting (a)'s.
+        rig.pump(Duration::from_millis(700));
+        assert!(
+            !rig.host.runtime.kernel.presence.owns_target(Instant::now()),
+            "fixture check: (a)'s physical presence must have gone stale, or this case \
+             would pass on the preemption gate and say nothing about 5b"
+        );
+        // A *second* petition from the same principal, left pending with its
+        // prompt on screen. `observe` rather than the layout verbs: this
+        // principal's first grant already holds `layout_arrange`, and
+        // D-018(4) would resolve a second one `layout_held` at admission
+        // without ever raising a prompt.
+        send_second_petition_for(&mut client, Verb::OBSERVE);
+        let pending = pump_until_armed(&mut rig, &grab);
+        let identity = rig
+            .host
+            .runtime
+            .conns
+            .values()
+            .find_map(|c| c.server.bound_identity())
+            .expect("the client is bound")
+            .clone();
+        assert!(
+            rig.host.runtime.kernel.petitions.prompt_up_for(&identity),
+            "fixture check: the prompt for petition {pending:?} must be up for THIS \
+             principal, which is the fact step 5b reads"
+        );
+        send_focus(&mut client);
+        assert_eq!(
+            next_refusal(&mut rig, &mut client),
+            Some(Refusal::ConsentHeld),
+            "a layout request must yield to this principal's own pending prompt: a \
+             principal that could move the output away from the card it is waiting on — or \
+             fullscreen a realm over it — would be arranging the very decision it is \
+             waiting on"
+        );
+        // ...and `set_fullscreen` meets it too: both layout requests are
+        // attention-shaped, not just the one that moves the output.
+        send_set_fullscreen(
+            &mut client,
+            vitrin_protocol::generated::vitrin_layout_arrange::Mode::Fullscreen,
+        );
+        assert_eq!(
+            next_refusal(&mut rig, &mut client),
+            Some(Refusal::ConsentHeld),
+            "set_fullscreen is attention-shaped on exactly the same terms focus is"
+        );
+        assert_ne!(
+            rig.host.view.focused(),
+            Some(&b),
+            "and neither refused request moved anything"
+        );
+        // Let the prompt go so it cannot leak into case (c) as a global
+        // condition (it is per principal, and this proves it by clearing it).
+        grab.borrow_mut().queue_decision(Decision {
+            petition: pending,
+            choice: Choice::Deny,
+        });
+        rig.pump(Duration::from_millis(400));
+
+        // (c) The granted realm has no live view: `no_surface`. A different
+        // principal, over `realm-c`, which serves and has committed nothing.
+        let mut watcher = agent(&rig.socket);
+        send_preamble_as(&mut watcher, OTHER_IDENTITY, OTHER_TOKEN, "realm-c");
+        send_petition_for(&mut watcher, Verb::LAYOUT_FOCUS);
+        let petition = pump_until_armed(&mut rig, &grab);
+        grab.borrow_mut().queue_decision(Decision {
+            petition,
+            choice: Choice::Allow(PersistenceRung::WhileRunning),
+        });
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(
+            await_resolution(&mut watcher),
+            Outcome::Granted,
+            "fixture check: the grant must be real, or `not_granted` would mask the gate"
+        );
+        mint_layout_facets(&mut watcher);
+        send_focus(&mut watcher);
+        assert_eq!(
+            next_refusal(&mut rig, &mut watcher),
+            Some(Refusal::NoSurface),
+            "focusing a realm with no live view would bind the output to nothing, which is \
+             a successful-looking answer to a request that did nothing (D-022(6))"
+        );
+        assert_ne!(
+            rig.host.view.focused(),
+            Some(&RealmId::new("realm-c")),
+            "and the refused focus must not have bound the output to the vacant realm"
+        );
+    }
+
+    /// **A denied layout petition confers nothing, and says so recoverably.**
+    /// The human says no; the facet is still mintable (mint-freely-and-
+    /// check-at-use) and its first use refuses `not_granted` without killing
+    /// the connection.
+    #[test]
+    fn a_denied_layout_focus_grant_refuses_not_granted_on_use() {
+        use vitrin_protocol::generated::vitrin_grant::{events::Refused, Refusal};
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "layout-denied",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let grab = rig.attach_grab();
+        rig.start_realms(&[("realm-a", &["--serve", "--seat"])]);
+        rig.pump(Duration::from_millis(400));
+
+        let mut client = agent(&rig.socket);
+        send_preamble_as(&mut client, DEMO_IDENTITY, TOKEN, "realm-a");
+        send_petition_for(&mut client, Verb::LAYOUT_FOCUS);
+        let petition = pump_until_armed(&mut rig, &grab);
+        grab.borrow_mut().queue_decision(Decision {
+            petition,
+            choice: Choice::Deny,
+        });
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(await_resolution(&mut client), Outcome::Denied);
+
+        // The mint is still legal — refusing it would turn a structural mint
+        // into an authority oracle.
+        mint_layout_facets(&mut client);
+        send_focus(&mut client);
+        rig.pump(Duration::from_millis(300));
+
+        let mut refusal = None;
+        for _ in 0..32 {
+            let Ok(Some(msg)) = client.recv_message() else {
+                break;
+            };
+            if msg.header.object_id == GRANT_ID && msg.header.opcode == Refused::OPCODE {
+                let (_, event) = Refused::decode(&msg.bytes, msg.fd).expect("decode refused");
+                refusal = Some(event);
+                break;
+            }
+        }
+        let refusal = refusal.expect("a use of a denied grant must be refused, not ignored");
+        assert_eq!(refusal.verb, Verb::LAYOUT_FOCUS);
+        assert_eq!(
+            refusal.code,
+            Refusal::NotGranted,
+            "a denied petition's facet refuses not_granted"
+        );
+        // ...and the connection is alive: a refusal is an answer.
+        send_focus(&mut client);
+        rig.pump(Duration::from_millis(200));
+        assert!(
+            rig.host.runtime.conns.len() == 1,
+            "a recoverable refusal must never kill the connection"
+        );
+    }
+
+    /// **`set_fullscreen` really re-configures the realm, and windowed really
+    /// does not.** The two modes are indistinguishable while the output's
+    /// size and the realm's size are equal (the IDL says so in as many
+    /// words), so this drives the one thing that separates them: an output
+    /// resize under the realm.
+    #[test]
+    fn set_fullscreen_reconfigures_the_realm_across_an_output_resize() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rig, a, _b) = two_realm_rig("layout-fullscreen");
+        // The realm must have a live view: `set_fullscreen` is refused
+        // `no_surface` on a realm that has committed nothing, because an app
+        // that has painted nothing has neither an own size to keep nor a
+        // buffer to fill the output with (decision 6).
+        commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
+        let mut holder = layout_holder(&mut rig, DEMO_IDENTITY, TOKEN, "realm-a");
+        assert_eq!(
+            rig.realm("realm-a")
+                .server
+                .as_ref()
+                .expect("serving")
+                .configured_size(),
+            VIEW,
+            "a realm is spawned configured to the output's size"
+        );
+
+        // Windowed first: the core imposes no size, so nothing is sent even
+        // though the output has moved out from under the realm.
+        send_set_fullscreen(
+            &mut holder,
+            vitrin_protocol::generated::vitrin_layout_arrange::Mode::Windowed,
+        );
+        rig.pump(Duration::from_millis(200));
+        let bigger = (VIEW.0 * 2, VIEW.1 + 8);
+        apply_output_resize(&mut rig.host, bigger);
+        send_set_fullscreen(
+            &mut holder,
+            vitrin_protocol::generated::vitrin_layout_arrange::Mode::Windowed,
+        );
+        rig.pump(Duration::from_millis(200));
+        assert_eq!(
+            rig.realm("realm-a")
+                .server
+                .as_ref()
+                .expect("serving")
+                .configured_size(),
+            VIEW,
+            "windowed must impose no size: the realm keeps the one it had and the \
+             compositor letterboxes it"
+        );
+
+        // Fullscreen: the realm's view size now tracks the output's.
+        send_set_fullscreen(
+            &mut holder,
+            vitrin_protocol::generated::vitrin_layout_arrange::Mode::Fullscreen,
+        );
+        rig.pump(Duration::from_millis(300));
+        assert_eq!(
+            rig.realm("realm-a")
+                .server
+                .as_ref()
+                .expect("serving")
+                .configured_size(),
+            bigger,
+            "fullscreen must re-send configure at the output's size — the IDL's \
+             'may be re-sent when the view resizes', finally exercised"
+        );
+    }
+
+    /// **Fullscreen *tracks* the output across a later resize; windowed does
+    /// not.** The second half of `set_fullscreen`'s normative wire semantics:
+    /// `configure` carries the output's size on entering the mode "and again
+    /// whenever the output resizes while the realm is in it".
+    ///
+    /// Entering the mode was already covered
+    /// ([`set_fullscreen_reconfigures_the_realm_across_an_output_resize`]);
+    /// the "and again" was a claim four surfaces made and no code kept, with
+    /// [`RealmRuntime::arrangement`] written and never read. So this drives
+    /// **one** resize with the two realms in **different** arrangements and
+    /// asserts exactly one of them moved — a reconfigure loop that ignored
+    /// the arrangement and a reconfigure loop that did not exist both fail,
+    /// in opposite directions.
+    ///
+    /// The resize goes through [`apply_output_resize`], which is the same
+    /// call the nested backend's `Resized` handler makes and the only way to
+    /// move this rig's output size at all.
+    #[test]
+    fn an_output_resize_reconfigures_every_fullscreen_realm_and_no_windowed_one() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rig, a, b) = two_realm_rig("layout-resize-tracks");
+        commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
+        commit_into(&mut rig, &b, VIEW.0, VIEW.1, 0x99);
+
+        // Both realms are spawned configured to the output's size and both
+        // are born fullscreen (`start_realm_in` told each shim that size, so
+        // the field is not a guess). One holder takes realm-a out of it —
+        // and only one holder exists, because D-018(4) allows exactly one
+        // live `layout_arrange` grant per output.
+        let mut holder = layout_holder(&mut rig, DEMO_IDENTITY, TOKEN, "realm-a");
+        send_set_fullscreen(
+            &mut holder,
+            vitrin_protocol::generated::vitrin_layout_arrange::Mode::Windowed,
+        );
+        rig.pump(Duration::from_millis(200));
+        assert_eq!(
+            (
+                rig.realm("realm-a").arrangement,
+                rig.realm("realm-b").arrangement
+            ),
+            (LayoutMode::Windowed, LayoutMode::Fullscreen),
+            "fixture check: the two realms must be in different arrangements, or this \
+             test cannot tell a loop that respects the arrangement from one that does not"
+        );
+
+        let bigger = (VIEW.0 + 64, VIEW.1 + 32);
+        assert_ne!(
+            bigger, VIEW,
+            "fixture check: the resize must move something"
+        );
+        apply_output_resize(&mut rig.host, bigger);
+        rig.pump(Duration::from_millis(200));
+
+        assert_eq!(
+            rig.realm("realm-b")
+                .server
+                .as_ref()
+                .expect("serving")
+                .configured_size(),
+            bigger,
+            "a realm in the fullscreen arrangement must be re-configured at the output's \
+             new size: that is what 'the view size tracks the output's' means, and it is \
+             stated as normative wire semantics in the IDL, on prose page 18, in \
+             `ShimServer::reconfigure`'s own docs and in D-022(4)"
+        );
+        assert_eq!(
+            rig.realm("realm-a")
+                .server
+                .as_ref()
+                .expect("serving")
+                .configured_size(),
+            VIEW,
+            "a windowed realm must be left alone: the core imposes no size on it, so the \
+             resize is exactly the moment the two modes stop being indistinguishable"
+        );
+    }
+
+    /// **A focus change does not strand a key the losing app is holding.**
+    ///
+    /// The same class of defect WS-E.1.2 fixed one layer down — a sibling
+    /// realm's death resetting the shared router and latching a key in the
+    /// survivor — reintroduced by making the *target* movable. `bind_to`
+    /// clears the pairing table without emitting anything, so before this
+    /// the app that lost the output kept the key down forever, with no
+    /// release it could ever receive: `seat_target` no longer names it.
+    ///
+    /// Driven the whole way: a real physical key press through the router
+    /// (so the pairing table is written by the code that writes it in
+    /// production), a real `focus` over the wire from a real grant, and the
+    /// release read back out of the flight recorder, where it must be
+    /// journaled against the **losing** realm.
+    #[test]
+    fn a_focus_change_releases_what_the_losing_realm_was_holding() {
+        use vitrin_protocol::generated::vitrin_shim_seat::{KeyState, Origin};
+
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rig, a, b) = two_realm_rig("layout-focus-strand");
+        commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
+        commit_into(&mut rig, &b, VIEW.0, VIEW.1, 0x99);
+        // Only realm-a's mock shim mints a seat (`--seat`), and it is the
+        // realm the output starts bound to — so the press below is delivered
+        // and journaled, which is the precondition the assertions rest on.
+        rig.pump_until(Duration::from_secs(5), |host| {
+            host.runtime
+                .realms
+                .get(&RealmId::new("realm-a"))
+                .and_then(|r| r.server.as_ref())
+                .is_some_and(|s| s.seat_minted())
+        });
+
+        // The human holds a key down in the realm on the output, through the
+        // production physical path: `input::physical_key` is the very
+        // function the nested backend's own keyboard pump calls (#118), and
+        // it is the only way to mint a physical-tagged event at all — the
+        // constructor is private to `crate::input` precisely so a
+        // physical-origin masquerade is a compile error (B2).
+        const EVDEV_LEFTCTRL: u32 = 29;
+        const KEYSYM_CONTROL_L: u32 = 0xFFE3;
+        let switch = std::cell::RefCell::new(crate::deadman::DeadManSwitch::new(
+            crate::deadman::DeadManConfig::default(),
+        ));
+        route_physical_turn(
+            &mut rig.host.runtime,
+            &rig.host.view.scenes,
+            &switch,
+            crate::input::physical_key(EVDEV_LEFTCTRL, Some(KEYSYM_CONTROL_L), KeyState::Pressed),
+            VIEW,
+        );
+        assert_eq!(
+            rig.host.runtime.router.held_keys(),
+            [(KEYSYM_CONTROL_L, Origin::Physical)],
+            "fixture check: the router must believe realm-a's app is holding the key, or \
+             there is nothing for the focus change to strand"
+        );
+
+        // A holder over the *other* realm moves the output.
+        let mut holder = layout_holder(&mut rig, DEMO_IDENTITY, TOKEN, "realm-b");
+        send_focus(&mut holder);
+        rig.pump(Duration::from_millis(300));
+        assert_eq!(
+            rig.host.view.focused(),
+            Some(&b),
+            "fixture check: the focus request must have moved the output"
+        );
+        assert!(
+            rig.host.runtime.router.held_keys().is_empty(),
+            "the router must not still believe a key is held: the table it kept was \
+             realm-a's, and the binding has left realm-a"
+        );
+
+        // The journal records delivery *shape* only — never the key state,
+        // because an entry that said "press" or "release" would be one field
+        // away from a keylogger — so the release is counted rather than
+        // named: realm-a saw two key events, the press and the release it is
+        // owed. Without the drain there is exactly one.
+        let entries = rig.entries();
+        let keys: Vec<_> = crate::recorder::tests::of_kind(&entries, "seat_delivered")
+            .into_iter()
+            .filter(|e| e.str("event") == "key")
+            .map(|e| (e.str("realm").to_string(), e.str("origin").to_string()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (a.to_string(), "physical".to_string()),
+                (a.to_string(), "physical".to_string()),
+            ],
+            "realm-a must have seen its press AND its release, and realm-b neither: the \
+             release is owed to the app that was TOLD about the press, never to the realm \
+             gaining the output, which never saw it go down. The tag is read back off the \
+             pairing table's entry, never minted (B2)."
+        );
+        assert_ne!(a, b);
     }
 }

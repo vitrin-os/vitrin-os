@@ -7,11 +7,20 @@ Where this page and the IDL (`protocol/vitrin-v0.xml`) disagree, **the IDL
 wins** — its `<description>` text is the source of truth and this page
 restates it.
 
-Two wire versions exist. Version 2 appends exactly three things — the
-`realm_launch` verb bit, the structural mint `vitrin_grant.get_launcher`, and
-the [`vitrin_launcher`](16-vitrin_launcher.md) interface it mints — and
-changes nothing else: every version-1 signature is byte-identical at version
-2. Statements below that say "version 1" are statements about version 1 and
+Two wire versions exist. Version 2 appends, and changes nothing else — every
+version-1 signature is byte-identical at version 2:
+
+- the `realm_launch` verb bit, the structural mint
+  `vitrin_grant.get_launcher`, and the
+  [`vitrin_launcher`](16-vitrin_launcher.md) interface it mints;
+- the structural mints `vitrin_grant.get_layout_focus` and
+  `vitrin_grant.get_layout_arrange`, and the two interfaces they mint —
+  [`vitrin_layout_focus`](17-vitrin_layout_focus.md) and
+  [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md) — through which the
+  already-allocated `layout_focus` and `layout_arrange` verbs are exercised;
+- the `layout_held` entry on `vitrin_grant.outcome`.
+
+Statements below that say "version 1" are statements about version 1 and
 stay accurate; where version 2 differs, it is named.
 
 The words MUST, MUST NOT, SHOULD, and MAY are used in the RFC 2119 sense.
@@ -30,6 +39,8 @@ Interface pages:
 - [10 — vitrin_shim_surface](10-vitrin_shim_surface.md)
 - [11 — vitrin_shim_seat](11-vitrin_shim_seat.md)
 - [16 — vitrin_launcher](16-vitrin_launcher.md) *(since version 2)*
+- [17 — vitrin_layout_focus](17-vitrin_layout_focus.md) *(since version 2)*
+- [18 — vitrin_layout_arrange](18-vitrin_layout_arrange.md) *(since version 2)*
 
 The gap from 11 to 16 is deliberate: pages 12–15 are allocated to interfaces
 that have not landed yet (`docs/plan/02-phase-2-semantic-epochs.md` §5), and
@@ -143,38 +154,63 @@ enforces these invariants unconditionally:
 4. no **agent** principal's cursor is composited into another principal's
    captured frame — the one cursor a capture may ever contain is the human
    principal's, and only for a grant holding `observe_cursor`, which is the
-   single carve-out and is itself grant-governed rather than free.
+   single carve-out and is itself grant-governed rather than free;
+5. the **human's own physical input** reaches only the realm the output is
+   bound to.
 
-**Their standing today, stated rather than implied** (D-018 costs; this
-paragraph is the honest reading of "unconditionally", and the two must be read
-together). Invariant 1 holds and is exercised: the overlay composites at the
-output stage, structurally above the scene the capture is taken from, and
-`backend/headless.rs`'s
-`a_prompt_reaches_human_visible_output_but_never_a_capture` asserts exactly
-that — the trust band's colour at pixel (0,0) of the human-visible output where
-the capture at the same pixel still holds realm content, the consent card
-verbatim in the output, and the capture byte-identical to the bare scene
-compose. Invariant 4 **is no longer vacuous** (D-019): the core now composites
-an agent principal's own cursor, so there is something the rule can be violated
-by. What enforces it is *where* the sprite is drawn — at the output stage,
-downstream of the `Scene::compose` every capture is taken from, so a capture
-cannot carry it by construction rather than by a checked flag — and a test does
-exist for exactly that: `backend/headless.rs`'s
-`the_agent_cursor_reaches_human_visible_output_but_never_a_capture`, which
-asserts the sprite really is on the human-visible framebuffer at the agent's
-own position, that the realm view is unchanged to the byte, and that no sprite
-pixel survives into the frame a `capture_frame` would seal into a memfd. Two
-limits stated rather than left to be found: that test is a **component** test
-against composited pixels in-process, not a mock-free integration gate, and it
-proves the *core* excludes the sprite from a capture — it does not exercise a
-second agent trying to obtain the first's cursor, because agent-to-agent
-observation has no wire surface to try it through (no agent can name another's
-grant), so that half remains unpurchasable by construction rather than by test.
-Invariant 2 still holds **vacuously**: no client can state a stacking order.
-Invariant 3 has nothing to be true of, because there is no arrangement
-mechanism. **None of the four is tested *as an invariant*** — against a client
-trying to violate it — and none can be until something outside the core can
-arrange realms. That test is E3's, and D-018 is the reason it must exist.
+Rule 5 joined the set when `layout_focus` became servable, and it is the
+reason that verb is **one act**. Splitting "which realm is shown" from "which
+realm receives the human's keys", in a scene that shows one realm at a time,
+would let a holder make a human type into a realm they cannot see. An agent's
+*injected* input is not governed by this rule: it is addressed to the realm
+its own grant names and carries the `emulated` origin tag. (D-018(2)
+enumerated four; this fifth is appended by a superseding decision-log entry
+rather than by editing that one.)
+
+**Their standing today, stated rather than implied.** D-018's cost note said
+of these rules that "none of the four is tested *as an invariant* against a
+client trying to violate it, and none can be until something outside the core
+can arrange realms". Serving the layout verbs is that moment, and the tests
+now exist. Each drives a real client over a real socket, holding **every verb
+the reference core serves**, through the whole production path
+(`request_grant` → consent → `get_layout_*` → `focus`/`set_fullscreen` → the
+enforcement chokepoint → the presenter), and sweeps the *entire* arrangement
+space those two verbs can express — which is finite and small precisely
+because `layout_arrange` defines one request. A property proved at the maximum
+verb set is a property of *no grant*, not of the grant a test happened to
+construct.
+
+- **Invariant 1 and 3** — `session.rs`'s
+  `no_arrangement_at_the_maximum_verb_set_can_touch_the_consent_card`: with
+  another principal's prompt on screen, every arrangement leaves the trust
+  band's colour at pixel (0,0) and the consent card byte-identical, row by
+  row, to an independently rasterized card. What enforces it is *where* the
+  overlay composites — at the output stage, downstream of the scene an
+  arrangement selects — so it is structural rather than a check on the way
+  past. Still also exercised on real backend pixels by `backend/headless.rs`'s
+  `a_prompt_reaches_human_visible_output_but_never_a_capture`.
+- **Invariant 2** — `the_core_not_the_client_decides_which_surface_input_reaches`,
+  in two halves. There is no stacking to claim: neither served facet defines
+  any request beyond the one it ships, and the test pins that, so a `place` or
+  `raise` appended before the scene can honour it turns red. And what a holder
+  *can* move, it moves wholly: across the sweep, the realm the output shows and
+  the realm the human's input reaches are never two different realms.
+- **Invariant 4** — `no_arrangement_puts_an_agent_cursor_into_any_realms_capture`:
+  one principal actuates (driving a real cursor sprite through a real
+  `vitrin_actuator_pointer.move`), a *second* principal observes another
+  realm, and across the sweep both principals' captures — read back from the
+  sealed memfd, not from a readback beside it — stay byte-identical to their
+  own bare scene. What enforces it is that the sprite is composited at the
+  output stage (D-019(3)); the test is what stops that drifting.
+- **Invariant 5** — `the_humans_input_follows_the_realm_a_focus_holder_bound`:
+  before the request the output and the seat are both on the first realm,
+  after it both are on the granted one.
+
+Two limits stated rather than left to be found. These are **component** tests
+against a real socket and real forked shims in-process, not mock-free
+integration gates; and invariant 4's agent→agent half remains unpurchasable
+*by construction* rather than by test, because agent-to-agent observation has
+no wire surface to try it through — no agent can name another's grant.
 
 The shell gets *arrangement*; the core keeps *ordering*. Read the ordinary
 window-manager verbs as authority rather than decoration and the reason is
@@ -184,6 +220,19 @@ the whole session. Invariants 1–3 are what make those attack primitives
 unpurchasable, which is also why `raise`, `move`, `resize`, and `fullscreen`
 are **not** separate verbs — with ordering held by the core, splitting them
 further would be attenuation theatre.
+
+**What `layout_arrange` actually says, and what it deliberately cannot.** The
+two verbs are served through two facets,
+[`vitrin_layout_focus`](17-vitrin_layout_focus.md) and
+[`vitrin_layout_arrange`](18-vitrin_layout_arrange.md), and between them they
+define exactly two requests: `focus` and `set_fullscreen`. There is **no**
+`place`, `resize`, `raise` or stacking request at all — not a request that
+refuses, but no request. A scene that shows one realm at a time, unstacked and
+unoverlapped, cannot honour them, and a granted verb whose requests the server
+cannot carry out is the "a deployment MUST NOT grant a verb it does not
+enforce" rule turned inside out. Growth arrives when the scene can honour it,
+as `since`-gated siblings, never as a request that silently does less than its
+name.
 
 **Cursors.** Each principal has exactly one virtual pointer per realm it holds
 pointer authority over, and
@@ -200,8 +249,13 @@ verb set, agent→human is closed by default and opens only through that verb,
 which is meaningful only alongside `observe`. See
 [`vitrin_view`](06-vitrin_view.md#what-a-capture-does-not-contain).
 
-**What version 1 actually does.** It serves neither layout verb (it has no
-window manager). It **does** composite an agent principal's own cursor, and
+**What a deployment actually serves.** Whether a defined verb is served is a
+property of the deployment, not of the wire: a client must read `unsupported`
+as *"not here, not now"*, never as *"not in this protocol"*. The reference
+core serves both layout verbs as of WS-E.1.4 — each has a facet interface, an
+enforcement-chokepoint arm and consent-prompt copy — and still refuses
+`observe_cursor`, because per-principal cursor *delivery* does not exist
+(D-017, D-019). It **does** composite an agent principal's own cursor, and
 only into human-visible output — never into a captured frame — at the same
 output stage as the consent overlay and the trust indicator; nested mode draws
 it always, and `--headless --agent-cursor` on request (the headless
@@ -210,14 +264,14 @@ view by the trusted-band witness). No *human* cursor is composited: in nested
 operation the host desktop draws it, outside the realm view entirely. Delivery
 is a separate thing from drawing, and delivery has not changed: version 1 still
 delivers **one shared pointer position** per realm view to the shim, and
-per-principal delivery stays deferred to M2 (D-017, D-019). All three of the
-verbs this section governs — `observe_cursor`, `layout_arrange`,
-`layout_focus` — are defined on the wire and refused `unsupported`. They are
-not the whole unserved set: version 2's `realm_launch` takes the same staged
-posture for a different question, which is why
-[§ defined but unserved](04-vitrin_grant.md#defined-but-unserved) lists four
-verbs rather than these three. See it for why defining a verb early is
-structural rather than cosmetic.
+per-principal delivery stays deferred to M2 (D-017, D-019). Of the three verbs this section governs, `layout_arrange` and `layout_focus`
+are **servable** — each has a facet interface, and the reference core serves
+both — while `observe_cursor` is refused `unsupported` by every deployment,
+because the delivery it would widen a capture with does not exist.
+`realm_launch` takes the same staged posture for a different question. See
+[§ defined but unserved](04-vitrin_grant.md#defined-but-unserved) for why
+defining a verb before serving it is structural rather than cosmetic, and for
+why "unserved" is a statement about a deployment rather than about the wire.
 
 ---
 
@@ -463,7 +517,8 @@ narrower than requested); on any other outcome they are zero.
 the single enforcement chokepoint, covering capture, actuation and launch
 alike. `retry_after_ms` is greater than zero only for `rate_limited`.
 Which codes a given use can draw is not uniform: `preempted` and
-`consent_held` are actuation-only, `capacity` is launch-only, and a launch is
+`consent_held` are attention-shaped (actuation and the layout verbs),
+`capacity` is launch-only, and a launch is
 never refused `no_surface` (a vacant realm is the state `realm_launch` exists
 to leave). The single voice is the invariant; the applicable set is per-verb
 and is stated on each facet's page.
@@ -788,10 +843,19 @@ location to keep in sync.
 The `@verb` value set is **closed by the schema**, so widening it is a
 **dialect** change: `protocol/vitrin-v0.rng` moves in the same commit as the
 IDL, and `xmllint --relaxng` gates the pair. The set tracks the
-*facet-bearing* verbs, not the whole `verb` bitfield — `observe_cursor`,
-`layout_arrange` and `layout_focus` have no interface to annotate, so naming
-one here is rejected by the schema (`protocol/test-mutations.sh` covers both
-directions: an invented verb name and a real-but-facetless one).
+*facet-bearing* verbs, not the whole `verb` bitfield — `observe_cursor` has no
+interface to annotate, because it widens what `capture_frame` composites
+rather than adding a request, so naming it here is rejected by the schema
+(`protocol/test-mutations.sh` covers both directions: an invented verb name
+and a real-but-facetless one).
+
+`layout_arrange` and `layout_focus` were in that facetless list until they
+gained one each. They are **two** interfaces rather than one, and this
+attribute is why: `@verb` is one value per interface, so a single combined
+layout facet could name only one of them and the other's requests would reach
+the chokepoint with no verb to check them against. D-018(3) requires the two
+to be independently attenuable, and one attribute per interface is how the
+dialect makes that structural rather than conventional.
 
 ### 8.3 Scanner lints
 
@@ -836,7 +900,7 @@ record of *how* it arrived, which is what a later seam copies.
 | drag intents | new `since="2"` sibling requests on `vitrin_actuator_pointer` | intent-level motion (drag with duration/easing, interpolated server-side) is added beside `move`/`button`/`scroll`, which stay valid forever |
 | `actuate_key` verb | new appended entry in the `verb` bitfield + a later key-actuation facet | version-0 verb bits are untouched; a new power-of-two bit and its facet are additive — see the landed `realm_launch` row for the shape, including that the bit's *value* comes from the repo-wide allocation registry rather than from the next unused-looking power of two |
 | serving `observe_cursor` | no new message: the verb bit already exists and widens what the *existing* `frame_ready` composites for a grant that holds it | version 0 refuses the verb `unsupported`, so beginning to serve it changes no signature and no version-0 client's behavior (a client that never petitions for it sees nothing new) |
-| layout facet | new `since="2"` structural mint on `vitrin_grant` (`get_layout`), exercising the already-defined `layout_arrange`/`layout_focus` bits | `request_grant`'s five `new_id` arguments are frozen, so the facet cannot be co-minted; a mint on the grant follows the existing structural-mint class (no terminal event, not refusable) and the verbs are refused `unsupported` until it lands |
+| ~~layout facet~~ **(landed, version 2)** | **two** `since="2"` structural mints on `vitrin_grant` — `get_layout_focus` and `get_layout_arrange` — minting [`vitrin_layout_focus`](17-vitrin_layout_focus.md) and [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md) | `request_grant`'s five `new_id` arguments are frozen, so neither facet could be co-minted. This row said "a layout facet" singular and **understated the seam**: `@verb` is one value per interface, so one facet could declare only one of the two verbs, and D-018(3) requires them independently attenuable. Corrected here rather than silently, because the row was the record |
 | per-principal pointer delivery | new `since="2"` sibling events on `vitrin_shim_seat` that name the principal alongside the coordinates | `motion`/`button`/`scroll` signatures are immutable, so delivery grows by sibling; each new event still ends with `origin`, satisfying B2 structurally, and a v0-only shim keeps working |
 | IME physical text | reuse of the existing `origin` tag on `vitrin_shim_seat.text` | human input-method text arrives as `text` with `origin=physical`; the origin tag exists from day one, so the new source is additive with no signature change |
 
@@ -866,7 +930,9 @@ named here so their absence is understood as a decision, not an omission:
   client can know without being told. Realm *creation* is on the wire as the
   `realm_launch` verb and the [`vitrin_launcher`](16-vitrin_launcher.md)
   facet, but **no deployment serves it yet**: the verb is admitted and refused
-  `unsupported`, exactly as `observe_cursor` and the layout verbs are. What is
+  `unsupported`, exactly as `observe_cursor` is. (The layout verbs were in that
+  same position until version 2 served them — which is why "unserved" is a
+  statement about a deployment rather than about the wire.) What is
   decided now, and would otherwise be unstateable, is the *shape* — launch is
   an attenuable grant verb rather than a request on the realm handle, and the
   program name is never on the wire. **Stopping** a realm is not expressible at
@@ -874,12 +940,15 @@ named here so their absence is understood as a decision, not an omission:
 - **Powerbox** — no system-mediated resource picker; petitions name resources
   by a type-prefixed string vocabulary.
 - **Wallet** — no credential/secret storage or presentation verb.
-- **Layout** — the core has no window manager, and version 0 serves neither
-  `layout_arrange` nor `layout_focus`; both are defined on the wire and refused
-  `unsupported` (§1.4, D-018). What is *not* deferred is the posture: layout is
-  authority, not decoration, and the ordering invariants bind the core from day
-  one — though only the first has anything to bind *against* today, and none is
-  yet tested as an invariant (§1.4, "their standing today").
+- **Layout** — version 2 serves `layout_arrange` and `layout_focus` through
+  two facets, and what stays deferred is everything the scene cannot honour:
+  there is no `place`, `resize`, `raise` or stacking request, and the core
+  still has no window manager (the shell that arranges realms is a client). A
+  deployment that serves neither verb refuses both `unsupported`, which is a
+  property of that deployment (§1.4, D-018). The posture was never deferred —
+  layout is authority, not decoration — and the ordering invariants are now
+  **tested as invariants** against a client holding every served verb (§1.4,
+  "their standing today").
 - **Per-principal cursor delivery** — version 0 delivers one shared pointer
   position per realm view; per-principal **delivery** is deferred to M2 and
   arrives as sibling `vitrin_shim_seat` events (§1.4, D-017). What is *not*

@@ -14,10 +14,15 @@ import enum
 
 # protocol/@version — the wire version integer offered in hello. The "v0"
 # in the document family's name is the spec generation; the wire integer
-# starts at 1 (the schema forbids 0) and is 2 today. Version 2 appends the
-# realm_launch verb, vitrin_grant.get_launcher and the vitrin_launcher
-# interface; every version-1 signature is byte-identical at version 2, so
-# this SDK offering 2 changes nothing about the messages it already sends.
+# starts at 1 (the schema forbids 0) and is 2 today. Version 2 appends, in
+# full: the realm_launch verb; the three structural mints on vitrin_grant
+# (get_launcher, get_layout_focus, get_layout_arrange); the three interfaces
+# they mint (vitrin_launcher, vitrin_layout_focus, vitrin_layout_arrange)
+# with their requests launch/launched, focus and set_fullscreen; the
+# vitrin_layout_arrange.mode enum; the capacity refusal code; and the
+# layout_held outcome. Every version-1 signature is byte-identical at
+# version 2, so this SDK offering 2 changes nothing about the messages it
+# already sends — it only widens what it can send and must decode.
 PROTOCOL_VERSION = 2
 
 # --- object-id ranges (conventions section 3) ------------------------------
@@ -56,12 +61,15 @@ class ErrorCode(enum.IntEnum):
 class Verb(enum.IntFlag):
     """vitrin_grant.verb — the grantable verb bitfield.
 
-    The last four are *defined but unserved*: the IDL defines them ahead of
-    the core serving them and refuses them "unsupported". That distinction
-    is the whole reason they are here. An out-of-range bit is fatal
+    Every bit here is *defined on the wire*. Whether a given bit is **served**
+    is a property of the deployment, not of the protocol: the IDL defines a
+    verb ahead of anyone serving it, and a deployment that does not serve one
+    refuses the petition "unsupported". That distinction is the whole reason
+    the unserved bits are here. An out-of-range bit is fatal
     "invalid_argument" and kills the connection, so an SDK that omitted them
     would turn a recoverable refusal into a dead socket for any client that
-    petitioned one.
+    petitioned one. Read "unsupported" as "not here, not now", never as "not
+    in this protocol".
 
     The 64/128/256 gap is deliberate and must not be filled by guesswork:
     those bits are allocated repo-wide to verbs the IDL does not define yet,
@@ -72,9 +80,9 @@ class Verb(enum.IntFlag):
     OBSERVE = 1
     ACTUATE_POINTER = 2
     ACTUATE_TEXT = 4
-    OBSERVE_CURSOR = 8  # resolves "unsupported" in version 1
-    LAYOUT_ARRANGE = 16  # resolves "unsupported" in version 1
-    LAYOUT_FOCUS = 32  # resolves "unsupported" in version 1
+    OBSERVE_CURSOR = 8  # refused "unsupported" by every deployment at version 2
+    LAYOUT_ARRANGE = 16  # served by the reference core since WS-E.1.4
+    LAYOUT_FOCUS = 32  # served by the reference core since WS-E.1.4
     REALM_LAUNCH = 512  # resolves "unsupported" until a deployment serves it
 
 
@@ -90,13 +98,26 @@ VERB_MASK = int(
     | Verb.REALM_LAUNCH
 )
 
-# The verbs a deployment actually serves. Named for version 1 because that
-# is the version whose served set this is, and the set did not widen at
-# version 2 — `realm_launch` arrived defined-but-unserved, like the three
-# before it. The rest are refused "unsupported", and a petition mixing
-# served and unserved verbs is refused whole — the core never silently
-# narrows a verb set.
-VERBS_SERVED_IN_VERSION_1 = int(Verb.OBSERVE | Verb.ACTUATE_POINTER | Verb.ACTUATE_TEXT)
+# The verbs a deployment actually serves, as the IDL's own entry summaries
+# state it: an entry carrying "refused unsupported in version 1" is unserved,
+# and `tests/test_verb_parity.py` re-derives this constant from the IDL so the
+# two cannot drift. Kept under its version-1 name because the *wire* did not
+# change when the set widened — serving a verb is a deployment property, not a
+# version property, and renaming this would imply otherwise.
+#
+# `layout_arrange` and `layout_focus` joined the set at WS-E.1.4: each gained a
+# facet interface (`vitrin_layout_focus`, `vitrin_layout_arrange`), an
+# enforcement arm and consent-prompt copy. Still out: `observe_cursor`
+# (per-principal cursor delivery is M2's) and `realm_launch` (no spawn path).
+# Those are refused "unsupported", and a petition mixing served and unserved
+# verbs is refused whole — the core never silently narrows a verb set.
+VERBS_SERVED_IN_VERSION_1 = int(
+    Verb.OBSERVE
+    | Verb.ACTUATE_POINTER
+    | Verb.ACTUATE_TEXT
+    | Verb.LAYOUT_ARRANGE
+    | Verb.LAYOUT_FOCUS
+)
 
 # The SDK-level dotted names are these bits (per the IDL's verb enum text,
 # which fixes the spelling: the first underscore of the wire name becomes a
@@ -122,7 +143,14 @@ class Persistence(enum.IntEnum):
 
 
 class Outcome(enum.IntEnum):
-    """vitrin_grant.outcome — petition outcomes."""
+    """vitrin_grant.outcome — petition outcomes.
+
+    ``LAYOUT_HELD`` arrived with wire version 2. It is here for exactly the
+    reason ``Refusal.CAPACITY`` is: an outcome the SDK does not know decodes
+    to ``ServerContractViolation``, which closes the connection — turning the
+    recoverable admission answer the IDL's staging argument exists to
+    guarantee into the connection death it exists to prevent.
+    """
 
     GRANTED = 0
     DENIED = 1
@@ -130,6 +158,7 @@ class Outcome(enum.IntEnum):
     UNAVAILABLE = 3
     UNSUPPORTED = 4
     BUSY = 5
+    LAYOUT_HELD = 6
 
 
 class Refusal(enum.IntEnum):
@@ -188,6 +217,19 @@ class Axis(enum.IntEnum):
 
     VERTICAL = 0
     HORIZONTAL = 1
+
+
+class LayoutMode(enum.IntEnum):
+    """vitrin_layout_arrange.mode — the two arrangements the scene can express.
+
+    A closed pair rather than a boolean, so a scene able to express a third
+    arrangement appends an entry here instead of needing a second request.
+    An out-of-range value is fatal ``invalid_argument`` server-side, which is
+    why :func:`vitrin_os.messages.encode_set_fullscreen` refuses one locally.
+    """
+
+    WINDOWED = 0
+    FULLSCREEN = 1
 
 
 # Linux evdev button codes for convenience (the wire carries the raw code).

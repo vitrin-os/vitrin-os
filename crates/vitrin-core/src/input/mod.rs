@@ -686,7 +686,8 @@ impl<H: PreemptionHook> PreemptionHook for PresenceHook<H> {
 /// realms (WS-E.1.2), and this is still one instance — but the state below
 /// is *per shim generation*, and a shim generation belongs to exactly one
 /// realm: every delivery goes to a single realm, the one
-/// [`crate::session::seat_target`] picks. [`Self::bound`] records which,
+/// [`crate::session::physical_seat_target`] picks. [`Self::bound`] records
+/// which,
 /// and it exists for one reason: a realm's death must clear that realm's
 /// delivery debt and **must not** clear a surviving sibling's, or a key the
 /// survivor's app is holding latches down forever with nothing in the log
@@ -731,12 +732,21 @@ pub(crate) struct InputRouter<H: PreemptionHook> {
     ///
     /// [`ConsentGrab::pointer`]: crate::consent::grab::ConsentGrab
     agent_pointer: Option<(f64, f64)>,
-    /// Button codes of delivered-and-unreleased presses, in press order
-    /// (a multiset: a pathological double-press pairs with a double-
+    /// Delivered-and-unreleased button presses as `(code, origin)`, in press
+    /// order (a multiset: a pathological double-press pairs with a double-
     /// release). Nonempty means an implicit grab holds the pointer on
     /// the surface; a release is delivered iff its code is present here —
     /// per-button pairing, Wayland-style, never a bare count.
-    pressed: Vec<u32>,
+    ///
+    /// The origin is carried for the same reason [`Self::pressed_keys`]
+    /// carries it and is read by the same kind of caller: anything that
+    /// synthesises a release from an entry reads the tag back off the entry
+    /// rather than minting one, because minting `Origin::Physical` for an
+    /// agent's button would forge the physical-vs-emulated distinction (B2)
+    /// on the wire and in the flight recorder. Pairing itself stays
+    /// per-code, never per-`(code, origin)`: the app has one pointer, and
+    /// its grab state counts presses, not who made them.
+    pressed: Vec<(u32, Origin)>,
     /// Delivered-and-unreleased key presses as `(keysym, origin)`, same
     /// multiset discipline as [`Self::pressed`] and for the same razor: a key
     /// release is delivered iff its own press was (module docs). Keys hold
@@ -784,7 +794,7 @@ impl<H: PreemptionHook> InputRouter<H> {
 
     /// **Adopt `realm`'s shim generation**, called by each delivery site
     /// with the realm it is about to deliver to
-    /// ([`crate::session::seat_target`]).
+    /// ([`crate::session::physical_seat_target`]).
     ///
     /// Re-binding to the realm already bound is a no-op — the ordinary case,
     /// once per delivery round. Binding to a *different* realm forgets the
@@ -792,10 +802,19 @@ impl<H: PreemptionHook> InputRouter<H> {
     /// rather than tidiness: the pairing table is a record of presses **this
     /// app** saw, so carrying it across a target change would send the new
     /// realm's seat a release whose press it never received, and let a
-    /// pointer position hit-test geometry a different shim produced. The
-    /// only way the target changes today is the previous one dying, which
-    /// has already reset through [`Self::reset_for`]; this is the backstop
-    /// for the day routing stops being a placeholder (WS-E.1.6).
+    /// pointer position hit-test geometry a different shim produced.
+    ///
+    /// **This forgets a debt; it does not pay it**, and whoever moves the
+    /// target owes the payment first. The target used to change only when
+    /// the previous realm died, which had already reset through
+    /// [`Self::reset_for`] and where no delivery was possible anyway.
+    /// Serving `layout_focus` (WS-E.1.4) made that false: a holder moves the
+    /// binding while the losing realm's app is very much alive and may be
+    /// holding a key or a button, and an entry forgotten here is a press
+    /// whose release that app can never receive — a latched `Ctrl` in an app
+    /// the human can no longer even see. So `session::apply_layout` drains
+    /// [`Self::release_held`] into the losing realm *before* the binding
+    /// moves, and this call then finds nothing left to forget.
     pub fn bind_to(&mut self, realm: &crate::grants::RealmId) {
         if self.bound.as_ref() == Some(realm) {
             return;
@@ -950,6 +969,68 @@ impl<H: PreemptionHook> InputRouter<H> {
         released
     }
 
+    /// Release **everything** the router believes the currently bound realm's
+    /// app is holding — keys and buttons, both origins, in press order — and
+    /// forget it. One wire-ready [`SeatDelivery`] per outstanding press, for
+    /// the caller to deliver *to the realm that is being left*.
+    ///
+    /// Called by `session::apply_layout` when a `layout_focus` holder moves
+    /// the output binding, and only there. The moment after is
+    /// [`Self::bind_to`] on the new target, which clears this table without a
+    /// word; every entry in it is then a press whose release the losing app
+    /// can never receive. Draining first is what stops a focus change
+    /// latching a modifier — or wedging an implicit pointer grab — in an app
+    /// the human has just stopped being able to see.
+    ///
+    /// **Both origins, and that is the difference from
+    /// [`Self::release_physical_keys`].** That method drains the human's keys
+    /// only, because host-window focus loss changes nothing about an agent's
+    /// actuation channel — the agent can still release its own key on the
+    /// next request. Here the channel itself is what closed: the binding has
+    /// moved, so `session::seat_target` no longer names this realm, the
+    /// chokepoint's step-5d guard refuses that agent's next actuation
+    /// `internal`, and the release it would have sent can no longer be
+    /// delivered by anyone. Leaving an agent's press in the table would
+    /// strand exactly what this exists to free.
+    ///
+    /// Each release carries the tag its own entry recorded, so no origin is
+    /// minted here (B2): a release synthesised for an agent's key must not
+    /// reach the shim, or the flight recorder, attributed to the human.
+    ///
+    /// **Why the preemption hook is bypassed**, as in
+    /// [`Self::release_physical_keys`]: these are not new events to judge —
+    /// nothing moved — they are the delivery debt the router itself is
+    /// recording. Routing them back through [`Self::route`] would hand the
+    /// dead-man watcher a release with no press, and a gate that consumed one
+    /// would strand the very press this frees.
+    ///
+    /// Keys are released before buttons, which is the order Wayland clients
+    /// are least surprised by (a keyboard latch is the state that misbehaves
+    /// worst) and is otherwise immaterial: within each kind, press order is
+    /// preserved.
+    pub fn release_held(&mut self) -> Vec<SeatDelivery> {
+        let mut released = Vec::with_capacity(self.pressed_keys.len() + self.pressed.len());
+        for (keysym, origin) in self.pressed_keys.drain(..) {
+            released.push(SeatDelivery {
+                origin,
+                kind: SeatDeliveryKind::Key {
+                    keysym,
+                    state: KeyState::Released,
+                },
+            });
+        }
+        for (button, origin) in self.pressed.drain(..) {
+            released.push(SeatDelivery {
+                origin,
+                kind: SeatDeliveryKind::Button {
+                    button,
+                    state: ButtonState::Released,
+                },
+            });
+        }
+        released
+    }
+
     /// Route one tagged event against the current geometry: `view` is the
     /// composed realm-view size (nested: the host window size the scene
     /// composes at), `surface` the committed client surface size
@@ -1051,7 +1132,10 @@ impl<H: PreemptionHook> InputRouter<H> {
                     if self.pressed.is_empty() && !self.pointer_over_surface(view, surface) {
                         return None; // press on the matte starts nothing
                     }
-                    self.pressed.push(button);
+                    // The tag rides into the pairing table with the press,
+                    // so whatever synthesises this button's release later
+                    // reads it back rather than assuming one.
+                    self.pressed.push((button, origin));
                     SeatDeliveryKind::Button { button, state }
                 }
                 ButtonState::Released => {
@@ -1083,7 +1167,7 @@ impl<H: PreemptionHook> InputRouter<H> {
     /// whether one existed (i.e. whether a release of this code pairs
     /// with a delivered press).
     fn release_pressed(&mut self, button: u32) -> bool {
-        match self.pressed.iter().position(|&b| b == button) {
+        match self.pressed.iter().position(|&(b, _)| b == button) {
             Some(i) => {
                 self.pressed.remove(i);
                 true
@@ -3063,6 +3147,7 @@ pub(crate) mod tests {
             },
             std::time::Instant::now(),
             &realms,
+            false,
         ) else {
             panic!("an interactive petition must pend");
         };
@@ -3410,6 +3495,8 @@ pub(crate) mod tests {
                         // guard has nothing to say here.
                         seat_reaches_grant_realm: true,
                         actuations: &mut |input| routed.push(input),
+                        grant_realm: None,
+                        layout: &mut |act| panic!("no layout act expected: {act:?}"),
                     },
                     now,
                     &mut |_principal_frame, _fd| Ok(()),
@@ -4115,6 +4202,112 @@ pub(crate) mod tests {
             }
         );
         assert!(router.pressed_keys.is_empty());
+    }
+
+    /// **A binding change drains everything, both origins, keys and buttons.**
+    ///
+    /// The sibling of [`a_focus_drain_never_speaks_for_an_agents_held_key`],
+    /// and deliberately the *opposite* filter, because the two moments are
+    /// different. Host-window focus loss changes nothing about an agent's
+    /// actuation channel — it can still release its own key on the next
+    /// request — so that drain leaves an agent's presses alone. A
+    /// `layout_focus` holder moving the output closes the channel itself:
+    /// `session::seat_target` stops naming this realm, the chokepoint's step
+    /// 5d refuses that agent's next actuation `internal`, and the release it
+    /// would have sent can no longer be delivered by anyone. An entry left
+    /// behind is stranded for good.
+    ///
+    /// Buttons are here and not in the focus-loss drain for the same reason
+    /// the whole table is: `bind_to` is about to clear the implicit grab too,
+    /// and a grab the app thinks it holds with no release coming wedges its
+    /// pointer exactly as a latched modifier wedges its keyboard.
+    #[test]
+    fn a_binding_change_drains_every_held_press_with_the_tag_it_recorded() {
+        let mut router = InputRouter::new(NoopHook);
+        let view = (64, 48);
+        let surface = Some(view);
+        const HUMAN_KEY: u32 = 0xffe3; // Control_L
+        const AGENT_KEY: u32 = 0xffe1; // Shift_L
+        const HUMAN_BUTTON: u32 = 0x110; // BTN_LEFT
+
+        router.bind_to(&crate::grants::RealmId::new("realm-a"));
+        assert!(router
+            .route(phys(motion(10.0, 10.0)), view, surface)
+            .is_some());
+        for input in [
+            phys(SeatInputKind::Key {
+                keysym: HUMAN_KEY,
+                state: KeyState::Pressed,
+            }),
+            SeatInput::emulated(SeatInputKind::Key {
+                keysym: AGENT_KEY,
+                state: KeyState::Pressed,
+            }),
+            phys(SeatInputKind::Button {
+                button: HUMAN_BUTTON,
+                state: ButtonState::Pressed,
+            }),
+        ] {
+            assert!(
+                router.route(input, view, surface).is_some(),
+                "fixture check: every press must reach the app, or there is nothing to strand"
+            );
+        }
+
+        // The output moves. Everything the app is holding comes back, keys
+        // first, each carrying the tag its own entry recorded.
+        let released = router.release_held();
+        assert_eq!(
+            released
+                .iter()
+                .map(|d| (d.origin(), d.kind().clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Origin::Physical,
+                    SeatDeliveryKind::Key {
+                        keysym: HUMAN_KEY,
+                        state: KeyState::Released
+                    }
+                ),
+                (
+                    Origin::Emulated,
+                    SeatDeliveryKind::Key {
+                        keysym: AGENT_KEY,
+                        state: KeyState::Released
+                    }
+                ),
+                (
+                    Origin::Physical,
+                    SeatDeliveryKind::Button {
+                        button: HUMAN_BUTTON,
+                        state: ButtonState::Released
+                    }
+                ),
+            ],
+            "a binding change must pay the losing app every press it is holding, whoever \
+             made it, with the tag the table recorded and never a minted one (B2)"
+        );
+        assert!(router.pressed_keys.is_empty() && router.pressed.is_empty());
+
+        // Idempotent, and the debt is really gone: the binding moves, and the
+        // new realm's generation starts clean.
+        assert!(router.release_held().is_empty());
+        router.bind_to(&crate::grants::RealmId::new("realm-b"));
+        assert!(
+            router
+                .route(
+                    phys(SeatInputKind::Key {
+                        keysym: HUMAN_KEY,
+                        state: KeyState::Released
+                    }),
+                    view,
+                    surface,
+                )
+                .is_none(),
+            "a release arriving after the drain pairs with nothing and must not reach the \
+             realm that never saw the press"
+        );
     }
 
     // ------------------------------------------------------------------

@@ -11,11 +11,14 @@
 //! # What this proves
 //!
 //! `decode(bytes, fd)` on **every** message type defined in
-//! `protocol/vitrin-v0.xml` (all 32 -- `DECODERS.len()` is asserted against
+//! `protocol/vitrin-v0.xml` -- `DECODERS.len()` is asserted against
 //! `vitrin_protocol::generated::MESSAGE_COUNT` below, so an IDL message
 //! added without a matching decoder entry here fails the assertion the
-//! first time the fuzzer runs, not silently) must, for **any** byte slice
-//! and **any** fd presence:
+//! first time the fuzzer runs, not silently. Deliberately no literal
+//! count in this prose: the assertion is the gate, and a number written
+//! here would be one more thing to forget to bump (it was, at 32, when
+//! `vitrin_layout_focus`/`vitrin_layout_arrange` took the total to 36).
+//! For **any** byte slice and **any** fd presence, every decoder must:
 //!
 //! - never panic and never invoke undefined behaviour (libFuzzer's own
 //!   contract: a panic or an ASan/UBSan report aborts the process, which
@@ -36,7 +39,7 @@
 //!
 //! # Input layout
 //!
-//! `data[0]` selects which of the 32 message decoders to call (mod
+//! `data[0]` selects which message decoder to call (mod
 //! `DECODERS.len()`); `data[1]`'s low bit selects whether an fd
 //! accompanies the call (an open `/dev/null`, close-on-exec, freshly
 //! opened per call since `decode` takes ownership of an `OwnedFd`); the
@@ -65,10 +68,14 @@ type GetRealm = gen::vitrin_principal::requests::GetRealm;
 type Bound = gen::vitrin_principal::events::Bound;
 type RequestGrant = gen::vitrin_realm::requests::RequestGrant;
 type GetLauncher = gen::vitrin_grant::requests::GetLauncher;
+type GetLayoutFocus = gen::vitrin_grant::requests::GetLayoutFocus;
+type GetLayoutArrange = gen::vitrin_grant::requests::GetLayoutArrange;
 type Resolved = gen::vitrin_grant::events::Resolved;
 type Refused = gen::vitrin_grant::events::Refused;
 type Launch = gen::vitrin_launcher::requests::Launch;
 type Launched = gen::vitrin_launcher::events::Launched;
+type LayoutFocus = gen::vitrin_layout_focus::requests::Focus;
+type LayoutSetFullscreen = gen::vitrin_layout_arrange::requests::SetFullscreen;
 type ConsentStateEvent = gen::vitrin_consent::events::State;
 type CaptureFrame = gen::vitrin_view::requests::CaptureFrame;
 type FrameReady = gen::vitrin_view::events::FrameReady;
@@ -99,8 +106,8 @@ fn devnull_fd() -> OwnedFd {
 }
 
 /// Try one message type's `decode`, discarding the value but keeping the
-/// panic-freedom and round-trip checks in one place so the 32-entry table
-/// below is pure data, not 32 copies of this logic. For the fd-less
+/// panic-freedom and round-trip checks in one place so the decoder table
+/// below is pure data, not one copy of this logic per type. For the fd-less
 /// majority of message types the round-trip is a full equality check
 /// ([`DecodeMsg::decoded_eq`]); the two fd-bearing types
 /// (`vitrin_view.frame_ready`, `vitrin_shim_surface.attach`) only derive
@@ -227,6 +234,10 @@ impl_decode_msg_no_fd!(
     SeatText,
     Launch,
     Launched,
+    GetLayoutFocus,
+    GetLayoutArrange,
+    LayoutFocus,
+    LayoutSetFullscreen,
 );
 // The two fd-bearing messages in v0.xml (grep for an `fd`-typed arg),
 // matching tests/roundtrip.rs's dedicated-block split.
@@ -234,7 +245,7 @@ impl_decode_msg_with_fd!(FrameReady, Attach);
 
 /// One panic-free-and-round-trips-if-it-decodes wrapper per message type,
 /// unified behind this shape so the fuzz target body is a single indexed
-/// call, not a 32-armed match.
+/// call, not a match with one arm per message.
 type Decoder = fn(&[u8], Option<OwnedFd>);
 
 macro_rules! decoder_table {
@@ -278,6 +289,10 @@ static DECODERS: &[Decoder] = decoder_table!(
     SeatText,
     Launch,
     Launched,
+    GetLayoutFocus,
+    GetLayoutArrange,
+    LayoutFocus,
+    LayoutSetFullscreen,
 );
 
 fuzz_target!(|data: &[u8]| {

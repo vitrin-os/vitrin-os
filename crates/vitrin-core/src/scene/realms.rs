@@ -32,14 +32,16 @@
 //! Everything here is a `BTreeMap`, a bound id and two counters.
 //!
 //! Nor does it choose *who* may bind: [`RealmScenes::bind`] and
-//! [`RealmScenes::unbind`] are the mechanisms, and the authority question —
-//! which principal may call them, and under what verb — is WS-E.1.4's (issue
-//! #210). The runtime's callers today take the first still-serving realm in
-//! id order, at first attach and again when the realm holding the output
-//! dies, which is a placeholder in the same sense
-//! [`crate::session::seat_target`] is one — and deliberately the *same*
-//! placeholder, so the realm a human is looking at and the realm an actuation
-//! reaches never drift apart.
+//! [`RealmScenes::unbind`] are the mechanisms, and the authority question is
+//! answered outside this module. WS-E.1.4 (issue #210) answered it: a
+//! principal holding the `layout_focus` grant verb, through the
+//! `vitrin_layout_focus` facet and the enforcement chokepoint, reaching here
+//! via `session::apply_layout`. [`crate::session::physical_seat_target`]
+//! follows the
+//! binding, so the realm a human is looking at and the realm the human's
+//! input reaches move as one act. Absent such a client the runtime's own
+//! callers still take the first still-serving realm in id order, at first
+//! attach and again when the realm holding the output dies.
 //!
 //! # Hidden realms still hold a scene, and still get composed
 //!
@@ -219,9 +221,9 @@ impl RealmScenes {
     /// dead realm's cleared scene (the deterministic background) forever,
     /// while live siblings ran, and suppressing the agent-cursor sprite on the
     /// strength of a `focused()` that named a corpse. This is the way out of
-    /// that state, not a focus policy: *who* may move the output is still
-    /// WS-E.1.4's question (issue #210), and the runtime reaches for this only
-    /// when there is no realm left to move it to.
+    /// that state, not a focus policy: *who* may move the output is answered
+    /// by the `layout_focus` verb (WS-E.1.4, issue #210), and the runtime
+    /// reaches for this only when there is no realm left to move it to.
     ///
     /// Bumps the outgoing realm's `layout_generation` exactly as `bind` does —
     /// a realm's geometry changed when it lost the output, whether it lost it

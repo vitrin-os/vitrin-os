@@ -315,7 +315,7 @@ static inline vitrin_decode_status_t vitrin_frame_header_decode(
 /* test_header_compiles.c) checks its own list length against this with */
 /* _Static_assert, so a message added to the IDL cannot ship without a */
 /* compile-time proof that its marshal functions type-check. */
-#define VITRIN_MESSAGE_COUNT 32
+#define VITRIN_MESSAGE_COUNT 36
 
 /* ==================================================================== */
 /* Section 1: per-interface metadata and enums.                          */
@@ -421,9 +421,9 @@ typedef uint32_t vitrin_grant_verb_t;
 #define VITRIN_GRANT_VERB_ACTUATE_TEXT ((vitrin_grant_verb_t)4)
 /* capture frames that include the human principal's cursor - reading the human's attention, hence a verb and not a display preference; meaningful only alongside observe, and a petition naming it without observe resolves unsupported; another agent principal's cursor is not purchasable by this or any verb; refused unsupported in version 1 */
 #define VITRIN_GRANT_VERB_OBSERVE_CURSOR ((vitrin_grant_verb_t)8)
-/* place, resize, raise, and fullscreen the granted realm's views, subject to the ordering invariants no grant can purchase; refused unsupported in version 1 */
+/* arrange the granted realm's view, subject to the ordering invariants no grant can purchase; exercised through vitrin_layout_arrange, which defines set_fullscreen and no other request - place, resize, raise and stacking are absent rather than refused, because a scene showing one unstacked realm cannot honour them; at most one holder per output, counting a live grant that carries this verb AND a petition still pending for it, so a second petition while either exists resolves layout_held */
 #define VITRIN_GRANT_VERB_LAYOUT_ARRANGE ((vitrin_grant_verb_t)16)
-/* direct keyboard focus to a view of the granted realm; separate from layout_arrange because focus theft is the sharpest attack and the most legitimate need, so it must be attenuable alone; refused unsupported in version 1 */
+/* bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone */
 #define VITRIN_GRANT_VERB_LAYOUT_FOCUS ((vitrin_grant_verb_t)32)
 /* launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64, 128 and 256 are allocated to verbs not yet defined here and were skipped rather than reused; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it */
 #define VITRIN_GRANT_VERB_REALM_LAUNCH ((vitrin_grant_verb_t)512)
@@ -485,6 +485,8 @@ typedef enum {
     VITRIN_GRANT_OUTCOME_UNSUPPORTED = 4,
     /* the pending-petition admission cap for this verified identity (across all of its connections) was reached */
     VITRIN_GRANT_OUTCOME_BUSY = 5,
+    /* layout_arrange is already spoken for on this output, and there is at most one holder per output; the holder may be a live grant that carries the verb OR a petition still pending for it, because two petitions racing through a human's two approvals would otherwise mint two holders - so a petition that is only waiting really does hold the slot. A distinct entry rather than a reuse of busy, whose meaning is the consent-fatigue valve, and answered at admission rather than at use because contention is about who HOLDS the authority rather than about one use of it - it never reaches a prompt, so it costs the human nothing. Retrying once the holder's grant expires, is revoked, or its connection ends - or once the pending petition resolves to anything other than granted - is legal, and this outcome is the ONLY thing the core says about arbitration: choosing between two would-be holders is window-management policy and belongs outside the core */
+    VITRIN_GRANT_OUTCOME_LAYOUT_HELD = 6,
 } vitrin_grant_outcome_t;
 
 /* Whole-value membership check for `vitrin_grant_outcome_t` (decode a wire value by
@@ -497,6 +499,7 @@ static inline bool vitrin_grant_outcome_is_valid(uint32_t v) {
         case VITRIN_GRANT_OUTCOME_UNAVAILABLE:
         case VITRIN_GRANT_OUTCOME_UNSUPPORTED:
         case VITRIN_GRANT_OUTCOME_BUSY:
+        case VITRIN_GRANT_OUTCOME_LAYOUT_HELD:
             return true;
         default:
             return false;
@@ -830,6 +833,46 @@ static inline bool vitrin_shim_seat_origin_is_valid(uint32_t v) {
 #define VITRIN_LAUNCHER_INTERFACE_VERSION 1u
 /* Every request on this interface exercises the grant verb `realm_launch`. */
 #define VITRIN_LAUNCHER_VERB "realm_launch"
+
+/* ==== vitrin_layout_focus (version 1) ==== */
+/* focus facet */
+
+#define VITRIN_LAYOUT_FOCUS_INTERFACE_NAME "vitrin_layout_focus"
+#define VITRIN_LAYOUT_FOCUS_INTERFACE_VERSION 1u
+/* Every request on this interface exercises the grant verb `layout_focus`. */
+#define VITRIN_LAYOUT_FOCUS_VERB "layout_focus"
+
+/* ==== vitrin_layout_arrange (version 1) ==== */
+/* arrangement facet */
+
+#define VITRIN_LAYOUT_ARRANGE_INTERFACE_NAME "vitrin_layout_arrange"
+#define VITRIN_LAYOUT_ARRANGE_INTERFACE_VERSION 1u
+/* Every request on this interface exercises the grant verb `layout_arrange`. */
+#define VITRIN_LAYOUT_ARRANGE_VERB "layout_arrange"
+
+/* Enum `mode` on `vitrin_layout_arrange`.
+ *
+ * the two arrangements this scene can express
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* compose the realm's view at the size its own app last committed, letterboxed centered and unscaled inside the output */
+    VITRIN_LAYOUT_ARRANGE_MODE_WINDOWED = 0,
+    /* configure the realm's view to the output's size, so the app fills the output */
+    VITRIN_LAYOUT_ARRANGE_MODE_FULLSCREEN = 1,
+} vitrin_layout_arrange_mode_t;
+
+/* Whole-value membership check for `vitrin_layout_arrange_mode_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_layout_arrange_mode_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_LAYOUT_ARRANGE_MODE_WINDOWED:
+        case VITRIN_LAYOUT_ARRANGE_MODE_FULLSCREEN:
+            return true;
+        default:
+            return false;
+    }
+}
 
 /* ==================================================================== */
 /* Section 2: message structs and marshal functions, in document order   */
@@ -1700,6 +1743,190 @@ static inline vitrin_decode_status_t vitrin_grant_req_get_launcher_decode(
     size_t pos = VITRIN_HEADER_LEN;
     vitrin_decode_status_t st_launcher = vitrin_raw_read_u32(in, in_len, &pos, &out->launcher);
     if (st_launcher != VITRIN_DECODE_OK) { return st_launcher; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Request `get_layout_focus` (opcode 1) on `vitrin_grant`.
+ *
+ * mint the focus facet for this grant
+ */
+typedef struct {
+    /* the focus facet, born inert (confers nothing until this grant is granted with layout_focus) (new_id: vitrin_layout_focus) */
+    uint32_t layout_focus;
+} vitrin_grant_req_get_layout_focus_t;
+
+#define VITRIN_GRANT_REQ_GET_LAYOUT_FOCUS_OPCODE ((uint8_t)1)
+#define VITRIN_GRANT_REQ_GET_LAYOUT_FOCUS_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_GRANT_REQ_GET_LAYOUT_FOCUS_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_grant_req_get_layout_focus_encode(const vitrin_grant_req_get_layout_focus_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_GRANT_REQ_GET_LAYOUT_FOCUS_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_GRANT_REQ_GET_LAYOUT_FOCUS_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, msg->layout_focus);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_grant_req_get_layout_focus_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_grant_req_get_layout_focus_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_GRANT_REQ_GET_LAYOUT_FOCUS_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_GRANT_REQ_GET_LAYOUT_FOCUS_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_GRANT_REQ_GET_LAYOUT_FOCUS_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_layout_focus = vitrin_raw_read_u32(in, in_len, &pos, &out->layout_focus);
+    if (st_layout_focus != VITRIN_DECODE_OK) { return st_layout_focus; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Request `get_layout_arrange` (opcode 2) on `vitrin_grant`.
+ *
+ * mint the arrangement facet for this grant
+ */
+typedef struct {
+    /* the arrangement facet, born inert (confers nothing until this grant is granted with layout_arrange) (new_id: vitrin_layout_arrange) */
+    uint32_t layout_arrange;
+} vitrin_grant_req_get_layout_arrange_t;
+
+#define VITRIN_GRANT_REQ_GET_LAYOUT_ARRANGE_OPCODE ((uint8_t)2)
+#define VITRIN_GRANT_REQ_GET_LAYOUT_ARRANGE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_GRANT_REQ_GET_LAYOUT_ARRANGE_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_grant_req_get_layout_arrange_encode(const vitrin_grant_req_get_layout_arrange_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_GRANT_REQ_GET_LAYOUT_ARRANGE_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_GRANT_REQ_GET_LAYOUT_ARRANGE_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, msg->layout_arrange);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_grant_req_get_layout_arrange_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_grant_req_get_layout_arrange_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_GRANT_REQ_GET_LAYOUT_ARRANGE_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_GRANT_REQ_GET_LAYOUT_ARRANGE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_GRANT_REQ_GET_LAYOUT_ARRANGE_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_layout_arrange = vitrin_raw_read_u32(in, in_len, &pos, &out->layout_arrange);
+    if (st_layout_arrange != VITRIN_DECODE_OK) { return st_layout_arrange; }
     if (pos != in_len) {
         return VITRIN_DECODE_ERR_TRAILING_BYTES;
     }
@@ -4206,6 +4433,194 @@ static inline vitrin_decode_status_t vitrin_launcher_evt_launched_decode(
     size_t pos = VITRIN_HEADER_LEN;
     vitrin_decode_status_t st_realm = vitrin_raw_read_string(in, in_len, &pos, 64u, &out->realm);
     if (st_realm != VITRIN_DECODE_OK) { return st_realm; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* ==== vitrin_layout_focus messages ==== */
+
+/* Request `focus` (opcode 0) on `vitrin_layout_focus`.
+ *
+ * bind the output to the granted realm and direct input there
+ */
+typedef struct {
+    /* no arguments -- a truly empty struct is not portable standard C */
+    char reserved;
+} vitrin_layout_focus_req_focus_t;
+
+#define VITRIN_LAYOUT_FOCUS_REQ_FOCUS_OPCODE ((uint8_t)0)
+#define VITRIN_LAYOUT_FOCUS_REQ_FOCUS_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_LAYOUT_FOCUS_REQ_FOCUS_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_layout_focus_req_focus_encode(const vitrin_layout_focus_req_focus_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_LAYOUT_FOCUS_REQ_FOCUS_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_LAYOUT_FOCUS_REQ_FOCUS_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    (void)msg;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_layout_focus_req_focus_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_layout_focus_req_focus_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_LAYOUT_FOCUS_REQ_FOCUS_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_LAYOUT_FOCUS_REQ_FOCUS_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_LAYOUT_FOCUS_REQ_FOCUS_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    out->reserved = 0;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* ==== vitrin_layout_arrange messages ==== */
+
+/* Request `set_fullscreen` (opcode 0) on `vitrin_layout_arrange`.
+ *
+ * fill the output, or compose at the app's own size
+ */
+typedef struct {
+    /* fullscreen or windowed */
+    vitrin_layout_arrange_mode_t mode;
+} vitrin_layout_arrange_req_set_fullscreen_t;
+
+#define VITRIN_LAYOUT_ARRANGE_REQ_SET_FULLSCREEN_OPCODE ((uint8_t)0)
+#define VITRIN_LAYOUT_ARRANGE_REQ_SET_FULLSCREEN_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_LAYOUT_ARRANGE_REQ_SET_FULLSCREEN_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_layout_arrange_req_set_fullscreen_encode(const vitrin_layout_arrange_req_set_fullscreen_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_LAYOUT_ARRANGE_REQ_SET_FULLSCREEN_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_LAYOUT_ARRANGE_REQ_SET_FULLSCREEN_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->mode);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_layout_arrange_req_set_fullscreen_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_layout_arrange_req_set_fullscreen_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_LAYOUT_ARRANGE_REQ_SET_FULLSCREEN_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_LAYOUT_ARRANGE_REQ_SET_FULLSCREEN_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_LAYOUT_ARRANGE_REQ_SET_FULLSCREEN_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    uint32_t mode_raw;
+    vitrin_decode_status_t st_mode = vitrin_raw_read_u32(in, in_len, &pos, &mode_raw);
+    if (st_mode != VITRIN_DECODE_OK) { return st_mode; }
+    if (!vitrin_layout_arrange_mode_is_valid(mode_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->mode = (vitrin_layout_arrange_mode_t)mode_raw;
     if (pos != in_len) {
         return VITRIN_DECODE_ERR_TRAILING_BYTES;
     }

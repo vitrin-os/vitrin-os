@@ -83,8 +83,8 @@ def _parse_verbs(verbs: int | Verb | Iterable[str | Verb]) -> int:
     if bits & ~protocol.VERB_MASK:
         # An out-of-range verb bit is fatal invalid_argument server-side.
         raise ValueError(f"verb bits {bits:#x} outside the IDL's verb bitfield")
-    # Bits inside the mask but unserved (observe.cursor, layout.*,
-    # realm.launch) are NOT
+    # Bits inside the mask a given deployment may not serve (observe.cursor,
+    # realm.launch, and layout.* on a deployment that declines them) are NOT
     # refused here: the core answers them "unsupported" on the grant, which is
     # recoverable and is the answer the caller is entitled to see. Pre-empting
     # it locally would hide a deployment difference behind a client-side error.
@@ -324,6 +324,31 @@ class Frame:
         )
 
 
+class _LayoutFocusFacet(_Proxy):
+    """`vitrin_layout_focus` — bind the output to the granted realm.
+
+    Events: none. This interface deliberately offers no read of which realm
+    holds the output; a holder learns the effect of its own request through a
+    capture it holds separate `observe` authority for.
+    """
+
+    _interface = "vitrin_layout_focus"
+
+    def __init__(self, conn: "Connection", oid: int, grant: "Grant") -> None:
+        super().__init__(conn, oid)
+        self._grant = grant
+
+
+class _LayoutArrangeFacet(_Proxy):
+    """`vitrin_layout_arrange` — fill the output, or keep the app's own size."""
+
+    _interface = "vitrin_layout_arrange"
+
+    def __init__(self, conn: "Connection", oid: int, grant: "Grant") -> None:
+        super().__init__(conn, oid)
+        self._grant = grant
+
+
 class Grant(_Proxy):
     """A capability handle, born pending; resolved exactly once, ever."""
 
@@ -339,6 +364,13 @@ class Grant(_Proxy):
         self._view: _ViewProxy
         self.pointer: PointerActuator
         self.text: TextActuator
+        # The two layout facets are minted on demand rather than co-minted:
+        # `request_grant`'s five new_id arguments are frozen forever, so
+        # every facet added after version 1 arrives as a structural mint on
+        # the grant. Minting is always legal, so this is lazy purely to keep
+        # a petition's id footprint at five for clients that never arrange.
+        self._layout_focus: _LayoutFocusFacet | None = None
+        self._layout_arrange: _LayoutArrangeFacet | None = None
 
     def _handle_event(self, event: Event) -> None:
         if isinstance(event, ResolvedEvent):
@@ -402,6 +434,56 @@ class Grant(_Proxy):
     def consent_state(self) -> ConsentState | None:
         """The latest prompt-visibility state, if any was delivered."""
         return self._consent_states[-1] if self._consent_states else None
+
+    # -- layout --------------------------------------------------------------
+
+    def focus(self) -> None:
+        """Show the granted realm and send the human's input there.
+
+        Fire-and-forget: no terminal event, so this returns as soon as the
+        request is on the wire. A refusal arrives on the grant and surfaces
+        at the next :meth:`Connection.sync` or the next reply-bearing call —
+        the sync-barrier discovery idiom, which is how every fire-and-forget
+        refusal is discovered.
+
+        Showing a realm and directing the human's own keyboard and pointer to
+        it are **one act**: there is no verb set that separates them, because
+        routing a human's keys to a realm they cannot see is focus theft in
+        its sharpest form.
+        """
+        self._conn._send(messages.encode_focus(self._focus_facet().id))
+
+    def set_fullscreen(self, fullscreen: bool) -> None:
+        """Make the granted realm fill the output, or stop making it.
+
+        Fire-and-forget, like :meth:`focus`.
+
+        The two modes differ only in whether the realm's view size *tracks*
+        the output's, so while the output and the realm are the same size
+        they are indistinguishable and this changes nothing observable. That
+        is the protocol's own statement, not this SDK's simplification.
+        """
+        facet = self._arrange_facet()
+        mode = (
+            protocol.LayoutMode.FULLSCREEN if fullscreen else protocol.LayoutMode.WINDOWED
+        )
+        self._conn._send(messages.encode_set_fullscreen(facet.id, mode=mode))
+
+    def _focus_facet(self) -> _LayoutFocusFacet:
+        if self._layout_focus is None:
+            oid = self._conn._allocate_ids(1)[0]
+            self._layout_focus = _LayoutFocusFacet(self._conn, oid, self)
+            self._conn._register(self._layout_focus)
+            self._conn._send(messages.encode_get_layout_focus(self.id, facet_id=oid))
+        return self._layout_focus
+
+    def _arrange_facet(self) -> _LayoutArrangeFacet:
+        if self._layout_arrange is None:
+            oid = self._conn._allocate_ids(1)[0]
+            self._layout_arrange = _LayoutArrangeFacet(self._conn, oid, self)
+            self._conn._register(self._layout_arrange)
+            self._conn._send(messages.encode_get_layout_arrange(self.id, facet_id=oid))
+        return self._layout_arrange
 
     # -- observation --------------------------------------------------------
 

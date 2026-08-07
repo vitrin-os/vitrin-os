@@ -103,8 +103,8 @@ avoids.
 **Why here and not on `request_grant`.** `request_grant`'s five `new_id`
 arguments are frozen forever, like every message signature, so no facet added
 after version 1 can be co-minted. A mint on the grant that authorizes the
-facet is the documented route (see [Growth](#growth)); the layout facet is
-specified to arrive the same way.
+facet is the documented route (see [Growth](#growth)); the two layout facets
+below arrived the same way.
 
 **Calling it twice** mints a second, equivalent facet. This is not a special
 case: no version defines a destructor, ids are never reused, and each minted
@@ -118,6 +118,43 @@ version-1 connection, where sending its opcode is fatal `invalid_opcode`. The
 a version-1 connection may name it in a petition and is answered
 `unsupported`, because a bitfield is one mask checked identically on every
 version (see [conventions § 7.3](00-conventions.md)).
+
+### get_layout_focus
+
+`get_layout_focus(layout_focus: new_id)` — **since version 2**
+
+| arg | type | description |
+|---|---|---|
+| `layout_focus` | `new_id` → [`vitrin_layout_focus`](17-vitrin_layout_focus.md) | the focus facet, born **inert** |
+
+A **structural mint**, on exactly [`get_launcher`](#get_launcher)'s terms:
+neither reply-bearing nor refusable, always legal whatever verbs the grant
+holds and whether or not it has resolved, born inert, duplicates permitted and
+conferring nothing extra, bounded by the per-connection live-object cap whose
+breach is fatal `resource_exhausted`, and `since="2"` so the opcode does not
+exist on a version-1 connection.
+
+The one difference worth naming: unlike a launcher, the use this mints **can
+succeed** — the reference core serves `layout_focus`.
+
+### get_layout_arrange
+
+`get_layout_arrange(layout_arrange: new_id)` — **since version 2**
+
+| arg | type | description |
+|---|---|---|
+| `layout_arrange` | `new_id` → [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md) | the arrangement facet, born **inert** |
+
+Identical in every structural respect to
+[`get_layout_focus`](#get_layout_focus).
+
+**A separate mint, deliberately.** One facet interface declares exactly one
+grant verb — that is what generates the single-site authority check — and
+`layout_arrange` and `layout_focus` must stay independently attenuable. A
+shell granted arrangement but not focus holds a live
+`vitrin_layout_arrange` and a `vitrin_layout_focus` that refuses `not_granted`
+forever, which is exactly the shape that separation is for. A combined
+`get_layout` could not express it.
 
 ## Events
 
@@ -218,16 +255,21 @@ IDL so a second implementation transcribing this enum has no name to invent.
 | `actuate_pointer` | 0x2 | yes | inject pointer motion, buttons, and scroll |
 | `actuate_text` | 0x4 | yes | inject Unicode text |
 | `observe_cursor` | 0x8 | **no** — resolves `unsupported` | capture frames that include the human principal's cursor; meaningful only alongside `observe` |
-| `layout_arrange` | 0x10 | **no** — resolves `unsupported` | place, resize, raise, and fullscreen the granted realm's views |
-| `layout_focus` | 0x20 | **no** — resolves `unsupported` | direct keyboard focus to a view of the granted realm |
+| `layout_arrange` | 0x10 | yes | arrange the granted realm's view, through the [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md) facet; **one holder per output** — a live grant carrying it, or a petition still pending for it — so a second petition while either exists resolves `layout_held` |
+| `layout_focus` | 0x20 | yes | bind the output to the granted realm and direct the human's input there, through the [`vitrin_layout_focus`](17-vitrin_layout_focus.md) facet |
 | `realm_launch` | 0x200 | **no** — resolves `unsupported` | launch the realm template this grant addresses into a new realm instance, through the [`vitrin_launcher`](16-vitrin_launcher.md) facet |
+
+The **served** column describes the reference core. Whether a defined verb is
+served is a property of a *deployment*, so a client reads `unsupported` as
+"not here, not now", never as "not in this protocol".
 
 `VALID_MASK` is therefore `0x23f` (575), not `0x7f`.
 
 This enum is the type of `request_grant`'s `verbs` argument, of
-`resolved.verbs`, and of `refused.verb`. Four verbs map one-to-one to a facet
+`resolved.verbs`, and of `refused.verb`. Six verbs map one-to-one to a facet
 interface and to that interface's `@verb` annotation, which drives the
-scanner-generated chokepoint table. Later phases append entries (for example
+scanner-generated chokepoint table; `observe_cursor` is the one that does not,
+by construction. Later phases append entries (for example
 key actuation, credential presentation, subtree reads) without touching
 existing bits; values are immutable.
 
@@ -250,11 +292,20 @@ petitioning for 64 today is fatal `invalid_argument`, not `unsupported`.
 
 #### Defined but unserved
 
-`observe_cursor`, `layout_arrange`, `layout_focus` and `realm_launch` are
-defined on the wire ahead of being served and **refused `unsupported`** — the
-same posture the [`persistence`](#persistence) ladder takes toward its durable
-rungs. The first three were defined from day one; `realm_launch` arrived with
-version 2 and ships in the same staged state. Two reasons, both structural:
+A verb may be defined on the wire ahead of being served and **refused
+`unsupported`** by a deployment that does not serve it — the same posture the
+[`persistence`](#persistence) ladder takes toward its durable rungs.
+
+Four verbs were defined this way. `observe_cursor`, `layout_arrange` and
+`layout_focus` were defined from day one and `realm_launch` arrived with
+version 2; of those, **`layout_arrange` and `layout_focus` are now served** by
+the reference core (each has a facet interface, an enforcement arm and consent
+copy), while `observe_cursor` and `realm_launch` are not. `observe_cursor`
+stays unserved everywhere because the per-principal cursor *delivery* it would
+widen a capture with does not exist (D-017, D-019); `realm_launch` stays
+unserved by this core because it has no spawn path.
+
+The staging is structural rather than cosmetic, for two reasons:
 
 1. **An out-of-range bit is fatal.** A bitfield argument is validated as a
    mask, so a bit outside the defined union is `invalid_argument` and the
@@ -272,12 +323,12 @@ version 2 and ships in the same staged state. Two reasons, both structural:
    expressible without a verb, and adding one later is a version bump against
    deployed clients.
 
-Two rules hold for every unserved verb:
+Two rules hold for every verb a deployment does not serve:
 
 - **A deployment MUST NOT grant a verb it does not enforce.** `unsupported` is
   the honest answer; accepting the bit and enforcing nothing is the failure
   this section exists to prevent.
-- **A mixed petition is refused whole.** `verbs = observe|layout_arrange`
+- **A mixed petition is refused whole.** `verbs = observe|observe_cursor`
   resolves `unsupported`; the server does not quietly drop the unserved bit and
   grant `observe`. Narrowing a verb set is the human's move at consent time —
   a silent server-side edit would leave the agent believing it holds authority
@@ -286,13 +337,22 @@ Two rules hold for every unserved verb:
 Not every verb has a facet interface. `observe_cursor` has none by
 construction: it widens what
 [`vitrin_view.capture_frame`](06-vitrin_view.md) composites rather than adding
-a request. The layout verbs' facet arrives as a `since`-gated mint on *this*
-interface, because `request_grant`'s five `new_id` arguments are frozen forever
-(see [Growth](#growth)). `realm_launch` **does** have one —
-[`vitrin_launcher`](16-vitrin_launcher.md), minted the same way by
-[`get_launcher`](#get_launcher) — so it is defined-but-unserved with the facet
-already on the wire rather than still pending: the deployment refuses the
-verb, not the mint.
+a request. Every other verb does, and the three added at version 2 all arrive
+as `since`-gated mints on *this* interface, because `request_grant`'s five
+`new_id` arguments are frozen forever (see [Growth](#growth)):
+[`get_launcher`](#get_launcher), [`get_layout_focus`](#get_layout_focus) and
+[`get_layout_arrange`](#get_layout_arrange).
+
+**The layout verbs take two facets, not one, and that is forced rather than
+chosen.** A facet interface declares exactly one grant verb — that is what
+generates the single-site authority check — so one combined layout facet could
+name only one of them, and the other's requests would reach the chokepoint
+with no verb to check them against. D-018(3) requires the two independently
+attenuable; two interfaces is how the dialect makes that structural.
+
+`realm_launch` is therefore defined-but-unserved *with its facet already on
+the wire*: the deployment refuses the verb, not the mint. Minting is always
+legal for every facet, and the use is what refuses.
 
 #### Verb composition
 
@@ -305,10 +365,18 @@ enforce — and it settles the case the wire would otherwise leave open:
 `observe_cursor` is **not** an independent authority and is never
 inert-but-held. Every other verb (`observe`, `actuate_pointer`, `actuate_text`,
 `layout_arrange`, `layout_focus`, `realm_launch`) is independently
-petitionable. Version 1
-refuses `observe_cursor` in any combination, so the rule is not yet
-distinguishable from the blanket unserved refusal; it is stated now because the
-enum entry is frozen now.
+petitionable — including the two layout verbs, which is the whole point of
+`layout_focus` being its own bit. A deployment that
+refuses `observe_cursor` in any combination cannot distinguish this rule from
+the blanket unserved refusal; it is stated now because the enum entry is
+frozen now.
+
+`layout_arrange` carries a different kind of constraint, and it is **not** a
+composition rule: at most one principal holds it per output, so a second
+petition for it resolves [`layout_held`](#outcome) rather than reaching a
+human. "Holds" counts a **pending** petition as well as a live grant — see
+[the outcome](#outcome) for why. That is contention, not dependency — the verb
+needs no other verb alongside it.
 
 `realm_launch` in particular does **not** imply `observe`. Authority to start
 an app is not authority to watch it, and an agent that wants both petitions
@@ -330,29 +398,23 @@ enforces these **ordering invariants** unconditionally:
   surface;
 - no **agent** principal's cursor is composited into another principal's
   captured frame — the one cursor a capture may ever contain is the human
-  principal's, and only for a grant holding `observe_cursor`.
+  principal's, and only for a grant holding `observe_cursor`;
+- the **human's own physical input** reaches only the realm the output is
+  bound to.
 
-**What "unconditionally" means today.** The first invariant holds and is
-exercised (the overlay composites at the output stage, above the scene a
-capture is taken from; `backend/headless.rs`'s
-`a_prompt_reaches_human_visible_output_but_never_a_capture` asserts it). The
-fourth **is no longer vacuous** (D-019): the core composites an agent
-principal's own cursor, so there is something the rule can be violated by. What
-enforces it is where the sprite is drawn — at the output stage, downstream of
-the `Scene::compose` a capture is taken from, so a capture cannot carry it by
-construction rather than by a checked flag — and a test does exist:
-`backend/headless.rs`'s
-`the_agent_cursor_reaches_human_visible_output_but_never_a_capture`, which
-asserts both halves on real composited pixels. Two limits, stated: it is a
-**component** test rather than a mock-free integration gate, and it proves the
-core excludes the sprite from a capture rather than exercising a second agent
-trying to obtain the first's cursor — agent-to-agent has no wire surface to try
-it through, so that half stays unpurchasable by construction. The second still
-holds **vacuously** — no client can state a stacking order. The third has
-nothing to be true of, there being no arrangement mechanism. **None of the four
-is tested *as an invariant*** against a client trying to violate it, and none
-can be until something outside the core can arrange realms; that test belongs
-to the mission-control shell (E3), and D-018 is the reason it must exist.
+The fifth joined the set when `layout_focus` became servable: it is why that
+verb is one act, and why no verb set separates "show a realm" from "send the
+human's keys there". An agent's *injected* input is not governed by it.
+
+**What "unconditionally" means today.** All five are now tested **as
+invariants** — against a real client, over a real socket, holding every verb
+the reference core serves, sweeping the whole arrangement space those verbs
+can express. See [conventions § 1.4](00-conventions.md#14-scene-authority-arrangement-ordering-cursors)
+for the test names and what each asserts. Two limits, stated rather than left
+to be found: they are **component** tests rather than mock-free integration
+gates, and invariant 4's agent→agent half stays unpurchasable *by
+construction* rather than by test, because agent-to-agent observation has no
+wire surface to try it through — no agent can name another's grant.
 
 The split is deliberate: a shell gets *arrangement*, the core keeps *ordering*.
 This is what lets window-management policy live outside the TCB (PRD §5.1)
@@ -390,8 +452,38 @@ All outcomes are recoverable: a denial is an answer, not a protocol violation.
 | `unavailable` | 3 | the realm was unknown, vacant, or closed while the petition was pending |
 | `unsupported` | 4 | well-formed but refused by policy: durable rung without provenance, reserved flag set, unserved resource prefix, or a defined verb this deployment does not serve (an *out-of-range* verb bit is instead fatal `invalid_argument`) |
 | `busy` | 5 | the pending-petition admission cap for this verified identity (across all of its connections) was reached |
+| `layout_held` | 6 | `layout_arrange` is already spoken for on this output — by a live grant carrying it, or by another petition still pending for it |
 
 This enum types `resolved.outcome`.
+
+**Why `layout_held` is its own entry.** D-018(4) fixes at most one
+`layout_arrange` holder per output and refuses to arbitrate between two, which
+would be the window-management policy PRD §5.1 exiles from the core. The
+answer a second holder receives had to be *some* entry, and it could not be
+`busy`: `busy` means the consent-fatigue valve tripped, and widening its
+meaning is a wire-semantics change the [growth rules](00-conventions.md) forbid.
+
+It is decided **at admission**, not at use, because contention is about who
+*holds* the authority rather than about one use of it — a use-time answer
+would let two principals both believe they hold arrangement and discover
+otherwise one request at a time. It therefore never reaches a prompt and costs
+the human nothing.
+
+**A pending petition holds the slot too**, and that is a design choice rather
+than an implementation accident. If only *live grants* counted, two petitions
+for `layout_arrange` could both be admitted while both waited, a human could
+approve both, and the session would end up with exactly the two holders this
+rule exists to make unreachable — with no answer left to give the second one,
+because it has already been granted. So the slot is taken from admission, and
+it is released when the pending petition resolves to anything other than
+`granted`. The cost is stated plainly: a principal whose petition is sitting
+in front of a human can lock out a second principal for as long as that human
+takes to answer, and the second principal is told `layout_held` rather than
+`busy`, so it can tell contention from fatigue.
+
+Retrying once the holder's grant expires, is revoked, or its connection ends —
+or once the pending petition resolves non-`granted` — is legal, and this
+outcome is the **only** thing the core says about arbitration.
 
 ### refusal
 
@@ -425,11 +517,20 @@ as one will spin.
 
 **Not every code is reachable by every verb.** `no_surface` answers "the realm
 has no live surface", which is the state `realm_launch` exists to leave, so a
-launch is never refused `no_surface`. `preempted` and `consent_held` are
-actuation-only and refuse neither a capture nor a launch. `capacity` concerns
-creating a realm and so reaches only `realm_launch`. A code's absence from a
-verb's reachable set is a property of the operation, never a promise the code
-is unused.
+launch is never refused `no_surface`. `capacity` concerns creating a realm and
+so reaches only `realm_launch`. A code's absence from a verb's reachable set
+is a property of the operation, never a promise the code is unused.
+
+**The layout verbs are refused `no_surface`, `preempted` and `consent_held`**,
+and each is deliberate. `no_surface`: focusing a realm with no live view would
+bind the output to nothing and arranging one has no geometry to arrange — the
+asymmetry with `realm_launch` is that a vacant realm is the state *launch*
+exists to leave, and focus has no such excuse. `preempted` and `consent_held`:
+moving the human's attention while the human's own hand is on the input, or
+while that principal's consent prompt is up, is exactly the attention-shaped
+hazard those two codes exist for, so they are no longer actuation-only. They
+still refuse neither a capture (observation is concurrent by design) nor a
+launch.
 
 **`capacity` is a cross-principal side channel, and the only one here.** Every
 other code in this table answers from the asking principal's *own* grant:
@@ -576,12 +677,15 @@ rules](00-conventions.md) guarantee.
   existing bits. Bit *values* come from the repo-wide allocation registry, not
   from the next unused-looking power of two — see [the gap between 0x20 and
   0x200](#the-gap-between-0x20-and-0x200-is-allocation-not-free-space).
-- **Layout facet mint.** The `layout_arrange` and `layout_focus` verbs need a
-  facet to be exercised through, and `request_grant`'s five `new_id` arguments
-  are frozen. It therefore arrives as a `since`-gated **structural mint on this
-  interface** (`get_layout(new_id)`), following the same mint-freely,
-  check-at-use pattern as the co-minted facets. Both verbs are refused
-  `unsupported`, so there is nothing to mint yet.
+- **Layout facet mints — landed at version 2.**
+  [`get_layout_focus`](#get_layout_focus) and
+  [`get_layout_arrange`](#get_layout_arrange), minting
+  [`vitrin_layout_focus`](17-vitrin_layout_focus.md) and
+  [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md). **Two** mints, where
+  this row previously anticipated one `get_layout`: a facet interface declares
+  exactly one grant verb, so a combined facet could name only one of the pair
+  and D-018(3) requires them independently attenuable. The correction is
+  recorded here rather than made silently, because this row was the record.
 - **Launch facet mint — landed at version 2.**
   [`get_launcher`](#get_launcher) is the first facet minted this way rather
   than co-minted, and it is the worked example the layout mint follows: a

@@ -1006,7 +1006,7 @@ mod tests {
             flags: 0,
         };
         let Admission::Pending { petition } =
-            registry.admit(request, std::time::Instant::now(), &realms)
+            registry.admit(request, std::time::Instant::now(), &realms, false)
         else {
             panic!("an interactive petition must pend");
         };
@@ -1487,6 +1487,7 @@ mod tests {
             },
             std::time::Instant::now(),
             &realms,
+            false,
         ) else {
             panic!("an interactive petition must pend");
         };
@@ -1682,6 +1683,7 @@ mod tests {
             },
             std::time::Instant::now(),
             &realms,
+            false,
         ) else {
             panic!("an interactive petition must pend");
         };

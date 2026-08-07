@@ -1383,14 +1383,14 @@ fn run_inner(
             let size = state.view.backend.window_size();
             debug!(?size, "host window resized");
             // Every realm composes at the output's size, bound or not, so a
-            // resize moves every realm's geometry. `set_view_size` bumps each
-            // one's `layout_generation` (D-018(5), decision 4) — deliberately
-            // not `Scene::generation`, which the damage path keys on and
-            // which a resize is not a repaint of.
-            state
-                .view
-                .scenes
-                .set_view_size((size.w.max(0) as u32, size.h.max(0) as u32));
+            // resize moves every realm's geometry — and every realm in the
+            // FULLSCREEN arrangement is re-configured at the new size,
+            // because that is what `set_fullscreen` normatively promises
+            // ("and again whenever the output resizes while the realm is in
+            // it"). Both halves live in `session::apply_output_resize` so
+            // this backend cannot do one without the other; see that
+            // function for why the pairing is the whole point.
+            session::apply_output_resize(state, (size.w.max(0) as u32, size.h.max(0) as u32));
             // Drop the uploaded view; the next redraw recomposes it 1:1 at
             // the new size (kept pixel-exact for the P1.3.2/P1.3.6 goldens).
             state.view.texture = None;
@@ -1702,53 +1702,6 @@ pub(crate) fn route_turn<H: input::PreemptionHook>(
     }
 }
 
-/// Hand one routed seat event to the realm's shim, and journal it.
-///
-/// Physical input reaches the realm's seat over the same outbox an agent's
-/// chokepoint-admitted actuation uses; the origin tag bound at intake rides
-/// the wire unchanged (B2). This is the *only* site that produces
-/// `origin="physical"` at runtime — a human's input reaching the app is the
-/// half of the physical-vs-emulated audit that never crosses a chokepoint —
-/// so sharing [`input::record_seat_delivery`] with the agent path keeps the
-/// two from silently diverging (and inherits the motion-flood guard the
-/// physical path needs most, issue #83).
-///
-/// A free function rather than [`NestedState::route_physical_inputs`]'s
-/// inline closure so [`NestedState::handle_focus`] can pay the app the key
-/// releases a focus change owes it through *this* funnel — same outbox, same
-/// journal entry — instead of a second delivery path that could drift from
-/// it.
-///
-/// **Which realm, with more than one attached:** whichever
-/// [`session::seat_target`] names, which is the same function the agent half
-/// (`session::route_seat`) and the router's generation binding ask — routing
-/// physical input to a realm is WS-E.1.6's question, and answering it here
-/// would be answering it a second time, differently.
-fn deliver_physical(
-    realms: &std::collections::BTreeMap<crate::grants::RealmId, session::RealmRuntime>,
-    recorder: &mut Recorder,
-    delivery: input::SeatDelivery,
-) {
-    let Some((realm_id, realm)) = session::seat_target(realms) else {
-        trace!(origin = ?delivery.origin(), "routed input dropped: no serving realm attached");
-        return;
-    };
-    let Some(server) = realm.server.as_ref() else {
-        return;
-    };
-    let mut send = |frame: &[u8]| realm.outbox.send(frame);
-    match server.deliver_seat_event(&delivery, &mut send) {
-        Ok(sent) => {
-            if sent {
-                input::record_seat_delivery(recorder, realm_id, &delivery);
-            }
-        }
-        Err(err) => {
-            tracing::warn!(realm = %realm_id, %err, "seat delivery to the realm failed");
-        }
-    }
-}
-
 impl DeadManHost for NestedState {
     fn switch(&self) -> &Rc<RefCell<DeadManSwitch>> {
         &self.deadman
@@ -1841,50 +1794,20 @@ impl NestedState {
         // core follows). The grab and the dead-man watcher read it through
         // their hooks.
         self.now.set(Instant::now());
-        // Route this turn's events, then drain the dead-man watcher's replay
-        // (see `route_turn`, which owns both halves so they can be tested).
+        // The whole of the turn — bind the router's generation, map through
+        // the target realm's geometry, route, drain the dead-man watcher's
+        // replay, deliver — lives in `session::route_physical_turn`. It is
+        // there rather than inline here because CI has no display (D-019(4)),
+        // so anything inside a `NestedState` method is unreachable by every
+        // test in this workspace: that is how D-018(2)'s fifth ordering rule
+        // came to have production wiring a reviewer could revert while the
+        // suite stayed green.
         //
-        // **The seat target's own surface geometry** (WS-E.1.3): the router
-        // maps view coordinates to surface coordinates through
-        // `layout::place`, so it must be handed the geometry of the surface
-        // the event is about. With one scene those were the same thing; with
-        // several, a hidden realm's committed size would silently place a
-        // human's click for the app being typed into. Read from the same
-        // `seat_target` the binding and the delivery sink below use, so the
-        // three cannot disagree.
-        //
-        // Disjoint field borrows: the router is handed to `route_turn` while
-        // the delivery sink below reaches the realm's shim session. Both are
-        // fields of the same `Runtime`, so they are split here rather than
-        // reached through `&mut self` twice.
+        // Disjoint field borrows: `self.view.scenes` is read while
+        // `self.runtime` is borrowed mutably, so they are split here rather
+        // than reached through `&mut self` twice.
         let scenes = &self.view.scenes;
-        let session::Runtime {
-            router,
-            realms,
-            kernel,
-            ..
-        } = &mut self.runtime;
-        let surface = session::seat_target(realms)
-            .and_then(|(realm_id, _)| scenes.scene(realm_id))
-            .and_then(|scene| scene.surface_size());
-        // Before the routing, not after: `route_turn` writes this turn's
-        // presses into the router's pairing table, and that debt has to be
-        // on record as *this realm's* from the first one — otherwise a
-        // sibling realm dying mid-session would clear a key this app is
-        // still holding (`input::InputRouter::reset_for`). Same target the
-        // sink below picks, from the same function, so the two cannot
-        // disagree about whose generation this is.
-        if let Some((realm_id, _)) = session::seat_target(realms) {
-            router.bind_to(realm_id);
-        }
-        route_turn(
-            router,
-            &self.deadman,
-            inputs,
-            view,
-            surface,
-            &mut |delivery| deliver_physical(realms, &mut kernel.recorder, delivery),
-        );
+        session::route_physical_turn(&mut self.runtime, scenes, &self.deadman, inputs, view);
         // Backstop 2 of 3 for the elapse check (`crate::deadman`): the
         // switch is already being asked about this turn's events, so ask it
         // about the clock too. `OffChain` — a host input event is not a
@@ -1944,7 +1867,12 @@ impl NestedState {
 
         // Disjoint field borrows, the same split `route_physical_inputs`
         // takes: the router hands back the deliveries while the sink reaches
-        // the realm's shim session.
+        // the realm's shim session. The releases a focus change owes an app
+        // must reach the app that was *told* about the presses, which is the
+        // realm the output is bound to — `session::deliver_physical` reads
+        // that binding from the scene registry itself, so this site has no
+        // binding to get wrong.
+        let scenes = &self.view.scenes;
         let session::Runtime {
             router,
             realms,
@@ -1953,7 +1881,7 @@ impl NestedState {
         } = &mut self.runtime;
         for delivery in router.release_physical_keys() {
             debug!("releasing a key held across focus loss so it cannot latch in the app");
-            deliver_physical(realms, &mut kernel.recorder, delivery);
+            session::deliver_physical(realms, scenes, &mut kernel.recorder, delivery);
         }
     }
 
@@ -2446,6 +2374,14 @@ impl session::Presenter for NestedView {
     fn view_size(&self) -> (u32, u32) {
         let size = self.backend.window_size();
         (size.w.max(0) as u32, size.h.max(0) as u32)
+    }
+
+    /// The host window is the output here, so its size is already the new one
+    /// by the time `Resized` is dispatched — [`Self::view_size`] reads it
+    /// back from the backend. What this propagates is the scene registry's
+    /// copy, which is what bumps every realm's `layout_generation`.
+    fn set_view_size(&mut self, size: (u32, u32)) {
+        self.scenes.set_view_size(size);
     }
 
     /// Composites nothing, and deliberately so: this backend does not own its

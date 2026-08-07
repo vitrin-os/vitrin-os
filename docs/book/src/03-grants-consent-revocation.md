@@ -30,11 +30,13 @@ A row in the core's grant table:
 - **principal** — who. Authenticated at handshake, never asserted by the
   requester afterwards.
 - **resource** — what. A realm, or a specific surface within it.
-- **verbs** — which actions. `observe`, `actuate.pointer`, `actuate.text`
-  today; four more are defined but refuse `unsupported` — `observe.cursor`,
-  the two `layout.*` verbs, and `realm.launch` (added at wire version 2).
-  Defining a verb before serving it is deliberate: it makes asking for one a
-  recoverable refusal instead of a fatal out-of-range bit.
+- **verbs** — which actions. `observe`, `actuate.pointer`, `actuate.text` and
+  the two `layout.*` verbs today; two more are defined and refuse
+  `unsupported` — `observe.cursor` and `realm.launch` (added at wire version
+  2). Defining a verb before serving it is deliberate: it makes asking for one
+  a recoverable refusal instead of a fatal out-of-range bit. Which of the
+  defined verbs a deployment actually serves is that deployment's property,
+  not the wire's.
 - **constraints** — under what limits: expiry, event-rate ceiling, focus
   conditions, persistence.
 

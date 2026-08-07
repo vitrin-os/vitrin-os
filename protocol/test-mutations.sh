@@ -71,15 +71,24 @@ check_rejected allow-null-on-uint \
 check_rejected no-protocol-version \
   's|<protocol name="vitrin" version="2">|<protocol name="vitrin">|'
 
-# interface/@verb is a closed four-value set.
+# interface/@verb is a closed value set.
 check_rejected bad-verb-value \
   's|verb="observe"|verb="observe_frames"|'
 
 # ... and a verb name that reads like a grant verb but names no facet
 # interface is rejected too: the set is the facet-bearing verbs, not the
 # whole vitrin_grant.verb bitfield.
+#
+# `observe_cursor` is the standing example, and it is the only one left:
+# `layout_arrange` and `layout_focus` were facetless when this case was
+# written and each has an interface now (WS-E.1.4), so the old mutation
+# ("realm_launch" -> "layout_arrange") became a *legal* document and this
+# case reported the schema as broken when the schema was right. Re-pinned on
+# the verb that is facetless by construction -- it widens what capture_frame
+# composites rather than adding a request -- so this case cannot go stale the
+# same way again.
 check_rejected verb-without-facet \
-  's|verb="realm_launch"|verb="layout_arrange"|'
+  's|verb="realm_launch"|verb="observe_cursor"|'
 
 # Descriptions are required on every interface.
 check_rejected drop-interface-description \

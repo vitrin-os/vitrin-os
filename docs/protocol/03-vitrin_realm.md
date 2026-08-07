@@ -69,10 +69,11 @@ puts a prompt naming the principal and the template in front of the human, and
 that ties the authority's death to the grant's.
 
 **Served status.** No such prompt happens today, and none can: `realm_launch`
-is defined but **unserved**, like `observe_cursor` and the layout verbs, so a
+is defined but **unserved by the reference core**, like `observe_cursor`, so a
 petition naming it is refused `unsupported` at admission — before a prompt
 exists to show. What is decided now is the *design*; what is served is
-nothing. See [defined but
+nothing. (The layout verbs were in this same position and no longer are — the
+reference core serves both as of WS-E.1.4.) See [defined but
 unserved](./04-vitrin_grant.md#defined-but-unserved).
 
 A realm handle *is* still how such a petition is addressed — it names a realm
@@ -237,9 +238,9 @@ that are **defined on [`vitrin_grant`](./04-vitrin_grant.md)** and documented
 there:
 
 - `verbs` uses the bitfield [`vitrin_grant.verb`](./04-vitrin_grant.md#verb)
-  (`observe` = 1, `actuate_pointer` = 2, `actuate_text` = 4, plus the
-  defined-but-unserved `observe_cursor` = 8, `layout_arrange` = 16,
-  `layout_focus` = 32 and `realm_launch` = 512).
+  (`observe` = 1, `actuate_pointer` = 2, `actuate_text` = 4,
+  `layout_arrange` = 16, `layout_focus` = 32, plus the defined-but-unserved
+  `observe_cursor` = 8 and `realm_launch` = 512).
 - `persistence` uses the enum
   [`vitrin_grant.persistence`](./04-vitrin_grant.md#persistence) (`once` = 0,
   `while_running` = 1, `until_revoked` = 2, `always` = 3).

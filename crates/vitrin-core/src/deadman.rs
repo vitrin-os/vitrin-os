@@ -1795,6 +1795,7 @@ mod tests {
             },
             Instant::now(),
             &realms,
+            false,
         ) else {
             panic!("an interactive petition must pend");
         };
@@ -2107,6 +2108,10 @@ mod tests {
                         // must not silently supply its refusals.
                         seat_reaches_grant_realm: true,
                         actuations: &mut |_input| {},
+                        // No layout use here; the sink must still exist,
+                        // and a layout act reaching it would be the bug.
+                        grant_realm: None,
+                        layout: &mut |act| panic!("no layout act expected: {act:?}"),
                     },
                     now,
                     &mut |_frame, _fd| Ok(()),

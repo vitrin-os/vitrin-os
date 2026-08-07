@@ -14,11 +14,11 @@ What is claimed, and what is not. Each realm really does get its own shim
 process, its own `$XDG_RUNTIME_DIR/vitrin-0/<id>/` tree and its own
 `wayland-0` address — that is the paths half of the claim
 `crates/vitrin-core/src/realm.rs` audits, and it is the half that was
-genuinely a deletion. What multi-realm does *not* yet buy is a per-realm
-view: the core still composites one output from one scene, so only the last
-committer is visible and a capture is of that output rather than of the
-realm a grant names. Binding an output to a realm is WS-E.1.3, and nothing
-below asserts otherwise.
+genuinely a deletion. Since WS-E.1.3 each realm also gets its own scene and
+its own capture: an `observe` grant returns the pixels of the realm it
+names, hidden or not. What multi-realm does *not* buy is a per-realm
+**output** -- the core composites one output from the one realm bound to it,
+the first to attach -- and nothing below asserts otherwise.
 
 These are **component** tests: the realms run `vitrin-mock-shim`, not a real
 app under the real C shim, so they are not evidence for any milestone. The
@@ -277,10 +277,17 @@ class OneRealmDies(IntegrationTest):
 
         Liveness is judged against the realm a grant row names, not against
         "is any realm live". The second reading is fail-**open** across
-        realms: with two realms attached, a grant over the dead one would
-        clear the gate on the living one's account and then capture the
-        shared scene — which in this project is an authority bug rather than
-        a fidelity one.
+        realms: with two realms attached, a grant over the dead one clears
+        the gate on the living one's account and is then served a frame at
+        all.
+
+        Since WS-E.1.3 the frame it would be served is that realm's own last
+        composition rather than the sibling's — the scenes are per realm and
+        the capture cache is keyed and pruned by realm id. So the failure this
+        gate now stands between is a **stale** frame, which the protocol
+        forbids in as many words (`no_surface` is documented as "never a stale
+        frame"), rather than a sibling's pixels. One property milder, still
+        refused here.
 
         The pair is the evidence. A fix that refused *everything* after any
         realm's death would satisfy the first assertion and lose the session.
@@ -292,9 +299,13 @@ class OneRealmDies(IntegrationTest):
             doomed = whole_realm_grant(conn, realm="editor")
             survivor = whole_realm_grant(conn, realm="realm-0")
             # Both capture while both realms are live: the baseline the
-            # refusal below is measured against. (That they see the *same*
-            # output is the published WS-E.1.3 limit, not this test's
-            # subject.)
+            # refusal below is measured against. Each frame is its own realm's
+            # composition; that the two happen to be byte-identical here is a
+            # content coincidence, because `vitrin-mock-shim` paints a pure
+            # function of the frame index and both realms run the same mock.
+            # Two *different* pictures proving the selection is
+            # `test_two_realms.py`'s job, with real apps — this test asserts
+            # only which grant is refused.
             capture_when_ready(survivor)
             capture_when_ready(doomed)
 
@@ -305,9 +316,10 @@ class OneRealmDies(IntegrationTest):
                 time.sleep(0.05)
             self.assertFalse(_alive(editor), "the victim must be reaped")
 
-            # The survivor keeps painting, so the shared scene has a surface
-            # again — exactly the state a fail-open liveness check would have
-            # served to the dead realm's grant.
+            # The survivor keeps painting, so *a* realm in this session still
+            # has a committed surface — exactly the state a fail-open
+            # ("is any realm live") check would have cleared the dead realm's
+            # grant on.
             capture_when_ready(survivor)
 
             with self.assertRaises(errors.NoSurface):

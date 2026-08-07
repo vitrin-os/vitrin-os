@@ -14,11 +14,15 @@
 //! design smell here and belong outside the core.
 //!
 //! **A session can now hold more than one realm** (WS-E.1.2), and this
-//! module has not moved with it: every realm's shim commits into the same
-//! single-surface [`crate::scene::Scene`], so the last committer is the one
-//! placed and the rest are invisible. Binding an output to a realm is
-//! WS-E.1.3's, and it is the task that decides *which* surface reaches
-//! here — not a second placement rule added below.
+//! module still has not moved, which is the correct outcome. WS-E.1.3 gave
+//! every realm its own single-surface [`crate::scene::Scene`] and bound the
+//! output to one of them, so *which* surface reaches here is decided
+//! outside this module — by the binding — and each realm's placement is
+//! still one surface, centered, unscaled. That is what "must never grow"
+//! looked like under the pressure that would most obviously have grown it:
+//! two realms are not two placements, they are one placement asked twice.
+//! Stacking, overlap and per-realm resize were all declined explicitly
+//! (issue #209 decision 3).
 //!
 //! No decorations by construction: the shim disables server-side
 //! decorations via xdg-decoration (P1.6.1) and the core draws nothing

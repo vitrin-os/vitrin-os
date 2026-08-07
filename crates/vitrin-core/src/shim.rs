@@ -591,11 +591,16 @@ impl ShimServer {
     /// a bare clear: one router serves a session that may hold several
     /// realms (WS-E.1.2), so a realm dying must forget its **own** seat
     /// state and leave a sibling's alone — otherwise a key the sibling's app
-    /// is holding latches down when an unrelated realm exits. The scene half
-    /// above is still session-wide, and deliberately so: there is one scene
-    /// with one committed surface until WS-E.1.3 binds an output to a realm,
-    /// and clearing it is the fail-closed direction (survivors' captures
-    /// refuse `no_surface` until they commit again).
+    /// is holding latches down when an unrelated realm exits. The `scene` and
+    /// the `importer` handed in are likewise **this realm's own** since
+    /// WS-E.1.3 (the embedder resolves both by realm id in
+    /// `Presenter::teardown_view`: the scene from `RealmScenes::scene_mut`,
+    /// the importer over `RealmGpuContent::slot_mut`), so this drops exactly
+    /// the dying realm's surface and exactly its own retained texture, and
+    /// leaves every sibling's composed view byte-identical and every
+    /// sibling's GPU content resident. They used to be the session's one
+    /// scene and one retained slot, where clearing them took whatever
+    /// happened to be there -- fail-closed, but not scoped.
     ///
     /// [`InputRouter::reset_for`]: crate::input::InputRouter::reset_for
     pub fn connection_closed<H: crate::input::PreemptionHook>(

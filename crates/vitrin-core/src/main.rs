@@ -350,14 +350,18 @@ USAGE:
                                 on its path owned by root or the core's uid and
                                 not writable by group or other).
     vitrind [--capture-dump PATH]
-                                DIAGNOSTIC (P1.8.5): mirror every composited
-                                realm-view readback to PATH as raw RGBA8888
+                                DIAGNOSTIC (P1.8.5): mirror every live realm's
+                                composited realm-view readback to
+                                PATH.<realm-id> as raw RGBA8888
                                 (width*height*4, rows top-down) — the
                                 core-internal capture, taken before the wire and
-                                the SDK ever run. Used by the real-app fidelity
-                                test to prove the capture path adds no
-                                distortion; off by default, and not a wire
-                                feature. Written atomically each redraw.
+                                the SDK ever run. NOTHING is written to PATH
+                                itself: every dump names the realm it is of, so
+                                a comparison against an agent's frame cannot be
+                                about a realm nobody chose (WS-E.1.3). Used by
+                                the real-app fidelity test to prove the capture
+                                path adds no distortion; off by default, and not
+                                a wire feature. Written atomically each redraw.
     vitrind [--dead-man-chord KEY]
                                 Key for the dead-man switch: holding it
                                 revokes every grant in the session at once.
@@ -373,13 +377,17 @@ USAGE:
                                 no physical input device, structurally.
     vitrind --agent-cursor      `--headless` ONLY: also composite the agent
                                 cursor sprite into this run's human-visible
-                                output. Nested mode always composites it (a
-                                human is watching that window), which is why
-                                the flag is refused with `--nested` rather
-                                than accepted as a no-op. Off by default here
+                                output. Nested mode needs no flag -- a human
+                                is watching that window -- which is why this
+                                one is refused with `--nested` rather than
+                                accepted as a no-op. Off by default here
                                 because the headless human-visible framebuffer
                                 is measured byte-for-byte against the realm
                                 view by the trusted-band witness (issue #139).
+                                Neither mode draws a sprite for a realm the
+                                output is not bound to: with several realms
+                                configured, an agent acting in a hidden realm
+                                draws nothing (a published limit, WS-E.1.3).
                                 The sprite NEVER reaches a captured frame in
                                 either mode: it is drawn at the output stage,
                                 downstream of the composite a capture reads.
@@ -440,9 +448,14 @@ enum Action {
         realm: Option<PathBuf>,
         shim: Option<PathBuf>,
         /// The `--capture-dump PATH` diagnostic target (P1.8.5, issue #107):
-        /// mirror every composited realm-view readback to a file, the
-        /// core-internal capture the fidelity test compares an agent's
-        /// `observe()` frame against. Valid in both modes; exercised headless.
+        /// mirror each live realm's composited realm-view readback to
+        /// `PATH.<realm-id>`, the core-internal capture the fidelity gate
+        /// compares an agent's `observe()` frame against. The realm suffix is
+        /// load-bearing since WS-E.1.3 (issue #209) -- with N realms an
+        /// unqualified dump names *a* view and the gate's ground truth
+        /// becomes a guess -- and the bare `PATH` is never written; see
+        /// `session::capture_dump_path`. Valid in both modes; exercised
+        /// headless.
         capture_dump: Option<PathBuf>,
         /// Parsed and validated even here, so the same command line is
         /// accepted or refused identically in both modes -- the `--consent`
@@ -456,11 +469,15 @@ enum Action {
         /// `--agent-cursor` (D-019): composite the agent cursor sprite into
         /// this run's human-visible output.
         ///
-        /// Headless-only, and `false` by default. Nested always composites
-        /// the sprite, so there is no field for it on
-        /// [`Action::RunNested`] -- the flag is refused with `--nested` at
-        /// parse time rather than accepted as a silent no-op, the same
-        /// posture `--size` and `--consent-injector-fd` take. The default is
+        /// Headless-only, and `false` by default. Nested needs no flag --
+        /// it draws the sprite for whatever position the runtime offers it --
+        /// so there is no field for it on [`Action::RunNested`], and the flag
+        /// is refused with `--nested` at parse time rather than accepted as a
+        /// silent no-op, the same posture `--size` and
+        /// `--consent-injector-fd` take. Since WS-E.1.3 the *runtime* is what
+        /// withholds the position when the router's realm is not the realm
+        /// the output is bound to (`session::post_dispatch`), so neither
+        /// backend draws a hidden realm's sprite whatever this flag says. The default is
         /// off here because this backend's human-visible framebuffer is
         /// measured against the realm view by the trusted-band witness
         /// (issue #139) and by `tests/integration/test_real_trust_band.py`;
@@ -684,14 +701,20 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     }
 
     // `--agent-cursor`'s companion refusal (D-019), at parse time like every
-    // other one here. Nested mode always composites the sprite -- it is the
-    // mode a human watches -- so the flag would be a no-op there, and a flag
-    // that silently does nothing is how an operator comes to believe a run is
-    // configured differently than it is. `--size` sets the precedent.
+    // other one here. Nested needs no opt-in -- it is the mode a human watches
+    // -- so the flag would be a no-op there, and a flag that silently does
+    // nothing is how an operator comes to believe a run is configured
+    // differently than it is. `--size` sets the precedent.
+    //
+    // "No opt-in" is not "always drawn": `session::post_dispatch` offers a
+    // position only for the realm the output is bound to (WS-E.1.3), so an
+    // agent acting in a hidden realm draws no sprite in either mode. That is
+    // a published limit and it is not what this flag is about.
     if agent_cursor && matches!(mode, Some(Mode::Nested)) {
         return Err(
-            "`--agent-cursor` is only valid with `--headless`: nested mode always composites \
-             the agent cursor into the host window, so the flag would do nothing there."
+            "`--agent-cursor` is only valid with `--headless`: nested mode composites the \
+             agent cursor into the host window with no opt-in, so the flag would do nothing \
+             there."
                 .into(),
         );
     }
@@ -3023,10 +3046,10 @@ mod tests {
             "--agent-cursor"
         ]));
 
-        // Nested always composites the sprite, so the flag would do nothing
-        // there: refused at parse time, the `--size` precedent.
+        // Nested needs no opt-in, so the flag would do nothing there:
+        // refused at parse time, the `--size` precedent.
         let nested = parse_args(["--nested", "--agent-cursor"])
-            .expect_err("nested composites the agent cursor unconditionally");
+            .expect_err("nested composites the agent cursor with no flag");
         assert!(nested.contains("--headless"), "{nested}");
         assert!(nested.contains("--agent-cursor"), "{nested}");
         // With no mode at all it is still the missing mode that is reported.

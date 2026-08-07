@@ -94,10 +94,11 @@ use tracing::{debug, error, info, trace};
 use crate::consent::grab::{ConsentGate, ConsentGrab};
 use crate::consent::{ConsentSurface, TrustedIndicator};
 use crate::deadman::{DeadManConfig, DeadManHook, DeadManSwitch, Trigger};
-use crate::dmabuf::{present_human_visible, DmabufImporter, GlesDmabufImporter, GpuContent};
+use crate::dmabuf::{present_human_visible, DmabufImporter, GlesDmabufImporter, RealmGpuContent};
+use crate::grants::RealmId;
 use crate::input;
 use crate::recorder::Recorder;
-use crate::scene::Scene;
+use crate::scene::{RealmScenes, Scene};
 use crate::session::{self, Runtime, RuntimeSeed};
 
 /// Initial logical window size; matches the planned headless default
@@ -156,10 +157,27 @@ const FRAME_BUDGET: Duration = Duration::from_micros(16_667);
 /// prompt on it) until the scene happened to change next, and GL presentation
 /// cannot be driven on a CI runner with no display. See
 /// `the_texture_key_changes_on_every_visible_transition`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TextureKey {
     size: Size<i32, Physical>,
-    /// [`Scene::generation`] at upload time.
+    /// The realm the output was bound to at upload time (WS-E.1.3, issue
+    /// #209), or `None` when nothing was bound.
+    ///
+    /// In the key because a bind changes every pixel of the window, and
+    /// nothing else here would notice: [`Self::scene_generation`] is the
+    /// *bound* scene's counter, and two realms' counters are independent —
+    /// realm B's generation can equal realm A's by coincidence, so a bind
+    /// between them would compare equal and leave the previous realm's
+    /// texture on the human's screen until something unrelated changed.
+    ///
+    /// Deliberately **not** the realm's `layout_generation`: that counter is
+    /// D-018(5)'s and issue #209 lands it unread on purpose, so the texture
+    /// cache does not become its first consumer by accident. The identity of
+    /// the bound realm is the fact this key needs, and it is the one it
+    /// carries. (This is what costs [`TextureKey`] its `Copy`: a `RealmId`
+    /// owns a `String`.)
+    realm: Option<RealmId>,
+    /// [`Scene::generation`] of the **bound** realm's scene at upload time.
     scene_generation: u64,
     /// [`ConsentSurface::generation`] at upload time. A separate counter
     /// rather than a merged one because the two changes have different
@@ -197,6 +215,7 @@ impl TextureKey {
     /// The key describing what a texture composed *right now* would contain.
     fn current(
         size: Size<i32, Physical>,
+        realm: Option<&RealmId>,
         scene: &Scene,
         consent: &ConsentSurface,
         hold: Option<f64>,
@@ -204,6 +223,7 @@ impl TextureKey {
     ) -> Self {
         Self {
             size,
+            realm: realm.cloned(),
             scene_generation: scene.generation(),
             consent_generation: consent.generation(),
             hold_bucket: hold.map(|p| (p.clamp(0.0, 1.0) * HOLD_STEPS) as u8),
@@ -283,6 +303,45 @@ fn window_pixels(
         crate::deadman::composite_hold_indicator(&mut pixels, w, h, progress);
     }
     pixels
+}
+
+/// **Whose retained texture this frame presents zero-copy** — the *bound*
+/// realm's, or nothing at all (WS-E.1.3, issue #209).
+///
+/// `None` means [`NestedState::try_redraw`] takes the CPU compose path over
+/// [`RealmScenes::bound`] instead, which is what it did before any dmabuf was
+/// ever imported. There are exactly three ways to get it:
+///
+/// - **No realm is bound.** There is no picture to be showing, so there is no
+///   texture to show.
+/// - **The bound realm has imported nothing** (or its import was cleared by a
+///   shm commit or by its death). A *hidden* realm's retained content is not a
+///   candidate here and that is the whole point of this function: the CPU path
+///   was keyed on the bound realm from the start and this one was not, so with
+///   `--dmabuf` a hidden realm's commit took over the human's window and
+///   falsified the published "only the bound realm is on screen" claim on the
+///   one path a human actually looks at.
+/// - **An overlay needs the window.** A consent card (P1.7.1) or a dead-man
+///   hold indicator (P1.7.3) is up, and neither can be composited onto a GPU
+///   texture on this path — see [`NestedState::try_redraw`], which carries that
+///   seam's full argument.
+///
+/// A free function rather than a method on either argument because it is a
+/// judgement *between* them, and split out for the reason [`window_pixels`] is:
+/// presenting needs an EGL context and a host window, so CI cannot drive
+/// `try_redraw` end to end (D-019(4) records headless as the only backend CI
+/// can run). This is the part of that frame path a display-free test can hold,
+/// and `a_hidden_realms_dmabuf_import_is_never_what_the_window_presents` holds
+/// it.
+fn zero_copy_source<'a, C>(
+    scenes: &RealmScenes,
+    content: &'a RealmGpuContent<C>,
+    overlay_up: bool,
+) -> Option<&'a C> {
+    if overlay_up {
+        return None;
+    }
+    content.of(scenes.focused()?)
 }
 
 /// The pixels this backend serves as an **agent capture** (P1.3.8, issue
@@ -1107,11 +1166,13 @@ fn init_nested_winit(
 /// rather than one flat struct (see [`crate::session`]).
 pub(crate) struct NestedView {
     backend: NestedWinitBackend,
-    /// The realm's scene (P1.3.3) — the same composition implementation the
-    /// headless backend retains for capture; this backend presents its
-    /// output 1:1 in the host window. The shim-facing protocol server
-    /// (P1.3.4) commits into it and requests a redraw.
-    scene: Scene,
+    /// **Every realm's scene, and the one bound to the host window**
+    /// (P1.3.3; WS-E.1.3, issue #209) — the same composition implementation
+    /// the headless backend retains for capture; this backend presents the
+    /// *bound* realm's output 1:1 in the host window. The shim-facing
+    /// protocol server (P1.3.4) commits into the committing realm's own
+    /// scene and requests a redraw.
+    scenes: RealmScenes,
     /// The consent surface (P1.7.1): the prompt composited above the realm
     /// view in the host window. Driven now (issue #90): once per dispatch
     /// round [`session::RuntimeHost::service_consent`] calls
@@ -1134,14 +1195,21 @@ pub(crate) struct NestedView {
     /// the construction site.
     indicator: TrustedIndicator,
     texture: Option<SceneTexture>,
-    /// The retained zero-copy GPU content, if a `kind=dmabuf` commit has
-    /// been imported and nothing has replaced it since (P1.3.5, issue
-    /// #117). Lives here rather than in [`Scene`] because it is GPU state
-    /// bound to this backend's own [`GlesRenderer`] — [`Scene`] stays
-    /// renderer-free and shared with the headless backend, which has no
-    /// GPU to hold this on. `None` on every path that has not imported a
-    /// dmabuf: the ordinary shm/CPU-compose path, unchanged.
-    dmabuf_content: Option<GpuContent>,
+    /// **Every realm's** retained zero-copy GPU content: one slot per realm,
+    /// filled by a `kind=dmabuf` commit and emptied by a replacement or by
+    /// that realm's death (P1.3.5, issue #117; keyed by realm since WS-E.1.3,
+    /// issue #209). Lives here rather than in [`Scene`] because it is GPU
+    /// state bound to this backend's own [`GlesRenderer`] — [`Scene`] stays
+    /// renderer-free and shared with the headless backend, which has no GPU
+    /// to hold this on. Every slot empty on every path that has not imported
+    /// a dmabuf: the ordinary shm/CPU-compose path, unchanged.
+    ///
+    /// Keyed for the same reason [`Self::scenes`] is, and it is not a
+    /// symmetry argument: while this was one slot for the session, the
+    /// zero-copy branch of [`NestedState::try_redraw`] presented whichever
+    /// realm imported last, so a **hidden** realm's commit took the human's
+    /// window. [`RealmGpuContent`] carries the whole argument.
+    dmabuf_content: RealmGpuContent,
     /// The agent-owned pointer position this window draws the cursor sprite
     /// at (D-019), pushed here once per dispatch round by
     /// [`session::Presenter::set_agent_cursor`] from
@@ -1314,6 +1382,15 @@ fn run_inner(
         NestedWinitEvent::Resized => {
             let size = state.view.backend.window_size();
             debug!(?size, "host window resized");
+            // Every realm composes at the output's size, bound or not, so a
+            // resize moves every realm's geometry. `set_view_size` bumps each
+            // one's `layout_generation` (D-018(5), decision 4) — deliberately
+            // not `Scene::generation`, which the damage path keys on and
+            // which a resize is not a repaint of.
+            state
+                .view
+                .scenes
+                .set_view_size((size.w.max(0) as u32, size.h.max(0) as u32));
             // Drop the uploaded view; the next redraw recomposes it 1:1 at
             // the new size (kept pixel-exact for the P1.3.2/P1.3.6 goldens).
             state.view.texture = None;
@@ -1362,14 +1439,20 @@ fn run_inner(
         .as_ref()
         .expect("the seed is present until the state is built")
         .indicator;
+    // Read before `backend` moves into the state: the scene set is seeded
+    // with the window's size so the very first `Resized` that reports the
+    // same size is correctly a no-op for `layout_generation`.
+    let backend_size = backend.window_size();
     let mut state = NestedState {
         view: NestedView {
             backend,
-            scene: Scene::new(),
+            // The host window's current size; the `Resized` handler feeds
+            // every later change through `RealmScenes::set_view_size`.
+            scenes: RealmScenes::new((backend_size.w.max(0) as u32, backend_size.h.max(0) as u32)),
             consent: ConsentSurface::new(indicator),
             indicator,
             texture: None,
-            dmabuf_content: None,
+            dmabuf_content: RealmGpuContent::new(),
             // No agent has moved a pointer yet; the first emulated motion
             // establishes it (`InputRouter::agent_pointer`).
             agent_cursor: None,
@@ -1760,17 +1843,30 @@ impl NestedState {
         self.now.set(Instant::now());
         // Route this turn's events, then drain the dead-man watcher's replay
         // (see `route_turn`, which owns both halves so they can be tested).
-        let surface = self.view.scene.surface_size();
+        //
+        // **The seat target's own surface geometry** (WS-E.1.3): the router
+        // maps view coordinates to surface coordinates through
+        // `layout::place`, so it must be handed the geometry of the surface
+        // the event is about. With one scene those were the same thing; with
+        // several, a hidden realm's committed size would silently place a
+        // human's click for the app being typed into. Read from the same
+        // `seat_target` the binding and the delivery sink below use, so the
+        // three cannot disagree.
+        //
         // Disjoint field borrows: the router is handed to `route_turn` while
         // the delivery sink below reaches the realm's shim session. Both are
         // fields of the same `Runtime`, so they are split here rather than
         // reached through `&mut self` twice.
+        let scenes = &self.view.scenes;
         let session::Runtime {
             router,
             realms,
             kernel,
             ..
         } = &mut self.runtime;
+        let surface = session::seat_target(realms)
+            .and_then(|(realm_id, _)| scenes.scene(realm_id))
+            .and_then(|scene| scene.surface_size());
         // Before the routing, not after: `route_turn` writes this turn's
         // presses into the router's pairing table, and that debt has to be
         // on record as *this realm's* from the first one — otherwise a
@@ -1963,9 +2059,10 @@ impl NestedState {
         let hold = self.deadman.borrow().hold_progress(Instant::now());
         let overlay_up = hold.is_some() || self.view.consent.prompt().is_some();
 
-        // Zero-copy dmabuf presentation (P1.3.5, issue #117): a retained GPU
-        // import exists and neither overlay needs the window this frame, so
-        // the client's own texture goes straight to the framebuffer via
+        // Zero-copy dmabuf presentation (P1.3.5, issue #117): **the bound
+        // realm** has a retained GPU import and neither overlay needs the
+        // window this frame, so the client's own texture goes straight to the
+        // framebuffer via
         // [`present_human_visible`] — no CPU composite, no [`ImportMem`]
         // upload of any kind, and no core-side copy of a client pixel. This
         // is the runtime home of the zero-memcpy claim [`crate::dmabuf`]'s
@@ -2004,13 +2101,19 @@ impl NestedState {
         // petition gets decided, a hold releases or fires — so the window
         // self-heals back to live GPU content the instant `overlay_up` next
         // reads `false`.
-        if self.view.dmabuf_content.is_some() && !overlay_up {
+        //
+        // **Whose texture, decided by [`zero_copy_source`] and nowhere else**
+        // (WS-E.1.3). Before that this branch asked only "is there a retained
+        // import", of a slot every realm shared, so a hidden realm's dmabuf
+        // commit became the picture in the human's window — the CPU path had
+        // been keyed on the bound realm and this one had not.
+        if zero_copy_source(&self.view.scenes, &self.view.dmabuf_content, overlay_up).is_some() {
             {
                 // Scoped: `bind` holds `self.view.backend` mutably (a
-                // disjoint field from `dmabuf_content` and `indicator`) for
-                // the duration of the composite, and both borrows must end
-                // here — `submit` and `schedule_next_frame` right after need
-                // the whole `self.view`/`self` back.
+                // disjoint field from `dmabuf_content`, `scenes` and
+                // `indicator`) for the duration of the composite, and both
+                // borrows must end here — `submit` and `schedule_next_frame`
+                // right after need the whole `self.view`/`self` back.
                 let indicator = self.view.indicator;
                 // Copied out before the mutable borrow, same as the
                 // indicator. The sprite rides in the draw list rather than
@@ -2018,7 +2121,13 @@ impl NestedState {
                 // quietly present without it (`dmabuf::human_visible_frame`).
                 let agent_cursor = self.view.agent_cursor;
                 let (renderer, mut framebuffer) = self.view.backend.bind()?;
-                let content = self.view.dmabuf_content.as_ref().expect("checked above");
+                // Resolved a second time rather than held across `bind`: the
+                // selection is one map lookup, and re-asking the same function
+                // is what keeps the branch condition and the presented texture
+                // from ever being two different decisions.
+                let content =
+                    zero_copy_source(&self.view.scenes, &self.view.dmabuf_content, overlay_up)
+                        .expect("checked above");
                 present_human_visible(
                     renderer,
                     &mut framebuffer,
@@ -2052,9 +2161,16 @@ impl NestedState {
         // scene or the consent surface next happened to change, which for an
         // agent hovering over a static app is never.
         let agent_cursor = self.view.agent_cursor;
+        // **The bound realm's** scene: this is the window, and the window
+        // shows one realm (WS-E.1.3). A hidden realm's commit still marks the
+        // frame dirty and still costs this backend a redraw — that is
+        // decision 2's pacing bill, paid so the hidden realm's own capture
+        // never goes stale — but it changes no pixel here, and the texture
+        // key says so by keying on the bound scene's generation alone.
         let key = TextureKey::current(
             size,
-            &self.view.scene,
+            self.view.scenes.focused(),
+            self.view.scenes.bound(),
             &self.view.consent,
             hold,
             agent_cursor,
@@ -2069,14 +2185,14 @@ impl NestedState {
             != Some(key.scene_generation);
         let scene_damage = if scene_dirty {
             self.view
-                .scene
-                .take_damage_view((size.w.max(0) as u32, size.h.max(0) as u32))
+                .scenes
+                .take_bound_damage((size.w.max(0) as u32, size.h.max(0) as u32))
         } else {
             None
         };
-        if self.view.texture.as_ref().map(|v| v.key) != Some(key) {
+        if self.view.texture.as_ref().map(|v| &v.key) != Some(&key) {
             let pixels = window_pixels(
-                &self.view.scene,
+                self.view.scenes.bound(),
                 &mut self.view.consent,
                 hold,
                 agent_cursor,
@@ -2109,6 +2225,7 @@ impl NestedState {
             let bounded_scene_only_damage = match (&self.view.texture, scene_damage) {
                 (Some(prev), Some(rect))
                     if prev.key.size == key.size
+                        && prev.key.realm == key.realm
                         && prev.key.consent_generation == key.consent_generation
                         && prev.key.hold_bucket == key.hold_bucket
                         && prev.key.agent_cursor == key.agent_cursor =>
@@ -2126,7 +2243,7 @@ impl NestedState {
                         .backend
                         .renderer()
                         .update_memory(&prev.texture, &pixels, region)?;
-                    self.view.texture.as_mut().expect("checked above").key = key;
+                    self.view.texture.as_mut().expect("checked above").key = key.clone();
                     trace!(?rect, "damage-limited texture upload");
                 }
                 // Degenerate (all-zero) damage: the accumulated change
@@ -2137,7 +2254,7 @@ impl NestedState {
                 // state rather than re-deriving the same "nothing to do"
                 // answer.
                 Some(_) => {
-                    self.view.texture.as_mut().expect("checked above").key = key;
+                    self.view.texture.as_mut().expect("checked above").key = key.clone();
                 }
                 None => {
                     let texture = self.view.backend.renderer().import_memory(
@@ -2306,8 +2423,24 @@ impl session::RuntimeHost for NestedState {
 }
 
 impl session::Presenter for NestedView {
-    fn scene(&mut self) -> &mut Scene {
-        &mut self.scene
+    fn scene_mut(&mut self, realm: &RealmId) -> &mut Scene {
+        self.scenes.scene_mut(realm)
+    }
+
+    fn scene(&self, realm: &RealmId) -> Option<&Scene> {
+        self.scenes.scene(realm)
+    }
+
+    fn focused(&self) -> Option<&RealmId> {
+        self.scenes.focused()
+    }
+
+    fn bind_output(&mut self, realm: &RealmId) {
+        self.scenes.bind(realm);
+    }
+
+    fn unbind_output(&mut self) {
+        self.scenes.unbind();
     }
 
     fn view_size(&self) -> (u32, u32) {
@@ -2395,12 +2528,19 @@ impl session::Presenter for NestedView {
     /// no realm view to compose, so the capture meets the chokepoint's
     /// `no_surface` refusal — the honest answer, exactly as before this
     /// backend could serve captures at all.
-    fn view_rgba(&mut self) -> Option<Vec<u8>> {
-        // The window size is the size the realm view composes at (P1.3.3), the
-        // same one `view_size` and `try_redraw` read. `capture_pixels` composes
-        // the bare scene — never `window_pixels` — so the overlay and the hold
+    fn view_rgba(&mut self, realm: &RealmId) -> Option<Vec<u8>> {
+        // The window size is the size *every* realm's view composes at
+        // (P1.3.3; decision 3 keeps one output size for all of them), the same
+        // one `view_size` and `try_redraw` read. `capture_pixels` composes the
+        // bare scene — never `window_pixels` — so the overlay and the hold
         // indicator cannot reach a capture.
-        capture_pixels(&self.scene, self.backend.window_size())
+        //
+        // **This realm's scene, bound or not** (WS-E.1.3): a hidden realm's
+        // `observe` grant serves that realm's own composition, and the bound
+        // realm has no privileged path here — nested composes on the CPU for
+        // both, which is why this backend needed no second implementation to
+        // stop leaking siblings' pixels.
+        capture_pixels(self.scenes.scene(realm)?, self.backend.window_size())
     }
 
     fn request_present(&mut self) {
@@ -2418,9 +2558,14 @@ impl session::Presenter for NestedView {
     /// [`TextureKey::agent_cursor`] keys on, so this method and the texture
     /// cache cannot disagree about what counts as a move.
     ///
-    /// Nested mode always composites the sprite. It is the mode a human is
-    /// watching, and the reason this change exists at all — an operator was
-    /// told to "watch the cursor move" at a window that drew none.
+    /// This backend never opts out of the sprite: it is the mode a human is
+    /// watching, and the reason D-019 exists at all — an operator was told to
+    /// "watch the cursor move" at a window that drew none. That is a statement
+    /// about *this method*, not about every frame: since WS-E.1.3
+    /// [`session::post_dispatch`] offers `None` unless the router's realm is
+    /// the realm the output is bound to, so an agent acting in a hidden realm
+    /// reaches here with nothing to draw. See
+    /// [`session::Presenter::set_agent_cursor`] for that gate and its cost.
     fn set_agent_cursor(&mut self, pos: Option<(f64, f64)>) -> bool {
         let quantize =
             |pos: Option<(f64, f64)>| pos.and_then(|(x, y)| crate::cursor::hotspot(x, y));
@@ -2449,10 +2594,17 @@ impl session::Presenter for NestedView {
     ///
     /// The importer, unlike the retained half, is very much needed here: a
     /// GPU renderer exists ([`Self::backend`]'s `GlesRenderer`), and the
-    /// death funnel must drop any retained [`GpuContent`] through it
-    /// ([`DmabufImporter::clear`]) exactly as a live dispatch's replacing
+    /// death funnel must drop the dying realm's retained GPU content through
+    /// it ([`DmabufImporter::clear`]) exactly as a live dispatch's replacing
     /// commit would — the same GPU-done sync, the same single disposal
     /// path, never a second one for teardown alone.
+    ///
+    /// **It is lent `realm`'s own slot** (WS-E.1.3): the importer is built
+    /// over [`RealmGpuContent::slot_mut`], so a death drops exactly the dying
+    /// realm's texture. Before that there was one slot for the session, so any
+    /// realm's death cleared whichever realm's content happened to be resident
+    /// — the same session-wide reach the scene half had, and it outlived the
+    /// scene's fix because the two are different fields.
     ///
     /// The concrete [`GlesDmabufImporter`] lives as this call's own local —
     /// never boxed and handed back by value (see
@@ -2462,6 +2614,7 @@ impl session::Presenter for NestedView {
     /// call.
     fn teardown_view<R>(
         &mut self,
+        realm: &RealmId,
         f: impl for<'v> FnOnce(
             &'v mut Scene,
             Option<&'v mut dyn crate::lifecycle::RetainedOutput>,
@@ -2470,9 +2623,9 @@ impl session::Presenter for NestedView {
     ) -> R {
         let mut importer = GlesDmabufImporter {
             renderer: self.backend.renderer(),
-            content: &mut self.dmabuf_content,
+            content: self.dmabuf_content.slot_mut(realm),
         };
-        f(&mut self.scene, None, Some(&mut importer))
+        f(self.scenes.scene_mut(realm), None, Some(&mut importer))
     }
 
     /// The scene and a [`GlesDmabufImporter`] wrapping this backend's live
@@ -2481,19 +2634,27 @@ impl session::Presenter for NestedView {
     /// zero-copy import instead of the designed headless fallback.
     ///
     /// Constructed fresh per dispatch, as the trait's docs require: the
-    /// importer borrows `self.backend`'s renderer and `self.dmabuf_content`
-    /// for exactly this call and is handed to `f` as a bare trait reference,
-    /// never boxed (see [`session::Presenter::scene_and_importer`]'s docs
-    /// for why that distinction is load-bearing, not stylistic).
+    /// importer borrows `self.backend`'s renderer and **this realm's**
+    /// [`RealmGpuContent`] slot for exactly this call and is handed to `f` as
+    /// a bare trait reference, never boxed (see
+    /// [`session::Presenter::scene_and_importer`]'s docs for why that
+    /// distinction is load-bearing, not stylistic).
+    ///
+    /// **Both halves name the same realm** (WS-E.1.3) — the one whose shim
+    /// connection is being dispatched. A `kind=dmabuf` commit therefore lands
+    /// in that realm's own slot, and [`zero_copy_source`] decides separately
+    /// whether the output is showing that realm; while this was one slot for
+    /// the session, importing *was* presenting.
     fn scene_and_importer<R>(
         &mut self,
+        realm: &RealmId,
         f: impl for<'v> FnOnce(&'v mut Scene, Option<&'v mut dyn DmabufImporter>) -> R,
     ) -> R {
         let mut importer = GlesDmabufImporter {
             renderer: self.backend.renderer(),
-            content: &mut self.dmabuf_content,
+            content: self.dmabuf_content.slot_mut(realm),
         };
-        f(&mut self.scene, Some(&mut importer))
+        f(self.scenes.scene_mut(realm), Some(&mut importer))
     }
 }
 
@@ -2879,6 +3040,191 @@ mod tests {
         assert!(capture_pixels(&scene, size_of(W, 0)).is_none());
     }
 
+    /// **The nested window shows the bound realm, and the texture key knows
+    /// when that changes** (WS-E.1.3, issue #209) — the whole of what CI can
+    /// check about this backend's realm keying.
+    ///
+    /// **CI cannot exercise the nested backend at all**: GitHub runners have
+    /// no display, and D-019(4) records headless as the only backend CI can
+    /// run. So this pins the two decisions `try_redraw` makes — *which pixels
+    /// to upload* ([`window_pixels`] over [`RealmScenes::bound`]) and *when to
+    /// re-upload them* ([`TextureKey`]) — and nothing about the GL submit.
+    /// "A human sees the right realm in the host window" is a **manual
+    /// runbook step** (`shim/docs/nested-multi-realm.md`), written as one, and
+    /// is not a CI criterion.
+    ///
+    /// The realm in the key is what this is really about. Two realms' scenes
+    /// have independent `generation` counters, so a bind between two realms
+    /// whose counters happen to match would compare equal on every other field
+    /// — leaving the *previous* realm's texture on the human's screen until
+    /// something unrelated changed. The fixture below builds exactly that
+    /// coincidence rather than hoping for it.
+    #[test]
+    fn the_window_shows_the_bound_realm_and_a_bind_re_uploads() {
+        const W: i32 = 320;
+        const H: i32 = 200;
+        let size = size_of(W, H);
+        let (a, b) = (RealmId::new("realm-0"), RealmId::new("realm-b"));
+        let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
+        let mut scenes = RealmScenes::new((W as u32, H as u32));
+
+        // Two realms, different content, and — deliberately — the **same**
+        // scene generation: one commit each.
+        scenes
+            .scene_mut(&a)
+            .commit(SurfaceContent::from_rgba(client_pixels(64, 48), 64, 48).expect("content"));
+        scenes
+            .scene_mut(&b)
+            .commit(SurfaceContent::from_rgba(client_pixels(80, 60), 80, 60).expect("content"));
+        assert_eq!(
+            scenes.scene(&a).unwrap().generation(),
+            scenes.scene(&b).unwrap().generation(),
+            "the fixture must produce the counter coincidence this test is about"
+        );
+
+        // Bound to A: the window is A's composition, byte for byte.
+        scenes.bind(&a);
+        let window_a = window_pixels(scenes.bound(), &mut consent, None, None, size);
+        assert_eq!(
+            window_a,
+            super::super::compose_human_visible(
+                scenes.scene(&a).unwrap(),
+                &mut ConsentSurface::new(TrustedIndicator::for_test()),
+                W as u32,
+                H as u32
+            ),
+            "the host window must be the bound realm's own composition"
+        );
+        let key_a =
+            TextureKey::current(size, scenes.focused(), scenes.bound(), &consent, None, None);
+
+        // Bound to B: different pixels, and a different key even though every
+        // other field is identical.
+        scenes.bind(&b);
+        let window_b = window_pixels(scenes.bound(), &mut consent, None, None, size);
+        assert!(
+            window_a != window_b,
+            "binding the output to another realm must change what the window shows"
+        );
+        let key_b =
+            TextureKey::current(size, scenes.focused(), scenes.bound(), &consent, None, None);
+        assert_eq!(
+            key_a.scene_generation, key_b.scene_generation,
+            "fixture check: the scene counters really do coincide, so the key below \
+             cannot be distinguishing on them"
+        );
+        assert_ne!(
+            key_a, key_b,
+            "a bind must re-upload: without the realm in the key, two realms whose scene \
+             generations coincide leave the previous realm's texture on the screen"
+        );
+
+        // And a capture of either realm is that realm's own view, whichever
+        // is bound — this backend composes both on the CPU, so the bound one
+        // has no privileged path.
+        assert_eq!(
+            capture_pixels(scenes.scene(&a).unwrap(), size).expect("a nonzero view"),
+            scenes.scene(&a).unwrap().compose(W as u32, H as u32)
+        );
+        assert!(
+            capture_pixels(scenes.scene(&a).unwrap(), size)
+                != capture_pixels(scenes.scene(&b).unwrap(), size),
+            "two realms' captures must differ while both are live"
+        );
+    }
+
+    /// **A hidden realm's dmabuf import is never what the window presents**
+    /// (WS-E.1.3, issue #209) — the zero-copy half of the same claim
+    /// [`the_window_shows_the_bound_realm_and_a_bind_re_uploads`] makes about
+    /// the CPU path.
+    ///
+    /// The defect this pins was live and was **only** on the `--dmabuf` path:
+    /// the retained GPU content was one slot for the whole session, written by
+    /// whichever realm imported last and presented without ever consulting
+    /// [`RealmScenes::focused`]. So a hidden realm's commit took over the
+    /// human-visible window while the CPU path — keyed on the bound realm from
+    /// the start — went on claiming the opposite. That falsifies
+    /// `docs/book/src/limits.md`'s "only the realm the output is bound to is
+    /// on screen" on the one path a human actually looks at.
+    ///
+    /// **Display-free, and here is exactly what that costs.** Presenting needs
+    /// an EGL context and a host window; D-019(4) records headless as the only
+    /// backend CI can run, and a [`GpuContent`] cannot even be *minted* without
+    /// a live GL context. So this drives the real [`RealmGpuContent`] and the
+    /// real [`zero_copy_source`] — the one function `try_redraw`'s branch and
+    /// its `present_human_visible` argument both go through — with a stand-in
+    /// content type. What is left uncovered is the GL submit itself, and that
+    /// is a manual runbook step (`shim/docs/nested-multi-realm.md`).
+    ///
+    /// Both directions are asserted, because only the pair is evidence: a
+    /// `zero_copy_source` that answered `None` forever would satisfy the
+    /// hidden-realm assertion and silently delete the zero-copy path.
+    ///
+    /// [`GpuContent`]: crate::dmabuf::GpuContent
+    #[test]
+    fn a_hidden_realms_dmabuf_import_is_never_what_the_window_presents() {
+        let (a, b) = (RealmId::new("realm-0"), RealmId::new("realm-b"));
+        let mut scenes = RealmScenes::new((320, 200));
+        let mut content: RealmGpuContent<&'static str> = RealmGpuContent::new();
+
+        // The output shows A. The *hidden* realm B imports a dmabuf — the
+        // exact sequence that used to put B's texture in the window.
+        scenes.bind(&a);
+        *content.slot_mut(&b) = Some("B's texture");
+        assert!(
+            zero_copy_source(&scenes, &content, false).is_none(),
+            "a HIDDEN realm's dmabuf import must not become the frame the window presents; \
+             with one retained slot for the session it did, and the CPU path's bound-realm \
+             keying said otherwise"
+        );
+
+        // ...and the bound realm's own import *is* presented, so the assertion
+        // above is not passing because nothing is ever selected.
+        *content.slot_mut(&a) = Some("A's texture");
+        assert_eq!(
+            zero_copy_source(&scenes, &content, false),
+            Some(&"A's texture"),
+            "the bound realm's retained import is what the zero-copy path presents"
+        );
+
+        // Rebinding moves the selection with the output, both ways.
+        scenes.bind(&b);
+        assert_eq!(
+            zero_copy_source(&scenes, &content, false),
+            Some(&"B's texture")
+        );
+        scenes.bind(&a);
+        assert_eq!(
+            zero_copy_source(&scenes, &content, false),
+            Some(&"A's texture")
+        );
+
+        // An overlay takes the window: the CPU compose path, whatever is
+        // retained (`try_redraw`'s documented MVP seam).
+        assert!(
+            zero_copy_source(&scenes, &content, true).is_none(),
+            "a consent card or a hold indicator forces the CPU path"
+        );
+
+        // A death clears exactly the dying realm's slot — the teardown funnel
+        // is handed `slot_mut(realm)`, so it cannot reach a sibling's texture
+        // the way one shared slot could.
+        *content.slot_mut(&a) = None;
+        assert!(
+            zero_copy_source(&scenes, &content, false).is_none(),
+            "the bound realm's cleared slot leaves nothing to present zero-copy"
+        );
+        assert_eq!(
+            content.of(&b),
+            Some(&"B's texture"),
+            "one realm's teardown must leave a sibling's retained content alone"
+        );
+
+        // Nothing bound: there is no picture to be showing.
+        let vacant = RealmScenes::new((320, 200));
+        assert!(zero_copy_source(&vacant, &content, false).is_none());
+    }
+
     /// The texture cache must re-upload on every transition a human would see.
     ///
     /// The consent generation is the one that is easy to leave out and
@@ -2888,49 +3234,57 @@ mod tests {
     #[test]
     fn the_texture_key_changes_on_every_visible_transition() {
         let size = size_of(800, 600);
+        let realm = RealmId::new(crate::realm::WELL_KNOWN_REALM_ID);
         let mut scene = Scene::new();
         let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
 
-        let base = TextureKey::current(size, &scene, &consent, None, None);
+        let base = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
         assert_eq!(
             base,
-            TextureKey::current(size, &scene, &consent, None, None),
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None),
             "an unchanged output must not force a re-upload"
         );
 
         // A prompt going up, and coming back down, both re-upload.
         consent.show_for_test(prompt_fixture());
-        let shown = TextureKey::current(size, &scene, &consent, None, None);
+        let shown = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
         assert_ne!(base, shown, "a prompt appearing must re-upload");
         consent.dismiss_for_test();
-        let dismissed = TextureKey::current(size, &scene, &consent, None, None);
+        let dismissed = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
         assert_ne!(shown, dismissed, "a prompt going away must re-upload");
 
         // The queue advancing to a different petition re-uploads too, so the
         // window cannot keep showing a decided petition's card.
         consent.show_for_test(prompt_fixture());
-        let first = TextureKey::current(size, &scene, &consent, None, None);
+        let first = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
         let mut next = prompt_fixture();
         next.principal =
             crate::identity::PrincipalIdentity::parse("vitrin://local/agent/other").unwrap();
         consent.show_for_test(next);
         assert_ne!(
             first,
-            TextureKey::current(size, &scene, &consent, None, None),
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None),
             "a different petition must re-upload"
         );
 
         // And the two pre-existing inputs still matter.
-        let held = TextureKey::current(size, &scene, &consent, None, None);
+        let held = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
         scene.commit(SurfaceContent::from_rgba(client_pixels(64, 48), 64, 48).expect("content"));
         assert_ne!(
             held,
-            TextureKey::current(size, &scene, &consent, None, None),
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None),
             "a scene commit must re-upload"
         );
         assert_ne!(
-            TextureKey::current(size, &scene, &consent, None, None),
-            TextureKey::current(size_of(640, 480), &scene, &consent, None, None),
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None),
+            TextureKey::current(
+                size_of(640, 480),
+                Some(&realm),
+                &scene,
+                &consent,
+                None,
+                None
+            ),
             "a resize must re-upload"
         );
 
@@ -2938,25 +3292,53 @@ mod tests {
         // sprite left out of the key would move only when something else
         // happened to change, which for an agent hovering over a static app
         // is never — the operator watches a frozen crosshair.
-        let no_cursor = TextureKey::current(size, &scene, &consent, None, None);
-        let at_100 = TextureKey::current(size, &scene, &consent, None, Some((100.0, 100.0)));
+        let no_cursor = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
+        let at_100 = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            None,
+            Some((100.0, 100.0)),
+        );
         assert_ne!(
             no_cursor, at_100,
             "an agent cursor appearing must re-upload"
         );
         assert_ne!(
             at_100,
-            TextureKey::current(size, &scene, &consent, None, Some((140.0, 100.0))),
+            TextureKey::current(
+                size,
+                Some(&realm),
+                &scene,
+                &consent,
+                None,
+                Some((140.0, 100.0))
+            ),
             "an agent cursor MOVING must re-upload"
         );
         assert_eq!(
             at_100,
-            TextureKey::current(size, &scene, &consent, None, Some((100.4, 99.8))),
+            TextureKey::current(
+                size,
+                Some(&realm),
+                &scene,
+                &consent,
+                None,
+                Some((100.4, 99.8))
+            ),
             "a sub-pixel move draws the same sprite and must not re-upload"
         );
         assert_eq!(
             no_cursor,
-            TextureKey::current(size, &scene, &consent, None, Some((f64::NAN, 0.0))),
+            TextureKey::current(
+                size,
+                Some(&realm),
+                &scene,
+                &consent,
+                None,
+                Some((f64::NAN, 0.0))
+            ),
             "a position that is not a number draws no sprite, so it is no transition"
         );
     }
@@ -2975,6 +3357,7 @@ mod tests {
         const W: i32 = 320;
         const H: i32 = 200;
         let size = size_of(W, H);
+        let realm = RealmId::new(crate::realm::WELL_KNOWN_REALM_ID);
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(client_pixels(64, 48), 64, 48).expect("content"));
         let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
@@ -3009,6 +3392,7 @@ mod tests {
         for step in 0..=10 {
             keys.push(TextureKey::current(
                 size,
+                Some(&realm),
                 &scene,
                 &consent,
                 Some(f64::from(step) / 10.0),
@@ -3022,8 +3406,8 @@ mod tests {
             keys.len()
         );
         assert_ne!(
-            TextureKey::current(size, &scene, &consent, Some(1.0), None),
-            TextureKey::current(size, &scene, &consent, None, None),
+            TextureKey::current(size, Some(&realm), &scene, &consent, Some(1.0), None),
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None),
             "the indicator disappearing must re-upload too"
         );
     }

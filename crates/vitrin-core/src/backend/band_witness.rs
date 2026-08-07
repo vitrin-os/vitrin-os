@@ -57,6 +57,33 @@
 //! view (that is the whole capture argument in [`super`]), so that digest is
 //! client-owned bytes the harness already holds.
 //!
+//! [`BandReport::realm`] joins it under the same rule and passes: a realm id
+//! is configuration (`realm.toml`), fixed before the indicator is minted, and
+//! constant across two runs that differ only in the colour.
+//!
+//! # Which realm a report is about (WS-E.1.3, issue #209)
+//!
+//! **The realm bound to the output, and it says so.** A session may hold up
+//! to [`crate::realm::MAX_REALMS`] realms, each with its own scene and its own
+//! capture, but the human-visible framebuffer shows exactly one of them —
+//! and every field below is a statement about *that* one:
+//!
+//! - [`BandReport::tracks_view`] compares the human-visible output against
+//!   **the bound realm's** view, the two buffers
+//!   [`super::headless::HeadlessOutput::present`] composites from. Against any
+//!   other realm it would read `false` forever and mean nothing.
+//! - [`BandReport::probe_changes`] and [`BandReport::probe_fnv`] digest the
+//!   bound realm's rows below the band.
+//! - [`BandReport::band_changes`] and [`BandReport::band_uniform`] are about
+//!   the output's band rows, which belong to no realm at all — they are the
+//!   core's own overdraw.
+//!
+//! Before this the assertion was about "the realm view" with one realm to
+//! mean, so it was true by having nothing to be ambiguous about.
+//! `tests/integration/test_real_trust_band.py`'s `band_changes == 0` would
+//! otherwise become a zero over an undefined comparison — a number that
+//! cannot be wrong because it is not about anything.
+//!
 //! # Why not a commitment scheme
 //!
 //! Issue #139 sketches one: the core publishes a hash or derived witness the
@@ -124,9 +151,19 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 /// One reading of the witness. Every field is secret-independent; see the
-/// module docs for why that is the rule rather than "no pixels".
+/// module docs for why that is the rule rather than "no pixels" — and for
+/// **which realm** the pixel-derived fields are about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BandReport {
+pub(crate) struct BandReport<'a> {
+    /// The realm bound to the output at the latest composite, or `None`
+    /// before any realm has attached.
+    ///
+    /// Not decoration: [`Self::tracks_view`], [`Self::probe_changes`] and
+    /// [`Self::probe_fnv`] are statements about *this* realm's view, and a
+    /// reader that assumed another realm would be comparing a number against
+    /// the wrong picture. Secret-independent (it comes from `realm.toml`), so
+    /// it does not weaken the rule the module docs set.
+    pub realm: Option<&'a str>,
     /// Composites this witness evaluated, over the life of the session.
     pub composites: u64,
     /// Composites (after the first) at which the human-visible output's band
@@ -177,14 +214,45 @@ pub(crate) struct BandReport {
     pub probe_fnv: u64,
 }
 
-impl std::fmt::Display for BandReport {
-    /// The channel's wire form: ten space-separated ASCII fields, no payload,
-    /// no descriptor. Rendered here rather than at the call site so the one
-    /// place the report becomes bytes is the one place to audit.
+impl std::fmt::Display for BandReport<'_> {
+    /// The channel's wire form: eleven space-separated ASCII fields, no
+    /// payload, no descriptor. Rendered here rather than at the call site so
+    /// the one place the report becomes bytes is the one place to audit.
+    ///
+    /// The bound realm's id is **last**, after the digest, so the ten fields
+    /// that predate WS-E.1.3 keep their positions; `-` when no realm is
+    /// bound.
+    ///
+    /// **Why it cannot turn this line into a payload**, stated as the two
+    /// separate facts it actually rests on:
+    ///
+    /// - *Provenance.* The id comes from `realm.toml`, which the operator
+    ///   writes. No peer of this channel, and no confined client, contributes
+    ///   a byte of it — which is the property the module docs' rule is about.
+    ///   Every other field is a core-owned counter, flag, geometry value or
+    ///   digest, so the whole line is core-authored.
+    /// - *Length.* A realm id is at most **64 bytes** over `[A-Za-z0-9._-]`
+    ///   and never `.` or `..` (`crate::realm::validate_realm`, which defers
+    ///   to `vitrin_ipc::paths::shim_runtime_dir_in` so the rule has one
+    ///   definition). It is **not** the `[a-z0-9-]` this comment used to
+    ///   claim: uppercase, `.` and `_` are all legal, and the real bound is
+    ///   64 rather than the 7 bytes `realm-0` happens to occupy.
+    ///
+    /// Sixty-five bytes (the id plus its separator) is more than half the
+    /// channel's 128-byte budget, so `the_wire_form_is_eleven_scalar_fields`
+    /// measures the line at the **loader's** maximum rather than at a
+    /// fixture's, and records what is left over for the counters.
+    ///
+    /// The counters are `u64` and are the one thing on this line without a
+    /// short bound. At their type maximum the line would not fit `MAX_LINE`
+    /// with *or* without a realm id (137 bytes for the first ten fields
+    /// alone), and that is stated rather than papered over: what makes the
+    /// bound hold is that they count this session's composites, and the test
+    /// pins the headroom that leaves.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} {} {} {} {} {} {} {} {} {:016x}",
+            "{} {} {} {} {} {} {} {} {} {:016x} {}",
             self.composites,
             self.band_changes,
             self.probe_changes,
@@ -195,6 +263,7 @@ impl std::fmt::Display for BandReport {
             self.view_w,
             self.view_h,
             self.probe_fnv,
+            self.realm.unwrap_or("-"),
         )
     }
 }
@@ -202,9 +271,10 @@ impl std::fmt::Display for BandReport {
 /// Accumulates [`BandReport`] over a session's composites.
 ///
 /// Fed from [`super::headless::HeadlessOutput::present`] with the two buffers
-/// that composite already has in hand — the realm view and the human-visible
-/// output — so it measures the bytes that are actually presented rather than a
-/// second composition that could agree with them today and drift tomorrow.
+/// that composite already has in hand — **the bound realm's** view and the
+/// human-visible output — so it measures the bytes that are actually
+/// presented rather than a second composition that could agree with them
+/// today and drift tomorrow.
 pub(crate) struct BandWitness {
     /// The previous composite's band rows.
     ///
@@ -229,11 +299,16 @@ pub(crate) struct BandWitness {
     view_w: u32,
     view_h: u32,
     probe_fnv: u64,
+    /// The realm bound to the output at the latest composite. Owned rather
+    /// than borrowed because the witness outlives any one composite; handed
+    /// out as a `&str` in [`BandReport::realm`].
+    realm: Option<crate::grants::RealmId>,
 }
 
 impl BandWitness {
     pub(crate) fn new() -> Self {
         Self {
+            realm: None,
             previous_band: None,
             previous_probe: None,
             composites: 0,
@@ -254,14 +329,31 @@ impl BandWitness {
 
     /// Evaluate one composite.
     ///
-    /// `view` is [`crate::scene::Scene::compose`]'s output and `output` is
-    /// [`super::human_visible_from_view`]'s, both tightly packed RGBA8888 of
-    /// `width * height * 4` bytes. A pair that is not that size is **counted
-    /// and skipped** rather than panicking or silently ignored: this runs
-    /// inside the compositor, where taking the session down over a witness
-    /// would be absurd, and a silent skip would let `band_changes == 0` mean
-    /// "nothing was measured".
-    pub(crate) fn observe(&mut self, view: &[u8], output: &[u8], width: u32, height: u32) {
+    /// `view` is **the bound realm's** [`crate::scene::Scene::compose`]
+    /// output and `output` is [`super::human_visible_from_view`]'s, both
+    /// tightly packed RGBA8888 of `width * height * 4` bytes; `realm` names
+    /// the realm `view` belongs to, so the report can say what it is about
+    /// (module docs). A pair that is not that size is **counted and skipped**
+    /// rather than panicking or silently ignored: this runs inside the
+    /// compositor, where taking the session down over a witness would be
+    /// absurd, and a silent skip would let `band_changes == 0` mean "nothing
+    /// was measured".
+    ///
+    /// The realm is recorded **before** the size check, deliberately: a
+    /// refused composite is still a composite of some realm, and a report
+    /// whose counters said "refusals: 1" while naming no realm would hide
+    /// which one.
+    pub(crate) fn observe(
+        &mut self,
+        view: &[u8],
+        output: &[u8],
+        width: u32,
+        height: u32,
+        realm: Option<&crate::grants::RealmId>,
+    ) {
+        if self.realm.as_ref() != realm {
+            self.realm = realm.cloned();
+        }
         let expected = width as usize * height as usize * 4;
         if expected == 0 || view.len() != expected || output.len() != expected {
             self.refusals += 1;
@@ -308,8 +400,9 @@ impl BandWitness {
             && band.chunks_exact(4).all(|pixel| pixel == &band[..4]);
     }
 
-    pub(crate) fn report(&self) -> BandReport {
+    pub(crate) fn report(&self) -> BandReport<'_> {
         BandReport {
+            realm: self.realm.as_ref().map(|realm| realm.as_str()),
             composites: self.composites,
             band_changes: self.band_changes,
             probe_changes: self.probe_changes,
@@ -350,13 +443,30 @@ mod tests {
         crate::backend::human_visible_from_view(view.to_vec(), &mut surface, W, H)
     }
 
-    fn run(indicator: TrustedIndicator, views: &[Vec<u8>]) -> BandReport {
+    /// The realm every fixture below binds to the output, so a report names
+    /// one — the same well-known id `realm.toml` always carries.
+    fn bound() -> crate::grants::RealmId {
+        crate::grants::RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)
+    }
+
+    fn run(indicator: TrustedIndicator, views: &[Vec<u8>]) -> BandReport<'static> {
         let mut witness = BandWitness::new();
+        let realm = bound();
         for view in views {
             let output = human_visible(view, indicator);
-            witness.observe(view, &output, W, H);
+            witness.observe(view, &output, W, H, Some(&realm));
         }
-        witness.report()
+        // The report borrows the witness, which dies here; the tests only
+        // compare it, and every field but `realm` is `Copy` scalars — so the
+        // realm is re-stated as a `'static` literal rather than kept
+        // borrowed. Checked against the witness's own answer first, so this
+        // convenience cannot mask a witness that named the wrong realm.
+        let report = witness.report();
+        assert_eq!(report.realm, Some(crate::realm::WELL_KNOWN_REALM_ID));
+        BandReport {
+            realm: Some(crate::realm::WELL_KNOWN_REALM_ID),
+            ..report
+        }
     }
 
     /// A view the fixture card — and, more to the point, the trusted ring
@@ -390,7 +500,7 @@ mod tests {
     /// sequence the real-app gate's session goes through before it reads the
     /// witness, so it is the sequence the secret-independence rule has to hold
     /// over.
-    fn run_across_a_prompt(indicator: TrustedIndicator) -> BandReport {
+    fn run_across_a_prompt(indicator: TrustedIndicator) -> BandReport<'static> {
         let mut surface = ConsentSurface::new(indicator);
         let mut witness = BandWitness::new();
         let views = [
@@ -406,9 +516,14 @@ mod tests {
             }
             let output =
                 crate::backend::human_visible_from_view(view.clone(), &mut surface, CARD_W, CARD_H);
-            witness.observe(view, &output, CARD_W, CARD_H);
+            witness.observe(view, &output, CARD_W, CARD_H, Some(&bound()));
         }
-        witness.report()
+        let report = witness.report();
+        assert_eq!(report.realm, Some(crate::realm::WELL_KNOWN_REALM_ID));
+        BandReport {
+            realm: Some(crate::realm::WELL_KNOWN_REALM_ID),
+            ..report
+        }
     }
 
     /// **The leak argument, mechanically.** Two sessions identical in every way
@@ -536,7 +651,7 @@ mod tests {
             client_view([0x00, 0x00, 0x00]),
             client_view([0xff, 0x00, 0x00]),
         ] {
-            witness.observe(&view, &view, W, H);
+            witness.observe(&view, &view, W, H, Some(&bound()));
         }
         let report = witness.report();
         assert_eq!(
@@ -566,7 +681,7 @@ mod tests {
             for pixel in output[..band_bytes / 2].chunks_exact_mut(4) {
                 pixel.copy_from_slice(&colour);
             }
-            witness.observe(&view, &output, W, H);
+            witness.observe(&view, &output, W, H, Some(&bound()));
         }
         let report = witness.report();
         assert_eq!(report.band_changes, 1);
@@ -585,7 +700,7 @@ mod tests {
         let indicator = TrustedIndicator::for_test();
         let frozen = human_visible(&client_view([0x00, 0x00, 0x00]), indicator);
         for rgb in [[0x00, 0x00, 0x00], [0xff, 0x00, 0x00]] {
-            witness.observe(&client_view(rgb), &frozen, W, H);
+            witness.observe(&client_view(rgb), &frozen, W, H, Some(&bound()));
         }
         let report = witness.report();
         assert_eq!(report.band_changes, 0, "a frozen output never changes");
@@ -602,9 +717,15 @@ mod tests {
     #[test]
     fn a_mismatched_buffer_is_counted_as_a_refusal() {
         let mut witness = BandWitness::new();
-        witness.observe(&[], &[], W, H);
-        witness.observe(&client_view([0; 3]), &[], W, H);
-        witness.observe(&client_view([0; 3]), &client_view([0; 3]), 0, 0);
+        witness.observe(&[], &[], W, H, Some(&bound()));
+        witness.observe(&client_view([0; 3]), &[], W, H, Some(&bound()));
+        witness.observe(
+            &client_view([0; 3]),
+            &client_view([0; 3]),
+            0,
+            0,
+            Some(&bound()),
+        );
         let report = witness.report();
         assert_eq!(report.refusals, 3);
         assert_eq!(report.composites, 0);
@@ -615,28 +736,104 @@ mod tests {
     /// A report read before any composite must not look like a passing one.
     #[test]
     fn a_witness_that_has_seen_nothing_reports_nothing_passing() {
-        let report = BandWitness::new().report();
+        let witness = BandWitness::new();
+        let report = witness.report();
         assert_eq!(report.composites, 0);
+        assert_eq!(report.realm, None, "no realm has been bound");
         assert!(!report.tracks_view);
         assert!(!report.band_uniform);
         // A zero digest rather than the FNV offset basis: nothing was hashed,
         // and a report that opened with the digest of the empty string would be
         // indistinguishable from one taken over an empty probe strip.
-        assert_eq!(report.to_string(), "0 0 0 0 0 0 0 0 0 0000000000000000");
+        assert_eq!(report.to_string(), "0 0 0 0 0 0 0 0 0 0000000000000000 -");
     }
 
-    /// The wire form is ten fields of bounded ASCII, so the reply cannot become
-    /// a pixel channel by accident: `MAX_LINE` is 128 bytes and a 640x480
-    /// band is 20 480.
+    /// The wire form is eleven fields of bounded ASCII, so the reply cannot
+    /// become a pixel channel by accident: `MAX_LINE` is 128 bytes and a
+    /// 640x480 band is 20 480. The eleventh is the bound realm's id, itself
+    /// length-bounded by the loader.
+    ///
+    /// **Measured at the loader's maximum, not at `realm-0`'s length.** The
+    /// bound that matters is 64 bytes over `[A-Za-z0-9._-]`, and this test
+    /// used to render a 7-byte fixture and conclude the line fits — which
+    /// checked 7 of the 65 bytes the field can actually contribute out of a
+    /// 128-byte budget. See [`BandReport`]'s `Display` for the two facts the
+    /// no-payload claim really rests on.
     #[test]
-    fn the_wire_form_is_ten_scalar_fields() {
+    fn the_wire_form_is_eleven_scalar_fields() {
         let report = run(TrustedIndicator::for_test(), &[client_view([1, 2, 3])]);
         let line = report.to_string();
-        assert_eq!(line.split(' ').count(), 10, "{line}");
+        assert_eq!(line.split(' ').count(), 11, "{line}");
+        assert!(
+            line.ends_with(&format!(" {}", crate::realm::WELL_KNOWN_REALM_ID)),
+            "the report must name the realm it is about: {line}"
+        );
         assert!(line.is_ascii());
         assert!(
             line.len() + "band ".len() < crate::consent::injector::MAX_LINE,
             "the band reply must fit the channel's line bound: {line}"
+        );
+    }
+
+    /// **The reply still fits the channel at the longest realm id the loader
+    /// accepts**, and here is exactly how much room that leaves.
+    ///
+    /// The id is checked against the real validator rather than assumed legal,
+    /// so a future tightening or loosening of the rule moves this test rather
+    /// than silently invalidating the arithmetic below.
+    #[test]
+    fn the_band_reply_fits_the_channel_at_the_longest_legal_realm_id() {
+        const MAX_ID: usize = 64;
+        // Every character class the rule allows, padded to the exact maximum:
+        // uppercase, digits, `.`, `_` and `-` are all legal, which the old
+        // `[a-z0-9-]` claim would have ruled out.
+        let longest = format!("Aa0._-{}", "z".repeat(MAX_ID - 6));
+        assert_eq!(longest.len(), MAX_ID);
+        assert!(
+            vitrin_ipc::paths::shim_runtime_dir_in(std::path::Path::new("/"), &longest).is_ok(),
+            "fixture check: {longest} must be a legal realm id, or this measures nothing"
+        );
+
+        let mut witness = BandWitness::new();
+        let realm = crate::grants::RealmId::new(&longest);
+        let view = client_view([1, 2, 3]);
+        witness.observe(
+            &view,
+            &human_visible(&view, TrustedIndicator::for_test()),
+            W,
+            H,
+            Some(&realm),
+        );
+        let line = witness.report().to_string();
+        assert!(line.is_ascii());
+        assert_eq!(line.split(' ').count(), 11, "{line}");
+        assert!(
+            line.ends_with(&format!(" {longest}")),
+            "the report must name the realm it is about: {line}"
+        );
+
+        let budget = crate::consent::injector::MAX_LINE - "band ".len();
+        assert!(
+            line.len() < budget,
+            "the band reply must fit the channel's line bound at the longest legal realm id: \
+             {} of {budget} bytes -- {line}",
+            line.len()
+        );
+
+        // What is left over, named rather than implied. The realm field eats
+        // 65 bytes of the budget; the four `u64` counters and the three `u32`
+        // geometry fields share what remains, and they are the only fields
+        // without a short bound. This is a real constraint, not a formality:
+        // at their type maximum the first ten fields alone are 137 bytes and
+        // would overflow the line with no realm id at all. What keeps the
+        // bound true is that they count *this session's* composites -- and
+        // nothing a peer of this channel, or a confined client, can inflate.
+        let headroom = budget - line.len();
+        assert!(
+            headroom >= 16,
+            "only {headroom} bytes are left for the counters at the longest realm id; a \
+             session compositing at 60 fps needs ~7 digits of `composites` and as many of \
+             `probe_changes`, so this reply is one field away from not fitting"
         );
     }
 }

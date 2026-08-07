@@ -70,11 +70,20 @@ dmabuf behind `--dmabuf`.
 
 None of these is DRM work. The backend is not the binding constraint.
 
-1. **One app at a time — half closed by WS-E.1.2 (#208).** `MAX_REALMS` is now
-   **16** and a session runs every realm its `realm.toml` declares, each with
-   its own shim, runtime tree and socket. The `Scene` still holds at most one
-   client surface, single-maximized (`scene/mod.rs:232`), so several realms
-   run and only the last committer is visible. **The registry's claim that
+1. **One app at a time — closed by WS-E.1.2 (#208) and WS-E.1.3 (#209).**
+   `MAX_REALMS` is now **16** and a session runs every realm its `realm.toml`
+   declares, each with its own shim, runtime tree, socket, **scene and
+   capture**. Each `Scene` still holds at most one client surface,
+   single-maximized — that is the model *per app*, not per session — and
+   exactly one of them is bound to the one output, so several realms run and
+   one is visible. Which one is a placeholder — the first still-serving realm
+   in id order, applied at first attach and again when the realm holding the
+   output exits, deliberately the same rule `session::seat_target` uses so the
+   visible realm and the seat's target never drift — until WS-E.1.4 decides
+   who may *choose* it. Not moving it at all was the first shape and it was a
+   defect: the output stayed bound to a realm that was gone, compositing the
+   deterministic background for the rest of the session while live siblings
+   ran. **The registry's claim that
    raising the cap was *"a deletion here rather than a re-plumbing"* turned
    out to be half true**, and `crates/vitrin-core/src/realm.rs`'s module docs
    now carry the audit: the registry, grant keying, path derivation, lifecycle
@@ -87,8 +96,12 @@ None of these is DRM work. The backend is not the binding constraint.
    app*, one realm's death resetting the session-wide input router, and a
    failed spawn orphaning the realms already forked — which is the honest
    measure of how wrong "a deletion" was. All four were caught by review
-   rather than by a test, which is its own finding. The scene remains the
-   real work, and it is WS-E.1.3's.
+   rather than by a test, which is its own finding. The scene was the real
+   work and WS-E.1.3 did it: one scene per realm, one bound to the output,
+   a capture resolved from the grant's realm id. Its own cost — every realm
+   renders whether or not it is visible, and `MAX_REALMS` now has a measured
+   memory bill rather than only a descriptor one — is published in
+   `docs/book/src/limits.md` and re-derived in `realm.rs`.
 2. **No way to launch an app.** `vitrin_realm` has exactly **one** request
    (`request_grant`). Realms exist only from `realm.toml` at startup, so
    changing app means restarting `vitrind`. This is new protocol, and it is an
@@ -112,7 +125,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 
 | Stage | Delivers | Est. |
 |---|---|---|
-| **1 — multi-app, nested** | Runtime app launch · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · Scene binds the output to a focused realm · `layout_focus`/`layout_arrange` served · a shell client (switcher + launcher) · input routed to the focused realm | 7–9 w |
+| **1 — multi-app, nested** | Runtime app launch · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · `layout_focus`/`layout_arrange` served · a shell client (switcher + launcher) · input routed to the focused realm | 7–9 w |
 | **2 — livable** | Cross-realm clipboard · core-drawn lock screen on the consent stack · status in the trusted band · human screenshot | 4–6 w |
 | **3 — bare metal** | The keymap decision · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
 | **4 — long tail** | X11 (defers to E3.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |
@@ -173,23 +186,43 @@ this workstream owns, not inherits:
 - **No touch, gestures, tablet, switches or relative motion**: v0's seat
   vocabulary is pointer + keyboard only, so on a laptop that means no touchpad
   gestures and no lid switch.
-- **Several realms run, one is visible, and a capture cannot tell them
-  apart** (created by WS-E.1.2, closed by WS-E.1.3). Raising the cap landed
-  before the scene binds an output to a realm, so a multi-realm session
-  composites one output from one single-surface scene: the last committer is
-  what is on screen, and an agent's capture is of that output rather than of
-  the realm its grant names. While two realms are **live**, a capture under a
-  grant over one can carry the other's pixels. The exposure stops at *live*
-  realms: liveness is judged per realm, against the realm the grant row
-  names, so a grant over a dead realm refuses `no_surface` whatever its
-  siblings are doing. (Judging it against *any* live realm was the obvious
-  rewrite and would have been fail-**open** across realms — an authority bug,
-  not a fidelity one; the review of WS-E.1.2 caught it before merge.) The
-  remaining exposure is real, it is published in `docs/book/src/limits.md`,
-  and it exists **only** in a configuration that declares more than one
-  realm. Landing the cap first was the right order (WS-E.1.3 needs more than
-  one realm to bind an output *to*); shipping the gap silently would not have
-  been.
+- ~~**Several realms run, one is visible, and a capture cannot tell them
+  apart**~~ (created by WS-E.1.2, **closed by WS-E.1.3**). Raising the cap
+  landed before the scene bound an output to a realm, so for one workstream
+  task a multi-realm session composited one output from one single-surface
+  scene: the last committer was what was on screen, and an agent's capture
+  was of that output rather than of the realm its grant named. While two
+  realms were **live**, a capture under a grant over one could carry the
+  other's pixels. The exposure always stopped at *live* realms — liveness is
+  judged per realm, against the realm the grant row names, so a grant over a
+  dead realm refuses `no_surface` whatever its siblings are doing. (Judging
+  it against *any* live realm was the obvious rewrite and would have been
+  fail-**open** across realms — an authority bug, not a fidelity one; the
+  review of WS-E.1.2 caught it before merge.) WS-E.1.3 closed the live half
+  by making the frame a *function of the realm id*: one scene and one
+  composed frame per realm, resolved from the grant row's realm on the same
+  line that judges its liveness. Landing the cap first was the right order
+  (WS-E.1.3 needs more than one realm to bind an output *to*); shipping the
+  gap silently would not have been, and it was not.
+- **Every realm renders, visible or not** (created by WS-E.1.3, no owner).
+  The price of the item above. A Wayland client throttles on frame
+  callbacks, so a realm that stopped being paced would stop repainting and
+  its capture would go stale — which `refusal.no_surface` forbids in as many
+  words. So every live realm is paced off the output's completed composite
+  and every live realm's view is composed. On the WS-E laptop that is the
+  difference between one app compositing and up to sixteen, plus
+  `2 x width x height x 4` bytes of core-side pixels per realm (~590 MiB
+  resident at sixteen realms on a 2560x1600 panel, measured, which is why
+  `MAX_REALMS`'s justification had to be re-derived against memory rather
+  than descriptors). Visibility-aware pacing would buy the power back at the
+  cost of capture honesty; that trade was declined rather than overlooked.
+  Published in `docs/book/src/limits.md`.
+- **The agent cursor is drawn only for the visible realm** (created by
+  WS-E.1.3, fixed by a per-realm indicator nobody has scheduled). D-019 added
+  the sprite so a human can see that an agent is acting. It is painted into
+  the output, which shows one realm, so an agent actuating inside a hidden
+  realm draws nothing — the exact defect D-019 exists to close,
+  reintroduced for hidden realms. Published in `docs/book/src/limits.md`.
 - **Only one realm can be actuated, and the rest are refused rather than
   misdelivered** (created by WS-E.1.2, closed by WS-E.1.6). The write-side
   twin of the item above, and the one the same review found second. There is

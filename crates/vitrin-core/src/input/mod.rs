@@ -848,10 +848,17 @@ impl<H: PreemptionHook> InputRouter<H> {
         self.agent_pointer = None;
     }
 
-    /// The realm this router's delivery debt is owed to, if any. Test-only:
-    /// production code names the realm rather than asking which one is
-    /// bound.
-    #[cfg(test)]
+    /// The realm this router's delivery debt is owed to, if any.
+    ///
+    /// Every *delivery* site names its realm rather than asking this — that
+    /// is what [`Self::bind_to`] is for. The one production reader is
+    /// [`crate::session::post_dispatch`]'s agent-cursor gate (WS-E.1.3),
+    /// which needs the opposite question: not "where do I deliver" but "is
+    /// the pointer state I am about to *draw* owed to the realm the output is
+    /// showing". Drawing a hidden realm's pointer would paint a crosshair at
+    /// coordinates that mean nothing in the picture the human is looking at,
+    /// so the sprite is drawn only when this matches
+    /// [`crate::session::Presenter::focused`].
     pub fn bound_realm(&self) -> Option<&crate::grants::RealmId> {
         self.bound.as_ref()
     }

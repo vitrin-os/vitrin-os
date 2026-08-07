@@ -80,6 +80,7 @@ import unittest
 
 from harness import (
     IntegrationTest,
+    capture_dump_path,
     children_of,
     comm_of,
     descendant_named,
@@ -300,8 +301,11 @@ class RealDeadManRevocation(IntegrationTest):
             )
 
     def test_sigusr1_triggers_the_deadman_switch_and_revokes_a_real_grant(self):
-        dump_path = str(self.work / "internal.rgba")
-        core = self.real_core(capture_dump=dump_path)
+        dump_base = str(self.work / "internal.rgba")
+        # The core writes one dump per realm at `PATH.<realm-id>`; this gate
+        # reads `realm-0`'s, the realm its grant names (WS-E.1.3).
+        dump_path = str(capture_dump_path(dump_base))
+        core = self.real_core(capture_dump=dump_base)
         self._spine(core)
 
         conn = core.connect()

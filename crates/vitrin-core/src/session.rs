@@ -179,13 +179,21 @@ pub(crate) struct RuntimeSeed {
     /// runtime consumes.
     pub indicator: crate::consent::TrustedIndicator,
     /// Optional `--capture-dump PATH` target (P1.8.5, issue #107): when set,
-    /// every redraw also writes the freshly composited realm-view readback —
-    /// the raw RGBA the capture cache is refreshed from — to this path. It is
-    /// the **core-internal capture**, taken before `render_frame`, the memfd,
-    /// the wire and the SDK decode ever run, so an agent's `observe()` frame
-    /// can be compared against it to prove the grant/capture path adds no
-    /// distortion against a real app. A diagnostic knob, not a wire feature;
-    /// `None` in every ordinary run.
+    /// every redraw also writes each live realm's freshly composited
+    /// realm-view readback — the raw RGBA that realm's capture cache entry is
+    /// refreshed from — to **`PATH.<realm-id>`**. It is the **core-internal
+    /// capture**, taken before `render_frame`, the memfd, the wire and the
+    /// SDK decode ever run, so an agent's `observe()` frame can be compared
+    /// against it to prove the grant/capture path adds no distortion against
+    /// a real app. A diagnostic knob, not a wire feature; `None` in every
+    /// ordinary run.
+    ///
+    /// **The realm suffix is not cosmetic** (WS-E.1.3, issue #209). While a
+    /// session held one realm, `PATH` unambiguously named the one view the
+    /// M1.3 fidelity gate compares against. With N realms an unqualified
+    /// dump names *a* view and the gate's ground truth becomes a guess, so
+    /// nothing is written to the bare `PATH` at all — every dump names the
+    /// realm it is of. See [`capture_dump_path`].
     pub capture_dump: Option<PathBuf>,
 }
 
@@ -237,13 +245,26 @@ pub(crate) struct Runtime<H: PreemptionHook> {
     /// Set by a latched commit, cleared by [`post_dispatch`]. The whole of
     /// the anti-amplification defence the module docs describe.
     pub dirty: bool,
-    /// The latest completed realm view, refreshed at redraw time and never on
-    /// the capture path, so `capture` stays the pure read of "what the
-    /// compositor last finished" that keeps goldens deterministic.
-    view_cache: Option<Vec<u8>>,
+    /// **Each live realm's** latest completed view, refreshed at redraw time
+    /// and never on the capture path, so `capture` stays the pure read of
+    /// "what the compositor last finished" that keeps goldens deterministic.
+    ///
+    /// Keyed by realm since WS-E.1.3 (issue #209), and that is decision 1
+    /// made storable: with one entry for the session, an `observe` grant over
+    /// realm A returned realm B's pixels the instant B committed. A realm
+    /// with no entry has no frame to serve and its grant meets the
+    /// chokepoint's `no_surface` refusal.
+    ///
+    /// [`post_dispatch`] both fills and *prunes* this map: a realm with no
+    /// live shim session has its entry removed, so a dead realm's last frame
+    /// cannot sit here waiting for a predicate to fail open. That is the same
+    /// defence-in-depth posture `RetainedOutput::scrub_retained_frame` takes
+    /// for the headless framebuffer, applied to the capture cache.
+    view_cache: BTreeMap<RealmId, Vec<u8>>,
     /// The `--capture-dump PATH` diagnostic target from the seed (P1.8.5),
     /// `None` in every ordinary run. When set, [`post_dispatch`] mirrors each
-    /// refreshed [`Self::view_cache`] to this file — see [`RuntimeSeed::capture_dump`].
+    /// realm's refreshed [`Self::view_cache`] entry to `PATH.<realm-id>` —
+    /// see [`RuntimeSeed::capture_dump`] and [`capture_dump_path`].
     capture_dump: Option<PathBuf>,
     /// This session's monotonic zero, for presentation timestamps.
     epoch: Instant,
@@ -337,14 +358,64 @@ pub(crate) enum Presentation {
 }
 
 pub(crate) trait Presenter {
-    /// The session's one scene — what [`ShimServer::handle_message`] commits
-    /// into, for **every** realm: it holds at most one committed surface, so
-    /// the last realm to commit is the one composited (WS-E.1.3 binds an
-    /// output to a realm).
-    fn scene(&mut self) -> &mut Scene;
+    /// **This realm's** scene — what [`ShimServer::handle_message`] commits
+    /// into for the realm whose connection it is servicing, minted empty on
+    /// first use.
+    ///
+    /// Keyed by realm since WS-E.1.3 (issue #209). Before that there was one
+    /// scene for the whole session and every realm's shim committed into it,
+    /// so the last committer owned the only surface and an `observe` grant
+    /// over realm A served realm B's pixels the instant B painted. Naming
+    /// the realm here is what makes that impossible rather than merely
+    /// unlikely; [`RealmScenes::bound`] is the deliberately differently-named
+    /// accessor the *output* composites through, so a capture path reaching
+    /// for the output's scene reads as the mistake it is.
+    ///
+    /// [`RealmScenes::bound`]: crate::scene::RealmScenes::bound
+    fn scene_mut(&mut self, realm: &RealmId) -> &mut Scene;
+    /// This realm's scene for reading, or `None` when it has none — the
+    /// realm has never committed and has never held the output.
+    ///
+    /// Split from [`Self::scene_mut`] because the runtime's one caller is
+    /// [`RealmLifecycle::view_is_live`], the single fact behind every
+    /// `no_surface` refusal, and asking that question must not *create* a
+    /// scene for a realm that has none. `None` and "an empty scene" give the
+    /// same answer here; the difference is that this one cannot mint state
+    /// from a read.
+    ///
+    /// [`RealmLifecycle::view_is_live`]: crate::lifecycle::RealmLifecycle::view_is_live
+    fn scene(&self, realm: &RealmId) -> Option<&Scene>;
+    /// The realm the output is bound to, or `None` before any realm has
+    /// attached.
+    fn focused(&self) -> Option<&RealmId>;
+    /// Bind the output to `realm`: the mechanism, not the policy.
+    ///
+    /// **Who** may call this is WS-E.1.4's question (issue #210) and **where
+    /// input goes as a result** is WS-E.1.6's (issue #212). The runtime's two
+    /// callers today both take the first still-serving realm in id order —
+    /// [`start_one_realm_in`] at first attach and
+    /// [`rebind_output_after_death`] when the bound realm dies — which is a
+    /// placeholder in exactly the sense [`seat_target`] is one, and
+    /// deliberately the *same* rule so the visible realm and the seat's
+    /// target agree while the chokepoint's step-5d stopgap is still refusing
+    /// the mismatch.
+    fn bind_output(&mut self, realm: &RealmId);
+    /// Bind the output to **no realm**, so it composites the deterministic
+    /// background and [`Self::focused`] answers `None`.
+    ///
+    /// The way out of "bound to a realm that is gone", and nothing more.
+    /// [`rebind_output_after_death`] is the one caller and it reaches for this
+    /// only when no realm is still serving — the moment one is,
+    /// [`Self::bind_output`] moves the output there instead. Separate from
+    /// `bind_output` rather than folded into it as an `Option` argument so
+    /// that WS-E.1.4's question ("which principal may bind, under what verb")
+    /// stays a question about one named verb.
+    fn unbind_output(&mut self);
     /// The size the realm view composes at: the virtual output for headless,
-    /// the host window for nested. One output, so one size, handed to every
-    /// realm's shim at `configure`. The input router maps view coordinates to
+    /// the host window for nested. One output, so one size, shared by every
+    /// realm and handed to every realm's shim at `configure` — decision 3 of
+    /// issue #209 keeps it that way (one bound realm, no stacking, no
+    /// overlap, no resize). The input router maps view coordinates to
     /// surface coordinates against it.
     fn view_size(&self) -> (u32, u32);
     /// Recomposite. Called at most once per dispatch round, from
@@ -358,21 +429,28 @@ pub(crate) trait Presenter {
     /// shim its frame reached a display that never drew it, which is how a
     /// throttled client becomes an unthrottled one.
     fn redraw(&mut self) -> Result<Presentation, Box<dyn Error>>;
-    /// The latest completed realm view as tightly packed RGBA8888, or `None`
-    /// when there is no realm view to serve.
+    /// **This realm's** latest completed view as tightly packed RGBA8888, or
+    /// `None` when there is no view to serve.
     ///
-    /// Both backends produce a view: headless reads back its retained pixman
-    /// framebuffer; nested composes the bare scene on the CPU
-    /// ([`Scene::compose`], P1.3.8) — byte-identical for the same scene, and
-    /// overlay-free on both because `Scene::compose` is upstream of the
-    /// output-stage fork. `None` is not a failure and must not be treated as
-    /// one: it is the honest answer for a degenerate view (a minimized nested
-    /// window, a readback failure). A capture then meets the chokepoint's
-    /// existing `no_surface` refusal, which is the correct outcome — better
-    /// than a black frame an agent would read as the realm's actual content.
-    fn view_rgba(&mut self) -> Option<Vec<u8>>;
-    /// Lend the scene, the retained framebuffer, and the dmabuf importer to
-    /// `f`, all borrowed **together** for the one call.
+    /// Keyed by realm since WS-E.1.3, and this is the read side of decision
+    /// 1: what a capture serves is a function of the realm the *grant*
+    /// names. The bound realm's answer is the output's own composition
+    /// (headless reads back its retained pixman framebuffer; nested composes
+    /// the bare scene on the CPU); a hidden realm's is that realm's scene
+    /// composed at the same view size. Both go through [`Scene::compose`], so
+    /// the two can no more drift from each other than the two backends can
+    /// (P1.3.8), and both are overlay-free because `Scene::compose` is
+    /// upstream of the output-stage fork.
+    ///
+    /// `None` is not a failure and must not be treated as one: it is the
+    /// honest answer for a realm with no scene at all, or for a degenerate
+    /// view (a minimized nested window, a readback failure). A capture then
+    /// meets the chokepoint's existing `no_surface` refusal, which is the
+    /// correct outcome — better than a black frame an agent would read as the
+    /// realm's actual content.
+    fn view_rgba(&mut self, realm: &RealmId) -> Option<Vec<u8>>;
+    /// Lend **the dying realm's** scene, the retained framebuffer, and the
+    /// dmabuf importer to `f`, all borrowed **together** for the one call.
     ///
     /// A callback rather than a returned tuple — unlike every other
     /// [`Presenter`] method — because the concrete importer a GPU-backed
@@ -414,17 +492,33 @@ pub(crate) trait Presenter {
     /// `None` for the importer half is the headless posture (no GPU
     /// renderer exists at all): there is never any retained zero-copy
     /// content to drop.
+    ///
+    /// **The scene and the importer handed out are `realm`'s own**
+    /// (WS-E.1.3). Before that both were the session's: one scene, so a
+    /// realm's death cleared whatever surface happened to be committed — a
+    /// sibling's included — and one retained zero-copy slot, so a realm's
+    /// death dropped whichever realm's GPU texture happened to be resident.
+    /// Both directions were fail-closed, and both are gone: a death takes
+    /// exactly the dying realm's surface and exactly its own retained import
+    /// (`RealmGpuContent::slot_mut`). The retained *framebuffer* half is
+    /// still the **output's** and is scrubbed on any realm's death, which is
+    /// over-broad and stays that way on purpose — see [`with_realm_teardown`].
     fn teardown_view<R>(
         &mut self,
+        realm: &RealmId,
         f: impl for<'v> FnOnce(
             &'v mut Scene,
             Option<&'v mut dyn RetainedOutput>,
             Option<&'v mut dyn DmabufImporter>,
         ) -> R,
     ) -> R;
-    /// Lend the scene and a dmabuf importer bound to this backend's live GPU
-    /// renderer to `f`, both borrowed **together**, for one shim dispatch
-    /// (P1.3.5's zero-copy path, issue #117).
+    /// Lend **this realm's** scene and a dmabuf importer bound to this
+    /// backend's live GPU renderer to `f`, both borrowed **together**, for one
+    /// shim dispatch (P1.3.5's zero-copy path, issue #117).
+    ///
+    /// `realm` is the realm whose shim connection is being dispatched
+    /// ([`dispatch_shim`] carries it in the source's callback), so a commit
+    /// lands in that realm's own scene and nowhere else.
     ///
     /// A callback for the reason [`Self::teardown_view`]'s docs give in
     /// full: the concrete importer's `renderer: &mut GlesRenderer` field is
@@ -443,9 +537,10 @@ pub(crate) trait Presenter {
     /// `import_failed` shm fallback, exactly as before this method existed.
     fn scene_and_importer<R>(
         &mut self,
+        realm: &RealmId,
         f: impl for<'v> FnOnce(&'v mut Scene, Option<&'v mut dyn DmabufImporter>) -> R,
     ) -> R {
-        f(self.scene(), None)
+        f(self.scene_mut(realm), None)
     }
     /// Ask the backend to schedule a presentation, for backends whose frame
     /// clock is external (nested: the host compositor's redraw request). The
@@ -467,6 +562,16 @@ pub(crate) trait Presenter {
     /// to the shim stays one shared position per realm view; see
     /// [`crate::cursor`] for the whole distinction and why the sprite may not
     /// be drawn on [`InputRouter::pointer`].
+    ///
+    /// **Gated on the bound realm since WS-E.1.3.** [`post_dispatch`] passes
+    /// `None` unless the router's currently bound realm is the one the output
+    /// is bound to, because the sprite is drawn in *output* coordinates over
+    /// the *output's* realm: drawing a hidden realm's pointer would paint a
+    /// crosshair at coordinates that mean nothing in the picture the human is
+    /// looking at. The consequence — an agent actuating in a hidden realm
+    /// draws no sprite, so the human loses the one visual signal D-019 exists
+    /// to give them — is real, is not fixed here, and is published in
+    /// `docs/book/src/limits.md`.
     ///
     /// `true` means the caller should mark the frame dirty and request a
     /// present. Backends that composite no agent cursor answer `false`
@@ -553,7 +658,7 @@ impl<H: PreemptionHook> Runtime<H> {
             router,
             shim,
             dirty: false,
-            view_cache: None,
+            view_cache: BTreeMap::new(),
             capture_dump,
             epoch: Instant::now(),
         }
@@ -819,11 +924,12 @@ pub(crate) fn start_realm_in<H: RuntimeHost>(
     host: &mut H,
     paths: &SpawnPaths,
 ) -> Result<(), Box<dyn Error>> {
-    // NOT per-realm, and the one claim this loop's predecessor got wrong:
-    // the view size is the *output's*, shared by every realm, because the
-    // scene composites one surface for one output. Binding an output to a
-    // realm is WS-E.1.3; until it lands, every shim is configured with the
-    // same geometry and only the last committer is visible.
+    // NOT per-realm, and still deliberately so after WS-E.1.3: the view size
+    // is the *output's*, shared by every realm, because there is one output
+    // and decision 3 keeps it that way — one bound realm, no stacking, no
+    // overlap, no resize. Every realm now has its own scene and its own
+    // capture, but every one of them composes at this one geometry, so every
+    // shim is still configured identically.
     let (width, height) = {
         let (_, view) = host.split();
         view.view_size()
@@ -922,6 +1028,34 @@ fn start_one_realm_in<H: RuntimeHost>(
         Ok::<_, Box<dyn Error>>(Hangup::registered(move || releaser.remove(token)))
     })?;
     let outbox = registered.expect("adopt runs `place` exactly once on the success path");
+
+    // **The output's first binding**, and a placeholder in exactly the sense
+    // [`seat_target`] is one: the first realm to attach gets the output. Who
+    // *may* move it is WS-E.1.4's question (issue #210) and this issue
+    // deliberately answers none of it — it lands the mechanism
+    // (`Presenter::bind_output`) and its callers.
+    //
+    // Only *this* caller is conditional on nothing being bound yet. The other
+    // one, [`rebind_output_after_death`], moves the output when the realm
+    // holding it stops serving, because "bound once, never moved" left the
+    // output stuck on a corpse for the rest of the session.
+    //
+    // Deliberately the same realm `seat_target` names — realms attach in the
+    // registry's id order, and `seat_target` takes the first still-serving
+    // realm in id order — so the realm a human is looking at is the realm an
+    // actuation reaches. They are still independent choices in separate
+    // functions, which is why the chokepoint's step-5d comparison stays
+    // fail-closed rather than being relaxed on the strength of this comment.
+    {
+        let (runtime, view) = host.split();
+        if view.focused().is_none() {
+            view.bind_output(realm_id);
+            tracing::info!(realm = %realm_id, "output bound to the first realm to attach");
+        }
+        // The bound realm's view has changed under the output; nothing has
+        // composited it yet.
+        runtime.dirty = true;
+    }
 
     let runtime = host.runtime();
     runtime.realms.insert(
@@ -1028,13 +1162,25 @@ fn live_realm_ids<H: RuntimeHost>(host: &mut H) -> Vec<RealmId> {
 /// `kind=dmabuf` commit already resolved as the designed `import_failed` shm
 /// fallback and there is no zero-copy content to drop.
 ///
-/// **The `scene` and `retained` halves are still session-wide**, because
-/// there is one output and one scene: a realm's death therefore clears
-/// whatever surface the scene holds, even if a sibling put it there. That
-/// direction is fail-closed — the survivors' captures refuse `no_surface`
-/// until they commit again, rather than serving a dead realm's pixels — and
-/// it is a consequence of the scene not yet being bound to a realm
-/// (WS-E.1.3), not of the teardown funnel.
+/// **The `scene` and `importer` halves are now this realm's own** (WS-E.1.3):
+/// a death clears exactly the dying realm's surface and drops exactly its own
+/// retained zero-copy import, leaving every sibling's composed view
+/// byte-identical and every sibling's GPU texture resident. They used to be
+/// the session's single scene and single retained slot, so a death took
+/// whichever realm's happened to be there — fail-closed, and stated as such,
+/// but gone now.
+///
+/// **The `retained` half is still the output's, and is still scrubbed on any
+/// realm's death.** That is over-broad — a hidden realm dying blanks the
+/// bound realm's last painted frame out of the headless framebuffer — and it
+/// stays that way on purpose, for two reasons. It is the fail-*closed*
+/// direction (a scrub can only remove pixels, never serve a dead realm's),
+/// and [`close_realm`] marks the frame dirty and requests a present on the
+/// same path, so the very next round recomposites the bound realm and the
+/// blank is not observable to a capture that could not already refuse. The
+/// alternative — scrubbing only when the *bound* realm dies — is a second
+/// predicate about whose pixels are in that buffer, which is precisely what
+/// `RetainedOutput`'s docs refuse to grow.
 ///
 /// The `router` half, by contrast, **is** scoped: it is one router, but its
 /// per-shim-generation state belongs to one realm at a time, and
@@ -1048,26 +1194,111 @@ fn with_realm_teardown<H: RuntimeHost, T>(
     realm_id: &RealmId,
     f: impl FnOnce(&mut RealmLifecycle, &mut RealmTeardown<'_, '_, H::Hook>) -> T,
 ) -> Option<T> {
+    let out = {
+        let (runtime, view) = host.split();
+        view.teardown_view(realm_id, move |scene, retained, importer| {
+            let Runtime {
+                kernel,
+                realms,
+                router,
+                ..
+            } = runtime;
+            let realm = realms.get_mut(realm_id)?;
+            let mut teardown = RealmTeardown {
+                scene,
+                shim: &mut realm.server,
+                importer,
+                router,
+                retained,
+                realms: &mut kernel.realms,
+                recorder: &mut kernel.recorder,
+            };
+            Some(f(&mut realm.life, &mut teardown))
+        })
+    };
+    // Here rather than in `close_realm` because this is the funnel every death
+    // path shares -- `close_realm`, `reap_realm` and `shutdown_realm` all
+    // arrive through it, and a rebind wired to one of the three would leave a
+    // `SIGCHLD`-observed death holding the output.
+    rebind_output_after_death(host);
+    out
+}
+
+/// **The output must not stay bound to a realm that is gone.**
+///
+/// [`RealmScenes::bind`] was the only writer of the binding, and nothing
+/// cleared it: [`start_one_realm_in`] bound the first realm to attach, and
+/// when that realm's app exited the teardown funnel cleared its *scene* while
+/// the binding survived. Every later composite then rendered the empty scene
+/// — the deterministic background — for the rest of the session, and
+/// [`post_dispatch`]'s bound-realm gate suppressed the agent-cursor sprite on
+/// the strength of a `focused()` that named a corpse, all while live siblings
+/// ran. That is a stuck output, not a policy.
+///
+/// # The narrowest behaviour, and why this one
+///
+/// **Move the output to the first still-serving realm in id order; unbind only
+/// when there is none.** That is [`seat_target`]'s rule, letter for letter,
+/// and choosing it is the whole of the argument:
+///
+/// - It is not a focus *policy*. Who may move the output is WS-E.1.4's
+///   question (issue #210) and this answers none of it — it is the same
+///   placeholder [`start_one_realm_in`] already applies at first attach, now
+///   also applied when the realm it picked stops existing. A policy that
+///   arrives later replaces both call sites and this function with it.
+/// - It keeps the step-5d stopgap **fail-closed rather than relaxed**. The
+///   chokepoint refuses an actuation whose grant names a realm other than the
+///   one [`seat_target`] serves (`enforcement.rs` step 5d, owned by issue
+///   #212). That refusal is safe precisely because the visible realm and the
+///   seat's target are two independent placeholders that *agree*; picking any
+///   other realm here would make the human watch realm X while every admitted
+///   actuation went to realm Y, which is the one direction a stopgap must
+///   never move.
+/// - Unbinding instead — the other narrow option — is a different way of being
+///   stuck: it composites the deterministic background while a live sibling
+///   paints, which is the state this function exists to leave. So it is the
+///   answer only when nothing is serving, where [`seat_target`] also answers
+///   `None` and the two still agree.
+///
+/// A no-op unless the realm the output is bound to has actually lost its shim
+/// session, so the ordinary path — a `SIGCHLD` poll that finds nothing, a
+/// sibling dying — costs one map lookup and changes nothing.
+fn rebind_output_after_death<H: RuntimeHost>(host: &mut H) {
     let (runtime, view) = host.split();
-    view.teardown_view(move |scene, retained, importer| {
-        let Runtime {
-            kernel,
-            realms,
-            router,
-            ..
-        } = runtime;
-        let realm = realms.get_mut(realm_id)?;
-        let mut teardown = RealmTeardown {
-            scene,
-            shim: &mut realm.server,
-            importer,
-            router,
-            retained,
-            realms: &mut kernel.realms,
-            recorder: &mut kernel.recorder,
-        };
-        Some(f(&mut realm.life, &mut teardown))
-    })
+    // `server.is_none()` is the same fact `seat_target` filters on and the
+    // same one `refresh_view_cache` prunes on: `RealmLifecycle::die` takes the
+    // `ShimServer` out of the runtime entry, and no other path does.
+    let bound_is_gone = view.focused().is_some_and(|bound| {
+        runtime
+            .realms
+            .get(bound)
+            .is_none_or(|realm| realm.server.is_none())
+    });
+    if !bound_is_gone {
+        return;
+    }
+    match seat_target(&runtime.realms).map(|(realm_id, _)| realm_id.clone()) {
+        Some(next) => {
+            view.bind_output(&next);
+            tracing::info!(
+                realm = %next,
+                "the realm holding the output died; the output follows the seat to the first \
+                 still-serving realm in id order"
+            );
+        }
+        None => {
+            view.unbind_output();
+            tracing::info!(
+                "the realm holding the output died and no realm is still serving; the output \
+                 shows the deterministic background"
+            );
+        }
+    }
+    // The window is showing a different realm now, and on a backend whose
+    // frame clock is external the dirty flag alone composites nothing --
+    // exactly the pairing `close_realm` documents.
+    runtime.dirty = true;
+    view.request_present();
 }
 
 /// The advisory expiry sweeps, one timer tick.
@@ -1414,6 +1645,10 @@ fn dispatch_principal<H: RuntimeHost>(
             let outcome = {
                 let (runtime, view) = host.split();
                 let (width, height) = view.view_size();
+                // Reborrowed shared for the rest of this block: both closures
+                // below only *read* the presenter, and a scene must never be
+                // minted by the act of asking whether a realm has one.
+                let view = &*view;
                 let Runtime {
                     kernel,
                     conns,
@@ -1437,24 +1672,51 @@ fn dispatch_principal<H: RuntimeHost>(
                 // then capture the scene B committed into. So the answer is
                 // a *function of the realm id*, and
                 // `PrincipalServer::serve_facet_use` applies it to the realm
-                // the grant row names.
-                //
-                // What is still session-wide is the frame itself: one scene,
-                // one committed surface, one view cache, so a live realm's
-                // capture can carry a live *sibling's* pixels while both are
-                // running. That is the scene's single-surface model, owned by
-                // WS-E.1.3 and published as a limit
-                // (`docs/book/src/limits.md`). A **dead** realm's grant is
-                // not part of that exposure and never was meant to be: it
-                // refuses `no_surface` here.
-                //
-                // The cache itself is refreshed at redraw time, never here,
-                // so capture stays a pure read of the last completed frame.
-                let scene = &*view.scene();
+                // the grant row names. It is asked against **that realm's own
+                // scene** since WS-E.1.3; before that there was one scene to
+                // ask, which is why the leak below existed at all.
                 let realm_is_live = |realm_id: &RealmId| {
+                    let Some(scene) = view.scene(realm_id) else {
+                        // No scene at all: the realm has never committed and
+                        // has never held the output. Nothing to photograph.
+                        return false;
+                    };
                     realms
                         .get(realm_id)
                         .is_some_and(|realm| realm.life.view_is_live(scene))
+                };
+                // **THE selection decision 1 is about, and it is deliberately
+                // a function of the realm id rather than a value.**
+                //
+                // A capture must return *the granted realm's* pixels, never
+                // whatever is on the output. Until WS-E.1.3 this was one
+                // `Option<RealmViewFrame>` built from one session-wide cache,
+                // so an `observe` grant over realm A returned realm B's frame
+                // the instant B committed — nothing in that code was wrong
+                // (there was one realm) and nothing in it prevented the leak
+                // either. Making the frame a function of the id is what makes
+                // the leak unrepresentable: there is no "the view" left to
+                // hand the chokepoint by mistake.
+                //
+                // `PrincipalServer::serve_facet_use` is the one caller, and
+                // it applies this to the realm the **grant row** names, on
+                // the same line it applies `realm_is_live` — the two halves
+                // of "the view of the realm this grant is about" resolved
+                // together, beside each other, or not at all.
+                //
+                // One `(width, height)` for every realm: there is one output
+                // and decision 3 keeps it that way, so every realm's view is
+                // composed at the output's size (`start_realm_in` configures
+                // every shim with it).
+                //
+                // The cache itself is refreshed at redraw time, never here,
+                // so capture stays a pure read of the last completed frame.
+                let realm_view = |realm_id: &RealmId| {
+                    view_cache.get(realm_id).map(|rgba| RealmViewFrame {
+                        rgba: rgba.as_slice(),
+                        width,
+                        height,
+                    })
                 };
                 // **The write-side half of the same question** ([`route_seat`]
                 // is where an admitted actuation actually goes). Resolved here
@@ -1467,11 +1729,6 @@ fn dispatch_principal<H: RuntimeHost>(
                 let Some(state) = conns.get_mut(&id) else {
                     return;
                 };
-                let realm_view = view_cache.as_deref().map(|rgba| RealmViewFrame {
-                    rgba,
-                    width,
-                    height,
-                });
                 let mut actuations = |input: SeatInput| seat.push(input);
                 let mut ctx = ServerCtx {
                     verifier: &kernel.verifier,
@@ -1479,7 +1736,7 @@ fn dispatch_principal<H: RuntimeHost>(
                     realms: &kernel.realms,
                     grants: &mut kernel.grants,
                     now,
-                    realm_view,
+                    realm_view: &realm_view,
                     realm_is_live: &realm_is_live,
                     seat_target_realm,
                     presence: &kernel.presence,
@@ -1536,13 +1793,27 @@ fn dispatch_principal<H: RuntimeHost>(
 /// allowed to answer on its own — which realm a grant's actuation targets,
 /// and which realm physical input follows — and both are WS-E.1.6's,
 /// alongside the per-realm [`PhysicalPresence`] the preemption judgement
-/// reads. Until then there is one router and one shared scene, so "the
-/// realm" is as meaningful as it was when there was only one; naming the
-/// choice in **one** function is what stops it being mistaken for a
-/// decision, and what keeps the agent path ([`route_seat`]), the physical
-/// path (`backend::winit::route_physical_inputs`) and the router's
-/// generation binding from disagreeing about the target. The eventual
-/// policy replaces this body and nothing else.
+/// reads.
+///
+/// The scene is no longer shared, so "there is only one place input could
+/// go" is no longer the reason this survives. What survives instead is
+/// narrower and does not depend on the rendering model at all: there is
+/// **one router** — one implicit-grab state, one pointer position, one
+/// generation binding, shared between the human's physical input and every
+/// agent's admitted actuation — so exactly one realm can be its target at a
+/// time, and *something* has to name that realm. Naming it in **one**
+/// function is what stops the choice being mistaken for a decision, and what
+/// keeps the agent path ([`route_seat`]), the physical path
+/// (`backend::winit::route_physical_inputs`) and the router's generation
+/// binding from disagreeing about it. The eventual policy — a router per
+/// realm — replaces this body and nothing else.
+///
+/// It is also the rule the **output** binding follows, deliberately:
+/// [`start_one_realm_in`] and [`rebind_output_after_death`] both bind the
+/// first still-serving realm in id order, so the realm a human is watching
+/// and the realm an actuation reaches agree. They stay two independent
+/// choices in three functions, which is why the chokepoint's step-5d
+/// comparison below is still made rather than assumed.
 ///
 /// "Still serving" rather than plain "first": a dead realm keeps its map
 /// entry until shutdown (the registry and the runtime both outlive the
@@ -1606,7 +1877,6 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
     }
     let (runtime, view) = host.split();
     let view_size = view.view_size();
-    let surface = view.scene().surface_size();
     let Runtime {
         router,
         realms,
@@ -1619,6 +1889,13 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
     let Some(server) = realm.server.as_ref() else {
         return;
     };
+    // **The target realm's own surface geometry**, read after the target is
+    // known rather than before (WS-E.1.3). The router maps view coordinates
+    // to surface coordinates through `layout::place`, so it must be handed
+    // the geometry of the surface the event is about; with one scene those
+    // were the same thing, and with several a hidden realm's committed size
+    // would silently place a click for the realm being typed into.
+    let surface = view.scene(realm_id).and_then(|scene| scene.surface_size());
     // Before the first `route`: the router's pairing table and implicit
     // grab are a record of what *this realm's app* was told, so the realm
     // has to be on record before anything is added to them. It is what
@@ -1690,7 +1967,11 @@ fn dispatch_shim<H: RuntimeHost>(
             // explicit point rather than at its last syntactic use — and
             // `view.request_present()`/`close_realm(host, ..)` below both
             // need `view`/`host` free again.
-            let outcome = view.scene_and_importer(|scene, importer| {
+            // **This realm's** scene, named by the id the source's callback
+            // carried (WS-E.1.3): a commit lands in the committing realm's
+            // own scene, so the last committer no longer owns the only
+            // surface in the session.
+            let outcome = view.scene_and_importer(realm_id, |scene, importer| {
                 server.handle_message(msg, scene, importer, &mut send)
             });
             match outcome {
@@ -1794,10 +2075,23 @@ fn close_realm<H: RuntimeHost>(host: &mut H, realm_id: &RealmId, cause: DeathCau
 /// anti-amplification defense; coalescing the *callbacks* would break pacing,
 /// which is why `ShimServer::presented` batches rather than collapses.
 ///
-/// **Every attached realm is paid, not the first.** One composite discharges
-/// whatever each realm is owed: a realm skipped here is a shim that paces on
-/// `frame_done` and never hears one, which is a permanent stall of that app
-/// with nothing in the log to say so.
+/// **Every attached realm is paid, not the first, and visibility is not a
+/// condition** (WS-E.1.3 decision 2). One composite discharges whatever each
+/// realm is owed, bound or hidden. A realm skipped here is a shim that paces
+/// on `frame_done` and never hears one, which is a permanent stall of that
+/// app with nothing in the log to say so — and, once captures are per realm,
+/// it is worse than a stall: a Wayland client that stops repainting leaves
+/// its capture a **stale frame**, which `vitrin_grant.refusal.no_surface`
+/// forbids in as many words ("never a stale frame"). Refusing capture on a
+/// hidden realm instead was the alternative and it is a lie, because the
+/// realm *has* a surface.
+///
+/// So a hidden realm is paced by the same real clock the bound one is: one
+/// permit per **completed output composite**, never per dispatch round, which
+/// is exactly the rule [`Presentation`] exists to keep. The cost — up to
+/// [`crate::realm::MAX_REALMS`] apps rendering at the output's rate whether or
+/// not anyone is looking — is deliberate, untraded, and published in
+/// `docs/book/src/limits.md`.
 pub(crate) fn emit_presented<H: PreemptionHook>(runtime: &mut Runtime<H>) {
     let Runtime { realms, epoch, .. } = runtime;
     let time_ms = epoch.elapsed().as_millis() as u32;
@@ -1833,7 +2127,21 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
         // nothing else in this round will say so (the app owes no commit for
         // a hover). Drawing only — the shim's delivery already happened
         // inside the round, through `route_seat`, and is unaffected.
-        if view.set_agent_cursor(runtime.router.agent_pointer()) {
+        //
+        // **Gated on the bound realm** (WS-E.1.3): the sprite is painted in
+        // the output's coordinates over the output's realm, so an agent
+        // pointing inside a *hidden* realm has no position that means
+        // anything in the picture the human is looking at, and drawing one
+        // anyway would put a crosshair over an unrelated app. The router
+        // knows which realm its pointer state is owed to; the presenter knows
+        // which realm the output shows; the sprite is drawn only when they
+        // agree. The consequence is a real weakening of D-019 and is
+        // published as a limit, not smoothed over.
+        let cursor = runtime
+            .router
+            .agent_pointer()
+            .filter(|_| runtime.router.bound_realm() == view.focused());
+        if view.set_agent_cursor(cursor) {
             runtime.dirty = true;
             view.request_present();
         }
@@ -1847,22 +2155,25 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
                 // so a refresh on the request path would make an agent's
                 // capture trigger a composite and make goldens depend on
                 // request timing.
-                runtime.view_cache = view.view_rgba();
-                // The `--capture-dump` diagnostic (P1.8.5): mirror the same
-                // freshly refreshed readback to a file. Written here, off the
-                // redraw path and NOT on the capture request, so the dumped
-                // frame and the frame an `observe()` later serves come from one
-                // and the same `view_cache` — the two diverge only in the
-                // transport between them (`render_frame`, the memfd, the wire,
-                // the SDK decode), which is exactly the "adds no distortion"
-                // claim the SSIM comparison tests. A write failure is logged,
-                // never fatal: a broken diagnostic must not take a session down.
-                if let (Some(path), Some(rgba)) = (
-                    runtime.capture_dump.as_deref(),
-                    runtime.view_cache.as_deref(),
-                ) {
-                    write_capture_dump(path, rgba);
-                }
+                //
+                // **Every live realm, not the bound one** (decision 1). A
+                // hidden realm's `observe` grant must serve that realm's own
+                // pixels, so its view is composed here too — the same site,
+                // the same completed-composite occasion, the same purity
+                // rule. The bound realm's entry is the output's own
+                // composition (headless reads its retained framebuffer back);
+                // the rest are `Scene::compose` of their own scenes, which is
+                // byte-identical machinery.
+                //
+                // Also a **prune**: a realm whose shim session is gone
+                // (`server.is_none()`, the fact the death funnel sets) has
+                // its entry dropped rather than left behind. `realm_is_live`
+                // already refuses a dead realm's capture, so this is defence
+                // in depth of exactly the kind
+                // `RetainedOutput::scrub_retained_frame` is for the headless
+                // framebuffer — the bytes behind the predicate are gone, not
+                // merely unreachable.
+                refresh_view_cache(runtime, view);
                 // Only a composite that actually happened discharges the
                 // realm's owed `frame_done`. On a backend whose clock is
                 // external this is `Scheduled`, and the frame callbacks stay
@@ -1883,10 +2194,118 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
     }
 }
 
+/// Recompose **every live realm's** view into [`Runtime::view_cache`], and
+/// mirror each one to its `--capture-dump` file.
+///
+/// Split out of [`post_dispatch`] because it is now a loop with a prune
+/// rather than one assignment, and because "which realms does the cache hold"
+/// is a confidentiality statement worth reading in one place:
+///
+/// - **Fill** — one entry per realm with a live shim session, composed at the
+///   output's view size. A realm whose view is degenerate (a minimized nested
+///   window, a readback failure, a realm with no scene) gets no entry, which
+///   the chokepoint turns into `no_surface`.
+/// - **Prune** — every other entry is removed, so a dead realm's last frame
+///   does not sit in the map behind a predicate. `realm_is_live` already
+///   refuses it; this makes the bytes gone as well as unreachable.
+///
+/// # "Live" is `server.is_some()`, not "has a map entry"
+///
+/// **No production path ever removes a key from [`Runtime::realms`]** — the
+/// entry outlives the process by design, so a `waitpid` and a shutdown ladder
+/// can still find it, and [`close_realm`] leaves it in place with
+/// `server: None`. Deriving the live set from `realms.keys()` therefore made
+/// the prune a no-op that could never fire, with the defence-in-depth claim
+/// above stated anyway and a test that only passed because it removed the key
+/// by hand — a state the runtime does not produce.
+///
+/// `server.is_none()` is what actually marks a dead realm: [`RealmLifecycle`]'s
+/// death funnel takes the [`ShimServer`] out of the entry
+/// (`teardown.shim.take()`) and nothing else does. It is the same fact
+/// [`seat_target`] filters on and the same one [`rebind_output_after_death`]
+/// tests, so the three cannot disagree about which realms are gone.
+///
+/// Cost: one `Scene::compose` per live realm per **dirty** round — not per
+/// output frame, and nothing at all on an idle session. That is decision 2's
+/// bill and it is published as a limit.
+fn refresh_view_cache<K: PreemptionHook, P: Presenter>(runtime: &mut Runtime<K>, view: &mut P) {
+    let live: Vec<RealmId> = runtime
+        .realms
+        .iter()
+        .filter(|(_, realm)| realm.server.is_some())
+        .map(|(realm_id, _)| realm_id.clone())
+        .collect();
+    runtime.view_cache.retain(|realm, _| live.contains(realm));
+    for realm_id in live {
+        match view.view_rgba(&realm_id) {
+            Some(rgba) => {
+                if let Some(base) = runtime.capture_dump.as_deref() {
+                    // The `--capture-dump` diagnostic (P1.8.5): mirror the
+                    // same freshly refreshed readback to a file. Written
+                    // here, off the redraw path and NOT on the capture
+                    // request, so the dumped frame and the frame an
+                    // `observe()` later serves come from one and the same
+                    // cache entry — the two diverge only in the transport
+                    // between them (`render_frame`, the memfd, the wire, the
+                    // SDK decode), which is exactly the "adds no distortion"
+                    // claim the SSIM comparison tests. A write failure is
+                    // logged, never fatal: a broken diagnostic must not take
+                    // a session down.
+                    write_capture_dump(&capture_dump_path(base, &realm_id), &rgba);
+                }
+                runtime.view_cache.insert(realm_id, rgba);
+            }
+            None => {
+                runtime.view_cache.remove(&realm_id);
+            }
+        }
+    }
+}
+
+/// Where a realm's `--capture-dump` frame is written: the operator's `PATH`
+/// with `.<realm-id>` appended.
+///
+/// **Every dump names its realm, and the bare `PATH` is never written**
+/// (WS-E.1.3). While a session held one realm, `PATH` unambiguously named the
+/// one view the M1.3 fidelity gate (`tests/integration/test_real_capture_fidelity.py`)
+/// compares an agent's `observe()` against. With N realms it would name *a*
+/// view — whichever realm the writer happened to mean — and a gate whose
+/// ground truth is a guess is worse than no gate. Suffixing rather than
+/// silently keeping `PATH` for the bound realm is the choice that makes a
+/// mismatch between the dump's realm and the grant's realm impossible to
+/// write by accident.
+///
+/// Appended to the whole path, not swapped into the extension: a realm id is
+/// at most 64 bytes over `[A-Za-z0-9._-]` and never `.` or `..`
+/// (`crate::realm::validate_realm`, which defers to
+/// `vitrin_ipc::paths::shim_runtime_dir_in` so the rule has one definition),
+/// so the result is always a distinct, path-safe sibling of the target —
+/// including for a `PATH` that already has an extension, where
+/// `with_extension` would have eaten it.
+///
+/// The charset is not `[a-z0-9-]`, which this comment used to claim. `.` and
+/// `_` are legal in an id, and the argument survives that: `.` is legal
+/// *inside* an id but a bare `.` or `..` is refused outright, and every legal
+/// id is exactly the single path component the realm's own runtime directory
+/// is named with — so no id can add a separator, escape the parent directory,
+/// or name the parent itself. What it does **not** promise is that the
+/// suffixed path fits any particular filesystem's name limit; a 64-byte id on
+/// a `PATH` whose basename is already near `NAME_MAX` fails the write, which
+/// [`write_capture_dump`] logs rather than treating as fatal — this is the
+/// `--capture-dump` diagnostic, and a broken diagnostic must not take a
+/// session down.
+fn capture_dump_path(base: &std::path::Path, realm: &RealmId) -> PathBuf {
+    let mut named = base.as_os_str().to_owned();
+    named.push(".");
+    named.push(realm.as_str());
+    PathBuf::from(named)
+}
+
 /// Write the core-internal capture (`--capture-dump`, P1.8.5) atomically.
 ///
 /// The bytes are the raw RGBA realm-view readback — `width * height * 4`,
-/// rows top-down, exactly what [`Runtime::view_cache`] holds. Written to a
+/// rows top-down, exactly what one [`Runtime::view_cache`] entry holds.
+/// Written to a
 /// sibling temp and renamed into place so a reader (the P1.8.5 fidelity test)
 /// never observes a half-written frame; the rename is atomic within a
 /// directory, and the single-threaded loop means there is never a second
@@ -1954,7 +2373,7 @@ mod tests {
     /// makes "how many composites did one dispatch round cost" an assertable
     /// number rather than something a GPU hides.
     struct TestView {
-        scene: Scene,
+        scenes: crate::scene::RealmScenes,
         redraws: usize,
         /// How many times the backend was asked to *schedule* a
         /// presentation. Distinct from [`Self::redraws`] on purpose: on a
@@ -1970,11 +2389,41 @@ mod tests {
         /// but only exercised when a grab is attached; the consent tests
         /// assert a card was raised on it.
         consent: ConsentSurface,
+        /// The last position [`Presenter::set_agent_cursor`] was **offered**,
+        /// `None` when it has not been called since a test cleared it.
+        ///
+        /// Recorded rather than acted on: this view composites nothing, and
+        /// what WS-E.1.3 changed is which position `post_dispatch` decides to
+        /// offer at all (the bound-realm gate). `Some(None)` — offered, and
+        /// the offer was "draw nothing" — is a different fact from `None`,
+        /// which is "the gate was never reached".
+        cursor_offered: Option<Option<(f64, f64)>>,
+    }
+
+    impl TestView {
+        /// This realm's committed surface size, if it has one — the read the
+        /// death-path tests use to check that a realm really painted and
+        /// that the teardown funnel really took *its* surface away.
+        fn surface_of(&self, realm: &RealmId) -> Option<(u32, u32)> {
+            self.scenes.scene(realm).and_then(|s| s.surface_size())
+        }
     }
 
     impl Presenter for TestView {
-        fn scene(&mut self) -> &mut Scene {
-            &mut self.scene
+        fn scene_mut(&mut self, realm: &RealmId) -> &mut Scene {
+            self.scenes.scene_mut(realm)
+        }
+        fn scene(&self, realm: &RealmId) -> Option<&Scene> {
+            self.scenes.scene(realm)
+        }
+        fn focused(&self) -> Option<&RealmId> {
+            self.scenes.focused()
+        }
+        fn bind_output(&mut self, realm: &RealmId) {
+            self.scenes.bind(realm);
+        }
+        fn unbind_output(&mut self) {
+            self.scenes.unbind();
         }
         fn view_size(&self) -> (u32, u32) {
             VIEW
@@ -1986,8 +2435,17 @@ mod tests {
             self.redraws += 1;
             Ok(self.posture)
         }
-        fn view_rgba(&mut self) -> Option<Vec<u8>> {
-            Some(crate::test_pattern::render(VIEW.0, VIEW.1))
+        /// **This realm's own** composition, exactly as both shipped
+        /// backends serve — never a fixed frame for the session. A realm
+        /// with no scene has no view, which the chokepoint turns into
+        /// `no_surface`.
+        ///
+        /// Composed rather than stubbed because the cross-realm capture
+        /// tests below are byte-exact: a `TestView` that answered the same
+        /// bytes for every realm would let a runtime that handed out the
+        /// wrong realm's frame pass them.
+        fn view_rgba(&mut self, realm: &RealmId) -> Option<Vec<u8>> {
+            Some(self.scenes.scene(realm)?.compose(VIEW.0, VIEW.1))
         }
         /// Counts the requests the nested backend turns into
         /// `Window::request_redraw`. Overridden rather than inherited as the
@@ -2002,20 +2460,22 @@ mod tests {
         /// rather than inherited from a trait default so that adding a
         /// presentation path is a compile error until someone decides
         /// whether it draws the sprite.
-        fn set_agent_cursor(&mut self, _pos: Option<(f64, f64)>) -> bool {
+        fn set_agent_cursor(&mut self, pos: Option<(f64, f64)>) -> bool {
+            self.cursor_offered = Some(pos);
             false
         }
         /// No retained image to scrub: this view keeps a counter, not a
         /// framebuffer. No GPU renderer either, so no importer.
         fn teardown_view<R>(
             &mut self,
+            realm: &RealmId,
             f: impl for<'v> FnOnce(
                 &'v mut Scene,
                 Option<&'v mut dyn RetainedOutput>,
                 Option<&'v mut dyn DmabufImporter>,
             ) -> R,
         ) -> R {
-            f(&mut self.scene, None, None)
+            f(self.scenes.scene_mut(realm), None, None)
         }
     }
 
@@ -2124,11 +2584,12 @@ mod tests {
             let mut host = TestHost {
                 runtime: Runtime::new(seed, InputRouter::new(NoopHook)),
                 view: TestView {
-                    scene: Scene::new(),
+                    scenes: crate::scene::RealmScenes::new(VIEW),
                     redraws: 0,
                     presents: 0,
                     posture: Presentation::Completed,
                     consent: ConsentSurface::new(crate::consent::TrustedIndicator::for_test()),
+                    cursor_offered: None,
                 },
                 handle: handle.clone(),
                 signal: event_loop.get_signal(),
@@ -2322,6 +2783,13 @@ mod tests {
     /// outcome. Blocking: every caller has already pumped the loop long
     /// enough that the bytes are in the socket.
     fn await_resolution(client: &mut Connection) -> Outcome {
+        await_resolution_at(client, GRANT_ID)
+    }
+
+    /// The same, for a grant at an arbitrary wire id — a session with more
+    /// than one realm has more than one grant, at ids climbing above the
+    /// watermark.
+    fn await_resolution_at(client: &mut Connection, grant_id: u32) -> Outcome {
         for _ in 0..32 {
             let msg = client
                 .recv_message()
@@ -2330,7 +2798,7 @@ mod tests {
             // Object id as well as opcode: opcodes are per-interface, so
             // matching on the opcode alone would decode some other
             // interface's event as a resolution.
-            if msg.header.object_id == GRANT_ID
+            if msg.header.object_id == grant_id
                 && msg.header.opcode == vitrin_grant::events::Resolved::OPCODE
                 && msg.bytes.len() >= HEADER_LEN
             {
@@ -2340,6 +2808,44 @@ mod tests {
             }
         }
         panic!("no vitrin_grant.resolved arrived");
+    }
+
+    /// Capture through the wire on the facet `view_id` names, and read the
+    /// delivered memfd back.
+    ///
+    /// The bytes, not the dimensions: what WS-E.1.3 is about is *whose*
+    /// pixels arrive, and two realms at one output size have identical
+    /// dimensions — a test that asserted only `width`/`height` would pass
+    /// against the very leak this closes.
+    fn capture_bytes(rig: &mut Rig, client: &mut Connection, view_id: u32) -> Vec<u8> {
+        use std::os::unix::fs::FileExt;
+        client
+            .send_message(
+                &vitrin_protocol::generated::vitrin_view::requests::CaptureFrame {}.encode(view_id),
+                None,
+            )
+            .expect("capture_frame");
+        rig.pump(Duration::from_millis(200));
+        for _ in 0..32 {
+            let msg = client
+                .recv_message()
+                .expect("client receive")
+                .expect("the core must not have hung up");
+            if msg.header.object_id != view_id {
+                continue;
+            }
+            let (_, frame) = vitrin_protocol::generated::vitrin_view::events::FrameReady::decode(
+                &msg.bytes, msg.fd,
+            )
+            .expect("a well-formed frame_ready");
+            let len = (frame.stride * frame.height) as usize;
+            let mut bytes = vec![0u8; len];
+            std::fs::File::from(frame.fd)
+                .read_exact_at(&mut bytes, 0)
+                .expect("the sealed memfd must be readable");
+            return bytes;
+        }
+        panic!("no frame_ready arrived on view {view_id}");
     }
 
     /// **Acceptance criterion 3.** A pending petition resolves `timed_out`
@@ -3404,11 +3910,12 @@ mod tests {
         rig.start_realm(&["--serve", "--animate", "100000"]);
         // Let the shim commit at least one frame, so there really are dead
         // pixels for the teardown to clear rather than an empty scene.
+        let realm = RealmId::new(crate::realm::WELL_KNOWN_REALM_ID);
         rig.pump_until(Duration::from_secs(10), |host| {
-            host.view.scene.surface_size().is_some()
+            host.view.surface_of(&realm).is_some()
         });
         assert!(
-            rig.host.view.scene.surface_size().is_some(),
+            rig.host.view.surface_of(&realm).is_some(),
             "fixture check: the realm painted something before it died"
         );
 
@@ -3421,16 +3928,22 @@ mod tests {
         );
 
         assert!(
-            rig.host.view.scene.surface_size().is_none(),
+            rig.host.view.surface_of(&realm).is_none(),
             "fixture check: the death funnel takes the surface out of the scene"
         );
         assert!(
             rig.host.runtime.dirty,
             "realm death must mark the frame dirty"
         );
-        assert_eq!(
-            rig.host.view.presents,
-            presents_before + 1,
+        // At least one, not exactly one. Two paths ask for the frame on this
+        // fixture and both are wanted: `close_realm` asks because the dead
+        // realm's surface left the scene, and `rebind_output_after_death` asks
+        // because the output was bound to that realm and is not any more (here
+        // there is no sibling, so it unbinds). A duplicate `request_redraw` is
+        // coalesced by the host compositor into one frame; a *missing* one is
+        // the defect this test is about.
+        assert!(
+            rig.host.view.presents > presents_before,
             "realm death never reached the compositor: on the nested backend the dead \
              app's last frame stays on the human's screen until something unrelated \
              happens to ask for a redraw"
@@ -3750,5 +4263,491 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Every dump names its realm, and nothing is written to the bare
+    /// path** (WS-E.1.3).
+    #[test]
+    fn a_capture_dump_path_names_its_realm() {
+        let base = std::path::Path::new("/tmp/vitrin/internal.rgba");
+        assert_eq!(
+            capture_dump_path(base, &RealmId::new("realm-0")),
+            PathBuf::from("/tmp/vitrin/internal.rgba.realm-0")
+        );
+        // Two realms can never collide on one file, which is the whole
+        // point: an unqualified dump named *a* view.
+        assert_ne!(
+            capture_dump_path(base, &RealmId::new("realm-0")),
+            capture_dump_path(base, &RealmId::new("editor"))
+        );
+        // The suffix is appended to the whole path, never swapped into the
+        // extension, so a base that already has one keeps it.
+        assert_eq!(
+            capture_dump_path(std::path::Path::new("dump.rgba"), &RealmId::new("editor")),
+            PathBuf::from("dump.rgba.editor")
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // WS-E.1.3 (issue #209): one scene per realm, one bound to the output.
+    // ---------------------------------------------------------------------
+
+    /// Commit a deterministic fixture into `realm`'s scene through the same
+    /// [`Scene::commit`] seam `ShimServer::handle_message` drives.
+    ///
+    /// Sized rather than coloured, because [`client_pixels`] is a pure
+    /// function of `(x, y)`: two different sizes give two different composed
+    /// views (one fills the view exactly, the other letterboxes), and both are
+    /// recomputable in the assertion without a second copy of the fixture.
+    ///
+    /// [`client_pixels`]: crate::scene::tests::client_pixels
+    fn commit_fixture<H: RuntimeHost>(host: &mut H, realm: &RealmId, (w, h): (u32, u32)) {
+        let (_, view) = host.split();
+        view.scene_mut(realm).commit(
+            crate::scene::SurfaceContent::from_rgba(crate::scene::tests::client_pixels(w, h), w, h)
+                .expect("well-formed fixture"),
+        );
+    }
+
+    /// What a realm's view composes to at the test host's view size — the
+    /// bytes any honest capture of that realm must return.
+    fn expected_view((w, h): (u32, u32)) -> Vec<u8> {
+        let mut scene = Scene::new();
+        scene.commit(
+            crate::scene::SurfaceContent::from_rgba(crate::scene::tests::client_pixels(w, h), w, h)
+                .expect("well-formed fixture"),
+        );
+        scene.compose(VIEW.0, VIEW.1)
+    }
+
+    /// **THE confidentiality property (decision 1), byte-exact.**
+    ///
+    /// Two live realms commit different fixtures and **A is bound to the
+    /// output**. A capture under a grant over A returns A's bytes; a capture
+    /// under a grant over B returns B's bytes. Neither returns the other's,
+    /// and neither returns "whatever is on the output".
+    ///
+    /// This is the test that fails by construction against the code this
+    /// issue replaces: with one session-wide scene and one `view_cache`, both
+    /// realms' captures were the *same* frame — the last committer's — so a
+    /// grant over the hidden realm returned the bound realm's pixels. The
+    /// bug needed two live realms to express at all, which is why nothing
+    /// before WS-E.1.2 could have caught it and nothing in WS-E.1.2 did.
+    ///
+    /// Driven through the shipped runtime rather than the presenter alone:
+    /// `post_dispatch` fills the per-realm cache, `dispatch_principal`
+    /// resolves the frame by realm id, and the chokepoint decides — so a
+    /// regression anywhere along that path fails here, not only one in the
+    /// scene set.
+    #[test]
+    fn a_capture_returns_the_granted_realms_pixels_and_never_the_outputs() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "cross-realm-capture",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        // Two live shim sessions, so both realms are live for
+        // `RealmLifecycle::view_is_live` and neither capture can be refused
+        // `no_surface` for a reason that has nothing to do with selection.
+        let serve: &[&str] = &["--serve"];
+        rig.start_realms(&[("realm-0", serve), ("realm-b", serve)]);
+
+        let bound = RealmId::new("realm-0");
+        let hidden = RealmId::new("realm-b");
+        // The first realm to attach holds the output, in id order.
+        assert_eq!(
+            rig.host.view.focused(),
+            Some(&bound),
+            "the output binds to the first realm to attach"
+        );
+
+        // Different fixtures: A exactly fills the view, B is letterboxed.
+        const A: (u32, u32) = VIEW;
+        const B: (u32, u32) = (VIEW.0 / 2, VIEW.1 / 2);
+        commit_fixture(&mut rig.host, &bound, A);
+        commit_fixture(&mut rig.host, &hidden, B);
+        let (want_a, want_b) = (expected_view(A), expected_view(B));
+        assert_ne!(want_a, want_b, "the two fixtures must actually differ");
+
+        // One dirty round refreshes **both** realms' caches off the same
+        // completed composite.
+        rig.host.runtime.dirty = true;
+        post_dispatch(&mut rig.host);
+        assert_eq!(rig.host.runtime.view_cache.get(&bound), Some(&want_a));
+        assert_eq!(
+            rig.host.runtime.view_cache.get(&hidden),
+            Some(&want_b),
+            "a hidden realm's view is composed too, or its capture goes stale"
+        );
+
+        // Now over the wire, through a real grant on each realm.
+        let mut client = agent(&rig.socket);
+        send_preamble(&mut client);
+        send_petition(&mut client);
+        rig.pump(Duration::from_millis(200));
+        assert_eq!(await_resolution(&mut client), Outcome::Granted);
+
+        // A second realm handle and a second grant, at ids above the
+        // watermark.
+        client
+            .send_message(
+                &vitrin_principal::requests::GetRealm {
+                    realm: 9,
+                    name: "realm-b".into(),
+                }
+                .encode(2),
+                None,
+            )
+            .expect("get_realm realm-b");
+        client
+            .send_message(
+                &vitrin_realm::requests::RequestGrant {
+                    grant: 10,
+                    consent: 11,
+                    view: 12,
+                    pointer: 13,
+                    text: 14,
+                    resource: String::new(),
+                    verbs: Verb::OBSERVE,
+                    expiry_ms: 0,
+                    max_event_rate: 0,
+                    persistence: Persistence::WhileRunning,
+                    flags: 0,
+                }
+                .encode(9),
+                None,
+            )
+            .expect("request_grant realm-b");
+        rig.pump(Duration::from_millis(200));
+        assert_eq!(
+            await_resolution_at(&mut client, 10),
+            Outcome::Granted,
+            "the second realm's petition must be granted"
+        );
+
+        // The bound realm's view id is 6, the hidden realm's is 12.
+        let (wire_a, wire_b) = (
+            crate::capture::tests::xrgb_of(&want_a),
+            crate::capture::tests::xrgb_of(&want_b),
+        );
+        let got_a = capture_bytes(&mut rig, &mut client, 6);
+        let got_b = capture_bytes(&mut rig, &mut client, 12);
+        // Diagnosed rather than dumped: two frames of a few hundred KiB in
+        // an `assert_eq!` message is a wall of bytes nobody reads, and the
+        // fact that matters is *whose* pixels arrived.
+        let whose = |got: &[u8]| match got {
+            g if g == wire_a => "the BOUND realm's",
+            g if g == wire_b => "the HIDDEN realm's",
+            _ => "neither realm's",
+        };
+        assert_eq!(
+            whose(&got_a),
+            "the BOUND realm's",
+            "a capture over the bound realm must be the bound realm's own pixels"
+        );
+        assert_eq!(
+            whose(&got_b),
+            "the HIDDEN realm's",
+            "a capture over the HIDDEN realm returned {} pixels: with one frame for the \
+             session a grant over a hidden realm is served whatever is on the output, \
+             which is the cross-realm leak WS-E.1.3 exists to close",
+            whose(&got_b)
+        );
+        assert_ne!(got_a, got_b);
+    }
+
+    /// **A hidden realm keeps being paced, and its capture keeps moving.**
+    ///
+    /// Decision 2: a Wayland client throttles on `frame_done`, so a realm
+    /// that stops being paced stops repainting and its capture becomes a
+    /// stale frame — which `refusal.no_surface` forbids in as many words.
+    /// Both halves are asserted: the hidden realm's shim really is handed
+    /// frame callbacks off the output's completed composite, and its cached
+    /// view really changes when it repaints.
+    #[test]
+    fn a_hidden_realm_is_paced_and_its_capture_keeps_changing() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "hidden-pacing",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        // Both realms animate, so both owe frame callbacks continuously.
+        let serve: &[&str] = &["--serve", "--animate", "100000"];
+        rig.start_realms(&[("realm-0", serve), ("realm-b", serve)]);
+        let hidden = RealmId::new("realm-b");
+        assert_ne!(
+            rig.host.view.focused(),
+            Some(&hidden),
+            "fixture check: realm-b must NOT be the realm on the output"
+        );
+
+        // The hidden realm's app commits: a shim that were never paced would
+        // publish its first frame and then stall on the frame callback.
+        rig.pump_until(Duration::from_secs(10), |host| {
+            host.view.surface_of(&hidden).is_some()
+        });
+        rig.pump(Duration::from_millis(200));
+        let first = rig
+            .host
+            .runtime
+            .view_cache
+            .get(&hidden)
+            .cloned()
+            .expect("the hidden realm's view is cached");
+
+        // Over a window, the hidden realm's *cached capture* changes: it is
+        // still receiving `frame_done` and still repainting.
+        let mut moved = false;
+        for _ in 0..40 {
+            rig.pump(Duration::from_millis(50));
+            if rig.host.runtime.view_cache.get(&hidden) != Some(&first) {
+                moved = true;
+                break;
+            }
+        }
+        assert!(
+            moved,
+            "a hidden realm's capture never changed: its shim is not being paced, so its \
+             frames are stale -- the exact thing decision 2 refuses to ship"
+        );
+        // ...and the bound realm has a cached view of its own, so the frame
+        // the hidden realm's capture read was not the only one in the map.
+        //
+        // This is a weaker counterweight than the real-app gate's, and saying
+        // so is the point: it asserts *presence*, not that the two frames
+        // differ. What rules out "the whole session happens to be animating
+        // one realm" is `RealTwoRealmsHiddenKeepsPainting`, which pairs a
+        // STATIC bound realm with an animating hidden one and requires the
+        // bound realm's capture not to move. In-crate, both realms are driven
+        // by the same synthetic commit, so that asymmetry is unavailable here.
+        assert!(
+            rig.host
+                .runtime
+                .view_cache
+                .contains_key(&RealmId::new("realm-0")),
+            "the bound realm keeps its own cached view"
+        );
+    }
+
+    /// **A dead realm's cached frame is removed, not merely refused.**
+    ///
+    /// `realm_is_live` already refuses a dead realm's capture; this is the
+    /// defence-in-depth half — the same posture
+    /// `RetainedOutput::scrub_retained_frame` takes for the headless
+    /// framebuffer — applied to the per-realm capture cache, so the bytes are
+    /// gone rather than only unreachable.
+    ///
+    /// **Driven entirely by the production death path**, which is what makes
+    /// it evidence at all. It used to reach in and `realms.remove(&doomed)`
+    /// afterwards, manufacturing a state no production path produces —
+    /// [`close_realm`] leaves the entry with `server: None`, and nothing in the
+    /// runtime ever removes a key from [`Runtime::realms`] before shutdown. The
+    /// prune it was checking was keyed on `realms.keys()` and so could never
+    /// fire; the test passed by fabricating its own precondition.
+    #[test]
+    fn a_realm_with_no_live_shim_session_loses_its_cached_frame() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "cache-prune",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let serve: &[&str] = &["--serve"];
+        rig.start_realms(&[("realm-0", serve), ("realm-b", serve)]);
+        let doomed = RealmId::new("realm-b");
+        commit_fixture(&mut rig.host, &doomed, VIEW);
+        rig.host.runtime.dirty = true;
+        post_dispatch(&mut rig.host);
+        assert!(
+            rig.host.runtime.view_cache.contains_key(&doomed),
+            "fixture check: the realm's frame is cached before it dies"
+        );
+
+        // The realm's shim session ends. Nothing else: the runtime entry
+        // stays, exactly as it does in production.
+        close_realm(&mut rig.host, &doomed, DeathCause::ConnectionClosed);
+        assert!(
+            rig.host.runtime.realms.contains_key(&doomed),
+            "fixture check: the death path leaves the runtime entry in place -- if this ever \
+             stops being true, `refresh_view_cache`'s live set is keyed on the wrong fact"
+        );
+        rig.host.runtime.dirty = true;
+        post_dispatch(&mut rig.host);
+        assert!(
+            !rig.host.runtime.view_cache.contains_key(&doomed),
+            "a realm with no live shim session must not keep a frame in the capture cache"
+        );
+        assert!(
+            rig.host
+                .runtime
+                .view_cache
+                .contains_key(&RealmId::new("realm-0")),
+            "and the survivor keeps its own"
+        );
+    }
+
+    /// **The output does not stay bound to a realm that is gone.**
+    ///
+    /// `RealmScenes::bind` was the only writer of the binding and nothing
+    /// cleared it, so when the bound realm's app exited the teardown funnel
+    /// cleared that realm's scene and left the output pointed at it: every
+    /// later composite rendered the empty scene — the deterministic background
+    /// — for the rest of the session while a live sibling painted, and
+    /// `post_dispatch`'s bound-realm gate went on suppressing the agent cursor
+    /// against a `focused()` that named a corpse.
+    ///
+    /// Three things are asserted, and the third is the one that keeps the
+    /// stopgap honest:
+    ///
+    /// 1. The output moves to the survivor rather than staying on the corpse.
+    /// 2. What it composites is the survivor's own pixels, not the background
+    ///    — byte-exact, because "bound somewhere" is not the claim.
+    /// 3. It moves to the realm [`seat_target`] serves. The chokepoint's
+    ///    step-5d guard refuses an actuation whose grant names a realm other
+    ///    than the seat's target; that refusal is safe because the two
+    ///    placeholders agree, and a rebind that broke the agreement would leave
+    ///    a human watching one realm while every admitted actuation drove
+    ///    another.
+    #[test]
+    fn the_output_leaves_a_dead_realm_for_a_live_sibling() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "bound-realm-death",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let serve: &[&str] = &["--serve"];
+        rig.start_realms(&[("realm-0", serve), ("realm-b", serve)]);
+        let (bound, survivor) = (RealmId::new("realm-0"), RealmId::new("realm-b"));
+        assert_eq!(
+            rig.host.view.focused(),
+            Some(&bound),
+            "fixture check: the output binds to the first realm to attach"
+        );
+
+        // Both realms paint, and the survivor's fixture is deliberately not
+        // the bound realm's, so "the output shows the survivor" is a claim
+        // about bytes rather than about a name.
+        const A: (u32, u32) = VIEW;
+        const B: (u32, u32) = (VIEW.0 / 2, VIEW.1 / 2);
+        commit_fixture(&mut rig.host, &bound, A);
+        commit_fixture(&mut rig.host, &survivor, B);
+        let want_b = expected_view(B);
+        assert_ne!(
+            want_b,
+            crate::test_pattern::render(VIEW.0, VIEW.1),
+            "fixture check: the survivor's view must differ from the empty-scene background, \
+             or the assertion below cannot tell a rebind from a stuck output"
+        );
+
+        // The realm holding the output dies. Nothing else moves.
+        close_realm(&mut rig.host, &bound, DeathCause::ConnectionClosed);
+        assert_eq!(
+            rig.host.view.focused(),
+            Some(&survivor),
+            "the output must not stay bound to a realm whose shim session is gone"
+        );
+        assert_eq!(
+            seat_target(&rig.host.runtime.realms).map(|(realm_id, _)| realm_id),
+            Some(&survivor),
+            "and it must land on the realm the seat serves, or the step-5d stopgap starts \
+             refusing every actuation the human can see the effect of"
+        );
+
+        // What the output composites is the survivor's own view, not the
+        // deterministic background.
+        assert_eq!(
+            rig.host.view.scenes.bound().compose(VIEW.0, VIEW.1),
+            want_b,
+            "the output composites the survivor's pixels; a binding left on the dead realm \
+             renders its cleared scene -- the background -- for the rest of the session"
+        );
+
+        // The survivor dies too: nothing is serving, so the output is bound
+        // to no realm and shows the background. `seat_target` answers `None`
+        // on the same fact, so the two still agree.
+        close_realm(&mut rig.host, &survivor, DeathCause::ConnectionClosed);
+        assert_eq!(rig.host.view.focused(), None);
+        assert_eq!(
+            seat_target(&rig.host.runtime.realms).map(|(realm_id, _)| realm_id),
+            None
+        );
+        assert_eq!(
+            rig.host.view.scenes.bound().compose(VIEW.0, VIEW.1),
+            crate::test_pattern::render(VIEW.0, VIEW.1),
+            "with no realm serving the output is the documented deterministic background"
+        );
+    }
+
+    /// **The agent cursor is drawn only for the realm on the output**
+    /// (D-019, weakened deliberately by WS-E.1.3 and published as a limit).
+    ///
+    /// The sprite is painted in the output's coordinates over the output's
+    /// realm, so a pointer owed to a hidden realm has no position that means
+    /// anything in the picture the human is looking at. Asserted at the one
+    /// site that decides it, `post_dispatch`, because the gate is a
+    /// comparison between two facts neither backend owns alone.
+    #[test]
+    fn the_agent_cursor_is_offered_only_for_the_bound_realm() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "cursor-bound",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let serve: &[&str] = &["--serve"];
+        rig.start_realms(&[("realm-0", serve), ("realm-b", serve)]);
+        let bound = RealmId::new("realm-0");
+        let hidden = RealmId::new("realm-b");
+        assert_eq!(rig.host.view.focused(), Some(&bound));
+
+        // An agent moves its pointer while the router is serving the bound
+        // realm: the sprite's position is offered.
+        rig.host.runtime.router.bind_to(&bound);
+        rig.host.runtime.router.route(
+            SeatInput::emulated(crate::input::SeatInputKind::Motion { x: 12.0, y: 9.0 }),
+            VIEW,
+            Some(VIEW),
+        );
+        assert_eq!(
+            rig.host.runtime.router.agent_pointer(),
+            Some((12.0, 9.0)),
+            "fixture check: the router holds an agent-owned position"
+        );
+        rig.host.view.cursor_offered = None;
+        post_dispatch(&mut rig.host);
+        assert_eq!(
+            rig.host.view.cursor_offered,
+            Some(Some((12.0, 9.0))),
+            "the bound realm's agent pointer must reach the sprite"
+        );
+
+        // The router is now serving a hidden realm. The same pointer must
+        // NOT be offered: it is a position in another realm's view.
+        rig.host.runtime.router.bind_to(&hidden);
+        rig.host.runtime.router.route(
+            SeatInput::emulated(crate::input::SeatInputKind::Motion { x: 30.0, y: 20.0 }),
+            VIEW,
+            Some(VIEW),
+        );
+        rig.host.view.cursor_offered = None;
+        post_dispatch(&mut rig.host);
+        assert_eq!(
+            rig.host.view.cursor_offered,
+            Some(None),
+            "an agent pointing inside a HIDDEN realm must draw no sprite on the output"
+        );
     }
 }

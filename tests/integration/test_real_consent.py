@@ -162,6 +162,7 @@ from harness import (
     ConsentInjector,
     CoreFailed,
     IntegrationTest,
+    capture_dump_path,
     children_of,
     comm_of,
     descendant_named,
@@ -391,7 +392,12 @@ class RealConsentPrompt(IntegrationTest):
         self.app_bin = str(pathlib.Path(app).resolve())
         self.work = pathlib.Path(tempfile.mkdtemp(prefix="vitrin-consent-"))
         self.addCleanup(shutil.rmtree, self.work, True)
+        #: The `--capture-dump` base the core is launched with. Nothing is
+        #: written here: the core writes one frame per realm at
+        #: `PATH.<realm-id>` (WS-E.1.3), so readers use `self.dump_path`.
         self.dump = str(self.work / "internal.rgba")
+        #: `realm-0`'s dump -- the realm this gate's grant names.
+        self.dump_path = str(capture_dump_path(self.dump))
         self.core_log = self.work / "core.log"
 
     # -- the core, under the one policy this gate is about -----------------
@@ -497,7 +503,7 @@ class RealConsentPrompt(IntegrationTest):
         stable = 0
         last: bytes | None = None
         while time.monotonic() < deadline:
-            frame = _read_dump(self.dump, REALM_WH)
+            frame = _read_dump(self.dump_path, REALM_WH)
             green = _count_rgba(frame, self.TARGET)
             if green >= MIN_TARGET_PIXELS and frame == last:
                 stable += 1
@@ -830,7 +836,7 @@ class RealConsentPrompt(IntegrationTest):
 
         # B = the same rectangle sliced out of the core-internal realm view.
         # The capture path still shows the target at exactly those coordinates.
-        dump_up = _read_dump(self.dump, REALM_WH)
+        dump_up = _read_dump(self.dump_path, REALM_WH)
         green_b = _count_rgba(_crop_rgba(dump_up, REALM_WH, card), self.TARGET)
         self.assertGreaterEqual(
             green_b,
@@ -900,7 +906,7 @@ class RealConsentPrompt(IntegrationTest):
         #
         # Fact 3: the app's own observable side effect. Read the CORE-INTERNAL
         # capture, which no grant, wire frame or SDK decode stands in front of.
-        dump_held = _read_dump(self.dump, REALM_WH)
+        dump_held = _read_dump(self.dump_path, REALM_WH)
         hit_px = _count_rgba(dump_held, self.HIT)
         green_held = _count_rgba(dump_held, self.TARGET)
         self.assertEqual(

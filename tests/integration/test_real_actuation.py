@@ -356,8 +356,9 @@ class RealActuationCrossRealm(IntegrationTest):
 
     The line carries no realm id, which is why the count carries the proof
     rather than the identity. Nothing here asserts *which* app is on screen:
-    one scene, one surface, last committer wins (the published WS-E.1.3
-    limit), and this test deliberately does not depend on it.
+    the output is bound to one realm (WS-E.1.3, the first to attach), and
+    this test deliberately does not depend on that binding -- it is about
+    delivery, and delivery follows `seat_target`, not the output.
     """
 
     TARGET = RealActuationPointer.TARGET

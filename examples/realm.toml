@@ -28,16 +28,27 @@
 # is where nearly all of a realm's real cost is. The core neither measures
 # nor limits it.
 #
-# WHAT MORE THAN ONE REALM DOES NOT YET BUY YOU. Each realm gets its own
-# shim, its own private runtime tree and its own Wayland socket -- that
-# part is real. But the core still composites ONE output from ONE scene
-# holding at most one client surface, so with several realms running only
-# the one that committed last is visible, and an agent's capture is of
-# whatever is on that output rather than of the realm its grant names.
-# Binding an output to a realm, and routing input to it, are the next two
-# tasks in this workstream (WS-E.1.3 and WS-E.1.6). Until they land,
-# configure a second realm knowing that it runs but is not separately
-# observable.
+# WHAT MORE THAN ONE REALM BUYS YOU, AND WHAT IT DOES NOT. Each realm gets
+# its own shim, its own private runtime tree, its own Wayland socket, its
+# own scene and its own capture: an agent's `observe` grant returns the
+# pixels of the realm it names, visible or not. What the core still has is
+# ONE OUTPUT, bound to one realm -- the first to attach -- so with several
+# realms running only one is on screen. The binding moves in exactly one
+# circumstance: when the bound realm's shim session ends, the output follows
+# the first still-serving realm in id order, so a death does not leave you
+# staring at a cleared scene for the rest of the session. Nothing else moves
+# it yet; choosing the visible realm deliberately is WS-E.1.4's, and routing
+# input to it is the remaining task in this
+# workstream (WS-E.1.6); until it lands, an agent's actuation is refused
+# unless its grant names the realm the seat serves.
+#
+# AND WHAT IT COSTS. Every realm renders whether or not it is visible: a
+# Wayland client throttles on frame callbacks, so a realm that stopped
+# being paced would stop repainting and its capture would go stale, which
+# the protocol forbids. Budget roughly 2 x width x height x 4 bytes of
+# core-side memory per realm (~32 MB each on a 2560x1600 panel) plus the
+# app's own, and expect sixteen realms to composite at the output's rate
+# with nobody looking at fifteen of them.
 #
 # SECURITY -- this file names the program the trusted core will execute, so
 # whoever can write it chooses what vitrind spawns. It is refused unless it

@@ -63,6 +63,7 @@ import unittest
 from harness import (
     GOLDEN_CMP,
     IntegrationTest,
+    capture_dump_path,
     children_of,
     comm_of,
     descendant_named,
@@ -296,7 +297,7 @@ class RealCaptureFidelity(IntegrationTest):
         # redraw byte-identical, so the dump reflects exactly this frame.
         agent_path = self.scratch("agent.xrgb")
         pathlib.Path(agent_path).write_bytes(packed_xrgb(frame))
-        dump_path = self._await_dump(dump)
+        dump_path = self._await_dump(capture_dump_path(dump))
 
         # The issue offers "SSIM / per-pixel tolerance"; the gate asserts BOTH,
         # because they are complementary on this scene. SSIM is the named proof

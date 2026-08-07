@@ -77,10 +77,12 @@ None of these is DRM work. The backend is not the binding constraint.
    single-maximized — that is the model *per app*, not per session — and
    exactly one of them is bound to the one output, so several realms run and
    one is visible. Which one **is now a client's to choose** (WS-E.1.4/#210):
-   a principal holding `layout_focus` binds the output, and `session::seat_target`
-   follows that binding, so the visible realm and the realm the human's input
-   reaches move as one act — the fifth of D-018(2)'s unpurchasable ordering
-   rules. Absent such a client the old placeholder still answers: the first
+   a principal holding `layout_focus` binds the output, and
+   `session::physical_seat_target` follows that binding, so the visible realm
+   and the realm the **human's** input reaches move as one act — the fifth of
+   D-018(2)'s unpurchasable ordering rules. An **agent's** actuation does not
+   follow the binding at all (WS-E.1.6/#212): it goes to the realm its own
+   grant names, so an agent works in a realm nobody is looking at. Absent such a client the old placeholder still answers: the first
    still-serving realm in id order, applied at first attach and again when the
    realm holding the output exits. Not moving it at all was the first shape and it was a
    defect: the output stayed bound to a realm that was gone, compositing the
@@ -131,7 +133,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 
 | Stage | Delivers | Est. |
 |---|---|---|
-| **1 — multi-app, nested** | Runtime app launch · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · a shell client (switcher + launcher) · input routed to the focused realm | 7–9 w |
+| **1 — multi-app, nested** | Runtime app launch · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · a shell client (switcher + launcher) | 7–9 w |
 | **2 — livable** | Cross-realm clipboard · core-drawn lock screen on the consent stack · status in the trusted band · human screenshot | 4–6 w |
 | **3 — bare metal** | The keymap decision · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
 | **4 — long tail** | X11 (defers to E3.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |
@@ -229,33 +231,57 @@ this workstream owns, not inherits:
   the output, which shows one realm, so an agent actuating inside a hidden
   realm draws nothing — the exact defect D-019 exists to close,
   reintroduced for hidden realms. Published in `docs/book/src/limits.md`.
-- **Only one realm can be actuated, and the rest are refused rather than
-  misdelivered** (created by WS-E.1.2, closed by WS-E.1.6). The write-side
-  twin of the item above, and the one the same review found second. There is
-  one input router and one delivery target (`session::seat_target`, the
-  first still-serving realm in id order), so an actuation admitted under a
-  grant naming *another* realm would have been delivered into a sibling's
-  app — an agent driving an app it holds no authority over, which is a
-  **write**, and worse than the read the item above describes. It was
-  unreachable while `MAX_REALMS` was 1; raising the cap is what made it
-  reachable.
+- ~~**Only one realm can be actuated, and the rest are refused rather than
+  misdelivered**~~ (created by WS-E.1.2, **closed by WS-E.1.6/#212**). The
+  write-side twin of the item above, and the one the same review found
+  second. There was one input router and one delivery target
+  (`session::seat_target`), so an actuation admitted under a grant naming
+  *another* realm would have been delivered into a sibling's app — an agent
+  driving an app it holds no authority over, which is a **write**. WS-E.1.2
+  refused it `internal` instead, deliberately choosing a stopgap over half a
+  routing model; WS-E.1.6 deleted the guard **and** the placeholder, because
+  a real router makes the comparison unnecessary rather than merely passing.
+  With it went the cross-principal denial of service a `layout_focus` holder
+  briefly had over every other principal's actuations.
 
-  The fix is deliberately **not** routing. Routing — focus, per-realm
-  `PhysicalPresence`, which realm physical input follows — is WS-E.1.6's
-  whole deliverable and #208's Key decision 5 defers it there; building half
-  of it under a bug fix would be the same mistake in the other direction.
-  So the chokepoint compares the grant's realm with the realm the seat
-  actually serves and **refuses** `internal` when they differ, delivering
-  nothing. `internal` because the IDL already defines it as "server-side
-  failure during this use (renderer, memfd, **delivery**)", which is exactly
-  true here: the authority was real and this core cannot carry out the
-  delivery. Nothing in the refusal vocabulary is invented, and `unsupported`
-  is a petition outcome rather than a refusal code, so it was never a
-  candidate.
+  The router now keeps one seat's state per realm and follows two addressing
+  rules that never move each other: physical input goes to the **bound**
+  realm (the human's attention, which `layout_focus` moves), an agent's
+  actuation goes to the realm its **grant** names. `PhysicalPresence` is per
+  realm on the same grounds.
 
-  Published in `docs/book/src/limits.md`. WS-E.1.6 deletes the guard and the
-  placeholder together; a real router makes the comparison unnecessary
-  rather than merely passing.
+- **Per-realm presence narrows a blanket safety behaviour** (created by
+  WS-E.1.6, no owner). The price of the item above, and it is a *loss* worth
+  stating on its own: `preempted` used to mean "a human is touching something
+  in this session", so a hand on the keyboard suspended every agent
+  everywhere. It now means "a human is touching *this realm*". That is the
+  correct reading of the IDL's own words ("physical human input owns **the
+  target**") and it is also strictly less refusing than before, with no wire
+  event to tell an agent — or a human — that the breadth is gone. Layout
+  requests keep the old breadth, because they move what the human is looking
+  at rather than being delivered into a realm. Published in
+  `docs/book/src/limits.md`.
+
+- **A realm switch mid-gesture tells the app the human let go** (created by
+  WS-E.1.6, no owner). A key or button held across a binding change is
+  released into the realm being left, because the human's real release will
+  be delivered to the realm they moved to. The app cannot distinguish that
+  release from a real one. The alternative is a latched modifier or a wedged
+  pointer grab in an app the human can no longer see, which is worse — it is
+  the same trade `InputRouter::release_physical_keys` already made for host
+  focus loss — but it now happens on every switcher keypress rather than only
+  on alt-tab. Published in `docs/book/src/limits.md`.
+
+- **`PhysicalPresence` is still fed by nothing in production** (pre-existing,
+  surfaced by WS-E.1.6, no owner). `PresenceHook` is the tap that feeds it and
+  it is constructed in tests only: the nested backend's router stacks
+  `ConsentGate<DeadManHook<NoopHook>>` and the headless one stacks `NoopHook`,
+  so no shipping build ever calls `PhysicalPresence::note` and the `preempted`
+  refusal cannot fire at runtime. Making presence per-realm makes it *correct*
+  per realm; it does not make it *reachable*. Wiring the hook is a behaviour
+  change (agents would start being refused when a human types, for the first
+  time) and was deliberately left outside #212's scope rather than smuggled in
+  with it.
 
 ## 7. Safety rule, non-negotiable
 

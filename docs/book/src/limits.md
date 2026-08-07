@@ -55,31 +55,19 @@ evidence for the human half.
 **Several realms run; only one is visible.** A `realm.toml` may now declare
 up to 16 realms, and each gets its own shim process, its own private runtime
 tree, its own Wayland socket and — since the output binding landed — its own
-scene and its own capture. What it does *not* get is its own **output**: the
-core composites one output from one realm's scene, so with two realms
+scene, its own capture and its own seat state. What it does *not* get is its
+own **output**: the core composites one output from one realm's scene, so with two realms
 running only the realm the output is bound to is on screen. Which realm that
 is **is now somebody's to choose**: a client holding the `layout.focus` grant
 verb moves the output, and the human's own keyboard and pointer move with it —
-one act, because showing a realm and typing into it must never come apart.
+one act, because showing a realm and typing into it must never come apart. An
+**agent's** actuation does not follow the output at all — it follows the realm
+its own grant names, so an agent works in a realm nobody is looking at.
 Absent such a client the output binds to the first realm to attach, and moves
 on one event nobody chooses: the bound realm's app exiting, after which the
 output follows to the first realm still serving, and to no realm at all once
 none is serving. Treat a multi-realm configuration as "several apps running,
 one of them on screen".
-
-**A `layout.focus` holder can silently refuse every other agent's
-actuation.** The session has one input router and one delivery target, and
-that target now follows the output binding. An agent's actuation into a realm
-that is not the one on screen is refused `internal` rather than delivered — a
-stopgap that exists so one realm's authorized keystroke can never land in
-another realm's app. Before layout was served, which grants that refused was a
-fixed property of the deployment; now a principal holding `layout.focus`
-chooses it, and can therefore deny service to every other agent by focusing
-elsewhere. The refusal is recoverable, journaled, spends no rate-limit token
-and burns no `once` rung, and it disappears when per-realm input routing lands
-(then a hidden realm's actuation is *delivered* instead of refused). Until
-then, do not run a `layout.focus` client you do not trust alongside agents you
-need to keep working.
 
 **Layout is two requests, and the absences are deliberate.** A holder can
 focus a realm and choose whether it fills the output or keeps its own size.
@@ -125,28 +113,53 @@ is acting. It is painted into the output, which shows one realm — so an
 agent actuating inside a **hidden** realm draws no sprite, and the human
 loses that signal entirely for everything happening off-screen. This
 reintroduces, for hidden realms, exactly the defect the sprite was added to
-close. The fix is a per-realm indicator in the trusted band and it is not
-built.
+close, and per-realm input routing makes it more likely to bite rather than
+less: agents can now actually work in hidden realms, so there is more going on
+that nothing draws. The fix is a per-realm indicator in the trusted band and
+it is not built.
 
-**Input goes to one realm, and an agent that names another is refused.**
-There is one input router and one physical-presence tracker for the whole
-session, so physical input reaches the first realm in id order and a human
-touching the keyboard preempts agent actuation in every realm at once.
+**A human's hand no longer stops agents in other realms — and that is a
+narrowing of a blanket safety behaviour.** The core refuses an agent's
+actuation `preempted` while physical human input owns the target, and "the
+target" used to be the whole session: touching the keyboard suspended every
+agent everywhere for half a second, whatever realm each was working in. It is
+now judged **per realm**. Typing in realm A suspends agents acting on realm A
+and leaves agents acting on realm B alone, which is what "several apps running
+concurrently" has to mean — but if you were relying on the old breadth as a
+crude session-wide "hands off while I work", you no longer have it, and no
+wire event tells you so. Layout requests (`focus`, `set_fullscreen`) still
+yield to a hand anywhere the human is: those move what you are looking at
+rather than being delivered into a realm, so they are judged against the realm
+your input is following.
 
-An agent's actuation is different, because it is *authorized against a named
-realm*: delivering it to whichever realm the router happens to serve would
-drive an app the grant confers no authority over. So the core refuses it
-instead. With more than one realm configured, **only grants over the realm
-the session's seat currently serves can actuate**; every other actuation is
-refused `internal` (the IDL's "server-side failure during this use …
-delivery"), recoverably, with nothing delivered. Observation is unaffected —
-a capture addresses no seat, and it is now of the realm the grant names. This
-is a stopgap that fails closed, not a routing policy: per-realm routing is
-deferred and replaces the refusal. Binding the output to a realm did **not**
-relax it: the realm the seat serves and the realm the output shows are
-chosen by two separate placeholders that happen to agree today, and the
-refusal is what makes "happen to agree" safe. A single-realm configuration
-never meets it.
+**You cannot switch realms in the same half-second you typed, and a
+keyboard-driven switcher feels this constantly.** Because layout requests
+yield to a hand, any physical input marks the realm you are in as yours for
+500 ms, and a `focus` or `set_fullscreen` arriving inside that window is
+refused `preempted`. That is correct for the case the rule was written for —
+an agent must not move the output out from under someone mid-keystroke — but
+it lands hardest on the most ordinary human action there is. Type `focus
+editor` into a shell and press Enter, and the Enter is itself the physical
+input that preempts the request the Enter just sent. The refusal is
+recoverable and the same request succeeds a moment later, but nothing in the
+core retries it, and a client that shows refusals rather than hiding them
+(which is the behaviour this project asks of clients) will show this one
+often. There is no attention key and no core-owned "the human meant this"
+signal that would distinguish a switch the human just asked for from a
+switch an agent attempted while they typed; naming that gap is not filling
+it.
+
+**Switching realms mid-gesture releases what you were holding, into the realm
+you left.** A key or pointer button you are physically holding when the output
+binding moves is released to the app you are leaving, because your actual
+release will be delivered to the realm you moved to. The app cannot tell that
+release from a real one — it is told you let go when you did not. The
+alternative is worse (a modifier latched down forever, or a wedged pointer
+grab, in an app you can no longer see), and it is the same trade the core
+already makes when the nested window loses host keyboard focus; the difference
+is that it now happens on every switcher keypress rather than only on alt-tab.
+An **agent's** held keys are not touched — its grant still reaches that realm,
+so it can release them itself.
 
 **Resizing the nested window does not resize the apps.** `vitrind --nested`
 runs inside a host compositor's window, and that window can be dragged to any

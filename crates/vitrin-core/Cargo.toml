@@ -343,6 +343,48 @@ dead-man-injector = []
 # above, and for the same reason: a build that cannot even name a test hook
 # cannot be tricked into responding to one.
 consent-injector = []
+# Compile the physical-input test injector (issue #212, WS-E.1.6): on the
+# HEADLESS backend only, and only when `--physical-input-fd N` also names an
+# inherited socketpair, a channel on which a harness may say `key`, `button`,
+# `motion` and `scroll` -- and have those become `Origin::Physical` seat input
+# through the SAME entry points the nested backend's winit event handler uses
+# (`input::intake_physical` for the pointer, `input::physical_key` for keys),
+# routed by the SAME `session::route_physical_turn`.
+#
+# # Why it has to exist for WS-E.1.6 to be testable at all
+#
+# `SeatInput::physical` is private to `crate::input` by design, `intake_physical`
+# is the nested backend's only caller, headless has no input device, and
+# headless is the only backend CI runs (D-019(4)). So "physical input follows
+# the bound realm, an agent's actuation follows its grant" -- the whole of
+# issue #212 -- has no mock-free gate without a way to make physical-tagged
+# input happen in a headless process. This is that way, and it is the same
+# posture `dead-man-injector` and `consent-injector` already established: gated
+# on the feature ALONE for everything carrying authority (the fd adoption, the
+# calloop source, the application), inert without the runtime flag, never
+# enabled in a deployment build.
+#
+# # What it costs, stated rather than implied
+#
+# `crate::input`'s module docs lean heavily on `SeatInput::physical`'s privacy
+# being a **compile-time** guarantee: "no phantom physical-input path can
+# exist" in a headless build, structurally, not by a runtime check. A build
+# with this feature is a build in which that sentence is weaker -- something
+# that is not a human can mint physical-tagged input, on the say-so of whoever
+# holds a descriptor. The mitigation is the same as the other two injectors'
+# (feature-gated, flag-gated, routed through the real entry point rather than a
+# second weaker one) and the honest statement is that a `physical-input-injector`
+# build has a *runtime* guarantee where a shipping build has a compile-time
+# one. `crate::input`'s docs say so where they make the claim.
+#
+# One further asymmetry, deliberate: the headless router stacks `NoopHook`, so
+# an injected event passes no consent grab and no dead-man watcher. The
+# injector does not stack them either -- it would be inventing a hook stack no
+# backend actually runs -- so what this gate proves is *routing*, and the
+# trusted-path properties (a prompt consumes input for every realm; a held
+# chord revokes across realms) are proved in-crate against the real
+# `ConsentGate`/`DeadManHook` instead, where a real stack exists to drive.
+physical-input-injector = []
 
 [dev-dependencies]
 # The permanent mock-shim fixture (issue #21): a compliant peer speaking the

@@ -94,7 +94,7 @@ High-resolution scroll on one axis. The `value120` unit follows the Wayland high
 - `expired` — the grant's expiry passed.
 - `revoked` — the grant was revoked (hold-Esc, panel, or policy); effective on the very next request.
 - `rate_limited` — the grant's `max_event_rate` token bucket is empty; `retry_after_ms` hints the refill.
-- `preempted` — physical human input owns the target right now.
+- `preempted` — physical human input owns the target right now. *(What "the target" is with several realms is the server's to decide and the IDL does not fix it; see [`vitrin_grant`](04-vitrin_grant.md#refusal) for what the reference core answers.)*
 - `consent_held` — a consent prompt is up; agent actuation is refused, never delivered to the app.
 - `no_surface` — the realm has no surface (its shim crashed or exited).
 - `internal` — a server-side failure during this use.

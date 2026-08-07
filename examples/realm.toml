@@ -30,17 +30,30 @@
 #
 # WHAT MORE THAN ONE REALM BUYS YOU, AND WHAT IT DOES NOT. Each realm gets
 # its own shim, its own private runtime tree, its own Wayland socket, its
-# own scene and its own capture: an agent's `observe` grant returns the
-# pixels of the realm it names, visible or not. What the core still has is
-# ONE OUTPUT, bound to one realm -- the first to attach -- so with several
-# realms running only one is on screen. The binding moves in exactly one
-# circumstance: when the bound realm's shim session ends, the output follows
-# the first still-serving realm in id order, so a death does not leave you
-# staring at a cleared scene for the rest of the session. Nothing else moves
-# it yet; choosing the visible realm deliberately is WS-E.1.4's, and routing
-# input to it is the remaining task in this
-# workstream (WS-E.1.6); until it lands, an agent's actuation is refused
-# unless its grant names the realm the seat serves.
+# own scene, its own capture and its own seat state: an agent's `observe`
+# grant returns the pixels of the realm it names, visible or not, and its
+# `actuate.*` grants reach that realm's app, visible or not. What the core
+# still has is ONE OUTPUT, bound to one realm -- the first to attach -- so
+# with several realms running only one is on screen, and the human's own
+# keyboard and pointer go to whichever that is. A principal holding
+# `layout.focus` moves the binding, and the picture and the human's input
+# move together in one act; when the bound realm's shim session ends the
+# output falls back to the first still-serving realm in id order, so a death
+# does not leave you staring at a cleared scene for the rest of the session.
+#
+# The two rules are deliberately different and neither moves the other: the
+# HUMAN's input follows attention (the bound realm), and an AGENT's follows
+# its grant. So an agent can work in a realm nobody is looking at -- which
+# is the point of running several -- and a human typing in one realm no
+# longer mutes agents in the others. WHAT THAT NARROWS: before this, a hand
+# on the keyboard suspended every agent in the session; now it suspends only
+# the agents acting on the realm you are in. See docs/book/src/limits.md.
+#
+# One consequence to know about if you switch realms mid-gesture: a key or
+# button you are physically holding when the output moves is RELEASED into
+# the realm you left, because your release will be delivered to the realm
+# you moved to. The app reads that release as real. The alternative is a
+# modifier latched down forever in an app you can no longer see.
 #
 # AND WHAT IT COSTS. Every realm renders whether or not it is visible: a
 # Wayland client throttles on frame callbacks, so a realm that stopped

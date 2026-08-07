@@ -100,6 +100,35 @@
 //! origin reaches this grab's `judge`, because there is no intake to tag one
 //! physical.
 //!
+//! # The physical-input injector (issue #212, `physical-input-injector`)
+//!
+//! Headless has **no input device**, structurally: `crate::input`'s
+//! `SeatInput::physical` is private to that module and its only producer is
+//! the nested backend's intake, so a plain build here cannot mint a
+//! physical-origin event at all. That is why the router below stacks
+//! [`NoopHook`] — there is no chord to hold and no prompt for a human to
+//! click.
+//!
+//! WS-E.1.6's claim is precisely about where physical input goes versus where
+//! an agent's actuation goes, so it has no mock-free gate without one. Under
+//! the `physical-input-injector` cargo feature — never a deployment build,
+//! same posture as the two above — **and only when the invocation also
+//! carries `--physical-input-fd N`**, this backend adopts a second inherited
+//! socketpair ([`crate::input::injector`]) on which a harness says `motion`,
+//! `button`, `scroll` and `key`. Each becomes a host event handed to
+//! `crate::input::intake_physical` (or `physical_key`), the same entry points
+//! the nested backend's winit handler calls, and is then routed by the same
+//! [`session::route_physical_turn`]. There is no second, weaker path.
+//!
+//! Two things it deliberately does **not** do. It does not stack a hook: the
+//! router here still carries [`NoopHook`], so an injected event passes no
+//! consent grab and no dead-man watcher, because inventing a hook stack no
+//! backend actually runs would prove something about a configuration nobody
+//! ships. And it does not pretend to be a human — the injected input is
+//! physical-*tagged*, which is the whole point, and it is also why a build
+//! carrying this feature has a runtime guarantee where a shipping build has a
+//! compile-time one (`crate::input::injector`, and the feature's Cargo block).
+//!
 //! [`view_framebuffer`]: HeadlessView::view_framebuffer
 //! [`output_framebuffer`]: HeadlessView::output_framebuffer
 
@@ -120,7 +149,7 @@ use tracing::info;
 use crate::consent::{ConsentSurface, TrustedIndicator};
 use crate::deadman::DeadManConfig;
 use crate::grants::RealmId;
-use crate::input::{InputRouter, NoopHook};
+use crate::input::{InputRouter, NoopHook, PhysicalPresenceMap};
 use crate::recorder::Recorder;
 use crate::scene::{RealmScenes, Scene};
 use crate::session::{self, Runtime, RuntimeSeed};
@@ -277,6 +306,7 @@ pub fn run(
     dead_man: DeadManConfig,
     agent_cursor: bool,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
+    #[cfg(feature = "physical-input-injector")] physical_input_fd: Option<std::os::fd::RawFd>,
     seed: RuntimeSeed,
 ) -> (Recorder, Result<(), Box<dyn Error>>) {
     // The seed is consumed the moment the state is built; until then it is
@@ -292,6 +322,8 @@ pub fn run(
         agent_cursor,
         #[cfg(feature = "consent-injector")]
         consent_injector_fd,
+        #[cfg(feature = "physical-input-injector")]
+        physical_input_fd,
         &mut seed,
         &mut recovered,
     );
@@ -307,6 +339,7 @@ fn run_inner(
     dead_man: DeadManConfig,
     agent_cursor: bool,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
+    #[cfg(feature = "physical-input-injector")] physical_input_fd: Option<std::os::fd::RawFd>,
     seed: &mut Option<RuntimeSeed>,
     recovered: &mut Option<Recorder>,
 ) -> Result<(), Box<dyn Error>> {
@@ -391,6 +424,17 @@ fn run_inner(
         ),
         None => None,
     };
+    // The physical-input channel (issue #212), adopted on the same terms and
+    // for the same reason a failure is a **startup error**: a session started
+    // with a hook that is not there would look instrumented from the outside
+    // and behave as a plain one.
+    #[cfg(feature = "physical-input-injector")]
+    let physical_input = match physical_input_fd {
+        Some(number) => {
+            Some(crate::input::injector::Injector::adopt(number).map_err(Box::<dyn Error>::from)?)
+        }
+        None => None,
+    };
     if agent_cursor {
         info!(
             "--agent-cursor: the agent cursor sprite will be composited into this run's \
@@ -406,12 +450,25 @@ fn run_inner(
     )?;
     let mut state = HeadlessState {
         view,
-        // Headless has no physical input device — structurally, not by a
-        // runtime check — so its router stacks no preemption hook: there is
-        // no chord to hold and no prompt for a human to click.
+        // Headless stacks **no policy hook** — there is no chord to hold and
+        // no prompt for a human to click — but it does carry the presence tap,
+        // because `InputRouter` carries one unconditionally: the chokepoint's
+        // `preempted` judgement reads the map the router writes, and an
+        // optional tap is what made `preempted` unreachable in every shipped
+        // build up to issue #212's review. It is fed only in a
+        // `physical-input-injector` build, which is what lets
+        // `tests/integration/test_input_switch.py` prove the per-realm
+        // narrowing mock-free instead of by unit test alone.
         runtime: Runtime::new(
             seed.take().expect("the seed is consumed exactly once"),
-            InputRouter::new(NoopHook),
+            InputRouter::new(
+                std::rc::Rc::new(std::cell::RefCell::new(PhysicalPresenceMap::new())),
+                // Nothing else on this backend reads the clock cell — there
+                // is no grab and no watcher stacked — so the router keeps the
+                // only handle and `route_physical_turn` is the one writer.
+                std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now())),
+                NoopHook,
+            ),
         ),
         loop_handle: event_loop.handle(),
         fatal: None,
@@ -425,6 +482,8 @@ fn run_inner(
         grab: crate::consent::grab::ConsentGrab::new(),
         #[cfg(feature = "consent-injector")]
         injector,
+        #[cfg(feature = "physical-input-injector")]
+        physical_input,
     };
 
     // Readiness for the injector channel. The `Injector` itself lives in the
@@ -443,6 +502,28 @@ fn run_inner(
                 // keeps running and every pending petition times out, which
                 // is the fail-closed direction.
                 Ok(if state.service_injector() {
+                    calloop::PostAction::Continue
+                } else {
+                    calloop::PostAction::Remove
+                })
+            },
+        )?;
+    }
+
+    // Readiness for the physical-input channel, the same shape as the consent
+    // one above and for the same borrow reason: the `Injector` lives in the
+    // state, so the source carries a duplicate descriptor used for nothing but
+    // `poll`.
+    #[cfg(feature = "physical-input-injector")]
+    if let Some(injector) = state.physical_input.as_ref() {
+        let poll_fd = rustix::io::fcntl_dupfd_cloexec(injector.as_fd(), 3)?;
+        loop_handle.insert_source(
+            calloop::generic::Generic::new(poll_fd, calloop::Interest::READ, calloop::Mode::Level),
+            |_readiness, _fd, state: &mut HeadlessState| {
+                // EOF or a protocol violation removes the source; the core
+                // keeps running with no way to inject, which is the
+                // fail-closed direction.
+                Ok(if state.service_physical_input() {
                     calloop::PostAction::Continue
                 } else {
                     calloop::PostAction::Remove
@@ -535,6 +616,70 @@ pub(crate) struct HeadlessState {
     /// above runs at all) or when the peer has gone away.
     #[cfg(feature = "consent-injector")]
     injector: Option<crate::consent::injector::Injector>,
+    /// The adopted physical-input channel (issue #212, module docs), or
+    /// `None` when the run named no `--physical-input-fd`.
+    ///
+    /// A fifth disjoint field for the same reason the grab is a fourth: it is
+    /// borrowed while `runtime` and `view.scenes` are, by the turn that routes
+    /// what it produced.
+    #[cfg(feature = "physical-input-injector")]
+    physical_input: Option<crate::input::injector::Injector>,
+}
+
+/// The `physical-input-injector` build's channel service (issue #212): read
+/// the peer's requests, turn each into physical-tagged intake through the
+/// production entry point, and route the turn.
+#[cfg(feature = "physical-input-injector")]
+impl HeadlessState {
+    /// Drain everything the peer has written. Returns `false` once the
+    /// channel is finished, so the caller removes the calloop source.
+    ///
+    /// Every accepted request is routed through
+    /// [`session::route_physical_turn`] — the same function the nested
+    /// backend's input handler tails into, which binds the human's attention
+    /// to the realm the output shows, pays the realm being left whatever it is
+    /// owed, maps through that realm's geometry and delivers. `switch` is
+    /// `None`: this backend stacks no dead-man watcher, so there is no replay
+    /// to drain (see [`crate::backend::winit::route_turn`]).
+    ///
+    /// The reply is the number of `SeatInput`s the intake produced, never the
+    /// number delivered: whether an event reaches an app is the router's and
+    /// the shim's business, and a channel that reported delivery would be the
+    /// core agreeing with itself about the very thing a gate here measures.
+    fn service_physical_input(&mut self) -> bool {
+        let Some(mut injector) = self.physical_input.take() else {
+            return false;
+        };
+        let batch = injector.poll_requests();
+        let alive = batch.is_ok();
+        // One clock sample for the whole batch, before any of it is routed —
+        // the same discipline `NestedState::handle_input` follows, and what
+        // makes the presence tap's `note` and the chokepoint's `owns_target`
+        // read one timeline. `route_physical_turn` pushes it into the tap.
+        let now = std::time::Instant::now();
+        let view = session::Presenter::view_size(&self.view);
+        for parsed in batch.unwrap_or_default() {
+            let Some(request) = parsed else {
+                injector.reject("unknown request");
+                continue;
+            };
+            let inputs = crate::input::injector::intake(request, (view.0 as i32, view.1 as i32));
+            let produced = inputs.len();
+            session::route_physical_turn(
+                &mut self.runtime,
+                &self.view.scenes,
+                None,
+                inputs,
+                view,
+                now,
+            );
+            injector.ack(produced);
+        }
+        if alive {
+            self.physical_input = Some(injector);
+        }
+        alive
+    }
 }
 
 /// The `consent-injector` build's channel service (issue #138): read the
@@ -2923,7 +3068,7 @@ mod tests {
                 width: W,
                 height: H,
             })),
-            router: crate::input::InputRouter::new(crate::input::NoopHook),
+            router: crate::input::InputRouter::detached(crate::input::NoopHook),
             start: Instant::now(),
             presented: Vec::new(),
         };

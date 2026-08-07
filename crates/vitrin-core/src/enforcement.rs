@@ -79,20 +79,21 @@
 //!       because a principal that could fullscreen over its own pending
 //!       card would be arranging the decision it is waiting on.
 //!    c. `preempted` (attention-shaped, same set): physical human input
-//!       owns the target ([`PhysicalPresence::owns_target`], fed at the
+//!       owns **the realm this use acts on**
+//!       ([`PhysicalPresenceMap::owns_target`], fed per realm at the
 //!       input router's hook point). Moving the output out from under a
 //!       hand already on the keyboard is the hazard a synthetic click
-//!       poses, one step larger.
-//!    d. `internal` (actuation only -- this one really is, because
-//!       [`UseKind::delivered_through_the_seat`] is pointer and text
-//!       alone), the **cross-realm delivery guard**:
-//!       the session's one seat does not serve the realm this grant names
-//!       ([`UseEnv::seat_reaches_grant_realm`]). A stopgap that refuses,
-//!       so a multi-realm session cannot deliver one realm's authorized
-//!       keystroke into another realm's app; WS-E.1.6 (issue #212)
-//!       replaces it with per-realm routing rather than a refusal. See
-//!       the branch's own comment for why `internal` is the true code.
-//!    e. `rate_limited`: the per-grant token bucket -- deliberately the
+//!       poses, one step larger. Which realm that is differs by kind and
+//!       the choice is made in one place, at the gate: a seat-delivered
+//!       use is judged against the realm its **grant** names, a layout
+//!       request against the realm **physical input currently follows**
+//!       (it moves what the human is looking at rather than being
+//!       delivered into anything). Per realm since WS-E.1.6 (issue #212):
+//!       one session-wide answer refused an agent working in realm B
+//!       because a human was typing in realm A, which is the
+//!       concurrent-operation claim denied for no reason a human could
+//!       see.
+//!    d. `rate_limited`: the per-grant token bucket -- deliberately the
 //!       **last** gate, so a token is consumed if and only if the use is
 //!       otherwise admitted: quota meters what would actually happen, and
 //!       an agent blocked by a prompt, a human hand, or a dead realm is
@@ -111,7 +112,22 @@
 //!    fail-closed), then the operation runs: a capture renders and sends
 //!    `frame_ready`, an actuation is wrapped `SeatInput::emulated` (B2:
 //!    the origin tag says who really caused it) and handed to the
-//!    embedder's delivery sink.
+//!    embedder's delivery sink **naming the grant's own realm** (WS-E.1.6:
+//!    the sink addresses per realm, so an actuation reaches the app its
+//!    grant is over whether or not a human is looking at it).
+//!
+//! # The gate this chain no longer has (WS-E.1.6, issue #212)
+//!
+//! Between 5c and the rate gate there used to be a **cross-realm delivery
+//! guard**: the session had one input router and one delivery target, so a
+//! grant naming any other realm was refused `internal` rather than having
+//! its keystroke delivered into a different app. It was a stopgap, said so,
+//! and is now **deleted** -- not relaxed. The realm travels with the
+//! admitted event ([`UseEnv::grant_realm`] -> `session::route_seat`), so
+//! there is no comparison left to make and nothing an agent can do to reach
+//! a realm its grant does not name. The cross-principal denial-of-service
+//! surface a `layout_focus` holder had over *other* principals' actuations
+//! goes with it.
 //!
 //! # Decisions this task settles
 //!
@@ -196,7 +212,7 @@ use vitrin_protocol::generated::vitrin_grant::{self as grant, Refusal, Verb};
 use crate::capture::{self, RealmViewFrame};
 use crate::grants::{GrantId, GrantTable};
 use crate::identity::PrincipalIdentity;
-use crate::input::{PhysicalPresence, SeatInput, SeatInputKind};
+use crate::input::{PhysicalPresenceMap, SeatInput, SeatInputKind};
 use crate::petitions::PetitionRegistry;
 use crate::recorder::ObservedFrame;
 
@@ -322,14 +338,19 @@ impl UseKind {
         )
     }
 
-    /// Whether this use is **delivered through the session's one seat**,
-    /// and so subject to the cross-realm delivery guard (step 5d).
+    /// Whether this use is **delivered into a realm through that realm's
+    /// seat**, which is what decides *whose* physical presence preempts it
+    /// (step 5c).
     ///
     /// Only the two actuations are. A layout request is emphatically not:
-    /// `focus` exists precisely to *move* the seat target, so gating it on
-    /// the seat already being there would make the verb unable to do the
-    /// one thing it is for, and `set_fullscreen` addresses a shim's
-    /// `configure`, which is not the seat at all.
+    /// `focus` exists precisely to *move* which realm the human's input
+    /// follows, and `set_fullscreen` addresses a shim's `configure`, which is
+    /// not the seat at all. That difference is exactly why the two are judged
+    /// against different realms' presence.
+    ///
+    /// This predicate used to gate the cross-realm delivery guard, which
+    /// WS-E.1.6 deleted along with the one-target placeholder it defended;
+    /// what survives is the narrower question above.
     fn delivered_through_the_seat(&self) -> bool {
         matches!(self, UseKind::Pointer(_) | UseKind::Text(_))
     }
@@ -344,38 +365,55 @@ pub(crate) struct UseEnv<'a> {
     /// `no_surface` judgement (capture and actuation alike) and the
     /// capture/clamp source.
     pub realm_view: Option<&'a RealmViewFrame<'a>>,
-    /// Physical-input presence, fed at the input router's hook point:
-    /// the `preempted` judgement.
-    pub presence: &'a PhysicalPresence,
-    /// **Would an admitted actuation actually reach the realm this grant
-    /// names?** The write-side mirror of [`Self::realm_view`]'s liveness
-    /// gate, resolved the same way and at the same place
-    /// (`principal::PrincipalServer::serve_facet_use` compares
-    /// `GrantTable::realm_of` against the realm the embedder says the seat
-    /// currently delivers into, `session::seat_target`).
+    /// Physical-input presence **per realm**, fed at the input router's hook
+    /// point: the `preempted` judgement. Which realm's entry that judgement
+    /// reads is chosen at the gate, from [`Self::grant_realm`] or
+    /// [`Self::physical_realm`] — see step 5c.
+    pub presence: &'a PhysicalPresenceMap,
+    /// **The realm the human's physical input currently follows**, or `None`
+    /// when no realm is bound (`session::physical_seat_target`, which follows
+    /// the output binding a `layout_focus` holder moves).
     ///
-    /// `false` refuses the actuation rather than delivering it somewhere
-    /// else -- see the chain's step 5d for why the code is `internal` and
-    /// why this is a stopgap WS-E.1.6 removes. Irrelevant to a capture (a
-    /// read addresses no seat) and to a launch (it creates a realm rather
-    /// than actuating into one); only the actuation arms consult it.
-    pub seat_reaches_grant_realm: bool,
-    /// Where admitted actuations go, already origin-tagged `emulated`
-    /// (at runtime: the realm's input router toward the shim seat, reached
-    /// through `session::route_seat`; tests: a capture buffer). Delivery beyond this sink -- including
-    /// dropping events for a seatless realm -- is the delivery edge's
-    /// business, never an authority question.
-    pub actuations: &'a mut dyn FnMut(SeatInput),
+    /// Consulted by exactly one judgement — `preempted` for a **layout**
+    /// request — because a layout act is not delivered into a realm at all: it
+    /// moves what the human is looking at, so the human it can steal from is
+    /// the one in the realm they are already in, not the one the grant names.
+    ///
+    /// This field replaces `seat_reaches_grant_realm`, which asked whether the
+    /// session's single seat happened to serve the grant's realm and refused
+    /// `internal` when it did not (the chokepoint's old step 5d). WS-E.1.6
+    /// deleted that question: seat delivery is per realm now, so an actuation
+    /// always reaches the realm its grant names and there is nothing to
+    /// compare. A value rather than a callback because there is exactly one
+    /// answer per dispatch turn.
+    pub physical_realm: Option<&'a crate::grants::RealmId>,
+    /// Where admitted actuations go, already origin-tagged `emulated` and
+    /// **addressed to the realm the grant names** (at runtime: that realm's
+    /// seat state in the session's input router, reached through
+    /// `session::route_seat`; tests: a capture buffer). Delivery beyond this
+    /// sink -- including dropping events for a seatless or dead realm -- is
+    /// the delivery edge's business, never an authority question.
+    ///
+    /// The realm is a parameter rather than something the sink derives,
+    /// because deriving it is exactly the bug WS-E.1.6 closed: a sink that
+    /// picked the target itself would deliver an agent's keystroke into
+    /// whichever realm the session happened to be showing.
+    pub actuations: &'a mut dyn FnMut(&crate::grants::RealmId, SeatInput),
     /// **The realm this grant names**, resolved by the caller from the
     /// grant row -- the same resolution that produced
-    /// [`Self::realm_view`] and [`Self::seat_reaches_grant_realm`], from
-    /// the same row, on the same line.
+    /// [`Self::realm_view`], from the same row, on the same line.
     ///
-    /// Needed only by the layout arms, which must name a realm to the
-    /// embedder and must never take one from the wire: neither layout
-    /// request carries a realm argument, precisely so that a holder can
-    /// only ever move the realm the human saw on its consent prompt.
-    /// `None` when the row is gone, which is unreachable past step 3.
+    /// Needed by the layout arms, which must name a realm to the embedder and
+    /// must never take one from the wire (neither layout request carries a
+    /// realm argument, precisely so that a holder can only ever move the realm
+    /// the human saw on its consent prompt), and — since WS-E.1.6 — by the
+    /// actuation arms, which must name the realm the event is **delivered
+    /// into**, and by step 5c, which must name the realm whose physical
+    /// presence preempts a seat-delivered use.
+    ///
+    /// `None` when the row is gone, which is unreachable past step 3; every
+    /// arm that needs it surfaces that impossible case as the IDL's
+    /// `internal` rather than guessing a realm.
     pub grant_realm: Option<&'a crate::grants::RealmId>,
     /// Where admitted **layout** acts go (at runtime:
     /// `session::apply_layout`, which binds the output and re-sends
@@ -606,6 +644,30 @@ impl Chokepoint {
                 break 'decide Err(Refuse::code(Refusal::NoSurface));
             }
             if req.kind.attention_shaped() {
+                // **Whose realm the human's hand has to be in** for this use
+                // to be preempted (5c below), and the one place the two
+                // answers are chosen between (WS-E.1.6, issue #212).
+                //
+                // - A use **delivered through the seat** (pointer, text) acts
+                //   on the realm its grant names, so that is the realm whose
+                //   presence decides. This is the narrowing decision 4 buys:
+                //   a human typing in realm A no longer mutes an agent
+                //   working in realm B.
+                // - A **layout** request is not delivered into a realm at all;
+                //   it moves what the human is looking at. `focus` in
+                //   particular takes the output *away from* the realm the
+                //   human's hand is in, which is precisely the theft 5c
+                //   exists to stop, and the grant's realm is the realm being
+                //   moved *to*. So layout is judged against the realm
+                //   physical input currently follows — which is exactly the
+                //   session-wide behaviour layout had before this change,
+                //   because physical input only ever accumulates presence in
+                //   the realm it is addressed to.
+                let preempted_by = if req.kind.delivered_through_the_seat() {
+                    env.grant_realm
+                } else {
+                    env.physical_realm
+                };
                 // 5b, consent_held (attention-shaped uses only): the
                 // principal's own prompt is up. A layout request meets
                 // this on the same terms an actuation does, and for a
@@ -625,84 +687,11 @@ impl Chokepoint {
                 // synthetic click does -- moving the output out from under
                 // a human mid-keystroke is the theft this verb is
                 // separately attenuable in order to bound.
-                if env.presence.owns_target(now) {
+                if env.presence.owns_target(preempted_by, now) {
                     break 'decide Err(Refuse::code(Refusal::Preempted));
                 }
             }
-            if req.kind.delivered_through_the_seat() {
-                // 5d, the cross-realm delivery guard (seat-delivered uses
-                // only) --
-                // **a stopgap that refuses, not a routing policy**, and
-                // WS-E.1.6 (issue #212) deletes it along with the
-                // placeholder it defends.
-                //
-                // The session has one input router and one delivery target
-                // (`session::seat_target`). Since WS-E.1.2 raised
-                // `MAX_REALMS` above 1 a
-                // grant can name a realm that is *not* that target, and
-                // this branch is the difference between refusing such an
-                // actuation and delivering an agent's keystroke into a
-                // **different app than the one it holds authority over**.
-                // At `MAX_REALMS = 1` the situation was unreachable, so
-                // nothing here is a behaviour change for a single-realm
-                // deployment; with several realms it is the write-side
-                // mirror of the `no_surface` gate above (which stops a
-                // grant *reading* a sibling's pixels).
-                //
-                // **WS-E.1.4 armed this branch; it did not create it.**
-                // Until layout_focus was served, `seat_target` was the
-                // first still-serving realm in id order and no client could
-                // move it, so which grants this refused was a fixed
-                // property of the deployment. It now follows the output
-                // binding, so a principal holding `layout_focus` chooses
-                // which *other* principals' actuations land here. That is a
-                // real cross-principal denial-of-service surface, created
-                // by serving the verb, and it is bounded rather than
-                // absent: the refusal is recoverable, journaled, spends no
-                // token and burns no `once` rung. It closes when #212
-                // routes per realm and a hidden realm's actuation is
-                // *delivered* instead of refused. Published in
-                // `docs/book/src/limits.md`.
-                //
-                // **Why `internal`.** Its IDL summary is "server-side
-                // failure during this use (renderer, memfd, **delivery**)",
-                // and that is exactly what has happened: authority was
-                // real, and this core cannot carry out the delivery the
-                // grant names. No other code is true here. `no_surface`
-                // would claim the grant's realm has no surface when it may
-                // be painting; `preempted` would blame a human who is not
-                // there; `not_granted` would deny an authority the human
-                // did confer. Inventing a code is not an option either --
-                // the wire's refusal vocabulary is closed, and
-                // `unsupported` is a *petition* outcome, not a refusal.
-                // The same reasoning already put `internal` under the
-                // `Launch` arm below: a verb whose implementation this
-                // build cannot perform fails closed rather than pretending.
-                //
-                // Ordered after the judgements that are about the
-                // principal (consent, preemption) so the client is told the
-                // actionable truth first, and before the rate gate so a
-                // refusal costs no token and no `once` rung.
-                //
-                // `debug!`, not `warn!`, and not because it is unimportant:
-                // an agent can drive this branch at its own rate, so a
-                // per-event `warn` would be a log-flood vector on a path a
-                // caller controls. The audited channel is the recorder's
-                // `use_decision`, which coalesces and counts (the two
-                // refusals the other actuation gates raise log nothing at
-                // all, for the same reason).
-                if !env.seat_reaches_grant_realm {
-                    tracing::debug!(
-                        grant = req.grant_wire_id,
-                        "actuation refused: the session's seat does not serve this grant's \
-                         realm, and delivering it to the realm that is served would actuate \
-                         an app this grant confers no authority over (WS-E.1.6 replaces this \
-                         with per-realm routing)"
-                    );
-                    break 'decide Err(Refuse::code(Refusal::Internal));
-                }
-            }
-            // Step 5e, the rate constraint -- the final gate, so a token
+            // Step 5d, the rate constraint -- the final gate, so a token
             // is spent iff the use is otherwise admitted.
             let state = self.states.entry(req.grant_wire_id).or_default();
             let bucket = state
@@ -793,15 +782,42 @@ impl Chokepoint {
                 }
             }
             UseKind::Pointer(kind) | UseKind::Text(kind) => {
+                // **The realm comes from the grant row**, exactly as it does
+                // for the layout arms below and never from the wire (no
+                // actuator request carries a realm argument). `None` is
+                // unreachable past step 3 and is surfaced as the IDL's
+                // `internal` rather than defaulting to some realm the grant
+                // does not name -- the fail-closed direction, and the same
+                // shape the layout arm and the unreachable capture readback
+                // failure take.
+                let Some(realm) = env.grant_realm else {
+                    tracing::warn!("actuation admitted with no grant realm; refusing internal");
+                    let voiced = self.voice_refusal(
+                        req.grant_wire_id,
+                        verb,
+                        Refuse::code(Refusal::Internal),
+                        coalescible,
+                        now,
+                        send,
+                    )?;
+                    return Ok(UseOutcome::Refused {
+                        code: Refusal::Internal,
+                        voiced,
+                    });
+                };
                 // Realm-view coordinates outside the view are clamped,
                 // not refused (IDL vitrin_actuator_pointer; conventions
-                // §6.3 lists it legal-but-noteworthy).
+                // §6.3 lists it legal-but-noteworthy). **To the granted
+                // realm's own view**: `env.realm_view` is resolved by realm
+                // id (WS-E.1.3), so the bound the coordinates are clamped
+                // into is the one belonging to the realm this event is about,
+                // not whatever the output happens to be showing.
                 let kind = clamp_to_view(kind, live_view(env.realm_view));
                 // B2: the origin tag is bound here, at the single
                 // admitted-actuation intake -- the delivery sink (and
                 // through it the router, shim seat, and app) sees exactly
-                // who caused this event.
-                (env.actuations)(SeatInput::emulated(kind));
+                // who caused this event, and which realm it is for.
+                (env.actuations)(realm, SeatInput::emulated(kind));
                 Ok(UseOutcome::Admitted {
                     grant: allowed.grant_id,
                     // An actuation delivers no observation to identify.
@@ -964,6 +980,16 @@ fn live_view<'v, 'p>(view: Option<&'v RealmViewFrame<'p>>) -> Option<&'v RealmVi
 /// unreachable for admitted actuations (the chain refused `no_surface`
 /// at the same instant), kept total so the helper stays a pure function
 /// of its inputs.
+///
+/// **The view is the granted realm's**, not the output's, and has been since
+/// WS-E.1.3 made [`UseEnv::realm_view`] a function of the realm id: a grant
+/// over a hidden realm clamps into that realm's own frame, and a grant over a
+/// realm with no frame at all is refused `no_surface` before reaching here.
+/// The two are the same *numbers* today, because there is one output and every
+/// realm's view is composed at its size (`scene::realms`), but they are no
+/// longer the same *source* — and only the source is this function's to get
+/// right. Per-realm view **sizes** would be window-management geometry, which
+/// PRD §5.1 keeps out of the core permanently.
 fn clamp_to_view(kind: SeatInputKind, view: Option<&RealmViewFrame<'_>>) -> SeatInputKind {
     match (kind, view) {
         (SeatInputKind::Motion { x, y }, Some(view)) => SeatInputKind::Motion {
@@ -1067,6 +1093,62 @@ mod tests {
             value120: -120,
         };
         assert_eq!(clamp_to_view(scroll.clone(), Some(&view)), scroll);
+    }
+
+    /// **The clamp reads the frame it is handed, and nothing else**
+    /// (WS-E.1.6, issue #212).
+    ///
+    /// Read what this does and does not establish, because the difference is
+    /// where a vacuous test would sit. It pins that `clamp_to_view` is a
+    /// function of its argument: hand it two different frames and it produces
+    /// two different bounds. That is a real guard — it fails if someone later
+    /// reaches for an output-sized or otherwise session-wide bound *inside*
+    /// the clamp — and it is all a test at this level can reach.
+    ///
+    /// It does **not** establish #212's actual routing property, that the
+    /// frame handed over is the *granted* realm's. That resolution happens in
+    /// the caller ([`UseEnv::realm_view`], populated by realm id in
+    /// `session`), so no argument this test constructs can exercise it: this
+    /// test supplies the very binding the property is about, which is exactly
+    /// the shape that made three earlier tests in this workstream vacuous.
+    /// What pins the caller side is the mock-free gate
+    /// `tests/integration/test_input_switch.py`, whose first and third cases
+    /// drive a real agent's actuation into a realm the output is not showing
+    /// and assert the flight recorder names that realm.
+    ///
+    /// **Per-realm view *sizes* do not exist today**, deliberately. There is
+    /// one output and every realm's view composes at its size
+    /// (`scene::realms`), so the two numbers agree in every running session;
+    /// inventing a per-realm size would be window-management geometry, which
+    /// PRD §5.1 keeps out of the core permanently. What is checkable — and is
+    /// what a regression would break — is that the *source* is the realm's own
+    /// frame rather than a session-wide one, which this test states by handing
+    /// it two.
+    #[test]
+    fn the_clamp_bound_comes_from_the_frame_it_is_given_not_from_a_session_wide_one() {
+        let small = vec![0u8; 8 * 6 * 4];
+        let large = vec![0u8; 64 * 48 * 4];
+        let realm_b = RealmViewFrame {
+            rgba: &small,
+            width: 8,
+            height: 6,
+        };
+        let realm_a = RealmViewFrame {
+            rgba: &large,
+            width: 64,
+            height: 48,
+        };
+        let far = || SeatInputKind::Motion { x: 1e6, y: 1e6 };
+        assert_eq!(
+            clamp_to_view(far(), live_view(Some(&realm_b))),
+            SeatInputKind::Motion { x: 7.0, y: 5.0 },
+            "a grant over realm B must clamp into B's own view"
+        );
+        assert_eq!(
+            clamp_to_view(far(), live_view(Some(&realm_a))),
+            SeatInputKind::Motion { x: 63.0, y: 47.0 },
+            "...and one over realm A into A's, from the same function in the same build"
+        );
     }
 
     // -- the one-path property (the reviewer's grep, run by CI) -------------

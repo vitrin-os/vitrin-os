@@ -644,10 +644,10 @@ impl PetitionRegistry {
     ///
     /// `layout_arrange_held` is the grant table's answer to
     /// [`GrantTable::any_live_holder_of`], resolved by the caller for the
-    /// same reason `seat_reaches_grant_realm` is resolved outside the
-    /// chokepoint: this module holds no grant state, and taking the table
-    /// as a parameter here would give petition admission a second view of
-    /// authority beside the one the chokepoint queries.
+    /// same reason `enforcement::UseEnv::realm_view` and `grant_realm` are:
+    /// this module holds no grant state, and taking the table as a parameter
+    /// here would give petition admission a second view of authority beside
+    /// the one the chokepoint queries.
     ///
     /// [`GrantTable::any_live_holder_of`]: crate::grants::GrantTable::any_live_holder_of
     pub fn admit(

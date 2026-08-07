@@ -89,6 +89,128 @@ class InjectorFailed(Exception):
     """The consent-injector channel said something the harness cannot use."""
 
 
+class PhysicalInputInjector:
+    """The `physical-input-injector` channel (issue #212), from the harness
+    side.
+
+    A `physical-input-injector`-feature `vitrind` invoked with
+    `--physical-input-fd N` speaks four request lines on the inherited
+    socketpair (`crates/vitrin-core/src/input/injector.rs`)::
+
+        motion <x> <y>                  (realm-view pixels)
+        button <evdev-code> press|release
+        scroll vertical|horizontal <v120>
+        key <evdev-scancode> press|release
+
+    Each becomes a host event handed to the core's **production** intake
+    (`input::intake_physical`, or `input::physical_key` for keys), tagged
+    `origin=physical` by the one constructor that can tag it, and routed by the
+    same `session::route_physical_turn` the nested backend's winit handler
+    tails into.
+
+    The reply is ``ack <n>`` where `n` is the number of `SeatInput`s the intake
+    produced -- **not** the number delivered. Whether an event reaches an app
+    is what a gate here is measuring, so the channel deliberately does not
+    report it: the evidence is the app's own behaviour and the flight
+    recorder's `seat_delivered` realm.
+
+    Keys are limited to the core's layout-invariant scancode table (Escape,
+    Enter, Tab, arrows, modifiers, F-keys, space) because a headless core has
+    no host keymap to ask and the core is forbidden to grow one.
+    """
+
+    #: `KEY_LEFTCTRL` -- a modifier, in the layout-invariant table, and the
+    #: key a latch is worst for.
+    KEY_LEFTCTRL = 29
+    #: `BTN_LEFT`, the evdev code `click-target` watches for.
+    BTN_LEFT = 0x110
+
+    VERBS = ("vitrin-physical-input", "ack", "err")
+
+    def __init__(self, sock: "socket_mod.socket") -> None:
+        self.sock = sock
+        self._buf = b""
+        self._replies: list[tuple[str, ...]] = []
+        self.banner: str | None = None
+
+    def _pump(self, deadline: float) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise InjectorFailed("the physical-input channel went quiet")
+        self.sock.settimeout(remaining)
+        try:
+            data = self.sock.recv(4096)
+        except TimeoutError as exc:
+            raise InjectorFailed("the physical-input channel went quiet") from exc
+        if not data:
+            raise InjectorFailed(
+                "the core closed the physical-input channel (it exited, or never adopted it)"
+            )
+        self._buf += data
+        while b"\n" in self._buf:
+            raw, self._buf = self._buf.split(b"\n", 1)
+            fields = tuple(raw.decode("utf-8", "replace").split(" "))
+            if fields[0] not in self.VERBS:
+                raise InjectorFailed(f"unknown physical-input line: {fields!r}")
+            if fields[0] == "vitrin-physical-input":
+                self.banner = " ".join(fields)
+            else:
+                self._replies.append(fields)
+
+    def await_banner(self, timeout: float = 20.0) -> str:
+        """Block for the core's ``vitrin-physical-input 1`` greeting.
+
+        Its arrival is what distinguishes an instrumented core from one that
+        merely opened a socket, which is the same guarantee the consent
+        channel's banner carries.
+        """
+        deadline = time.monotonic() + timeout
+        while self.banner is None:
+            self._pump(deadline)
+        return self.banner
+
+    def _send(self, line: str, timeout: float = 10.0) -> tuple[str, ...]:
+        self.sock.sendall((line + "\n").encode("utf-8"))
+        deadline = time.monotonic() + timeout
+        while not self._replies:
+            self._pump(deadline)
+        return self._replies.pop(0)
+
+    def _expect_ack(self, line: str, produced: int | None = None) -> int:
+        fields = self._send(line)
+        if fields[0] != "ack":
+            raise InjectorFailed(f"{line!r} was refused: {' '.join(fields)}")
+        got = int(fields[1])
+        if produced is not None and got != produced:
+            raise InjectorFailed(
+                f"{line!r} produced {got} intake events, expected {produced}: the core's own "
+                "intake made something different of this request than the harness assumed"
+            )
+        return got
+
+    def motion(self, x: float, y: float) -> None:
+        self._expect_ack(f"motion {x} {y}", 1)
+
+    def button(self, code: int, pressed: bool) -> None:
+        self._expect_ack(f"button {code} {'press' if pressed else 'release'}", 1)
+
+    def key(self, evdev: int, pressed: bool) -> None:
+        self._expect_ack(f"key {evdev} {'press' if pressed else 'release'}", 1)
+
+    def click(self, x: float, y: float, code: int | None = None) -> None:
+        """Move, press, release -- the human's version of `grant.pointer.click`."""
+        code = self.BTN_LEFT if code is None else code
+        self.motion(x, y)
+        self.button(code, True)
+        self.button(code, False)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 class ConsentInjector:
     """The `consent-injector` channel (issue #138), from the harness side.
 
@@ -386,6 +508,7 @@ class Core:
         log_file: str | os.PathLike[str] | None = None,
         capture_dump: str | os.PathLike[str] | None = None,
         consent_injector: bool = False,
+        physical_input: bool = False,
     ) -> None:
         self.runtime = pathlib.Path(runtime_dir or tempfile.mkdtemp(prefix="vitrin-it-"))
         self._owns_runtime = runtime_dir is None
@@ -536,6 +659,20 @@ class Core:
         else:
             self.injector = None
         self.injector_fd = pass_fds[0] if pass_fds else None
+        # The physical-input channel (issue #212): a second inherited
+        # socketpair, on exactly the terms of the first. Independent of it --
+        # a gate wants one or the other, and combining them would make each
+        # test carry machinery it does not use.
+        physical_theirs: "socket_mod.socket | None" = None
+        if physical_input:
+            phys_ours, physical_theirs = socket_mod.socketpair(
+                socket_mod.AF_UNIX, socket_mod.SOCK_STREAM
+            )
+            pass_fds = pass_fds + (physical_theirs.fileno(),)
+            argv += ["--physical-input-fd", str(physical_theirs.fileno())]
+            self.physical: PhysicalInputInjector | None = PhysicalInputInjector(phys_ours)
+        else:
+            self.physical = None
         env = {**os.environ, "XDG_RUNTIME_DIR": str(self.runtime), "RUST_LOG": "info"}
         # The core's own environment is the source `env_allow` copies from,
         # so the real-app gate seeds WLR_* here for the allowlist to forward.
@@ -554,6 +691,8 @@ class Core:
         # waiting harness would hang instead of failing.
         if theirs is not None:
             theirs.close()
+        if physical_theirs is not None:
+            physical_theirs.close()
         if wait:
             self.await_socket()
 
@@ -676,6 +815,9 @@ class Core:
         if self.injector is not None:
             self.injector.close()
             self.injector = None
+        if self.physical is not None:
+            self.physical.close()
+            self.physical = None
         self.terminate()
         # Read the log before the tree it lives in goes away, so assertions
         # after the `with` block see the run rather than an empty list.

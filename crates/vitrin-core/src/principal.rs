@@ -247,7 +247,7 @@ use crate::capture::RealmViewFrame;
 use crate::enforcement::{Chokepoint, LayoutMode, UseEnv, UseKind, UseOutcome, UseRequest};
 use crate::grants::{GrantId, GrantTable, InsertError, RealmId};
 use crate::identity::{PresentedCredential, PrincipalIdentity, Verifier, VerifyOutcome};
-use crate::input::{PhysicalPresence, SeatInput, SeatInputKind};
+use crate::input::{PhysicalPresenceMap, SeatInput, SeatInputKind};
 use crate::petitions::{
     Admission, ConnectionId, PetitionRegistry, PetitionRequest, PromptRoute, Resolution, Verdict,
 };
@@ -841,26 +841,31 @@ pub(crate) struct ServerCtx<'a> {
     /// per message: the embedder answers straight out of its live-realm map
     /// and the scene it already holds.
     pub realm_is_live: &'a dyn Fn(&RealmId) -> bool,
-    /// **Which realm the session's seat currently delivers into**, or
-    /// `None` when no realm is serving one (`session::seat_target`).
+    /// **Which realm the human's own physical input currently follows**, or
+    /// `None` when no realm is bound (`session::physical_seat_target`).
     ///
-    /// The write-side sibling of [`Self::realm_is_live`], and needed for
-    /// the same reason: with several realms attached, the realm an
-    /// actuation would *reach* and the realm a grant *names* are two
-    /// different facts, and only the embedder knows the first.
-    /// [`PrincipalServer::serve_facet_use`] compares them and hands the
-    /// chokepoint the comparison, never the inputs.
+    /// Passed straight through to [`crate::enforcement::UseEnv::physical_realm`],
+    /// which consults it for exactly one judgement — `preempted` for a
+    /// **layout** request, the one attention-shaped use that is not delivered
+    /// into a realm and so steals from wherever the human already is.
     ///
-    /// A value rather than a callback because there is exactly one target
+    /// It used to be the write-side sibling of [`Self::realm_is_live`]:
+    /// "does the session's one seat serve the realm this grant names", compared
+    /// here and refused `internal` when it did not. WS-E.1.6 (issue #212) made
+    /// seat delivery per realm, so an actuation always reaches the realm its
+    /// grant names and that comparison has no question left to answer.
+    ///
+    /// A value rather than a callback because there is exactly one answer
     /// per dispatch turn — unlike liveness, which is a question *per realm*
     /// and so has to stay a function of the id.
-    pub seat_target_realm: Option<&'a RealmId>,
-    /// Physical-input presence, fed at the input router's hook point (the
-    /// chokepoint's `preempted` judgement).
-    pub presence: &'a PhysicalPresence,
-    /// Where chokepoint-admitted, origin-tagged actuations go (M1.1: the
-    /// realm's input router toward the shim seat).
-    pub actuations: &'a mut dyn FnMut(SeatInput),
+    pub physical_realm: Option<&'a RealmId>,
+    /// Physical-input presence **per realm**, fed at the input router's hook
+    /// point (the chokepoint's `preempted` judgement).
+    pub presence: &'a PhysicalPresenceMap,
+    /// Where chokepoint-admitted, origin-tagged actuations go, **naming the
+    /// realm the grant is over** (M1.1: that realm's seat state in the
+    /// session's input router, toward its shim seat).
+    pub actuations: &'a mut dyn FnMut(&RealmId, SeatInput),
     /// Where chokepoint-admitted **layout acts** go (WS-E.1.4: the
     /// session's output binding and the realm's `configure`).
     ///
@@ -1365,8 +1370,14 @@ impl PrincipalServer {
         // on why the log must not become a keylogger).
         let detail = ActuationDetail::of(&kind);
         // Read before `kind` moves into the request below; see
-        // `grant_realm`, which is resolved owned only for these two.
-        let is_layout = matches!(kind, UseKind::LayoutFocus | UseKind::LayoutArrange(_));
+        // `grant_realm`, which is resolved owned only for these four.
+        let is_attention_shaped = matches!(
+            kind,
+            UseKind::Pointer(_)
+                | UseKind::Text(_)
+                | UseKind::LayoutFocus
+                | UseKind::LayoutArrange(_)
+        );
         let grant_row = self.grant_row_id(grant_wire_id);
         let request = UseRequest {
             facet_id,
@@ -1375,32 +1386,33 @@ impl PrincipalServer {
             principal: &identity,
             kind,
         };
-        // **Whose realm this use is about**, resolved once for both
-        // directions, and the one place the halves of that question meet:
-        // the row names the realm, the embedder knows which realms are live
-        // and which one the seat serves, and the chokepoint is handed the
-        // answers rather than any of the inputs.
+        // **Whose realm this use is about**, resolved once and in one place:
+        // the row names the realm, the embedder knows which realms are live,
+        // and the chokepoint is handed the answers rather than any of the
+        // machinery.
         //
-        // - **Read** (`realm_is_live`, and the frame itself). With one realm
-        //   this could not differ from "is anything live"; with several,
-        //   judging liveness against *any* realm is fail-open -- a grant over
-        //   a dead realm would clear the `no_surface` gate on a living
-        //   sibling's account and then capture the scene that sibling
+        // - **Liveness and the frame** (`realm_is_live`, and `realm_view`).
+        //   With one realm this could not differ from "is anything live"; with
+        //   several, judging liveness against *any* realm is fail-open -- a
+        //   grant over a dead realm would clear the `no_surface` gate on a
+        //   living sibling's account and then capture the scene that sibling
         //   committed into. Since WS-E.1.3 the **frame** is resolved by realm
         //   here too, on the same line: a live realm's grant used to be
         //   handed the session's one view, so a capture over realm A could
         //   carry live sibling B's pixels. Both halves of "the view of the
         //   realm this grant names" are now resolved together, from the same
         //   `realm`, or not at all.
-        // - **Write** (`seat_reaches_grant_realm`). Same shape, worse
-        //   failure: the session has one seat target, so an actuation
-        //   admitted under a grant naming another realm would be *delivered
-        //   into a sibling's app*. Refusing is the stopgap; WS-E.1.6 routes
-        //   properly (see the chokepoint's step 5d).
+        // - **The realm's NAME**, which since WS-E.1.6 is what *addresses* an
+        //   admitted actuation as well as a layout act. The write-side
+        //   question used to be a comparison -- "does the session's one seat
+        //   serve this grant's realm", refused `internal` when it did not --
+        //   and it is gone with the one-target placeholder it defended: the
+        //   name travels with the event instead, so an actuation reaches the
+        //   realm its grant is over and nothing has to be compared.
         //
-        // All three are the closed answer when the row is gone -- fail
-        // closed, and unreachable anyway: a missing row is refused
-        // `not_granted` at step 3, before any of them is consulted.
+        // Both are the closed answer when the row is gone -- fail closed, and
+        // unreachable anyway: a missing row is refused `not_granted` at step
+        // 3, before either is consulted.
         //
         // Not an authority judgement (this function makes none): it resolves
         // *environment* facts the same way `presence` is resolved outside
@@ -1409,44 +1421,39 @@ impl PrincipalServer {
         // revocation, and only then the use-context gates. A row that fails
         // an earlier step never reaches this frame at all.
         //
-        // The realm's NAME travels alongside the two answers, for the
-        // layout arms: a layout act must name a realm to the embedder, and
-        // neither layout request carries one on the wire -- precisely so a
-        // holder can only ever move the realm the human saw named on its
-        // consent prompt. Resolved here, from the same row, on the same
-        // line as everything else that is "about the realm this grant
-        // names", rather than re-derived at a second site that could
-        // disagree.
+        // Neither a layout request nor an actuator request carries a realm on
+        // the wire -- precisely so a holder can only ever act on the realm the
+        // human saw named on its consent prompt. Resolving the name here, from
+        // the same row, on the same line as everything else that is "about the
+        // realm this grant names", is what keeps a second site from
+        // disagreeing.
         //
-        // Owned, and **only for a layout use**. The chokepoint takes
-        // `&mut GrantTable`, so a borrow of the row's realm cannot survive
-        // into the call; and the module's standing rule is that the
-        // dispatch path allocates nothing per message, which an
-        // unconditional clone would break for every pointer move an agent
-        // sends. `is_layout` is read before `kind` moves into the request.
-        let grant_realm = if is_layout {
+        // Owned, and **only for an attention-shaped use**: the two actuators
+        // and the two layout requests, which are exactly the uses that either
+        // name a realm to the embedder or are judged against a realm's
+        // physical presence. The chokepoint takes `&mut GrantTable`, so a
+        // borrow of the row's realm cannot survive into the call. That is one
+        // realm-name clone -- a `String` the wire caps at 64 bytes
+        // (`vitrin_realm`) -- per such request, and it is the cost of the
+        // event carrying its own destination; a **capture** still allocates
+        // nothing here, which is the high-rate path this rule was written for.
+        // `is_attention_shaped` is read before `kind` moves into the request.
+        let grant_realm = if is_attention_shaped {
             grant_row.and_then(|row| ctx.grants.realm_of(row)).cloned()
         } else {
             None
         };
-        let (realm_view, seat_reaches_grant_realm) =
-            match grant_row.and_then(|row| ctx.grants.realm_of(row)) {
-                Some(realm) => (
-                    // The liveness gate and the selection, side by side: a
-                    // dead realm is never photographable whatever its
-                    // siblings are doing, and a live one is photographed
-                    // through its own view and no other.
-                    (ctx.realm_is_live)(realm)
-                        .then(|| (ctx.realm_view)(realm))
-                        .flatten(),
-                    ctx.seat_target_realm == Some(realm),
-                ),
-                None => (None, false),
-            };
+        let realm_view = grant_row
+            .and_then(|row| ctx.grants.realm_of(row))
+            // The liveness gate and the selection, side by side: a dead realm
+            // is never photographable whatever its siblings are doing, and a
+            // live one is photographed through its own view and no other.
+            .filter(|realm| (ctx.realm_is_live)(realm))
+            .and_then(|realm| (ctx.realm_view)(realm));
         let env = UseEnv {
             realm_view: realm_view.as_ref(),
             presence: ctx.presence,
-            seat_reaches_grant_realm,
+            physical_realm: ctx.physical_realm,
             actuations: &mut *ctx.actuations,
             grant_realm: grant_realm.as_ref(),
             layout: &mut *ctx.layout,
@@ -2350,14 +2357,24 @@ pub(crate) mod tests {
         /// realm can be in the registry, still `Running` there, and have no
         /// view. Removing an id here is this rig's "that realm's shim died".
         live_realms: std::collections::BTreeSet<RealmId>,
-        /// Which realm the session's **seat** delivers into right now --
-        /// the rig's stand-in for `session::seat_target`, and the write-side
-        /// sibling of [`Shared::live_realms`]. Changing it is this rig's
-        /// "the session is serving a different realm's app", which is the
-        /// only way a grant's realm and the delivery target can differ.
-        seat_realm: Option<RealmId>,
-        presence: PhysicalPresence,
-        actuations: Vec<SeatInput>,
+        /// Which realm the **human's own physical input** follows right now
+        /// -- the rig's stand-in for `session::physical_seat_target`, which
+        /// follows the output binding. Read by exactly one judgement,
+        /// `preempted` for a layout request (WS-E.1.6).
+        ///
+        /// It used to be "which realm the seat delivers into", compared
+        /// against the grant's realm and refused `internal` when they
+        /// differed. Seat delivery is per realm now, so a test that wants a
+        /// cross-realm actuation simply performs one and reads
+        /// [`Shared::actuations`], which names each event's realm.
+        physical_realm: Option<RealmId>,
+        presence: PhysicalPresenceMap,
+        /// Every actuation the chokepoint admitted, **with the realm it was
+        /// addressed to** -- this rig's stand-in for `session::route_seat`.
+        /// The realm is the assertion WS-E.1.6 made possible: before it,
+        /// every admitted actuation went to the session's one target and
+        /// there was nothing to record.
+        actuations: Vec<(RealmId, SeatInput)>,
         /// Every **layout act** the chokepoint admitted, in order — this
         /// rig's stand-in for `session::apply_layout`. A test asserts on
         /// this to prove a `focus` or a `set_fullscreen` really reached the
@@ -2392,11 +2409,11 @@ pub(crate) mod tests {
                 live_realms: [RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)]
                     .into_iter()
                     .collect(),
-                // The seat serves the rig's one realm, so a test that says
+                // The human is in the rig's one realm, so a test that says
                 // nothing about routing behaves as it did while "the realm"
                 // was the only realm.
-                seat_realm: Some(RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)),
-                presence: PhysicalPresence::new(),
+                physical_realm: Some(RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)),
+                presence: PhysicalPresenceMap::new(),
                 actuations: Vec::new(),
                 layout: Vec::new(),
                 recorder,
@@ -2472,14 +2489,14 @@ pub(crate) mod tests {
             now,
             views,
             live_realms,
-            seat_realm,
+            physical_realm,
             presence,
             actuations,
             layout,
             recorder,
             ..
         } = shared;
-        let mut sink = |input: SeatInput| actuations.push(input);
+        let mut sink = |realm: &RealmId, input: SeatInput| actuations.push((realm.clone(), input));
         let mut layout_sink = |act: crate::enforcement::LayoutAct| layout.push(act);
         let realm_is_live = |realm: &RealmId| live_realms.contains(realm);
         for _ in 0..n {
@@ -2514,7 +2531,7 @@ pub(crate) mod tests {
                 // resolves it from `Runtime::view_cache` (WS-E.1.3).
                 realm_view: &realm_view,
                 realm_is_live: &realm_is_live,
-                seat_target_realm: seat_realm.as_ref(),
+                physical_realm: physical_realm.as_ref(),
                 presence,
                 actuations: &mut sink,
                 layout: &mut layout_sink,
@@ -3103,34 +3120,39 @@ pub(crate) mod tests {
         );
     }
 
-    /// **A grant naming realm A cannot actuate into realm B's app** (WS-E.1.2
-    /// second review, HIGH 1) -- the write-side mirror of the capture test
-    /// above, and the worse half: a capture that crossed realms leaked
-    /// pixels, an actuation that crosses realms *drives an app the grant
-    /// confers no authority over*.
+    /// **A grant naming realm B actuates into realm B's app, while the human
+    /// is in realm A** (WS-E.1.6, issue #212) -- the write-side mirror of the
+    /// capture test above, and the criterion this issue exists for.
     ///
-    /// The session has one seat and one delivery target
-    /// (`session::seat_target`). The rig models that with
-    /// [`Shared::seat_realm`]: while it names the grant's realm the
-    /// actuation is delivered, and when it names a sibling the chokepoint
-    /// refuses `internal` and **nothing reaches the sink** -- the sink being
-    /// the runtime's `route_seat`, so an event that arrives there is an
-    /// event the app receives.
+    /// # What this replaced, and why the assertion is inverted
     ///
-    /// Both directions again, because only the pair is evidence: refusing
-    /// every actuation would satisfy the refusal assertion and break the
-    /// session. And the refusal is recoverable -- the `sync` fence at the
-    /// end proves the connection is still serving.
+    /// WS-E.1.2 raised `MAX_REALMS` above 1 while the session still had one
+    /// input router and one delivery target, so an actuation admitted under a
+    /// grant naming any other realm would have been *delivered into a
+    /// sibling's app*. The stopgap refused it `internal`, and the test here
+    /// asserted the refusal. That is now the wrong behaviour: an agent working
+    /// in a realm the human is not looking at is the concurrent-operation
+    /// claim the project rests on, so the refusal is gone and the delivery is
+    /// the property.
+    ///
+    /// The sink is `session::route_seat`'s stand-in and each entry names the
+    /// realm it was addressed to, which is the assertion that could not be
+    /// written before: previously every admitted actuation went to the one
+    /// target and the realm was not part of the event.
+    ///
+    /// Both directions again, because only the pair is evidence: delivering
+    /// everything to one realm would satisfy "the editor's grant actuated"
+    /// and be exactly the bug.
     #[test]
-    fn a_grant_over_one_realm_cannot_actuate_into_a_siblings_app() {
+    fn a_grant_over_a_hidden_realm_actuates_into_that_realm_and_no_other() {
         let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
         let mut shared = Shared::new(ConsentPolicy::AutoApprove);
         shared.realms = crate::realm::tests::registry_with(&["realm-0", "editor"]);
         shared.live_realms.insert(RealmId::new("editor"));
         // The editor's own view: without it the editor's actuations would be
-        // refused `no_surface` at step 5a and never reach the step-5d
-        // cross-realm guard this test is about.
+        // refused `no_surface` at step 5a and this test would prove nothing
+        // about routing.
         shared.set_view(
             &RealmId::new("editor"),
             Some((vec![0x33u8; (VIEW_W * VIEW_H * 4) as usize], VIEW_W, VIEW_H)),
@@ -3157,11 +3179,9 @@ pub(crate) mod tests {
         expect_consent_state(&mut client, 11, ConsentState::Closed);
         assert_eq!(expect_resolved(&mut client, 10).outcome, Outcome::Granted);
 
-        // The seat serves realm-0. Its grant actuates; the editor's does
-        // not, and the editor is *alive* -- so this is not `no_surface`
-        // wearing another name, it is the delivery target differing from the
-        // authorized realm.
-        assert_eq!(shared.seat_realm, Some(RealmId::new("realm-0")));
+        // The human is in realm-0 and the editor is hidden. Both grants
+        // actuate, and each event is addressed to its own grant's realm.
+        assert_eq!(shared.physical_realm, Some(RealmId::new("realm-0")));
         client.send_message(&move_to(3, 4), None).unwrap();
         client
             .send_message(&pointer::requests::Move { x: 5, y: 6 }.encode(13), None)
@@ -3170,43 +3190,74 @@ pub(crate) mod tests {
             .send_message(&text::requests::Type { text: "hi".into() }.encode(14), None)
             .unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 3).unwrap();
-        // The sink is asserted **before** the refusals are read, deliberately:
-        // `expect_refused` blocks on the client socket, so a regression that
-        // delivered the cross-realm events instead of refusing them would
-        // hang this test rather than fail it. Checking what reached the app
-        // first makes the failure immediate and names the actual harm.
         assert_eq!(
-            shared.actuations.len(),
-            1,
-            "only the grant naming the served realm may reach the delivery sink"
+            shared
+                .actuations
+                .iter()
+                .map(|(realm, input)| (realm.as_str().to_string(), input.kind().clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "realm-0".to_string(),
+                    SeatInputKind::Motion { x: 3.0, y: 4.0 }
+                ),
+                (
+                    "editor".to_string(),
+                    SeatInputKind::Motion { x: 5.0, y: 6.0 }
+                ),
+                (
+                    "editor".to_string(),
+                    SeatInputKind::Text { text: "hi".into() }
+                ),
+            ],
+            "each admitted actuation must be addressed to the realm ITS OWN grant names, \
+             hidden or not -- an agent that can only work in the realm on screen is the \
+             concurrent-operation claim withdrawn"
         );
-        assert_eq!(
-            shared.actuations[0].kind(),
-            &SeatInputKind::Motion { x: 3.0, y: 4.0 },
-            "and it is the realm-0 grant's event, not the editor's"
-        );
-        expect_refused(&mut client, 10, Verb::ACTUATE_POINTER, Refusal::Internal);
-        expect_refused(&mut client, 10, Verb::ACTUATE_TEXT, Refusal::Internal);
 
-        // The editor's grant is not broken, it is unserved: point the seat
-        // at the editor and the same facet delivers, while realm-0's now
-        // refuses. Nothing about either grant changed.
+        // Nothing was refused: no `refused` event is waiting on either grant.
+        // Asserted through a `sync` fence, which is the only bounded way to
+        // say "and nothing else arrived".
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            77,
+        );
+
+        // Moving the human's attention to the editor changes **nothing**
+        // about either grant's delivery, which is the second half of the
+        // property: physical attention and grant authority are two different
+        // addressing rules and neither may move the other.
         shared.actuations.clear();
-        shared.seat_realm = Some(RealmId::new("editor"));
+        shared.physical_realm = Some(RealmId::new("editor"));
         client
             .send_message(&pointer::requests::Move { x: 7, y: 8 }.encode(13), None)
             .unwrap();
         client.send_message(&move_to(1, 2), None).unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 2).unwrap();
-        assert_eq!(shared.actuations.len(), 1);
         assert_eq!(
-            shared.actuations[0].kind(),
-            &SeatInputKind::Motion { x: 7.0, y: 8.0 }
+            shared
+                .actuations
+                .iter()
+                .map(|(realm, input)| (realm.as_str().to_string(), input.kind().clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "editor".to_string(),
+                    SeatInputKind::Motion { x: 7.0, y: 8.0 }
+                ),
+                (
+                    "realm-0".to_string(),
+                    SeatInputKind::Motion { x: 1.0, y: 2.0 }
+                ),
+            ],
+            "an agent's actuation follows its grant, not the human's attention"
         );
-        expect_refused(&mut client, 4, Verb::ACTUATE_POINTER, Refusal::Internal);
 
-        // Observation is untouched: this guard is about delivery, and a
-        // capture addresses no seat. (Which realm's pixels a capture returns
+        // Observation is untouched. (Which realm's pixels a capture returns
         // is
         // `a_grant_over_one_realm_captures_that_realms_pixels_and_no_siblings`'
         // subject, not this test's.)
@@ -3221,53 +3272,95 @@ pub(crate) mod tests {
             &mut client,
             &verifier,
             &mut shared,
-            77,
+            78,
         );
     }
 
-    /// A refused cross-realm actuation **spends nothing**: the guard sits
-    /// before the rate gate and before `commit_use`, so a `once` grant that
-    /// was refused for being unserved is still usable the moment the seat
-    /// serves its realm.
+    /// **Per-realm `preempted`** (WS-E.1.6, issue #212, decision 4): a human
+    /// working in realm A preempts an agent actuating in realm A and **does
+    /// not** preempt one actuating in realm B.
     ///
-    /// The inverse would be a silent authority loss -- the agent is refused
-    /// for a reason that is entirely the core's, and then billed for it.
+    /// This is the criterion issue #212 names as "the test that fails today".
+    /// It failed because [`Shared::presence`] was one session-wide tracker:
+    /// "physical human input owns *the target*" was answered for the whole
+    /// session, so a hand anywhere muted every agent everywhere.
+    ///
+    /// **Both halves, and the positive half first.** A per-realm split that
+    /// simply stopped refusing would satisfy "B is not preempted" and silently
+    /// remove the gate; the realm-A refusal is what says the gate still
+    /// exists. And the realm-A half is asserted at the *same instant* as the
+    /// realm-B half -- one `now`, one presence note -- so neither can pass on
+    /// the hold window having elapsed.
     #[test]
-    fn a_cross_realm_refusal_burns_no_authority() {
+    fn physical_presence_in_one_realm_preempts_an_agent_only_in_that_realm() {
         let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        // Rate 1/s so a spent token would be visible as `rate_limited`, and
-        // a `once` rung so a spent use would be visible as `expired`.
         let mut shared = Shared::new(ConsentPolicy::AutoApprove);
+        shared.realms = crate::realm::tests::registry_with(&["realm-0", "editor"]);
+        shared.live_realms.insert(RealmId::new("editor"));
+        shared.set_view(
+            &RealmId::new("editor"),
+            Some((vec![0x33u8; (VIEW_W * VIEW_H * 4) as usize], VIEW_W, VIEW_H)),
+        );
         let (mut server, mut core, mut client) = connect(&mut shared);
+
         bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
-        let mut req = petition_frame();
-        req.max_event_rate = 1;
-        req.persistence = WirePersistence::Once;
-        client.send_message(&req.encode(3), None).unwrap();
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
         expect_consent_state(&mut client, 5, ConsentState::Closed);
         assert_eq!(expect_resolved(&mut client, 4).outcome, Outcome::Granted);
 
-        // The seat serves nobody this turn (every realm's shim is gone --
-        // `seat_target` answers `None`), so the actuation is refused.
-        shared.seat_realm = None;
-        client.send_message(&move_to(1, 1), None).unwrap();
+        send_get_realm(&mut client, 2, 9, "editor");
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).expect("get_realm editor");
+        client
+            .send_message(&petition_at(10).encode(9), None)
+            .unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
-        // Sink first, refusal second -- see the sibling test for why the
-        // order matters to the failure mode.
-        assert!(shared.actuations.is_empty());
-        expect_refused(&mut client, 4, Verb::ACTUATE_POINTER, Refusal::Internal);
+        expect_consent_state(&mut client, 11, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client, 10).outcome, Outcome::Granted);
 
-        // The seat comes back to this grant's realm: the single `once` use
-        // is still there, and the token was never taken.
-        shared.seat_realm = Some(RealmId::new(crate::realm::WELL_KNOWN_REALM_ID));
-        client.send_message(&move_to(2, 2), None).unwrap();
+        // The human touches realm-0's input, at this turn's instant. Fed the
+        // way the router's hook point feeds it: with the realm the event was
+        // addressed to, which for physical input is the bound realm.
+        shared.presence.note(
+            Some(&RealmId::new("realm-0")),
+            Origin::Physical,
+            &SeatInputKind::Motion { x: 1.0, y: 1.0 },
+            shared.now,
+        );
+
+        // The agent actuates in both realms, in one dispatch round.
+        client.send_message(&move_to(3, 4), None).unwrap();
+        client
+            .send_message(&pointer::requests::Move { x: 5, y: 6 }.encode(13), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 2).unwrap();
+
+        // The editor's actuation landed; realm-0's did not.
+        assert_eq!(
+            shared
+                .actuations
+                .iter()
+                .map(|(realm, _)| realm.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["editor".to_string()],
+            "a hand in realm-0 must preempt realm-0's agent and no other realm's: muting \
+             every agent everywhere is the blanket answer WS-E.1.6 replaced"
+        );
+        expect_refused(&mut client, 4, Verb::ACTUATE_POINTER, Refusal::Preempted);
+
+        // The gate is transient, not a wedge: past the hold window realm-0's
+        // own agent actuates again, with the presence untouched.
+        shared.now += crate::input::PHYSICAL_HOLD_WINDOW;
+        shared.actuations.clear();
+        client.send_message(&move_to(9, 9), None).unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
         assert_eq!(
             shared.actuations.len(),
             1,
-            "the refusal must not have spent the once rung or the token"
+            "preemption is a transient suspension (PRD Doc 2 SS8), not a lock"
         );
     }
 
@@ -5539,6 +5632,7 @@ pub(crate) mod tests {
 
         // A physically held button owns the target outright.
         shared.presence.note(
+            Some(&RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)),
             Origin::Physical,
             &SeatInputKind::Button {
                 button: 0x110,
@@ -5559,6 +5653,7 @@ pub(crate) mod tests {
         // passes -- and the next actuation is admitted, origin-tagged
         // emulated for the delivery path (B2).
         shared.presence.note(
+            Some(&RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)),
             Origin::Physical,
             &SeatInputKind::Button {
                 button: 0x110,
@@ -5574,9 +5669,9 @@ pub(crate) mod tests {
         client.send_message(&move_to(3, 4), None).unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
         assert_eq!(shared.actuations.len(), 1);
-        assert_eq!(shared.actuations[0].origin(), Origin::Emulated);
+        assert_eq!(shared.actuations[0].1.origin(), Origin::Emulated);
         assert_eq!(
-            shared.actuations[0].kind(),
+            shared.actuations[0].1.kind(),
             &SeatInputKind::Motion { x: 3.0, y: 4.0 }
         );
         sync_fence(
@@ -5636,9 +5731,9 @@ pub(crate) mod tests {
             1,
             "admitted once the realm is back"
         );
-        assert_eq!(shared.actuations[0].origin(), Origin::Emulated);
+        assert_eq!(shared.actuations[0].1.origin(), Origin::Emulated);
         assert_eq!(
-            shared.actuations[0].kind(),
+            shared.actuations[0].1.kind(),
             &SeatInputKind::Motion { x: 1.0, y: 2.0 }
         );
     }
@@ -5824,6 +5919,7 @@ pub(crate) mod tests {
         // Human active: the once actuation refuses preempted -- and stays
         // unspent.
         shared.presence.note(
+            Some(&RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)),
             Origin::Physical,
             &SeatInputKind::Motion { x: 1.0, y: 1.0 },
             shared.now,
@@ -5860,7 +5956,7 @@ pub(crate) mod tests {
         client.send_message(&move_to(-50, 1_000_000), None).unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
         assert_eq!(
-            shared.actuations[0].kind(),
+            shared.actuations[0].1.kind(),
             &SeatInputKind::Motion {
                 x: 0.0,
                 y: f64::from(VIEW_H - 1),
@@ -5908,7 +6004,7 @@ pub(crate) mod tests {
             .unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
         assert_eq!(
-            shared.actuations[0].kind(),
+            shared.actuations[0].1.kind(),
             &SeatInputKind::Text {
                 text: "line\nwith\ttabs ok".into()
             }

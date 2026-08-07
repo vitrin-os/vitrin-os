@@ -9,13 +9,28 @@
 //! ceremony (plan P1.3.7; `docs/protocol/11-vitrin_shim_seat.md` flow (i)).
 //! Trusting nested host input as human is a documented limitation; real
 //! physical-origin verification is Phase 3. Headless mode has **no human
-//! device at all**, and that absence is compiler-enforced, not a runtime
-//! check: [`SeatInput::physical`] is private to this module, so the only
-//! producer of `Origin::Physical` events in the crate is
+//! device at all**, and in a shipping build that absence is compiler-enforced,
+//! not a runtime check: [`SeatInput::physical`] is private to this module, so
+//! the only producer of `Origin::Physical` events in the crate is
 //! [`intake_physical`], whose only caller is the nested backend's winit
 //! event handler — a call site anywhere else (the headless backend, a
 //! P1.4.x actuation path, a replay helper) is a compile error, so no
 //! phantom physical-input path can exist there.
+//!
+//! **One build weakens that sentence, and it is named rather than implied.**
+//! A `physical-input-injector` build (issue #212, WS-E.1.6) adds a second
+//! caller of [`intake_physical`]: [`injector`], fed by an inherited
+//! socketpair the headless backend adopts only when `--physical-input-fd N`
+//! is also passed. WS-E.1.6's whole claim is about where physical input goes,
+//! and headless is the only backend CI runs (D-019(4)), so without it that
+//! claim has no mock-free gate at all. The privacy above is unchanged — the
+//! injector cannot construct a `SeatInput`, it can only hand host events to
+//! the same intake the nested backend uses — but the *guarantee* is not: in a
+//! shipping build "nothing but a human's device produces a physical tag here"
+//! is enforced by the compiler, and in an instrumented build it is enforced
+//! by the feature, the flag and possession of a descriptor. That is a weaker
+//! guarantee than the one this paragraph otherwise claims, and it is the same
+//! trade `dead-man-injector` and `consent-injector` already make.
 //!
 //! # B2: the origin tag is bound at intake, structurally
 //!
@@ -29,7 +44,7 @@
 //!   ready for the wire) keep `origin` **private**, with no setter and no
 //!   `Default`. The only ways to obtain a `SeatInput` are the two
 //!   constructors [`SeatInput::physical`] (private to this module — only
-//!   [`intake_physical`] can mint the physical tag) and
+//!   [`intake_physical`] and [`physical_key`] can mint the physical tag) and
 //!   [`SeatInput::emulated`] (crate-visible for the P1.4.x actuation
 //!   intake) — an untagged event is unrepresentable, and a
 //!   physical-origin masquerade outside nested intake is a compile
@@ -37,15 +52,16 @@
 //!   `SeatInput` is not the only producer of a wire-ready event, so the
 //!   compile-time half of the guarantee needs the next bullet to be
 //!   complete.
-//! - A [`SeatDelivery`] is constructed at exactly two sites, both inside
-//!   `InputRouter`, and **neither invents an origin**. `InputRouter::route`
-//!   *moves* the tag out of the `SeatInput` it consumed.
-//!   `InputRouter::release_physical_keys` — the focus-loss drain, the one
-//!   place a wire event exists with no intake event behind it — *copies* the
-//!   tag off the pairing-table entry that key's own press recorded
-//!   (`InputRouter::pressed_keys` stores `(keysym, origin)` for exactly this
-//!   reason) and drains only the entries a human's press put there. The tag
-//!   is therefore never re-derived downstream and never minted, so it cannot
+//! - A [`SeatDelivery`] is constructed at exactly three sites, all inside
+//!   `InputRouter`, and **none invents an origin**. `InputRouter::route_into`
+//!   (behind both addressing rules) *moves* the tag out of the `SeatInput` it
+//!   consumed. [`InputRouter::release_physical_keys`] and
+//!   [`InputRouter::release_physical_buttons`] — the drains, the only places a
+//!   wire event exists with no intake event behind it — *copy* the tag off the
+//!   pairing-table entry that press recorded ([`RealmSeat::pressed_keys`] and
+//!   [`RealmSeat::pressed`] store `(code, origin)` for exactly this reason)
+//!   and drain only the entries a human's press put there. The tag is
+//!   therefore never re-derived downstream and never minted, so it cannot
 //!   drift between intake and the wire.
 //! - [`SeatDelivery::encode`] is the single seat-event encoder, an
 //!   exhaustive match with no catch-all: every arm feeds the origin into
@@ -79,7 +95,8 @@
 //! the pointer path simply yields nothing (keys and text still flow — the
 //! shim holds keyboard focus on its app and owns that judgement).
 //!
-//! Implicit grab: while any button the router delivered is still pressed,
+//! Implicit grab (**per realm**, like everything else in [`RealmSeat`]):
+//! while any button the router delivered is still pressed,
 //! all pointer events keep flowing regardless of position — coordinates
 //! may leave [0, surface) (the wire's `fixed` is signed) — so drags that
 //! stray off the surface never strand a stuck button in the app, mirroring
@@ -162,12 +179,14 @@
 //! app's accounting is never split. The router's per-keysym pairing is what
 //! proves it: the reconciliation finds no delivered press and does nothing.
 //!
-//! The first real observe-side consumer was [`PresenceHook`] (P1.4.4): it
-//! feeds [`PhysicalPresence`], the physical-activity state behind the
-//! enforcement chokepoint's `preempted` refusal — attached in the same shape
-//! (non-consuming, wraps an inner hook), so the chokepoint's "does physical
-//! input own the target" judgement rides the same single tap point as every
-//! other preemption policy.
+//! The physical-activity state behind the enforcement chokepoint's
+//! `preempted` refusal ([`PhysicalPresenceMap`]) rides the same single tap
+//! point, but it is **not** a stackable hook: the router records it itself,
+//! above the stack, because it is the one per-realm fact here and no policy
+//! hook may be told a realm ([`PreemptionHook`], [`InputRouter`]). It was a
+//! hook from P1.4.4 until issue #212's review, and in that whole time no
+//! shipping backend stacked it — so `preempted` could not fire in any
+//! `vitrind` ever built.
 //!
 //! # What arrives later (deliberately not here)
 //!
@@ -175,11 +194,29 @@
 //!   `vitrin_actuator_text` requests pass the enforcement chokepoint
 //!   (P1.4.4 — grant, verbs, constraints, and the token-bucket rate limit
 //!   of PRD Doc 2 §8) *before* being wrapped by [`SeatInput::emulated`]
-//!   and routed here. The router is not an authority check and must never
-//!   grow one: by the time an event reaches it, the authority question is
-//!   settled (prose page 11). One pointer state serves both origins in v0
-//!   (one seat, one cursor per realm); multi-principal routing is the
-//!   Phase-2+ generalization.
+//!   and routed here, **naming the realm the grant is over**
+//!   ([`InputRouter::route_emulated`]). The router is not an authority check
+//!   and must never grow one: by the time an event reaches it, the authority
+//!   question is settled (prose page 11), and naming the realm at the entry
+//!   point is addressing, not authorization. Within a realm one pointer state
+//!   still serves both origins in v0 (one seat, one cursor per realm);
+//!   multi-*principal* routing is the Phase-2+ generalization.
+//!
+//! # Two addressing rules (WS-E.1.6, issue #212)
+//!
+//! A session holds up to [`crate::realm::MAX_REALMS`] realms and every one of
+//! them may be receiving input at once. Which realm an event reaches is
+//! answered by two different rules, and [`InputRouter`] carries both without
+//! either becoming an authority check:
+//!
+//! - **physical input follows the human's attention** — the bound realm,
+//!   which a `layout_focus` holder moves ([`InputRouter::route_physical`]);
+//! - **an agent's actuation follows its grant** — the realm named by the
+//!   grant it was admitted under, watched or not
+//!   ([`InputRouter::route_emulated`]).
+//!
+//! The full argument, including what stays session-wide and what a bind
+//! change costs the app it leaves, is on [`InputRouter`] itself.
 //! - **Keyboard interpretation never lands here.** Keys travel as
 //!   xkbcommon keysyms and the core does *no keymap interpretation* (IDL
 //!   `vitrin_shim_seat.key`); see [`invariant_keysym`] for what nested
@@ -293,8 +330,11 @@ impl SeatInput {
 
 /// A routed seat event, wire-ready: pointer coordinates already mapped to
 /// the shim's view space (surface top-left = origin) and widened to the
-/// wire's 24.8 fixed-point. Constructed only by [`InputRouter::route`],
-/// which moves the origin from the [`SeatInput`] it consumed.
+/// wire's 24.8 fixed-point. Constructed only inside [`InputRouter`] — by the
+/// shared routing body behind [`InputRouter::route_physical`] and
+/// [`InputRouter::route_emulated`], which moves the origin from the
+/// [`SeatInput`] it consumed, and by the two drains, which copy it off the
+/// pairing-table entry that press recorded.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SeatDelivery {
     origin: Origin,
@@ -409,10 +449,10 @@ pub(crate) fn origin_label(origin: Origin) -> &'static str {
 /// covers the code both run.
 ///
 /// `realm` is a parameter rather than something this function derives: both
-/// call sites pick the delivery target themselves (today from
-/// `session::seat_target`, tomorrow from WS-E.1.6's router) and the journal
-/// has to record the realm that was actually addressed, not one this funnel
-/// re-derived and could disagree about.
+/// call sites pick the delivery target themselves — the physical path from
+/// `session::physical_seat_target`, an agent's from the grant row its use was
+/// admitted under — and the journal has to record the realm that was actually
+/// addressed, not one this funnel re-derived and could disagree about.
 ///
 /// Pointer **motion is deliberately not journaled**. On the physical path it
 /// arrives at raw device rate with no chokepoint token bucket to bound it (an
@@ -486,15 +526,44 @@ pub(crate) enum Gate {
 /// the chord key and nothing else. The rule above is otherwise absolute:
 /// a gate must not consume a release whose press the *router* delivered.
 ///
+/// # Session-wide by construction: **no** hook is ever told a realm
+///
+/// Since WS-E.1.6 the router addresses each event to a realm (physical input
+/// to the bound realm, an agent's actuation to the realm its grant names),
+/// and the whole hook stack sits **above** that split: one stack for the
+/// session, called for every event of every realm.
+///
+/// Neither [`observe`] nor [`gate`] receives the realm, and that is the whole
+/// of the guarantee: the consent grab is the trusted path and the dead-man
+/// watcher is the human's off-switch, and neither may ever apply to some
+/// realms and not others. A policy that is never told which realm an event is
+/// for cannot scope itself to one — "the prompt consumes input for every
+/// realm" and "the chord revokes every realm's grants" are then
+/// inexpressibly-otherwise rather than merely tested, which is the shape
+/// D-018(2) asks for.
+///
+/// `observe` **did** take the realm for one review cycle, because
+/// per-realm physical presence needed it — and that made the guarantee a
+/// convention (a hook could simply have ignored events for other realms)
+/// while three doc comments described it as structural. Presence is now
+/// recorded by [`InputRouter`] itself, above the stack, so the argument is
+/// sound again: see [`InputRouter`]'s "Presence is not a stackable hook".
+///
 /// [`observe`]: PreemptionHook::observe
 /// [`gate`]: PreemptionHook::gate
 pub(crate) trait PreemptionHook {
     /// Non-consuming tap: sees every event at intake, in view coordinates,
     /// before and regardless of gating.
+    ///
+    /// Sees every event of **every** realm, and is not told which — the tap
+    /// runs even for physical input arriving while no realm is bound at all,
+    /// because the human's off-switch must work when nothing is on screen.
     fn observe(&mut self, input: &SeatInput);
 
     /// Consuming gate: runs after [`observe`](Self::observe); a
     /// [`Gate::Consume`] verdict stops the event before routing.
+    ///
+    /// Not given the realm either — see the trait docs.
     fn gate(&mut self, input: &SeatInput) -> Gate;
 }
 
@@ -543,9 +612,9 @@ pub(crate) const PHYSICAL_HOLD_WINDOW: std::time::Duration = std::time::Duration
 /// feeder gap from becoming a process-lifetime denial of actuation.
 pub(crate) const PHYSICAL_HOLD_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Physical-input presence: the state behind the enforcement chokepoint's
-/// `preempted` refusal (P1.4.4). "Physical human input owns the target
-/// right now" (IDL) holds while either
+/// Physical-input presence **in one realm**: the state behind the
+/// enforcement chokepoint's `preempted` refusal (P1.4.4). "Physical human
+/// input owns the target right now" (IDL) holds while either
 ///
 /// - a **physically pressed button is still down** (a human mid-click or
 ///   mid-drag owns the target however long that takes, provided the
@@ -561,15 +630,13 @@ pub(crate) const PHYSICAL_HOLD_CEILING: std::time::Duration = std::time::Duratio
 /// caller's `now`, `owns_target` judges at the caller's `now`, and the
 /// chokepoint samples one instant per request for both.
 ///
-/// One tracker serves the process: one seat, one human, and — until
-/// WS-E.1.6 — one presence answer shared by every realm a session holds,
-/// even though a session may now hold several (WS-E.1.2). So a human
-/// touching the physical keyboard preempts agent actuation in *every*
-/// realm, not only the one they are working in. That is the conservative
-/// direction (it refuses more, never less) and it is a placeholder, not a
-/// design: per-realm presence is WS-E.1.6's, alongside the routing question
-/// it cannot be answered separately from.
-#[cfg_attr(not(test), allow(dead_code))]
+/// **One tracker per realm** since WS-E.1.6 (issue #212), held in a
+/// [`PhysicalPresenceMap`]. There is still one seat and one human, but
+/// physical input is addressed to the **bound** realm while an agent's
+/// actuation is addressed to the realm its grant names, so "the target" is a
+/// realm rather than the session — see [`PhysicalPresenceMap`] for what that
+/// narrows and why the narrowing is the correct direction rather than a
+/// relaxation for convenience.
 #[derive(Debug, Default)]
 pub(crate) struct PhysicalPresence {
     /// Button codes of physically pressed, not-yet-released buttons (a
@@ -579,8 +646,11 @@ pub(crate) struct PhysicalPresence {
     last_activity: Option<std::time::Instant>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl PhysicalPresence {
+    /// A test's way to build one tracker in isolation. Production never calls
+    /// it: entries are minted through [`PhysicalPresenceMap::note`]'s
+    /// `or_default`, which is the only place a realm may acquire one.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -592,7 +662,7 @@ impl PhysicalPresence {
     /// [`SeatInput`] so that tests outside this module can model an
     /// observed physical event without a physical-origin *constructor*
     /// leaking out of intake; the only runtime feeder is
-    /// [`PresenceHook::observe`], which passes the tag intake bound.
+    /// [`InputRouter::route_into`], which passes the tag intake bound.
     pub fn note(&mut self, origin: Origin, kind: &SeatInputKind, now: std::time::Instant) {
         if origin != Origin::Physical {
             return;
@@ -634,75 +704,129 @@ impl PhysicalPresence {
     }
 }
 
-/// The [`PhysicalPresence`] tracker attached at THE preemption hook point:
-/// an observe-side tap -- non-consuming, sees every event even while the
-/// consent grab consumes delivery, the same shape P1.7.3's dead-man watcher
-/// detects with -- wrapping an inner hook so the P1.7.x consumers stack
-/// beside it rather than displacing one another. Because
-/// the hook trait deliberately carries no clock (the router never reads
-/// one), the embedder that drives `route` shares a clock cell with this
-/// hook and advances it to the dispatch turn's injected `now` -- the same
-/// single-sample instant the rest of the turn uses.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct PresenceHook<H: PreemptionHook> {
-    presence: std::rc::Rc<std::cell::RefCell<PhysicalPresence>>,
-    now: std::rc::Rc<std::cell::Cell<std::time::Instant>>,
-    inner: H,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl<H: PreemptionHook> PresenceHook<H> {
-    pub fn new(
-        presence: std::rc::Rc<std::cell::RefCell<PhysicalPresence>>,
-        now: std::rc::Rc<std::cell::Cell<std::time::Instant>>,
-        inner: H,
-    ) -> Self {
-        Self {
-            presence,
-            now,
-            inner,
-        }
-    }
-}
-
-impl<H: PreemptionHook> PreemptionHook for PresenceHook<H> {
-    fn observe(&mut self, input: &SeatInput) {
-        self.presence
-            .borrow_mut()
-            .note(input.origin, &input.kind, self.now.get());
-        self.inner.observe(input);
-    }
-
-    fn gate(&mut self, input: &SeatInput) -> Gate {
-        self.inner.gate(input)
-    }
-}
-
-/// The session's input router: the one path from tagged intake events to
-/// wire-ready seat deliveries. Holds the seat's pointer state (v0: one
-/// seat, one cursor, shared by both origins) and the preemption hook.
+/// **Which realms the human's hand is in**: one [`PhysicalPresence`] per
+/// realm, and the whole of decision 4 of issue #212 (WS-E.1.6).
 ///
-/// **One router, one realm at a time.** A session may now hold several
-/// realms (WS-E.1.2), and this is still one instance — but the state below
-/// is *per shim generation*, and a shim generation belongs to exactly one
-/// realm: every delivery goes to a single realm, the one
-/// [`crate::session::physical_seat_target`] picks. [`Self::bound`] records
-/// which,
-/// and it exists for one reason: a realm's death must clear that realm's
-/// delivery debt and **must not** clear a surviving sibling's, or a key the
-/// survivor's app is holding latches down forever with nothing in the log
-/// to say why.
-pub(crate) struct InputRouter<H: PreemptionHook> {
-    hook: H,
-    /// The realm the state below is owed to: whichever realm
-    /// [`Self::bind_to`] last named, or `None` before the first delivery
-    /// and after the bound realm's death.
+/// # Why this is per realm, and what per realm narrows
+///
+/// The chokepoint's `preempted` refusal means "physical human input owns
+/// **the target** right now". While a session held one realm the target and
+/// the session were the same thing, so one tracker was exact. With several
+/// realms the target of an actuation is the realm its **grant** names, and a
+/// session-wide tracker answers a different question than the one the refusal
+/// asks: a human typing in realm A would preempt an agent working in realm B,
+/// which is the concurrent-operation claim the whole project rests on being
+/// refused for no reason a human could see.
+///
+/// **So this narrows a blanket safety behaviour, and that is disclosed rather
+/// than smoothed over.** Before WS-E.1.6, a human touching anything muted
+/// every agent everywhere. After it, a human in realm A mutes agents in realm
+/// A. Anyone who was relying on the old *breadth* — as a crude session-wide
+/// "hands off while I work" — loses it here and is not told by any wire
+/// event. It is published in `docs/book/src/limits.md`. The narrowing is
+/// still the correct direction: the old breadth refused uses whose target no
+/// human was anywhere near, which is not caution, it is a wrong answer that
+/// happened to be conservative.
+///
+/// # Entries only ever exist for realms a human has actually been in
+///
+/// [`Self::note`] is fed from the router's observe-side tap with **the realm
+/// the event was addressed to**, and physical input is addressed to the bound
+/// realm alone. So a realm that has never held the human's attention has no
+/// entry at all and [`Self::owns_target`] answers `false` for it — the honest
+/// answer, not a default. [`Self::forget`] drops a realm's entry when the
+/// human's attention leaves it (`session::route_physical_turn` and
+/// `session::apply_layout`, at the same moment the router drains that realm's
+/// held physical presses), so a button the human was holding when the binding
+/// moved cannot keep that realm "owned" for the whole
+/// [`PHYSICAL_HOLD_CEILING`] with nobody touching it.
+#[derive(Debug, Default)]
+pub(crate) struct PhysicalPresenceMap {
+    per_realm: std::collections::BTreeMap<crate::grants::RealmId, PhysicalPresence>,
+}
+
+impl PhysicalPresenceMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one observed intake event at `now`, against **the realm it was
+    /// addressed to**. Emulated events are ignored by [`PhysicalPresence::note`]
+    /// itself (B2), and an event addressed to no realm — physical input while
+    /// nothing is bound — is recorded nowhere, because there is no target for
+    /// a human to own.
     ///
-    /// Not a routing decision and not a second copy of one — the target is
-    /// chosen in `session::seat_target` and merely *recorded* here, so the
-    /// eventual per-realm routing policy (WS-E.1.6) changes one function
-    /// and this field follows it.
-    bound: Option<crate::grants::RealmId>,
+    /// An entry is minted only by a *physical* event, so the map cannot grow
+    /// an entry per realm an agent actuates into.
+    pub fn note(
+        &mut self,
+        realm: Option<&crate::grants::RealmId>,
+        origin: Origin,
+        kind: &SeatInputKind,
+        now: std::time::Instant,
+    ) {
+        if origin != Origin::Physical {
+            return;
+        }
+        let Some(realm) = realm else {
+            return;
+        };
+        self.per_realm
+            .entry(realm.clone())
+            .or_default()
+            .note(origin, kind, now);
+    }
+
+    /// Does physical human input own `realm` at `now`?
+    ///
+    /// `None` — a use that names no realm — answers `false`, and the two
+    /// callers that can produce it are both correct with that answer: a
+    /// layout request judged while **no** realm is bound has no human
+    /// attention to steal, and a seat-delivered use whose grant row has
+    /// vanished is unreachable here (step 3 refused it `not_granted`) and is
+    /// refused `internal` at the delivery arm regardless. This is not the
+    /// fail-open direction it looks like: there is no realm whose presence
+    /// could be consulted, so answering `true` would refuse every agent in
+    /// the session for a human who is demonstrably nowhere.
+    pub fn owns_target(
+        &self,
+        realm: Option<&crate::grants::RealmId>,
+        now: std::time::Instant,
+    ) -> bool {
+        realm
+            .and_then(|realm| self.per_realm.get(realm))
+            .is_some_and(|presence| presence.owns_target(now))
+    }
+
+    /// Forget `realm`'s presence entirely — the human is no longer in it.
+    ///
+    /// Called at exactly the moments the router drains that realm's held
+    /// physical presses: the human's attention moved somewhere else, so their
+    /// next physical event will be addressed to another realm and this one's
+    /// held-button set can never be paid down by an intake release. Without
+    /// this, a bind change mid-drag leaves a realm "owned" for
+    /// [`PHYSICAL_HOLD_CEILING`] — a full minute of refusing every agent
+    /// actuating there, on the strength of a button the human let go of into
+    /// a different realm.
+    pub fn forget(&mut self, realm: &crate::grants::RealmId) {
+        self.per_realm.remove(realm);
+    }
+}
+
+/// One realm's seat state: everything the router believes **that realm's
+/// app** was told, and nothing else.
+///
+/// Split out of [`InputRouter`] by WS-E.1.6 (issue #212). It was one copy per
+/// session, which was exact while a session held one realm and became a bug
+/// the moment it held two: the pairing tables are the *app's* press/release
+/// accounting, so sharing them across realms means a focus switch mid-chord
+/// leaves a latched modifier that silently rewrites every subsequent
+/// keystroke in an app the human can no longer even see.
+///
+/// Minted lazily, on the first event addressed to a realm, and dropped by
+/// [`InputRouter::reset_for`] when that realm's shim generation ends.
+#[derive(Debug, Default)]
+pub(crate) struct RealmSeat {
     /// Last known pointer position in view coordinates — buttons and
     /// scroll carry no position of their own and hit-test against this.
     /// Updated at intake (a physical fact), even for events the gate
@@ -722,13 +846,14 @@ pub(crate) struct InputRouter<H: PreemptionHook> {
     /// the human an agent is pointing where the human is pointing.
     ///
     /// Updated at intake beside [`Self::pointer`], before gating, for the same
-    /// reason: where a pointer *is* is a fact, not a delivery outcome. Cleared
-    /// by [`Self::reset`] with the rest of the per-shim-generation state.
+    /// reason: where a pointer *is* is a fact, not a delivery outcome.
     ///
     /// **This is display state and nothing else.** It feeds no hit test, no
     /// routing decision, and no wire event; delivery to the shim remains one
     /// shared position per realm view (module docs; D-019 supersedes only the
-    /// "composites no cursor" half of D-017, never the delivery half).
+    /// "composites no cursor" half of D-017, never the delivery half). Now
+    /// one such position **per realm**, which multiplies the drawn-vs-delivered
+    /// gap D-017 defers rather than closing any of it — published as a limit.
     ///
     /// [`ConsentGrab::pointer`]: crate::consent::grab::ConsentGrab
     agent_pointer: Option<(f64, f64)>,
@@ -755,8 +880,8 @@ pub(crate) struct InputRouter<H: PreemptionHook> {
     /// without leaving a latched modifier in the app.
     ///
     /// **Why the origin is stored and not assumed.** Both origins share this
-    /// router on purpose (`session::route_seat` routes chokepoint-admitted
-    /// actuations through the very same instance, which is what makes the
+    /// realm's seat on purpose (`session::route_seat` routes chokepoint-admitted
+    /// actuations through the very same router, which is what makes the
     /// preemption hook meaningful), so the table holds an agent's held keys
     /// beside a human's. Anything that synthesises a release from an entry
     /// therefore has to read the tag back off the entry rather than assume
@@ -769,400 +894,7 @@ pub(crate) struct InputRouter<H: PreemptionHook> {
     pressed_keys: Vec<(u32, Origin)>,
 }
 
-impl<H: PreemptionHook> InputRouter<H> {
-    pub fn new(hook: H) -> Self {
-        Self {
-            hook,
-            bound: None,
-            pointer: None,
-            agent_pointer: None,
-            pressed: Vec::new(),
-            pressed_keys: Vec::new(),
-        }
-    }
-
-    /// Where the **agent's** pointer last was, in view coordinates, or `None`
-    /// before its first motion (and after [`Self::reset`]).
-    ///
-    /// Read only by the presentation side, to draw the sprite: the backends
-    /// pull it once per dispatch round through
-    /// [`crate::session::Presenter::set_agent_cursor`]. See
-    /// [`Self::agent_pointer`] for why this is not [`Self::pointer`].
-    pub fn agent_pointer(&self) -> Option<(f64, f64)> {
-        self.agent_pointer
-    }
-
-    /// **Adopt `realm`'s shim generation**, called by each delivery site
-    /// with the realm it is about to deliver to
-    /// ([`crate::session::physical_seat_target`]).
-    ///
-    /// Re-binding to the realm already bound is a no-op — the ordinary case,
-    /// once per delivery round. Binding to a *different* realm forgets the
-    /// previous one's state first, and that is the fail-closed direction
-    /// rather than tidiness: the pairing table is a record of presses **this
-    /// app** saw, so carrying it across a target change would send the new
-    /// realm's seat a release whose press it never received, and let a
-    /// pointer position hit-test geometry a different shim produced.
-    ///
-    /// **This forgets a debt; it does not pay it**, and whoever moves the
-    /// target owes the payment first. The target used to change only when
-    /// the previous realm died, which had already reset through
-    /// [`Self::reset_for`] and where no delivery was possible anyway.
-    /// Serving `layout_focus` (WS-E.1.4) made that false: a holder moves the
-    /// binding while the losing realm's app is very much alive and may be
-    /// holding a key or a button, and an entry forgotten here is a press
-    /// whose release that app can never receive — a latched `Ctrl` in an app
-    /// the human can no longer even see. So `session::apply_layout` drains
-    /// [`Self::release_held`] into the losing realm *before* the binding
-    /// moves, and this call then finds nothing left to forget.
-    pub fn bind_to(&mut self, realm: &crate::grants::RealmId) {
-        if self.bound.as_ref() == Some(realm) {
-            return;
-        }
-        self.reset();
-        self.bound = Some(realm.clone());
-    }
-
-    /// Forget `realm`'s per-shim-generation seat state — the implicit-grab
-    /// bookkeeping, the key pairing, and the last known pointer position —
-    /// **if that is the realm this router's state belongs to**. Returns
-    /// whether it cleared anything.
-    ///
-    /// Invoked by the realm teardown funnel
-    /// ([`ShimServer::connection_closed`](crate::shim::ShimServer::connection_closed)),
-    /// so no state can survive into the next shim generation: a stale
-    /// grab would route off-surface input to an app that never saw the
-    /// press, a stale release (button or key) would arrive unpaired at the
-    /// fresh seat, and a stale pointer position would let a press hit-test
-    /// geometry the new shim never produced. First motion re-establishes
-    /// the pointer.
-    ///
-    /// The agent-owned position goes with it, so the sprite does not hover
-    /// over a realm that no longer exists: the next composite draws none.
-    ///
-    /// **Scoped, and that scoping is the whole of this method.** One router
-    /// serves a session that may hold several realms, so an unconditional
-    /// clear on *any* realm's death is one realm reaching into another's
-    /// state: the survivor's app keeps holding a key whose release the
-    /// router has just forgotten it owes, and the key latches down with
-    /// nothing in the journal to say why. A realm that never held the
-    /// router's generation therefore clears nothing when it dies.
-    pub fn reset_for(&mut self, realm: &crate::grants::RealmId) -> bool {
-        if self.bound.as_ref() != Some(realm) {
-            return false;
-        }
-        self.reset();
-        self.bound = None;
-        true
-    }
-
-    /// The unconditional clear the two scoped entry points above share.
-    /// Private on purpose: an embedder that could reach it would be able to
-    /// wipe one realm's seat state on another realm's event, which is
-    /// exactly the bug [`Self::reset_for`] exists to make unwritable.
-    fn reset(&mut self) {
-        self.pressed.clear();
-        self.pressed_keys.clear();
-        self.pointer = None;
-        self.agent_pointer = None;
-    }
-
-    /// The realm this router's delivery debt is owed to, if any.
-    ///
-    /// Every *delivery* site names its realm rather than asking this — that
-    /// is what [`Self::bind_to`] is for. The one production reader is
-    /// [`crate::session::post_dispatch`]'s agent-cursor gate (WS-E.1.3),
-    /// which needs the opposite question: not "where do I deliver" but "is
-    /// the pointer state I am about to *draw* owed to the realm the output is
-    /// showing". Drawing a hidden realm's pointer would paint a crosshair at
-    /// coordinates that mean nothing in the picture the human is looking at,
-    /// so the sprite is drawn only when this matches
-    /// [`crate::session::Presenter::focused`].
-    pub fn bound_realm(&self) -> Option<&crate::grants::RealmId> {
-        self.bound.as_ref()
-    }
-
-    /// The presses the router believes the bound realm's app is holding, as
-    /// `(keysym, origin)` in press order. Test-only read of
-    /// [`Self::pressed_keys`]: the pairing table is the state a sibling
-    /// realm's death must not disturb, and nothing outside this module can
-    /// otherwise observe it without consuming it
-    /// ([`Self::release_physical_keys`] drains).
-    #[cfg(test)]
-    pub fn held_keys(&self) -> &[(u32, Origin)] {
-        &self.pressed_keys
-    }
-
-    /// Release every key the router believes the app is holding **on the
-    /// human's behalf**, in press order, and forget those — one wire-ready
-    /// [`SeatDelivery`] per key, for the caller to deliver. Keys an agent is
-    /// holding are left exactly as they were.
-    ///
-    /// This is [`Self::pressed_keys`]'s pairing invariant read out loud: the
-    /// table holds exactly the keysyms whose **press this router delivered**,
-    /// so one release per physical entry is precisely what the app is owed
-    /// and never more. A key whose press a gate consumed (the dead-man
-    /// chord's) is not in there and gets nothing, because the app never saw
-    /// it go down.
-    ///
-    /// **Why only the physical entries.** The caller's whole warrant is that
-    /// host-window focus loss is the moment the core knows *the human's*
-    /// release will land somewhere else. Nothing about an agent's actuation
-    /// channel changed — it does not run through the host window's keyboard
-    /// focus at all — so draining an agent's held key here would invent a
-    /// release the principal never sent, drop a modifier it is deliberately
-    /// holding without telling it, and (since the delivery and the flight
-    /// recorder both carry the tag) attribute that to the human. Both
-    /// origins share this router by design (`session::route_seat`), so the
-    /// filter is load-bearing, not defensive.
-    ///
-    /// Each release carries the tag its own entry recorded, so no origin is
-    /// minted here; the filter is what makes that tag always `Physical` in
-    /// practice. Entries are removed in place, so press order survives.
-    ///
-    /// **Why the preemption hook is bypassed.** These are not new physical
-    /// events to judge — no key moved — they are the delivery debt the router
-    /// itself is recording. Routing them back through [`Self::route`] would
-    /// hand the dead-man watcher a release with no press, and a gate that
-    /// consumed one would strand exactly the key this exists to free.
-    ///
-    /// Called on host-window focus loss (`crate::backend::winit`'s
-    /// `handle_focus`), the one moment the core knows the physical release
-    /// will be delivered somewhere else: winit's Wayland backend emits no key
-    /// events at all on `wl_keyboard.leave`, so without this a key held
-    /// across an alt-tab stays latched down in the confined app forever.
-    ///
-    /// Distinct from [`Self::reset`] on purpose. `reset` forgets *all*
-    /// per-shim-generation state for a shim that is gone, where no delivery
-    /// is possible or wanted; this pays the app what it is owed while the
-    /// shim is very much alive, and leaves the pointer and the implicit grab
-    /// untouched — a focus change is not a new shim generation.
-    ///
-    /// Known imprecision, bounded and deliberate: pairing is per-keysym (see
-    /// [`Self::pressed_keys`]), so if both origins hold the *same* keysym at
-    /// once, a release consumes the oldest entry regardless of tag and the
-    /// surviving entry's tag can name the other origin. The number of
-    /// outstanding presses is always right, and no release is ever emitted
-    /// with a tag the table did not record — but in that one overlap the
-    /// drain can skip a human's key (leaving it latched until the agent
-    /// releases) or keep an agent's. Making the table exact would mean
-    /// pairing per-`(keysym, origin)`, which would drop a human's release of
-    /// an agent-pressed key as unpaired — a latched modifier, the worse of
-    /// the two failures.
-    pub fn release_physical_keys(&mut self) -> Vec<SeatDelivery> {
-        let mut released = Vec::new();
-        self.pressed_keys.retain(|&(keysym, origin)| {
-            if origin != Origin::Physical {
-                return true;
-            }
-            released.push(SeatDelivery {
-                // The tag is read back off the entry, never minted: see the
-                // origin argument above.
-                origin,
-                kind: SeatDeliveryKind::Key {
-                    keysym,
-                    state: KeyState::Released,
-                },
-            });
-            false
-        });
-        released
-    }
-
-    /// Release **everything** the router believes the currently bound realm's
-    /// app is holding — keys and buttons, both origins, in press order — and
-    /// forget it. One wire-ready [`SeatDelivery`] per outstanding press, for
-    /// the caller to deliver *to the realm that is being left*.
-    ///
-    /// Called by `session::apply_layout` when a `layout_focus` holder moves
-    /// the output binding, and only there. The moment after is
-    /// [`Self::bind_to`] on the new target, which clears this table without a
-    /// word; every entry in it is then a press whose release the losing app
-    /// can never receive. Draining first is what stops a focus change
-    /// latching a modifier — or wedging an implicit pointer grab — in an app
-    /// the human has just stopped being able to see.
-    ///
-    /// **Both origins, and that is the difference from
-    /// [`Self::release_physical_keys`].** That method drains the human's keys
-    /// only, because host-window focus loss changes nothing about an agent's
-    /// actuation channel — the agent can still release its own key on the
-    /// next request. Here the channel itself is what closed: the binding has
-    /// moved, so `session::seat_target` no longer names this realm, the
-    /// chokepoint's step-5d guard refuses that agent's next actuation
-    /// `internal`, and the release it would have sent can no longer be
-    /// delivered by anyone. Leaving an agent's press in the table would
-    /// strand exactly what this exists to free.
-    ///
-    /// Each release carries the tag its own entry recorded, so no origin is
-    /// minted here (B2): a release synthesised for an agent's key must not
-    /// reach the shim, or the flight recorder, attributed to the human.
-    ///
-    /// **Why the preemption hook is bypassed**, as in
-    /// [`Self::release_physical_keys`]: these are not new events to judge —
-    /// nothing moved — they are the delivery debt the router itself is
-    /// recording. Routing them back through [`Self::route`] would hand the
-    /// dead-man watcher a release with no press, and a gate that consumed one
-    /// would strand the very press this frees.
-    ///
-    /// Keys are released before buttons, which is the order Wayland clients
-    /// are least surprised by (a keyboard latch is the state that misbehaves
-    /// worst) and is otherwise immaterial: within each kind, press order is
-    /// preserved.
-    pub fn release_held(&mut self) -> Vec<SeatDelivery> {
-        let mut released = Vec::with_capacity(self.pressed_keys.len() + self.pressed.len());
-        for (keysym, origin) in self.pressed_keys.drain(..) {
-            released.push(SeatDelivery {
-                origin,
-                kind: SeatDeliveryKind::Key {
-                    keysym,
-                    state: KeyState::Released,
-                },
-            });
-        }
-        for (button, origin) in self.pressed.drain(..) {
-            released.push(SeatDelivery {
-                origin,
-                kind: SeatDeliveryKind::Button {
-                    button,
-                    state: ButtonState::Released,
-                },
-            });
-        }
-        released
-    }
-
-    /// Route one tagged event against the current geometry: `view` is the
-    /// composed realm-view size (nested: the host window size the scene
-    /// composes at), `surface` the committed client surface size
-    /// ([`Scene::surface_size`](crate::scene::Scene::surface_size)), if
-    /// any.
-    ///
-    /// Returns the wire-ready delivery, or `None` if the event was
-    /// consumed by the gate or had no destination under the module's
-    /// routing rules (matte hit, no committed surface, unpaired release).
-    pub fn route(
-        &mut self,
-        input: SeatInput,
-        view: (u32, u32),
-        surface: Option<(u32, u32)>,
-    ) -> Option<SeatDelivery> {
-        // Position is recorded before gating: where the pointer *is* is a
-        // physical fact, not a delivery outcome.
-        if let SeatInputKind::Motion { x, y } = input.kind {
-            self.pointer = Some((x, y));
-            // ...and the agent-owned position beside it, for the display
-            // sprite only, written by this one origin (see
-            // `Self::agent_pointer`). Not an `else` branch: the shared
-            // position keeps taking both origins, because that is what the
-            // app is delivered.
-            if input.origin == Origin::Emulated {
-                self.agent_pointer = Some((x, y));
-            }
-        }
-
-        // THE preemption hook point: observe unconditionally, then gate.
-        self.hook.observe(&input);
-        if self.hook.gate(&input) == Gate::Consume {
-            // Delivered-state reconciliation: a consumed release still
-            // physically ended a hold the app saw begin. Clear the
-            // press's bookkeeping — nothing is delivered — so a consuming
-            // gate can never wedge the implicit grab or strand a keysym in
-            // the pairing table; the app-side pairing debt belongs to the
-            // gate implementor (`Gate::Consume` docs). Both release kinds
-            // are reconciled, because both are paired.
-            match &input.kind {
-                SeatInputKind::Button {
-                    button,
-                    state: ButtonState::Released,
-                } => {
-                    self.release_pressed(*button);
-                }
-                SeatInputKind::Key {
-                    keysym,
-                    state: KeyState::Released,
-                } => {
-                    self.release_pressed_key(*keysym);
-                }
-                _ => {}
-            }
-            return None;
-        }
-
-        let SeatInput { origin, kind } = input;
-        let kind = match kind {
-            // Keyboard focus is held on the app shim-side (IDL: focus is
-            // synthesized in the shim in v1), so keys route without
-            // geometry — but not without pairing: a release is delivered
-            // iff its own press was, per keysym, so no policy that stops a
-            // key release can leave a latched modifier behind in the app
-            // (module docs).
-            SeatInputKind::Key { keysym, state } => match state {
-                KeyState::Pressed => {
-                    // The tag rides into the pairing table with the press, so
-                    // whatever synthesises this key's release later reads it
-                    // back rather than assuming one ([`Self::pressed_keys`]).
-                    self.pressed_keys.push((keysym, origin));
-                    SeatDeliveryKind::Key { keysym, state }
-                }
-                KeyState::Released => {
-                    if !self.release_pressed_key(keysym) {
-                        return None;
-                    }
-                    SeatDeliveryKind::Key { keysym, state }
-                }
-            },
-            SeatInputKind::Text { text } => SeatDeliveryKind::Text { text },
-
-            SeatInputKind::Motion { x, y } => {
-                // No committed surface: nothing to point at (and no
-                // placement to map through) — not deliverable.
-                let surface = surface?;
-                let (sx, sy) = surface_local((x, y), view, surface);
-                if self.pressed.is_empty() && !inside(sx, sy, surface) {
-                    return None; // the matte is not the app
-                }
-                SeatDeliveryKind::Motion {
-                    x: Fixed::from_f64(sx),
-                    y: Fixed::from_f64(sy),
-                }
-            }
-
-            SeatInputKind::Button { button, state } => match state {
-                ButtonState::Pressed => {
-                    if self.pressed.is_empty() && !self.pointer_over_surface(view, surface) {
-                        return None; // press on the matte starts nothing
-                    }
-                    // The tag rides into the pairing table with the press,
-                    // so whatever synthesises this button's release later
-                    // reads it back rather than assuming one.
-                    self.pressed.push((button, origin));
-                    SeatDeliveryKind::Button { button, state }
-                }
-                ButtonState::Released => {
-                    // A release is delivered iff its own press was — per
-                    // button code, so a matte-dropped press can never
-                    // borrow another button's grab, the wire never sees
-                    // a release for a button the app never saw pressed,
-                    // and the implicit grab guarantees the app never
-                    // holds a stuck button, wherever the pointer
-                    // wandered meanwhile.
-                    if !self.release_pressed(button) {
-                        return None;
-                    }
-                    SeatDeliveryKind::Button { button, state }
-                }
-            },
-
-            SeatInputKind::Scroll { axis, value120 } => {
-                if self.pressed.is_empty() && !self.pointer_over_surface(view, surface) {
-                    return None;
-                }
-                SeatDeliveryKind::Scroll { axis, value120 }
-            }
-        };
-        Some(SeatDelivery { origin, kind })
-    }
-
+impl RealmSeat {
     /// Remove one delivered-press entry for `button`, if any; returns
     /// whether one existed (i.e. whether a release of this code pairs
     /// with a delivered press).
@@ -1184,9 +916,9 @@ impl<H: PreemptionHook> InputRouter<H> {
     /// Matches on the keysym alone, never on the origin: the app has one
     /// keyboard and its latch state counts presses, so a release must be able
     /// to pay down any outstanding press of that keysym. The entry's tag is
-    /// carried for the benefit of [`Self::release_physical_keys`], which is
-    /// the only reader of it — see [`Self::pressed_keys`] for the bound on
-    /// how far a mixed-origin overlap can skew it.
+    /// carried for the benefit of the drains, which are the only readers of
+    /// it — see [`Self::pressed_keys`] for the bound on how far a
+    /// mixed-origin overlap can skew it.
     fn release_pressed_key(&mut self, keysym: u32) -> bool {
         match self.pressed_keys.iter().position(|&(k, _)| k == keysym) {
             Some(i) => {
@@ -1205,6 +937,767 @@ impl<H: PreemptionHook> InputRouter<H> {
         };
         let (sx, sy) = surface_local(pointer, view, surface);
         inside(sx, sy, surface)
+    }
+}
+
+/// The session's input router: the one path from tagged intake events to
+/// wire-ready seat deliveries. Holds **one seat's worth of state per realm**
+/// (v0: one seat, one cursor per realm, shared by both origins) and the one
+/// session-wide preemption hook.
+///
+/// # Two addressing rules, named as two entry points
+///
+/// A session holds up to [`crate::realm::MAX_REALMS`] realms (WS-E.1.2) and
+/// every one of them may be receiving input at once, from two different
+/// sources answering to two different rules (WS-E.1.6, issue #212):
+///
+/// - **physical input follows the human's attention** — the *bound* realm,
+///   the one [`crate::session::physical_seat_target`] names, which a
+///   `layout_focus` holder moves ([`Self::route_physical`]);
+/// - **an agent's actuation follows its grant** — the realm the grant it was
+///   admitted under names, whether or not a human is looking at it
+///   ([`Self::route_emulated`]).
+///
+/// Collapsing the two onto the bound realm would break the project's own
+/// premise: an agent must be able to work in a realm the human is not
+/// watching, which is the whole of the headless-fleet and concurrent-operation
+/// claim. So the rules are two **named entry points** rather than one function
+/// that inspects the origin tag and decides: a call site has to say which rule
+/// it is following, and switching a path from one to the other is a visible
+/// edit rather than a silent one.
+///
+/// **This is still not an authority check, and must never grow one.** Neither
+/// entry point asks whether the caller may address that realm — by the time an
+/// agent's event arrives the chokepoint has settled that (prose page 11), and
+/// physical input answers to no grant at all. What the split buys is that the
+/// two *addresses* cannot be confused, not that either is authorized here.
+///
+/// # What stays session-wide
+///
+/// The hook stack ([`Self::hook`]): the consent grab is the trusted path and
+/// the dead-man watcher is the human's off-switch, and both must see every
+/// physical event regardless of which realm is bound. [`PreemptionHook::gate`]
+/// is not even *told* the realm, so a gate scoped to one realm is
+/// inexpressible rather than merely untested.
+///
+/// # Presence is not a stackable hook, it is the router's own record
+///
+/// [`PhysicalPresenceMap`] is what the chokepoint's `preempted` refusal reads,
+/// so a build in which it is never written does not refuse a synthetic click
+/// under the human's hand — it *admits* it. From P1.4.4 until issue #212's
+/// review, a `PresenceHook` was an optional member of the stack that every
+/// shipping backend forgot to include, and the `preempted` step was therefore
+/// unreachable in every `vitrind` ever built while the book described it as
+/// live behaviour.
+///
+/// So presence is not stacked at all now: this struct holds the map and writes
+/// it in [`Self::route_into`], **above** the hook stack, and [`Self::presence`]
+/// is the handle `session::Runtime::new` puts in [`crate::session::Kernel`]. A
+/// router that does not feed presence, or a kernel whose presence is not its
+/// router's, is unconstructible rather than a mistake nobody made on purpose.
+///
+/// This is also what restores the hook stack's session-wide guarantee to a
+/// structural one. Presence was the *only* reason [`PreemptionHook::observe`]
+/// was ever handed a realm, and while it was, "the off-switch cannot be scoped
+/// to one realm" was a convention (a `return` away from being false) that three
+/// doc comments called inexpressible. With the realm gone from the trait
+/// entirely, no policy hook can see one.
+///
+/// The router still makes **no judgement** with a clock: `now` is a cell the
+/// embedder sets through [`Self::observe_at`], and it is used for one thing,
+/// timestamping what the human just did.
+pub(crate) struct InputRouter<H: PreemptionHook> {
+    /// The session-wide policy stack: the consent grab, the dead-man watcher,
+    /// and whatever they bottom out in. Told no realm, ever.
+    hook: H,
+    /// **Where the human's hand is**, per realm — read by the chokepoint
+    /// through [`crate::session::Kernel::presence`], which is this same
+    /// object.
+    presence: std::rc::Rc<std::cell::RefCell<PhysicalPresenceMap>>,
+    /// The dispatch turn's instant, set by the embedder through
+    /// [`Self::observe_at`]. Shared with the grab and the watcher on the
+    /// nested backend, so the whole turn is judged against one sample.
+    now: std::rc::Rc<std::cell::Cell<std::time::Instant>>,
+    /// **The realm physical input follows**: whichever realm
+    /// [`Self::bind_to`] last named, or `None` before the first bind and
+    /// after the bound realm's death.
+    ///
+    /// Not a routing *policy* and not a second copy of one — the binding is
+    /// chosen by `session::physical_seat_target` (which follows the output,
+    /// which a `layout_focus` holder moves) and merely recorded here, so the
+    /// policy lives in one function and this field follows it.
+    bound: Option<crate::grants::RealmId>,
+    /// **One seat's state per realm**, minted on that realm's first event and
+    /// dropped when its shim generation ends ([`Self::reset_for`]).
+    ///
+    /// The map is what makes a sibling's death, and a focus change,
+    /// inconsequential to a realm that was not involved: there is no shared
+    /// pairing table left to clear by accident.
+    ///
+    /// **Bounded, and the bound is small enough to state exactly.** At most
+    /// [`crate::realm::MAX_REALMS`] entries, because a realm can only be
+    /// addressed while it exists. `size_of::<RealmSeat>()` is **96 bytes**
+    /// (two `Option<(f64, f64)>` at 24 each, two `Vec`s at 24 each — measured,
+    /// x86-64), plus each `Vec`'s heap for the presses actually outstanding,
+    /// which a human's ten fingers and an agent's rate limit both bound in
+    /// practice. Sixteen realms is therefore ~1.5 KiB of router state against
+    /// the ~590 MiB of per-realm pixels `MAX_REALMS` is actually justified
+    /// against ([`crate::realm::MAX_REALMS`]); this changes that accounting by
+    /// nothing measurable and is stated so nobody has to wonder.
+    seats: std::collections::BTreeMap<crate::grants::RealmId, RealmSeat>,
+}
+
+/// The three things [`InputRouter::route_into`] needs from `self` besides the
+/// seats: the session-wide policy stack, the per-realm presence map, and this
+/// turn's instant.
+///
+/// A struct rather than three parameters so the two addressing rules
+/// ([`InputRouter::route_physical`] and [`InputRouter::route_emulated`]) build
+/// it identically, and so a future field cannot be silently passed by only one
+/// of them. `now` is copied out of the cell here, once per event, because the
+/// borrow of `self` that holds `hook` and `seats` mutably cannot also hold the
+/// cell.
+struct Tap<'a, H: PreemptionHook> {
+    hook: &'a mut H,
+    presence: &'a std::rc::Rc<std::cell::RefCell<PhysicalPresenceMap>>,
+    now: std::time::Instant,
+}
+
+impl<H: PreemptionHook> InputRouter<H> {
+    /// Build the session's router around `hook`, feeding `presence` at the
+    /// observe-side tap on the `now` cell the embedder advances.
+    ///
+    /// `presence` is a parameter rather than something this constructor mints
+    /// because the chokepoint has to read the same map: `Runtime::new` takes it
+    /// straight back out through [`Self::presence`], so the kernel's presence
+    /// and the router's are one object by construction (struct docs).
+    pub fn new(
+        presence: std::rc::Rc<std::cell::RefCell<PhysicalPresenceMap>>,
+        now: std::rc::Rc<std::cell::Cell<std::time::Instant>>,
+        hook: H,
+    ) -> Self {
+        Self {
+            hook,
+            presence,
+            now,
+            bound: None,
+            seats: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The presence map this router feeds, for the kernel to judge `preempted`
+    /// against. Cloning the handle is the *only* way to obtain it, which is
+    /// what makes "the kernel reads the map the router writes" structural.
+    pub fn presence(&self) -> std::rc::Rc<std::cell::RefCell<PhysicalPresenceMap>> {
+        std::rc::Rc::clone(&self.presence)
+    }
+
+    /// Set the presence tap's clock to this dispatch turn's instant.
+    ///
+    /// The router still reads no clock of its own — it is *told* one, by
+    /// `session::route_physical_turn`, which is the single funnel every
+    /// backend's physical input passes through. Putting it there rather than
+    /// leaving each embedder to advance a shared cell is deliberate: a tap
+    /// whose clock never moved would record every physical event at process
+    /// start and `owns_target` would answer `false` forever, which is the same
+    /// silent failure as not stacking the tap at all.
+    pub fn observe_at(&self, now: std::time::Instant) {
+        self.now.set(now);
+    }
+
+    /// A router whose presence map nothing else can see, for unit tests that
+    /// are about routing rather than about preemption.
+    ///
+    /// `#[cfg(test)]`, deliberately: a backend cannot call it, so no shipping
+    /// build can end up with a router whose presence the kernel never reads —
+    /// the exact defect issue #212's review found in P1.4.4's wiring.
+    #[cfg(test)]
+    pub fn detached(hook: H) -> Self {
+        Self::new(
+            std::rc::Rc::new(std::cell::RefCell::new(PhysicalPresenceMap::new())),
+            std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now())),
+            hook,
+        )
+    }
+
+    /// `realm`'s seat state, minted empty if this is its first event.
+    ///
+    /// A free function over the map rather than a method on `self`, so the
+    /// routing body can hold `&mut self.hook` and `&mut self.seats` at once
+    /// (the hook runs for every event; the seat is only the addressed
+    /// realm's). `contains_key` then `get_mut` rather than `entry`, because
+    /// `entry` demands an owned key and would clone a realm id on **every**
+    /// pointer motion rather than on the first one.
+    fn seat_mut<'s>(
+        seats: &'s mut std::collections::BTreeMap<crate::grants::RealmId, RealmSeat>,
+        realm: &crate::grants::RealmId,
+    ) -> &'s mut RealmSeat {
+        if !seats.contains_key(realm) {
+            seats.insert(realm.clone(), RealmSeat::default());
+        }
+        seats
+            .get_mut(realm)
+            .expect("the entry was just inserted if it was missing")
+    }
+
+    /// Where the **agent's** pointer last was in `realm`, in view coordinates,
+    /// or `None` before its first motion there (and after that realm's
+    /// [`Self::reset_for`]).
+    ///
+    /// Read only by the presentation side, to draw the sprite: the backends
+    /// pull it once per dispatch round through
+    /// [`crate::session::Presenter::set_agent_cursor`], for the realm the
+    /// output is showing. See [`RealmSeat::agent_pointer`] for why this is not
+    /// [`RealmSeat::pointer`].
+    pub fn agent_pointer(&self, realm: &crate::grants::RealmId) -> Option<(f64, f64)> {
+        self.seats.get(realm).and_then(|seat| seat.agent_pointer)
+    }
+
+    /// **Move the human's attention to `realm`**, and hand back what the realm
+    /// being left is owed.
+    ///
+    /// Called by the physical delivery path with the realm
+    /// [`crate::session::physical_seat_target`] names, and by
+    /// `session::apply_layout` the moment a `layout_focus` holder moves the
+    /// output. Re-binding the realm already bound is a no-op returning `None`
+    /// — the ordinary case, once per physical dispatch round.
+    ///
+    /// # The drain, and why the caller cannot skip it
+    ///
+    /// Binding elsewhere **drains the losing realm's held physical presses**:
+    /// every key and every button whose press this router delivered *for the
+    /// human*, in press order, keys first. Those come back as
+    /// `(losing realm, deliveries)` for the caller to send, and the method is
+    /// `#[must_use]` so a call site that ignores them is a warning rather than
+    /// a latched `Ctrl` in an app the human has just stopped being able to
+    /// see. This is `release_physical_keys`'s reason one level down: host-window
+    /// focus loss is the moment the core knows *the human's* release will be
+    /// delivered somewhere else, and a realm switch is exactly the same fact —
+    /// the next release goes to the realm that just gained the binding.
+    ///
+    /// **The buttons are new here** (issue #212, decision 3). A press held
+    /// across a switch used to be forgotten with no delivery at all, which
+    /// wedges an implicit pointer grab in the losing app for good.
+    ///
+    /// **The agent's held presses are deliberately left alone**, and that is
+    /// the whole difference this change makes: an agent addressed to the
+    /// losing realm still reaches it, so it can still release its own key on
+    /// its next request. Draining those would invent a release the principal
+    /// never sent — and, since the delivery and the flight recorder both carry
+    /// the tag, attribute it to the human.
+    ///
+    /// **What the drain costs the app**, stated rather than hidden: a release
+    /// the app reads as real. Telling an app the human let go when the human
+    /// did not is a lie the app cannot detect; the alternative is a latched
+    /// modifier forever, which is worse, and this is the same trade
+    /// `release_physical_keys` already argues for focus loss. It now happens
+    /// on every switcher keypress rather than only on alt-tab.
+    ///
+    /// # The losing realm's presence goes with the drain, here rather than in
+    /// the caller
+    ///
+    /// The human's hand has left `losing`, so their next release is addressed
+    /// elsewhere and the held set recorded against `losing` can never be paid
+    /// down by an intake release. Left behind it would keep the realm "owned"
+    /// for [`PHYSICAL_HOLD_CEILING`] — a full minute of refusing every agent
+    /// actuating there, on the strength of a button the human let go of in a
+    /// different realm. [`Self::forget_presence_of`] therefore runs *inside*
+    /// this method, not beside its two call sites: it was a caller's
+    /// obligation for exactly one review cycle and the third caller (the realm
+    /// death funnel) did not know it existed.
+    #[must_use = "the losing realm is owed these releases; dropping them latches a key or \
+                  wedges a pointer grab in an app the human can no longer see"]
+    pub fn bind_to(
+        &mut self,
+        realm: &crate::grants::RealmId,
+    ) -> Option<(crate::grants::RealmId, Vec<SeatDelivery>)> {
+        if self.bound.as_ref() == Some(realm) {
+            return None;
+        }
+        let losing = self.bound.replace(realm.clone())?;
+        let mut owed = self.release_physical_keys(&losing);
+        owed.extend(self.release_physical_buttons(&losing));
+        self.forget_presence_of(&losing);
+        Some((losing, owed))
+    }
+
+    /// Drop `realm`'s physical-presence entry, at the two moments the human's
+    /// attention provably leaves it: a bind change ([`Self::bind_to`]) and the
+    /// realm's death ([`Self::reset_for`]).
+    ///
+    /// Private, and called only from those two, because the invariant
+    /// [`PhysicalPresenceMap::forget`] documents — an entry exists only while
+    /// the human is in that realm — is exactly "the router's per-realm seat
+    /// state and the human's presence in that realm are forgotten in one act".
+    /// Splitting them is what let a dead realm keep a held button, and a
+    /// `preempted` refusal, for the stale-hold ceiling after its shim was
+    /// gone.
+    fn forget_presence_of(&mut self, realm: &crate::grants::RealmId) {
+        self.presence.borrow_mut().forget(realm);
+    }
+
+    /// Forget `realm`'s seat state — the implicit-grab bookkeeping, the key
+    /// pairing, and the last known pointer position. Returns whether there was
+    /// anything to forget.
+    ///
+    /// Invoked by the realm teardown funnel
+    /// ([`ShimServer::connection_closed`](crate::shim::ShimServer::connection_closed)),
+    /// so no state can survive into the next shim generation: a stale
+    /// grab would route off-surface input to an app that never saw the
+    /// press, a stale release (button or key) would arrive unpaired at the
+    /// fresh seat, and a stale pointer position would let a press hit-test
+    /// geometry the new shim never produced. First motion re-establishes
+    /// the pointer.
+    ///
+    /// The agent-owned position goes with it, so the sprite does not hover
+    /// over a realm that no longer exists: the next composite draws none.
+    ///
+    /// **Scoped by construction now.** One router serves a session holding
+    /// several realms, and an unconditional clear on *any* realm's death used
+    /// to be one realm reaching into another's state — the survivor's app
+    /// keeps holding a key whose release the router has just forgotten it
+    /// owes. Since the state is a map keyed by realm there is no shared table
+    /// left to clear by accident; this removes one entry and nothing else.
+    ///
+    /// The binding goes too when the dying realm held it, because physical
+    /// input has nowhere to follow until `session::rebind_output_after_death`
+    /// picks a survivor. **No drain accompanies that**, unlike
+    /// [`Self::bind_to`]: the shim is gone, so there is nobody left to deliver
+    /// a release to.
+    ///
+    /// **The presence entry goes too**, for the same reason it goes on a bind
+    /// change: a human mid-drag when the shim dies would otherwise leave that
+    /// realm "owned" — every agent actuating there refused `preempted` — for
+    /// [`PHYSICAL_HOLD_CEILING`], with the app that could have paid the
+    /// release down already dead. It is unobservable today only by an accident
+    /// of ordering (step 5a refuses a seat-delivered use over a dead realm
+    /// `no_surface` before step 5c is reached), which is not a property to
+    /// rest on: [`Self::forget_presence_of`] is called here so the ordering
+    /// never has to hold.
+    pub fn reset_for(&mut self, realm: &crate::grants::RealmId) -> bool {
+        let had_seat = self.seats.remove(realm).is_some();
+        let was_bound = self.bound.as_ref() == Some(realm);
+        if was_bound {
+            self.bound = None;
+        }
+        self.forget_presence_of(realm);
+        had_seat || was_bound
+    }
+
+    /// The realm physical input currently follows, if any.
+    ///
+    /// Every *emulated* delivery site names its own realm (that is what
+    /// [`Self::route_emulated`] is for) and never asks this. The one reader is
+    /// the physical path: `crate::backend::winit`'s focus-loss drain, which
+    /// needs the realm the human's held keys are owed to. `post_dispatch`'s
+    /// agent-cursor gate used to be the second, asking the opposite question
+    /// — "is the output showing the realm whose agent pointer I am about to
+    /// draw" — and WS-E.1.6 removed it: the sprite position is looked up by
+    /// the focused realm through [`Self::agent_pointer`], so there is no
+    /// binding to compare against.
+    pub fn bound_realm(&self) -> Option<&crate::grants::RealmId> {
+        self.bound.as_ref()
+    }
+
+    /// The presses the router believes `realm`'s app is holding, as
+    /// `(keysym, origin)` in press order. Test-only read of
+    /// [`RealmSeat::pressed_keys`]: the pairing table is the state a sibling
+    /// realm's death and a focus change must not disturb, and nothing outside
+    /// this module can otherwise observe it without consuming it (the drains
+    /// drain).
+    #[cfg(test)]
+    pub fn held_keys(&self, realm: &crate::grants::RealmId) -> &[(u32, Origin)] {
+        self.seats
+            .get(realm)
+            .map(|seat| seat.pressed_keys.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The buttons the router believes `realm`'s app is holding, same
+    /// discipline as [`Self::held_keys`].
+    #[cfg(test)]
+    pub fn held_buttons(&self, realm: &crate::grants::RealmId) -> &[(u32, Origin)] {
+        self.seats
+            .get(realm)
+            .map(|seat| seat.pressed.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Release every key the router believes **`realm`'s** app is holding **on
+    /// the human's behalf**, in press order, and forget those — one wire-ready
+    /// [`SeatDelivery`] per key, for the caller to deliver. Keys an agent is
+    /// holding are left exactly as they were.
+    ///
+    /// This is [`RealmSeat::pressed_keys`]'s pairing invariant read out loud:
+    /// the table holds exactly the keysyms whose **press this router
+    /// delivered**, so one release per physical entry is precisely what the
+    /// app is owed and never more. A key whose press a gate consumed (the
+    /// dead-man chord's) is not in there and gets nothing, because the app
+    /// never saw it go down.
+    ///
+    /// **Why only the physical entries.** Both callers' warrant is that the
+    /// human's release will land somewhere else — host-window focus loss
+    /// (`crate::backend::winit`'s `handle_focus`), or the binding moving to
+    /// another realm ([`Self::bind_to`]). Nothing about an agent's actuation
+    /// channel changed in either case — it does not run through the host
+    /// window's keyboard focus, and since WS-E.1.6 it does not run through the
+    /// binding either — so draining an agent's held key here would invent a
+    /// release the principal never sent, drop a modifier it is deliberately
+    /// holding without telling it, and (since the delivery and the flight
+    /// recorder both carry the tag) attribute that to the human. Both origins
+    /// share this realm's seat by design, so the filter is load-bearing, not
+    /// defensive.
+    ///
+    /// Each release carries the tag its own entry recorded, so no origin is
+    /// minted here; the filter is what makes that tag always `Physical` in
+    /// practice. Entries are removed in place, so press order survives.
+    ///
+    /// **Why the preemption hook is bypassed.** These are not new physical
+    /// events to judge — no key moved — they are the delivery debt the router
+    /// itself is recording. Routing them back through [`Self::route_physical`]
+    /// would hand the dead-man watcher a release with no press, and a gate
+    /// that consumed one would strand exactly the key this exists to free.
+    ///
+    /// On host-window focus loss this is the one moment the core knows the
+    /// physical release will be delivered somewhere else: winit's Wayland
+    /// backend emits no key events at all on `wl_keyboard.leave`, so without
+    /// this a key held across an alt-tab stays latched down in the confined
+    /// app forever.
+    ///
+    /// Distinct from [`Self::reset_for`] on purpose. That forgets *all* of a
+    /// realm's seat state for a shim that is gone, where no delivery is
+    /// possible or wanted; this pays the app what it is owed while the shim is
+    /// very much alive, and leaves the pointer position untouched — a focus
+    /// change is not a new shim generation.
+    ///
+    /// Known imprecision, bounded and deliberate: pairing is per-keysym (see
+    /// [`RealmSeat::pressed_keys`]), so if both origins hold the *same* keysym
+    /// in the same realm at once, a release consumes the oldest entry
+    /// regardless of tag and the surviving entry's tag can name the other
+    /// origin. The number of outstanding presses is always right, and no
+    /// release is ever emitted with a tag the table did not record — but in
+    /// that one overlap the drain can skip a human's key (leaving it latched
+    /// until the agent releases) or keep an agent's. Making the table exact
+    /// would mean pairing per-`(keysym, origin)`, which would drop a human's
+    /// release of an agent-pressed key as unpaired — a latched modifier, the
+    /// worse of the two failures.
+    pub fn release_physical_keys(&mut self, realm: &crate::grants::RealmId) -> Vec<SeatDelivery> {
+        let mut released = Vec::new();
+        let Some(seat) = self.seats.get_mut(realm) else {
+            return released;
+        };
+        seat.pressed_keys.retain(|&(keysym, origin)| {
+            if origin != Origin::Physical {
+                return true;
+            }
+            released.push(SeatDelivery {
+                // The tag is read back off the entry, never minted: see the
+                // origin argument above.
+                origin,
+                kind: SeatDeliveryKind::Key {
+                    keysym,
+                    state: KeyState::Released,
+                },
+            });
+            false
+        });
+        released
+    }
+
+    /// The pointer twin of [`Self::release_physical_keys`]: release every
+    /// button the router believes **`realm`'s** app is holding on the human's
+    /// behalf, in press order, and forget those.
+    ///
+    /// Added by WS-E.1.6 (issue #212, decision 3), and it is the half that was
+    /// missing rather than a symmetry for its own sake. A key held across a
+    /// bind change latches a modifier; a *button* held across one wedges the
+    /// app's implicit pointer grab, and until this existed the only treatment
+    /// a held button got was being forgotten — correct for a dead shim,
+    /// wrong for a live one, and a mid-drag focus switch is exactly the live
+    /// case.
+    ///
+    /// Everything [`Self::release_physical_keys`] says about origins, minted
+    /// tags, the bypassed hook and the bounded per-code imprecision applies
+    /// here word for word; the only difference is which table is drained.
+    ///
+    /// **Keys before buttons** where both are drained ([`Self::bind_to`]),
+    /// which is the order Wayland clients are least surprised by (a keyboard
+    /// latch is the state that misbehaves worst) and is otherwise immaterial:
+    /// within each kind, press order is preserved.
+    pub fn release_physical_buttons(
+        &mut self,
+        realm: &crate::grants::RealmId,
+    ) -> Vec<SeatDelivery> {
+        let mut released = Vec::new();
+        let Some(seat) = self.seats.get_mut(realm) else {
+            return released;
+        };
+        seat.pressed.retain(|&(button, origin)| {
+            if origin != Origin::Physical {
+                return true;
+            }
+            released.push(SeatDelivery {
+                origin,
+                kind: SeatDeliveryKind::Button {
+                    button,
+                    state: ButtonState::Released,
+                },
+            });
+            false
+        });
+        released
+    }
+
+    /// **Route one physical event to the realm the human's attention is bound
+    /// to** — the first of the router's two addressing rules.
+    ///
+    /// `view` is the composed realm-view size (nested: the host window size
+    /// the scene composes at), `surface` the committed client surface size of
+    /// **that same bound realm**
+    /// ([`Scene::surface_size`](crate::scene::Scene::surface_size)), if any;
+    /// `session::route_physical_turn` resolves both from one call to
+    /// `physical_seat_target` so they cannot name different realms.
+    ///
+    /// Returns the wire-ready delivery, or `None` if the event was consumed by
+    /// the gate, had no destination under the module's routing rules (matte
+    /// hit, no committed surface, unpaired release), or arrived while **no
+    /// realm is bound**. The hook still runs in that last case: a human must
+    /// be able to hold the dead-man chord when there is nothing on screen.
+    pub fn route_physical(
+        &mut self,
+        input: SeatInput,
+        view: (u32, u32),
+        surface: Option<(u32, u32)>,
+    ) -> Option<SeatDelivery> {
+        debug_assert_eq!(
+            input.origin,
+            Origin::Physical,
+            "route_physical addresses the human's attention; an agent's actuation is \
+             addressed by its grant (route_emulated)"
+        );
+        let Self {
+            hook,
+            presence,
+            now,
+            bound,
+            seats,
+        } = self;
+        Self::route_into(
+            Tap {
+                hook,
+                presence,
+                now: now.get(),
+            },
+            seats,
+            bound.as_ref(),
+            input,
+            view,
+            surface,
+        )
+    }
+
+    /// **Route one chokepoint-admitted actuation to the realm its grant
+    /// names** — the router's second addressing rule, and the one that makes
+    /// an agent able to work in a realm nobody is looking at.
+    ///
+    /// `realm` comes from the grant row the use was admitted under, carried
+    /// here by `session::route_seat`; `view`/`surface` are that realm's
+    /// geometry. Nothing here re-checks the authority that named it — a
+    /// delivery site that made its own authority judgement would be the second
+    /// enforcement site this crate does not have.
+    pub fn route_emulated(
+        &mut self,
+        realm: &crate::grants::RealmId,
+        input: SeatInput,
+        view: (u32, u32),
+        surface: Option<(u32, u32)>,
+    ) -> Option<SeatDelivery> {
+        debug_assert_eq!(
+            input.origin,
+            Origin::Emulated,
+            "route_emulated addresses a grant's realm; the human's own input follows the \
+             binding (route_physical)"
+        );
+        let Self {
+            hook,
+            presence,
+            now,
+            seats,
+            ..
+        } = self;
+        Self::route_into(
+            Tap {
+                hook,
+                presence,
+                now: now.get(),
+            },
+            seats,
+            Some(realm),
+            input,
+            view,
+            surface,
+        )
+    }
+
+    /// The routing body both addressing rules share: hook, then this realm's
+    /// pairing and geometry.
+    ///
+    /// Takes the fields rather than `&mut self` so the caller can pick the
+    /// realm out of `self.bound` without a clone and without the borrow
+    /// checker seeing two mutable borrows of `self`.
+    fn route_into(
+        tap: Tap<'_, H>,
+        seats: &mut std::collections::BTreeMap<crate::grants::RealmId, RealmSeat>,
+        realm: Option<&crate::grants::RealmId>,
+        input: SeatInput,
+        view: (u32, u32),
+        surface: Option<(u32, u32)>,
+    ) -> Option<SeatDelivery> {
+        // Position is recorded before gating: where the pointer *is* is a
+        // physical fact, not a delivery outcome. Into the addressed realm's
+        // own seat -- with several realms, one shared position would let a
+        // press in one realm hit-test against a pointer another realm moved.
+        if let (Some(realm), SeatInputKind::Motion { x, y }) = (realm, &input.kind) {
+            let seat = Self::seat_mut(seats, realm);
+            seat.pointer = Some((*x, *y));
+            // ...and the agent-owned position beside it, for the display
+            // sprite only, written by this one origin (see
+            // `RealmSeat::agent_pointer`). Not an `else` branch: the shared
+            // position keeps taking both origins, because that is what the
+            // app is delivered.
+            if input.origin == Origin::Emulated {
+                seat.agent_pointer = Some((*x, *y));
+            }
+        }
+
+        // THE preemption point. Two things happen here, in this order, and
+        // the split between them is the whole of the module's session-wide
+        // guarantee:
+        //
+        //   1. the router records **where the human's hand is**, per realm,
+        //      against this turn's instant -- above the stack, because it is
+        //      the one per-realm fact and no policy hook may see a realm;
+        //   2. the session-wide stack observes unconditionally, then gates.
+        //
+        // Both are reached even when no realm is bound: `note` discards an
+        // event addressed to nothing, and the human's off-switch does not
+        // depend on anything being on screen.
+        let Tap {
+            hook,
+            presence,
+            now,
+        } = tap;
+        presence
+            .borrow_mut()
+            .note(realm, input.origin, &input.kind, now);
+        hook.observe(&input);
+        if hook.gate(&input) == Gate::Consume {
+            // Delivered-state reconciliation: a consumed release still
+            // physically ended a hold the app saw begin. Clear the
+            // press's bookkeeping — nothing is delivered — so a consuming
+            // gate can never wedge the implicit grab or strand a keysym in
+            // the pairing table; the app-side pairing debt belongs to the
+            // gate implementor (`Gate::Consume` docs). Both release kinds
+            // are reconciled, because both are paired.
+            if let Some(seat) = realm.and_then(|realm| seats.get_mut(realm)) {
+                match &input.kind {
+                    SeatInputKind::Button {
+                        button,
+                        state: ButtonState::Released,
+                    } => {
+                        seat.release_pressed(*button);
+                    }
+                    SeatInputKind::Key {
+                        keysym,
+                        state: KeyState::Released,
+                    } => {
+                        seat.release_pressed_key(*keysym);
+                    }
+                    _ => {}
+                }
+            }
+            return None;
+        }
+
+        // Nothing bound: physical input has no destination this round. The
+        // hook above has already seen it, which is the half that must not
+        // depend on a realm being on screen.
+        let realm = realm?;
+        let seat = Self::seat_mut(seats, realm);
+
+        let SeatInput { origin, kind } = input;
+        let kind = match kind {
+            // Keyboard focus is held on the app shim-side (IDL: focus is
+            // synthesized in the shim in v1), so keys route without
+            // geometry — but not without pairing: a release is delivered
+            // iff its own press was, per keysym, so no policy that stops a
+            // key release can leave a latched modifier behind in the app
+            // (module docs).
+            SeatInputKind::Key { keysym, state } => match state {
+                KeyState::Pressed => {
+                    // The tag rides into the pairing table with the press, so
+                    // whatever synthesises this key's release later reads it
+                    // back rather than assuming one ([`RealmSeat::pressed_keys`]).
+                    seat.pressed_keys.push((keysym, origin));
+                    SeatDeliveryKind::Key { keysym, state }
+                }
+                KeyState::Released => {
+                    if !seat.release_pressed_key(keysym) {
+                        return None;
+                    }
+                    SeatDeliveryKind::Key { keysym, state }
+                }
+            },
+            SeatInputKind::Text { text } => SeatDeliveryKind::Text { text },
+
+            SeatInputKind::Motion { x, y } => {
+                // No committed surface: nothing to point at (and no
+                // placement to map through) — not deliverable.
+                let surface = surface?;
+                let (sx, sy) = surface_local((x, y), view, surface);
+                if seat.pressed.is_empty() && !inside(sx, sy, surface) {
+                    return None; // the matte is not the app
+                }
+                SeatDeliveryKind::Motion {
+                    x: Fixed::from_f64(sx),
+                    y: Fixed::from_f64(sy),
+                }
+            }
+
+            SeatInputKind::Button { button, state } => match state {
+                ButtonState::Pressed => {
+                    if seat.pressed.is_empty() && !seat.pointer_over_surface(view, surface) {
+                        return None; // press on the matte starts nothing
+                    }
+                    // The tag rides into the pairing table with the press,
+                    // so whatever synthesises this button's release later
+                    // reads it back rather than assuming one.
+                    seat.pressed.push((button, origin));
+                    SeatDeliveryKind::Button { button, state }
+                }
+                ButtonState::Released => {
+                    // A release is delivered iff its own press was — per
+                    // button code, so a matte-dropped press can never
+                    // borrow another button's grab, the wire never sees
+                    // a release for a button the app never saw pressed,
+                    // and the implicit grab guarantees the app never
+                    // holds a stuck button, wherever the pointer
+                    // wandered meanwhile.
+                    if !seat.release_pressed(button) {
+                        return None;
+                    }
+                    SeatDeliveryKind::Button { button, state }
+                }
+            },
+
+            SeatInputKind::Scroll { axis, value120 } => {
+                if seat.pressed.is_empty() && !seat.pointer_over_surface(view, surface) {
+                    return None;
+                }
+                SeatDeliveryKind::Scroll { axis, value120 }
+            }
+        };
+        Some(SeatDelivery { origin, kind })
     }
 }
 
@@ -1480,204 +1973,34 @@ pub(crate) fn keysym_is_intakeable(keysym: u32) -> bool {
     (0u32..256).any(|code| invariant_keysym(code) == Some(keysym))
 }
 
+/// A synthetic Smithay input backend, shared by this module's unit tests and
+/// by the `physical-input-injector` build — see the module's own docs for why
+/// there is exactly one copy.
+#[cfg(any(test, feature = "physical-input-injector"))]
+pub(crate) mod synthetic;
+
+/// The `physical-input-injector` channel (issue #212): the line vocabulary a
+/// harness one process boundary away uses to make physical-tagged input happen
+/// in a headless core. Feature-gated in full; see [`injector`]'s docs and the
+/// feature's own block in `Cargo.toml` for what it widens.
+#[cfg(any(test, feature = "physical-input-injector"))]
+pub(crate) mod injector;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
     use std::os::fd::AsFd;
     use std::rc::Rc;
 
-    use smithay::backend::input::{
-        AxisRelativeDirection, AxisSource, Device, DeviceCapability, Event, Keycode, UnusedEvent,
-    };
     use vitrin_ipc::{Connection, TransportError};
     use vitrin_mock_shim::{MockShim, SeatEvent};
 
+    use super::synthetic::{
+        SyntheticButton, SyntheticHost, SyntheticKey, SyntheticMotion, SyntheticScroll,
+    };
     use super::*;
     use crate::scene::Scene;
     use crate::shim::{ShimConfig, ShimServer};
-
-    // ------------------------------------------------------------------
-    // A synthetic Smithay input backend: winit cannot run in CI, so the
-    // generic [`intake_physical`] is driven with handcrafted host events
-    // through the same `InputBackend` trait surface `WinitInput` provides.
-    // ------------------------------------------------------------------
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    struct SyntheticDevice;
-
-    impl Device for SyntheticDevice {
-        fn id(&self) -> String {
-            "synthetic".into()
-        }
-        fn name(&self) -> String {
-            "synthetic host device".into()
-        }
-        fn has_capability(&self, _capability: DeviceCapability) -> bool {
-            true
-        }
-        fn usb_id(&self) -> Option<(u32, u32)> {
-            None
-        }
-        fn syspath(&self) -> Option<std::path::PathBuf> {
-            None
-        }
-    }
-
-    /// Absolute pointer motion already in target coordinates (the
-    /// transform is the identity, mirroring how the nested window's
-    /// physical pixels are the view's pixels).
-    struct SyntheticMotion {
-        x: f64,
-        y: f64,
-    }
-
-    impl Event<SyntheticHost> for SyntheticMotion {
-        fn time(&self) -> u64 {
-            0
-        }
-        fn device(&self) -> SyntheticDevice {
-            SyntheticDevice
-        }
-    }
-
-    impl AbsolutePositionEvent<SyntheticHost> for SyntheticMotion {
-        fn x(&self) -> f64 {
-            self.x
-        }
-        fn y(&self) -> f64 {
-            self.y
-        }
-        fn x_transformed(&self, _width: i32) -> f64 {
-            self.x
-        }
-        fn y_transformed(&self, _height: i32) -> f64 {
-            self.y
-        }
-    }
-
-    impl smithay::backend::input::PointerMotionAbsoluteEvent<SyntheticHost> for SyntheticMotion {}
-
-    struct SyntheticButton {
-        code: u32,
-        state: host::ButtonState,
-    }
-
-    impl Event<SyntheticHost> for SyntheticButton {
-        fn time(&self) -> u64 {
-            0
-        }
-        fn device(&self) -> SyntheticDevice {
-            SyntheticDevice
-        }
-    }
-
-    impl PointerButtonEvent<SyntheticHost> for SyntheticButton {
-        fn button_code(&self) -> u32 {
-            self.code
-        }
-        fn state(&self) -> host::ButtonState {
-            self.state
-        }
-    }
-
-    /// Scroll with independent per-axis discrete (`v120`) and continuous
-    /// (pixel) amounts, `(vertical, horizontal)`.
-    struct SyntheticScroll {
-        v120: (Option<f64>, Option<f64>),
-        pixels: (Option<f64>, Option<f64>),
-    }
-
-    impl Event<SyntheticHost> for SyntheticScroll {
-        fn time(&self) -> u64 {
-            0
-        }
-        fn device(&self) -> SyntheticDevice {
-            SyntheticDevice
-        }
-    }
-
-    impl PointerAxisEvent<SyntheticHost> for SyntheticScroll {
-        fn amount(&self, axis: host::Axis) -> Option<f64> {
-            match axis {
-                host::Axis::Vertical => self.pixels.0,
-                host::Axis::Horizontal => self.pixels.1,
-            }
-        }
-        fn amount_v120(&self, axis: host::Axis) -> Option<f64> {
-            match axis {
-                host::Axis::Vertical => self.v120.0,
-                host::Axis::Horizontal => self.v120.1,
-            }
-        }
-        fn source(&self) -> AxisSource {
-            if self.v120.0.is_some() || self.v120.1.is_some() {
-                AxisSource::Wheel
-            } else {
-                AxisSource::Continuous
-            }
-        }
-        fn relative_direction(&self, _axis: host::Axis) -> AxisRelativeDirection {
-            AxisRelativeDirection::Identical
-        }
-    }
-
-    struct SyntheticKey {
-        evdev: u32,
-        state: host::KeyState,
-    }
-
-    impl Event<SyntheticHost> for SyntheticKey {
-        fn time(&self) -> u64 {
-            0
-        }
-        fn device(&self) -> SyntheticDevice {
-            SyntheticDevice
-        }
-    }
-
-    impl KeyboardKeyEvent<SyntheticHost> for SyntheticKey {
-        fn key_code(&self) -> Keycode {
-            // The xkb-domain keycode, exactly as Smithay's winit backend
-            // produces it (evdev scancode + 8).
-            (self.evdev + XKB_KEYCODE_OFFSET).into()
-        }
-        fn state(&self) -> host::KeyState {
-            self.state
-        }
-        fn count(&self) -> u32 {
-            1
-        }
-    }
-
-    struct SyntheticHost;
-
-    impl InputBackend for SyntheticHost {
-        type Device = SyntheticDevice;
-        type KeyboardKeyEvent = SyntheticKey;
-        type PointerAxisEvent = SyntheticScroll;
-        type PointerButtonEvent = SyntheticButton;
-        type PointerMotionEvent = UnusedEvent;
-        type PointerMotionAbsoluteEvent = SyntheticMotion;
-        type GestureSwipeBeginEvent = UnusedEvent;
-        type GestureSwipeUpdateEvent = UnusedEvent;
-        type GestureSwipeEndEvent = UnusedEvent;
-        type GesturePinchBeginEvent = UnusedEvent;
-        type GesturePinchUpdateEvent = UnusedEvent;
-        type GesturePinchEndEvent = UnusedEvent;
-        type GestureHoldBeginEvent = UnusedEvent;
-        type GestureHoldEndEvent = UnusedEvent;
-        type TouchDownEvent = UnusedEvent;
-        type TouchUpEvent = UnusedEvent;
-        type TouchMotionEvent = UnusedEvent;
-        type TouchCancelEvent = UnusedEvent;
-        type TouchFrameEvent = UnusedEvent;
-        type TabletToolAxisEvent = UnusedEvent;
-        type TabletToolProximityEvent = UnusedEvent;
-        type TabletToolTipEvent = UnusedEvent;
-        type TabletToolButtonEvent = UnusedEvent;
-        type SwitchToggleEvent = UnusedEvent;
-        type SpecialEvent = ();
-    }
 
     const VIEW: (i32, i32) = (100, 80);
 
@@ -1925,12 +2248,12 @@ pub(crate) mod tests {
         let (server, _scene, mut core, mut mock) = wire_setup();
         let view = (VIEW_W, VIEW_H);
         let surface = Some(view);
-        let mut router = InputRouter::new(NoopHook);
+        let mut router = router();
 
         // KEY_H (scancode 35) is layout-dependent — dropped with no host
         // keysym; given winit's `logical_key` ('h' = 0x0068) it flows.
         for input in physical_key(35, Some(0x0068), KeyState::Pressed) {
-            if let Some(delivery) = router.route(input, view, surface) {
+            if let Some(delivery) = router.route_physical(input, view, surface) {
                 server
                     .deliver_seat_event(&delivery, &mut |frame| core.send_message(frame, None))
                     .expect("send");
@@ -2058,12 +2381,52 @@ pub(crate) mod tests {
     // Routing: letterbox / crop coordinate mapping and hit-testing
     // ------------------------------------------------------------------
 
-    fn router() -> InputRouter<NoopHook> {
-        InputRouter::new(NoopHook)
+    /// The realm every router fixture below addresses, unless a test names a
+    /// second one on purpose. A constant rather than a parameter because the
+    /// coordinate-mapping and pairing tests are about one realm's seat and
+    /// would say nothing extra for being spread over two.
+    pub(crate) fn test_realm() -> crate::grants::RealmId {
+        crate::grants::RealmId::new("realm-0")
     }
 
-    fn phys(kind: SeatInputKind) -> SeatInput {
+    /// A router with the human's attention already on [`test_realm`], which
+    /// is what makes `route_physical` below have a destination at all.
+    ///
+    /// The bind's drain is `None` here by construction (nothing was bound, so
+    /// nothing can be owed) and is asserted rather than discarded, so this
+    /// fixture cannot quietly start swallowing a debt if `bind_to` changes.
+    fn router() -> InputRouter<NoopHook> {
+        let mut router = InputRouter::detached(NoopHook);
+        assert!(
+            router.bind_to(&test_realm()).is_none(),
+            "the first bind can owe nothing: no realm was bound before it"
+        );
+        router
+    }
+
+    pub(crate) fn phys(kind: SeatInputKind) -> SeatInput {
         SeatInput::physical(kind)
+    }
+
+    /// Route one event **by the rule its own origin implies**, to
+    /// [`test_realm`] either way.
+    ///
+    /// For the tests that sweep `Origin::ALL` and are about the *tag* rather
+    /// than the addressing: they need one call that takes either origin, and
+    /// picking the entry point from the tag here keeps the production
+    /// signatures from having to. Everything that is actually about which
+    /// realm an event reaches calls `route_physical`/`route_emulated`
+    /// directly, which is the whole point of there being two.
+    fn route_by_origin<H: PreemptionHook>(
+        router: &mut InputRouter<H>,
+        input: SeatInput,
+        view: (u32, u32),
+        surface: Option<(u32, u32)>,
+    ) -> Option<SeatDelivery> {
+        match input.origin() {
+            Origin::Physical => router.route_physical(input, view, surface),
+            Origin::Emulated => router.route_emulated(&test_realm(), input, view, surface),
+        }
     }
 
     fn motion(x: f64, y: f64) -> SeatInputKind {
@@ -2116,16 +2479,15 @@ pub(crate) mod tests {
     #[test]
     fn the_agent_pointer_follows_the_emulated_origin_and_nothing_else() {
         let mut router = router();
-        let realm = crate::grants::RealmId::new("realm-0");
-        router.bind_to(&realm);
+        let realm = test_realm();
         let view = (64, 48);
         let surface = Some((64, 48));
-        assert_eq!(router.agent_pointer(), None, "nothing has moved yet");
+        assert_eq!(router.agent_pointer(&realm), None, "nothing has moved yet");
 
         // A human's motion moves the shared position and NOT the agent's.
-        router.route(phys(motion(10.0, 20.0)), view, surface);
+        router.route_physical(phys(motion(10.0, 20.0)), view, surface);
         assert_eq!(
-            router.agent_pointer(),
+            router.agent_pointer(&test_realm()),
             None,
             "physical motion must never move the agent's cursor"
         );
@@ -2133,13 +2495,18 @@ pub(crate) mod tests {
         // An agent's motion moves both: the shared one because that is what
         // the app is delivered, the agent-owned one because that is what the
         // sprite is drawn at.
-        router.route(SeatInput::emulated(motion(30.0, 40.0)), view, surface);
-        assert_eq!(router.agent_pointer(), Some((30.0, 40.0)));
+        router.route_emulated(
+            &test_realm(),
+            SeatInput::emulated(motion(30.0, 40.0)),
+            view,
+            surface,
+        );
+        assert_eq!(router.agent_pointer(&test_realm()), Some((30.0, 40.0)));
 
         // A later human motion does not drag the sprite along with it.
-        router.route(phys(motion(1.0, 2.0)), view, surface);
+        router.route_physical(phys(motion(1.0, 2.0)), view, surface);
         assert_eq!(
-            router.agent_pointer(),
+            router.agent_pointer(&test_realm()),
             Some((30.0, 40.0)),
             "the agent's cursor moved because the human's mouse did"
         );
@@ -2147,18 +2514,19 @@ pub(crate) mod tests {
         // Recorded at intake, before gating and before hit-testing: a motion
         // onto the letterbox matte is not delivered, but the pointer is still
         // there and the sprite must be drawn there.
-        router.route(
+        router.route_emulated(
+            &test_realm(),
             SeatInput::emulated(motion(200.0, 200.0)),
             view,
             Some((10, 10)),
         );
-        assert_eq!(router.agent_pointer(), Some((200.0, 200.0)));
+        assert_eq!(router.agent_pointer(&test_realm()), Some((200.0, 200.0)));
 
         // Realm teardown forgets it, so no sprite hovers over a realm that is
         // gone -- through the scoped entry point the teardown funnel uses,
         // so the private clear has no caller outside this module's own API.
         assert!(router.reset_for(&realm));
-        assert_eq!(router.agent_pointer(), None);
+        assert_eq!(router.agent_pointer(&test_realm()), None);
     }
 
     #[test]
@@ -2168,7 +2536,7 @@ pub(crate) mod tests {
         // IDL's realm-view-pixel flows number for number.
         let mut router = router();
         let out = router
-            .route(phys(motion(10.25, 47.5)), (64, 48), Some((64, 48)))
+            .route_physical(phys(motion(10.25, 47.5)), (64, 48), Some((64, 48)))
             .expect("inside the surface");
         assert_motion(&out, 10.25, 47.5);
         assert_eq!(out.origin(), Origin::Physical);
@@ -2183,18 +2551,18 @@ pub(crate) mod tests {
         let surface = Some((40, 20));
 
         // Top-left surface pixel.
-        let out = router.route(phys(motion(30.0, 30.0)), view, surface);
+        let out = router.route_physical(phys(motion(30.0, 30.0)), view, surface);
         assert_motion(&out.expect("surface origin"), 0.0, 0.0);
         // Bottom-right interior point.
-        let out = router.route(phys(motion(69.5, 49.5)), view, surface);
+        let out = router.route_physical(phys(motion(69.5, 49.5)), view, surface);
         assert_motion(&out.expect("inside"), 39.5, 19.5);
         // One pixel past the right edge: matte, not app.
         assert!(router
-            .route(phys(motion(70.0, 40.0)), view, surface)
+            .route_physical(phys(motion(70.0, 40.0)), view, surface)
             .is_none());
         // Just left of the placed rectangle: matte.
         assert!(router
-            .route(phys(motion(29.5, 40.0)), view, surface)
+            .route_physical(phys(motion(29.5, 40.0)), view, surface)
             .is_none());
     }
 
@@ -2207,9 +2575,9 @@ pub(crate) mod tests {
         let view = (40, 30);
         let surface = Some((60, 50));
 
-        let out = router.route(phys(motion(0.0, 0.0)), view, surface);
+        let out = router.route_physical(phys(motion(0.0, 0.0)), view, surface);
         assert_motion(&out.expect("crop origin"), 10.0, 10.0);
-        let out = router.route(phys(motion(39.0, 29.0)), view, surface);
+        let out = router.route_physical(phys(motion(39.0, 29.0)), view, surface);
         assert_motion(&out.expect("crop interior"), 49.0, 39.0);
     }
 
@@ -2221,13 +2589,13 @@ pub(crate) mod tests {
         let view = (100, 20);
         let surface = Some((40, 50));
 
-        let out = router.route(phys(motion(30.0, 0.0)), view, surface);
+        let out = router.route_physical(phys(motion(30.0, 0.0)), view, surface);
         assert_motion(&out.expect("placed origin"), 0.0, 15.0);
-        let out = router.route(phys(motion(69.0, 19.0)), view, surface);
+        let out = router.route_physical(phys(motion(69.0, 19.0)), view, surface);
         assert_motion(&out.expect("placed interior"), 39.0, 34.0);
         // Left of the placed rectangle: matte on the x axis.
         assert!(router
-            .route(phys(motion(29.0, 10.0)), view, surface)
+            .route_physical(phys(motion(29.0, 10.0)), view, surface)
             .is_none());
     }
 
@@ -2246,7 +2614,7 @@ pub(crate) mod tests {
         // precision here.
         let mut router = router();
         let out = router
-            .route(phys(motion(0.5, 0.25)), (10, 10), Some((10, 10)))
+            .route_physical(phys(motion(0.5, 0.25)), (10, 10), Some((10, 10)))
             .expect("inside");
         match out.kind() {
             SeatDeliveryKind::Motion { x, y } => {
@@ -2268,12 +2636,18 @@ pub(crate) mod tests {
         let surface = Some((40, 20)); // placed at (30, 30)
 
         assert!(router
-            .route(phys(motion(5.0, 5.0)), view, surface)
+            .route_physical(phys(motion(5.0, 5.0)), view, surface)
             .is_none());
-        assert!(router.route(phys(press()), view, surface).is_none());
-        assert!(router.route(phys(scroll()), view, surface).is_none());
-        assert!(router.route(phys(release()), view, surface).is_none());
-        let key = router.route(
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_none());
+        assert!(router
+            .route_physical(phys(scroll()), view, surface)
+            .is_none());
+        assert!(router
+            .route_physical(phys(release()), view, surface)
+            .is_none());
+        let key = router.route_physical(
             phys(SeatInputKind::Key {
                 keysym: 0xff0d,
                 state: KeyState::Pressed,
@@ -2292,26 +2666,34 @@ pub(crate) mod tests {
 
         // Move onto the surface and press: both delivered.
         assert!(router
-            .route(phys(motion(35.0, 35.0)), view, surface)
+            .route_physical(phys(motion(35.0, 35.0)), view, surface)
             .is_some());
-        assert!(router.route(phys(press()), view, surface).is_some());
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_some());
 
         // Drag off the surface: motion keeps flowing under the implicit
         // grab, with out-of-bounds (here negative) surface-local
         // coordinates — the wire's fixed is signed for exactly this.
-        let out = router.route(phys(motion(0.0, 0.0)), view, surface);
+        let out = router.route_physical(phys(motion(0.0, 0.0)), view, surface);
         assert_motion(&out.expect("grabbed motion"), -30.0, -30.0);
         // Scroll during the grab flows too.
-        assert!(router.route(phys(scroll()), view, surface).is_some());
+        assert!(router
+            .route_physical(phys(scroll()), view, surface)
+            .is_some());
         // The release lands wherever the drag ended: delivered, so the app
         // never holds a stuck button.
-        assert!(router.route(phys(release()), view, surface).is_some());
+        assert!(router
+            .route_physical(phys(release()), view, surface)
+            .is_some());
 
         // Grab over: the same off-surface events are matte again.
         assert!(router
-            .route(phys(motion(0.0, 0.0)), view, surface)
+            .route_physical(phys(motion(0.0, 0.0)), view, surface)
             .is_none());
-        assert!(router.route(phys(scroll()), view, surface).is_none());
+        assert!(router
+            .route_physical(phys(scroll()), view, surface)
+            .is_none());
     }
 
     #[test]
@@ -2331,31 +2713,31 @@ pub(crate) mod tests {
 
         // BTN_LEFT pressed on the matte: dropped, no grab.
         assert!(router
-            .route(phys(motion(5.0, 5.0)), view, surface)
+            .route_physical(phys(motion(5.0, 5.0)), view, surface)
             .is_none());
         assert!(router
-            .route(phys(button(0x110, ButtonState::Pressed)), view, surface)
+            .route_physical(phys(button(0x110, ButtonState::Pressed)), view, surface)
             .is_none());
         // Drag onto the surface (the host keeps reporting motion while
         // the button stays physically held) and press BTN_RIGHT there.
         assert!(router
-            .route(phys(motion(35.0, 35.0)), view, surface)
+            .route_physical(phys(motion(35.0, 35.0)), view, surface)
             .is_some());
         assert!(router
-            .route(phys(button(0x111, ButtonState::Pressed)), view, surface)
+            .route_physical(phys(button(0x111, ButtonState::Pressed)), view, surface)
             .is_some());
         // BTN_LEFT's release: its press was never delivered — dropped,
         // it must not consume BTN_RIGHT's grab.
         assert!(router
-            .route(phys(button(0x110, ButtonState::Released)), view, surface)
+            .route_physical(phys(button(0x110, ButtonState::Released)), view, surface)
             .is_none());
         // BTN_RIGHT's release still pairs: no stuck button in the app.
         assert!(router
-            .route(phys(button(0x111, ButtonState::Released)), view, surface)
+            .route_physical(phys(button(0x111, ButtonState::Released)), view, surface)
             .is_some());
         // The grab is fully over: off-surface motion is matte again.
         assert!(router
-            .route(phys(motion(0.0, 0.0)), view, surface)
+            .route_physical(phys(motion(0.0, 0.0)), view, surface)
             .is_none());
     }
 
@@ -2368,10 +2750,12 @@ pub(crate) mod tests {
         let mut router = router();
         let view = (100, 80);
 
-        assert!(router.route(phys(motion(10.0, 10.0)), view, None).is_none());
-        assert!(router.route(phys(press()), view, None).is_none());
-        assert!(router.route(phys(scroll()), view, None).is_none());
-        let key = router.route(
+        assert!(router
+            .route_physical(phys(motion(10.0, 10.0)), view, None)
+            .is_none());
+        assert!(router.route_physical(phys(press()), view, None).is_none());
+        assert!(router.route_physical(phys(scroll()), view, None).is_none());
+        let key = router.route_physical(
             phys(SeatInputKind::Key {
                 keysym: 0xff1b,
                 state: KeyState::Pressed,
@@ -2380,7 +2764,8 @@ pub(crate) mod tests {
             None,
         );
         assert!(key.is_some());
-        let text = router.route(
+        let text = router.route_emulated(
+            &test_realm(),
             SeatInput::emulated(SeatInputKind::Text {
                 text: "hello".into(),
             }),
@@ -2420,16 +2805,17 @@ pub(crate) mod tests {
     fn hook_observes_every_event_before_the_gate_and_consumption_blocks_delivery() {
         let log = Rc::new(RefCell::new(Vec::new()));
         let consume = Rc::new(Cell::new(false));
-        let mut router = InputRouter::new(RecordingHook {
+        let mut router = InputRouter::detached(RecordingHook {
             log: Rc::clone(&log),
             consume: Rc::clone(&consume),
         });
+        assert!(router.bind_to(&test_realm()).is_none());
         let view = (64, 48);
         let surface = Some((64, 48));
 
         // Delivering: observe precedes gate.
         assert!(router
-            .route(phys(motion(1.0, 1.0)), view, surface)
+            .route_physical(phys(motion(1.0, 1.0)), view, surface)
             .is_some());
         assert_eq!(
             log.borrow().as_slice(),
@@ -2441,10 +2827,10 @@ pub(crate) mod tests {
         log.borrow_mut().clear();
         consume.set(true);
         assert!(router
-            .route(phys(motion(2.0, 2.0)), view, surface)
+            .route_physical(phys(motion(2.0, 2.0)), view, surface)
             .is_none());
         assert!(router
-            .route(SeatInput::emulated(scroll()), view, surface)
+            .route_emulated(&test_realm(), SeatInput::emulated(scroll()), view, surface)
             .is_none());
         assert_eq!(
             log.borrow().as_slice(),
@@ -2461,27 +2847,32 @@ pub(crate) mod tests {
     fn consumed_press_starts_no_implicit_grab() {
         let log = Rc::new(RefCell::new(Vec::new()));
         let consume = Rc::new(Cell::new(false));
-        let mut router = InputRouter::new(RecordingHook {
+        let mut router = InputRouter::detached(RecordingHook {
             log,
             consume: Rc::clone(&consume),
         });
+        assert!(router.bind_to(&test_realm()).is_none());
         let view = (64, 48);
         let surface = Some((64, 48));
 
         // Pointer on the surface; a grab-holder consumes the press.
         assert!(router
-            .route(phys(motion(5.0, 5.0)), view, surface)
+            .route_physical(phys(motion(5.0, 5.0)), view, surface)
             .is_some());
         consume.set(true);
-        assert!(router.route(phys(press()), view, surface).is_none());
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_none());
 
         // Gate reopens: no implicit grab exists, so off-surface motion is
         // matte and the (never-pressed) release is dropped unpaired.
         consume.set(false);
         assert!(router
-            .route(phys(motion(1000.0, 1000.0)), view, surface)
+            .route_physical(phys(motion(1000.0, 1000.0)), view, surface)
             .is_none());
-        assert!(router.route(phys(release()), view, surface).is_none());
+        assert!(router
+            .route_physical(phys(release()), view, surface)
+            .is_none());
     }
 
     #[test]
@@ -2494,22 +2885,27 @@ pub(crate) mod tests {
         // debt (see `Gate::Consume`).
         let log = Rc::new(RefCell::new(Vec::new()));
         let consume = Rc::new(Cell::new(false));
-        let mut router = InputRouter::new(RecordingHook {
+        let mut router = InputRouter::detached(RecordingHook {
             log,
             consume: Rc::clone(&consume),
         });
+        assert!(router.bind_to(&test_realm()).is_none());
         let view = (100, 80);
         let surface = Some((40, 20)); // placed at (30, 30)
 
         // Press delivered on the surface: implicit grab begins.
         assert!(router
-            .route(phys(motion(35.0, 35.0)), view, surface)
+            .route_physical(phys(motion(35.0, 35.0)), view, surface)
             .is_some());
-        assert!(router.route(phys(press()), view, surface).is_some());
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_some());
 
         // The grab consumes the user's release: not delivered ...
         consume.set(true);
-        assert!(router.route(phys(release()), view, surface).is_none());
+        assert!(router
+            .route_physical(phys(release()), view, surface)
+            .is_none());
 
         // ... but the router did not wedge. With the gate open again,
         // matte hit-testing works (no phantom grab force-delivers
@@ -2518,18 +2914,28 @@ pub(crate) mod tests {
         // behaves normally.
         consume.set(false);
         assert!(router
-            .route(phys(motion(5.0, 5.0)), view, surface)
+            .route_physical(phys(motion(5.0, 5.0)), view, surface)
             .is_none());
-        assert!(router.route(phys(press()), view, surface).is_none());
-        assert!(router.route(phys(scroll()), view, surface).is_none());
-        assert!(router.route(phys(release()), view, surface).is_none());
         assert!(router
-            .route(phys(motion(35.0, 35.0)), view, surface)
+            .route_physical(phys(press()), view, surface)
+            .is_none());
+        assert!(router
+            .route_physical(phys(scroll()), view, surface)
+            .is_none());
+        assert!(router
+            .route_physical(phys(release()), view, surface)
+            .is_none());
+        assert!(router
+            .route_physical(phys(motion(35.0, 35.0)), view, surface)
             .is_some());
-        assert!(router.route(phys(press()), view, surface).is_some());
-        assert!(router.route(phys(release()), view, surface).is_some());
         assert!(router
-            .route(phys(motion(5.0, 5.0)), view, surface)
+            .route_physical(phys(press()), view, surface)
+            .is_some());
+        assert!(router
+            .route_physical(phys(release()), view, surface)
+            .is_some());
+        assert!(router
+            .route_physical(phys(motion(5.0, 5.0)), view, surface)
             .is_none());
     }
 
@@ -2540,36 +2946,60 @@ pub(crate) mod tests {
         // the realm teardown funnel (`ShimServer::connection_closed`)
         // invokes alongside `Scene::clear_surface`.
         let mut router = router();
-        let realm = crate::grants::RealmId::new("realm-0");
-        router.bind_to(&realm);
+        let realm = test_realm();
         let view = (100, 80);
         let surface = Some((40, 20)); // placed at (30, 30)
 
         assert!(router
-            .route(phys(motion(35.0, 35.0)), view, surface)
+            .route_physical(phys(motion(35.0, 35.0)), view, surface)
             .is_some());
-        assert!(router.route(phys(press()), view, surface).is_some());
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_some());
 
         assert!(router.reset_for(&realm), "the bound realm's death clears");
+        assert_eq!(
+            router.bound_realm(),
+            None,
+            "the human's input has nowhere to go until a realm is bound again"
+        );
+        // The next shim generation attaches and the binding comes back to it
+        // (`session::rebind_output_after_death`, then the next physical
+        // turn's `bind_to`). Without this the assertions below would all pass
+        // vacuously on "nothing is bound" rather than on the reset.
+        assert!(
+            router.bind_to(&realm).is_none(),
+            "a re-bind after a death owes nothing: the reset already dropped the seat"
+        );
 
         // The stale release from the dead generation is unpaired at the
         // fresh seat: dropped.
-        assert!(router.route(phys(release()), view, surface).is_none());
+        assert!(router
+            .route_physical(phys(release()), view, surface)
+            .is_none());
         // The pointer position was forgotten too: a press cannot
         // hit-test against a pre-teardown position (which sat over the
         // surface) — first motion must re-establish it.
-        assert!(router.route(phys(press()), view, surface).is_none());
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_none());
         // No phantom grab: off-surface events are matte again.
         assert!(router
-            .route(phys(motion(0.0, 0.0)), view, surface)
+            .route_physical(phys(motion(0.0, 0.0)), view, surface)
             .is_none());
-        assert!(router.route(phys(scroll()), view, surface).is_none());
+        assert!(router
+            .route_physical(phys(scroll()), view, surface)
+            .is_none());
         // The fresh generation then works normally.
         assert!(router
-            .route(phys(motion(35.0, 35.0)), view, surface)
+            .route_physical(phys(motion(35.0, 35.0)), view, surface)
             .is_some());
-        assert!(router.route(phys(press()), view, surface).is_some());
-        assert!(router.route(phys(release()), view, surface).is_some());
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_some());
+        assert!(router
+            .route_physical(phys(release()), view, surface)
+            .is_some());
     }
 
     /// **A sibling realm's death must not clear the bound realm's state**
@@ -2589,25 +3019,30 @@ pub(crate) mod tests {
     #[test]
     fn a_siblings_death_leaves_the_bound_realms_held_key_alone() {
         use crate::grants::RealmId;
-        let mut router = router();
+        let mut router = InputRouter::detached(NoopHook);
         let view = (100, 80);
         let surface = Some((40, 20));
         let bound = RealmId::new("browser");
         let sibling = RealmId::new("realm-0");
 
         // The generation belongs to `browser`: everything below is what
-        // *its* app was told.
-        router.bind_to(&bound);
+        // *its* app was told. Nothing was bound before, so the bind can owe
+        // nothing -- asserted rather than discarded.
+        assert!(router.bind_to(&bound).is_none());
         assert!(router
-            .route(phys(motion(35.0, 35.0)), view, surface)
+            .route_physical(phys(motion(35.0, 35.0)), view, surface)
             .is_some());
-        assert!(router.route(phys(press()), view, surface).is_some());
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_some());
         let key_down = || SeatInputKind::Key {
             keysym: 0xffe1, // Shift_L: the modifier a latch is worst for
             state: KeyState::Pressed,
         };
-        assert!(router.route(phys(key_down()), view, surface).is_some());
-        assert_eq!(router.held_keys(), [(0xffe1, Origin::Physical)]);
+        assert!(router
+            .route_physical(phys(key_down()), view, surface)
+            .is_some());
+        assert_eq!(router.held_keys(&bound), [(0xffe1, Origin::Physical)]);
 
         // An unrelated realm dies. Nothing of this generation is its to
         // forget.
@@ -2621,7 +3056,7 @@ pub(crate) mod tests {
             "and it does not steal the binding either"
         );
         assert_eq!(
-            router.held_keys(),
+            router.held_keys(&bound),
             [(0xffe1, Origin::Physical)],
             "the survivor's app is still holding this key, so the router still owes its release"
         );
@@ -2633,23 +3068,27 @@ pub(crate) mod tests {
             state: KeyState::Released,
         };
         assert!(
-            router.route(phys(key_up), view, surface).is_some(),
+            router.route_physical(phys(key_up), view, surface).is_some(),
             "the held key's release must still be deliverable"
         );
         // ...and the implicit grab survived too, so an off-surface release
         // still reaches the app that saw the press.
         assert!(router
-            .route(phys(motion(0.0, 0.0)), view, surface)
+            .route_physical(phys(motion(0.0, 0.0)), view, surface)
             .is_some());
-        assert!(router.route(phys(release()), view, surface).is_some());
+        assert!(router
+            .route_physical(phys(release()), view, surface)
+            .is_some());
 
         // The bound realm's own death still clears everything, which is the
         // half `reset_forgets_grab_and_pointer_across_shim_generations`
         // covers in full.
-        assert!(router.route(phys(key_down()), view, surface).is_some());
+        assert!(router
+            .route_physical(phys(key_down()), view, surface)
+            .is_some());
         assert!(router.reset_for(&bound), "its own realm's death clears");
         assert_eq!(router.bound_realm(), None);
-        assert!(router.held_keys().is_empty());
+        assert!(router.held_keys(&bound).is_empty());
     }
 
     // ------------------------------------------------------------------
@@ -2674,8 +3113,7 @@ pub(crate) mod tests {
             let surface = Some((64, 48));
 
             let deliver = |router: &mut InputRouter<NoopHook>, kind| {
-                router
-                    .route(wrap(kind), view, surface)
+                route_by_origin(router, wrap(kind), view, surface)
                     .expect("routable by construction")
             };
 
@@ -2740,8 +3178,7 @@ pub(crate) mod tests {
             let view = (64, 48);
             let surface = Some((64, 48));
             let mut deliver = |kind| {
-                router
-                    .route(wrap(kind), view, surface)
+                route_by_origin(&mut router, wrap(kind), view, surface)
                     .expect("routable by construction")
             };
 
@@ -2784,10 +3221,10 @@ pub(crate) mod tests {
         let view = (64, 48);
         let surface = Some((64, 48));
         let motion_delivery = router
-            .route(SeatInput::physical(motion(1.0, 2.0)), view, surface)
+            .route_physical(SeatInput::physical(motion(1.0, 2.0)), view, surface)
             .expect("motion routes");
         let button_delivery = router
-            .route(SeatInput::physical(press()), view, surface)
+            .route_physical(SeatInput::physical(press()), view, surface)
             .expect("button routes");
         let realm = crate::grants::RealmId::new("realm-7");
         super::record_seat_delivery(&mut rec, &realm, &motion_delivery);
@@ -2860,7 +3297,9 @@ pub(crate) mod tests {
 
         let mut send_all = |inputs: Vec<SeatInput>, router: &mut InputRouter<NoopHook>| {
             for input in inputs {
-                let delivery = router.route(input, view, surface).expect("routable");
+                let delivery = router
+                    .route_physical(input, view, surface)
+                    .expect("routable");
                 let sent = server
                     .deliver_seat_event(&delivery, &mut |frame| core.send_message(frame, None))
                     .expect("send");
@@ -2900,7 +3339,8 @@ pub(crate) mod tests {
         );
         {
             let delivery = router
-                .route(
+                .route_emulated(
+                    &test_realm(),
                     SeatInput::emulated(SeatInputKind::Text {
                         text: "vitrin".into(),
                     }),
@@ -2975,7 +3415,7 @@ pub(crate) mod tests {
 
         let mut router = router();
         let delivery = router
-            .route(
+            .route_physical(
                 phys(SeatInputKind::Key {
                     keysym: 0xff1b,
                     state: KeyState::Pressed,
@@ -3060,11 +3500,14 @@ pub(crate) mod tests {
             let grab = Rc::new(RefCell::new(crate::consent::grab::ConsentGrab::new()));
             let now = Rc::new(std::cell::Cell::new(std::time::Instant::now()));
             let spy = Rc::new(HookSpy::default());
-            let router = InputRouter::new(crate::consent::grab::ConsentGate::new(
+            let mut router = InputRouter::detached(crate::consent::grab::ConsentGate::new(
                 Rc::clone(&grab),
                 Rc::clone(&now),
                 SpyHook(Rc::clone(&spy)),
             ));
+            // The human's attention is on the rig's one realm, so
+            // `route_physical` below has somewhere to deliver.
+            assert!(router.bind_to(&test_realm()).is_none());
             let (recorder, log_path) = crate::recorder::tests::scratch_recorder("input-grab");
             Self {
                 router,
@@ -3154,6 +3597,106 @@ pub(crate) mod tests {
         (registry, petition)
     }
 
+    /// **The trusted path is session-wide, and the per-realm split did not
+    /// scope it** (WS-E.1.6, issue #212, acceptance criterion 4, first half).
+    ///
+    /// A consent prompt consumes physical input for **every** realm, not only
+    /// the one the human's attention is bound to. That has to be asserted
+    /// rather than assumed, because a per-realm router is exactly the change
+    /// that could quietly make a grab apply to one realm's events and not
+    /// another's — and a prompt that stopped consuming the moment the binding
+    /// moved would be answerable by whatever was pointing at the card.
+    ///
+    /// It is also structural, not merely tested:
+    /// [`PreemptionHook::gate`] is never told which realm an event was
+    /// addressed to, so a realm-scoped gate is *inexpressible* rather than
+    /// forbidden. This test is what proves the structure was not worked
+    /// around at the router.
+    #[test]
+    fn a_prompt_consumes_physical_input_for_every_realm_not_only_the_bound_one() {
+        let mut rig = Grabbed::new();
+        let (mut registry, petition) = pending_petition();
+        let view = (900, 700);
+        let surface_size = Some(view);
+        rig.grab.borrow_mut().set_view(view);
+        let a = test_realm();
+        let b = crate::grants::RealmId::new("realm-b");
+
+        // Fixture: ordinary routing in realm A, before any prompt.
+        assert!(rig
+            .router
+            .route_physical(phys(motion(10.0, 10.0)), view, surface_size)
+            .is_some());
+
+        rig.raise_awake(petition, &mut registry);
+
+        // Realm A is bound: consumed, as `a_raised_prompt_stops_human_input_at_the_router`
+        // already pins.
+        assert!(rig
+            .router
+            .route_physical(phys(motion(20.0, 20.0)), view, surface_size)
+            .is_none());
+
+        // The human's attention moves to realm B *while the prompt is up*.
+        // Everything must still be consumed. A gate scoped to the realm that
+        // was bound when the prompt went up would deliver here.
+        let (losing, owed) = rig
+            .router
+            .bind_to(&b)
+            .expect("the binding moved, so the realm being left is owed its drain");
+        assert_eq!(losing, a);
+        assert!(
+            owed.is_empty(),
+            "nothing was held: the prompt consumed the presses, so no app saw one begin"
+        );
+        for input in [
+            phys(motion(30.0, 30.0)),
+            phys(press()),
+            phys(scroll()),
+            phys(SeatInputKind::Key {
+                keysym: 0xff0d,
+                state: KeyState::Pressed,
+            }),
+        ] {
+            assert!(
+                rig.router
+                    .route_physical(input, view, surface_size)
+                    .is_none(),
+                "a raised prompt must consume physical input for EVERY realm: a grab that \
+                 stopped at the realm it was raised over would let the human's next click \
+                 reach an app instead of the card"
+            );
+        }
+        // Neither realm's app was told anything at all.
+        assert!(rig.router.held_keys(&a).is_empty() && rig.router.held_buttons(&a).is_empty());
+        assert!(rig.router.held_keys(&b).is_empty() && rig.router.held_buttons(&b).is_empty());
+
+        // An agent's actuation into a *third* realm passes through, exactly as
+        // it does with one realm: the grab consumes `physical` only
+        // (`crate::consent::grab`, "why agent input is not consumed here" --
+        // the petitioning principal's own actuations are already refused
+        // `consent_held` at the chokepoint, and another principal's are none
+        // of this prompt's business). The realm is not part of that
+        // judgement, and the point of asserting it here is that it did not
+        // *become* part of one.
+        assert!(rig
+            .router
+            .route_emulated(
+                &crate::grants::RealmId::new("realm-c"),
+                SeatInput::emulated(motion(40.0, 40.0)),
+                view,
+                surface_size,
+            )
+            .is_some());
+
+        // Lowering restores delivery, in the realm now bound.
+        rig.lower(&mut registry);
+        assert!(rig
+            .router
+            .route_physical(phys(motion(50.0, 50.0)), view, surface_size)
+            .is_some());
+    }
+
     #[test]
     fn a_raised_prompt_stops_human_input_at_the_router() {
         // The acceptance criterion "all human input routes exclusively to
@@ -3168,7 +3711,7 @@ pub(crate) mod tests {
         // Before the prompt: ordinary routing.
         assert!(rig
             .router
-            .route(phys(motion(10.0, 10.0)), view, surface_size)
+            .route_physical(phys(motion(10.0, 10.0)), view, surface_size)
             .is_some());
 
         rig.raise_awake(petition, &mut registry);
@@ -3191,7 +3734,7 @@ pub(crate) mod tests {
         ] {
             assert!(
                 rig.router
-                    .route(phys(kind.clone()), view, surface_size)
+                    .route_physical(phys(kind.clone()), view, surface_size)
                     .is_none(),
                 "{kind:?} reached the app while a prompt was up"
             );
@@ -3201,7 +3744,7 @@ pub(crate) mod tests {
         rig.lower(&mut registry);
         assert!(rig
             .router
-            .route(phys(motion(30.0, 30.0)), view, surface_size)
+            .route_physical(phys(motion(30.0, 30.0)), view, surface_size)
             .is_some());
     }
 
@@ -3233,7 +3776,7 @@ pub(crate) mod tests {
         for kind in consumed.iter() {
             assert!(
                 rig.router
-                    .route(phys(kind.clone()), view, surface_size)
+                    .route_physical(phys(kind.clone()), view, surface_size)
                     .is_none(),
                 "fixture check: {kind:?} must be consumed here"
             );
@@ -3265,11 +3808,11 @@ pub(crate) mod tests {
         // A drag begins in the app.
         assert!(rig
             .router
-            .route(phys(motion(40.0, 40.0)), view, surface_size)
+            .route_physical(phys(motion(40.0, 40.0)), view, surface_size)
             .is_some());
         assert!(rig
             .router
-            .route(phys(press()), view, surface_size)
+            .route_physical(phys(press()), view, surface_size)
             .is_some());
 
         rig.raise_awake(petition, &mut registry);
@@ -3278,12 +3821,12 @@ pub(crate) mod tests {
         // across a security decision) ...
         assert!(rig
             .router
-            .route(phys(motion(50.0, 50.0)), view, surface_size)
+            .route_physical(phys(motion(50.0, 50.0)), view, surface_size)
             .is_none());
         // ... but the release still reaches the app: no stuck button.
         assert!(
             rig.router
-                .route(phys(release()), view, surface_size)
+                .route_physical(phys(release()), view, surface_size)
                 .is_some(),
             "hold-until-release: the drag's own release must land"
         );
@@ -3291,11 +3834,11 @@ pub(crate) mod tests {
         // is dropped unpaired by the router rather than leaking.
         assert!(rig
             .router
-            .route(phys(press()), view, surface_size)
+            .route_physical(phys(press()), view, surface_size)
             .is_none());
         assert!(rig
             .router
-            .route(phys(release()), view, surface_size)
+            .route_physical(phys(release()), view, surface_size)
             .is_none());
     }
 
@@ -3321,27 +3864,27 @@ pub(crate) mod tests {
         // The human is holding Shift when the prompt appears.
         assert!(rig
             .router
-            .route(phys(key(SHIFT_L, KeyState::Pressed)), view, surface_size)
+            .route_physical(phys(key(SHIFT_L, KeyState::Pressed)), view, surface_size)
             .is_some());
         rig.raise_awake(petition, &mut registry);
 
         // Key presses during the prompt are consumed ...
         assert!(rig
             .router
-            .route(phys(key(CTRL_L, KeyState::Pressed)), view, surface_size)
+            .route_physical(phys(key(CTRL_L, KeyState::Pressed)), view, surface_size)
             .is_none());
         // ... and that press's own release is dropped by the router's
         // pairing rather than arriving unpaired at the app.
         assert!(
             rig.router
-                .route(phys(key(CTRL_L, KeyState::Released)), view, surface_size)
+                .route_physical(phys(key(CTRL_L, KeyState::Released)), view, surface_size)
                 .is_none(),
             "a release whose press the grab consumed must not reach the app"
         );
         // But the Shift the app already saw go down must come back up.
         assert!(
             rig.router
-                .route(phys(key(SHIFT_L, KeyState::Released)), view, surface_size)
+                .route_physical(phys(key(SHIFT_L, KeyState::Released)), view, surface_size)
                 .is_some(),
             "hold-until-release: a modifier held from before the prompt must be released"
         );
@@ -3351,7 +3894,7 @@ pub(crate) mod tests {
         rig.lower(&mut registry);
         assert!(rig
             .router
-            .route(phys(key(SHIFT_L, KeyState::Released)), view, surface_size)
+            .route_physical(phys(key(SHIFT_L, KeyState::Released)), view, surface_size)
             .is_none());
     }
 
@@ -3389,7 +3932,9 @@ pub(crate) mod tests {
 
         for kind in [motion(target.0, target.1), press(), release()] {
             assert!(
-                rig.router.route(phys(kind), view, surface_size).is_none(),
+                rig.router
+                    .route_physical(phys(kind), view, surface_size)
+                    .is_none(),
                 "answering the prompt must deliver nothing to the app"
             );
         }
@@ -3459,7 +4004,10 @@ pub(crate) mod tests {
             width: VIEW_W,
             height: VIEW_H,
         };
-        let presence = PhysicalPresence::new();
+        let presence = PhysicalPresenceMap::new();
+        // The realm the grant row names, and so the realm an admitted
+        // actuation is addressed to (WS-E.1.6).
+        let grant_realm = crate::grants::RealmId::new("realm-0");
         let mut chokepoint = Chokepoint::new();
 
         // One actuation attempt: chokepoint, then -- only if it admitted
@@ -3476,7 +4024,7 @@ pub(crate) mod tests {
                        registry: &crate::petitions::PetitionRegistry,
                        router: &mut InputRouter<crate::consent::grab::ConsentGate<SpyHook>>,
                        core: &mut Connection| {
-            let mut routed: Vec<SeatInput> = Vec::new();
+            let mut routed: Vec<(crate::grants::RealmId, SeatInput)> = Vec::new();
             let outcome = chokepoint
                 .enforce_use(
                     UseRequest {
@@ -3491,19 +4039,19 @@ pub(crate) mod tests {
                     UseEnv {
                         realm_view: Some(&frame),
                         presence: &presence,
-                        // One realm, and it is this grant's: the cross-realm
-                        // guard has nothing to say here.
-                        seat_reaches_grant_realm: true,
-                        actuations: &mut |input| routed.push(input),
-                        grant_realm: None,
+                        // No human anywhere: preemption is not this test's
+                        // subject and must not silently supply its refusals.
+                        physical_realm: None,
+                        actuations: &mut |realm, input| routed.push((realm.clone(), input)),
+                        grant_realm: Some(&grant_realm),
                         layout: &mut |act| panic!("no layout act expected: {act:?}"),
                     },
                     now,
                     &mut |_principal_frame, _fd| Ok(()),
                 )
                 .expect("transport is healthy");
-            for input in routed {
-                if let Some(delivery) = router.route(input, view, surface_size) {
+            for (realm, input) in routed {
+                if let Some(delivery) = router.route_emulated(&realm, input, view, surface_size) {
                     server
                         .deliver_seat_event(&delivery, &mut |frame| core.send_message(frame, None))
                         .expect("send");
@@ -3593,7 +4141,7 @@ pub(crate) mod tests {
             )));
             let now = Rc::new(Cell::new(std::time::Instant::now()));
             let spy = Rc::new(HookSpy::default());
-            let router = InputRouter::new(crate::consent::grab::ConsentGate::new(
+            let mut router = InputRouter::detached(crate::consent::grab::ConsentGate::new(
                 Rc::clone(&grab),
                 Rc::clone(&now),
                 crate::deadman::DeadManHook::new(
@@ -3602,6 +4150,8 @@ pub(crate) mod tests {
                     SpyHook(Rc::clone(&spy)),
                 ),
             ));
+            // The human's attention is on the rig's one realm.
+            assert!(router.bind_to(&test_realm()).is_none());
             let (recorder, log_path) = crate::recorder::tests::scratch_recorder("input-deadman");
             Self {
                 router,
@@ -3657,7 +4207,7 @@ pub(crate) mod tests {
         let gated_before = rig.spy.gated.get();
         assert!(rig
             .router
-            .route(phys(chord_press().kind().clone()), view, surface)
+            .route_physical(phys(chord_press().kind().clone()), view, surface)
             .is_none());
         assert_eq!(
             rig.spy.gated.get(),
@@ -3700,13 +4250,19 @@ pub(crate) mod tests {
 
         assert!(rig
             .router
-            .route(phys(chord_press().kind().clone()), view, surface)
+            .route_physical(phys(chord_press().kind().clone()), view, surface)
             .is_none());
         for step in 0..200 {
             rig.now.set(t0 + std::time::Duration::from_millis(step * 5));
-            let _ = rig.router.route(emulated_chord_press(), view, surface);
-            let _ = rig.router.route(emulated_chord_release(), view, surface);
-            let _ = rig.router.route(emulated_motion(), view, surface);
+            let _ = rig
+                .router
+                .route_emulated(&test_realm(), emulated_chord_press(), view, surface);
+            let _ =
+                rig.router
+                    .route_emulated(&test_realm(), emulated_chord_release(), view, surface);
+            let _ = rig
+                .router
+                .route_emulated(&test_realm(), emulated_motion(), view, surface);
         }
         rig.deadman
             .borrow_mut()
@@ -3749,7 +4305,7 @@ pub(crate) mod tests {
         // 1. The tap's press, no prompt up: withheld.
         assert!(rig
             .router
-            .route(phys(chord_press().kind().clone()), view, surface)
+            .route_physical(phys(chord_press().kind().clone()), view, surface)
             .is_none());
 
         // 2. A prompt goes up mid-tap.
@@ -3769,12 +4325,12 @@ pub(crate) mod tests {
         rig.now.set(t0 + std::time::Duration::from_millis(80));
         assert!(rig
             .router
-            .route(phys(chord_release().kind().clone()), view, surface)
+            .route_physical(phys(chord_release().kind().clone()), view, surface)
             .is_none());
         let replay = rig.deadman.borrow_mut().take_replay();
         assert_eq!(replay.len(), 2, "fixture check: a tap replays a pair");
         for input in replay {
-            let _ = rig.router.route(input, view, surface);
+            let _ = rig.router.route_physical(input, view, surface);
         }
 
         // The prompt is answered and lowered; input is ordinary again.
@@ -3787,7 +4343,7 @@ pub(crate) mod tests {
         rig.now.set(t1);
         assert!(
             rig.router
-                .route(phys(chord_press().kind().clone()), view, surface)
+                .route_physical(phys(chord_press().kind().clone()), view, surface)
                 .is_none(),
             "the held chord's press reached the app on a stale replay pass"
         );
@@ -3802,16 +4358,16 @@ pub(crate) mod tests {
             .set(t1 + crate::deadman::DEFAULT_HOLD + std::time::Duration::from_millis(10));
         assert!(
             rig.router
-                .route(phys(chord_release().kind().clone()), view, surface)
+                .route_physical(phys(chord_release().kind().clone()), view, surface)
                 .is_none(),
             "the chord's release reached the app"
         );
         // And nothing is latched: the router holds no key it delivered a
         // press for, which is the property a split pair violates.
         assert!(
-            rig.router.pressed_keys.is_empty(),
+            rig.router.held_keys(&test_realm()).is_empty(),
             "a chord left a key latched down in the confined app: {:?}",
-            rig.router.pressed_keys
+            rig.router.held_keys(&test_realm())
         );
     }
 
@@ -3836,11 +4392,12 @@ pub(crate) mod tests {
             crate::deadman::DeadManConfig::default(),
         )));
         let now = Rc::new(Cell::new(std::time::Instant::now()));
-        let mut router = InputRouter::new(crate::deadman::DeadManHook::new(
+        let mut router = InputRouter::detached(crate::deadman::DeadManHook::new(
             Rc::clone(&deadman),
             Rc::clone(&now),
             NoopHook,
         ));
+        assert!(router.bind_to(&test_realm()).is_none());
 
         // The embedder's loop, condensed: route each intake event, then
         // drain whatever the watcher decided the app is owed.
@@ -3850,7 +4407,7 @@ pub(crate) mod tests {
             let send = |router: &mut InputRouter<crate::deadman::DeadManHook<NoopHook>>,
                         core: &mut Connection,
                         input| {
-                if let Some(delivery) = router.route(input, view, surface) {
+                if let Some(delivery) = router.route_physical(input, view, surface) {
                     server
                         .deliver_seat_event(&delivery, &mut |frame| core.send_message(frame, None))
                         .expect("send");
@@ -3962,25 +4519,30 @@ pub(crate) mod tests {
             crate::deadman::DeadManConfig::default(),
         )));
         let now = Rc::new(Cell::new(std::time::Instant::now()));
-        let mut router = InputRouter::new(crate::deadman::DeadManHook::new(
+        let mut router = InputRouter::detached(crate::deadman::DeadManHook::new(
             Rc::clone(&deadman),
             Rc::clone(&now),
             NoopHook,
         ));
+        assert!(router.bind_to(&test_realm()).is_none());
         let view = (64, 48);
         let surface = Some(view);
         let t0 = now.get();
 
-        assert!(router.route(chord_press(), view, surface).is_none());
+        assert!(router
+            .route_physical(chord_press(), view, surface)
+            .is_none());
         deadman
             .borrow_mut()
             .fire_if_due(t0 + crate::deadman::DEFAULT_HOLD);
         assert!(deadman.borrow_mut().take_trigger().is_some());
-        assert!(router.route(chord_release(), view, surface).is_none());
+        assert!(router
+            .route_physical(chord_release(), view, surface)
+            .is_none());
         assert!(
-            router.pressed_keys.is_empty(),
+            router.held_keys(&test_realm()).is_empty(),
             "the chord latched a key in the router's pairing table: {:?}",
-            router.pressed_keys
+            router.held_keys(&test_realm())
         );
         assert!(
             deadman.borrow_mut().take_replay().is_empty(),
@@ -4015,11 +4577,12 @@ pub(crate) mod tests {
             crate::deadman::DeadManConfig::default(),
         )));
         let now = Rc::new(Cell::new(std::time::Instant::now()));
-        let mut router = InputRouter::new(crate::deadman::DeadManHook::new(
+        let mut router = InputRouter::detached(crate::deadman::DeadManHook::new(
             Rc::clone(&deadman),
             Rc::clone(&now),
             NoopHook,
         ));
+        assert!(router.bind_to(&test_realm()).is_none());
         let view = (64, 48);
         let surface = Some(view);
 
@@ -4028,7 +4591,7 @@ pub(crate) mod tests {
         for keysym in [NON_CHORD_KEYSYM, 0x061] {
             assert!(
                 router
-                    .route(
+                    .route_physical(
                         phys(SeatInputKind::Key {
                             keysym,
                             state: KeyState::Pressed
@@ -4041,13 +4604,15 @@ pub(crate) mod tests {
             );
         }
         assert!(
-            router.route(chord_press(), view, surface).is_none(),
+            router
+                .route_physical(chord_press(), view, surface)
+                .is_none(),
             "fixture check: the chord's press is withheld"
         );
 
         // Focus leaves. Every key the app is holding — and only those — is
         // released, in press order.
-        let released = router.release_physical_keys();
+        let released = router.release_physical_keys(&test_realm());
         assert_eq!(
             released
                 .iter()
@@ -4073,20 +4638,20 @@ pub(crate) mod tests {
              a missing one stays latched down in the confined app forever"
         );
         assert!(
-            router.pressed_keys.is_empty(),
+            router.held_keys(&test_realm()).is_empty(),
             "the router still believes a key is down after focus loss: {:?}",
-            router.pressed_keys
+            router.held_keys(&test_realm())
         );
 
         // Idempotent: a second focus-out (or a `handle_focus` racing the
         // synthetic releases) owes nothing.
-        assert!(router.release_physical_keys().is_empty());
+        assert!(router.release_physical_keys(&test_realm()).is_empty());
 
         // And X11's synthetic release, arriving after the drain, pairs with
         // nothing and is dropped -- the app is never told a key came up twice.
         assert!(
             router
-                .route(
+                .route_physical(
                     phys(SeatInputKind::Key {
                         keysym: NON_CHORD_KEYSYM,
                         state: KeyState::Released
@@ -4099,15 +4664,20 @@ pub(crate) mod tests {
         );
 
         // The pointer and its implicit grab are untouched: a focus change is
-        // not a new shim generation, which is what `reset` is for.
-        let mut router = InputRouter::new(NoopHook);
+        // not a new shim generation, which is what `reset_for` is for.
+        let mut router = InputRouter::detached(NoopHook);
+        assert!(router.bind_to(&test_realm()).is_none());
         assert!(router
-            .route(phys(motion(10.0, 10.0)), view, surface)
+            .route_physical(phys(motion(10.0, 10.0)), view, surface)
             .is_some());
-        assert!(router.route(phys(press()), view, surface).is_some());
-        assert!(router.release_physical_keys().is_empty());
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_some());
+        assert!(router.release_physical_keys(&test_realm()).is_empty());
         assert!(
-            router.route(phys(release()), view, surface).is_some(),
+            router
+                .route_physical(phys(release()), view, surface)
+                .is_some(),
             "releasing held keys must not drop the pointer's implicit grab"
         );
     }
@@ -4135,7 +4705,7 @@ pub(crate) mod tests {
     /// have traded one stuck key for another).
     #[test]
     fn a_focus_drain_never_speaks_for_an_agents_held_key() {
-        let mut router = InputRouter::new(NoopHook);
+        let mut router = router();
         let view = (64, 48);
         let surface = Some(view);
         const AGENT_KEY: u32 = 0xffe1; // Shift_L, an agent holding a modifier
@@ -4152,14 +4722,14 @@ pub(crate) mod tests {
             }),
         ] {
             assert!(
-                router.route(input, view, surface).is_some(),
+                route_by_origin(&mut router, input, view, surface).is_some(),
                 "fixture check: both origins' presses reach the app"
             );
         }
 
         // The human alt-tabs. Exactly one release goes out, it is the human's
         // key, and it carries the human's tag.
-        let released = router.release_physical_keys();
+        let released = router.release_physical_keys(&test_realm());
         assert_eq!(
             released
                 .iter()
@@ -4176,15 +4746,16 @@ pub(crate) mod tests {
              held key released here is an origin forgery on the wire and in the journal"
         );
         assert_eq!(
-            router.pressed_keys,
-            vec![(AGENT_KEY, Origin::Emulated)],
+            router.held_keys(&test_realm()),
+            [(AGENT_KEY, Origin::Emulated)],
             "the agent's press must survive a human's focus change, with its own tag"
         );
 
         // The agent's own release still pairs and still goes out as the
         // agent's -- the drain neither paid this debt nor forgot it.
         let delivery = router
-            .route(
+            .route_emulated(
+                &test_realm(),
                 SeatInput::emulated(SeatInputKind::Key {
                     keysym: AGENT_KEY,
                     state: KeyState::Released,
@@ -4201,46 +4772,117 @@ pub(crate) mod tests {
                 state: KeyState::Released
             }
         );
-        assert!(router.pressed_keys.is_empty());
+        assert!(router.held_keys(&test_realm()).is_empty());
     }
 
-    /// **A binding change drains everything, both origins, keys and buttons.**
+    /// **One dispatch round, two realms, two rules** (WS-E.1.6, issue #212,
+    /// acceptance criterion 2).
     ///
-    /// The sibling of [`a_focus_drain_never_speaks_for_an_agents_held_key`],
-    /// and deliberately the *opposite* filter, because the two moments are
-    /// different. Host-window focus loss changes nothing about an agent's
-    /// actuation channel — it can still release its own key on the next
-    /// request — so that drain leaves an agent's presses alone. A
-    /// `layout_focus` holder moving the output closes the channel itself:
-    /// `session::seat_target` stops naming this realm, the chokepoint's step
-    /// 5d refuses that agent's next actuation `internal`, and the release it
-    /// would have sent can no longer be delivered by anyone. An entry left
-    /// behind is stranded for good.
+    /// Realm A is bound. In the same round an agent's motion under a grant
+    /// over realm **B** is delivered against B's geometry, and the human's
+    /// motion is delivered against A's — and neither realm's seat state is
+    /// touched by the other's event. The geometries are deliberately
+    /// *different*, which is what makes the mapping assertions discriminate:
+    /// with equal surfaces every coordinate would arrive unchanged whichever
+    /// realm the router picked.
     ///
-    /// Buttons are here and not in the focus-loss drain for the same reason
-    /// the whole table is: `bind_to` is about to clear the implicit grab too,
-    /// and a grab the app thinks it holds with no release coming wedges its
-    /// pointer exactly as a latched modifier wedges its keyboard.
+    /// (Per-realm **view** sizes do not exist — one output, `scene::realms`
+    /// — so it is the two realms' committed *surfaces* that differ here,
+    /// which is exactly what `route_physical`/`route_emulated` are handed and
+    /// exactly what a router picking the wrong realm would get wrong.)
     #[test]
-    fn a_binding_change_drains_every_held_press_with_the_tag_it_recorded() {
-        let mut router = InputRouter::new(NoopHook);
+    fn a_round_delivers_the_agent_to_its_grants_realm_and_the_human_to_the_bound_one() {
+        let mut router = InputRouter::detached(NoopHook);
+        let a = crate::grants::RealmId::new("realm-a");
+        let b = crate::grants::RealmId::new("realm-b");
+        let view = (100, 80);
+        // A fills its view; B is letterboxed, placed at (30, 30).
+        let surface_a = Some((100, 80));
+        let surface_b = Some((40, 20));
+        assert!(router.bind_to(&a).is_none());
+
+        // The agent, into the realm nobody is watching, through B's placement.
+        let to_b = router
+            .route_emulated(&b, SeatInput::emulated(motion(35.0, 35.0)), view, surface_b)
+            .expect("an agent's motion must reach the realm its grant names");
+        assert_motion(&to_b, 5.0, 5.0);
+        assert_eq!(to_b.origin(), Origin::Emulated);
+
+        // The human, in the same round, into the bound realm through A's.
+        let to_a = router
+            .route_physical(phys(motion(35.0, 35.0)), view, surface_a)
+            .expect("the human's motion must reach the bound realm");
+        assert_motion(&to_a, 35.0, 35.0);
+        assert_eq!(to_a.origin(), Origin::Physical);
+
+        // Neither realm's pointer state is the other's: the agent's sprite
+        // position exists only for B, and A's implicit-grab hit test uses
+        // only what the human moved.
+        assert_eq!(router.agent_pointer(&b), Some((35.0, 35.0)));
+        assert_eq!(
+            router.agent_pointer(&a),
+            None,
+            "an agent working in B must not put a cursor position into A"
+        );
+
+        // A press in each realm pairs only in its own realm.
+        assert!(router
+            .route_emulated(&b, SeatInput::emulated(press()), view, surface_b)
+            .is_some());
+        assert!(router
+            .route_physical(phys(press()), view, surface_a)
+            .is_some());
+        assert_eq!(router.held_buttons(&a), [(0x110, Origin::Physical)]);
+        assert_eq!(router.held_buttons(&b), [(0x110, Origin::Emulated)]);
+
+        // ...and the human's release pays down only A's.
+        assert!(router
+            .route_physical(phys(release()), view, surface_a)
+            .is_some());
+        assert!(router.held_buttons(&a).is_empty());
+        assert_eq!(
+            router.held_buttons(&b),
+            [(0x110, Origin::Emulated)],
+            "a human's release in the bound realm must not end an agent's drag in another"
+        );
+    }
+
+    /// **A binding change drains the human's held presses out of the realm
+    /// being left — keys and buttons — and leaves the agent's alone.**
+    ///
+    /// The acceptance criterion of issue #212, first bullet, and the sibling
+    /// of [`a_focus_drain_never_speaks_for_an_agents_held_key`] — now with the
+    /// *same* filter rather than the opposite one, which is the change
+    /// WS-E.1.6 makes. Before it, a `layout_focus` holder moving the output
+    /// closed the agent's channel too (the session had one delivery target, and
+    /// the chokepoint refused an actuation naming any other realm), so an
+    /// agent's entry left behind was stranded for good and the drain paid it.
+    /// Seat delivery is per realm now: the agent still reaches the realm it
+    /// holds a grant over, so releasing its key here would invent an act it
+    /// never performed and put the human's tag on it.
+    ///
+    /// Buttons are drained here and not on host-window focus loss because a
+    /// realm switch really does move the human's pointer away, grab and all,
+    /// where a lost keyboard focus says nothing about a drag still in progress
+    /// (see `backend::winit`'s `handle_focus`).
+    #[test]
+    fn a_binding_change_drains_the_humans_held_presses_and_only_the_humans() {
+        let mut router = InputRouter::detached(NoopHook);
         let view = (64, 48);
         let surface = Some(view);
+        let a = crate::grants::RealmId::new("realm-a");
+        let b = crate::grants::RealmId::new("realm-b");
         const HUMAN_KEY: u32 = 0xffe3; // Control_L
         const AGENT_KEY: u32 = 0xffe1; // Shift_L
         const HUMAN_BUTTON: u32 = 0x110; // BTN_LEFT
 
-        router.bind_to(&crate::grants::RealmId::new("realm-a"));
+        assert!(router.bind_to(&a).is_none(), "nothing was bound before");
         assert!(router
-            .route(phys(motion(10.0, 10.0)), view, surface)
+            .route_physical(phys(motion(10.0, 10.0)), view, surface)
             .is_some());
         for input in [
             phys(SeatInputKind::Key {
                 keysym: HUMAN_KEY,
-                state: KeyState::Pressed,
-            }),
-            SeatInput::emulated(SeatInputKind::Key {
-                keysym: AGENT_KEY,
                 state: KeyState::Pressed,
             }),
             phys(SeatInputKind::Button {
@@ -4249,14 +4891,32 @@ pub(crate) mod tests {
             }),
         ] {
             assert!(
-                router.route(input, view, surface).is_some(),
+                router.route_physical(input, view, surface).is_some(),
                 "fixture check: every press must reach the app, or there is nothing to strand"
             );
         }
+        assert!(
+            router
+                .route_emulated(
+                    &a,
+                    SeatInput::emulated(SeatInputKind::Key {
+                        keysym: AGENT_KEY,
+                        state: KeyState::Pressed,
+                    }),
+                    view,
+                    surface,
+                )
+                .is_some(),
+            "fixture check: the agent's press must reach the app too"
+        );
 
-        // The output moves. Everything the app is holding comes back, keys
-        // first, each carrying the tag its own entry recorded.
-        let released = router.release_held();
+        // The human's attention moves. Everything *they* left holding comes
+        // back, keys first, each carrying the tag its own entry recorded, and
+        // addressed to the realm being left rather than the one gained.
+        let (losing, released) = router
+            .bind_to(&b)
+            .expect("moving the binding owes the realm being left its releases");
+        assert_eq!(losing, a, "the debt is owed to the realm the human left");
         assert_eq!(
             released
                 .iter()
@@ -4271,13 +4931,6 @@ pub(crate) mod tests {
                     }
                 ),
                 (
-                    Origin::Emulated,
-                    SeatDeliveryKind::Key {
-                        keysym: AGENT_KEY,
-                        state: KeyState::Released
-                    }
-                ),
-                (
                     Origin::Physical,
                     SeatDeliveryKind::Button {
                         button: HUMAN_BUTTON,
@@ -4285,18 +4938,44 @@ pub(crate) mod tests {
                     }
                 ),
             ],
-            "a binding change must pay the losing app every press it is holding, whoever \
-             made it, with the tag the table recorded and never a minted one (B2)"
+            "a binding change must pay the losing app every press THE HUMAN is holding, keys              before buttons, with the tag the table recorded and never a minted one (B2) --              and must not speak for the agent, which still reaches that realm"
         );
-        assert!(router.pressed_keys.is_empty() && router.pressed.is_empty());
+        assert_eq!(
+            router.held_keys(&a),
+            [(AGENT_KEY, Origin::Emulated)],
+            "the agent's press must survive the human's binding change, with its own tag"
+        );
+        assert!(
+            router.held_buttons(&a).is_empty(),
+            "the human's implicit grab in the losing realm is over"
+        );
 
-        // Idempotent, and the debt is really gone: the binding moves, and the
-        // new realm's generation starts clean.
-        assert!(router.release_held().is_empty());
-        router.bind_to(&crate::grants::RealmId::new("realm-b"));
+        // Nothing was delivered *to* the realm the human moved to.
+        assert!(router.held_keys(&b).is_empty() && router.held_buttons(&b).is_empty());
+
+        // The agent's own release still pairs in realm A, still goes out as
+        // the agent's, and reaches A while B is bound -- which is the whole
+        // point of the drain being one-sided.
+        let delivery = router
+            .route_emulated(
+                &a,
+                SeatInput::emulated(SeatInputKind::Key {
+                    keysym: AGENT_KEY,
+                    state: KeyState::Released,
+                }),
+                view,
+                surface,
+            )
+            .expect("an agent's release of its own held key must still reach its realm");
+        assert_eq!(delivery.origin(), Origin::Emulated);
+        assert!(router.held_keys(&a).is_empty());
+
+        // Idempotent, and the human's debt is really gone.
+        assert!(router.release_physical_keys(&a).is_empty());
+        assert!(router.release_physical_buttons(&a).is_empty());
         assert!(
             router
-                .route(
+                .route_physical(
                     phys(SeatInputKind::Key {
                         keysym: HUMAN_KEY,
                         state: KeyState::Released
@@ -4305,8 +4984,7 @@ pub(crate) mod tests {
                     surface,
                 )
                 .is_none(),
-            "a release arriving after the drain pairs with nothing and must not reach the \
-             realm that never saw the press"
+            "a release arriving after the drain pairs with nothing in the realm now bound,              and must not reach an app that never saw the press"
         );
     }
 
@@ -4415,28 +5093,35 @@ pub(crate) mod tests {
         // consuming gate stops -- while delivery proceeds through the
         // inner hook untouched.
         let t0 = std::time::Instant::now();
-        let presence = Rc::new(RefCell::new(PhysicalPresence::new()));
+        let presence = Rc::new(RefCell::new(PhysicalPresenceMap::new()));
         let clock = Rc::new(Cell::new(t0));
         let consume = Rc::new(Cell::new(false));
         let log = Rc::new(RefCell::new(Vec::new()));
-        let mut router = InputRouter::new(PresenceHook::new(
+        let mut router = InputRouter::new(
             Rc::clone(&presence),
             Rc::clone(&clock),
             RecordingHook {
                 log: Rc::clone(&log),
                 consume: Rc::clone(&consume),
             },
-        ));
+        );
+        // The handle the kernel gets is the very map this test holds — the
+        // property `Runtime::new` relies on (`InputRouter::presence`).
+        assert!(Rc::ptr_eq(&router.presence(), &presence));
+        assert!(router.bind_to(&test_realm()).is_none());
+        let bound = test_realm();
         let view = (64, 48);
         let surface = Some((64, 48));
 
         // A delivered physical motion is observed and recorded at the
         // clock cell's injected instant.
         assert!(router
-            .route(phys(motion(2.0, 2.0)), view, surface)
+            .route_physical(phys(motion(2.0, 2.0)), view, surface)
             .is_some());
-        assert!(presence.borrow().owns_target(t0));
-        assert!(!presence.borrow().owns_target(t0 + PHYSICAL_HOLD_WINDOW));
+        assert!(presence.borrow().owns_target(Some(&bound), t0));
+        assert!(!presence
+            .borrow()
+            .owns_target(Some(&bound), t0 + PHYSICAL_HOLD_WINDOW));
 
         // A consumed event still reaches the tap (observe precedes the
         // gate), at the advanced clock.
@@ -4444,18 +5129,18 @@ pub(crate) mod tests {
         clock.set(t1);
         consume.set(true);
         assert!(router
-            .route(phys(motion(3.0, 3.0)), view, surface)
+            .route_physical(phys(motion(3.0, 3.0)), view, surface)
             .is_none());
-        assert!(presence.borrow().owns_target(t1));
+        assert!(presence.borrow().owns_target(Some(&bound), t1));
 
         // Emulated events pass the tap without arming it.
         let t2 = t1 + std::time::Duration::from_secs(10);
         clock.set(t2);
         consume.set(false);
         assert!(router
-            .route(SeatInput::emulated(scroll()), view, surface)
+            .route_emulated(&test_realm(), SeatInput::emulated(scroll()), view, surface)
             .is_some());
-        assert!(!presence.borrow().owns_target(t2));
+        assert!(!presence.borrow().owns_target(Some(&bound), t2));
 
         // The inner hook saw everything, in observe-then-gate order.
         assert_eq!(
@@ -4468,6 +5153,85 @@ pub(crate) mod tests {
                 ("observe", Origin::Emulated),
                 ("gate", Origin::Emulated),
             ]
+        );
+    }
+
+    /// **A realm the human's hand has left stops being "owned" — whether it
+    /// was left by a bind change or by dying.**
+    ///
+    /// `PhysicalPresenceMap::forget`'s own doc says an entry is dropped "at
+    /// exactly the moments the router drains that realm's held physical
+    /// presses". `bind_to` was one of those moments and the realm death funnel
+    /// was the other, and only the first was wired: a human mid-drag when a
+    /// shim died left a held button recorded against a realm with no app,
+    /// which `owns_target` honours for [`PHYSICAL_HOLD_CEILING`] — a full
+    /// minute in which every agent actuating there is refused `preempted` with
+    /// nobody touching anything.
+    ///
+    /// It is unobservable in today's chokepoint only because step 5a refuses a
+    /// seat-delivered use over a dead realm `no_surface` before step 5c is
+    /// reached. That is an accident of step order, not a property, so both
+    /// moments now run through `InputRouter::forget_presence_of` and neither
+    /// is a caller's obligation.
+    ///
+    /// A **held button** rather than bare motion in both halves, deliberately:
+    /// motion alone expires after [`PHYSICAL_HOLD_WINDOW`] (500 ms) and would
+    /// make the assertion pass on the clock instead of on the forget.
+    #[test]
+    fn a_realm_the_human_has_left_is_not_owned_by_the_human_whether_it_was_switched_or_died() {
+        let t0 = std::time::Instant::now();
+        let much_later = t0 + PHYSICAL_HOLD_WINDOW * 4;
+        let view = (64, 48);
+        let surface = Some((64, 48));
+        let (a, b) = (
+            crate::grants::RealmId::new("realm-a"),
+            crate::grants::RealmId::new("realm-b"),
+        );
+
+        // (1) The realm dies under a held button.
+        let presence = Rc::new(RefCell::new(PhysicalPresenceMap::new()));
+        let mut router = InputRouter::new(Rc::clone(&presence), Rc::new(Cell::new(t0)), NoopHook);
+        assert!(router.bind_to(&a).is_none());
+        assert!(router
+            .route_physical(phys(motion(2.0, 2.0)), view, surface)
+            .is_some());
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_some());
+        assert!(
+            presence.borrow().owns_target(Some(&a), much_later),
+            "fixture check: a held button owns its realm well past the motion window, or \
+             the assertion below would pass on the clock"
+        );
+        assert!(router.reset_for(&a));
+        assert!(
+            !presence.borrow().owns_target(Some(&a), much_later),
+            "a dead realm's app can never pay the release down, so its presence must die \
+             with it rather than refusing every agent there for the stale-hold ceiling"
+        );
+
+        // (2) The binding moves away under a held button.
+        let presence = Rc::new(RefCell::new(PhysicalPresenceMap::new()));
+        let mut router = InputRouter::new(Rc::clone(&presence), Rc::new(Cell::new(t0)), NoopHook);
+        assert!(router.bind_to(&a).is_none());
+        assert!(router
+            .route_physical(phys(motion(2.0, 2.0)), view, surface)
+            .is_some());
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_some());
+        assert!(presence.borrow().owns_target(Some(&a), much_later));
+        let (losing, owed) = router.bind_to(&b).expect("the binding moved");
+        assert_eq!(losing, a);
+        assert!(
+            !owed.is_empty(),
+            "fixture check: the losing realm is owed its release, which is the act the \
+             forget travels with"
+        );
+        assert!(
+            !presence.borrow().owns_target(Some(&a), much_later),
+            "the human's next release is addressed to realm-b, so realm-a's held set can \
+             never be paid down and must not keep it owned"
         );
     }
 }

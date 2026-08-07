@@ -142,6 +142,18 @@ opposite — it is session-wide, because an off-switch scoped to whatever you
 happen to be looking at is not an off-switch. The narrowing of `preempted` is
 published as a limit ([limits](limits.md)).
 
+**...and for the two layout verbs only, you can suspend it yourself.** Tap
+**Super** and, for about a second, a client holding `layout_focus` or
+`layout_arrange` is not refused `preempted` — once. That is not you granting
+anything: the client could already do it, and what you withdrew was a courtesy
+the core was extending to your own typing. It exists because otherwise a shell
+running *inside* a realm can never switch realms — the Enter that sends the
+request is the physical input that forbids it. The core eats that key
+everywhere, no app ever sees it, and while the window is open a small marker
+sits just below the trusted band. A focus change with no marker up was not
+yours. The costs, including that either of two layout holders may take the
+press, are in [limits](limits.md).
+
 ## The dead-man switch
 
 Hold Escape for one second. Every live grant is revoked.

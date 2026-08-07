@@ -498,7 +498,7 @@ Preempted, ConsentHeld, NoSurface, OperationFailed, AtCapacity).
 | `expired` | 1 | the grant's expiry passed; checked on use and by a proactive timer |
 | `revoked` | 2 | revoked by hold-Esc, panel, or policy; effective on the very next request |
 | `rate_limited` | 3 | the token bucket is empty; `retry_after_ms` hints the refill |
-| `preempted` | 4 | physical human input owns the target right now |
+| `preempted` | 4 | physical human input owns the target right now — **conditional for the two layout verbs**, see below |
 | `consent_held` | 5 | the principal's **own** pending petition has a prompt up; that principal's actuation is refused (never delivered to the app) until the prompt closes — other principals' grants are unaffected |
 | `no_surface` | 6 | the realm has no surface (its shim crashed or exited); never a stale frame |
 | `internal` | 7 | server-side failure during this use (renderer, memfd, delivery) |
@@ -545,6 +545,30 @@ while that principal's consent prompt is up, is exactly the attention-shaped
 hazard those two codes exist for, so they are no longer actuation-only. They
 still refuse neither a capture (observation is concurrent by design) nor a
 launch.
+
+**`preempted` is conditional for the layout verbs, and only for them.** A server
+MAY define an attention signal by which the human states that their *own* hand is
+off the input — [`vitrin_principal.attention`](02-vitrin_principal.md#attention),
+version 2 — and while that signal is live for a principal, that principal's
+[`layout_focus`](17-vitrin_layout_focus.md) / [`layout_arrange`](18-vitrin_layout_arrange.md)
+use is not refused `preempted`. It exists because a human at a shell running
+inside a realm otherwise cannot ask it to change the layout: the keystroke that
+sends the request is the physical input that forbids it. The exemption is
+deliberately narrow in three ways a client should not misread:
+
+- **`consent_held` is never conditional in the same way.** A prompt up means the
+  human is answering a security question, and no signal about their hand lifts it.
+- **The two actuation verbs are never exempted at all.** A human's hand still
+  mutes an agent actuating into the realm the hand is in, and no human gesture can
+  lift that.
+- **The signal delegates nothing.** Everything the client may do afterwards, it
+  could already do; what changes is one refusal, once.
+
+The consequence a client must accept is that **two identical layout requests can
+be answered differently by server state the client cannot read**. An agent
+reading only its own journal can no longer reconstruct why one `focus` landed
+and an identical one did not. `preempted` used to mean one thing; it now means
+"the human's hand owns the target, and the human has not said otherwise".
 
 **`capacity` is a cross-principal side channel, and the only one here.** Every
 other code in this table answers from the asking principal's *own* grant:

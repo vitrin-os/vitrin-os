@@ -69,6 +69,7 @@ static int sink = 0;
     X(vitrin_handshake_evt_done)                                             \
     X(vitrin_principal_req_get_realm)                                        \
     X(vitrin_principal_evt_bound)                                            \
+    X(vitrin_principal_evt_attention)                                        \
     X(vitrin_realm_req_request_grant)                                        \
     X(vitrin_grant_req_get_launcher)                                         \
     X(vitrin_grant_req_get_layout_focus)                                     \

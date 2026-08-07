@@ -52,6 +52,12 @@ GOLDEN_GET_REALM = bytes(
     [7, 0, 0, 0, 20, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, ord("a"), ord("b"), ord("c"), 0]
 )
 
+# vitrin_principal.attention{} on object 2 — a bare 8-byte header and no
+# payload at all. `attention` (WS-E.1.7) carries no arguments forever, and it
+# is event opcode 1, appended after `bound`: the vector pins the emptiness and
+# the opcode together, because a reorder would decode as a truncated `bound`.
+GOLDEN_ATTENTION = bytes([2, 0, 0, 0, 8, 0, 1, 0])
+
 # vitrin_actuator_pointer.move{x: -1, y: 2} on object 3
 # (-1 as two's-complement little-endian i32 pins signedness + endianness).
 GOLDEN_MOVE = bytes([3, 0, 0, 0, 16, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 2, 0, 0, 0])

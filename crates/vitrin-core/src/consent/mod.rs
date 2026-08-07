@@ -1155,7 +1155,7 @@ pub(crate) mod tests {
 
         // Capture path vs human-visible path off the same scene + prompt.
         let capture = scene.compose(W, H);
-        let human = crate::backend::compose_human_visible(&scene, &mut consent, W, H);
+        let human = crate::backend::compose_human_visible(&scene, &mut consent, W, H, false);
 
         // The frame is in the human output...
         let card = render::rasterize(&prompt_fixture());
@@ -1211,6 +1211,7 @@ pub(crate) mod tests {
             &mut consent,
             W,
             H,
+            false,
         );
         let secret = indicator.color();
 

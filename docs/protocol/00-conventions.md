@@ -521,7 +521,12 @@ Which codes a given use can draw is not uniform: `preempted` and
 `capacity` is launch-only, and a launch is
 never refused `no_surface` (a vacant realm is the state `realm_launch` exists
 to leave). The single voice is the invariant; the applicable set is per-verb
-and is stated on each facet's page.
+and is stated on each facet's page. One code is also **conditional**:
+`preempted` on the two layout verbs is lifted while the human's attention
+signal ([`vitrin_principal.attention`](02-vitrin_principal.md#attention),
+version 2) is live for that principal — so an agent cannot reconstruct from its
+own journal why one layout request landed and an identical one did not (see
+[`vitrin_grant.refusal`](04-vitrin_grant.md#refusal)).
 
 **Shim fallback** — `vitrin_shim_surface.buffer_done(buffer_id, status)` with a
 non-`released` status is the recoverable dmabuf-import-fallback path
@@ -748,8 +753,29 @@ offering a lower integer — convergence by descending reoffer, bounded by the
 client's own maximum.
 
 **The two versions, and what separates them.** Version 1 is the original wire.
-Version 2 appends the `realm_launch` verb bit, `vitrin_grant.get_launcher`,
-and `vitrin_launcher`'s `launch`/`launched` — nothing else. A version-1
+Version 2 appends the `realm_launch` verb bit and these messages, and nothing
+else:
+
+| interface | message |
+|---|---|
+| `vitrin_principal` | event `attention` |
+| `vitrin_grant` | requests `get_launcher`, `get_layout_focus`, `get_layout_arrange` |
+| `vitrin_launcher` | request `launch`, event `launched` |
+| `vitrin_layout_focus` | request `focus` |
+| `vitrin_layout_arrange` | request `set_fullscreen` |
+
+> **This paragraph had drifted, and the correction is recorded rather than
+> silently applied.** It read "`vitrin_grant.get_launcher`, and
+> `vitrin_launcher`'s `launch`/`launched` — nothing else" until WS-E.1.7. That
+> was already false before this issue touched it: WS-E.1.4 landed four more
+> `since="2"` messages (`get_layout_focus`, `get_layout_arrange`, `focus`,
+> `set_fullscreen`) without updating it, and WS-E.1.7 adds a fifth
+> (`attention`). A closed enumeration nobody re-reads when appending is a
+> tripwire that only ever fires late; the growth rules below now say in as many
+> words that this table is normative and must be extended with every `since=`
+> addition.
+
+A version-1
 connection is served exactly as before: it never sees a `since="2"` event, and
 sending a `since="2"` opcode on it is fatal `invalid_opcode`. One thing is
 deliberately *not* version-gated: a **verb bit**. The `verb` bitfield is a
@@ -774,6 +800,13 @@ recoverable).
 
 - **New messages** are appended with `since` attributes. Opcodes are implicit
   document order; **requests and events are numbered separately from 0**.
+- **The version enumeration in [§7.3](#73-versioning-and-negotiation) is
+  normative and MUST be extended in the same edit** as any `since=` addition.
+  It is a closed list of what separates one protocol version from another, so a
+  message appended without it makes the document state something false about
+  the wire — and, being a list nobody re-reads while appending, it goes stale
+  silently and is discovered late. It has gone stale exactly once, and that is
+  recorded there rather than quietly fixed.
 - **Enum entries** are appended (values are immutable; a `deprecated-since`
   mark never removes). Entries carry **no `since`**: an enum's wire validation
   is one mask or membership table with no version dimension, so a
@@ -901,6 +934,7 @@ record of *how* it arrived, which is what a later seam copies.
 | `actuate_key` verb | new appended entry in the `verb` bitfield + a later key-actuation facet | version-0 verb bits are untouched; a new power-of-two bit and its facet are additive — see the landed `realm_launch` row for the shape, including that the bit's *value* comes from the repo-wide allocation registry rather than from the next unused-looking power of two |
 | serving `observe_cursor` | no new message: the verb bit already exists and widens what the *existing* `frame_ready` composites for a grant that holds it | version 0 refuses the verb `unsupported`, so beginning to serve it changes no signature and no version-0 client's behavior (a client that never petitions for it sees nothing new) |
 | ~~layout facet~~ **(landed, version 2)** | **two** `since="2"` structural mints on `vitrin_grant` — `get_layout_focus` and `get_layout_arrange` — minting [`vitrin_layout_focus`](17-vitrin_layout_focus.md) and [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md) | `request_grant`'s five `new_id` arguments are frozen, so neither facet could be co-minted. This row said "a layout facet" singular and **understated the seam**: `@verb` is one value per interface, so one facet could declare only one of the two verbs, and D-018(3) requires them independently attenuable. Corrected here rather than silently, because the row was the record |
+| **human attention signal** *(landed, version 2)* | one `since="2"` argument-free event `attention` on [`vitrin_principal`](02-vitrin_principal.md#attention), and **no verb bit** | Appended to the one object whose scope is the connection, which is the subject's scope: the event is about the *human*, not about this principal's authority. Purely additive — a version-1 connection never receives it, and no signature changed. **No verb bit is allocated, positively**: a grantable "receive the human's attention key" verb would put a delegation framing on a signal that delegates nothing, and delivery is instead filtered to principals already holding a layout verb, which is what keeps the wire silent for everyone else rather than opening a keystroke-timing oracle. It makes `preempted` *conditional* for the two layout verbs — the first conditional refusal code in this protocol, and the cost is stated at [`vitrin_grant.refusal`](04-vitrin_grant.md#refusal) rather than left to be discovered |
 | per-principal pointer delivery | new `since="2"` sibling events on `vitrin_shim_seat` that name the principal alongside the coordinates | `motion`/`button`/`scroll` signatures are immutable, so delivery grows by sibling; each new event still ends with `origin`, satisfying B2 structurally, and a v0-only shim keeps working |
 | IME physical text | reuse of the existing `origin` tag on `vitrin_shim_seat.text` | human input-method text arrives as `text` with `origin=physical`; the origin tag exists from day one, so the new source is additive with no signature change |
 

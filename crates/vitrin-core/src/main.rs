@@ -69,6 +69,16 @@
 //! prompt (no display, no physical input device) and so is refused with
 //! `--consent=interactive` at startup; auto-approve is the headless policy.
 
+/// The human's attention key (WS-E.1.7, issue #232): the core's **second**
+/// physical chord — a tapped, consumed Super that opens a short, single-use
+/// window in which the two layout verbs are not refused `preempted`, and that
+/// delivers one argument-free `vitrin_principal.attention` event to every
+/// principal holding layout authority. It **delegates nothing**: it is the
+/// human stating that their own hand is off the app, which withdraws a
+/// transient courtesy, and every authority exercised afterwards came from a
+/// grant approved on a consent card. Kept structurally apart from `deadman`
+/// at every level — see that module's "neighbour, never sibling" table.
+mod attention;
 mod backend;
 /// Capture-frame mechanics (P1.3.6): the sealed-memfd pixel path behind
 /// `vitrin_view.frame_ready`. Pure mechanics — the authority decision on
@@ -375,6 +385,24 @@ USAGE:
                                 milliseconds. Default: 1000 (accepted range
                                 250..=10000). Nested mode only: headless has
                                 no physical input device, structurally.
+    vitrind [--attention-chord KEY]
+                                Key for the human's ATTENTION signal: tapping
+                                it opens a short, single-use window in which
+                                a layout_focus/layout_arrange holder is not
+                                refused `preempted`, and delivers one
+                                argument-free `attention` event to every such
+                                holder. Default: super (also accepted:
+                                rsuper). The key is CONSUMED -- no confined
+                                app ever sees it. It DELEGATES NOTHING: it is
+                                the human saying their own hand is off the
+                                app, and every authority exercised afterwards
+                                came from a grant approved on a consent card.
+                                Startup FAILS on an unknown key, a key this
+                                build's intake cannot deliver, or a key equal
+                                to --dead-man-chord. The window's length is
+                                fixed and deliberately not configurable: it
+                                is a security parameter, not an ergonomics
+                                one.
     vitrind --agent-cursor      `--headless` ONLY: also composite the agent
                                 cursor sprite into this run's human-visible
                                 output. Nested mode needs no flag -- a human
@@ -439,6 +467,11 @@ enum Action {
         shim: Option<PathBuf>,
         capture_dump: Option<PathBuf>,
         dead_man: DeadManConfig,
+        /// The `--attention-chord` key (WS-E.1.7): the core's second physical
+        /// chord. Resolved and validated at parse time exactly as
+        /// `dead_man.chord` is, including the cross-flag refusal that the two
+        /// may not name the same key.
+        attention: attention::AttentionChord,
     },
     RunHeadless {
         size: (u32, u32),
@@ -466,6 +499,14 @@ enum Action {
         /// build still reads this to name the synthesized trigger's
         /// chord/hold (issue #109) -- see `backend::headless::run`.
         dead_man: DeadManConfig,
+        /// The `--attention-chord` key (WS-E.1.7), validated here for the same
+        /// reason `dead_man` is: both modes must accept or refuse the same
+        /// command line. A plain headless build has no physical input device
+        /// to tap it on, so the signal never opens; a
+        /// `physical-input-injector` build stacks the hook and the injector's
+        /// `attention` line presses **this** chord through the production
+        /// intake, which is what gives the mechanism a mock-free gate.
+        attention: attention::AttentionChord,
         /// `--agent-cursor` (D-019): composite the agent cursor sprite into
         /// this run's human-visible output.
         ///
@@ -551,6 +592,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut capture_dump: Option<PathBuf> = None;
     let mut chord: Option<deadman::Chord> = None;
     let mut hold_ms: Option<u64> = None;
+    let mut attention_chord: Option<attention::AttentionChord> = None;
     let mut agent_cursor = false;
     #[cfg(feature = "consent-injector")]
     let mut consent_injector_fd: Option<std::os::fd::RawFd> = None;
@@ -619,6 +661,12 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 )?;
                 set_hold(&mut hold_ms, value)?;
             }
+            "--attention-chord" => {
+                let value = args
+                    .next()
+                    .ok_or("`--attention-chord` requires a key (e.g. `--attention-chord super`)")?;
+                set_attention_chord(&mut attention_chord, value)?;
+            }
             // Idempotent rather than "given more than once" -- a boolean
             // switch repeated says the same thing twice, unlike a valued flag
             // where the second value would have to win or lose silently.
@@ -673,6 +721,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_chord(&mut chord, value)?;
                 } else if let Some(value) = other.strip_prefix("--dead-man-hold=") {
                     set_hold(&mut hold_ms, value)?;
+                } else if let Some(value) = other.strip_prefix("--attention-chord=") {
+                    set_attention_chord(&mut attention_chord, value)?;
                 } else {
                     return Err(format!("unknown argument `{other}`"));
                 }
@@ -694,6 +744,28 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         dead_man = dead_man
             .with_hold_ms(ms)
             .map_err(|err| format!("`--dead-man-hold`: {err}"))?;
+    }
+    let attention = attention_chord.unwrap_or_else(|| {
+        attention::AttentionChord::parse(attention::DEFAULT_CHORD)
+            .expect("the default attention chord is in the vocabulary")
+    });
+    // **The two core-owned chords may not be the same key.** Unreachable
+    // today, and checked anyway: the dead-man vocabulary excludes every
+    // modifier and the attention vocabulary is nothing but modifiers, so they
+    // are disjoint by construction (WS-E.1.7 decision 1) -- but the day an
+    // edit to either list breaks that disjointness is the day one of the two
+    // keys silently stops working, and one of them is the human's off-switch.
+    // Refusing at startup is the same fail-closed posture `Chord::parse` takes
+    // against a key intake cannot deliver.
+    if attention.keysym() == dead_man.chord.keysym() {
+        return Err(format!(
+            "`--attention-chord` `{}` names the same key as `--dead-man-chord` `{}`: the \
+             core's two physical chords must be distinct, or the one that is gated first \
+             silently swallows the other (the dead-man switch is the human's off-switch \
+             and must never be the loser of that race)",
+            attention.name(),
+            dead_man.chord.name()
+        ));
     }
 
     // The injector channel's two companion refusals (issue #138), taken at
@@ -771,6 +843,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             shim,
             capture_dump,
             dead_man,
+            attention,
         }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
         // A headless core has no display to draw the consent prompt on and no
@@ -813,6 +886,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             shim,
             capture_dump,
             dead_man,
+            attention,
             agent_cursor,
             #[cfg(feature = "consent-injector")]
             consent_injector_fd,
@@ -904,12 +978,35 @@ fn set_chord(slot: &mut Option<deadman::Chord>, value: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Record the `--attention-chord` key (WS-E.1.7), rejecting a repeat flag and
+/// any key this build's input intake could not deliver.
+///
+/// The `--dead-man-chord` precedent exactly, including naming every accepted
+/// key rather than saying "unknown" — the vocabulary is two words long and an
+/// operator who guessed `meta` or `win` should be told what to write. The
+/// *collision* check against the dead-man chord is not here: it needs both
+/// halves resolved, so it lives in `parse_args` beside the other cross-flag
+/// refusals.
+fn set_attention_chord(
+    slot: &mut Option<attention::AttentionChord>,
+    value: &str,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--attention-chord` given more than once".into());
+    }
+    let chord = attention::AttentionChord::parse(value).map_err(|err| {
+        let accepted: Vec<&str> = attention::AttentionChord::vocabulary().collect();
+        format!(
+            "`--attention-chord` `{value}`: {err} (accepted: {})",
+            accepted.join(", ")
+        )
+    })?;
+    *slot = Some(chord);
+    Ok(())
+}
+
 /// Record the `--dead-man-hold` duration in milliseconds, rejecting a repeat
-/// flag and a value that is not a plain non-negative integer. The *range* is
-/// checked once both halves are resolved, by
-/// [`DeadManConfig::with_hold_ms`](deadman::DeadManConfig::with_hold_ms), so
-/// the bounds and their justification live next to each other rather than
-/// being restated here.
+/// flag and a value that is not a plain non-negative integer.
 fn set_hold(slot: &mut Option<u64>, value: &str) -> Result<(), String> {
     if slot.is_some() {
         return Err("`--dead-man-hold` given more than once".into());
@@ -1024,6 +1121,7 @@ fn main() -> ExitCode {
             shim,
             capture_dump,
             dead_man,
+            attention,
         } => {
             init_tracing();
             run_session(
@@ -1036,7 +1134,7 @@ fn main() -> ExitCode {
                 // `--consent-injector-fd` is refused with `--nested` at parse
                 // time (issue #138), so a nested run is never instrumented.
                 false,
-                move |seed| backend::winit::run(dead_man, seed),
+                move |seed| backend::winit::run(dead_man, attention, seed),
             )
         }
         Action::RunHeadless {
@@ -1054,6 +1152,7 @@ fn main() -> ExitCode {
             // `dead-man-injector` build reads it to name the chord/hold a
             // SIGUSR1-synthesized trigger reports (issue #109).
             dead_man,
+            attention,
             agent_cursor,
             #[cfg(feature = "consent-injector")]
             consent_injector_fd,
@@ -1077,6 +1176,7 @@ fn main() -> ExitCode {
                     backend::headless::run(
                         size,
                         dead_man,
+                        attention,
                         agent_cursor,
                         #[cfg(feature = "consent-injector")]
                         consent_injector_fd,
@@ -1995,7 +2095,8 @@ mod tests {
                 realm: None,
                 shim: None,
                 capture_dump: None,
-                dead_man: DeadManConfig::default()
+                dead_man: DeadManConfig::default(),
+                attention: default_attention()
             })
         );
     }
@@ -2017,6 +2118,7 @@ mod tests {
                 shim: None,
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
+                attention: default_attention(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
@@ -2042,6 +2144,7 @@ mod tests {
                 shim: None,
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
+                attention: default_attention(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
@@ -2060,6 +2163,7 @@ mod tests {
                 shim: None,
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
+                attention: default_attention(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
@@ -2088,6 +2192,7 @@ mod tests {
                     shim: None,
                     capture_dump: None,
                     dead_man: DeadManConfig::default(),
+                    attention: default_attention(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -2104,7 +2209,8 @@ mod tests {
                 realm: None,
                 shim: None,
                 capture_dump: None,
-                dead_man: DeadManConfig::default()
+                dead_man: DeadManConfig::default(),
+                attention: default_attention()
             })
         );
     }
@@ -2388,6 +2494,7 @@ mod tests {
                 shim: None,
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
+                attention: default_attention(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
@@ -2419,6 +2526,7 @@ mod tests {
                     shim: None,
                     capture_dump: None,
                     dead_man: DeadManConfig::default(),
+                    attention: default_attention(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -2440,7 +2548,8 @@ mod tests {
                 realm: None,
                 shim: None,
                 capture_dump: None,
-                dead_man: DeadManConfig::default()
+                dead_man: DeadManConfig::default(),
+                attention: default_attention()
             })
         );
     }
@@ -2475,6 +2584,7 @@ mod tests {
                     shim: None,
                     capture_dump: None,
                     dead_man: DeadManConfig::default(),
+                    attention: default_attention(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -2497,7 +2607,8 @@ mod tests {
                 realm: Some(PathBuf::from("/tmp/realm.toml")),
                 shim: None,
                 capture_dump: None,
-                dead_man: DeadManConfig::default()
+                dead_man: DeadManConfig::default(),
+                attention: default_attention()
             })
         );
     }
@@ -2547,6 +2658,7 @@ mod tests {
                     shim: Some(PathBuf::from("/usr/lib/vitrin/vitrin-shim")),
                     capture_dump: None,
                     dead_man: DeadManConfig::default(),
+                    attention: default_attention(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -2564,7 +2676,8 @@ mod tests {
                 realm: None,
                 shim: Some(PathBuf::from("/opt/vitrin/vitrin-shim")),
                 capture_dump: None,
-                dead_man: DeadManConfig::default()
+                dead_man: DeadManConfig::default(),
+                attention: default_attention()
             })
         );
     }
@@ -2612,6 +2725,7 @@ mod tests {
                     shim: None,
                     capture_dump: Some(PathBuf::from("/tmp/internal.rgba")),
                     dead_man: DeadManConfig::default(),
+                    attention: default_attention(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -2629,7 +2743,8 @@ mod tests {
                 realm: None,
                 shim: None,
                 capture_dump: Some(PathBuf::from("/tmp/x.rgba")),
-                dead_man: DeadManConfig::default()
+                dead_man: DeadManConfig::default(),
+                attention: default_attention()
             })
         );
     }
@@ -3113,6 +3228,7 @@ mod tests {
                     shim: None,
                     capture_dump: None,
                     dead_man: DeadManConfig::default(),
+                    attention: default_attention(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -3179,6 +3295,7 @@ mod tests {
                 shim: None,
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
+                attention: default_attention(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
@@ -3275,6 +3392,13 @@ mod tests {
         assert!(parse_args(["--nested", "extra"]).is_err());
     }
 
+    /// The default attention chord, for the `Action` literals these tests
+    /// compare against. Resolved through the real parser, so a change to the
+    /// default is a change these tests follow rather than one they pin twice.
+    fn default_attention() -> attention::AttentionChord {
+        attention::AttentionChord::parse(attention::DEFAULT_CHORD).expect("the default parses")
+    }
+
     /// The dead-man configuration this run resolved, whichever mode it named.
     fn dead_man_of(action: &Action) -> DeadManConfig {
         match action {
@@ -3302,6 +3426,126 @@ mod tests {
                 &parse_args(["--headless", "--consent=auto-approve"]).expect("defaults parse")
             ),
             config
+        );
+    }
+
+    /// The attention chord this run resolved, whichever mode it named.
+    fn attention_of(action: &Action) -> attention::AttentionChord {
+        match action {
+            Action::RunNested { attention, .. } | Action::RunHeadless { attention, .. } => {
+                *attention
+            }
+            other => panic!("not a run action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_attention_key_defaults_to_super_and_parses_both_spellings() {
+        // WS-E.1.7's default, pinned for the same reason the dead-man's is: a
+        // session that came up with a different attention key than the one
+        // documented is a surprise at exactly the moment the human is trying
+        // to find out why their switch does nothing.
+        assert_eq!(
+            attention_of(&parse_args(["--nested"]).expect("defaults parse")).name(),
+            "super"
+        );
+        for args in [
+            vec!["--nested", "--attention-chord", "rsuper"],
+            vec!["--nested", "--attention-chord=rsuper"],
+        ] {
+            let chord =
+                attention_of(&parse_args(args.clone()).unwrap_or_else(|e| panic!("{args:?}: {e}")));
+            assert_eq!(chord.name(), "rsuper");
+            // The other half keeps its default rather than being reset.
+            assert_eq!(dead_man_of(&parse_args(args).unwrap()).chord.name(), "esc");
+        }
+        // Both modes accept the same command line, exactly as they do for the
+        // dead-man switch: a shared alias must not behave differently.
+        assert_eq!(
+            attention_of(
+                &parse_args([
+                    "--headless",
+                    "--consent=auto-approve",
+                    "--attention-chord=rsuper"
+                ])
+                .expect("headless parses it too")
+            )
+            .name(),
+            "rsuper"
+        );
+    }
+
+    #[test]
+    fn a_session_never_comes_up_with_an_attention_key_that_cannot_fire() {
+        // The three startup refusals WS-E.1.7 requires, each with a message
+        // naming what was wrong. An attention key that silently never fires is
+        // the same fail-open configuration trap `Chord::parse` exists to
+        // prevent -- one gesture milder, and just as invisible.
+
+        // (1) Not in the vocabulary. The message must list what is.
+        let err = parse_args(["--nested", "--attention-chord", "f13"])
+            .expect_err("`f13` is not an attention key");
+        assert!(err.contains("f13"), "{err}");
+        assert!(err.contains("unknown attention key"), "{err}");
+        assert!(err.contains("super") && err.contains("rsuper"), "{err}");
+
+        // (2) A key `keysym_is_intakeable` rejects. Unreachable through the
+        // CLI while the vocabulary and the intake table agree -- which is the
+        // point -- so it is asserted at the parser that owns the check, on the
+        // same `AttentionChordError` the CLI renders.
+        assert_eq!(
+            attention::AttentionChord::parse("f13"),
+            Err(attention::AttentionChordError::Unknown)
+        );
+        assert!(attention::AttentionChord::vocabulary()
+            .all(|name| attention::AttentionChord::parse(name).is_ok()));
+
+        // (3) The two core-owned chords may not name the same key. Unreachable
+        // today (the vocabularies are disjoint by construction) and refused
+        // anyway: the day an edit makes it reachable is the day one of the two
+        // keys silently stops working, and one of them is the off-switch. The
+        // spelling the issue names is exercised, and it fails at (1) first --
+        // `esc` is not an attention key -- which is itself the disjointness.
+        let err = parse_args([
+            "--nested",
+            "--attention-chord",
+            "esc",
+            "--dead-man-chord",
+            "esc",
+        ])
+        .expect_err("`esc` is not an attention key");
+        assert!(err.contains("attention-chord"), "{err}");
+
+        // ...and the collision check itself, reached the only way it can be:
+        // by asking the parser's own comparison. If a later edit puts a shared
+        // key in both vocabularies, this is what turns red.
+        let dead: Vec<u32> = deadman::Chord::vocabulary()
+            .map(|n| deadman::Chord::parse(n).unwrap().keysym())
+            .collect();
+        for name in attention::AttentionChord::vocabulary() {
+            let keysym = attention::AttentionChord::parse(name).unwrap().keysym();
+            assert!(
+                !dead.contains(&keysym),
+                "`{name}` is in both chord vocabularies -- the startup collision refusal is \
+                 now reachable, and the two chords can no longer both work"
+            );
+        }
+    }
+
+    #[test]
+    fn the_attention_chord_flag_is_refused_twice_and_bare() {
+        let err = parse_args([
+            "--nested",
+            "--attention-chord",
+            "super",
+            "--attention-chord",
+            "rsuper",
+        ])
+        .expect_err("a valued flag repeated must not silently pick a winner");
+        assert!(err.contains("given more than once"), "{err}");
+        assert!(
+            parse_args(["--nested", "--attention-chord"]).is_err(),
+            "a bare flag takes the next argument; there is none"
         );
     }
 

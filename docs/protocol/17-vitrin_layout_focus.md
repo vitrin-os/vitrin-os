@@ -140,7 +140,7 @@ these arrives as `vitrin_grant.refused(layout_focus, code, retry_after_ms)`:
 | `revoked` | the grant was revoked |
 | `rate_limited` | the grant's token bucket is empty; `retry_after_ms` > 0 |
 | `no_surface` | the granted realm has no live view to show |
-| `preempted` | physical human input owns the target right now |
+| `preempted` | physical human input owns the target right now — **conditional**, see below |
 | `consent_held` | this principal's own consent prompt is up |
 | `internal` | a server-side failure carrying out the binding |
 
@@ -159,6 +159,18 @@ actuation-shaped hazard those codes exist for. (The consent surface is
 untouchable by any arrangement whatever these gates do — that is
 [ordering invariant 3](00-conventions.md#14-scene-authority-arrangement-ordering-cursors),
 enforced elsewhere and unconditionally. Both exist.)
+
+**`preempted` is conditional for this verb**, and only for the two layout verbs.
+A server MAY define an attention signal by which the human states that their own
+hand is off the input — [`vitrin_principal.attention`](02-vitrin_principal.md#attention),
+version 2 — and while that signal is live for a principal, that principal's
+`focus` is not refused `preempted`. `consent_held` is never conditional in the
+same way, and the two actuation verbs are never exempted at all: a human's hand
+still mutes an agent actuating into the realm the hand is in. What a client must
+accept in exchange is that two identical `focus` requests can be answered
+differently by server state it cannot read — an agent reading only its own
+journal can no longer reconstruct why one landed and one did not. See
+[`vitrin_grant.refusal`](04-vitrin_grant.md#refusal).
 
 ## Growth
 

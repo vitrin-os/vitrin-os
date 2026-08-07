@@ -36,6 +36,7 @@ from .errors import (
     resolution_error_by_outcome,
 )
 from .messages import (
+    AttentionEvent,
     BoundEvent,
     ConsentStateEvent,
     DoneEvent,
@@ -124,6 +125,14 @@ class _PrincipalProxy(_Proxy):
             # bound carries the verifier-canonical identity, not an echo of
             # the claimed string.
             self._conn._bound_identity = event.identity
+        elif isinstance(event, AttentionEvent):
+            # The human pressed the compositor's attention key. It confers
+            # nothing, so the SDK does nothing with it beyond counting it:
+            # what a client should do is send the layout request it has
+            # already staged and show the refusal if it lost the race. A
+            # counter rather than a callback keeps this dependency-free and
+            # keeps the SDK from implying the window is this client's.
+            self._conn._attention_count += 1
 
 
 class _ConsentProxy(_Proxy):
@@ -596,6 +605,7 @@ class Connection:
         self._done_cookies: set[int] = set()
         self._next_cookie = 1
         self._bound_identity: str | None = None
+        self._attention_count = 0
         self._hello_sent = False
         self._realms: dict[str, Realm] = {}
         self._register(_HandshakeProxy(self, protocol.BOOTSTRAP_OBJECT_ID))
@@ -758,6 +768,23 @@ class Connection:
     @property
     def bound(self) -> bool:
         return self._bound_identity is not None
+
+    @property
+    def attention_count(self) -> int:
+        """How many ``vitrin_principal.attention`` events have arrived.
+
+        The human pressed the compositor's own attention key. The event
+        confers **nothing** — it says the human's hand is off the app they are
+        in, which for a short window stops the server refusing this
+        principal's layout requests ``preempted``. Only principals holding a
+        live layout grant receive it at all.
+
+        Exposed as a count rather than a callback on purpose: a callback would
+        invite a client to *start* work on the press, and the window is not
+        promised to any one recipient. Send the request you already staged and
+        show the ``Preempted`` refusal if you lost the race.
+        """
+        return self._attention_count
 
     # -- steady-state API ---------------------------------------------------
 

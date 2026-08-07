@@ -20,7 +20,7 @@ Request opcodes (document order):
 
 Event opcodes (document order):
     vitrin_handshake:        error=0, done=1
-    vitrin_principal:        bound=0
+    vitrin_principal:        bound=0, attention=1        (attention since=2)
     vitrin_grant:            resolved=0, refused=1
     vitrin_consent:          state=0
     vitrin_view:             frame_ready=0 (fd_count=1)
@@ -231,6 +231,26 @@ class BoundEvent:
 
 
 @dataclass(frozen=True)
+class AttentionEvent:
+    """vitrin_principal.attention — the human pressed the compositor's own
+    attention key (since version 2).
+
+    Carries no arguments and confers **nothing**. It says the human made a
+    statement about their own input state ("my hand is off this app"), which
+    for a short server-chosen window stops the server refusing this
+    principal's ``layout.focus``/``layout.arrange`` uses ``preempted``. It is
+    not a confirmation, not a consent decision, and delegates no authority:
+    everything the client may do afterwards it could already do.
+
+    Only principals holding a live grant carrying a layout verb receive it.
+    Receiving it is not a promise the window is yours — any recipient may use
+    it and the first admitted use consumes it — so the honest response is to
+    send an already-staged request immediately and surface the ``Preempted``
+    refusal if you lost the race.
+    """
+
+
+@dataclass(frozen=True)
 class ResolvedEvent:
     """vitrin_grant.resolved — the petition's terminal outcome."""
 
@@ -272,6 +292,7 @@ Event = (
     ErrorEvent
     | DoneEvent
     | BoundEvent
+    | AttentionEvent
     | ResolvedEvent
     | RefusedEvent
     | ConsentStateEvent
@@ -293,6 +314,10 @@ def _decode_done(dec: MessageDecoder, fd: int | None) -> DoneEvent:
 
 def _decode_bound(dec: MessageDecoder, fd: int | None) -> BoundEvent:
     return BoundEvent(identity=dec.string(max_bytes=protocol.MAX_IDENTITY_BYTES))
+
+
+def _decode_attention(dec: MessageDecoder, fd: int | None) -> AttentionEvent:
+    return AttentionEvent()
 
 
 def _decode_resolved(dec: MessageDecoder, fd: int | None) -> ResolvedEvent:
@@ -329,7 +354,10 @@ _EVENT_DECODERS: dict[
     str, dict[int, tuple[bool, Callable[[MessageDecoder, int | None], Event]]]
 ] = {
     "vitrin_handshake": {0: (False, _decode_error), 1: (False, _decode_done)},
-    "vitrin_principal": {0: (False, _decode_bound)},
+    "vitrin_principal": {
+        0: (False, _decode_bound),
+        1: (False, _decode_attention),
+    },
     "vitrin_grant": {0: (False, _decode_resolved), 1: (False, _decode_refused)},
     "vitrin_consent": {0: (False, _decode_consent_state)},
     "vitrin_view": {0: (True, _decode_frame_ready)},

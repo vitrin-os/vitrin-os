@@ -11,6 +11,45 @@
 //! event queue, a timer that never fires, a partially-consumed chord. Each
 //! of those is named below at the code that answers it.
 //!
+//! # The core owns a second physical chord now, and this one's warrant is
+//! unchanged by it
+//!
+//! Until WS-E.1.7 (issue #232) this module said the core owns **exactly one**
+//! physical chord, because the human's off-switch must not depend on a client.
+//! That sentence is now false: [`crate::attention`] owns a second, and it is
+//! written out here rather than quietly left, because a stale claim in the one
+//! module whose value is that nothing can defeat it is worse than none.
+//!
+//! **What has not changed is the argument.** The warrant this module claims is
+//! narrow and stays narrow: *an off-switch may not depend on a client, so the
+//! core owns the key that fires it.* It was never "the core may own chords in
+//! general", and admitting a neighbour must not be read as generalising it. A
+//! third chord would have to make its own case from scratch, against this
+//! module's own bar, and the presumption is still against one.
+//!
+//! The two are kept structurally apart at every level, so that nothing about
+//! the neighbour can weaken this switch:
+//!
+//! - **Disjoint vocabularies.** [`Chord::VOCABULARY`] excludes every modifier
+//!   (below, and for its own reason); the attention vocabulary is *nothing
+//!   but* the two Super keys. They cannot collide even before the startup
+//!   equality check `main.rs` keeps as defence in depth.
+//! - **Different halves of the hook.** This switch detects in
+//!   [`DeadManSwitch::observe_event`], reached from
+//!   [`PreemptionHook::observe`] — unconditional, unstoppable, owning all its
+//!   own state. The attention key only ever gates, so it is suppressible by
+//!   this hook, by a consent prompt, and by anything else above it.
+//! - **Stacking order.** [`DeadManHook`] is stacked *outside*
+//!   `AttentionHook`, so a chord press wins: an attention press in the same
+//!   dispatch round changes nothing this switch does, which is asserted rather
+//!   than argued (`an_attention_press_in_the_same_round_changes_nothing_here`).
+//! - **Draw order.** [`composite_hold_indicator`] stays the last thing
+//!   composited, so the attention marker — drawn beside the trusted band,
+//!   further down the frame — can never hide a hold in progress.
+//! - **Failure classes.** This switch's failure is a revocation that does not
+//!   happen. The attention key's is a focus change that does not happen. They
+//!   are not in the same class and nothing here may make them look like it.
+//!
 //! # Revocation flows through the ordinary grant path
 //!
 //! There is no kill switch, no side channel, and no second enforcement
@@ -252,7 +291,11 @@
 //! scancode→keysym table. Without that check, `--dead-man-chord f13` would
 //! start a session whose off-switch silently never fires — a fail-open
 //! configuration trap, which is the class of bug [`crate::realm`]'s loader
-//! refuses for the same reason.
+//! refuses for the same reason. Since WS-E.1.7 startup **also** refuses a
+//! `--dead-man-chord` equal to `--attention-chord`: the two vocabularies are
+//! disjoint by construction, so it is unreachable today, and it is checked
+//! anyway because the day it becomes reachable is the day one of the two keys
+//! silently stops working.
 //!
 //! # The switch is whole in nested mode
 //!
@@ -431,6 +474,16 @@ impl Chord {
     /// The chord's configured name (`"esc"`), for logs and the journal.
     pub fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// The keysym intake delivers for this chord.
+    ///
+    /// One consumer outside this module: `main.rs`'s startup refusal of an
+    /// `--attention-chord` equal to this one (WS-E.1.7). Compared by *keysym*
+    /// rather than by name, because two vocabularies could in principle spell
+    /// the same physical key differently and it is the key that collides.
+    pub fn keysym(&self) -> u32 {
+        self.keysym
     }
 
     /// Every chord name this build accepts, for the CLI's error message.
@@ -930,16 +983,18 @@ impl DeadManSwitch {
             // Consumed in both outcomes, and safe in both: a tap's pair is
             // replayed by the embedder, and a chord's press was never
             // delivered — so the router's per-keysym pairing finds nothing to
-            // reconcile and the app is left holding nothing. This is the one
-            // release this codebase consumes, and it is sound only because
-            // the same gate consumed its press.
+            // reconcile and the app is left holding nothing. This is one of
+            // the two releases this codebase consumes (the other is the
+            // attention chord's, `crate::attention`), and it is sound only
+            // because the same gate consumed its press.
             KeyState::Released => Gate::Consume,
         }
     }
 }
 
 /// Apply one completed chord: revoke every grant, deny every pending
-/// petition, and journal both with their cause.
+/// petition, shut any open attention window, and journal the first two with
+/// their cause.
 ///
 /// The order is deliberate and is what a replay reader needs: the cause
 /// (`dead_man_triggered`) is written **first**, then the individual
@@ -964,9 +1019,17 @@ pub(crate) fn apply(
     trigger: &Trigger,
     grants: &mut GrantTable,
     petitions: &mut PetitionRegistry,
+    attention: &RefCell<crate::attention::AttentionSignal>,
     recorder: &mut Recorder,
     now: Instant,
 ) -> DeadManEffect {
+    // Belt and braces, alongside `seal_dead_man` below (WS-E.1.7). A human who
+    // has just hit the off-switch is not, in the same second, lifting a defence
+    // for anybody. It changes no outcome -- the seal refuses every layout use
+    // `revoked` at step 3, long before step 5c's exemption is reached -- and
+    // that is exactly why it is cheap to do and worth doing: it means the
+    // window's lifetime never has to be reasoned about across a revocation.
+    attention.borrow_mut().clear();
     // Every principal holding a row, not one (module docs: an off-switch that
     // revoked a single identity is defeated by an attacker holding two). The
     // ids are collected before mutating, because `rows` borrows the table.
@@ -1081,6 +1144,15 @@ impl<H: PreemptionHook> PreemptionHook for DeadManHook<H> {
             Gate::Consume => Gate::Consume,
             Gate::Deliver => self.inner.gate(input),
         }
+    }
+
+    /// Forwarded, never answered here: this watcher carries no attention signal
+    /// of its own. It is stacked **outside**
+    /// [`crate::attention::AttentionHook`] so a chord press wins — the human's
+    /// off-switch is never delayed by, or entangled with, a mechanism whose
+    /// worst failure is a focus change that does not happen.
+    fn attention(&self) -> Option<Rc<RefCell<crate::attention::AttentionSignal>>> {
+        self.inner.attention()
     }
 }
 
@@ -1219,6 +1291,202 @@ mod tests {
     // ------------------------------------------------------------------
     // Configuration
     // ------------------------------------------------------------------
+
+    /// **The attention key is a neighbour, and the dead-man switch is
+    /// bit-identical with it in the stack** (WS-E.1.7 decision 11).
+    ///
+    /// The hazard this pins is not that the two chords collide — they cannot,
+    /// their vocabularies are disjoint by construction — but that a second
+    /// core-owned chord in the same hook stack could *perturb* the off-switch:
+    /// a shared `now` cell, a gate that returns early, a hook that reorders.
+    /// So a full hold is driven twice, once through
+    /// `DeadManHook<NoopHook>` and once through
+    /// `DeadManHook<AttentionHook<NoopHook>>` **with an attention press
+    /// interleaved into the same dispatch round**, and every observable of the
+    /// switch is compared: what the app was shown, whether it armed, when it
+    /// is due, what it reveals, and the trigger it produced.
+    ///
+    /// **What this can and cannot catch, stated rather than implied.** With the
+    /// two vocabularies disjoint, the *stacking order* is defence in depth
+    /// rather than the thing that makes this true — reversing it changes none
+    /// of these observables, because neither hook ever sees the other's key. So
+    /// this test catches a neighbour that perturbs the switch (shared state, a
+    /// clock cell moved, a gate that swallows more than its own chord), and the
+    /// **order** is pinned separately and directly by
+    /// `the_nested_stack_is_consent_then_dead_man_then_attention` in
+    /// `backend::winit`, which fails on a reorder that this one would sit
+    /// through.
+    #[test]
+    fn an_attention_press_in_the_same_round_changes_nothing_here() {
+        use crate::attention::{AttentionChord, AttentionHook, AttentionSignal, DEFAULT_CHORD};
+        use crate::input::{NoopHook, PreemptionHook};
+
+        let t0 = Instant::now();
+        let chord = AttentionChord::parse(DEFAULT_CHORD).expect("the default chord parses");
+        let esc = |state: KeyState| {
+            let events = crate::input::physical_key(1, None, state);
+            assert_eq!(
+                events.len(),
+                1,
+                "fixture: KEY_ESC survives the intake table"
+            );
+            events.into_iter().next().unwrap()
+        };
+        let super_key = |state: KeyState| {
+            crate::input::physical_key(chord.evdev(), None, state)
+                .into_iter()
+                .next()
+                .expect("fixture: the attention chord survives the intake table")
+        };
+
+        /// One hold, observed through whatever hook stack is handed in:
+        /// (gate verdicts, armed, deadline-is-some, progress-is-some, trigger).
+        #[allow(clippy::type_complexity)]
+        fn run<H: PreemptionHook>(
+            hook: &mut H,
+            switch: &Rc<RefCell<DeadManSwitch>>,
+            t0: Instant,
+            events: &[SeatInput],
+        ) -> (Vec<Gate>, Vec<bool>, Vec<bool>, Option<Trigger>) {
+            let mut gates = Vec::new();
+            for input in events {
+                hook.observe(input);
+                gates.push(hook.gate(input));
+            }
+            // The hold elapses with no further event, exactly as a real one
+            // does (autorepeat is filtered upstream).
+            let due = t0 + DEFAULT_HOLD;
+            let deadline = vec![
+                switch.borrow().deadline().is_some(),
+                switch
+                    .borrow()
+                    .hold_progress(due - DEFAULT_HOLD / 2)
+                    .is_some(),
+            ];
+            switch.borrow_mut().fire_if_due(due);
+            let after = vec![
+                switch.borrow().deadline().is_some(),
+                switch.borrow().hold_progress(due).is_some(),
+            ];
+            let trigger = switch.borrow_mut().take_trigger();
+            (gates, deadline, after, trigger)
+        }
+
+        // (1) The switch alone. Only the chord's own press is routed.
+        let alone = Rc::new(RefCell::new(switch()));
+        let now = Rc::new(Cell::new(t0));
+        let mut plain = DeadManHook::new(Rc::clone(&alone), Rc::clone(&now), NoopHook);
+        let baseline = run(&mut plain, &alone, t0, &[esc(KeyState::Pressed)]);
+
+        // (2) The same hold, with the attention key stacked underneath and an
+        // attention press landing in the middle of the same dispatch round.
+        let neighboured = Rc::new(RefCell::new(switch()));
+        let signal = Rc::new(RefCell::new(AttentionSignal::new(chord)));
+        let now = Rc::new(Cell::new(t0));
+        let mut stacked = DeadManHook::new(
+            Rc::clone(&neighboured),
+            Rc::clone(&now),
+            AttentionHook::new(Rc::clone(&signal), Rc::clone(&now), NoopHook),
+        );
+        let with_neighbour = run(
+            &mut stacked,
+            &neighboured,
+            t0,
+            &[
+                esc(KeyState::Pressed),
+                super_key(KeyState::Pressed),
+                super_key(KeyState::Released),
+            ],
+        );
+
+        assert_eq!(
+            baseline.0[0], with_neighbour.0[0],
+            "the chord's own press must be gated identically with the neighbour present"
+        );
+        assert_eq!(
+            (baseline.1, baseline.2),
+            (with_neighbour.1.clone(), with_neighbour.2.clone()),
+            "arming, the timer deadline and the on-screen reveal must be bit-identical"
+        );
+        assert_eq!(
+            baseline.3.map(|t| t.chord),
+            with_neighbour.3.map(|t| t.chord),
+            "the completed chord must be the same chord"
+        );
+        assert!(baseline.3.is_some(), "fixture: the hold really did fire");
+
+        // The neighbour did its own job in the same round, so this is not a
+        // pass by the attention hook never running at all.
+        assert!(
+            signal.borrow_mut().take_pending().is_some(),
+            "control: the attention press must really have reached the inner hook"
+        );
+        // ...and the attention press did not disturb the app-visibility half:
+        // both chords are consumed, so the confined app saw neither.
+        assert!(
+            with_neighbour.0.iter().all(|g| *g == Gate::Consume),
+            "both core-owned chords are consumed; the app must see neither"
+        );
+    }
+
+    /// **A completed dead-man chord shuts any open attention window**
+    /// (WS-E.1.7, belt and braces beside `seal_dead_man`).
+    ///
+    /// It changes no outcome — the seal refuses every layout use `revoked` at
+    /// step 3, long before 5c's exemption is reached — and that is exactly why
+    /// it is worth doing: the window's lifetime then never has to be reasoned
+    /// about across a revocation. A human who has just hit the off-switch is
+    /// not, in the same second, lifting a defence for anybody.
+    #[test]
+    fn a_completed_chord_shuts_any_open_attention_window() {
+        use crate::attention::{AttentionChord, AttentionSignal, DEFAULT_CHORD};
+
+        let t0 = Instant::now();
+        let who = identity(PROMPT_IDENTITY);
+        let mut table = GrantTable::new();
+        let _row = grant_for(&mut table, &who, t0);
+        let mut registry =
+            PetitionRegistry::new(ConsentPolicy::Interactive, PetitionConfig::default());
+        let mut scratch = Scratch::new();
+
+        let signal = RefCell::new(AttentionSignal::new(
+            AttentionChord::parse(DEFAULT_CHORD).expect("the default chord parses"),
+        ));
+        signal
+            .borrow_mut()
+            .open(t0, std::collections::BTreeSet::from([who.clone()]));
+        assert!(
+            signal
+                .borrow()
+                .exempt(&who, &crate::enforcement::UseKind::LayoutFocus, t0)
+                .is_some(),
+            "fixture: the window must be open, or this proves nothing"
+        );
+
+        apply(
+            &Trigger {
+                chord: "esc",
+                held: DEFAULT_HOLD,
+            },
+            &mut table,
+            &mut registry,
+            &signal,
+            &mut scratch.recorder,
+            t0,
+        );
+
+        assert!(
+            signal
+                .borrow()
+                .exempt(&who, &crate::enforcement::UseKind::LayoutFocus, t0)
+                .is_none(),
+            "the off-switch must leave no lifted defence behind it"
+        );
+        assert!(
+            signal.borrow_mut().take_pending().is_none(),
+            "and no press waiting to become one"
+        );
+    }
 
     #[test]
     fn every_offered_chord_survives_intake() {
@@ -1830,6 +2098,7 @@ mod tests {
             },
             &mut table,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             now,
         );
@@ -1873,6 +2142,7 @@ mod tests {
             },
             &mut table,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             now,
         );
@@ -1912,6 +2182,7 @@ mod tests {
             },
             &mut table,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             now,
         );
@@ -1952,6 +2223,7 @@ mod tests {
             },
             &mut table,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             now,
         );
@@ -1998,6 +2270,7 @@ mod tests {
             },
             &mut table,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             now,
         );
@@ -2036,6 +2309,7 @@ mod tests {
                 &trigger,
                 &mut table,
                 &mut registry,
+                &RefCell::new(crate::attention::AttentionSignal::detached()),
                 &mut scratch.recorder,
                 now
             )
@@ -2047,6 +2321,7 @@ mod tests {
             &trigger,
             &mut table,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             now
         )
@@ -2141,6 +2416,7 @@ mod tests {
             &trigger,
             &mut table,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             now + held,
         );
@@ -2218,6 +2494,7 @@ mod tests {
                     UseEnv {
                         realm_view: Some(&frame),
                         presence: &presence,
+                        attention: &RefCell::new(crate::attention::AttentionSignal::detached()),
                         // No human anywhere: preemption is not this test's
                         // subject and must not silently supply its refusals.
                         physical_realm: None,
@@ -2258,6 +2535,7 @@ mod tests {
             },
             &mut grants,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             now,
         );
@@ -2321,6 +2599,7 @@ mod tests {
             },
             &mut grants,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             now,
         );
@@ -2370,6 +2649,7 @@ mod tests {
             &trigger,
             &mut grants,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             now,
         );
@@ -2392,6 +2672,7 @@ mod tests {
             &trigger,
             &mut grants,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             much_later,
         );
@@ -2512,6 +2793,7 @@ mod tests {
             },
             &mut table,
             &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
             &mut scratch.recorder,
             now,
         );

@@ -999,6 +999,47 @@ impl GrantTable {
         })
     }
 
+    /// **Does this principal hold a live row carrying `verb`?** WS-E.1.7's
+    /// attention-event **delivery filter** (issue #232).
+    ///
+    /// **A delivery filter and never an authority check**, and the distinction
+    /// is the whole reason this has its own doc paragraph. It answers "should
+    /// this connection be *told* the human pressed the attention key", so that
+    /// the wire stays silent for every client that could not act on it. It
+    /// never decides whether anything may happen: that stays
+    /// [`Self::check_use_grant`]'s, at the one chokepoint, and this function is
+    /// pinned **by name** as an exclusion in `enforcement.rs`'s
+    /// `single_enforcement_path` scan -- zero occurrences there, exactly one
+    /// outside this module -- so a future call from an enforcement path is a
+    /// red test rather than a second authority site nobody noticed.
+    ///
+    /// Being wrong here costs a notification, in one direction each: a false
+    /// negative is a layout holder that does not learn the human pressed the
+    /// key (its `focus` is then refused `preempted`, recoverably, exactly as
+    /// before this feature existed); a false positive is a client told about a
+    /// keypress it cannot use, which is the timing oracle the filter exists to
+    /// close and so is the direction that must not drift. It confers nothing
+    /// either way -- the *claim* is separately gated on membership of the
+    /// delivered-to set, which is resolved from this same answer at press time.
+    ///
+    /// `Active` only, at `now`, through the same [`Entry::state_at`] every
+    /// other read surface uses: a revoked, expired or spent row holds nothing.
+    /// Scoped to a principal, unlike [`Self::any_live_holder_of`], because the
+    /// question here really is per identity -- authority is keyed by verified
+    /// identity, not by connection. The consequence is worth stating: a
+    /// principal holding two connections is told on **both**, including on one
+    /// that minted no layout grant of its own. That is the honest reading (it
+    /// is the same principal, and it already holds the authority the signal is
+    /// filtered on) and it leaks nothing across a trust boundary, because there
+    /// is no boundary between one identity's own connections.
+    pub fn holds_verb(&self, principal: &PrincipalIdentity, verb: Verb, now: Instant) -> bool {
+        self.entries.values().any(|entry| {
+            entry.row.principal_id == *principal
+                && entry.row.verbs.contains(verb)
+                && entry.state_at(now) == GrantState::Active
+        })
+    }
+
     /// **The chokepoint query** (P1.4.4): may this use of `grant` --
     /// arriving through a facet co-minted with exactly that grant --
     /// perform `verb` at `now`, on behalf of `principal` (the verified

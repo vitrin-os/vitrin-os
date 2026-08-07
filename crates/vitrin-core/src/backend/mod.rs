@@ -111,17 +111,36 @@ use crate::scene::Scene;
 /// *except* for the trusted band along the top edge (issue #85), which is
 /// present on every human-visible frame; a prompt adds the scrim, the framed
 /// card, and nothing the band does not already assert.
+///
+/// `attention` is whether the human's attention window is open right now
+/// ([`crate::attention::AttentionSignal::is_open`]). It draws a fixed-geometry
+/// marker immediately *below* the reserved band — never in it, because the
+/// band's whole value is having exactly one correct appearance. Passing it
+/// through this function rather than a backend's own composite is what makes
+/// "the marker can never reach a capture" the same structural fact the consent
+/// card's exclusion is.
 pub(crate) fn human_visible_from_view(
     mut view: Vec<u8>,
     consent: &mut ConsentSurface,
     width: u32,
     height: u32,
+    attention: bool,
 ) -> Vec<u8> {
     // Prompt (scrim + frame + card) first; then the trusted band on top, so
     // client content — and even the scrim — never sits over the one strip the
     // human reads the session colour from.
     consent.composite_over(&mut view, width, height);
     consent.composite_trust_band(&mut view, width, height);
+    // ...and, while the human's attention window is open, a marker **beside**
+    // the band and never inside it (WS-E.1.7, issue #232). After the band so
+    // the band's rows are already final, and here rather than in
+    // `Scene::compose` so an agent cannot observe the human's attention presses
+    // through `frame_ready` — the same structural fork the overlay and the band
+    // already rest on. The dead-man hold indicator is still composited after
+    // everything, so nothing here can hide a hold in progress.
+    if attention {
+        crate::attention::composite_attention_marker(&mut view, width, height);
+    }
     view
 }
 
@@ -143,6 +162,13 @@ pub(crate) fn compose_human_visible(
     consent: &mut ConsentSurface,
     width: u32,
     height: u32,
+    attention: bool,
 ) -> Vec<u8> {
-    human_visible_from_view(scene.compose(width, height), consent, width, height)
+    human_visible_from_view(
+        scene.compose(width, height),
+        consent,
+        width,
+        height,
+        attention,
+    )
 }

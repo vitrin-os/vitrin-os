@@ -195,6 +195,17 @@ const EXPIRY_UNBOUNDED: &str = "no time limit - bounded only by the choice below
 /// binding, so approving it is approving that this principal may move
 /// where the human's next keystroke lands. Naming it "direct keyboard
 /// focus", the IDL's phrasing, would be accurate and would not say that.
+///
+/// **Both layout lines also name the attention key** (WS-E.1.7, issue #232),
+/// and that is Q13's rule applied to a *widened* verb rather than a new one:
+/// a verb whose consequence changed ships admitted-but-refused `unsupported`
+/// until its copy says so. What changed is that the grant now receives the
+/// human's attention key — a session-level fact about the human delivered to
+/// this principal's connection, and a moment in which this verb is not
+/// refused `preempted`. The human is told, in the same sentence, both halves:
+/// the grant is *told* when they press it, and it may *act* in that moment.
+/// It is deliberately not phrased as delegation ("you give it the key"),
+/// because the press delegates nothing — see [`crate::attention`].
 const VERB_CATALOGUE: [(Verb, &str, &str); 5] = [
     (Verb::OBSERVE, "observe", "capture frames of this realm"),
     (
@@ -210,12 +221,13 @@ const VERB_CATALOGUE: [(Verb, &str, &str); 5] = [
     (
         Verb::LAYOUT_ARRANGE,
         "layout_arrange",
-        "make this realm fill the screen, or shrink it back",
+        "make this realm fill the screen, or shrink it back - and act on your attention key",
     ),
     (
         Verb::LAYOUT_FOCUS,
         "layout_focus",
-        "show this realm and send your keyboard and mouse to it",
+        "show this realm and send your keyboard and mouse to it - and act on your attention \
+         key",
     ),
 ];
 
@@ -706,6 +718,35 @@ mod tests {
             crate::grants::SERVED_VERB_BITS | crate::grants::UNSERVED_VERB_BITS,
             Verb::VALID_MASK
         );
+        // **A layout verb served with the old copy fails here** (WS-E.1.7).
+        // Q13's rule -- "each new verb ships admitted-but-refused
+        // `unsupported` until its copy exists" -- applies to a *widened* verb
+        // too, and the widening is not cosmetic: the grant now receives a
+        // session-level event about the human, and is not refused `preempted`
+        // in the moment after they press the key. A prompt that omitted it
+        // would be asking a human to approve authority it does not name, which
+        // is the exact failure the catalogue exists to prevent.
+        for (verb, name, what) in VERB_CATALOGUE {
+            if !crate::attention::EXEMPT_VERBS.contains(&verb) {
+                continue;
+            }
+            assert!(
+                what.contains("attention key"),
+                "`{name}` is exempted by the attention key, so its consent copy must say so \
+                 (Q13, applied to a widened verb)"
+            );
+        }
+        // ...and the copy really reaches a rendered prompt, not just the
+        // table: the line a human reads is the one asserted above.
+        for verb in crate::attention::EXEMPT_VERBS {
+            let lines = verb_lines(verb);
+            assert_eq!(lines.len(), 1);
+            assert!(
+                lines[0].contains("attention key"),
+                "the rendered line for {verb:?} must name the attention key: {}",
+                lines[0]
+            );
+        }
         // Names match the IDL's spelling, so prompt and protocol cannot drift.
         let names: Vec<&str> = VERB_CATALOGUE.iter().map(|(_, name, _)| *name).collect();
         assert_eq!(

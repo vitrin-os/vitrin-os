@@ -846,7 +846,7 @@ pub(crate) struct ServerCtx<'a> {
     ///
     /// Passed straight through to [`crate::enforcement::UseEnv::physical_realm`],
     /// which consults it for exactly one judgement — `preempted` for a
-    /// **layout** request, the one attention-shaped use that is not delivered
+    /// **layout** request, the one attention-contending use that is not delivered
     /// into a realm and so steals from wherever the human already is.
     ///
     /// It used to be the write-side sibling of [`Self::realm_is_live`]:
@@ -862,6 +862,17 @@ pub(crate) struct ServerCtx<'a> {
     /// Physical-input presence **per realm**, fed at the input router's hook
     /// point (the chokepoint's `preempted` judgement).
     pub presence: &'a PhysicalPresenceMap,
+    /// **The human's own attention signal** (WS-E.1.7), opened at the input
+    /// router's innermost hook and passed straight through to
+    /// [`crate::enforcement::UseEnv::attention`], which reads it for exactly
+    /// one judgement — the exemption nested inside step 5c, for the two layout
+    /// verbs only — and writes it at step-6 admission.
+    ///
+    /// A `&RefCell` rather than a borrow of the contents because the
+    /// chokepoint claims the window; nothing else in the dispatch turn holds a
+    /// borrow of it, since the hook that opens one runs in
+    /// `session::route_physical_turn`, after connection dispatch has finished.
+    pub attention: &'a std::cell::RefCell<crate::attention::AttentionSignal>,
     /// Where chokepoint-admitted, origin-tagged actuations go, **naming the
     /// realm the grant is over** (M1.1: that realm's seat state in the
     /// session's input router, toward its shim seat).
@@ -1371,7 +1382,7 @@ impl PrincipalServer {
         let detail = ActuationDetail::of(&kind);
         // Read before `kind` moves into the request below; see
         // `grant_realm`, which is resolved owned only for these four.
-        let is_attention_shaped = matches!(
+        let contends_for_attention = matches!(
             kind,
             UseKind::Pointer(_)
                 | UseKind::Text(_)
@@ -1428,7 +1439,7 @@ impl PrincipalServer {
         // realm this grant names", is what keeps a second site from
         // disagreeing.
         //
-        // Owned, and **only for an attention-shaped use**: the two actuators
+        // Owned, and **only for an attention-contending use**: the two actuators
         // and the two layout requests, which are exactly the uses that either
         // name a realm to the embedder or are judged against a realm's
         // physical presence. The chokepoint takes `&mut GrantTable`, so a
@@ -1437,8 +1448,8 @@ impl PrincipalServer {
         // (`vitrin_realm`) -- per such request, and it is the cost of the
         // event carrying its own destination; a **capture** still allocates
         // nothing here, which is the high-rate path this rule was written for.
-        // `is_attention_shaped` is read before `kind` moves into the request.
-        let grant_realm = if is_attention_shaped {
+        // `contends_for_attention` is read before `kind` moves into the request.
+        let grant_realm = if contends_for_attention {
             grant_row.and_then(|row| ctx.grants.realm_of(row)).cloned()
         } else {
             None
@@ -1453,6 +1464,7 @@ impl PrincipalServer {
         let env = UseEnv {
             realm_view: realm_view.as_ref(),
             presence: ctx.presence,
+            attention: ctx.attention,
             physical_realm: ctx.physical_realm,
             actuations: &mut *ctx.actuations,
             grant_realm: grant_realm.as_ref(),
@@ -1485,6 +1497,26 @@ impl PrincipalServer {
             ctx.recorder.record(Event::GrantSpent {
                 connection: self.connection,
                 grant_id: grant,
+            });
+        }
+        // The human's attention window, if this admission spent it (WS-E.1.7):
+        // read off the same outcome, so the chokepoint still never learns a
+        // recorder exists and no third code path appears. Journaling *who*
+        // took the press is the one narrowing available against a session-wide
+        // window (issue #232 decision 10): the core cannot tell which of two
+        // layout holders the human meant, so what it can do is say afterwards
+        // which one actually took it.
+        if let UseOutcome::Admitted {
+            grant,
+            attention_claimed: true,
+            ..
+        } = outcome
+        {
+            ctx.recorder.record(Event::AttentionClaimed {
+                connection: self.connection,
+                principal: &identity,
+                grant_id: grant,
+                verb,
             });
         }
         Ok(())
@@ -2040,6 +2072,36 @@ impl PrincipalServer {
         result
     }
 
+    /// Emit `vitrin_principal.attention` on this connection (WS-E.1.7, issue
+    /// #232): the human pressed the core's attention key.
+    ///
+    /// **It carries nothing and confers nothing.** The event is argument-free
+    /// forever (IDL `vitrin_principal.attention`) and this function makes no
+    /// authority judgement whatsoever: *whether* a connection is told is the
+    /// caller's, decided by the grant table's delivery filter
+    /// ([`GrantTable::holds_verb`]), and *whether anything may then happen*
+    /// stays the chokepoint's. Adding a check here would be the second
+    /// enforcement site this crate does not have.
+    ///
+    /// `Ok(false)` for a connection that is not bound — nothing was sent, and
+    /// that is not an error: a connection mid-handshake holds no grant, so it
+    /// could not have been selected anyway. `Err` is transport death, which
+    /// the caller logs; a dropped attention event costs the client one window
+    /// it can neither observe nor be harmed by missing.
+    pub fn deliver_attention<F>(&mut self, send: &mut F) -> Result<bool, TransportError>
+    where
+        F: FnMut(&[u8], Option<BorrowedFd<'_>>) -> Result<(), TransportError>,
+    {
+        if self.phase != Phase::Bound {
+            return Ok(false);
+        }
+        let Some(principal_id) = self.principal_id else {
+            return Ok(false);
+        };
+        send(&principal::events::Attention {}.encode(principal_id), None)?;
+        Ok(true)
+    }
+
     /// The delivery body proper -- see [`Self::deliver_resolution`], which
     /// wraps it to record decisions this refuses.
     fn deliver_resolution_inner<F>(
@@ -2369,6 +2431,13 @@ pub(crate) mod tests {
         /// [`Shared::actuations`], which names each event's realm.
         physical_realm: Option<RealmId>,
         presence: PhysicalPresenceMap,
+        /// The human's **attention signal** (WS-E.1.7), the rig's stand-in for
+        /// `session::Kernel::attention`. A test opens a window on it with
+        /// [`AttentionSignal::open`] naming the principals the `attention`
+        /// event reached — which is what `session::open_attention_window`
+        /// resolves at press time — and then reads it back to prove the window
+        /// was, or was not, claimed.
+        attention: std::cell::RefCell<crate::attention::AttentionSignal>,
         /// Every actuation the chokepoint admitted, **with the realm it was
         /// addressed to** -- this rig's stand-in for `session::route_seat`.
         /// The realm is the assertion WS-E.1.6 made possible: before it,
@@ -2414,6 +2483,7 @@ pub(crate) mod tests {
                 // was the only realm.
                 physical_realm: Some(RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)),
                 presence: PhysicalPresenceMap::new(),
+                attention: std::cell::RefCell::new(crate::attention::AttentionSignal::detached()),
                 actuations: Vec::new(),
                 layout: Vec::new(),
                 recorder,
@@ -2491,6 +2561,7 @@ pub(crate) mod tests {
             live_realms,
             physical_realm,
             presence,
+            attention,
             actuations,
             layout,
             recorder,
@@ -2526,6 +2597,7 @@ pub(crate) mod tests {
                 petitions,
                 realms,
                 grants,
+                attention,
                 now: *now,
                 // Resolved by realm id, exactly as `session::dispatch_principal`
                 // resolves it from `Runtime::view_cache` (WS-E.1.3).

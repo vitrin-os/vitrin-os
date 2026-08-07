@@ -423,13 +423,23 @@
     </enum>
   </interface>
 
-  <interface name="vitrin_principal" version="1">
+  <interface name="vitrin_principal" version="2">
     <description summary="the authenticated principal">
       The bound identity: the root of the connection's authority chain,
       holding exactly the authority to address realms and petition for
       grants. Pre-allocated by hello and live upon bound. All of the
       principal's grants die with the connection - version 1 has no grant
       persistence (restore tokens are a future version's addition).
+
+      SINCE VERSION 2 IT IS ALSO WHERE SESSION-LEVEL FACTS ABOUT THE HUMAN
+      ARRIVE, and that is a widening of "the root of the connection's
+      authority chain" rather than a restatement of it. The attention event
+      below is about the human, not about this principal's authority, and it
+      is here because its scope is the connection and this is the only object
+      whose scope is the connection. Stated rather than left implicit: an
+      event on this object need not be an authority fact, and a later addition
+      that puts a second, less defensible session fact here would be following
+      a precedent this paragraph is the record of.
     </description>
 
     <event name="bound">
@@ -442,6 +452,55 @@
         this verifier-owned value, never from free client text.
       </description>
       <arg name="identity" type="string" summary="verifier-canonical principal identity (max 2048 bytes)"/>
+    </event>
+
+    <event name="attention" since="2">
+      <description summary="the human asked for their attention to move">
+        The human pressed the compositor's own attention key. It carries no
+        arguments and it confers NOTHING.
+
+        WHAT IT MEANS. The human made a statement about their own input
+        state - "my hand is off this app right now" - which withdraws a
+        transient courtesy the server extends to a human's typing: for a
+        short, server-chosen, single-use window, a use of layout_focus or
+        layout_arrange by a principal this event reached is not refused
+        "preempted". It is not a confirmation, it is not a consent decision,
+        and it delegates no authority whatsoever. Every authority the client
+        exercises afterwards came from a grant the human already approved.
+        A client that provokes the press gains TIMING, never authority.
+
+        WHY IT EXISTS. Without it a human at a shell running inside a realm
+        cannot ask that shell to change the layout: the keystroke that sends
+        the request is itself the physical input that makes the request meet
+        "preempted", and repeating it re-arms the window, so it is a
+        deterministic loop rather than a race.
+
+        WHO RECEIVES IT. Only principals holding a live grant that carries
+        layout_focus or layout_arrange. Every other client stays silent,
+        because an unconditional event would be a free keystroke-timing
+        oracle for every connected client. The server also does not deliver
+        the keypress to any confined application - the key is consumed - for
+        the same reason.
+
+        NO ARGUMENTS, AND THAT IS PERMANENT. A window length was considered
+        and refused: signatures are immutable, the window is a server-side
+        security parameter the server must stay free to shorten, and a client
+        that built a timer off it would be building a retry policy that
+        belongs nowhere. An honest client sends its already-staged request
+        immediately and shows the "preempted" refusal if it lost the race.
+
+        NOT A PROMISE THE WINDOW IS THE CLIENT'S. Any recipient may use it
+        and the first one to be admitted consumes it; a server cannot know
+        which of two layout holders the human meant, and choosing would be
+        window-management policy. Receiving this event is therefore not a
+        guarantee that a subsequent layout request is admitted.
+
+        There is deliberately no request on this interface to ask for it, no
+        way to observe that another principal consumed it, and no verb bit
+        governing its delivery - a grantable "receive the human's attention
+        key" verb would put a delegation framing on a signal that delegates
+        nothing.
+      </description>
     </event>
 
     <request name="get_realm">
@@ -867,6 +926,19 @@
         moving the human's attention while the human's own hand is on the
         input, or while that principal's consent prompt is up, is the
         actuation-shaped hazard those codes exist for.
+
+        preempted IS CONDITIONAL FOR THE LAYOUT VERBS, and only for them. A
+        server MAY define an attention signal by which the human states that
+        their own hand is off the input (vitrin_principal.attention, since
+        version 2); while such a signal is live for a principal, that
+        principal's layout_focus/layout_arrange use is not refused preempted.
+        consent_held is never conditional in the same way, and the two
+        actuation verbs are never exempted at all: a human's hand still mutes
+        an agent actuating into the realm the hand is in. The consequence a
+        client must accept is that two identical layout requests can be
+        answered differently by server state the client cannot read - an
+        agent reading only its own journal can no longer reconstruct why one
+        landed and one did not.
       </description>
       <entry name="not_granted" value="0" summary="the grant is not (or not yet) active, or the verb is outside its effective set: use while pending, through an ungranted facet, or after any non-granted resolution (denied, timed_out, unavailable, unsupported, busy)"/>
       <entry name="expired" value="1" summary="the grant's expiry passed; checked on use and by a proactive timer"/>
@@ -1685,6 +1757,11 @@
         the same reason). It is never refused capacity, which concerns
         creating a realm.
 
+        preempted here is CONDITIONAL: a server that defines the attention
+        signal (vitrin_principal.attention, since version 2) does not refuse
+        preempted while that signal is live for this principal. See
+        vitrin_grant.refusal.
+
         NOT REPLY-BEARING, deliberately. A terminal event would carry no
         information a subsequent capture does not already carry, and adding
         one would make the reply the place a client learns which realm is
@@ -1783,7 +1860,10 @@
         return to, and no view to fill the output with), preempted or
         consent_held on the attention-shaped terms an actuation meets them,
         and internal for a server-side failure while carrying the
-        arrangement out.
+        arrangement out. preempted is CONDITIONAL on the same terms focus's
+        is - the attention signal lifts it for both layout verbs or for
+        neither, because "fullscreen on&lt;Enter&gt;" hits the identical loop
+        that "focus editor&lt;Enter&gt;" does.
       </description>
       <arg name="mode" type="uint" enum="mode" summary="fullscreen or windowed"/>
     </request>

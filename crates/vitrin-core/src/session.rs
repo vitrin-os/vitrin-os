@@ -301,6 +301,20 @@ pub(crate) struct Kernel {
     /// member of the hook stack and no backend included it, so `preempted`
     /// could not fire while the book described it as live behaviour.
     pub presence: std::rc::Rc<std::cell::RefCell<PhysicalPresenceMap>>,
+    /// **The human's attention signal** (WS-E.1.7, issue #232): the short,
+    /// single-use window a core-owned Super tap opens, in which the two layout
+    /// verbs are not refused `preempted`.
+    ///
+    /// **The hook's own signal, not a second one.** [`Runtime::new`] takes this
+    /// handle out of the router it is handed
+    /// ([`InputRouter::attention`]) rather than minting one, so a kernel that
+    /// judges the exemption against a signal nothing opens is unconstructible
+    /// — the mistake presence really did ship with until issue #212's review.
+    /// A backend whose stack carries no
+    /// [`AttentionHook`](crate::attention::AttentionHook) gets a detached
+    /// signal that never opens, which is the honest answer for a build with no
+    /// physical input device rather than a special case in the chokepoint.
+    pub attention: std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>,
 }
 
 /// The realm's live shim session: the protocol server, the out-of-band send
@@ -642,6 +656,28 @@ pub(crate) trait Presenter {
     /// [`InputRouter::agent_pointer`]: crate::input::InputRouter::agent_pointer
     /// [`InputRouter::pointer`]: crate::input::InputRouter
     fn set_agent_cursor(&mut self, pos: Option<(f64, f64)>) -> bool;
+
+    /// Offer this round's **attention-window** state (WS-E.1.7, issue #232):
+    /// whether the core should draw the marker that says the human's attention
+    /// key is live right now.
+    ///
+    /// Drawn **beside** the reserved trusted band and never in it, and only on
+    /// the human-visible output stage
+    /// ([`crate::backend::human_visible_from_view`]) — so, exactly like the
+    /// consent card and the trust band, it cannot reach a capture and an agent
+    /// cannot observe the human's attention presses through `frame_ready`.
+    ///
+    /// `true` means the caller should mark the frame dirty and present. The
+    /// window closes by *time*, so an utterly idle session can leave the marker
+    /// up until the next round; nested redraws at the host's frame cadence, and
+    /// the marker asserts nothing about authenticity, so a stale one is a
+    /// cosmetic cost rather than a security one. What the human gets from it is
+    /// the negative: **a focus change that happened with no marker up was not
+    /// theirs.**
+    ///
+    /// Backends that composite no marker answer `false` forever, which costs
+    /// the dispatch round nothing.
+    fn set_attention(&mut self, open: bool) -> bool;
 }
 
 /// A backend state type that carries a [`Runtime`], split into provably
@@ -694,6 +730,18 @@ impl<H: PreemptionHook> Runtime<H> {
         // Before the router moves into the struct: the kernel's presence map
         // *is* the router's, so there is no wiring step a backend can skip.
         let presence = router.presence();
+        // ...and the attention signal, the same way and for the same reason
+        // (WS-E.1.7). `None` when this backend's stack carries no
+        // `AttentionHook` -- a plain headless run, which has no physical input
+        // device to press a chord on -- in which case the kernel gets a signal
+        // nothing ever writes, so the chokepoint's exemption arm is the same
+        // code in every build and "this backend has no attention key" is a fact
+        // about the hook stack rather than about the enforcement path.
+        let attention = router.attention().unwrap_or_else(|| {
+            std::rc::Rc::new(std::cell::RefCell::new(
+                crate::attention::AttentionSignal::detached(),
+            ))
+        });
         let RuntimeSeed {
             listener,
             verifier,
@@ -716,6 +764,7 @@ impl<H: PreemptionHook> Runtime<H> {
                 realms,
                 recorder,
                 presence,
+                attention,
             },
             listener: Some(listener),
             conns: BTreeMap::new(),
@@ -804,6 +853,7 @@ impl<H: PreemptionHook> Runtime<H> {
             trigger,
             &mut self.kernel.grants,
             &mut self.kernel.petitions,
+            &self.kernel.attention,
             &mut self.kernel.recorder,
             now,
         );
@@ -1823,8 +1873,8 @@ fn dispatch_principal<H: RuntimeHost>(
                 // **Where the human's own hand currently is** — the realm
                 // physical input follows, which a `layout_focus` holder moves.
                 // The chokepoint consults it for one judgement only:
-                // `preempted` for a *layout* request, the one attention-shaped
-                // use that steals from wherever the human already is rather
+                // `preempted` for a *layout* request, the one
+                // attention-contending use that steals from wherever the human already is rather
                 // than acting on the realm its grant names. Asked once per
                 // dispatch turn because it is one answer for the whole session
                 // — unlike liveness, which is a question per realm.
@@ -1852,6 +1902,14 @@ fn dispatch_principal<H: RuntimeHost>(
                 // dispatch has finished — so this borrow cannot collide with
                 // the tap that writes the map.
                 let presence = kernel.presence.borrow();
+                // The handle, cloned rather than borrowed: the chokepoint
+                // *writes* it (claiming the human's attention window at step-6
+                // admission), and `kernel` is already borrowed field-wise for
+                // the grant table and the recorder. Nothing else in this turn
+                // holds a borrow of the cell — the hook that opens a window
+                // runs in `route_physical_turn`, after connection dispatch has
+                // finished.
+                let attention = std::rc::Rc::clone(&kernel.attention);
                 let mut ctx = ServerCtx {
                     verifier: &kernel.verifier,
                     petitions: &mut kernel.petitions,
@@ -1862,6 +1920,7 @@ fn dispatch_principal<H: RuntimeHost>(
                     realm_is_live: &realm_is_live,
                     physical_realm,
                     presence: &presence,
+                    attention: &attention,
                     actuations: &mut actuations,
                     layout: &mut layout,
                     recorder: &mut kernel.recorder,
@@ -2396,6 +2455,95 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
     crate::backend::winit::route_turn(router, switch, inputs, view, surface, &mut |delivery| {
         deliver_physical(realms, scenes, &mut kernel.recorder, delivery)
     });
+    // After the routing, never before: the press the attention hook gated is
+    // one of *this* turn's events, and the window it opens is measured from the
+    // human's gesture rather than from the delivery round.
+    open_attention_window(runtime, now);
+}
+
+/// Turn a gated attention press into an open window (WS-E.1.7, issue #232):
+/// resolve who holds layout authority, tell exactly them, and open the window
+/// naming exactly that set.
+///
+/// **The hook cannot do any of this**, which is why the work is here. The
+/// preemption hook runs inside `InputRouter::route_physical`, and the router
+/// holds no authority state and must never grow any ([`crate::input`]'s module
+/// docs) — so the gate records a pending press and the embedder, which owns the
+/// grant table and the connections, resolves it. Exactly the division
+/// [`crate::deadman::Trigger`] makes, for exactly the same reason.
+///
+/// **Delivery is filtered, and the filter is not an authority check.**
+/// [`GrantTable::holds_verb`] answers "should this connection be *told*". An
+/// unconditional event would be a free, silent keystroke-timing oracle for
+/// every connected client — the same hazard consuming the key closes on the
+/// app side. Whether anything may then *happen* stays the chokepoint's, at step
+/// 5c, against the same delivered-to set.
+///
+/// **A press nobody could use opens nothing.** With no layout holder the set is
+/// empty, no principal could ever claim the window, and calling that "open"
+/// would overstate what the human's gesture did. The journal entry is written
+/// either way, so a human asking why their switch did nothing can see that the
+/// key fired and that nobody was listening.
+fn open_attention_window<H: PreemptionHook>(runtime: &mut Runtime<H>, now: Instant) {
+    let Some(pressed_at) = runtime.kernel.attention.borrow_mut().take_pending() else {
+        return;
+    };
+    let chord = runtime.kernel.attention.borrow().chord().name();
+    let Runtime { kernel, conns, .. } = runtime;
+    let mut delivered: std::collections::BTreeSet<crate::identity::PrincipalIdentity> =
+        std::collections::BTreeSet::new();
+    let mut notified = 0usize;
+    for conn in conns.values_mut() {
+        let Some(identity) = conn.server.bound_identity().cloned() else {
+            continue;
+        };
+        if !crate::attention::EXEMPT_VERBS
+            .iter()
+            .any(|verb| kernel.grants.holds_verb(&identity, *verb, now))
+        {
+            continue;
+        }
+        let outbox = conn.outbox.clone();
+        let mut send = |frame: &[u8], fd: Option<BorrowedFd<'_>>| {
+            debug_assert!(
+                fd.is_none(),
+                "no version-1 event sent outside dispatch carries an fd"
+            );
+            outbox.send(frame)
+        };
+        match conn.server.deliver_attention(&mut send) {
+            Ok(true) => {
+                notified += 1;
+                delivered.insert(identity);
+            }
+            // Not bound after all (a handshake that raced this turn): nothing
+            // was sent, so nothing may claim on its behalf.
+            Ok(false) => {}
+            Err(err) => {
+                // The connection is dying; its teardown entry follows. A lost
+                // attention event costs one window the client can neither
+                // observe nor be harmed by missing.
+                tracing::warn!(%err, "attention event could not be delivered");
+            }
+        }
+    }
+    let opened = !delivered.is_empty();
+    if opened {
+        kernel.attention.borrow_mut().open(pressed_at, delivered);
+    }
+    kernel
+        .recorder
+        .record(crate::recorder::Event::AttentionPressed {
+            chord,
+            opened,
+            notified,
+        });
+    tracing::debug!(
+        chord,
+        opened,
+        notified,
+        "attention key pressed: the human's hand is off the app they are in"
+    );
 }
 
 /// Route chokepoint-admitted actuations through the session's router toward
@@ -2717,6 +2865,13 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
             runtime.dirty = true;
             view.request_present();
         }
+        // ...and the attention marker, on the same terms and before the same
+        // gate: the human's window opening or closing changes the
+        // human-visible output and nothing else in this round says so.
+        if view.set_attention(runtime.kernel.attention.borrow().is_open(Instant::now())) {
+            runtime.dirty = true;
+            view.request_present();
+        }
         if !runtime.dirty {
             return;
         }
@@ -2986,6 +3141,10 @@ mod tests {
         /// the offer was "draw nothing" — is a different fact from `None`,
         /// which is "the gate was never reached".
         cursor_offered: Option<Option<(f64, f64)>>,
+        /// The last value [`Presenter::set_attention`] was offered — so a test
+        /// can say what the human would have been shown, without this rig
+        /// growing a second compositor to draw it with.
+        attention: bool,
     }
 
     impl TestView {
@@ -3008,7 +3167,13 @@ mod tests {
         /// — the one thing a `layout_focus` holder can move.
         fn human_visible(&mut self) -> Vec<u8> {
             let (w, h) = self.size;
-            crate::backend::compose_human_visible(self.scenes.bound(), &mut self.consent, w, h)
+            crate::backend::compose_human_visible(
+                self.scenes.bound(),
+                &mut self.consent,
+                w,
+                h,
+                false,
+            )
         }
 
         /// The bare realm view a capture of `realm` is taken from — the
@@ -3024,6 +3189,15 @@ mod tests {
     }
 
     impl Presenter for TestView {
+        /// The attention marker is presentation the invariant tests never
+        /// assert on; what they *do* assert is that no arrangement puts
+        /// anything into a capture, and this rig's `human_visible` goes
+        /// through the real `compose_human_visible` either way.
+        fn set_attention(&mut self, open: bool) -> bool {
+            let changed = self.attention != open;
+            self.attention = open;
+            changed
+        }
         fn scene_mut(&mut self, realm: &RealmId) -> &mut Scene {
             self.scenes.scene_mut(realm)
         }
@@ -3101,8 +3275,11 @@ mod tests {
         }
     }
 
+    /// The rig's hook stack: the real innermost hook, and nothing above it.
+    type RigHook = crate::attention::AttentionHook<NoopHook>;
+
     struct TestHost {
-        runtime: Runtime<NoopHook>,
+        runtime: Runtime<RigHook>,
         view: TestView,
         handle: LoopHandle<'static, TestHost>,
         signal: LoopSignal,
@@ -3117,10 +3294,10 @@ mod tests {
     }
 
     impl RuntimeHost for TestHost {
-        type Hook = NoopHook;
+        type Hook = RigHook;
         type View = TestView;
 
-        fn split(&mut self) -> (&mut Runtime<NoopHook>, &mut TestView) {
+        fn split(&mut self) -> (&mut Runtime<RigHook>, &mut TestView) {
             (&mut self.runtime, &mut self.view)
         }
         fn loop_handle(&self) -> LoopHandle<'static, Self> {
@@ -3211,7 +3388,35 @@ mod tests {
                 EventLoop::try_new().expect("event loop");
             let handle = event_loop.handle();
             let mut host = TestHost {
-                runtime: Runtime::new(seed, InputRouter::detached(NoopHook)),
+                // **The real hook stack's innermost member**, on the router's
+                // own clock cell (WS-E.1.7). Not `detached(NoopHook)`: with no
+                // `AttentionHook` in the stack `Runtime::new` mints a detached
+                // signal nothing ever opens, and every attention test here
+                // would be asserting against a rig that structurally cannot do
+                // the thing under test. The consent grab and the dead-man
+                // watcher stay out, exactly as they were: this rig has no
+                // display to raise a prompt on.
+                runtime: Runtime::new(seed, {
+                    let now = std::rc::Rc::new(std::cell::Cell::new(Instant::now()));
+                    InputRouter::new(
+                        std::rc::Rc::new(std::cell::RefCell::new(
+                            crate::input::PhysicalPresenceMap::new(),
+                        )),
+                        std::rc::Rc::clone(&now),
+                        crate::attention::AttentionHook::new(
+                            std::rc::Rc::new(std::cell::RefCell::new(
+                                crate::attention::AttentionSignal::new(
+                                    crate::attention::AttentionChord::parse(
+                                        crate::attention::DEFAULT_CHORD,
+                                    )
+                                    .expect("the default attention chord parses"),
+                                ),
+                            )),
+                            now,
+                            NoopHook,
+                        ),
+                    )
+                }),
                 view: TestView {
                     scenes: crate::scene::RealmScenes::new(VIEW),
                     redraws: 0,
@@ -3220,6 +3425,7 @@ mod tests {
                     consent: ConsentSurface::new(crate::consent::TrustedIndicator::for_test()),
                     size: VIEW,
                     cursor_offered: None,
+                    attention: false,
                 },
                 handle: handle.clone(),
                 signal: event_loop.get_signal(),
@@ -5811,9 +6017,17 @@ mod tests {
         // `place`, `raise` or `resize` request appended to either interface
         // moves it and fails here with a message naming why that is not a
         // free addition.
+        // Re-pinned 36 -> 37 by WS-E.1.7 (issue #232), and the decision it
+        // demanded was made rather than skipped: the added message is
+        // `vitrin_principal.attention`, an argument-free EVENT on the
+        // connection's own object. It is not a request on either layout
+        // interface, it adds no arrangement this scene cannot honour, and it
+        // allocates no verb bit -- so D-018(2) invariant 2 is untouched. What
+        // it does do is make `preempted` CONDITIONAL for the two layout verbs;
+        // that is D-023, not this invariant.
         assert_eq!(
             vitrin_protocol::generated::MESSAGE_COUNT,
-            36,
+            37,
             "a message was added to the IDL. If it is a request on \
              vitrin_layout_arrange or vitrin_layout_focus, D-018(2) invariant 2 is at \
              stake: this scene shows one realm, unstacked and unoverlapped, so it cannot \
@@ -6124,7 +6338,7 @@ mod tests {
         );
     }
 
-    /// **A layout request is attention-shaped, so it yields to the human.**
+    /// **A layout request contends for attention, so it yields to the human.**
     ///
     /// Three cases, one per chokepoint gate WS-E.1.4 widened from "actuation
     /// only" to "actuation and layout":
@@ -6299,7 +6513,7 @@ mod tests {
              waiting on"
         );
         // ...and `set_fullscreen` meets it too: both layout requests are
-        // attention-shaped, not just the one that moves the output.
+        // attention-contending, not just the one that moves the output.
         send_set_fullscreen(
             &mut client,
             vitrin_protocol::generated::vitrin_layout_arrange::Mode::Fullscreen,
@@ -6307,7 +6521,7 @@ mod tests {
         assert_eq!(
             next_refusal(&mut rig, &mut client),
             Some(Refusal::ConsentHeld),
-            "set_fullscreen is attention-shaped on exactly the same terms focus is"
+            "set_fullscreen contends for attention on exactly the same terms focus is"
         );
         assert_ne!(
             rig.host.view.focused(),
@@ -6350,6 +6564,550 @@ mod tests {
             rig.host.view.focused(),
             Some(&RealmId::new("realm-c")),
             "and the refused focus must not have bound the output to the vacant realm"
+        );
+    }
+
+    /// **The human's attention key lifts `preempted` for exactly one layout
+    /// use** — WS-E.1.7 (issue #232), driven through the production entry
+    /// points end to end.
+    ///
+    /// The loop this closes: a human at an in-realm shell types `focus
+    /// editor` and presses Enter; the Enter marks physical presence, and the
+    /// layout request the Enter just sent is refused `preempted`. Pressing
+    /// Enter again re-arms the window, so it is a deterministic loop rather
+    /// than a race.
+    ///
+    /// **Nothing here is hand-fed.** The presence comes from real physical
+    /// input through [`route_physical_turn`]; the chord press is a real
+    /// `physical_key` through the same function; the window is opened by
+    /// `open_attention_window`'s own delivery filter; and the client learns
+    /// about it from the wire event, not from the rig. Every assertion is on
+    /// something a client or the journal can see.
+    ///
+    /// **The press delegates nothing.** The grant that makes the admitted
+    /// `set_fullscreen` legal was approved before any of this; what the press
+    /// changes is one refusal, once.
+    #[test]
+    fn the_humans_attention_key_lifts_preemption_for_exactly_one_layout_use() {
+        use vitrin_protocol::generated::vitrin_grant::{events::Refused, Refusal};
+        use vitrin_protocol::generated::vitrin_layout_arrange::Mode;
+        use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rig, a, _b) = two_realm_rig("attention-key");
+        // The holder's grant is over `realm-a`, which is also the realm the
+        // output is bound to and therefore the realm the human's hand is in.
+        // `set_fullscreen` rather than `focus` for the admitted use, so the
+        // binding -- and with it `physical_realm` -- does not move underneath
+        // the second half of the test and quietly make the second refusal
+        // about a different realm.
+        commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
+        let mut holder = layout_holder(&mut rig, DEMO_IDENTITY, TOKEN, "realm-a");
+        assert_eq!(
+            rig.host.view.focused(),
+            Some(&a),
+            "fixture: realm-a is bound"
+        );
+
+        // Drain to a `sync` fence, counting the two things this test reads off
+        // the wire: refusals of the layout use, and `attention` events. A
+        // fence rather than a read count because an *admitted* request -- the
+        // thing a regression produces -- emits no terminal at all, and a bare
+        // `recv_message` on an empty queue blocks forever. A fresh cookie per
+        // call so an earlier round's `done` cannot end this one on its first
+        // iteration and report someone else's answer.
+        let cookie = std::cell::Cell::new(9000u32);
+        let drain = |rig: &mut Rig, client: &mut Connection| -> (Option<Refusal>, usize) {
+            use vitrin_protocol::generated::vitrin_principal::events::Attention;
+            let fence = cookie.get() + 1;
+            cookie.set(fence);
+            client
+                .send_message(
+                    &vitrin_handshake::requests::Sync { cookie: fence }.encode(HANDSHAKE_ID),
+                    None,
+                )
+                .expect("sync");
+            rig.pump(Duration::from_millis(300));
+            let mut found = None;
+            let mut attention = 0usize;
+            for _ in 0..256 {
+                let Ok(Some(msg)) = client.recv_message() else {
+                    break;
+                };
+                if msg.header.object_id == GRANT_ID && msg.header.opcode == Refused::OPCODE {
+                    let (_, e) = Refused::decode(&msg.bytes, msg.fd).expect("decode refused");
+                    found.get_or_insert(e.code);
+                    continue;
+                }
+                if msg.header.object_id == 2 && msg.header.opcode == Attention::OPCODE {
+                    attention += 1;
+                    continue;
+                }
+                if msg.header.object_id == HANDSHAKE_ID
+                    && msg.header.opcode == vitrin_handshake::events::Done::OPCODE
+                {
+                    let (_, done) = vitrin_handshake::events::Done::decode(&msg.bytes, msg.fd)
+                        .expect("decode done");
+                    if done.cookie == fence {
+                        break;
+                    }
+                }
+            }
+            (found, attention)
+        };
+
+        // The human types. A real key, through the production intake and the
+        // production turn -- the same function the nested backend tails into.
+        const EVDEV_A: u32 = 30;
+        const KEYSYM_A: u32 = 0x61;
+        let type_a = |rig: &mut Rig| {
+            for state in [KeyState::Pressed, KeyState::Released] {
+                route_physical_turn(
+                    &mut rig.host.runtime,
+                    &rig.host.view.scenes,
+                    None,
+                    crate::input::physical_key(EVDEV_A, Some(KEYSYM_A), state),
+                    VIEW,
+                    Instant::now(),
+                );
+            }
+        };
+        type_a(&mut rig);
+
+        // ...so the request that typing just sent is refused. This is the
+        // whole premise: the input that tells the client to act forbids it.
+        send_set_fullscreen(&mut holder, Mode::Windowed);
+        assert_eq!(
+            drain(&mut rig, &mut holder),
+            (Some(Refusal::Preempted), 0),
+            "fixture: without the attention key a layout use under the human's own hand \
+             must be refused, or this test proves nothing about lifting the refusal"
+        );
+
+        // The human presses the attention chord. `physical_key` on the
+        // chord's own scancode -- the same call the injector's `attention`
+        // line makes and the same one the nested backend's keyboard handler
+        // makes -- so nothing here is a second path into the core.
+        let chord = crate::attention::AttentionChord::parse(crate::attention::DEFAULT_CHORD)
+            .expect("the default chord parses");
+        let tap = |rig: &mut Rig| {
+            for state in [KeyState::Pressed, KeyState::Released] {
+                route_physical_turn(
+                    &mut rig.host.runtime,
+                    &rig.host.view.scenes,
+                    None,
+                    crate::input::physical_key(chord.evdev(), None, state),
+                    VIEW,
+                    Instant::now(),
+                );
+            }
+        };
+        tap(&mut rig);
+
+        // The client learns about it the only way it can -- the wire event --
+        // and the use the human's gesture was for is then admitted.
+        //
+        // **Admission is read out of the journal, not out of the wire's
+        // silence.** A second refusal with the same `(verb, code)` pair is
+        // *coalesced* by the delivery classification, so "no refusal arrived"
+        // is genuinely ambiguous between admitted and refused-again -- which
+        // is exactly how this assertion first passed with the exemption arm
+        // reverted. `use_decision` is written per decision regardless of
+        // coalescing, so it is what says which one happened.
+        let layout_decisions = |rig: &mut Rig| -> Vec<String> {
+            crate::recorder::tests::of_kind(&rig.entries(), "use_decision")
+                .into_iter()
+                .filter(|e| e.str("verb") == "layout_arrange")
+                .map(|e| e.str("decision").to_string())
+                .collect()
+        };
+        assert_eq!(
+            layout_decisions(&mut rig),
+            vec!["refused".to_string()],
+            "fixture: exactly the one refusal so far"
+        );
+        send_set_fullscreen(&mut holder, Mode::Windowed);
+        assert_eq!(
+            drain(&mut rig, &mut holder),
+            (None, 1),
+            "a layout holder must be told exactly once that the human pressed the key"
+        );
+        assert_eq!(
+            layout_decisions(&mut rig),
+            vec!["refused".to_string(), "allowed".to_string()],
+            "the layout use inside the window must be ADMITTED -- this is the interaction \
+             the key exists to unbreak. Read from the journal because a repeated refusal of \
+             the same (verb, code) pair is coalesced off the wire, so client-side silence \
+             cannot tell the two apart"
+        );
+
+        // **Exactly one.** The human's hand is still on the keyboard (the
+        // chord itself refreshed presence -- decision 3: the core must not
+        // manufacture a false fact about where the human is), so a second use
+        // meets the same 5c it did before, with the window now spent.
+        assert!(
+            rig.host
+                .runtime
+                .kernel
+                .presence
+                .borrow()
+                .owns_target(Some(&a), Instant::now()),
+            "fixture: the human's hand must still own realm-a, or the second refusal below \
+             would be about presence lapsing rather than about the window being spent"
+        );
+        send_set_fullscreen(&mut holder, Mode::Fullscreen);
+        let _ = drain(&mut rig, &mut holder);
+        assert_eq!(
+            layout_decisions(&mut rig),
+            vec![
+                "refused".to_string(),
+                "allowed".to_string(),
+                "refused".to_string()
+            ],
+            "one press admits at most ONE layout use: it cannot authorise a burst, and a \
+             holder that could focus, then fullscreen, then focus again would be spending \
+             one human gesture three times"
+        );
+
+        // The journal says what happened, and who took the press -- the one
+        // narrowing available against a session-wide window (decision 10).
+        let entries = rig.entries();
+        let pressed = crate::recorder::tests::of_kind(&entries, "attention_pressed");
+        assert_eq!(pressed.len(), 1, "one press, one entry");
+        assert_eq!(pressed[0].str("chord"), "super");
+        assert!(pressed[0].bool("opened"), "the window opened");
+        assert_eq!(pressed[0].u64("notified"), 1);
+        let claimed = crate::recorder::tests::of_kind(&entries, "attention_claimed");
+        assert_eq!(claimed.len(), 1, "one press, at most one claim");
+        assert_eq!(claimed[0].str("principal"), DEMO_IDENTITY);
+    }
+
+    /// **The window is burnt only by a use that actually needed it and was
+    /// actually admitted** (WS-E.1.7) — the same rule `commit_use` follows for
+    /// a `once` rung, and for the same reason.
+    ///
+    /// Two ways a naive implementation spends the human's press for nothing,
+    /// both driven through the real chokepoint:
+    ///
+    /// - **A use that did not need it.** If the human's hand had already
+    ///   lapsed, step 5c would not have refused anything, so there was no
+    ///   refusal to suppress and the window must survive for the use that
+    ///   really does meet a hand on the keyboard.
+    ///
+    /// The companion half — a use refused by an *earlier* gate, which is where
+    /// `consent_held` sits — is
+    /// `a_prompt_is_never_lifted_by_the_attention_key`. Between them the two
+    /// cover "refused for any other reason". The one case neither drives is an
+    /// exemption discarded by the rate bucket (the only gate *after* 5c), and
+    /// that one is closed by construction rather than by a test:
+    /// [`crate::attention::Exemption`] is `#[must_use]`, is not `Copy`, and is
+    /// consumed **by value** by `claim`, so an exemption the bucket refuses
+    /// past is simply dropped and the window is untouched — there is no code
+    /// path in which it could be spent.
+    ///
+    /// The open window is fed at the kernel the way every `preempted` test in
+    /// this file feeds presence. That the *press* opens one, and reaches the
+    /// wire, is the neighbouring test's job.
+    #[test]
+    fn a_use_that_did_not_need_the_window_or_that_was_refused_never_spends_it() {
+        use vitrin_protocol::generated::vitrin_grant::{events::Refused, Refusal};
+        use vitrin_protocol::generated::vitrin_layout_arrange::Mode;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rig, a, _b) = two_realm_rig("attention-not-spent");
+        commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
+        let mut holder = layout_holder(&mut rig, DEMO_IDENTITY, TOKEN, "realm-a");
+        let identity = crate::identity::PrincipalIdentity::parse(DEMO_IDENTITY).expect("identity");
+
+        let cookie = std::cell::Cell::new(3000u32);
+        let drain = |rig: &mut Rig, client: &mut Connection| -> Option<Refusal> {
+            let fence = cookie.get() + 1;
+            cookie.set(fence);
+            client
+                .send_message(
+                    &vitrin_handshake::requests::Sync { cookie: fence }.encode(HANDSHAKE_ID),
+                    None,
+                )
+                .expect("sync");
+            rig.pump(Duration::from_millis(300));
+            let mut found = None;
+            for _ in 0..512 {
+                let Ok(Some(msg)) = client.recv_message() else {
+                    break;
+                };
+                if msg.header.object_id == GRANT_ID && msg.header.opcode == Refused::OPCODE {
+                    let (_, e) = Refused::decode(&msg.bytes, msg.fd).expect("decode refused");
+                    found.get_or_insert(e.code);
+                    continue;
+                }
+                if msg.header.object_id == HANDSHAKE_ID
+                    && msg.header.opcode == vitrin_handshake::events::Done::OPCODE
+                {
+                    let (_, done) = vitrin_handshake::events::Done::decode(&msg.bytes, msg.fd)
+                        .expect("decode done");
+                    if done.cookie == fence {
+                        break;
+                    }
+                }
+            }
+            found
+        };
+        let open_window = |rig: &mut Rig| {
+            rig.host.runtime.kernel.attention.borrow_mut().open(
+                Instant::now(),
+                std::collections::BTreeSet::from([identity.clone()]),
+            );
+        };
+        let window_is_open = |rig: &Rig| {
+            rig.host
+                .runtime
+                .kernel
+                .attention
+                .borrow()
+                .exempt(
+                    &identity,
+                    &crate::enforcement::UseKind::LayoutFocus,
+                    Instant::now(),
+                )
+                .is_some()
+        };
+
+        // (1) No hand anywhere, so 5c refuses nothing and the window is not
+        // this use's to spend.
+        open_window(&mut rig);
+        send_set_fullscreen(&mut holder, Mode::Windowed);
+        assert_eq!(
+            drain(&mut rig, &mut holder),
+            None,
+            "fixture: with no hand on the input the use is admitted on its grant alone"
+        );
+        assert!(
+            window_is_open(&rig),
+            "a use that needed no exemption must leave the window open for the one that \
+             does: the human pressed the key for the request they are about to make, not \
+             for whatever happened to arrive first"
+        );
+
+        // And the journal agrees: nothing was claimed at all.
+        assert!(
+            crate::recorder::tests::of_kind(&rig.entries(), "attention_claimed").is_empty(),
+            "no use in this run suppressed a refusal, so none may be journaled as having \
+             spent the human's press"
+        );
+    }
+
+    /// **A consent prompt is never lifted by the attention key** (WS-E.1.7
+    /// decision 6, and D-022(6) underneath it).
+    ///
+    /// Step 5b runs strictly before 5c and is **never** exempted. A prompt up
+    /// means the human is answering a security question; the attention key
+    /// says nothing about a pending petition, and a principal that could focus
+    /// or fullscreen over its own pending card would be arranging the decision
+    /// it is waiting on. The window's existence changes nothing about that —
+    /// which is what "whether or not a window is open" in the criterion means,
+    /// and why the window is asserted open on both sides of the refusal.
+    ///
+    /// This is also the "refused for some other reason" half of
+    /// `a_use_that_did_not_need_the_window_or_that_was_refused_never_spends_it`:
+    /// the use never reaches 5c, so no exemption is ever obtained and the
+    /// window survives untouched.
+    #[test]
+    fn a_prompt_is_never_lifted_by_the_attention_key() {
+        use crate::input::SeatInputKind;
+        use vitrin_protocol::generated::vitrin_grant::{events::Refused, Refusal};
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "attention-prompt",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let grab = rig.attach_grab();
+        rig.start_realms(&[
+            ("realm-a", &["--serve", "--seat"]),
+            ("realm-b", &["--serve"]),
+        ]);
+        rig.pump(Duration::from_millis(400));
+        let a = RealmId::new("realm-a");
+        commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
+
+        let mut client = agent(&rig.socket);
+        send_preamble_as(&mut client, DEMO_IDENTITY, TOKEN, "realm-a");
+        send_petition_for(&mut client, max_verbs());
+        let petition = pump_until_armed(&mut rig, &grab);
+        grab.borrow_mut().queue_decision(Decision {
+            petition,
+            choice: Choice::Allow(PersistenceRung::WhileRunning),
+        });
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(await_resolution(&mut client), Outcome::Granted);
+        mint_layout_facets(&mut client);
+        rig.pump(Duration::from_millis(200));
+
+        // A second petition from the same principal, left pending with its
+        // prompt on screen -- `observe`, because D-018(4) would resolve a
+        // second `layout_arrange` petition `layout_held` at admission without
+        // ever raising a card.
+        send_second_petition_for(&mut client, Verb::OBSERVE);
+        let pending = pump_until_armed(&mut rig, &grab);
+        let identity = crate::identity::PrincipalIdentity::parse(DEMO_IDENTITY).expect("identity");
+        assert!(
+            rig.host.runtime.kernel.petitions.prompt_up_for(&identity),
+            "fixture check: the prompt for {pending:?} must be up for THIS principal, which \
+             is the fact step 5b reads"
+        );
+
+        // The human's hand is on the input **and** a window is open: both of
+        // 5c's inputs say "admit". 5b must still refuse.
+        rig.host.runtime.kernel.presence.borrow_mut().note(
+            Some(&a),
+            vitrin_protocol::generated::vitrin_shim_seat::Origin::Physical,
+            &SeatInputKind::Motion { x: 1.0, y: 1.0 },
+            Instant::now(),
+        );
+        rig.host.runtime.kernel.attention.borrow_mut().open(
+            Instant::now(),
+            std::collections::BTreeSet::from([identity.clone()]),
+        );
+
+        send_focus(&mut client);
+        client
+            .send_message(
+                &vitrin_handshake::requests::Sync { cookie: 5150 }.encode(HANDSHAKE_ID),
+                None,
+            )
+            .expect("sync");
+        rig.pump(Duration::from_millis(300));
+        let mut found = None;
+        for _ in 0..256 {
+            let Ok(Some(msg)) = client.recv_message() else {
+                break;
+            };
+            if msg.header.object_id == GRANT_ID && msg.header.opcode == Refused::OPCODE {
+                let (_, e) = Refused::decode(&msg.bytes, msg.fd).expect("decode refused");
+                found.get_or_insert(e.code);
+                continue;
+            }
+            if msg.header.object_id == HANDSHAKE_ID
+                && msg.header.opcode == vitrin_handshake::events::Done::OPCODE
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            found,
+            Some(Refusal::ConsentHeld),
+            "an open attention window must not lift `consent_held`: the human pressing a key \
+             about their own hand says nothing about the petition they are being asked to \
+             decide, and a principal that could arrange the screen around its own pending \
+             card would be arranging the decision it is waiting on"
+        );
+        assert!(
+            rig.host
+                .runtime
+                .kernel
+                .attention
+                .borrow()
+                .exempt(
+                    &identity,
+                    &crate::enforcement::UseKind::LayoutFocus,
+                    Instant::now()
+                )
+                .is_some(),
+            "and the refused use must not have spent the human's press"
+        );
+        assert!(
+            crate::recorder::tests::of_kind(&rig.entries(), "attention_claimed").is_empty(),
+            "nothing may be journaled as having spent a press that suppressed no refusal"
+        );
+    }
+
+    /// **A press nobody could use opens nothing, and only layout holders are
+    /// told at all** (WS-E.1.7).
+    ///
+    /// Two properties in one run because they are the same filter seen from
+    /// two sides. An unconditional `attention` event would be a free, silent
+    /// keystroke-timing oracle for every connected client — the same hazard
+    /// consuming the key closes on the confined app's side — so delivery is
+    /// filtered to principals holding a live grant carrying a layout verb, and
+    /// a press that reached nobody is journaled as having opened no window
+    /// rather than as an open one nobody may claim.
+    #[test]
+    fn a_client_holding_no_layout_verb_is_never_told_the_human_pressed_the_key() {
+        use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rig, _a, _b) = two_realm_rig("attention-filter");
+
+        // A client with real, live authority over the bound realm -- and none
+        // of it layout. If the filter were "any bound connection" this would
+        // receive the event.
+        let mut watcher = agent(&rig.socket);
+        send_preamble_as(&mut watcher, OTHER_IDENTITY, OTHER_TOKEN, "realm-a");
+        send_petition_for(&mut watcher, Verb::OBSERVE);
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(
+            await_resolution(&mut watcher),
+            Outcome::Granted,
+            "fixture: the observer's grant must be real, or silence proves nothing"
+        );
+
+        let chord = crate::attention::AttentionChord::parse(crate::attention::DEFAULT_CHORD)
+            .expect("the default chord parses");
+        for state in [KeyState::Pressed, KeyState::Released] {
+            route_physical_turn(
+                &mut rig.host.runtime,
+                &rig.host.view.scenes,
+                None,
+                crate::input::physical_key(chord.evdev(), None, state),
+                VIEW,
+                Instant::now(),
+            );
+        }
+        // Drained to a `sync` fence: a bare read on an empty queue blocks, and
+        // "nothing arrived" is exactly what this test expects to find.
+        watcher
+            .send_message(
+                &vitrin_handshake::requests::Sync { cookie: 7777 }.encode(HANDSHAKE_ID),
+                None,
+            )
+            .expect("sync");
+        rig.pump(Duration::from_millis(300));
+        let mut heard = 0usize;
+        for _ in 0..256 {
+            let Ok(Some(msg)) = watcher.recv_message() else {
+                break;
+            };
+            if msg.header.object_id == 2
+                && msg.header.opcode
+                    == vitrin_protocol::generated::vitrin_principal::events::Attention::OPCODE
+            {
+                heard += 1;
+                continue;
+            }
+            if msg.header.object_id == HANDSHAKE_ID
+                && msg.header.opcode == vitrin_handshake::events::Done::OPCODE
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            heard, 0,
+            "a client holding no layout verb must never learn the human pressed the key: an \
+             unconditional event is a free keystroke-timing oracle for every app in the \
+             session"
+        );
+
+        let entries = rig.entries();
+        let pressed = crate::recorder::tests::of_kind(&entries, "attention_pressed");
+        assert_eq!(pressed.len(), 1, "the press is journaled even so");
+        assert_eq!(pressed[0].u64("notified"), 0);
+        assert!(
+            !pressed[0].bool("opened"),
+            "a window no principal may claim is not open, and recording it as one would \
+             overstate what the human's gesture did"
         );
     }
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import vectors
 from vitrin_os import messages
-from vitrin_os.messages import FrameReadyEvent, decode_event
+from vitrin_os.messages import AttentionEvent, FrameReadyEvent, decode_event
 from vitrin_os.wire import HEADER_SIZE, MessageDecoder, fixed_to_float, unpack_header
 
 
@@ -34,6 +34,19 @@ def test_golden_get_realm_new_id_and_string_padding() -> None:
         messages.encode_get_realm(7, realm_id=2, name="abc")
         == vectors.GOLDEN_GET_REALM
     )
+
+
+def test_golden_attention_is_a_bare_header_with_no_payload() -> None:
+    # `vitrin_principal.attention` carries no arguments, forever, so the whole
+    # frame is the 8-byte header. Decoding it through the SDK's own event table
+    # is what proves the opcode is right: opcode 0 would have been `bound` and
+    # would have raised on a missing string.
+    object_id, size, opcode, fd_count = unpack_header(vectors.GOLDEN_ATTENTION)
+    assert (object_id, size, opcode, fd_count) == (2, 8, 1, 0)
+    event = decode_event(
+        "vitrin_principal", opcode, vectors.GOLDEN_ATTENTION[HEADER_SIZE:], fd=None
+    )
+    assert isinstance(event, AttentionEvent)
 
 
 def test_golden_pointer_move_negative_int() -> None:

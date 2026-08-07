@@ -1,5 +1,5 @@
 /* Golden-bytes (known-answer) test for the generated C header: encodes the
- * SAME five frames as crates/vitrin-protocol/tests/golden.rs and compares
+ * SAME six frames as crates/vitrin-protocol/tests/golden.rs and compares
  * them byte-for-byte against the same hardcoded expectations, then decodes
  * them back. Because both sides must match these bytes -- not each other --
  * the Rust and C encoders cannot silently drift apart, and a symmetric
@@ -54,6 +54,25 @@ int main(void) {
                vitrin_handshake_req_sync_decode(want, sizeof want, -1, &object_id,
                                                 &back) == VITRIN_DECODE_OK);
         expect("sync decode fields", object_id == 1u && back.cookie == 42u);
+    }
+
+    /* -- attention: a bare header, no payload --------------------------- */
+    {
+        /* vitrin_principal.attention (WS-E.1.7) carries no arguments, forever.
+         * The vector pins the empty payload AND the opcode: it is event 1,
+         * appended after bound, and a reorder would decode as a truncated
+         * bound. */
+        static const uint8_t want[] = {2, 0, 0, 0, 8, 0, 1, 0};
+        vitrin_principal_evt_attention_t msg = {0};
+        int32_t n = vitrin_principal_evt_attention_encode(&msg, 2, buf, sizeof buf);
+        expect_bytes("attention", buf, n, want, sizeof want);
+
+        uint32_t object_id = 0;
+        vitrin_principal_evt_attention_t back;
+        expect("attention decode ok",
+               vitrin_principal_evt_attention_decode(want, sizeof want, -1, &object_id,
+                                                     &back) == VITRIN_DECODE_OK);
+        expect("attention decode fields", object_id == 2u);
     }
 
     /* -- get_realm: new_id + string with padding ------------------------ */

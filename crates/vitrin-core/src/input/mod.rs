@@ -158,8 +158,13 @@
 //!    [`Gate::Consume`] and the pairing contract on [`PreemptionHook`]).
 //!
 //! Both sides are now taken, and the nested backend's router is
-//! `InputRouter<ConsentGate<DeadManHook<NoopHook>>>` — the stacking this
-//! hook point was designed for, reached without restructuring anything.
+//! `InputRouter<ConsentGate<DeadManHook<AttentionHook<NoopHook>>>>` — the
+//! stacking this hook point was designed for, reached without restructuring
+//! anything. The order is the decision, not the arrangement: a consent prompt
+//! consumes an event before the dead-man's *gate* half sees it, and both are
+//! outside the attention key, so the human's off-switch and the human's
+//! security question each short-circuit a mechanism whose worst failure is a
+//! focus change that does not happen.
 //!
 //! [`crate::consent::grab::ConsentGate`] (P1.7.2) is the gate. Its policy
 //! lives entirely in that module; what matters here is that it honours the
@@ -167,17 +172,28 @@
 //! the origin tag intake bound rather than by any authority question — the
 //! router still holds no authority check, and must not grow one.
 //!
-//! [`crate::deadman::DeadManHook`] (P1.7.3) is innermost, and it implements
-//! **both** halves — which is the resolution of a real tension rather than an
+//! [`crate::deadman::DeadManHook`] (P1.7.3) sits between them, and it
+//! implements **both** halves — which is the resolution of a real tension rather than an
 //! oversight, argued in full in [`crate::deadman`]. The two halves do two
 //! different jobs: `observe` detects the chord and owns every piece of switch
 //! state, so no other policy can stop the human's off-switch from firing;
 //! `gate` only decides what the confined app sees, withholding the chord key's
 //! press until a tap can be told from a hold. It therefore *does* consume a
-//! release — the one place in this core that does — and that is sound only
-//! because it consumed that release's press too, so the pair is atomic and the
-//! app's accounting is never split. The router's per-keysym pairing is what
+//! release — one of the two places in this core that do, the other being the
+//! attention hook below — and that is sound only because it consumed that
+//! release's press too, so the pair is atomic and the app's accounting is never
+//! split. The router's per-keysym pairing is what
 //! proves it: the reconciliation finds no delivered press and does nothing.
+//!
+//! [`crate::attention::AttentionHook`] (WS-E.1.7, issue #232) is innermost, and
+//! it implements `gate` **only**. It consumes the human's attention chord —
+//! both halves of the pair, taking the same sound exception for the same
+//! reason — and records a press the embedder turns into a short exemption
+//! window for the two layout verbs. Being innermost is what makes it
+//! *suppressible*: a raised prompt or a dead-man chord press never reaches it.
+//! That is the opposite posture from the dead-man's `observe`, deliberately —
+//! see [`crate::attention`]'s "neighbour, never sibling" table for why the two
+//! core-owned chords are kept apart at every level.
 //!
 //! The physical-activity state behind the enforcement chokepoint's
 //! `preempted` refusal ([`PhysicalPresenceMap`]) rides the same single tap
@@ -522,9 +538,12 @@ pub(crate) enum Gate {
 /// **The one sound exception**, and the only one in this core: a gate that
 /// consumed a press may consume that press's release, because then nothing
 /// is stranded — the app never saw the press begin, so it is not left
-/// holding anything. [`crate::deadman`] takes exactly this exception for
-/// the chord key and nothing else. The rule above is otherwise absolute:
-/// a gate must not consume a release whose press the *router* delivered.
+/// holding anything. Exactly two gates take it, each for its own core-owned
+/// chord key and nothing else: [`crate::deadman`] for the dead-man chord, and
+/// [`crate::attention`] for the attention chord (which consumes *both* halves
+/// unconditionally, so the pair is atomic by construction rather than by a
+/// classification). The rule above is otherwise absolute: a gate must not
+/// consume a release whose press the *router* delivered.
 ///
 /// # Session-wide by construction: **no** hook is ever told a realm
 ///
@@ -565,6 +584,39 @@ pub(crate) trait PreemptionHook {
     ///
     /// Not given the realm either — see the trait docs.
     fn gate(&mut self, input: &SeatInput) -> Gate;
+
+    /// The attention signal this stack carries, if any (WS-E.1.7, issue #232).
+    ///
+    /// **Not a third policy point** — it makes no decision and sees no event.
+    /// It is a *wiring* accessor, and it is on the trait for exactly the reason
+    /// [`InputRouter::presence`] is on the router: the capability kernel has to
+    /// read the same signal the hook writes, and a kernel whose signal is not
+    /// its router's would judge the exemption against something nothing opens.
+    /// That was constructible for presence until issue #212's review, and every
+    /// shipped `vitrind` was in that state. Reaching the signal *through* the
+    /// stack makes the mistake unconstructible instead: `Runtime::new` takes it
+    /// out of the router it is handed, so no backend can pass a second one.
+    ///
+    /// **Required, deliberately — there is no default.** `None` is a perfectly
+    /// honest answer (a plain headless build has no physical input device and so
+    /// no attention key, and [`NoopHook`] says exactly that), but it must be
+    /// *said* rather than inherited. A defaulted `None` would mean a wrapping
+    /// hook that forgot to forward its inner hook's answer silently returns "no
+    /// attention key", `Runtime::new` falls back to a detached signal, and the
+    /// chord opens a window nothing reads — the key simply stops working, with
+    /// every test still green.
+    ///
+    /// That is not a hypothetical failure mode, it is the one this codebase
+    /// already shipped: `PresenceHook` was an optional member of this same stack
+    /// that no backend included, so `preempted` could not fire in any `vitrind`
+    /// ever built while the book described it as live (issue #212's review). The
+    /// lesson taken from it was to make the omission unconstructible, and a
+    /// defaulted method here would have re-opened precisely that hole one
+    /// release later. Every wrapping hook must now forward explicitly or fail to
+    /// compile.
+    fn attention(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>>;
 }
 
 /// The terminal hook: observes nothing, consumes nothing.
@@ -579,6 +631,17 @@ impl PreemptionHook for NoopHook {
 
     fn gate(&mut self, _input: &SeatInput) -> Gate {
         Gate::Deliver
+    }
+
+    /// The terminal hook owns no attention signal, and says so out loud
+    /// rather than inheriting it: a stack that bottoms out here and is not
+    /// wrapped by an [`AttentionHook`](crate::attention::AttentionHook) has
+    /// no attention key. See [`PreemptionHook::attention`] for why this is
+    /// spelled rather than defaulted.
+    fn attention(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>> {
+        None
     }
 }
 
@@ -1090,6 +1153,21 @@ impl<H: PreemptionHook> InputRouter<H> {
     /// what makes "the kernel reads the map the router writes" structural.
     pub fn presence(&self) -> std::rc::Rc<std::cell::RefCell<PhysicalPresenceMap>> {
         std::rc::Rc::clone(&self.presence)
+    }
+
+    /// The attention signal this router's hook stack carries, if any
+    /// (WS-E.1.7): `None` when nothing in the stack is an
+    /// [`AttentionHook`](crate::attention::AttentionHook).
+    ///
+    /// The same discipline [`Self::presence`] follows and for the same reason:
+    /// `Runtime::new` takes the signal *out of the router it is handed* rather
+    /// than minting one beside it, so "the kernel judges the exemption against
+    /// the signal the hook opens" is structural rather than a wiring step a
+    /// backend can forget.
+    pub fn attention(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>> {
+        self.hook.attention()
     }
 
     /// Set the presence tap's clock to this dispatch turn's instant.
@@ -1919,8 +1997,15 @@ fn char_keysym(ch: char) -> Option<u32> {
 /// [`resolve_key_seat`] prefers it over this table. This subset is chosen so
 /// the consent / revocation paths never depend on the host resolving
 /// anything: Escape — P1.7.3's hold-Esc chord — is layout-invariant and
-/// always translates, from either path.
-fn invariant_keysym(evdev_code: u32) -> Option<u32> {
+/// always translates, from either path, and so are the two Super keys
+/// WS-E.1.7's attention chord is drawn from (`125`/`126` below).
+///
+/// `pub(crate)` for the two core-owned chord vocabularies, which assert against
+/// this table rather than restating it: [`crate::deadman::Chord::parse`]
+/// through [`keysym_is_intakeable`], and
+/// [`crate::attention::AttentionChord::parse`] through both — it carries the
+/// scancode as well, so it checks this row itself.
+pub(crate) fn invariant_keysym(evdev_code: u32) -> Option<u32> {
     Some(match evdev_code {
         1 => 0xff1b,                           // KEY_ESC        -> XK_Escape
         14 => 0xff08,                          // KEY_BACKSPACE  -> XK_BackSpace
@@ -1957,13 +2042,17 @@ fn invariant_keysym(evdev_code: u32) -> Option<u32> {
 /// Whether nested intake can ever produce `keysym` — i.e. whether some evdev
 /// scancode maps to it through [`invariant_keysym`].
 ///
-/// Exists for one caller and one hazard: [`crate::deadman::Chord::parse`]
-/// validates the configured dead-man chord against it, so a session can
-/// never come up with an off-switch whose key intake silently drops. Asking
-/// the real table rather than restating it is the whole point — a
-/// hand-maintained copy of the mapping would be free to drift, and the
-/// symptom of that drift is a dead-man switch that never fires, which is the
-/// worst possible thing to discover late.
+/// Exists for **two** callers and one hazard, and the second caller is why the
+/// hazard is stated as a class rather than as one switch:
+/// [`crate::deadman::Chord::parse`] validates the configured dead-man chord
+/// against it, and [`crate::attention::AttentionChord::parse`] the attention
+/// chord (WS-E.1.7), so a session can never come up with a core-owned chord
+/// whose key intake silently drops. Asking the real table rather than restating
+/// it is the whole point — a hand-maintained copy of the mapping would be free
+/// to drift, and the symptom of that drift is a chord that never fires, which
+/// is the worst possible thing to discover late. The two failures are not the
+/// same size (a dead off-switch versus a focus change that never happens) and
+/// the modules keep them apart; the *check* is identical and lives here once.
 ///
 /// The scan is over the byte-wide evdev keycode space the kernel defines
 /// (`input-event-codes.h` keeps `KEY_*` under 256, and [`invariant_keysym`]'s
@@ -2791,6 +2880,17 @@ pub(crate) mod tests {
         fn observe(&mut self, input: &SeatInput) {
             self.log.borrow_mut().push(("observe", input.origin()));
         }
+
+        // A terminal test double owns no attention signal. Spelled out because
+        // `PreemptionHook::attention` deliberately has no default: a wrapping
+        // hook that inherited `None` would silently disable the human's
+        // attention key, which is the shape of the bug #212's review found in
+        // `PresenceHook`.
+        fn attention(
+            &self,
+        ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>> {
+            None
+        }
         fn gate(&mut self, input: &SeatInput) -> Gate {
             self.log.borrow_mut().push(("gate", input.origin()));
             if self.consume.get() {
@@ -3472,6 +3572,17 @@ pub(crate) mod tests {
             self.0.observed.set(self.0.observed.get() + 1);
         }
 
+        // A terminal test double owns no attention signal. Spelled out because
+        // `PreemptionHook::attention` deliberately has no default: a wrapping
+        // hook that inherited `None` would silently disable the human's
+        // attention key, which is the shape of the bug #212's review found in
+        // `PresenceHook`.
+        fn attention(
+            &self,
+        ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>> {
+            None
+        }
+
         fn gate(&mut self, _input: &SeatInput) -> Gate {
             self.0.gated.set(self.0.gated.get() + 1);
             Gate::Deliver
@@ -4039,6 +4150,9 @@ pub(crate) mod tests {
                     UseEnv {
                         realm_view: Some(&frame),
                         presence: &presence,
+                        attention: &std::cell::RefCell::new(
+                            crate::attention::AttentionSignal::detached(),
+                        ),
                         // No human anywhere: preemption is not this test's
                         // subject and must not silently supply its refusals.
                         physical_realm: None,

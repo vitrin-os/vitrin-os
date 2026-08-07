@@ -9,7 +9,7 @@
 //! A handful of frames whose exact bytes are written down independently pins
 //! the actual wire format, not the codec's agreement with itself.
 //!
-//! The same five frames, byte for byte, are asserted from the C side in
+//! The same six frames, byte for byte, are asserted from the C side in
 //! `shim/tests/test_golden_frames.c` -- so Rust and C cannot silently
 //! disagree on the wire layout either: both must match *these* bytes, not
 //! each other.
@@ -51,6 +51,26 @@ fn golden_get_realm_new_id_and_string_padding() {
     assert_eq!(object_id, 7);
     assert_eq!(decoded.realm, 2);
     assert_eq!(decoded.name, "abc");
+}
+
+#[test]
+fn golden_attention_is_a_bare_header_with_no_payload() {
+    // `vitrin_principal.attention` (WS-E.1.7) carries NO arguments, forever:
+    // the window's length is a core-side security parameter and a client that
+    // built a timer off it would be building a retry policy that belongs
+    // nowhere. So the whole frame is the 8-byte header, and this vector pins
+    // both that emptiness and the opcode -- `attention` is event 1 on
+    // `vitrin_principal`, appended after `bound`, and an accidental reorder
+    // would decode as a `bound` with a truncated string.
+    // header: object_id=2 | size=8 | opcode=1 | fd_count=0.
+    let frame = gen::vitrin_principal::events::Attention {}.encode(2);
+    assert_eq!(frame, [2, 0, 0, 0, 8, 0, 1, 0]);
+
+    let (object_id, _decoded) =
+        gen::vitrin_principal::events::Attention::decode(&frame, None).unwrap();
+    assert_eq!(object_id, 2);
+    assert_eq!(gen::vitrin_principal::events::Attention::OPCODE, 1);
+    assert_eq!(gen::vitrin_principal::events::Attention::SINCE, 2);
 }
 
 #[test]

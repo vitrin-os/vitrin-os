@@ -47,11 +47,14 @@ writing a Go, TypeScript or C++ SDK forks it.
 
 **Three things to get right, because they are what a naïve port breaks:**
 
-- **Carry the defined-but-unserved verbs** (`observe.cursor`,
-  `layout.arrange`, `layout.focus`, `realm.launch`). An out-of-range verb bit
-  is fatal `invalid_argument` and kills the connection. Omitting them turns a
-  recoverable `unsupported` refusal into a dead socket for any user who
-  petitions one. Transcribe the *values* from the IDL rather than assuming
+- **Carry every defined verb, whether or not this core serves it**
+  (`observe.cursor`, `layout.arrange`, `layout.focus`, `realm.launch`). An
+  out-of-range verb bit is fatal `invalid_argument` and kills the connection.
+  Omitting one turns a recoverable `unsupported` refusal into a dead socket
+  for any user who petitions it. Which of them a deployment *serves* is that
+  deployment's business and can change under you — this core serves the two
+  layout verbs and refuses the other two — so never bake the served set into a
+  client. Transcribe the *values* from the IDL rather than assuming
   consecutive bits — `realm.launch` is 512, because 64/128/256 are allocated
   to verbs the IDL does not define yet and are still out of range. The Python
   SDK's `test_verb_parity.py` pins this against the IDL; write the

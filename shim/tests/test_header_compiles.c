@@ -32,6 +32,8 @@
  * a hand-maintained copy that silently falls behind the IDL -- which is
  * exactly what happened when version 2 added get_launcher, launch and
  * launched: the file kept compiling while type-checking 29 of 32 messages.
+ * (It fired as designed when version 2 later added the two layout mints and
+ * their two facet requests -- 32 to 36.)
  * It mirrors crates/vitrin-protocol/tests/roundtrip.rs's
  * `every_idl_message_is_in_the_roundtrip_table`, which gates the Rust
  * round-trip table on the same generated constant.
@@ -69,6 +71,8 @@ static int sink = 0;
     X(vitrin_principal_evt_bound)                                            \
     X(vitrin_realm_req_request_grant)                                        \
     X(vitrin_grant_req_get_launcher)                                         \
+    X(vitrin_grant_req_get_layout_focus)                                     \
+    X(vitrin_grant_req_get_layout_arrange)                                   \
     X(vitrin_grant_evt_resolved)                                             \
     X(vitrin_grant_evt_refused)                                              \
     X(vitrin_consent_evt_state)                                              \
@@ -92,7 +96,9 @@ static int sink = 0;
     X(vitrin_shim_seat_evt_key)                                              \
     X(vitrin_shim_seat_evt_text)                                             \
     X(vitrin_launcher_req_launch)                                            \
-    X(vitrin_launcher_evt_launched)
+    X(vitrin_launcher_evt_launched)                                          \
+    X(vitrin_layout_focus_req_focus)                                         \
+    X(vitrin_layout_arrange_req_set_fullscreen)
 
 /* The exhaustiveness gate. VITRIN_MESSAGE_COUNT is generated from the IDL,
  * so an appended message makes this a compile error here rather than a

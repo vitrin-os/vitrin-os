@@ -861,6 +861,15 @@ impl session::Presenter for HeadlessView {
         (size.w.max(0) as u32, size.h.max(0) as u32)
     }
 
+    /// Never called in production: this backend's virtual output is fixed at
+    /// construction and has no resize event to raise one. Implemented rather
+    /// than made to panic because "the output never resizes" is a property of
+    /// *this* backend, not of the trait, and a backend that grew a resizable
+    /// virtual output should get the same propagation the nested one does.
+    fn set_view_size(&mut self, size: (u32, u32)) {
+        self.scenes.set_view_size(size);
+    }
+
     /// Always [`Presentation::Completed`]: this backend composites
     /// synchronously into its retained framebuffer, so the composite finishing
     /// *is* the output cadence and any owed `frame_done` is due on return.

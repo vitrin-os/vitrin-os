@@ -139,6 +139,12 @@ struct vitrin_shim {
 	bool xdg_wired;
 	struct wl_listener new_toplevel; /* xdg_shell.new_toplevel */
 	struct wl_listener new_popup;    /* xdg_shell.new_popup */
+	/* Every live `struct vitrin_toplevel`, so a re-sent `configure` can
+	 * re-size all of them (`vitrin_output_resize`). Kept here rather than
+	 * walked out of the scene graph because the record this needs is ours,
+	 * not wlroots'. Initialized in `vitrin_setup_xdg`; a toplevel links
+	 * itself in at creation and unlinks in its destroy handler. */
+	struct wl_list toplevels;
 };
 
 /* Phase A (server.c): wl_display, event loop, headless backend, renderer,
@@ -152,6 +158,27 @@ bool vitrin_create_globals(struct vitrin_shim *s);
 /* Phase C (output.c): one headless output, its wl_output global, the
  * scene<->output-layout wiring, and the frame loop that forwards upstream. */
 bool vitrin_setup_output(struct vitrin_shim *s);
+
+/* **Live resize** (WS-E.1.4): the core re-sent `configure` with a new realm
+ * view size. Re-modes the headless output and re-configures every live
+ * toplevel to the new view, so the app answers with a buffer of that size.
+ *
+ * Until the core served `layout_arrange` it never re-sent `configure` at all,
+ * and this shim logged the event and letterboxed -- which the IDL explicitly
+ * permits a version-1 core to do. It is no longer enough: `set_fullscreen`
+ * means "the realm's view size tracks the output's", and a shim that ignored
+ * the message would make that verb silently do less than its name.
+ *
+ * Safe before the output exists (bring-up order) and safe with no toplevels
+ * mapped: both are no-ops. `false` means the output commit failed and the
+ * shim kept its old mode -- reported, never fatal, because a failed re-mode
+ * leaves a working session at the previous size. */
+bool vitrin_output_resize(struct vitrin_shim *s, uint32_t width, uint32_t height);
+
+/* Re-configure every live toplevel to the current `cfg` view size. Called by
+ * `vitrin_output_resize` after the output is re-moded; separate so the
+ * single-maximized layout rule stays in xdg.c, which owns it. */
+void vitrin_xdg_reconfigure_all(struct vitrin_shim *s);
 
 /* Phase D (xdg.c): the app's toplevel -> scene wiring and the
  * single-maximized layout. */

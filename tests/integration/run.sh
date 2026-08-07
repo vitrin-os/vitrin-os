@@ -62,6 +62,8 @@ MILESTONE_GATES=(
 PROPERTY_GATES=(
   test_real_trust_band.py       # trusted-band negative half (#139, refs #85)
   test_two_realms.py            # cross-realm capture confidentiality (#209)
+  test_layout.py                # layout_focus moves the output; captures stay
+                                # per-realm afterwards (#210)
 )
 missing=()
 for gate in "${MILESTONE_GATES[@]}" "${PROPERTY_GATES[@]}"; do

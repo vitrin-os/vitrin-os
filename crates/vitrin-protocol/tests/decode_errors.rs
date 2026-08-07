@@ -61,10 +61,14 @@ fn invalid_enum_value_is_rejected() {
 #[test]
 fn invalid_bitfield_value_is_rejected() {
     // `vitrin_grant.verb` is a bitfield with VALID_MASK 1|2|4|8|16|32|512 =
-    // 575. Bits 8, 16, 32 and 512 (`observe_cursor`, `layout_arrange`,
-    // `layout_focus`, `realm_launch`) are DEFINED but not served -- that is a
-    // petition-time `unsupported` resolution, deliberately not a decode
-    // error, so the codec must accept them (D-017/D-018).
+    // 575. Whether a defined bit is *served* is a property of a deployment
+    // and is settled at petition admission (`unsupported`), deliberately not
+    // a decode error, so the codec must accept every defined bit whatever
+    // any core does with it. That is unchanged by WS-E.1.4 serving
+    // `layout_arrange` (16) and `layout_focus` (32) in the reference core:
+    // this file is the codec's, and the codec never knew which bits were
+    // served. Bits 8 and 512 (`observe_cursor`, `realm_launch`) remain
+    // defined-and-unserved there (D-017/D-018).
     //
     // The 64/128/256 gap is not free space: those bits are allocated (to
     // `designate_file`, `egress`, `publish_tree`) but not yet defined in the

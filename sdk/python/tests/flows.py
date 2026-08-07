@@ -30,6 +30,10 @@ POINTER_ID = 7
 TEXT_ID = 8
 
 ALL_VERBS = 7  # observe | actuate_pointer | actuate_text
+# The two layout facets are minted on demand, after the five co-minted ids,
+# so they take 9 and 10 in the order the client first asks for them.
+LAYOUT_FOCUS_ID = 9
+LAYOUT_ARRANGE_ID = 10
 
 
 def hello_frame(version: int = protocol.PROTOCOL_VERSION) -> bytes:
@@ -109,6 +113,25 @@ def frame_ready_frame(*, format: int = 0x34325258, width: int, height: int, stri
 
 def capture_frame_frame() -> bytes:
     return frame(VIEW_ID, 0)
+
+
+def get_layout_focus_frame(facet_id: int = LAYOUT_FOCUS_ID) -> bytes:
+    """`vitrin_grant.get_layout_focus` — request opcode 1, since version 2."""
+    return frame(GRANT_ID, 1, u32(facet_id))
+
+
+def get_layout_arrange_frame(facet_id: int = LAYOUT_ARRANGE_ID) -> bytes:
+    """`vitrin_grant.get_layout_arrange` — request opcode 2, since version 2."""
+    return frame(GRANT_ID, 2, u32(facet_id))
+
+
+def focus_frame(facet_id: int = LAYOUT_FOCUS_ID) -> bytes:
+    """`vitrin_layout_focus.focus` — no arguments, deliberately."""
+    return frame(facet_id, 0)
+
+
+def set_fullscreen_frame(*, mode: int, facet_id: int = LAYOUT_ARRANGE_ID) -> bytes:
+    return frame(facet_id, 0, u32(mode))
 
 
 def sync_frame(cookie: int) -> bytes:

@@ -94,11 +94,16 @@ from vitrin_os import Verb
 verbs = Verb.OBSERVE | Verb.ACTUATE_POINTER
 ```
 
-Three more verbs exist in the enum — `OBSERVE_CURSOR`, `LAYOUT_ARRANGE`,
-`LAYOUT_FOCUS` — and version 1 resolves them `unsupported`. They are defined
-but unserved deliberately, and the SDK carries them for a precise reason: an
+Four more verbs exist in the enum. `LAYOUT_ARRANGE` and `LAYOUT_FOCUS` are
+**served** — a grant can carry them, and `grant.focus()` and
+`grant.set_fullscreen()` exercise them. `OBSERVE_CURSOR` and `REALM_LAUNCH`
+are defined and resolve `unsupported`: whether a verb is served is a property
+of the *deployment*, not of the protocol, so read `unsupported` as "not here,
+not now" rather than "not in this protocol".
+
+The SDK carries every defined bit either way, for a precise reason: an
 out-of-range verb bit is a **fatal** `invalid_argument` that kills the
-connection, so an SDK that omitted them would turn a recoverable "not yet"
+connection, so an SDK that omitted one would turn a recoverable "not yet"
 into a dead socket.
 
 ## Waiting for consent
@@ -115,7 +120,10 @@ decision was reached.
 Failure is typed:
 
 ```python
-from vitrin_os import GrantDenied, ConsentTimeout, RealmUnavailable, Busy
+from vitrin_os import (
+    Busy, ConsentTimeout, GrantDenied, GrantUnsupported, LayoutHeld,
+    RealmUnavailable,
+)
 
 try:
     grant.await_consent()
@@ -125,9 +133,18 @@ except ConsentTimeout:
     ...      # nobody answered
 except RealmUnavailable:
     ...      # no such realm, or it is not running
+except GrantUnsupported:
+    ...      # this deployment does not serve a verb you named
 except Busy:
     ...      # another petition is already up
+except LayoutHeld:
+    ...      # somebody else holds layout.arrange for this output
 ```
+
+There is one class per non-`granted` outcome, and the list is exhaustive on
+purpose: an outcome the SDK could not map would raise
+`ServerContractViolation` and **close the connection**, which is the opposite
+of what a recoverable answer is for.
 
 After it returns, inspect what you actually got — the core may have
 **attenuated** your request:

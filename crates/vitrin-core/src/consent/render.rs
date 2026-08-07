@@ -187,7 +187,15 @@ const EXPIRY_UNBOUNDED: &str = "no time limit - bounded only by the choice below
 /// set is pinned to the exact bits the IDL defines today, so appending a verb
 /// turns this test red until a human classifies it — served, and given a line
 /// below, or unserved, and added to that pin.
-const VERB_CATALOGUE: [(Verb, &str, &str); 3] = [
+///
+/// The two layout lines say what the human loses rather than what the
+/// principal gains, because that is the decision in front of them. "Show
+/// this realm and send your keyboard and mouse to it" is what
+/// `layout_focus` actually costs: the human's own typing follows the
+/// binding, so approving it is approving that this principal may move
+/// where the human's next keystroke lands. Naming it "direct keyboard
+/// focus", the IDL's phrasing, would be accurate and would not say that.
+const VERB_CATALOGUE: [(Verb, &str, &str); 5] = [
     (Verb::OBSERVE, "observe", "capture frames of this realm"),
     (
         Verb::ACTUATE_POINTER,
@@ -198,6 +206,16 @@ const VERB_CATALOGUE: [(Verb, &str, &str); 3] = [
         Verb::ACTUATE_TEXT,
         "actuate_text",
         "type text into this realm",
+    ),
+    (
+        Verb::LAYOUT_ARRANGE,
+        "layout_arrange",
+        "make this realm fill the screen, or shrink it back",
+    ),
+    (
+        Verb::LAYOUT_FOCUS,
+        "layout_focus",
+        "show this realm and send your keyboard and mouse to it",
     ),
 ];
 
@@ -665,12 +683,20 @@ mod tests {
         // unchanged and stays fail-closed -- an unclassified verb is unserved
         // and admission refuses it `unsupported`; this only refuses to let
         // that happen silently.
+        //
+        // Re-pinned by WS-E.1.4 (issue #210) with a human decision on each
+        // of the four bits that used to be here, not a mechanical subtraction
+        // of the two that moved: `layout_arrange` and `layout_focus` are
+        // served, so they left this pin and gained catalogue lines above;
+        // `observe_cursor` stays because per-principal cursor *delivery* is
+        // still M2's (D-017/D-019 both say so in as many words, and serving
+        // the verb without it would widen a capture with a cursor the core
+        // does not have); `realm_launch` stays because this core has no
+        // spawn path, which the chokepoint's `Launch` arm says at its own
+        // site.
         assert_eq!(
             crate::grants::UNSERVED_VERB_BITS,
-            Verb::OBSERVE_CURSOR.bits()
-                | Verb::LAYOUT_ARRANGE.bits()
-                | Verb::LAYOUT_FOCUS.bits()
-                | Verb::REALM_LAUNCH.bits(),
+            Verb::OBSERVE_CURSOR.bits() | Verb::REALM_LAUNCH.bits(),
             "the IDL defines a verb this module has not classified as served \
              or unserved (D-017/D-018)"
         );
@@ -682,7 +708,16 @@ mod tests {
         );
         // Names match the IDL's spelling, so prompt and protocol cannot drift.
         let names: Vec<&str> = VERB_CATALOGUE.iter().map(|(_, name, _)| *name).collect();
-        assert_eq!(names, ["observe", "actuate_pointer", "actuate_text"]);
+        assert_eq!(
+            names,
+            [
+                "observe",
+                "actuate_pointer",
+                "actuate_text",
+                "layout_arrange",
+                "layout_focus"
+            ]
+        );
     }
 
     #[test]

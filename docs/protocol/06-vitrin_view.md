@@ -8,7 +8,7 @@
 
 Capture is a **poll model**: one `capture_frame` request yields exactly one frame. There is no streaming, no subscription, and no server-initiated frame push. This keeps observation on the same request/reply spine as the rest of the principal connection and makes a threadless blocking SDK correct without extra machinery (see [conventions § delivery classification](00-conventions.md)). Streaming capture is a deliberate deferral, not an omission (decision D6): if a later version adds it, it arrives as `since`-gated sibling messages beside this poll pair, which stays valid forever.
 
-Observation is **concurrent by design**: capture never contends with physical human input or with a pending consent prompt, so the refusal codes `preempted` and `consent_held` are actuation-only and never refuse a capture. The consent overlay is composited into human-visible output only, so a frame captured while a prompt is up simply does not contain it (see [`vitrin_consent`](05-vitrin_consent.md)) — captures keep flowing while a prompt is pending.
+Observation is **concurrent by design**: capture never contends with physical human input or with a pending consent prompt, so the refusal codes `preempted` and `consent_held` never refuse a capture — they are **attention-shaped**, reaching actuation and the layout verbs. The consent overlay is composited into human-visible output only, so a frame captured while a prompt is up simply does not contain it (see [`vitrin_consent`](05-vitrin_consent.md)) — captures keep flowing while a prompt is pending.
 
 ### What a capture does not contain
 
@@ -63,7 +63,7 @@ Each capture passes the grant's single enforcement chokepoint. Captures are rate
 | `no_surface` | the realm has no surface (its shim crashed or exited) — a refusal, never a stale frame |
 | `internal` | server-side failure during this capture (renderer, memfd, delivery) |
 
-Three refusal codes are deliberately absent from this table. `preempted` and `consent_held` are **actuation-only** and never refuse a capture: observation is concurrent with physical input by design (concurrent observers are a documented non-error — [conventions § delivery classification](00-conventions.md)), and the consent overlay is never part of the realm view, so there is nothing a pending prompt would need to hide from capture. `capacity` (added at version 2) is **launch-only** — it answers "this deployment is at its realm limit", which no capture can ever provoke; see [`vitrin_launcher`](16-vitrin_launcher.md).
+Three refusal codes are deliberately absent from this table. `preempted` and `consent_held` are **attention-shaped** — they reach actuation and the layout verbs (version 2) — and never refuse a capture: observation is concurrent with physical input by design (concurrent observers are a documented non-error — [conventions § delivery classification](00-conventions.md)), and the consent overlay is never part of the realm view, so there is nothing a pending prompt would need to hide from capture. `capacity` (added at version 2) is **launch-only** — it answers "this deployment is at its realm limit", which no capture can ever provoke; see [`vitrin_launcher`](16-vitrin_launcher.md).
 
 (Fatal errors — bad opcode, an unsolicited fd, a foreign object id — belong to the framing and object-graph layers documented in [conventions § error taxonomy](00-conventions.md), not to `capture_frame`'s semantics.)
 

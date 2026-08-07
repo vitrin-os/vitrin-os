@@ -236,13 +236,15 @@ use vitrin_protocol::generated::vitrin_grant::{Outcome, Persistence as WirePersi
 use vitrin_protocol::generated::vitrin_handshake as handshake;
 use vitrin_protocol::generated::vitrin_handshake::Error as WireError;
 use vitrin_protocol::generated::vitrin_launcher as launcher;
+use vitrin_protocol::generated::vitrin_layout_arrange as layout_arrange;
+use vitrin_protocol::generated::vitrin_layout_focus as layout_focus;
 use vitrin_protocol::generated::vitrin_principal as principal;
 use vitrin_protocol::generated::vitrin_realm as realm;
 use vitrin_protocol::generated::vitrin_view as view;
 use vitrin_protocol::generated::PROTOCOL_VERSION;
 
 use crate::capture::RealmViewFrame;
-use crate::enforcement::{Chokepoint, UseEnv, UseKind, UseOutcome, UseRequest};
+use crate::enforcement::{Chokepoint, LayoutMode, UseEnv, UseKind, UseOutcome, UseRequest};
 use crate::grants::{GrantId, GrantTable, InsertError, RealmId};
 use crate::identity::{PresentedCredential, PrincipalIdentity, Verifier, VerifyOutcome};
 use crate::input::{PhysicalPresence, SeatInput, SeatInputKind};
@@ -295,6 +297,19 @@ pub(crate) const MAX_LIVE_PETITIONS: usize = 256;
 /// [`MAX_LIVE_PETITIONS`]. Breach is fatal `resource_exhausted`, the same
 /// denial-of-service confinement every other bound uses.
 pub(crate) const MAX_LIVE_LAUNCHERS: usize = MAX_LIVE_PETITIONS;
+
+/// Cap on **layout facets** per connection, counting `get_layout_focus`
+/// and `get_layout_arrange` together. Same derivation and same fatal
+/// `resource_exhausted` breach as [`MAX_LIVE_LAUNCHERS`], and shared
+/// between the two mints rather than split: the bound exists to limit
+/// permanent per-connection allocations, and two independent half-caps
+/// would let a connection hold twice as many objects for the same reason
+/// one cap admits.
+///
+/// A compliant client needs at most two per grant, so the cap is deliberately
+/// generous against the bound a real client hits ([`MAX_LIVE_PETITIONS`]
+/// grants) and tight against a connection minting facets in a loop.
+pub(crate) const MAX_LIVE_LAYOUT_FACETS: usize = 2 * MAX_LIVE_PETITIONS;
 
 /// Burst capacity of the per-connection petition-rate token bucket (the
 /// conventions' "server-side petition-rate ceiling"; breach is fatal
@@ -725,6 +740,19 @@ enum ObjectKind {
     /// the same terms as the co-minted three: it carries its grant's wire
     /// id and nothing else, and the chokepoint judges every use.
     Launcher { grant: u32 },
+    /// The focus facet (see [`ObjectKind::Launcher`]), minted on the grant
+    /// by `get_layout_focus`.
+    LayoutFocus { grant: u32 },
+    /// The arrangement facet (see [`ObjectKind::Launcher`]), minted on the
+    /// grant by `get_layout_arrange`.
+    ///
+    /// A **separate kind** from [`ObjectKind::LayoutFocus`] rather than one
+    /// `Layout { grant, verb }`, because a facet interface declares exactly
+    /// one verb and that is what generates the single-site authority check.
+    /// One kind carrying a verb field would put the verb in the object
+    /// table, where a later edit could set it from something other than
+    /// which mint created the object.
+    LayoutArrange { grant: u32 },
 }
 
 /// A grant handle's lifecycle on the wire: born pending, flipped exactly
@@ -833,6 +861,15 @@ pub(crate) struct ServerCtx<'a> {
     /// Where chokepoint-admitted, origin-tagged actuations go (M1.1: the
     /// realm's input router toward the shim seat).
     pub actuations: &'a mut dyn FnMut(SeatInput),
+    /// Where chokepoint-admitted **layout acts** go (WS-E.1.4: the
+    /// session's output binding and the realm's `configure`).
+    ///
+    /// A second sink beside [`Self::actuations`] rather than a widened one:
+    /// an actuation is an input event the delivery edge may legitimately
+    /// drop, and a layout act is a change to the session's presentation
+    /// that nothing downstream may reinterpret. Collapsing them would put
+    /// the two under one drop policy.
+    pub layout: &'a mut dyn FnMut(crate::enforcement::LayoutAct),
     /// The core's single flight-recorder handle (P1.4.5,
     /// [`crate::recorder`]): every handshake outcome, petition lifecycle
     /// transition, consent transition, and enforcement decision this
@@ -882,6 +919,10 @@ pub(crate) struct PrincipalServer {
     /// principal can repeat on an object it already holds, so it needs
     /// the same bound `get_realm` has.
     launcher_count: usize,
+    /// Layout facets ever minted on this connection (both mints together),
+    /// against [`MAX_LIVE_LAYOUT_FACETS`] -- the same bound and the same
+    /// reason [`Self::launcher_count`] has one.
+    layout_facet_count: usize,
     /// Petition-rate token bucket: remaining burst tokens.
     petition_tokens: u32,
     /// The bucket's refill anchor (the instant up to which refill has been
@@ -913,6 +954,7 @@ impl PrincipalServer {
             realm_count: 0,
             petition_count: 0,
             launcher_count: 0,
+            layout_facet_count: 0,
             petition_tokens: PETITION_RATE_BURST,
             petition_refill_anchor: None,
             chokepoint: Chokepoint::new(),
@@ -1054,14 +1096,20 @@ impl PrincipalServer {
                                 Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
                             }
                         },
-                        // vitrin_grant carries exactly one request, the
-                        // since="2" structural mint `get_launcher`; every
+                        // vitrin_grant carries exactly three requests, all
+                        // since="2" structural mints; every
                         // other opcode on it, and every opcode at all on
                         // vitrin_consent (which defines no requests at any
                         // version), is grammar (invalid_opcode), never an
                         // authority judgement.
                         ObjectKind::Grant(_) => match opcode {
                             grant::requests::GetLauncher::OPCODE => self.handle_get_launcher(msg),
+                            grant::requests::GetLayoutFocus::OPCODE => {
+                                self.handle_get_layout_focus(msg)
+                            }
+                            grant::requests::GetLayoutArrange::OPCODE => {
+                                self.handle_get_layout_arrange(msg)
+                            }
                             _ => {
                                 Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
                             }
@@ -1201,6 +1249,62 @@ impl PrincipalServer {
                                 Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
                             }
                         },
+                        // Both layout facets funnel through the same
+                        // `serve_facet_use` as every other use. `focus`
+                        // takes no arguments at all -- the realm comes from
+                        // the grant row, never the wire -- so decoding it
+                        // is a pure grammar check.
+                        ObjectKind::LayoutFocus { grant } => match opcode {
+                            layout_focus::requests::Focus::OPCODE => {
+                                let (_, _req) =
+                                    layout_focus::requests::Focus::decode(&msg.bytes, msg.fd)
+                                        .map_err(|source| PrincipalViolation::Malformed {
+                                            object_id,
+                                            source,
+                                        })?;
+                                self.serve_facet_use(
+                                    object_id,
+                                    grant,
+                                    UseKind::LayoutFocus,
+                                    ctx,
+                                    send,
+                                )
+                            }
+                            _ => {
+                                Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
+                            }
+                        },
+                        ObjectKind::LayoutArrange { grant } => match opcode {
+                            layout_arrange::requests::SetFullscreen::OPCODE => {
+                                // An out-of-range `mode` is a fatal
+                                // `invalid_argument` from the generated
+                                // decoder (plain enums decode by whole-value
+                                // membership), never a recoverable refusal:
+                                // it is grammar the client could have known,
+                                // which is the error razor's own test.
+                                let (_, req) = layout_arrange::requests::SetFullscreen::decode(
+                                    &msg.bytes, msg.fd,
+                                )
+                                .map_err(|source| PrincipalViolation::Malformed {
+                                    object_id,
+                                    source,
+                                })?;
+                                let mode = match req.mode {
+                                    layout_arrange::Mode::Fullscreen => LayoutMode::Fullscreen,
+                                    layout_arrange::Mode::Windowed => LayoutMode::Windowed,
+                                };
+                                self.serve_facet_use(
+                                    object_id,
+                                    grant,
+                                    UseKind::LayoutArrange(mode),
+                                    ctx,
+                                    send,
+                                )
+                            }
+                            _ => {
+                                Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
+                            }
+                        },
                     }
                 } else {
                     // The sender-constraint kill site: ids not in *this*
@@ -1260,6 +1364,9 @@ impl PrincipalServer {
         // shape and digest only -- never verbatim (see [`crate::recorder`]
         // on why the log must not become a keylogger).
         let detail = ActuationDetail::of(&kind);
+        // Read before `kind` moves into the request below; see
+        // `grant_realm`, which is resolved owned only for these two.
+        let is_layout = matches!(kind, UseKind::LayoutFocus | UseKind::LayoutArrange(_));
         let grant_row = self.grant_row_id(grant_wire_id);
         let request = UseRequest {
             facet_id,
@@ -1301,6 +1408,27 @@ impl PrincipalServer {
         // `not_granted` for a row that is missing, then expiry and
         // revocation, and only then the use-context gates. A row that fails
         // an earlier step never reaches this frame at all.
+        //
+        // The realm's NAME travels alongside the two answers, for the
+        // layout arms: a layout act must name a realm to the embedder, and
+        // neither layout request carries one on the wire -- precisely so a
+        // holder can only ever move the realm the human saw named on its
+        // consent prompt. Resolved here, from the same row, on the same
+        // line as everything else that is "about the realm this grant
+        // names", rather than re-derived at a second site that could
+        // disagree.
+        //
+        // Owned, and **only for a layout use**. The chokepoint takes
+        // `&mut GrantTable`, so a borrow of the row's realm cannot survive
+        // into the call; and the module's standing rule is that the
+        // dispatch path allocates nothing per message, which an
+        // unconditional clone would break for every pointer move an agent
+        // sends. `is_layout` is read before `kind` moves into the request.
+        let grant_realm = if is_layout {
+            grant_row.and_then(|row| ctx.grants.realm_of(row)).cloned()
+        } else {
+            None
+        };
         let (realm_view, seat_reaches_grant_realm) =
             match grant_row.and_then(|row| ctx.grants.realm_of(row)) {
                 Some(realm) => (
@@ -1320,6 +1448,8 @@ impl PrincipalServer {
             presence: ctx.presence,
             seat_reaches_grant_realm,
             actuations: &mut *ctx.actuations,
+            grant_realm: grant_realm.as_ref(),
+            layout: &mut *ctx.layout,
         };
         let outcome = self
             .chokepoint
@@ -1522,6 +1652,61 @@ impl PrincipalServer {
         Ok(())
     }
 
+    /// `vitrin_grant.get_layout_focus` (since version 2): a structural
+    /// mint, on exactly [`handle_get_launcher`]'s terms -- always legal,
+    /// born inert, duplicates permitted, only the object-graph rules can
+    /// fail. Unlike the launcher's, the *use* this mints can succeed:
+    /// `layout_focus` is in
+    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS).
+    ///
+    /// [`handle_get_launcher`]: PrincipalServer::handle_get_launcher
+    fn handle_get_layout_focus(&mut self, msg: Message) -> Result<(), PrincipalFault> {
+        let object_id = msg.header.object_id;
+        let (_, req) = grant::requests::GetLayoutFocus::decode(&msg.bytes, msg.fd)
+            .map_err(|source| PrincipalViolation::Malformed { object_id, source })?;
+        if self.layout_facet_count >= MAX_LIVE_LAYOUT_FACETS {
+            return Err(
+                PrincipalViolation::ResourceExhausted("live-layout-facet cap exceeded").into(),
+            );
+        }
+        self.allocate_id(req.layout_focus)?;
+        self.objects.insert(
+            req.layout_focus,
+            ObjectKind::LayoutFocus { grant: object_id },
+        );
+        self.layout_facet_count += 1;
+        Ok(())
+    }
+
+    /// `vitrin_grant.get_layout_arrange` (since version 2): the sibling of
+    /// [`handle_get_layout_focus`], and a separate request for the reason
+    /// the IDL gives -- one facet interface declares one verb, and the two
+    /// layout verbs must stay independently attenuable.
+    ///
+    /// Both mints share [`MAX_LIVE_LAYOUT_FACETS`] rather than counting
+    /// separately: the cap exists to bound permanent per-connection
+    /// allocations, and two half-caps would let a connection hold twice as
+    /// many objects for the same reason.
+    ///
+    /// [`handle_get_layout_focus`]: PrincipalServer::handle_get_layout_focus
+    fn handle_get_layout_arrange(&mut self, msg: Message) -> Result<(), PrincipalFault> {
+        let object_id = msg.header.object_id;
+        let (_, req) = grant::requests::GetLayoutArrange::decode(&msg.bytes, msg.fd)
+            .map_err(|source| PrincipalViolation::Malformed { object_id, source })?;
+        if self.layout_facet_count >= MAX_LIVE_LAYOUT_FACETS {
+            return Err(
+                PrincipalViolation::ResourceExhausted("live-layout-facet cap exceeded").into(),
+            );
+        }
+        self.allocate_id(req.layout_arrange)?;
+        self.objects.insert(
+            req.layout_arrange,
+            ObjectKind::LayoutArrange { grant: object_id },
+        );
+        self.layout_facet_count += 1;
+        Ok(())
+    }
+
     /// `vitrin_realm.request_grant`: the petition flow's wire half (module
     /// docs). Order of checks: grammar (decode), the non-zero-verb rule,
     /// the per-connection resource bounds (cap then rate -- bounds precede
@@ -1620,7 +1805,14 @@ impl PrincipalServer {
                 flags: petition.flags,
             },
         });
-        let admission = ctx.petitions.admit(petition, now, ctx.realms);
+        // D-018(4)'s single-holder question, asked of the grant table here
+        // rather than inside admission: the petition registry holds no
+        // grant state, and giving it the table would give the core a second
+        // view of authority beside the chokepoint's.
+        let layout_arrange_held = ctx.grants.any_live_holder_of(Verb::LAYOUT_ARRANGE, now);
+        let admission = ctx
+            .petitions
+            .admit(petition, now, ctx.realms, layout_arrange_held);
         match admission {
             Admission::Pending { petition } => {
                 // The prompt lifecycle began: it is waiting on the consent
@@ -2166,6 +2358,11 @@ pub(crate) mod tests {
         seat_realm: Option<RealmId>,
         presence: PhysicalPresence,
         actuations: Vec<SeatInput>,
+        /// Every **layout act** the chokepoint admitted, in order — this
+        /// rig's stand-in for `session::apply_layout`. A test asserts on
+        /// this to prove a `focus` or a `set_fullscreen` really reached the
+        /// embedder rather than being swallowed on the way.
+        layout: Vec<crate::enforcement::LayoutAct>,
         /// The rig's single flight-recorder handle (P1.4.5): every test in
         /// this module drives the real recorder, so the emission wiring is
         /// exercised by the whole suite and not only by the tests that
@@ -2201,6 +2398,7 @@ pub(crate) mod tests {
                 seat_realm: Some(RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)),
                 presence: PhysicalPresence::new(),
                 actuations: Vec::new(),
+                layout: Vec::new(),
                 recorder,
                 log_path,
             }
@@ -2277,10 +2475,12 @@ pub(crate) mod tests {
             seat_realm,
             presence,
             actuations,
+            layout,
             recorder,
             ..
         } = shared;
         let mut sink = |input: SeatInput| actuations.push(input);
+        let mut layout_sink = |act: crate::enforcement::LayoutAct| layout.push(act);
         let realm_is_live = |realm: &RealmId| live_realms.contains(realm);
         for _ in 0..n {
             let msg = core
@@ -2317,6 +2517,7 @@ pub(crate) mod tests {
                 seat_target_realm: seat_realm.as_ref(),
                 presence,
                 actuations: &mut sink,
+                layout: &mut layout_sink,
                 recorder,
             };
             server.handle_message(msg, &mut ctx, &mut |frame, fd| core.send_message(frame, fd))?;
@@ -4835,17 +5036,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_consent_defines_no_requests_and_a_grant_defines_only_get_launcher() {
+    fn a_consent_defines_no_requests_and_a_grant_defines_only_its_three_mints() {
         let _fd = crate::capture::tests::fd_lock();
         // vitrin_consent defines no requests at any version, and
-        // vitrin_grant defines exactly one (opcode 0, `get_launcher`,
-        // since=2). Everything else on either object is grammar
+        // vitrin_grant defines exactly three, all since=2 structural mints:
+        // opcode 0 `get_launcher`, 1 `get_layout_focus`, 2
+        // `get_layout_arrange`. Everything else on either object is grammar
         // (invalid_opcode), never an authority judgement -- including
         // opcode 0 on the consent object, which is `get_launcher`'s
         // opcode on the *other* interface and must not be routed by
         // number alone.
+        //
+        // The grant's probes are 3 and 9, one past the last defined mint
+        // and well past it: 1 and 2 stopped being invalid when WS-E.1.4
+        // appended the layout mints, and this test going red on that append
+        // is exactly what an append-only opcode space should do.
         let verifier = demo_verifier();
-        for (object_id, opcode) in [(4u32, 1u8), (4, 9), (5, 0), (5, 1)] {
+        for (object_id, opcode) in [(4u32, 3u8), (4, 9), (5, 0), (5, 1)] {
             let (mut server, mut core, mut client, mut shared) = setup();
             bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
             client

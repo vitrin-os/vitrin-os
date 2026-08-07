@@ -76,11 +76,13 @@ None of these is DRM work. The backend is not the binding constraint.
    capture**. Each `Scene` still holds at most one client surface,
    single-maximized — that is the model *per app*, not per session — and
    exactly one of them is bound to the one output, so several realms run and
-   one is visible. Which one is a placeholder — the first still-serving realm
-   in id order, applied at first attach and again when the realm holding the
-   output exits, deliberately the same rule `session::seat_target` uses so the
-   visible realm and the seat's target never drift — until WS-E.1.4 decides
-   who may *choose* it. Not moving it at all was the first shape and it was a
+   one is visible. Which one **is now a client's to choose** (WS-E.1.4/#210):
+   a principal holding `layout_focus` binds the output, and `session::seat_target`
+   follows that binding, so the visible realm and the realm the human's input
+   reaches move as one act — the fifth of D-018(2)'s unpurchasable ordering
+   rules. Absent such a client the old placeholder still answers: the first
+   still-serving realm in id order, applied at first attach and again when the
+   realm holding the output exits. Not moving it at all was the first shape and it was a
    defect: the output stayed bound to a realm that was gone, compositing the
    deterministic background for the rest of the session while live siblings
    ran. **The registry's claim that
@@ -110,8 +112,12 @@ None of these is DRM work. The backend is not the binding constraint.
 3. **No window management, by invariant.** [PRD](../PRD.md) §5.1 makes
    "window-management policy lives outside the core" permanent.
    [D-018](20-decision-log.md) allocated `layout_arrange` (0x10) and
-   `layout_focus` (0x20); both are served `unsupported` today. The shell is
-   therefore a **client**, never core code.
+   `layout_focus` (0x20); ~~both are served `unsupported` today~~ **both are
+   served as of WS-E.1.4 (#210)**, through the `vitrin_layout_focus` and
+   `vitrin_layout_arrange` facets. What is served is *arrangement*, not window
+   management: focus and fullscreen-or-not, with no `place`, `resize`, `raise`
+   or stacking request in existence. The shell is
+   therefore still a **client**, never core code.
 4. **No cross-realm clipboard.** `wl_data_device_manager` is per-shim and
    `shim/src/globals.c` states it *"GRANTS NOTHING ACROSS THE REALM
    BOUNDARY"*. Copy-paste between apps does not exist. It is a cross-realm
@@ -125,7 +131,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 
 | Stage | Delivers | Est. |
 |---|---|---|
-| **1 — multi-app, nested** | Runtime app launch · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · `layout_focus`/`layout_arrange` served · a shell client (switcher + launcher) · input routed to the focused realm | 7–9 w |
+| **1 — multi-app, nested** | Runtime app launch · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · a shell client (switcher + launcher) · input routed to the focused realm | 7–9 w |
 | **2 — livable** | Cross-realm clipboard · core-drawn lock screen on the consent stack · status in the trusted band · human screenshot | 4–6 w |
 | **3 — bare metal** | The keymap decision · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
 | **4 — long tail** | X11 (defers to E3.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |

@@ -10,9 +10,13 @@ Request opcodes (document order):
     vitrin_handshake:        hello=0, sync=1
     vitrin_principal:        get_realm=0
     vitrin_realm:            request_grant=0
+    vitrin_grant:            get_launcher=0, get_layout_focus=1,
+                             get_layout_arrange=2   (all since=2)
     vitrin_view:             capture_frame=0
     vitrin_actuator_pointer: move=0, button=1, scroll=2
     vitrin_actuator_text:    type=0
+    vitrin_layout_focus:     focus=0                (since=2)
+    vitrin_layout_arrange:   set_fullscreen=0       (since=2)
 
 Event opcodes (document order):
     vitrin_handshake:        error=0, done=1
@@ -44,6 +48,12 @@ OP_MOVE = 0
 OP_BUTTON = 1
 OP_SCROLL = 2
 OP_TYPE = 0
+# vitrin_grant's three since="2" structural mints, in document order.
+OP_GET_LAUNCHER = 0
+OP_GET_LAYOUT_FOCUS = 1
+OP_GET_LAYOUT_ARRANGE = 2
+OP_FOCUS = 0
+OP_SET_FULLSCREEN = 0
 
 
 def encode_hello(
@@ -111,6 +121,50 @@ def encode_request_grant(
 def encode_capture_frame(view_oid: int) -> bytes:
     # The request deliberately carries no arguments.
     return MessageEncoder().finish(view_oid, OP_CAPTURE_FRAME)
+
+
+def encode_get_layout_focus(grant_oid: int, *, facet_id: int) -> bytes:
+    """`vitrin_grant.get_layout_focus` — a since=2 structural mint.
+
+    Neither reply-bearing nor refusable: it allocates the facet and nothing
+    else, so there is no terminal to wait for. A grant that does not hold
+    `layout.focus` still mints fine and refuses on first use.
+    """
+    return MessageEncoder().put_new_id(facet_id).finish(grant_oid, OP_GET_LAYOUT_FOCUS)
+
+
+def encode_get_layout_arrange(grant_oid: int, *, facet_id: int) -> bytes:
+    """`vitrin_grant.get_layout_arrange` — the sibling mint.
+
+    A separate request rather than one `get_layout`, because a facet
+    interface declares exactly one grant verb and the two layout verbs stay
+    independently attenuable.
+    """
+    return MessageEncoder().put_new_id(facet_id).finish(grant_oid, OP_GET_LAYOUT_ARRANGE)
+
+
+def encode_focus(facet_oid: int) -> bytes:
+    """`vitrin_layout_focus.focus` — no arguments, deliberately.
+
+    The realm the grant was petitioned over is the realm this focuses, so a
+    holder can only ever move the output to a realm the human saw on the
+    consent prompt.
+    """
+    return MessageEncoder().finish(facet_oid, OP_FOCUS)
+
+
+def encode_set_fullscreen(facet_oid: int, *, mode: int) -> bytes:
+    """`vitrin_layout_arrange.set_fullscreen`.
+
+    `mode` is :class:`~vitrin_os.protocol.LayoutMode`: 0 windowed, 1
+    fullscreen. An out-of-range value is fatal `invalid_argument` server-side
+    (plain enums decode by whole-value membership), so it is rejected here
+    rather than sent — a client-side bug must not cost the caller its
+    connection.
+    """
+    if mode not in tuple(protocol.LayoutMode):
+        raise ValueError(f"set_fullscreen mode {mode} is outside vitrin_layout_arrange.mode")
+    return MessageEncoder().put_uint(int(mode)).finish(facet_oid, OP_SET_FULLSCREEN)
 
 
 def encode_move(pointer_oid: int, *, x: int, y: int) -> bytes:

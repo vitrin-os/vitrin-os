@@ -153,7 +153,8 @@ def test_typed_exception_mappings_are_exhaustive() -> None:
         for o in Outcome
         if o != Outcome.GRANTED
     }
-    assert len(outcome_classes) == len(Outcome) - 1 == 5
+    # Six since wire version 2 appended `layout_held`.
+    assert len(outcome_classes) == len(Outcome) - 1 == 6
 
     refusal_classes = {
         type(errors.refusal_error_by_code(1, code, 0)) for code in Refusal
@@ -164,7 +165,7 @@ def test_typed_exception_mappings_are_exhaustive() -> None:
     with pytest.raises(errors.ServerContractViolation):
         errors.fatal_error_by_code(1, 10, "m")
     with pytest.raises(errors.ServerContractViolation):
-        errors.resolution_error_by_outcome(6)
+        errors.resolution_error_by_outcome(7)
     with pytest.raises(errors.ServerContractViolation):
         errors.refusal_error_by_code(1, 9, 0)
 

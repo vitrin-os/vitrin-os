@@ -107,6 +107,194 @@ pub mod requests {
             Ok((header.object_id, GetLauncher { launcher }))
         }
     }
+
+    /// Request `get_layout_focus` (opcode 1) on `vitrin_grant`.
+    ///
+    /// mint the focus facet for this grant
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GetLayoutFocus {
+        /// the focus facet, born inert (confers nothing until this grant is granted with layout_focus) (new_id: vitrin_layout_focus)
+        pub layout_focus: u32,
+    }
+
+    impl GetLayoutFocus {
+        pub const OPCODE: u8 = 1;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_uint(&mut out, self.layout_focus);
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let layout_focus = crate::wire::read_uint(bytes, &mut pos)?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((header.object_id, GetLayoutFocus { layout_focus }))
+        }
+    }
+
+    /// Request `get_layout_arrange` (opcode 2) on `vitrin_grant`.
+    ///
+    /// mint the arrangement facet for this grant
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GetLayoutArrange {
+        /// the arrangement facet, born inert (confers nothing until this grant is granted with layout_arrange) (new_id: vitrin_layout_arrange)
+        pub layout_arrange: u32,
+    }
+
+    impl GetLayoutArrange {
+        pub const OPCODE: u8 = 2;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_uint(&mut out, self.layout_arrange);
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let layout_arrange = crate::wire::read_uint(bytes, &mut pos)?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((header.object_id, GetLayoutArrange { layout_arrange }))
+        }
+    }
 }
 
 pub mod events {
@@ -363,9 +551,9 @@ impl Verb {
     pub const ACTUATE_TEXT: Verb = Verb(4);
     /// capture frames that include the human principal's cursor - reading the human's attention, hence a verb and not a display preference; meaningful only alongside observe, and a petition naming it without observe resolves unsupported; another agent principal's cursor is not purchasable by this or any verb; refused unsupported in version 1
     pub const OBSERVE_CURSOR: Verb = Verb(8);
-    /// place, resize, raise, and fullscreen the granted realm's views, subject to the ordering invariants no grant can purchase; refused unsupported in version 1
+    /// arrange the granted realm's view, subject to the ordering invariants no grant can purchase; exercised through vitrin_layout_arrange, which defines set_fullscreen and no other request - place, resize, raise and stacking are absent rather than refused, because a scene showing one unstacked realm cannot honour them; at most one holder per output, counting a live grant that carries this verb AND a petition still pending for it, so a second petition while either exists resolves layout_held
     pub const LAYOUT_ARRANGE: Verb = Verb(16);
-    /// direct keyboard focus to a view of the granted realm; separate from layout_arrange because focus theft is the sharpest attack and the most legitimate need, so it must be attenuable alone; refused unsupported in version 1
+    /// bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone
     pub const LAYOUT_FOCUS: Verb = Verb(32);
     /// launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64, 128 and 256 are allocated to verbs not yet defined here and were skipped rather than reused; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it
     pub const REALM_LAUNCH: Verb = Verb(512);
@@ -476,6 +664,8 @@ pub enum Outcome {
     Unsupported = 4,
     /// the pending-petition admission cap for this verified identity (across all of its connections) was reached
     Busy = 5,
+    /// layout_arrange is already spoken for on this output, and there is at most one holder per output; the holder may be a live grant that carries the verb OR a petition still pending for it, because two petitions racing through a human's two approvals would otherwise mint two holders - so a petition that is only waiting really does hold the slot. A distinct entry rather than a reuse of busy, whose meaning is the consent-fatigue valve, and answered at admission rather than at use because contention is about who HOLDS the authority rather than about one use of it - it never reaches a prompt, so it costs the human nothing. Retrying once the holder's grant expires, is revoked, or its connection ends - or once the pending petition resolves to anything other than granted - is legal, and this outcome is the ONLY thing the core says about arbitration: choosing between two would-be holders is window-management policy and belongs outside the core
+    LayoutHeld = 6,
 }
 
 impl Outcome {
@@ -489,6 +679,7 @@ impl Outcome {
         Outcome::Unavailable,
         Outcome::Unsupported,
         Outcome::Busy,
+        Outcome::LayoutHeld,
     ];
 
     /// Decode a wire value, by whole-value membership in the defined entries.
@@ -500,6 +691,7 @@ impl Outcome {
             3 => Ok(Outcome::Unavailable),
             4 => Ok(Outcome::Unsupported),
             5 => Ok(Outcome::Busy),
+            6 => Ok(Outcome::LayoutHeld),
             _ => Err(crate::error::DecodeError::InvalidEnumValue {
                 interface: "vitrin_grant",
                 enum_name: "outcome",

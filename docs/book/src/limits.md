@@ -58,13 +58,42 @@ tree, its own Wayland socket and — since the output binding landed — its own
 scene and its own capture. What it does *not* get is its own **output**: the
 core composites one output from one realm's scene, so with two realms
 running only the realm the output is bound to is on screen. Which realm that
-is, is not yet anybody's to **choose**: the output binds to the first realm to
-attach, because *who may move it* is a separate, unlanded authority question.
-It does move on one event nobody chooses — the bound realm's app exiting, after
-which the output follows to the first realm still serving (the same rule the
-seat follows, so the realm you are watching and the realm an actuation reaches
-keep agreeing), and to no realm at all once none is serving. Treat a
-multi-realm configuration as "several apps running, one of them on screen".
+is **is now somebody's to choose**: a client holding the `layout.focus` grant
+verb moves the output, and the human's own keyboard and pointer move with it —
+one act, because showing a realm and typing into it must never come apart.
+Absent such a client the output binds to the first realm to attach, and moves
+on one event nobody chooses: the bound realm's app exiting, after which the
+output follows to the first realm still serving, and to no realm at all once
+none is serving. Treat a multi-realm configuration as "several apps running,
+one of them on screen".
+
+**A `layout.focus` holder can silently refuse every other agent's
+actuation.** The session has one input router and one delivery target, and
+that target now follows the output binding. An agent's actuation into a realm
+that is not the one on screen is refused `internal` rather than delivered — a
+stopgap that exists so one realm's authorized keystroke can never land in
+another realm's app. Before layout was served, which grants that refused was a
+fixed property of the deployment; now a principal holding `layout.focus`
+chooses it, and can therefore deny service to every other agent by focusing
+elsewhere. The refusal is recoverable, journaled, spends no rate-limit token
+and burns no `once` rung, and it disappears when per-realm input routing lands
+(then a hidden realm's actuation is *delivered* instead of refused). Until
+then, do not run a `layout.focus` client you do not trust alongside agents you
+need to keep working.
+
+**Layout is two requests, and the absences are deliberate.** A holder can
+focus a realm and choose whether it fills the output or keeps its own size.
+There is no `place`, no `resize`, no `raise` and no stacking — not requests
+that refuse, but no requests at all, because a scene showing one unstacked
+realm cannot honour them and a verb that silently does less than its name is
+worse than one with no request. Do not plan a tiling shell against this yet.
+
+**`set_fullscreen` is a no-op whenever the output and the realm are the same
+size.** The two modes differ only in whether the realm's view size tracks the
+output's, so while they are equal — which is the ordinary case for a realm
+spawned into an output that has not resized — switching between them changes
+nothing you can see. It is honest and it is surprising; the IDL says so in as
+many words.
 
 **Captures do tell realms apart, and that is enforced rather than
 incidental.** An agent's capture is of the realm its **grant names**, never

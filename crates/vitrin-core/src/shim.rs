@@ -427,6 +427,58 @@ impl ShimServer {
         send(&configure.encode(SHIM_SESSION_ID))
     }
 
+    /// **Re-send `configure` at a new realm-view size**, updating this
+    /// server's record of what the shim was told (WS-E.1.4, issue #210).
+    ///
+    /// The IDL says `configure` "may be re-sent when the view resizes",
+    /// and this is the core finally doing it: a realm in the fullscreen
+    /// arrangement has its view size track the output's, so it is
+    /// re-configured on entering that arrangement and again on every later
+    /// output resize. A realm in the windowed arrangement is never
+    /// re-configured at all — the core imposes no size and `Scene::compose`
+    /// letterboxes whatever the app keeps committing.
+    ///
+    /// Returns `Ok(false)` and sends **nothing** when the size is
+    /// unchanged. That is not an optimization: a re-sent `configure` makes
+    /// a shim re-mode its output and re-configure its toplevel, which a
+    /// real app answers with a fresh buffer, so sending one per redundant
+    /// request would let a holder drive an app's resize loop at its
+    /// max_event_rate.
+    ///
+    /// The realm identity is never re-stated to a different value — it is
+    /// assigned at fork and this only ever carries the same string back —
+    /// so nothing a shim could have cached about who it is can change here.
+    pub fn reconfigure<F>(
+        &mut self,
+        width: u32,
+        height: u32,
+        send: &mut F,
+    ) -> Result<bool, TransportError>
+    where
+        F: FnMut(&[u8]) -> Result<(), TransportError>,
+    {
+        if (self.config.width, self.config.height) == (width, height) {
+            return Ok(false);
+        }
+        self.config.width = width;
+        self.config.height = height;
+        self.send_configure(send)?;
+        Ok(true)
+    }
+
+    /// The realm-view size this server last told its shim (its spawn
+    /// `configure`, or the most recent [`Self::reconfigure`]).
+    ///
+    /// Test-only, and narrowly so: the *record* is maintained on every
+    /// reconfigure the runtime performs, and only this reader has no runtime
+    /// caller — nothing in the core needs to ask what it already decided.
+    /// It is what lets a test assert that `set_fullscreen` reached the shim
+    /// as a real `configure`, rather than that a flag flipped.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn configured_size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
     /// Dispatch one decoded frame from the shim connection.
     ///
     /// `importer` is the embedder's dmabuf import capability (P1.3.5):

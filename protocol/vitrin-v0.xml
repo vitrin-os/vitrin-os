@@ -97,8 +97,10 @@
 
     DELIVERY CLASSIFICATION. Requests are classified reply-bearing (hello,
     sync, request_grant, capture_frame, launch), fire-and-forget (move,
-    button, scroll, type, attach, damage, commit), or structural mints
-    (get_realm, create_surface, get_seat, get_launcher), which are neither
+    button, scroll, type, attach, damage, commit, focus, set_fullscreen),
+    or structural mints
+    (get_realm, create_surface, get_seat, get_launcher, get_layout_focus,
+    get_layout_arrange), which are neither
     reply-bearing nor
     refusable: the request only mints an object, with no terminal event and
     no wire acknowledgement - a malformed mint is a fatal object-graph
@@ -200,7 +202,7 @@
     distinct, and only one of them is purchasable. ARRANGEMENT - which
     realm view sits where, at what size, and which one holds keyboard
     focus - is grant-governed, named by the layout_arrange and layout_focus
-    verbs, so the unprivileged shell that eventually arranges realms does
+    verbs, so the unprivileged shell that arranges realms does
     so with attenuable, revocable, journaled authority rather than
     ambiently, and no window-management policy has to enter the core.
     ORDERING is purchasable by no grant, at any verb set, ever: the consent
@@ -212,18 +214,40 @@
     captured frame - the one cursor a capture may ever contain is the
     human principal's, and only for a grant that holds observe_cursor,
     which is the single carve-out and is itself grant-governed rather
-    than free. CURSORS are core-composited for the reason the consent
+    than free. A FIFTH ORDERING RULE joins the four the moment focus
+    becomes purchasable: the HUMAN'S OWN physical input reaches only the
+    realm the output is bound to. Splitting "which realm is shown" from
+    "which realm receives the human's keys" in a scene that shows one
+    realm at a time would let a holder make a human type into a realm
+    they cannot see, which is focus theft in its
+    sharpest form; so layout_focus is one act - bind the output and direct
+    the human's input - and no verb set separates the two. An agent's
+    injected input is not governed by this rule: it is addressed to the
+    realm its own grant names and carries the emulated origin tag.
+    CURSORS are core-composited
+    for the reason the consent
     surface is: a realm that supplied its own pointer bitmap could paint a
     decoy and mislead the human about where input is going. Version 1
     composites an AGENT principal's cursor, and only into human-visible
     output - never into any captured frame - so the ordering rule above
     binds the compositor now rather than vacuously. No HUMAN cursor is
     composited: in nested operation the host desktop draws the human's
-    cursor outside the realm view entirely. Version 1 serves neither
-    layout verb - it has no window manager - and refuses
-    layout_arrange, layout_focus and observe_cursor "unsupported"; the
-    verbs exist on the wire before the core serves them so that the model
-    is expressible at version 1 and a petition for it is an answer rather
+    cursor outside the realm view entirely.
+
+    WHAT ARRANGEMENT CAN AND CANNOT SAY. The two layout verbs are served
+    through two facets, vitrin_layout_focus and vitrin_layout_arrange, and
+    between them they define exactly two requests: focus and
+    set_fullscreen. There is deliberately no place, no resize, no raise and
+    no stacking request AT ALL - not a request that refuses, but no
+    request. A scene that shows one realm at a time, unstacked and
+    unoverlapped, cannot honour them, and a granted verb whose requests the
+    server cannot carry out is precisely the "deployment MUST NOT grant a
+    verb it does not enforce" rule turned inside out. Growth arrives when
+    the scene can honour it, as since-gated siblings on these interfaces,
+    and never as a request that silently does less than its name.
+    observe_cursor is still defined and refused "unsupported"; the verbs
+    exist on the wire before a deployment serves them so that the model is
+    expressible at version 1 and a petition for one is an answer rather
     than a connection death.
   </description>
 
@@ -506,12 +530,23 @@
         ceiling - never unlimited. persistence is the requested rung; the
         durable rungs (until_revoked, always) exist in the enum from day
         one but resolve "unsupported" in version 1, pending provenance
-        verification in a later phase. verbs obeys the same rule: the bits
-        version 1 does not serve (observe_cursor, layout_arrange,
-        layout_focus) are in-range, so naming one is never fatal, and such
+        verification in a later phase. verbs obeys the same rule: a bit a
+        deployment does not serve (observe_cursor everywhere; whichever
+        others a given deployment declines) is in-range, so naming one is
+        never fatal, and such
         a petition resolves "unsupported" WHOLE - the server never quietly
         drops an unserved bit and grants the remainder, because an agent
-        must never believe it holds authority nothing enforces. Clients
+        must never believe it holds authority nothing enforces. A petition
+        naming layout_arrange has one further admission-time answer,
+        "layout_held", when the verb is already SPOKEN FOR for the output -
+        by a live grant carrying it, or by another petition that is still
+        pending for it. At most one layout holder per output, decided at
+        admission because contention is about who HOLDS the authority
+        rather than about one use of it. The pending half is not an
+        implementation detail: without it two petitions could race through
+        a human's two approvals and mint two holders, which is the state
+        the rule exists to make unreachable, so a petition that is merely
+        waiting really does hold the slot. Clients
         MUST send flags 0 in version 1; bit 0 is reserved for the one_shot
         constraint. flags references no enum and is deliberately not
         wire-validated, so a set
@@ -563,11 +598,22 @@
       recoverably, never fatally.
 
       Version 1 defines no requests on this interface; version 2 defines
-      exactly one, the structural mint get_launcher. Both facts follow from
+      three, all structural mints: get_launcher, get_layout_focus and
+      get_layout_arrange. All four facts follow from
       the same rule: request_grant's five new_id arguments are frozen
       forever, so a sixth facet can never be co-minted and must instead be
       minted HERE, on the grant that authorizes it. Every later facet
       arrives the same way.
+
+      TWO LAYOUT MINTS, NOT ONE, and the reason is structural rather than
+      stylistic. Each facet interface declares the ONE grant verb its every
+      request exercises, which is what generates the single-site authority
+      check; a combined layout facet could therefore name only one of
+      layout_arrange and layout_focus, and the other's requests would
+      arrive at the chokepoint with no verb to check them against. The two
+      verbs are separately petitionable and separately attenuable - that is
+      the whole reason focus is its own bit - so they are separately
+      minted.
 
       Documented growth
       seams for later versions, each purely additive: a release destructor
@@ -575,11 +621,9 @@
       tombstone rule that clients discard events to released ids), an
       asynchronous revoked push event (resolved still fires exactly once,
       ever; refused remains the enforcement-bearing signal), attenuation
-      (minting narrower child grants), restore tokens, an
+      (minting narrower child grants), restore tokens, and an
       epoch-staleness refusal sibling carrying the current epoch for
-      compare-and-swap actuation, and a layout facet mint for the
-      layout_arrange and layout_focus verbs (a structural mint here, for
-      the same frozen-arguments reason get_launcher is one).
+      compare-and-swap actuation.
     </description>
 
     <request name="get_launcher" since="2">
@@ -615,6 +659,45 @@
         bounds it.
       </description>
       <arg name="launcher" type="new_id" interface="vitrin_launcher" summary="the launch facet, born inert (confers nothing until this grant is granted with realm_launch)"/>
+    </request>
+
+    <request name="get_layout_focus" since="2">
+      <description summary="mint the focus facet for this grant">
+        A structural mint: it creates the vitrin_layout_focus facet through
+        which the layout_focus verb is exercised, and nothing else. Like
+        every structural mint it is neither reply-bearing nor refusable,
+        and a malformed mint is a fatal object-graph error rather than an
+        authority answer.
+
+        The facet is born INERT on exactly the terms get_launcher's is:
+        minting is always legal whatever verbs this grant holds, because
+        mint-freely-and-check-at-use is the pattern request_grant's
+        co-minted facets already establish, and a facet minted from a grant
+        that does not hold layout_focus refuses "not_granted" on first use.
+        Neither is a protocol error and neither leaks anything about the
+        petition. Calling this more than once mints a second, equivalent
+        facet, which confers no additional authority for the same reason
+        get_launcher's duplicates do not.
+      </description>
+      <arg name="layout_focus" type="new_id" interface="vitrin_layout_focus" summary="the focus facet, born inert (confers nothing until this grant is granted with layout_focus)"/>
+    </request>
+
+    <request name="get_layout_arrange" since="2">
+      <description summary="mint the arrangement facet for this grant">
+        A structural mint: it creates the vitrin_layout_arrange facet
+        through which the layout_arrange verb is exercised, and nothing
+        else. Identical in every structural respect to get_layout_focus and
+        get_launcher - always legal, born inert, duplicates permitted,
+        never refusable.
+
+        A SEPARATE MINT FROM get_layout_focus, deliberately. One facet
+        interface declares one grant verb, and layout_arrange and
+        layout_focus must stay independently attenuable: a shell granted
+        arrangement but not focus holds a live vitrin_layout_arrange and a
+        vitrin_layout_focus that refuses "not_granted" forever, which is
+        exactly the shape that separation is for.
+      </description>
+      <arg name="layout_arrange" type="new_id" interface="vitrin_layout_arrange" summary="the arrangement facet, born inert (confers nothing until this grant is granted with layout_arrange)"/>
     </request>
 
     <event name="resolved">
@@ -672,11 +755,18 @@
         later would be a permanent wire collision rather than a rename.
         A bit is not free merely because this document does not define it.
 
-        DEFINED BUT UNSERVED. observe_cursor, layout_arrange,
-        layout_focus and realm_launch are defined ahead of being served and
-        refused "unsupported", exactly as the durable persistence rungs
-        are. Two
-        reasons, both structural rather than cosmetic. First, an
+        DEFINED BUT UNSERVED. A verb may be defined here and refused
+        "unsupported" by a deployment that does not serve it, exactly as
+        the durable persistence rungs are. observe_cursor is refused by
+        every deployment at version 2, because per-principal cursor
+        delivery does not exist. layout_arrange, layout_focus and
+        realm_launch were in that same position when they were allocated
+        and are now SERVABLE - each has a facet interface, a chokepoint arm
+        and prompt copy - so whether a petition for one is answered
+        "unsupported" is a property of the deployment rather than of the
+        wire. A client must therefore read "unsupported" as "not here, not
+        now", never as "not in this protocol". Two
+        reasons this staging is structural rather than cosmetic. First, an
         out-of-range bit is fatal "invalid_argument" and kills the
         connection, so a client petitioning for authority a deployment
         does not serve would die instead of being answered; a defined bit
@@ -692,11 +782,13 @@
 
         Not every verb has a facet interface. observe_cursor has none by
         construction - it widens what capture_frame composites rather than
-        adding a request - and the layout verbs' facet arrives as a
-        since-gated mint on vitrin_grant, because request_grant's five
-        new_id arguments are frozen forever. realm_launch DOES have one,
-        vitrin_launcher, minted the same since-gated way for the same
-        reason.
+        adding a request. Every other verb does: layout_arrange has
+        vitrin_layout_arrange, layout_focus has vitrin_layout_focus, and
+        realm_launch has vitrin_launcher, each a since-gated mint on
+        vitrin_grant because request_grant's five new_id arguments are
+        frozen forever. The layout verbs take TWO facets rather than one
+        because a facet interface declares exactly one verb; see
+        get_layout_arrange.
 
         COMPOSITION. observe_cursor is meaningful only alongside observe.
         It widens what a capture contains, so a petition naming it
@@ -715,8 +807,8 @@
       <entry name="actuate_pointer" value="2" summary="inject pointer motion, buttons, and scroll"/>
       <entry name="actuate_text" value="4" summary="inject Unicode text"/>
       <entry name="observe_cursor" value="8" summary="capture frames that include the human principal's cursor - reading the human's attention, hence a verb and not a display preference; meaningful only alongside observe, and a petition naming it without observe resolves unsupported; another agent principal's cursor is not purchasable by this or any verb; refused unsupported in version 1"/>
-      <entry name="layout_arrange" value="16" summary="place, resize, raise, and fullscreen the granted realm's views, subject to the ordering invariants no grant can purchase; refused unsupported in version 1"/>
-      <entry name="layout_focus" value="32" summary="direct keyboard focus to a view of the granted realm; separate from layout_arrange because focus theft is the sharpest attack and the most legitimate need, so it must be attenuable alone; refused unsupported in version 1"/>
+      <entry name="layout_arrange" value="16" summary="arrange the granted realm's view, subject to the ordering invariants no grant can purchase; exercised through vitrin_layout_arrange, which defines set_fullscreen and no other request - place, resize, raise and stacking are absent rather than refused, because a scene showing one unstacked realm cannot honour them; at most one holder per output, counting a live grant that carries this verb AND a petition still pending for it, so a second petition while either exists resolves layout_held"/>
+      <entry name="layout_focus" value="32" summary="bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone"/>
       <entry name="realm_launch" value="512" summary="launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64, 128 and 256 are allocated to verbs not yet defined here and were skipped rather than reused; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it"/>
     </enum>
 
@@ -745,6 +837,7 @@
       <entry name="unavailable" value="3" summary="the realm was unknown, vacant, or closed while the petition was pending"/>
       <entry name="unsupported" value="4" summary="in-range but refused by policy: durable rung without provenance, reserved flag set, unserved resource prefix, or a defined verb this deployment or resource does not serve (an out-of-range verb bit is instead fatal invalid_argument)"/>
       <entry name="busy" value="5" summary="the pending-petition admission cap for this verified identity (across all of its connections) was reached"/>
+      <entry name="layout_held" value="6" summary="layout_arrange is already spoken for on this output, and there is at most one holder per output; the holder may be a live grant that carries the verb OR a petition still pending for it, because two petitions racing through a human's two approvals would otherwise mint two holders - so a petition that is only waiting really does hold the slot. A distinct entry rather than a reuse of busy, whose meaning is the consent-fatigue valve, and answered at admission rather than at use because contention is about who HOLDS the authority rather than about one use of it - it never reaches a prompt, so it costs the human nothing. Retrying once the holder's grant expires, is revoked, or its connection ends - or once the pending petition resolves to anything other than granted - is legal, and this outcome is the ONLY thing the core says about arbitration: choosing between two would-be holders is window-management policy and belongs outside the core"/>
     </enum>
 
     <enum name="refusal">
@@ -758,10 +851,22 @@
         Codes are not all reachable by every verb. no_surface answers "the
         realm has no live surface", which is the state realm_launch exists
         to leave, so a launch is never refused no_surface; preempted and
-        consent_held are actuation-only and refuse neither a capture nor a
-        launch; capacity concerns creating a realm and so reaches only
+        consent_held are attention-shaped - they reach actuation and the
+        layout verbs, and refuse neither a capture nor a launch; capacity
+        concerns creating a realm and so reaches only
         realm_launch. A code's absence from a verb's reachable set is a
         property of the operation, never a promise the code is unused.
+
+        THE LAYOUT VERBS ARE REFUSED no_surface, and the asymmetry with
+        realm_launch is deliberate rather than an oversight. Focusing a
+        realm with no live view would bind the output to nothing, and
+        arranging one has no geometry to arrange; both would be a
+        successful-looking answer to a request that did nothing, where
+        launch's whole purpose is to leave that state. They are refused
+        preempted and consent_held too, on the same terms as an actuation:
+        moving the human's attention while the human's own hand is on the
+        input, or while that principal's consent prompt is up, is the
+        actuation-shaped hazard those codes exist for.
       </description>
       <entry name="not_granted" value="0" summary="the grant is not (or not yet) active, or the verb is outside its effective set: use while pending, through an ungranted facet, or after any non-granted resolution (denied, timed_out, unavailable, unsupported, busy)"/>
       <entry name="expired" value="1" summary="the grant's expiry passed; checked on use and by a proactive timer"/>
@@ -829,8 +934,9 @@
 
       Observation is concurrent by design: capture never contends with
       physical human input or with a pending consent prompt, so the
-      refusal codes preempted and consent_held are actuation-only and
-      never refuse a capture - and the consent overlay is composited into
+      refusal codes preempted and consent_held never refuse a capture -
+      they are attention-shaped, reaching actuation and the layout verbs -
+      and the consent overlay is composited into
       human-visible output only, so a frame captured while a prompt is up
       simply does not contain it.
 
@@ -1484,7 +1590,8 @@
         deployment is at its realm limit, and internal for a spawn failure
         the core did not choose. It is never refused no_surface - a realm
         with no surface is what launch exists to fix - and never preempted
-        or consent_held, which are actuation-only.
+        or consent_held, which are attention-shaped and so reach
+        actuation and the layout verbs rather than a launch.
       </description>
     </request>
 
@@ -1507,6 +1614,191 @@
       </description>
       <arg name="realm" type="string" summary="id of the newly created realm instance, usable as get_realm's name (max 64 bytes)"/>
     </event>
+  </interface>
+
+  <interface name="vitrin_layout_focus" version="1" verb="layout_focus">
+    <description summary="focus facet">
+      The focus capability: make the granted realm the one the output shows
+      and the one input reaches. Minted by vitrin_grant.get_layout_focus
+      and born inert - it confers nothing until its grant resolves granted
+      with layout_focus in the effective verb set, every use passes the
+      single enforcement chokepoint, and a refused use is recoverable
+      through vitrin_grant.refused, never fatal.
+
+      FOCUS IS ONE ACT, NOT TWO. Showing a realm and directing the HUMAN'S
+      OWN physical input to it are the same request here, and there is no
+      verb set, and no attenuation, that separates them. A holder that
+      could bind the output to realm A while the human's keystrokes
+      continued to reach realm B - or the reverse - would be able to make
+      a human type into a realm they cannot see, which is the sharpest
+      form of the focus theft this verb is separated from layout_arrange
+      in order to make attenuable. That coupling is an ordering rule, so
+      it sits with the other four in SCENE AUTHORITY: no grant purchases
+      it away.
+
+      This is a rule about PHYSICAL input, not about actuation. An agent's
+      injected pointer and text are addressed to the realm its own grant
+      names, are consented per realm and carry the emulated origin tag, so
+      they are not the human's attention and are not governed by the
+      binding.
+
+      WHAT THIS FACET IS NOT. It cannot raise, stack, place, resize or
+      close anything, and there is deliberately no request that does.
+      Neither can it read anything: which realm currently holds the output
+      is not reported here or anywhere else on the wire, so a holder learns
+      the effect of its own focus request only through a capture it holds
+      separate authority for. Focus is a write, not a window into the
+      session.
+
+      WHAT A FOCUS GRANT DOES NOT BOUND. The human's own input is not
+      mediated by this grant and never yields to it: physical input in
+      progress preempts a focus request exactly as it preempts an
+      actuation, and the human's revocation gesture is unreachable from
+      here.
+    </description>
+
+    <request name="focus" since="2">
+      <description summary="bind the output to the granted realm and direct input there">
+        Fire-and-forget: no terminal event, and refusals may be coalesced
+        per the delivery classification. The request deliberately carries
+        NO ARGUMENTS - the realm this grant was petitioned over is the
+        realm it focuses, so a holder can only ever focus what the human
+        saw named on the consent prompt. A realm argument would let one
+        grant move the output to a realm nobody consented to, which is the
+        authority-over-a-name mistake vitrin_realm refuses in the same
+        words.
+
+        Focusing the realm that is already focused is legal and is a no-op.
+
+        Focus is rate-limited by the grant's max_event_rate like every
+        other use, which is what stops a holder from flickering the output
+        between realms faster than a human can read it.
+
+        Refusals this request can receive are the grant-lifecycle ones
+        (not_granted, expired, revoked, rate_limited), no_surface when the
+        granted realm has no live view to show, the two
+        attention-shaped ones an actuation can receive - preempted while
+        physical human input owns the target, and consent_held while this
+        principal's own consent prompt is up - and internal, for a
+        server-side failure while carrying the focus out, on the same terms
+        every other verb can meet it (vitrin_launcher.launch names it for
+        the same reason). It is never refused capacity, which concerns
+        creating a realm.
+
+        NOT REPLY-BEARING, deliberately. A terminal event would carry no
+        information a subsequent capture does not already carry, and adding
+        one would make the reply the place a client learns which realm is
+        focused - a read this interface does not offer.
+      </description>
+    </request>
+  </interface>
+
+  <interface name="vitrin_layout_arrange" version="1" verb="layout_arrange">
+    <description summary="arrangement facet">
+      The arrangement capability: choose whether the granted realm's view
+      fills the output or is composited at the size its own app chose.
+      Minted by vitrin_grant.get_layout_arrange and born inert on exactly
+      the terms vitrin_layout_focus is.
+
+      ONE REQUEST, AND THE ABSENCES ARE THE DESIGN. There is no place, no
+      resize, no raise, no lower, no close and no stacking request on this
+      interface - not a request that refuses, but no request at all. The
+      scene shows one realm at a time, unstacked and unoverlapped, at one
+      output size; a place or raise request would have to either widen that
+      scene or accept an argument it then ignored, and a verb that silently
+      does less than its name is worse than one that has no request. Every
+      one of those absences is therefore a statement about what a granted
+      layout_arrange can and cannot do, and a deployment that adds a
+      request here before its scene can honour it breaks the rule that a
+      deployment MUST NOT grant a verb it does not enforce.
+
+      Growth arrives as since-gated sibling requests when the scene can
+      honour them, exactly as every other interface grows, and never by
+      changing set_fullscreen's meaning.
+
+      AT MOST ONE HOLDER PER OUTPUT. A petition for layout_arrange while
+      the verb is already spoken for resolves "layout_held" at admission -
+      it never reaches a human. Spoken for means either a live grant
+      carrying the verb or ANOTHER PETITION STILL PENDING for it, and the
+      pending half is deliberate: two petitions admitted while both waited
+      could be approved by a human twice over and mint two holders, which
+      is precisely the state this rule exists to make unreachable. So a
+      petition that has not resolved yet really does hold the slot, and it
+      frees it by resolving to anything other than granted. Arbitrating
+      between two would-be arrangers is window-management policy, so the
+      core refuses to arbitrate rather than choosing a rule. layout_focus
+      carries no such restriction: focus is a momentary act rather than a
+      standing arrangement, and several principals may hold it at once.
+
+      WHAT THIS FACET CANNOT REACH. The consent surface and the trust
+      indicator are not part of any realm's view and no arrangement moves,
+      resizes, occludes or fullscreens over them. That is an ordering
+      invariant (see SCENE AUTHORITY), so it is not a check this interface
+      performs on the way past - there is no request through which the
+      attempt is even expressible.
+    </description>
+
+    <request name="set_fullscreen" since="2">
+      <description summary="fill the output, or compose at the app's own size">
+        Fire-and-forget: no terminal event, and refusals may be coalesced
+        per the delivery classification. Carries no realm argument for the
+        same reason focus does not - the grant names the realm.
+
+        WHAT THE TWO MODES MEAN, precisely, because the difference is a
+        size and not a decoration. FULLSCREEN means the realm's view size
+        tracks the output's: the core sends vitrin_shim_session.configure
+        with the output's size on entering the mode and again whenever the
+        output resizes while the realm is in it, so the app fills the
+        output edge to edge. WINDOWED means it does not: the core imposes
+        no size at all, sends nothing, the realm's view keeps whatever
+        size it already had, and the compositor letterboxes that buffer
+        centered and unscaled inside the output. Re-sending configure is a
+        documented permission of that event, not a new mechanism.
+
+        THE CORE NEVER INVENTS A WINDOW SIZE, and that is why "windowed"
+        is an absence rather than a second size. A core that chose one
+        would be choosing where a window goes and how big it is, which is
+        window-management policy and belongs outside the core. The only
+        two sizes in the system are the output's and the one the realm
+        already has, and these two modes are exactly the choice between
+        them.
+
+        A CONSEQUENCE WORTH STATING PLAINLY: while the output's size and
+        the realm's size are equal, the two modes are indistinguishable
+        and switching between them changes nothing an observer can see.
+        They diverge the moment the output resizes under a windowed realm,
+        and converge again the moment that realm is fullscreened. A client
+        must not read a mode change as a guarantee that anything moved.
+
+        Setting the mode a realm is already in is legal and is a no-op.
+
+        This request is defined for the granted realm whether or not that
+        realm holds the output. A realm arranged while hidden takes the
+        arrangement with it when it is next focused; nothing here reads or
+        changes the binding, which is layout_focus's alone.
+
+        Refusals are exactly vitrin_layout_focus.focus's set, for the same
+        reasons: the grant-lifecycle codes, no_surface when the realm has
+        no live view (an app that has committed nothing has no own size to
+        return to, and no view to fill the output with), preempted or
+        consent_held on the attention-shaped terms an actuation meets them,
+        and internal for a server-side failure while carrying the
+        arrangement out.
+      </description>
+      <arg name="mode" type="uint" enum="mode" summary="fullscreen or windowed"/>
+    </request>
+
+    <enum name="mode">
+      <description summary="the two arrangements this scene can express">
+        A closed pair rather than a boolean, so that a scene able to
+        express a third arrangement appends an entry here instead of
+        needing a second request. Values are immutable and entries append,
+        like every other enum; an out-of-range value is fatal
+        "invalid_argument".
+      </description>
+      <entry name="windowed" value="0" summary="compose the realm's view at the size its own app last committed, letterboxed centered and unscaled inside the output"/>
+      <entry name="fullscreen" value="1" summary="configure the realm's view to the output's size, so the app fills the output"/>
+    </enum>
   </interface>
 
 </protocol>

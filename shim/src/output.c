@@ -200,6 +200,42 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	s->scene_output = NULL;
 }
 
+bool vitrin_output_resize(struct vitrin_shim *s, uint32_t width, uint32_t height) {
+	/* Record the new view first: `configure_to_view` and every later
+	 * toplevel's initial commit read `cfg`, so a toplevel created between
+	 * here and the sweep below still gets the new size. */
+	s->cfg.width = width;
+	s->cfg.height = height;
+
+	/* Before phase C, or after the output died: nothing to re-mode, and the
+	 * size above is what `vitrin_setup_output` will use. Not an error. */
+	if (s->output == NULL) {
+		return true;
+	}
+
+	/* A headless output has no mode list, so set_custom_mode is the only way
+	 * to give it a size -- the same call the enabling commit below uses. */
+	struct wlr_output_state st;
+	wlr_output_state_init(&st);
+	wlr_output_state_set_custom_mode(&st, (int32_t)width, (int32_t)height, 0);
+	bool committed = wlr_output_commit_state(s->output, &st);
+	wlr_output_state_finish(&st);
+	if (!committed) {
+		/* Reported, never fatal: a failed re-mode leaves a working session
+		 * at the previous size, and killing the realm over a resize would
+		 * be a far worse answer than a wrong-sized window. */
+		wlr_log(WLR_ERROR, "re-mode to %ux%u failed; keeping the previous output size",
+			width, height);
+		return false;
+	}
+
+	/* The apps have to be told, or the output is a different size from every
+	 * buffer in it and the compositor letterboxes forever. */
+	vitrin_xdg_reconfigure_all(s);
+	wlr_log(WLR_INFO, "realm view resized to %ux%u; toplevels re-configured", width, height);
+	return true;
+}
+
 bool vitrin_setup_output(struct vitrin_shim *s) {
 	/* cfg.width/height is the core's `configure` geometry whenever there is
 	 * an upstream link (upstream.c overwrites it), so the headless output IS

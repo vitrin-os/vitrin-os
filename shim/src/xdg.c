@@ -40,6 +40,9 @@ struct vitrin_toplevel {
 	struct vitrin_shim *shim;
 	struct wlr_xdg_toplevel *toplevel;
 	struct wlr_scene_tree *tree;
+	/* Membership of `vitrin_shim.toplevels`, so a re-sent `configure` can
+	 * reach every window (`vitrin_xdg_reconfigure_all`). */
+	struct wl_list link;
 
 	struct wl_listener commit;
 	struct wl_listener map;
@@ -176,6 +179,7 @@ static void toplevel_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&t->destroy.link);
 	wl_list_remove(&t->request_maximize.link);
 	wl_list_remove(&t->request_fullscreen.link);
+	wl_list_remove(&t->link);
 	free(t);
 }
 
@@ -233,6 +237,9 @@ static void on_new_toplevel(struct wl_listener *listener, void *data) {
 	}
 	t->shim = s;
 	t->toplevel = toplevel;
+	/* Linked before anything can fail below, so the destroy handler's
+	 * `wl_list_remove` always has an inserted link to remove. */
+	wl_list_insert(&s->toplevels, &t->link);
 
 	/* Covers the toplevel and its subsurfaces, and applies the client's
 	 * window geometry as a position offset -- so a client with CSD shadow
@@ -355,7 +362,31 @@ static void on_new_popup(struct wl_listener *listener, void *data) {
 	wl_signal_add(&popup->events.destroy, &p->destroy);
 }
 
+/* Re-configure every live toplevel to the current view size -- the
+ * single-maximized rule applied again after the core moved the view.
+ *
+ * `configure_to_view` is the *same* function the initial commit and the
+ * client's own maximize/fullscreen requests go through, deliberately: this
+ * shim has one layout rule and this must not become a second statement of it.
+ *
+ * `initialized` is the protocol guard, not defensive programming: a configure
+ * before the surface's first commit is illegal (see `toplevel_request_maximize`
+ * for the full argument), and a toplevel created mid-resize is in exactly that
+ * state. It gets the new size anyway, on its initial commit, from
+ * `toplevel_commit` -- which reads `cfg` and has already been updated. */
+void vitrin_xdg_reconfigure_all(struct vitrin_shim *s) {
+	struct vitrin_toplevel *t;
+	wl_list_for_each(t, &s->toplevels, link) {
+		if (!t->toplevel->base->initialized) {
+			continue;
+		}
+		configure_to_view(t);
+		wlr_xdg_surface_schedule_configure(t->toplevel->base);
+	}
+}
+
 bool vitrin_setup_xdg(struct vitrin_shim *s) {
+	wl_list_init(&s->toplevels);
 	s->new_toplevel.notify = on_new_toplevel;
 	wl_signal_add(&s->xdg_shell->events.new_toplevel, &s->new_toplevel);
 	s->new_popup.notify = on_new_popup;

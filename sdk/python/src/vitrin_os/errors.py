@@ -45,6 +45,7 @@ __all__ = [
     "RealmUnavailable",
     "GrantUnsupported",
     "Busy",
+    "LayoutHeld",
     "GrantRefused",
     "NotGranted",
     "GrantExpired",
@@ -256,9 +257,40 @@ class Busy(GrantResolutionError):
     OUTCOME = 5
 
 
+class LayoutHeld(GrantResolutionError):
+    """`layout_arrange` is already held for this output, so this petition is not.
+
+    Arrived with wire version 2. A **contention** answer decided at admission,
+    not a refusal of the principal and not a consent decision: it never reaches
+    a human, so it costs nothing to have asked. Distinct from :class:`Busy`,
+    whose meaning is the consent-fatigue valve.
+
+    Retrying once the holder's grant expires, is revoked, or its connection
+    ends is legal — but there is no event that announces that moment, and the
+    core says nothing else about arbitration, so a caller that retries is
+    polling. Petitioning for `layout.focus` alone is not affected: only
+    `layout.arrange` carries the single-holder rule.
+
+    Here even on a deployment that serves no layout verb, for the reason every
+    other defined-but-possibly-absent value is: an outcome this module could
+    not map would raise :class:`ServerContractViolation`, which closes the
+    connection — the exact failure the IDL defines a *recoverable* outcome to
+    avoid.
+    """
+
+    OUTCOME = 6
+
+
 _RESOLUTION_BY_OUTCOME: dict[int, type[GrantResolutionError]] = {
     cls.OUTCOME: cls
-    for cls in (GrantDenied, ConsentTimeout, RealmUnavailable, GrantUnsupported, Busy)
+    for cls in (
+        GrantDenied,
+        ConsentTimeout,
+        RealmUnavailable,
+        GrantUnsupported,
+        Busy,
+        LayoutHeld,
+    )
 }
 
 
@@ -397,7 +429,7 @@ def refusal_error_by_code(
 # ---------------------------------------------------------------------------
 
 assert sorted(_FATAL_BY_CODE) == list(range(10)), "fatal code mapping not exhaustive"
-assert sorted(_RESOLUTION_BY_OUTCOME) == list(range(1, 6)), (
+assert sorted(_RESOLUTION_BY_OUTCOME) == list(range(1, 7)), (
     "resolution outcome mapping not exhaustive"
 )
 assert sorted(_REFUSAL_BY_CODE) == list(range(9)), "refusal code mapping not exhaustive"

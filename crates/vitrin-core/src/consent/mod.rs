@@ -966,6 +966,7 @@ pub(crate) mod tests {
             petition_for(PROMPT_IDENTITY, Verb::OBSERVE | Verb::ACTUATE_TEXT),
             now,
             &realms,
+            false,
         ) else {
             panic!("interactive petition must pend");
         };
@@ -991,9 +992,12 @@ pub(crate) mod tests {
 
         // ...and different from a petition that differs only in its verbs,
         // so the pixels really do carry this petition's content.
-        let Admission::Pending { petition: other } =
-            reg.admit(petition_for(PROMPT_IDENTITY, Verb::OBSERVE), now, &realms)
-        else {
+        let Admission::Pending { petition: other } = reg.admit(
+            petition_for(PROMPT_IDENTITY, Verb::OBSERVE),
+            now,
+            &realms,
+            false,
+        ) else {
             panic!("interactive petition must pend");
         };
         let mut other_surface = ConsentSurface::new(TrustedIndicator::for_test());

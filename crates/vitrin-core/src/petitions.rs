@@ -632,7 +632,8 @@ impl PetitionRegistry {
     }
 
     /// Admit one wire-valid petition: run the policy checks in the
-    /// documented order (`unavailable` -> `unsupported` -> `busy`), then
+    /// documented order (`unavailable` -> `unsupported` -> `layout_held`
+    /// -> `busy`), then
     /// either resolve on the spot (policy refusal, or auto-approve
     /// approval) or enter it pending for a consent decision. Infallible by
     /// construction: admission decides, it never writes the grant table --
@@ -640,11 +641,21 @@ impl PetitionRegistry {
     ///
     /// `realms` is the core's realm registry (P1.5.1), consulted for the
     /// addressing check only; this module holds no realm state of its own.
+    ///
+    /// `layout_arrange_held` is the grant table's answer to
+    /// [`GrantTable::any_live_holder_of`], resolved by the caller for the
+    /// same reason `seat_reaches_grant_realm` is resolved outside the
+    /// chokepoint: this module holds no grant state, and taking the table
+    /// as a parameter here would give petition admission a second view of
+    /// authority beside the one the chokepoint queries.
+    ///
+    /// [`GrantTable::any_live_holder_of`]: crate::grants::GrantTable::any_live_holder_of
     pub fn admit(
         &mut self,
         req: PetitionRequest,
         now: Instant,
         realms: &RealmRegistry,
+        layout_arrange_held: bool,
     ) -> Admission {
         let declined = |outcome: Outcome| {
             Admission::Resolved(Resolution {
@@ -697,6 +708,41 @@ impl PetitionRegistry {
         };
         if !req.resource.is_empty() {
             return declined(Outcome::Unsupported);
+        }
+
+        // D-018(4)'s single-holder rule: at most one live grant carries
+        // `layout_arrange` per output, and there is exactly one output.
+        //
+        // **Ordered after `unsupported` and before `busy`**, and neither
+        // neighbour is arbitrary. After `unsupported`, because a deployment
+        // that does not serve the verb has no holders to contend with and
+        // must answer that it does not serve it -- telling a client the
+        // authority is *taken* when it is not even offered would send it
+        // back to poll forever. Before `busy`, because `busy` is the
+        // consent-fatigue valve and this petition is never going to reach a
+        // prompt: it costs the human nothing, so it must not be refused for
+        // the human's sake.
+        //
+        // **Admission-time, not use-time.** Contention here is about who
+        // *holds* the authority, not about one use of it; a use-time answer
+        // would let two principals both believe they hold arrangement and
+        // discover otherwise one request at a time.
+        //
+        // Both halves are checked. A live row is the holder proper; a
+        // *pending* petition naming the verb is a holder-in-waiting, and
+        // omitting it would let two petitions race through a human's two
+        // approvals and mint two holders -- which is exactly the state this
+        // rule exists to make unreachable. The pending half is this
+        // module's own state; the live half is the caller's answer from the
+        // grant table.
+        if req.verbs.contains(Verb::LAYOUT_ARRANGE)
+            && (layout_arrange_held
+                || self
+                    .pending
+                    .values()
+                    .any(|p| p.requested.verbs.contains(Verb::LAYOUT_ARRANGE)))
+        {
+            return declined(Outcome::LayoutHeld);
         }
 
         // Admission caps: per verified identity across all its connections,
@@ -1243,19 +1289,19 @@ mod tests {
         req.realm_name = "realm-9".into();
         req.flags = 1;
         req.persistence = WirePersistence::Always;
-        expect_declined(reg.admit(req, t0, &realms()), Outcome::Unavailable);
+        expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Unavailable);
 
         // Reserved flags before rung: both set, flags is checked first --
         // but both are the same outcome, so assert each in isolation.
         let mut req = request(DEMO, conn, 20);
         req.flags = 0b1;
-        expect_declined(reg.admit(req, t0, &realms()), Outcome::Unsupported);
+        expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Unsupported);
         let mut req = request(DEMO, conn, 30);
         req.persistence = WirePersistence::UntilRevoked;
-        expect_declined(reg.admit(req, t0, &realms()), Outcome::Unsupported);
+        expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Unsupported);
         let mut req = request(DEMO, conn, 40);
         req.resource = "surface:main".into();
-        expect_declined(reg.admit(req, t0, &realms()), Outcome::Unsupported);
+        expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Unsupported);
 
         // None of the refusals entered the pending table (and admission
         // never writes the grant table at all -- rows are minted at
@@ -1265,26 +1311,25 @@ mod tests {
 
     #[test]
     fn verbs_defined_but_unserved_resolve_unsupported_never_narrowed() {
-        // D-017/D-018: `observe_cursor`, `layout_arrange` and
-        // `layout_focus` are on the wire so that petitioning for them is
-        // an answer rather than a connection death -- but this core does
-        // not implement any of them, so admission must refuse. The
-        // failure this guards is the silent one: accepting the bit and
-        // enforcing nothing.
+        // D-017/D-018: a verb is on the wire so that petitioning for it is
+        // an answer rather than a connection death, and this core refuses
+        // the ones it does not implement. The failure this guards is the
+        // silent one: accepting the bit and enforcing nothing.
+        //
+        // Two bits, not three, since WS-E.1.4 (issue #210) served the
+        // layout pair. `observe_cursor` is here because per-principal
+        // cursor delivery is M2's; `realm_launch` because this core has no
+        // spawn path.
         let t0 = t0();
         let mut reg = registry(ConsentPolicy::AutoApprove);
         let conn = reg.register_connection();
 
         let mut wire_id = 10;
-        for verb in [
-            Verb::OBSERVE_CURSOR,
-            Verb::LAYOUT_ARRANGE,
-            Verb::LAYOUT_FOCUS,
-        ] {
+        for verb in [Verb::OBSERVE_CURSOR, Verb::REALM_LAUNCH] {
             // Alone.
             let mut req = request(DEMO, conn, wire_id);
             req.verbs = verb;
-            expect_declined(reg.admit(req, t0, &realms()), Outcome::Unsupported);
+            expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Unsupported);
             wire_id += 10;
 
             // Mixed with served verbs: refused WHOLE. Were it narrowed to
@@ -1292,15 +1337,19 @@ mod tests {
             // while believing it also holds `verb`.
             let mut req = request(DEMO, conn, wire_id);
             req.verbs = Verb::OBSERVE | verb;
-            expect_declined(reg.admit(req, t0, &realms()), Outcome::Unsupported);
+            expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Unsupported);
             wire_id += 10;
         }
 
         // The served set still admits under the same policy, so the check
         // above refuses the unserved bits and nothing else.
         let mut req = request(DEMO, conn, wire_id);
-        req.verbs = Verb::OBSERVE | Verb::ACTUATE_POINTER | Verb::ACTUATE_TEXT;
-        let Admission::Resolved(res) = reg.admit(req, t0, &realms()) else {
+        req.verbs = Verb::OBSERVE
+            | Verb::ACTUATE_POINTER
+            | Verb::ACTUATE_TEXT
+            | Verb::LAYOUT_ARRANGE
+            | Verb::LAYOUT_FOCUS;
+        let Admission::Resolved(res) = reg.admit(req, t0, &realms(), false) else {
             panic!("auto-approve must resolve a served petition");
         };
         assert!(matches!(res.verdict, Verdict::Granted { .. }));
@@ -1322,20 +1371,20 @@ mod tests {
 
         let mut req = request(DEMO, conn, 10);
         req.realm_name = "kiosk".into();
-        let Admission::Pending { .. } = reg.admit(req, t0, &realms) else {
+        let Admission::Pending { .. } = reg.admit(req, t0, &realms, false) else {
             panic!("a configured realm must admit petitions");
         };
 
         let mut req = request(DEMO, conn, 20);
         req.realm_name = crate::realm::WELL_KNOWN_REALM_ID.into();
-        expect_declined(reg.admit(req, t0, &realms), Outcome::Unavailable);
+        expect_declined(reg.admit(req, t0, &realms, false), Outcome::Unavailable);
 
         // An empty registry is the vacant case the IDL folds into the same
         // answer: every name resolves unavailable, none is distinguishable.
         let empty = crate::realm::tests::registry_with(&[]);
         let mut req = request(DEMO, conn, 30);
         req.realm_name = "kiosk".into();
-        expect_declined(reg.admit(req, t0, &empty), Outcome::Unavailable);
+        expect_declined(reg.admit(req, t0, &empty, false), Outcome::Unavailable);
         assert_eq!(reg.pending_total(), 1, "only the kiosk petition pended");
     }
 
@@ -1350,7 +1399,7 @@ mod tests {
         let mut req = request(DEMO, conn, 10);
         req.realm_name = "kiosk".into();
 
-        let Admission::Resolved(res) = reg.admit(req, t0, &realms) else {
+        let Admission::Resolved(res) = reg.admit(req, t0, &realms, false) else {
             panic!("auto-approve resolves immediately");
         };
         let Verdict::Granted { grant } = res.verdict else {
@@ -1378,14 +1427,14 @@ mod tests {
             for i in 0..4 {
                 let req = request(&format!("vitrin://local/agent/a{who}"), conn, 100 * who + i);
                 assert!(matches!(
-                    reg.admit(req, t0, &realms()),
+                    reg.admit(req, t0, &realms(), false),
                     Admission::Pending { .. }
                 ));
             }
         }
         assert_eq!(reg.pending_total(), 16);
         let req = request("vitrin://local/agent/fifth", conn, 900);
-        expect_declined(reg.admit(req, t0, &realms()), Outcome::Busy);
+        expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Busy);
     }
 
     #[test]
@@ -1398,7 +1447,8 @@ mod tests {
         let conn_a = reg.register_connection();
         let conn_b = reg.register_connection();
 
-        let Admission::Pending { petition } = reg.admit(request(DEMO, conn_a, 10), t0, &realms())
+        let Admission::Pending { petition } =
+            reg.admit(request(DEMO, conn_a, 10), t0, &realms(), false)
         else {
             panic!("interactive petition must pend");
         };
@@ -1420,7 +1470,8 @@ mod tests {
 
         // Withdrawal ends the hold the same way (the prompt disappears
         // with the petitioner), and a gone petition cannot be marked.
-        let Admission::Pending { petition } = reg.admit(request(DEMO, conn_b, 10), t0, &realms())
+        let Admission::Pending { petition } =
+            reg.admit(request(DEMO, conn_b, 10), t0, &realms(), false)
         else {
             panic!("interactive petition must pend");
         };
@@ -1442,7 +1493,8 @@ mod tests {
         let t0 = t0();
         let mut reg = registry(ConsentPolicy::Interactive);
         let conn = reg.register_connection();
-        let Admission::Pending { petition } = reg.admit(request(DEMO, conn, 10), t0, &realms())
+        let Admission::Pending { petition } =
+            reg.admit(request(DEMO, conn, 10), t0, &realms(), false)
         else {
             panic!("interactive petition must pend");
         };
@@ -1491,7 +1543,7 @@ mod tests {
         let mut admitted = Vec::new();
         for i in 0..3 {
             let Admission::Pending { petition } =
-                reg.admit(request(DEMO, conn, 10 + i), t0, &realms())
+                reg.admit(request(DEMO, conn, 10 + i), t0, &realms(), false)
             else {
                 panic!("interactive petition must pend");
             };
@@ -1530,7 +1582,7 @@ mod tests {
         req.verbs = Verb::OBSERVE;
         req.expiry_ms = 30_000;
         req.persistence = WirePersistence::Once;
-        let Admission::Pending { petition } = reg.admit(req, t0, &realms) else {
+        let Admission::Pending { petition } = reg.admit(req, t0, &realms, false) else {
             panic!("interactive petition must pend");
         };
 
@@ -1567,7 +1619,7 @@ mod tests {
             let mut again = request(DEMO, conn, 10);
             again.realm_name = "kiosk".into();
             again.persistence = WirePersistence::Once;
-            let Admission::Pending { .. } = reg.admit(again, t0, &realms) else {
+            let Admission::Pending { .. } = reg.admit(again, t0, &realms, false) else {
                 panic!("re-admission must pend");
             };
         }
@@ -1592,7 +1644,7 @@ mod tests {
         // Petition: observe|text, while_running, bounded to 60s.
         let mut req = request(DEMO, conn, 10);
         req.expiry_ms = 60_000;
-        let Admission::Pending { petition } = reg.admit(req, t0, &realms()) else {
+        let Admission::Pending { petition } = reg.admit(req, t0, &realms(), false) else {
             panic!("interactive petition must pend");
         };
 
@@ -1645,7 +1697,8 @@ mod tests {
         // A once-rung petition cannot be approved while_running.
         let mut once = request(DEMO, conn, 20);
         once.persistence = WirePersistence::Once;
-        let Admission::Pending { petition: once_pet } = reg.admit(once, t0, &realms()) else {
+        let Admission::Pending { petition: once_pet } = reg.admit(once, t0, &realms(), false)
+        else {
             panic!("interactive petition must pend");
         };
         assert!(matches!(
@@ -1703,7 +1756,7 @@ mod tests {
         let mut req = request(DEMO, conn, 10);
         req.expiry_ms = 60_000;
         req.max_event_rate = 7;
-        let Admission::Pending { petition } = reg.admit(req, t0, &realms()) else {
+        let Admission::Pending { petition } = reg.admit(req, t0, &realms(), false) else {
             panic!("interactive petition must pend");
         };
 
@@ -1734,7 +1787,8 @@ mod tests {
         let t0 = t0();
         let mut reg = registry(ConsentPolicy::Interactive);
         let conn = reg.register_connection();
-        let Admission::Pending { petition } = reg.admit(request(DEMO, conn, 10), t0, &realms())
+        let Admission::Pending { petition } =
+            reg.admit(request(DEMO, conn, 10), t0, &realms(), false)
         else {
             panic!("interactive petition must pend");
         };
@@ -1762,7 +1816,7 @@ mod tests {
         let conn = reg.register_connection();
         let mut once = request(DEMO, conn, 10);
         once.persistence = WirePersistence::Once;
-        let Admission::Pending { petition } = reg.admit(once, t0, &realms()) else {
+        let Admission::Pending { petition } = reg.admit(once, t0, &realms(), false) else {
             panic!("interactive petition must pend");
         };
 
@@ -1802,14 +1856,14 @@ mod tests {
             for choice in {
                 let mut req = request(DEMO, conn, 10);
                 req.persistence = WirePersistence::from(requested);
-                let Admission::Pending { petition } = reg.admit(req, t0, &realms()) else {
+                let Admission::Pending { petition } = reg.admit(req, t0, &realms(), false) else {
                     panic!("interactive petition must pend");
                 };
                 reg.prompt_content(petition).expect("pending").choices()
             } {
                 let mut req = request(DEMO, conn, 20);
                 req.persistence = WirePersistence::from(requested);
-                let Admission::Pending { petition } = reg.admit(req, t0, &realms()) else {
+                let Admission::Pending { petition } = reg.admit(req, t0, &realms(), false) else {
                     panic!("interactive petition must pend");
                 };
                 assert!(
@@ -1829,7 +1883,8 @@ mod tests {
         let t0 = t0();
         let mut reg = registry(ConsentPolicy::Interactive);
         let conn = reg.register_connection();
-        let Admission::Pending { petition } = reg.admit(request(DEMO, conn, 10), t0, &realms())
+        let Admission::Pending { petition } =
+            reg.admit(request(DEMO, conn, 10), t0, &realms(), false)
         else {
             panic!("interactive petition must pend");
         };
@@ -1854,12 +1909,12 @@ mod tests {
 
         for wire in [10, 20] {
             assert!(matches!(
-                reg.admit(request(DEMO, a, wire), t0, &realms()),
+                reg.admit(request(DEMO, a, wire), t0, &realms(), false),
                 Admission::Pending { .. }
             ));
         }
         assert!(matches!(
-            reg.admit(request(DEMO, b, 10), t0, &realms()),
+            reg.admit(request(DEMO, b, 10), t0, &realms(), false),
             Admission::Pending { .. }
         ));
 
@@ -1882,7 +1937,8 @@ mod tests {
 
         // rate 0 -> the documented 20/s default, on the approval and on
         // the row its delivery-time insert mints.
-        let Admission::Resolved(res) = reg.admit(request(DEMO, conn, 10), t0, &realms()) else {
+        let Admission::Resolved(res) = reg.admit(request(DEMO, conn, 10), t0, &realms(), false)
+        else {
             panic!("auto-approve resolves immediately");
         };
         let Verdict::Granted { grant } = res.verdict else {
@@ -1898,7 +1954,7 @@ mod tests {
         // An explicit rate is honored verbatim.
         let mut req = request(DEMO, conn, 20);
         req.max_event_rate = 5;
-        let Admission::Resolved(res) = reg.admit(req, t0, &realms()) else {
+        let Admission::Resolved(res) = reg.admit(req, t0, &realms(), false) else {
             panic!("auto-approve resolves immediately");
         };
         let Verdict::Granted { grant } = res.verdict else {

@@ -293,7 +293,7 @@
 //! | `session::reap_realm` | one `poll_exit` became one per live realm: a reaper that stopped at the first exit would leave zombies and a realm the registry still called `Running` |
 //! | `session::shutdown_realm` | one ladder became one ladder per realm |
 //! | `session::emit_presented` | one shim server became every shim server |
-//! | `session::dispatch_principal`'s liveness derivation | `is_some_and` over "the" realm became a **per-realm** question (`ServerCtx::realm_is_live`), applied by `principal::serve_facet_use` to the realm the grant row names. "Is *any* realm live" was the obvious rewrite and is fail-**open** across realms: a dead realm's grant would clear `no_surface` on a living sibling's account and photograph the shared scene |
+//! | `session::dispatch_principal`'s liveness derivation | `is_some_and` over "the" realm became a **per-realm** question (`ServerCtx::realm_is_live`), applied by `principal::serve_facet_use` to the realm the grant row names. "Is *any* realm live" was the obvious rewrite and is fail-**open** across realms: a dead realm's grant would clear `no_surface` on a living sibling's account and be served a frame anyway. (Which frame changed under WS-E.1.3 -- per-realm scenes and a per-realm, pruned capture cache mean the fail-open reading would now serve the dead realm's own stale composition rather than the sibling's pixels. Milder, still forbidden: `no_surface` is documented as "never a stale frame") |
 //! | `session::route_seat` | reached for "the" realm; now takes `session::seat_target`, the one function that names the delivery target, and binds the input router's generation to it |
 //! | `crate::input::InputRouter` | one router serves the session, so its per-shim-generation state had to learn *whose* generation it is (`bind_to` / `reset_for`): an unconditional reset on any realm's death latches a key down in a surviving realm's app |
 //! | `crate::shim::ShimServer::connection_closed` | takes the dying realm's id, for that scoped reset |
@@ -322,19 +322,28 @@
 //! 3. **The geometry**, which the sentence was silent on: the view size
 //!    handed to `start_shim_session` is one output's size shared by every
 //!    realm, not a per-realm geometry, so it is hoisted out of the loop and
-//!    every shim is configured identically (WS-E.1.3 owns fixing that).
+//!    every shim is configured identically. WS-E.1.3 examined that and
+//!    **kept it**: there is one output, so one size, and per-realm geometry
+//!    would be window-management policy (decision 3). What WS-E.1.3 did
+//!    change is which realm the output *shows* and whose pixels a capture
+//!    returns, neither of which is the configure geometry.
 //! 4. **The failure path**, which did not exist: with one spawn there was
 //!    no partial startup to unwind. With a loop there is, and the loop owns
 //!    it -- see the table above.
 //!
 //! ## Not per-realm at all, and deliberately not fixed here
 //!
+//! **Two rows of this table were closed by WS-E.1.3 (issue #209)** and are
+//! kept, struck through, because what they said was true and the shape of
+//! the fix is worth reading beside what is still shared:
+//!
 //! | Site | State | Owner |
 //! |---|---|---|
-//! | [`crate::scene::Scene`] -- one scene, at most one committed surface | every realm's shim commits into the same scene, so the last committer wins and only one realm is ever visible | WS-E.1.3 (bind the output to a realm) |
-//! | `session::Runtime::view_cache` / `principal::ServerCtx::realm_view` | one frame for the whole session, not one per realm: while two realms are **live**, a capture under a grant over realm A can carry realm B's pixels, because there is one scene and the last committer wins. Published as a limit (`docs/book/src/limits.md`). A **dead** realm is not part of this: `realm_is_live` is asked per realm, so its grant refuses `no_surface` however busy its siblings are | WS-E.1.3 |
+//! | ~~[`crate::scene::Scene`] -- one scene, at most one committed surface~~ | ~~every realm's shim commits into the same scene, so the last committer wins and only one realm is ever visible~~ **Closed by WS-E.1.3**: one [`crate::scene::Scene`] per realm, held in [`crate::scene::RealmScenes`], with exactly one bound to the output. Every realm still holds at most one surface -- that is the MVP's single-maximized model *per app*, and `scene::layout` says it must never grow | -- |
+//! | ~~`session::Runtime::view_cache` / `principal::ServerCtx::realm_view`~~ | ~~one frame for the whole session, not one per realm: while two realms are **live**, a capture under a grant over realm A can carry realm B's pixels~~ **Closed by WS-E.1.3**: the cache is keyed by realm and `ServerCtx::realm_view` is a *function of the realm id*, applied to the realm the grant row names, so there is no "the view" left to hand the chokepoint by mistake | -- |
 //! | [`crate::input::InputRouter`], `PhysicalPresence` | one router and one presence tracker for the session, so `session::seat_target` picks one realm to deliver to and a human at the keyboard preempts agent actuation in *every* realm at once. The router's *state* is scoped to the realm it was bound to, so a realm's death no longer clears a sibling's; what is still shared is the router itself | WS-E.1.6 |
-//! | [`crate::scene::layout`] | single-maximized placement, the MVP's whole layout policy | WS-E.1.3 / D-018 |
+//! | The **output**: one view size, one bound realm, one retained framebuffer pair | every realm's shim is configured with the output's geometry and every realm's view composes at it; a hidden realm renders but is never presented. Deliberate and permanent at this layer -- WS-E.1.3 decision 3 (no stacking, no overlap, no resize) and PRD §5.1, which exiles window-management policy from the core | -- (by design) |
+//! | [`crate::scene::layout`] | single-maximized placement, the MVP's whole layout policy | D-018 |
 //!
 //! Naming these is the point of the table. A reader who takes "a deletion
 //! rather than a re-plumbing" at face value would budget none of the work
@@ -385,15 +394,20 @@ pub(crate) const CONFIG_FILE_NAME: &str = "realm.toml";
 /// the argument for the value, because a limit chosen by taste is a limit
 /// nobody can revise on evidence.
 ///
-/// **This justification has now been wrong twice, and the number below is
-/// the third one.** The first argued 16 from a per-realm scene copy that
-/// does not exist; the second corrected that and then undercounted the
-/// descriptors, saying 2 permanent per realm when there are 3. Both were
-/// caught by review, neither by a test, and the pattern is worth naming:
-/// this is a constant whose argument is an *inventory*, and an inventory
-/// written from memory is wrong. So the count below is enumerated against
-/// the code that opens each descriptor **and** measured against a running
-/// core (`/proc/<pid>/fd`, which is where the third number came from).
+/// **This justification has been wrong twice, and WS-E.1.3 falsified half
+/// of the third.** The first argued 16 from a per-realm scene copy that did
+/// not exist; the second corrected that and then undercounted the
+/// descriptors, saying 2 permanent per realm when there are 3; the third
+/// counted the descriptors right and said the core holds "no pixels that
+/// scale with the realm count" -- true when it was written, and **false
+/// since WS-E.1.3** (issue #209), which made a per-realm scene and a
+/// per-realm capture cache real. That third draft said in as many words
+/// that when it happened the constant "has to be re-derived, not
+/// inherited"; what follows is the re-derivation. All three corrections are
+/// kept below rather than deleted, because the pattern is the point: this
+/// is a constant whose argument is an *inventory*, and an inventory written
+/// from memory is wrong. Every number here is measured against a running
+/// core.
 ///
 /// # What a realm actually costs the core
 ///
@@ -401,11 +415,11 @@ pub(crate) const CONFIG_FILE_NAME: &str = "realm.toml";
 /// |---|---|---|
 /// | Processes | one `vitrin-shim`, which execs one app | 32 |
 /// | Runtime tree | one directory, one `<id>.lock`, one `wayland-0` inode | 16 of each |
-/// | **Core-side descriptors** | **3** permanent + at most [`crate::shim::MAX_LIVE_SURFACES`] = 16 staged attach fds, so **≤ 19** | **≤ 304** |
-/// | Core-side bytes | the transport's bounded queues: `MAX_SEND_QUEUE_BYTES` (256 KiB) + one 64 KiB read scratch + at most one partial frame -- well under a MiB | low tens of MiB |
-/// | Core-side pixels | **none that scale with the realm count** -- see below | -- |
+/// | Core-side descriptors | **3** permanent + at most [`crate::shim::MAX_LIVE_SURFACES`] = 16 staged attach fds, so **≤ 19** | **≤ 304** |
+/// | **Core-side pixels** | **two** view-sized RGBA copies: the realm's [`crate::scene::Scene`] surface and its `session::Runtime::view_cache` entry | **32 of them** |
+/// | Core-side bytes (transport) | the transport's bounded queues: `MAX_SEND_QUEUE_BYTES` (256 KiB) + one 64 KiB read scratch + at most one partial frame -- well under a MiB | low tens of MiB |
 ///
-/// The three permanent ones, each against the line that opens it:
+/// The three permanent descriptors, each against the line that opens it:
 ///
 /// | # | Descriptor | Opened by | Held by |
 /// |---|---|---|---|
@@ -413,72 +427,125 @@ pub(crate) const CONFIG_FILE_NAME: &str = "realm.toml";
 /// | 2 | the realm's `<id>.lock` `flock` | `RuntimeDirGuard::create`, same function | `RealmLifecycle::_realm_lock`, released only at teardown |
 /// | 3 | the **outbox ping eventfd** | `calloop::ping::make_ping` inside `ConnectionSource::with_outbox` | the same source, for the life of the realm |
 ///
-/// The third is the one both earlier drafts missed, and it is not optional:
-/// every realm gets an outbox, because seat events and `frame_done` are
-/// pushed at a shim that is sitting in a blocking read (`vitrin-ipc`'s
-/// `Outbox` docs). On Linux calloop's ping is a *single* eventfd shared by
-/// both halves, so it is one descriptor and not two.
+/// # The pixels, re-derived for WS-E.1.3 and measured
 ///
-/// Measured, not only argued: a headless core with N realms holds 11 + 3N
-/// descriptors at rest (11 session-wide: stdio, `core.sock` + its lock, the
-/// recorder, the epoll, the loop's own eventfd and timerfd, two signalfds),
-/// counted at N = 1, 2, 3, 4 and differing by exactly 3.
+/// A realm now costs the core **exactly two view-sized RGBA buffers**, and
+/// naming both is the whole correction -- the third draft's own forecast
+/// named only one:
 ///
-/// **So the binding constraint is descriptors, not memory.** 304 is ~30% of
-/// the 1024 soft `RLIMIT_NOFILE` this repo already sizes against
-/// ([`vitrin_ipc::MAX_SEND_QUEUE_FDS`]'s rationale) -- ~31% counting the
-/// session-wide 11 -- which leaves the listener, its lock, every principal
-/// connection and every in-flight capture memfd comfortable room. **The
-/// corrected number does not change the verdict**: the worst case moves
-/// from 28% to 31% of the limit, well inside the same order of magnitude,
-/// so 16 remains a sensible cap and nothing downstream of it needs
-/// revisiting. It would have mattered at a cap around 50, where the staged
-/// attach fds alone would approach the limit -- which is the number to
-/// re-derive from, not to inherit, if the cap is ever raised. `EMFILE` is a
-/// whole-process failure, so the margin is what keeps one realm's surface
-/// churn from costing an unrelated agent its `accept`. Sixteen is also a
-/// human-scale ceiling for "apps on one desktop", which is what this cap is
-/// for: it is
-/// a *policy* on how many shims one configuration file may make the trusted
-/// core fork, not a memory computation.
+/// 1. its [`crate::scene::Scene`]'s committed `SurfaceContent`, the copy-in
+///    of the client's buffer (buffer path v0 = copy-in, plan D3), which
+///    under single-maximized is the view's size;
+/// 2. its `session::Runtime::view_cache` entry, the composed frame a capture
+///    of *that realm* serves.
+///
+/// So `2 * width * height * 4` bytes of **core-side pixels** per realm. The
+/// two retained framebuffers the headless backend holds are the **output's**
+/// and stay session-wide, because there is one output (WS-E.1.3 decision 3:
+/// one bound realm, no stacking).
+///
+/// **One more thing scales with the realm count, and it is not core-side
+/// pixels.** The nested backend retains one zero-copy GPU slot per realm
+/// ([`crate::dmabuf::RealmGpuContent`]), so a session where every realm
+/// commits `kind=dmabuf` holds up to `MAX_REALMS` `GlesTexture`s at once
+/// instead of the one it held while the slot was session-wide. It costs no
+/// core-side *copy*: each texture is an EGLImage sampling the client's own
+/// buffer, which is the whole zero-copy claim. What it does cost is a
+/// **reference that keeps that client buffer alive**, now up to sixteen of
+/// them rather than one, and the client's buffers are outside every number on
+/// this page ("What no number here bounds"). It is unavoidable rather than a
+/// regression: while one realm's import evicted another's, a hidden realm's
+/// commit was also what the human's window presented — the confidentiality
+/// defect WS-E.1.3 closed. The measured table below is a `--headless` run and
+/// is unaffected, because headless has no GPU renderer and its map is always
+/// empty.
+///
+/// **Measured**, on a release build with N animating shims, `VmRSS` at rest
+/// after the commits settle:
+///
+/// | View | 1 realm | 16 realms | Slope per realm | `2*w*h*4` |
+/// |---|---|---|---|---|
+/// | 1920x1080 | 63 MiB | **301 MiB** | ~15.9 MiB | 15.8 MiB |
+/// | 2560x1600 | 117 MiB | **586 MiB** | ~31.3 MiB | 31.3 MiB |
+///
+/// The slope matches the arithmetic to well under a percent, which is what
+/// makes this an *inventory that was checked* rather than a third guess: a
+/// third, unnoticed per-realm buffer would show up as a slope the formula
+/// does not predict. Descriptors were re-measured in the same runs and are
+/// unchanged at `11 + 3N` (14, 17, 20, 23 at N = 1..4; **59 at N = 16**).
+///
+/// # So which constraint binds now, and does 16 still hold
+///
+/// **The binding constraint has moved from descriptors to memory**, exactly
+/// as the third draft predicted it would if a per-realm copy became real.
+/// At the cap, descriptors reach ≤ 304 -- ~31% of the 1024 soft
+/// `RLIMIT_NOFILE` this repo already sizes against
+/// ([`vitrin_ipc::MAX_SEND_QUEUE_FDS`]'s rationale), the same fraction as
+/// before -- while pixels reach 500 MiB on a 2560x1600 panel.
+///
+/// **16 still holds, and this is why**: 586 MiB is ~7% of an 8 GiB laptop
+/// and ~4% of 16 GiB, on a machine that is by construction also running 16
+/// GUI apps whose own buffers dwarf it (the shims' and apps' memory is not
+/// counted here and never was -- see "What no number here bounds"). A cap
+/// whose worst case is a single-digit percentage of RAM is not the thing
+/// that will fail first.
+///
+/// **What to re-derive from if the cap is ever raised** -- and it is a
+/// different number from last time, so inheriting *this* paragraph would
+/// repeat the mistake: the product `cap x width x height x 8 bytes`. At
+/// 2560x1600 a cap of 64 would cost 2.0 GiB of core-side pixels alone, which
+/// is where "a percentage of RAM" stops being the right frame -- and 64
+/// realms would want ≤ 1216 descriptors, *past* the 1024 soft limit. So at
+/// that scale **both** constraints bind, and neither may be inherited from
+/// here. Sixteen is also a human-scale ceiling for "apps on one
+/// desktop", which is what this cap is for: it is a *policy* on how many
+/// shims one configuration file may make the trusted core fork, not a
+/// memory computation -- but it is now a policy with a measured memory bill
+/// attached.
 ///
 /// **The corrections, kept rather than deleted.**
 ///
-/// 1. *The scene that does not exist.* This constant used to argue 16 from
-///    "a realm's scene holds a full RGBA copy of its client's buffer ...
-///    ~262 MB at sixteen realms". **There is no per-realm scene.** The core
-///    holds exactly one [`crate::scene::Scene`] with at most one
-///    [`crate::scene::SurfaceContent`], shared by every realm -- the module
-///    docs' own "not per-realm at all" table says so -- so the core's pixel
-///    footprint does not grow with the realm count at all, and the number
-///    that looked like the argument was describing a data structure this
-///    core does not have. WS-E.1.3 binds an output to a realm and may well
-///    make a per-realm surface copy real; **when it does, this constant has
-///    to be re-derived, not inherited**, because at 2560x1600 one such copy
-///    is ~16.4 MB and sixteen of them would move the binding constraint
-///    back to memory.
-/// 2. *The descriptor that was not counted.* The replacement argument said
-///    "2 permanently (the shim socketpair end, the realm `flock`)" and
-///    derived ≤ 18 per realm, ≤ 288 at the cap, ~28% of `RLIMIT_NOFILE`.
-///    It omitted the outbox ping eventfd, which every realm has. The table
-///    above is the corrected count, and it is measured rather than
-///    remembered -- which is the only reason to trust the third attempt
-///    more than the first two.
+/// 1. *The scene that did not exist -- and now does.* This constant used to
+///    argue 16 from "a realm's scene holds a full RGBA copy of its client's
+///    buffer ... ~262 MB at sixteen realms", when the core held exactly one
+///    [`crate::scene::Scene`] shared by every realm. The correction was
+///    right at the time. WS-E.1.3 then made the per-realm scene real -- and
+///    also a per-realm capture cache, which no draft had counted -- so the
+///    original number was accidentally close for the wrong reason and is
+///    now replaced by the measured table above. The lesson kept from it:
+///    **a forecast is not a measurement**, and the forecast here named one
+///    copy where there are two.
+/// 2. *The descriptor that was not counted.* The second argument said "2
+///    permanently (the shim socketpair end, the realm `flock`)" and derived
+///    ≤ 18 per realm, ≤ 288 at the cap, ~28% of `RLIMIT_NOFILE`. It omitted
+///    the outbox ping eventfd, which every realm has. The table above is
+///    the corrected count, re-measured for this revision.
+/// 3. *The pixel claim that expired.* The third argument's table said
+///    core-side pixels were "**none that scale with the realm count**".
+///    That row is now the largest per-realm cost there is. It expired
+///    because a *different* issue changed the data structure it described,
+///    which is the failure mode a doc comment cannot prevent on its own --
+///    which is why the third draft wrote down the trigger ("if WS-E.1.3
+///    makes a per-realm surface copy real, re-derive") rather than only the
+///    number.
 ///
 /// **What no number here bounds.** The shim's own memory and its app's --
 /// the dominant cost of a realm by a wide margin, since that is where the
 /// client's buffers actually live. That is the operator's to manage; the
 /// core neither measures nor limits it, and pretending a cap on realm
 /// *count* constrains it would be the same class of false claim as the
-/// paragraph above.
+/// paragraph above. Nor does anything here bound **CPU**: WS-E.1.3 decision
+/// 2 has every live realm composing at the output's rate whether or not it
+/// is visible, which is published as a limit
+/// (`docs/book/src/limits.md`) rather than traded away.
 ///
 /// **Unbounded is not the alternative.** A deployment that served
 /// `realm_launch` with no cap would turn one launch grant into an
-/// fd-exhaustion and process-exhaustion primitive with no protocol
-/// violation anywhere in the trace. The wire already has the vocabulary for
-/// the refusal -- `vitrin_grant.refusal.capacity`, "the deployment is at its
-/// realm capacity" -- which exists precisely because the answer is a policy,
-/// not a fault.
+/// fd-exhaustion, memory-exhaustion and process-exhaustion primitive with no
+/// protocol violation anywhere in the trace. The wire already has the
+/// vocabulary for the refusal -- `vitrin_grant.refusal.capacity`, "the
+/// deployment is at its realm capacity" -- which exists precisely because
+/// the answer is a policy, not a fault.
 ///
 /// It is a *startup* bound today: realms come only from `realm.toml`, so
 /// the cap is enforced by the loader ([`too_many_realms`]) rather than at

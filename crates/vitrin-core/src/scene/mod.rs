@@ -13,6 +13,15 @@
 //! two paths therefore present identical composed content by construction
 //! — there is no per-backend scene walk to drift.
 //!
+//! **One [`Scene`] is one realm's view, not the session's** (WS-E.1.3,
+//! issue #209). A session holding N realms holds N scenes, in
+//! [`RealmScenes`], with exactly one of them bound to the output; a capture
+//! composes *the granted realm's* scene, never the output's. Everything
+//! below is about a single realm's composition and is unchanged by that —
+//! `Scene` never knew which realm it belonged to and still does not. See
+//! [`realms`] for the binding, the hidden-realm contract, and why the
+//! selection had to become structural.
+//!
 //! Composition is pure CPU byte assembly, deterministic and renderer-free:
 //! a pure function of the committed surface content and the view size.
 //! That keeps the pixel goldens exact (integer math only, no filtering, no
@@ -72,9 +81,12 @@
 //! instead of being the client's bytes.
 
 pub(crate) mod layout;
+pub(crate) mod realms;
 
 use std::error::Error;
 use std::fmt;
+
+pub(crate) use realms::RealmScenes;
 
 use crate::test_pattern;
 
@@ -224,10 +236,16 @@ impl PendingDamage {
     }
 }
 
-/// The realm's scene: at most one client surface in the MVP (single
+/// **One realm's** scene: at most one client surface in the MVP (single
 /// maximized, plan P1.3.3). The realm object (P1.5.1) hangs off this; the
 /// consent overlay (P1.7.1) later composites *above* the view this scene
 /// produces.
+///
+/// One per realm since WS-E.1.3 (issue #209) — see [`RealmScenes`], which
+/// owns the map and the output binding. "At most one client surface" is a
+/// statement about **this realm**, not about the session: it is the MVP's
+/// single-maximized model per app, and it is what `scene::layout` says must
+/// never grow.
 pub(crate) struct Scene {
     surface: Option<SurfaceContent>,
     /// Bumped on every content change; presentation caches (the nested

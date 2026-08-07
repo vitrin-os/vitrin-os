@@ -463,9 +463,12 @@ pub(crate) struct RealmTeardown<'a, 'v, H: PreemptionHook> {
     /// Taken (not borrowed) by the teardown funnel, which consumes it --
     /// so an embedder cannot keep serving a dead shim's object graph.
     pub shim: &'a mut Option<ShimServer>,
-    /// The connection's dmabuf importer, if the embedder has a GPU: any
-    /// retained zero-copy content is dropped with the realm. `'v` — see
-    /// [`Self::scene`].
+    /// **This realm's** dmabuf importer, if the embedder has a GPU: its own
+    /// retained zero-copy content is dropped with it, and a sibling's stays
+    /// resident. Keyed since WS-E.1.3 -- the nested backend builds this over
+    /// `RealmGpuContent::slot_mut(realm)`, so it reaches exactly one realm's
+    /// texture, the way [`Self::scene`] reaches exactly one realm's surface.
+    /// `'v` — see [`Self::scene`].
     pub importer: Option<&'v mut dyn DmabufImporter>,
     /// The realm's input router: seat state must not survive into a next
     /// shim generation.
@@ -1003,11 +1006,16 @@ impl RealmLifecycle {
         //    teardown funnel, never a second one. This is what makes the
         //    chokepoint's `no_surface` true: after it there is no committed
         //    surface, no retained zero-copy content, and no seat state *of
-        //    this realm's*. The seat half is scoped by realm id, the scene
-        //    half is not, and the asymmetry is the truth about the runtime
-        //    rather than an oversight: there is one router whose state
-        //    belongs to one realm at a time (`InputRouter::reset_for`) and
-        //    one scene shared by every realm until WS-E.1.3.
+        //    this realm's*. All three are scoped to this realm since
+        //    WS-E.1.3: the seat state by realm id
+        //    (`InputRouter::reset_for`, one router whose state belongs to
+        //    one realm at a time), the scene because the embedder now hands
+        //    the teardown funnel *this realm's* scene, and the importer
+        //    because it is built over that realm's own
+        //    `RealmGpuContent::slot_mut` -- all three from the one
+        //    `Presenter::teardown_view` call, which names the realm.
+        //    What is still session-wide is the retained framebuffer below,
+        //    which belongs to the output rather than to any realm.
         match teardown.shim.take() {
             // `importer.take()`, not a reborrow: the importer is cleared
             // exactly once, with the realm, and this body runs exactly once

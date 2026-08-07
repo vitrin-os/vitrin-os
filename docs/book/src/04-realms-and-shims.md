@@ -157,12 +157,18 @@ knowing: a realm's lock file sits *beside* its directory as `<id>.lock`, so
 a realm named `foo.lock` would collide with realm `foo`, and startup refuses
 that naming both.
 
-What a second realm does *not* get yet is its own view: the core composites
-one output from one scene, so with several realms running only the last one
-to paint is visible, and a capture is of that output rather than of the
-realm a grant names — for realms that are **live**. A grant over a realm
-whose app has died refuses `no_surface` regardless of what its siblings are
-doing. Read [Known limits](limits.md) before configuring more than one.
+What a second realm does get is its own scene and its own capture: an
+`observe` grant returns the pixels of the realm it names, hidden or not, and
+a grant over a realm whose app has died refuses `no_surface` regardless of
+what its siblings are doing. What it does *not* get is its own **output**:
+the core composites one output from one realm's scene, so with several
+realms running only the realm the output is bound to is visible — the first
+one to attach. Nothing *chooses* to move that binding, because who may choose
+is a separate, unlanded authority question; the one thing that moves it is the
+bound realm's app exiting, after which the output follows to the first realm
+still serving, and to no realm at all once none is. Every other realm still
+renders, and pays for it. Read [Known limits](limits.md) before configuring
+more than one.
 
 `--no-remote` in that example is load-bearing, not hygiene: without it, a
 `firefox --new-window` on a machine already running Firefox hands the window

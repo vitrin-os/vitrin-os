@@ -1,0 +1,194 @@
+# Watching the right realm: the nested multi-realm runbook (WS-E.1.3, issue #209)
+
+**This is a manual procedure, not a CI test — not skipped in CI, not present
+in CI.** It exists because one clause of issue #209 cannot be automated, and
+saying so plainly is cheaper than a gate that is cited for a property it never
+checked.
+
+## What CI proves, and the one thing it cannot
+
+Issue #209 gave every realm its own scene and its own capture, and bound the
+one output to one of them. Three of the four claims that follow are
+machine-checkable and are checked:
+
+| Claim | Where it is proved | Backend |
+|---|---|---|
+| A capture returns **the granted realm's** pixels, never the output's | `tests/integration/test_two_realms.py` (mock-free, two real `solid-client`s, cross-checked against each realm's own `--capture-dump`); `session.rs`'s `a_capture_returns_the_granted_realms_pixels_and_never_the_outputs`; `scene/realms.rs` | headless |
+| A **hidden** realm keeps being paced and keeps repainting | `test_two_realms.py`'s `RealTwoRealmsHiddenKeepsPainting` (a paced `damage-client` off-screen beside a static `solid-client` on it); `session.rs`'s `a_hidden_realm_is_paced_and_its_capture_keeps_changing` | headless |
+| The nested window composes the **bound** realm, and a bind re-uploads its texture | `backend/winit.rs`'s `the_window_shows_the_bound_realm_and_a_bind_re_uploads` — display-free assertions on `window_pixels` and `TextureKey` only | none (pure functions) |
+| **A human sees the right realm in the host window** | *this page* | nested, by hand |
+
+The fourth is not automatable here and the reason is structural rather than a
+missing budget: **GitHub runners have no display**, and D-019(4) records
+headless as the only backend CI can run. The nested backend presents through
+EGL/GLES into a host compositor's window; there is no runner that can open
+one. So `backend/winit.rs` pins the two decisions `try_redraw` makes — *which
+pixels to upload* and *when to re-upload them* — and leaves the GL submit and
+the human's eye to this page. A gate that claimed otherwise would be the exact
+class of dishonesty `tests/integration/README.md` is written to avoid.
+
+## Prerequisites and a nesting host
+
+Identical to `shim/docs/firefox.md` §8, which carries the host table in full
+(nested GNOME via `dbus-run-session -- gnome-shell --devkit`, or `Hyprland`
+from a spare TTY). In short:
+
+```bash
+cargo build --workspace
+meson compile -C shim/build
+```
+
+## The realm file: two realms, two obviously different pictures
+
+The whole point is to tell one realm from another by eye, so give the two
+realms colours nobody could confuse. `solid-client` is co-built with the shim
+and paints one flat colour over its whole surface.
+
+```bash
+cat > /tmp/two-realms.toml <<'EOF'
+[[realm]]
+id = "realm-0"
+command = "REPO/shim/build/solid-client"
+args = ["--run-ms", "600000", "--colour", "0000ff"]
+env_allow = []
+
+[[realm]]
+id = "second"
+command = "REPO/shim/build/solid-client"
+args = ["--run-ms", "600000", "--colour", "ff0000"]
+env_allow = []
+EOF
+sed -i "s#REPO#$PWD#g" /tmp/two-realms.toml
+```
+
+`realm-0` is mandatory in every configuration and sorts first, so it is the
+realm the output binds to; `second` is the hidden one. (Which realm gets the
+output is a **placeholder** — the first to attach — because *who may move the
+binding* is a separate authority question, WS-E.1.4/#210. When that lands,
+this page grows a step for moving it.)
+
+Then, from inside your nesting host:
+
+```bash
+target/debug/vitrind --nested --consent=auto-approve \
+  --shim "$PWD/shim/build/vitrin-shim" \
+  --realm /tmp/two-realms.toml \
+  --principals examples/principals.toml \
+  --recorder /tmp/two-realms.jsonl
+```
+
+## What to check, by eye
+
+1. **One window, one realm.** The host window is **solid blue** — `realm-0`,
+   the realm bound to the output. It is *not* red, and it is not a mixture:
+   `second` is running and painting, and none of its pixels are on screen.
+   Confirm `second` really is alive rather than merely absent — `pstree -p
+   $(pgrep -n vitrind)` shows **two** `vitrin-shim` processes, each with its
+   own `solid-client`.
+2. **The hidden realm is still costing you something.** `top -p $(pgrep -n
+   vitrind)` while both realms run: the core composites the bound realm and
+   composes the hidden realm's capture on every dirty round. This is the
+   published cost (`docs/book/src/limits.md`), and seeing it is the point of
+   listing it here — it is not a bug to report.
+3. **An agent observing the hidden realm gets red, not blue.** From a second
+   terminal, with the SDK on `PYTHONPATH`:
+
+   ```bash
+   PYTHONPATH="$PWD/sdk/python/src" python3 - <<'PY'
+   import collections, os
+   import vitrin_os
+
+   socket = os.path.join(
+       os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid()),
+       "vitrin-0", "core.sock",
+   )
+   conn = vitrin_os.connect(
+       socket,
+       identity="vitrin://local/agent/demo",
+       credential=open("examples/principals.toml").read().split('"')[-2],
+   )
+   for realm in ("realm-0", "second"):
+       grant = conn.request_grant(realm=realm, verbs=("observe",))
+       grant.await_consent()
+       frame = grant.observe()
+       px = collections.Counter(
+           bytes(frame.raw[i : i + 3]) for i in range(0, len(frame.raw), 4)
+       ).most_common(1)[0][0]
+       # xrgb8888 is little-endian, so the bytes read back B, G, R.
+       print(realm, "->", "#%02x%02x%02x" % (px[2], px[1], px[0]))
+   PY
+   ```
+
+   Expect `realm-0 -> #0000ff` and `second -> #ff0000`. The headless gate
+   already asserts those colours byte-exactly; what you are confirming here
+   is that the *nested* backend serves them too, since it composes captures
+   on the CPU rather than reading its window back.
+4. **The agent cursor follows the visible realm only.** Actuate a pointer move
+   under the grant over `realm-0` and watch the cyan crosshair appear in the
+   window. Do the same under the grant over `second` and **no sprite appears
+   at all** — the sprite is painted in the output's coordinates over the
+   output's realm, so an agent acting inside a hidden realm draws nothing.
+   That is a *published limit*, not a defect to file: it reintroduces, for
+   hidden realms, exactly the "the human cannot see that an agent is acting"
+   defect D-019 exists to close, and the fix (a per-realm indicator in the
+   trusted band) is not built. If you see a crosshair while actuating
+   `second`, **that** is the bug.
+5. **Resize the host window — and expect letterbox bars.** *Resize is not
+   handled.* The core sends `configure` exactly once, when a realm's shim
+   session starts (`spawn.rs`'s `start_shim_session`), and nothing re-sends it:
+   the nested backend's `Resized` handler only tells `RealmScenes` the new view
+   size, drops the uploaded texture and asks for a redraw. So both apps stay at
+   their **startup** surface size and the composite places each one centered
+   and 1:1 in the new view (`scene::layout::place`). Grow the window and you
+   get blue in the middle with the deterministic background around it; shrink
+   it and the surface is center-cropped. The window keeps showing `realm-0`
+   throughout, which is the part this step is really checking.
+
+   That is a real gap, not a decision: issue #209 decision 3 declined
+   *per-realm* resize (one output, one size, no stacking, no overlap), which is
+   a different question from re-configuring every realm when the one output
+   changes size. It is published as a limit in
+   [`docs/book/src/limits.md`](../../docs/book/src/limits.md), because a gap a
+   reader can hit is one the project states rather than one it leaves to be
+   discovered. No automated test can observe it: the headless backend — the
+   only one CI runs — has a fixed virtual output that never resizes, which is
+   why this runbook step exists at all.
+6. **Kill the hidden realm's app** (`pkill -f 'colour ff0000'`). The window is
+   unchanged — a sibling's death takes only that realm's surface — and a
+   capture under the grant over `second` now refuses `no_surface` while
+   `realm-0`'s still delivers.
+7. **Kill the *visible* realm's app** (`pkill -f 'colour 0000ff'`). The window
+   turns **red**: the output does not stay bound to a realm that is gone, it
+   moves to the first still-serving realm in id order — the same rule
+   `session::seat_target` uses, so the realm you are watching and the realm an
+   actuation reaches keep agreeing. Kill `second` too and the window falls back
+   to the deterministic background, because now nothing is serving.
+
+## What a failure here looks like
+
+- The window shows red, or flickers between red and blue → the output is not
+  bound to one realm, or the bound realm's texture is being replaced by a
+  sibling's commit. `TextureKey`'s `realm` field and `RealmScenes::bound` are
+  where to look.
+- Killing the *hidden* realm blanks or freezes the window → the teardown funnel
+  is clearing the wrong realm's scene, or the retained-image scrub is not
+  followed by a recomposite (`close_realm` sets dirty **and** calls
+  `request_present`; both are needed on this backend).
+- Killing the *visible* realm leaves the window on the background while `second`
+  is still painting → `session::rebind_output_after_death` did not run, or ran
+  and did not request a present. The output was bound once and never moved
+  before that function existed, which is exactly what this looks like.
+- On the zero-copy path the window shows the **hidden** realm's picture → the
+  retained GPU content is not realm-keyed. `backend/winit.rs`'s
+  `zero_copy_source` and `dmabuf.rs`'s `RealmGpuContent` are where to look. The
+  CPU path was keyed on the bound realm from the start, so this failure appears
+  only on the GPU path — which means only here: CI has no GPU, and the selection
+  is all a display-free test can hold
+  (`a_hidden_realms_dmabuf_import_is_never_what_the_window_presents`). Reaching
+  it needs the shim's `--dmabuf`, and `vitrind --shim` takes a path with no
+  arguments, so point it at a two-line wrapper that execs the real shim with
+  `--dmabuf "$@"`.
+- An agent observing `second` gets blue → the cross-realm capture leak is back.
+  That one *is* covered by CI (`test_two_realms.py`), so a failure here with
+  that gate green means the nested backend's `view_rgba` diverged from the
+  headless one, which is D-019(3)'s named drift risk.

@@ -765,25 +765,49 @@ pub(crate) struct ServerCtx<'a> {
     /// clock, so one consistent `now` governs each request's whole
     /// decision -- handshake, petition, and enforcement alike.
     pub now: Instant,
-    /// The **output's** latest completed view; `None` when nothing has
-    /// composited yet. Not yet per realm: there is one scene holding at
-    /// most one committed surface for the whole session, so this frame is
-    /// whichever realm painted last (WS-E.1.3 binds an output to a realm).
+    /// **This named realm's** latest completed view; `None` when that realm
+    /// has composited nothing (or has no scene at all).
+    ///
+    /// A function of the realm id rather than a value since WS-E.1.3 (issue
+    /// #209), and that is a **confidentiality** property rather than a
+    /// rendering nicety. It used to be one frame for the whole session --
+    /// there was one scene, holding at most one committed surface, so this
+    /// was whichever realm painted last, and an `observe` grant over realm A
+    /// returned realm B's pixels the instant B committed. Nothing in that
+    /// code was wrong (there was one realm) and nothing in it prevented the
+    /// leak either. There is now no "the view" to hand the chokepoint by
+    /// mistake: a frame can only be obtained by naming a realm.
     ///
     /// Never read directly by a use. [`Self::realm_is_live`] gates it, and
     /// [`PrincipalServer::serve_facet_use`] is the one place that pairs the
     /// two -- so what reaches the chokepoint as `UseEnv::realm_view` is
     /// always "the view of the realm *this grant* names", which is the
     /// thing `no_surface` is a statement about.
-    pub realm_view: Option<RealmViewFrame<'a>>,
+    ///
+    /// A callback rather than a map for the same reason
+    /// [`Self::realm_is_live`] is one: the dispatch path allocates nothing
+    /// per message, and the embedder answers straight out of the per-realm
+    /// cache it already holds.
+    pub realm_view: &'a dyn Fn(&RealmId) -> Option<RealmViewFrame<'a>>,
     /// **Does this named realm have a live view?**
     ///
     /// `RealmLifecycle::view_is_live` for one realm, asked by id, and the
     /// distinction is authority-relevant rather than cosmetic: with several
-    /// realms attached, "some realm is live" is *fail-open* -- a grant over
-    /// a dead realm would pass a liveness check a living sibling satisfied
-    /// and then capture the shared scene. A dead realm is never
-    /// photographable, whatever its siblings are doing.
+    /// realms attached, "some realm is live" is *fail-open* -- a grant over a
+    /// dead realm would pass a liveness check a living sibling satisfied, and
+    /// then go on to be served a frame.
+    ///
+    /// **Whose frame is no longer this gate's to worry about, and that is a
+    /// weakening of the failure, not of the gate.** Since WS-E.1.3 the frame
+    /// beside it is [`Self::realm_view`], resolved from the same realm id, and
+    /// the embedder prunes a dead realm's cached view on the next composite
+    /// (`session::refresh_view_cache`). So a leak through this hole would
+    /// serve the dead realm's *own* last composition, and only inside the
+    /// dispatch round its death landed in -- not the sibling's pixels it used
+    /// to serve. That is one property milder and still exactly what
+    /// `no_surface` forbids ("never a stale frame"). A dead realm is never
+    /// photographable, whatever its siblings are doing, and this is the gate
+    /// that says so.
     ///
     /// A callback rather than a set so the dispatch path allocates nothing
     /// per message: the embedder answers straight out of its live-realm map
@@ -1250,20 +1274,26 @@ impl PrincipalServer {
         // and which one the seat serves, and the chokepoint is handed the
         // answers rather than any of the inputs.
         //
-        // - **Read** (`realm_is_live`). With one realm this could not differ
-        //   from "is anything live"; with several, judging liveness against
-        //   *any* realm is fail-open -- a grant over a dead realm would
-        //   clear the `no_surface` gate on a living sibling's account and
-        //   then capture the scene that sibling committed into.
+        // - **Read** (`realm_is_live`, and the frame itself). With one realm
+        //   this could not differ from "is anything live"; with several,
+        //   judging liveness against *any* realm is fail-open -- a grant over
+        //   a dead realm would clear the `no_surface` gate on a living
+        //   sibling's account and then capture the scene that sibling
+        //   committed into. Since WS-E.1.3 the **frame** is resolved by realm
+        //   here too, on the same line: a live realm's grant used to be
+        //   handed the session's one view, so a capture over realm A could
+        //   carry live sibling B's pixels. Both halves of "the view of the
+        //   realm this grant names" are now resolved together, from the same
+        //   `realm`, or not at all.
         // - **Write** (`seat_reaches_grant_realm`). Same shape, worse
         //   failure: the session has one seat target, so an actuation
         //   admitted under a grant naming another realm would be *delivered
         //   into a sibling's app*. Refusing is the stopgap; WS-E.1.6 routes
         //   properly (see the chokepoint's step 5d).
         //
-        // Both are `false` when the row is gone -- fail closed, and
-        // unreachable anyway: a missing row is refused `not_granted` at step
-        // 3, before either fact is consulted.
+        // All three are the closed answer when the row is gone -- fail
+        // closed, and unreachable anyway: a missing row is refused
+        // `not_granted` at step 3, before any of them is consulted.
         //
         // Not an authority judgement (this function makes none): it resolves
         // *environment* facts the same way `presence` is resolved outside
@@ -1271,16 +1301,22 @@ impl PrincipalServer {
         // `not_granted` for a row that is missing, then expiry and
         // revocation, and only then the use-context gates. A row that fails
         // an earlier step never reaches this frame at all.
-        let (realm_is_live, seat_reaches_grant_realm) =
+        let (realm_view, seat_reaches_grant_realm) =
             match grant_row.and_then(|row| ctx.grants.realm_of(row)) {
                 Some(realm) => (
-                    (ctx.realm_is_live)(realm),
+                    // The liveness gate and the selection, side by side: a
+                    // dead realm is never photographable whatever its
+                    // siblings are doing, and a live one is photographed
+                    // through its own view and no other.
+                    (ctx.realm_is_live)(realm)
+                        .then(|| (ctx.realm_view)(realm))
+                        .flatten(),
                     ctx.seat_target_realm == Some(realm),
                 ),
-                None => (false, false),
+                None => (None, false),
             };
         let env = UseEnv {
-            realm_view: ctx.realm_view.as_ref().filter(|_| realm_is_live),
+            realm_view: realm_view.as_ref(),
             presence: ctx.presence,
             seat_reaches_grant_realm,
             actuations: &mut *ctx.actuations,
@@ -2098,12 +2134,20 @@ pub(crate) mod tests {
         realms: RealmRegistry,
         grants: GrantTable,
         now: Instant,
-        /// `(rgba, width, height)`; `None` models a realm with no live
-        /// surface -- the chokepoint's use-time `no_surface` judgement,
-        /// which is deliberately NOT the same thing as a realm being
-        /// vacant at petition time (that is [`Shared::realms`], and see
+        /// **Each realm's** latest completed view, `(rgba, width, height)`;
+        /// an absent entry models a realm with no live surface -- the
+        /// chokepoint's use-time `no_surface` judgement, which is
+        /// deliberately NOT the same thing as a realm being vacant at
+        /// petition time (that is [`Shared::realms`], and see
         /// [`crate::realm`]'s vacancy decision).
-        view: Option<(Vec<u8>, u32, u32)>,
+        ///
+        /// A map rather than one frame since WS-E.1.3 (issue #209), for the
+        /// same reason `ServerCtx::realm_view` became a function of the realm
+        /// id: with one frame for the rig, a test could not tell a capture
+        /// that served the granted realm's pixels from one that served a
+        /// sibling's, because there were no sibling pixels to serve. See
+        /// [`Shared::set_view`].
+        views: std::collections::BTreeMap<RealmId, (Vec<u8>, u32, u32)>,
         /// Which realms have a **live view** right now -- the rig's stand-in
         /// for `RealmLifecycle::view_is_live`, asked per realm id exactly as
         /// the runtime asks it (`ServerCtx::realm_is_live`).
@@ -2139,7 +2183,12 @@ pub(crate) mod tests {
                 realms: crate::realm::tests::registry_with(&[crate::realm::WELL_KNOWN_REALM_ID]),
                 grants: GrantTable::new(),
                 now: Instant::now(),
-                view: Some((crate::test_pattern::render(VIEW_W, VIEW_H), VIEW_W, VIEW_H)),
+                views: [(
+                    RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
+                    (crate::test_pattern::render(VIEW_W, VIEW_H), VIEW_W, VIEW_H),
+                )]
+                .into_iter()
+                .collect(),
                 // Every realm the rig serves is live by default, so a test
                 // that says nothing about liveness behaves as it did while
                 // "the realm" was the only realm.
@@ -2154,6 +2203,23 @@ pub(crate) mod tests {
                 actuations: Vec::new(),
                 recorder,
                 log_path,
+            }
+        }
+
+        /// Set (or clear) **one realm's** latest completed view.
+        ///
+        /// `None` is this rig's "that realm has composited nothing", which
+        /// the chokepoint turns into `no_surface`. A helper rather than a
+        /// public field write so every test that changes a view has to say
+        /// *whose* view it changed — the whole point of the map.
+        fn set_view(&mut self, realm: &RealmId, frame: Option<(Vec<u8>, u32, u32)>) {
+            match frame {
+                Some(frame) => {
+                    self.views.insert(realm.clone(), frame);
+                }
+                None => {
+                    self.views.remove(realm);
+                }
             }
         }
 
@@ -2206,7 +2272,7 @@ pub(crate) mod tests {
             realms,
             grants,
             now,
-            view,
+            views,
             live_realms,
             seat_realm,
             presence,
@@ -2221,17 +2287,32 @@ pub(crate) mod tests {
                 .recv_message()
                 .expect("core receive")
                 .expect("a message must be waiting");
+            // Built inside the loop, unlike `realm_is_live`: the frame it
+            // hands back borrows `views`, so `ServerCtx<'a>`'s lifetime is
+            // pinned to this closure's — and a closure hoisted out of the
+            // loop would pin `petitions`/`grants`/`recorder`'s `&mut`
+            // reborrows to the whole function, which is one dispatch's worth
+            // of borrow held across every dispatch. The runtime has the same
+            // shape for the same reason (`session::dispatch_principal`
+            // builds it per message).
+            let realm_view = |realm: &RealmId| {
+                views
+                    .get(realm)
+                    .map(|(rgba, width, height)| RealmViewFrame {
+                        rgba: rgba.as_slice(),
+                        width: *width,
+                        height: *height,
+                    })
+            };
             let mut ctx = ServerCtx {
                 verifier,
                 petitions,
                 realms,
                 grants,
                 now: *now,
-                realm_view: view.as_ref().map(|(rgba, width, height)| RealmViewFrame {
-                    rgba,
-                    width: *width,
-                    height: *height,
-                }),
+                // Resolved by realm id, exactly as `session::dispatch_principal`
+                // resolves it from `Runtime::view_cache` (WS-E.1.3).
+                realm_view: &realm_view,
                 realm_is_live: &realm_is_live,
                 seat_target_realm: seat_realm.as_ref(),
                 presence,
@@ -2475,7 +2556,10 @@ pub(crate) mod tests {
     pub(crate) fn capture_once(view: Option<crate::capture::RealmViewFrame<'_>>) -> CaptureOutcome {
         let verifier = demo_verifier();
         let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
-        shared.view = view.map(|v| (v.rgba.to_vec(), v.width, v.height));
+        shared.set_view(
+            &RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
+            view.map(|v| (v.rgba.to_vec(), v.width, v.height)),
+        );
 
         client.send_message(&capture_frame(), None).unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).expect("dispatch the capture");
@@ -2554,8 +2638,154 @@ pub(crate) mod tests {
         }
     }
 
+    /// Read the bytes a `frame_ready` actually delivered out of its sealed
+    /// memfd — what the **agent** holds, never what any state says.
+    fn frame_bytes(client: &mut Connection, view_id: u32) -> Vec<u8> {
+        use std::os::unix::fs::FileExt;
+        let frame = expect_frame(client, view_id);
+        let len = (frame.stride * frame.height) as usize;
+        let mut bytes = vec![0u8; len];
+        std::fs::File::from(frame.fd)
+            .read_exact_at(&mut bytes, 0)
+            .expect("the delivered memfd is readable");
+        bytes
+    }
+
+    /// **A grant over one realm captures that realm's pixels and no
+    /// sibling's** (WS-E.1.3, issue #209, decision 1) — byte-exact, at the
+    /// chokepoint, over the wire.
+    ///
+    /// This is issue #209's first acceptance criterion stated where the
+    /// decision is actually made. `ServerCtx::realm_view` used to be one
+    /// `Option<RealmViewFrame>` for the session, built from one scene holding
+    /// at most one committed surface, so an `observe` grant over realm A was
+    /// served realm B's pixels the instant B painted. Nothing in that code was
+    /// wrong — there was one realm — and nothing in it prevented the leak
+    /// either. Making the frame a **function of the realm id** is what makes
+    /// the leak unrepresentable; this is the test that says so in bytes.
+    ///
+    /// Both realms are alive and both deliver, which is what makes it a
+    /// *selection* test rather than a refusal test: a chokepoint that refused
+    /// the second grant, or served it a black frame, would satisfy "no
+    /// sibling's pixels" and be useless. The fixtures are two distinct
+    /// full-view images, asserted `assert_ne!` first, so "A got A's" cannot
+    /// pass by the two happening to be equal.
+    ///
+    /// Its siblings each disclaim a property by pointing here:
+    /// [`a_grant_over_a_dead_realm_cannot_photograph_a_live_siblings_scene`]
+    /// asks only the liveness question, and
+    /// [`a_grant_over_one_realm_cannot_actuate_into_a_siblings_app`] only the
+    /// delivery-target one. `session.rs`'s
+    /// `a_capture_returns_the_granted_realms_pixels_and_never_the_outputs`
+    /// makes the same claim end to end through the shipped runtime, where the
+    /// per-realm cache and the real compositor fill in; this one holds the
+    /// chokepoint's own half, so a regression in `serve_facet_use`'s pairing
+    /// of realm-to-frame fails here rather than only there.
+    #[test]
+    fn a_grant_over_one_realm_captures_that_realms_pixels_and_no_siblings() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let mut shared = Shared::new(ConsentPolicy::AutoApprove);
+        shared.realms = crate::realm::tests::registry_with(&["realm-0", "editor"]);
+        shared.live_realms.insert(RealmId::new("editor"));
+
+        // Two views that are each a full frame and are obviously different:
+        // the checkerboard test pattern, and its byte-wise inverse. Both are
+        // the same size, so a swap is a content difference and nothing else.
+        let view_a = crate::test_pattern::render(VIEW_W, VIEW_H);
+        let view_b: Vec<u8> = view_a.iter().map(|b| !b).collect();
+        assert_ne!(
+            view_a, view_b,
+            "the two realms' fixtures must actually differ, or nothing below is a test"
+        );
+        shared.set_view(
+            &RealmId::new("realm-0"),
+            Some((view_a.clone(), VIEW_W, VIEW_H)),
+        );
+        shared.set_view(
+            &RealmId::new("editor"),
+            Some((view_b.clone(), VIEW_W, VIEW_H)),
+        );
+
+        let (mut server, mut core, mut client) = connect(&mut shared);
+        // Realm handle 3 = realm-0, grant over it at ids 4..=8 (view facet 6).
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client, 4).outcome, Outcome::Granted);
+
+        // Realm handle 9 = editor, grant over it at ids 10..=14 (view facet
+        // 12). The ids climb because the watermark rule says they must.
+        send_get_realm(&mut client, 2, 9, "editor");
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).expect("get_realm editor");
+        client
+            .send_message(&petition_at(10).encode(9), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 11, ConsentState::Closed);
+        assert_eq!(expect_resolved(&mut client, 10).outcome, Outcome::Granted);
+
+        // The two captures, in the order that makes a shared frame visible:
+        // A first, then B. Under one frame for the session both would carry
+        // whatever `realm_view` last resolved to, which is the leak.
+        let (wire_a, wire_b) = (
+            crate::capture::tests::xrgb_of(&view_a),
+            crate::capture::tests::xrgb_of(&view_b),
+        );
+        client.send_message(&capture_frame(), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        let got_a = frame_bytes(&mut client, 6);
+        client
+            .send_message(&view::requests::CaptureFrame {}.encode(12), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        let got_b = frame_bytes(&mut client, 12);
+
+        // Diagnosed rather than dumped: two full frames in an `assert_eq!`
+        // message is a wall of bytes nobody reads, and the fact that matters
+        // is *whose* pixels arrived.
+        let whose = |got: &[u8]| match got {
+            g if g == wire_a => "realm-0's",
+            g if g == wire_b => "the editor's",
+            _ => "neither realm's",
+        };
+        assert_eq!(
+            whose(&got_a),
+            "realm-0's",
+            "a grant over realm-0 must be served realm-0's own pixels; it got {} instead",
+            whose(&got_a)
+        );
+        assert_eq!(
+            whose(&got_b),
+            "the editor's",
+            "a grant over the editor was served {} pixels: with one frame for the session a \
+             capture returns whatever realm painted last, which is the cross-realm leak \
+             WS-E.1.3 exists to close",
+            whose(&got_b)
+        );
+        assert_ne!(got_a, got_b);
+
+        // ...and the selection follows the *content*, not the facet id: swap
+        // what each realm is painting and each grant's capture swaps with it.
+        // A chokepoint that had cached a frame per facet, or resolved the
+        // realm once at grant time, passes everything above and fails here.
+        shared.set_view(&RealmId::new("realm-0"), Some((view_b, VIEW_W, VIEW_H)));
+        shared.set_view(&RealmId::new("editor"), Some((view_a, VIEW_W, VIEW_H)));
+        client.send_message(&capture_frame(), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        assert_eq!(whose(&frame_bytes(&mut client, 6)), "the editor's");
+        client
+            .send_message(&view::requests::CaptureFrame {}.encode(12), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        assert_eq!(whose(&frame_bytes(&mut client, 12)), "realm-0's");
+    }
+
     /// **A grant over a dead realm refuses `no_surface`, even while a live
-    /// sibling is painting the shared scene** (WS-E.1.2 review, HIGH 1).
+    /// sibling is painting** (WS-E.1.2 review, HIGH 1).
     ///
     /// The bug this pins is specific to there being more than one realm:
     /// liveness used to be derived as "does *any* attached realm have a live
@@ -2564,6 +2794,12 @@ pub(crate) mod tests {
     /// pixels, delivered under a grant over a realm that no longer exists.
     /// One realm could not express the bug at all, which is why nothing
     /// before this caught it.
+    ///
+    /// Since WS-E.1.3 each realm has its own view here, so the survivor's
+    /// capture is its *own* frame rather than the session's -- see
+    /// [`a_grant_over_one_realm_captures_that_realms_pixels_and_no_siblings`]
+    /// for the byte-exact statement of that. This test still asks only the
+    /// liveness question.
     ///
     /// Both directions are asserted, because only the pair is evidence: the
     /// dead realm's facet must refuse **and** the survivor's must still
@@ -2575,6 +2811,14 @@ pub(crate) mod tests {
         let mut shared = Shared::new(ConsentPolicy::AutoApprove);
         shared.realms = crate::realm::tests::registry_with(&["realm-0", "editor"]);
         shared.live_realms.insert(RealmId::new("editor"));
+        // Its own view, because a realm's capture is its own frame since
+        // WS-E.1.3: a live realm with no entry here has composited nothing
+        // and is refused `no_surface` for that reason, which would make the
+        // liveness assertion below pass for the wrong reason.
+        shared.set_view(
+            &RealmId::new("editor"),
+            Some((vec![0x33u8; (VIEW_W * VIEW_H * 4) as usize], VIEW_W, VIEW_H)),
+        );
         let (mut server, mut core, mut client) = connect(&mut shared);
 
         // Realm handle 3 = realm-0, then a grant over it (ids 4..=8).
@@ -2598,10 +2842,11 @@ pub(crate) mod tests {
         expect_consent_state(&mut client, 11, ConsentState::Closed);
         assert_eq!(expect_resolved(&mut client, 10).outcome, Outcome::Granted);
 
-        // Both realms live: both grants observe the shared scene. (That they
-        // observe the *same* scene is the published WS-E.1.3 limit, not this
-        // test's subject -- this is the baseline the refusal below is
-        // measured against.)
+        // Both realms live: both grants observe their own view. (That the
+        // two views are each realm's own is
+        // `a_grant_over_one_realm_captures_that_realms_pixels_and_no_siblings`'
+        // subject, not this test's -- this is the baseline the refusal below
+        // is measured against.)
         for (view_id, grant_id) in [(6, 4), (12, 10)] {
             assert!(
                 matches!(
@@ -2620,9 +2865,11 @@ pub(crate) mod tests {
             );
         }
 
-        // The editor realm's shim dies. The scene is untouched -- realm-0 is
-        // still painting it -- so the only thing that changed is *whose*
-        // realm has a live view.
+        // The editor realm's shim dies. Every view is untouched -- realm-0
+        // is still painting its own, and the editor's last frame is still in
+        // the rig's map -- so the only thing that changed is *whose* realm
+        // has a live view. Leaving the frame there is the point: liveness,
+        // not the absence of pixels, is what must refuse.
         shared.live_realms.remove(&RealmId::new("editor"));
 
         assert_eq!(
@@ -2680,6 +2927,13 @@ pub(crate) mod tests {
         let mut shared = Shared::new(ConsentPolicy::AutoApprove);
         shared.realms = crate::realm::tests::registry_with(&["realm-0", "editor"]);
         shared.live_realms.insert(RealmId::new("editor"));
+        // The editor's own view: without it the editor's actuations would be
+        // refused `no_surface` at step 5a and never reach the step-5d
+        // cross-realm guard this test is about.
+        shared.set_view(
+            &RealmId::new("editor"),
+            Some((vec![0x33u8; (VIEW_W * VIEW_H * 4) as usize], VIEW_W, VIEW_H)),
+        );
         let (mut server, mut core, mut client) = connect(&mut shared);
 
         // Grant over realm-0 (facets 4..=8), then over editor (10..=14) --
@@ -2751,8 +3005,10 @@ pub(crate) mod tests {
         expect_refused(&mut client, 4, Verb::ACTUATE_POINTER, Refusal::Internal);
 
         // Observation is untouched: this guard is about delivery, and a
-        // capture addresses no seat. (Which realm's pixels the shared scene
-        // holds is the published WS-E.1.3 limit, not this test's subject.)
+        // capture addresses no seat. (Which realm's pixels a capture returns
+        // is
+        // `a_grant_over_one_realm_captures_that_realms_pixels_and_no_siblings`'
+        // subject, not this test's.)
         client.send_message(&capture_frame(), None).unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
         drop(expect_frame(&mut client, 6));
@@ -5140,7 +5396,7 @@ pub(crate) mod tests {
         // realm whose seat is not yet minted -- not a vacant realm.)
         let verifier = demo_verifier();
         let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
-        shared.view = None;
+        shared.set_view(&RealmId::new(crate::realm::WELL_KNOWN_REALM_ID), None);
 
         client.send_message(&capture_frame(), None).unwrap();
         client.send_message(&move_to(9, 9), None).unwrap();
@@ -5160,7 +5416,10 @@ pub(crate) mod tests {
         // burned no quota on any facet (no_surface precedes the bucket)
         // -- and the admitted actuation ends the refusal coalescing
         // windows.
-        shared.view = Some((crate::test_pattern::render(VIEW_W, VIEW_H), VIEW_W, VIEW_H));
+        shared.set_view(
+            &RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
+            Some((crate::test_pattern::render(VIEW_W, VIEW_H), VIEW_W, VIEW_H)),
+        );
         client.send_message(&capture_frame(), None).unwrap();
         client.send_message(&move_to(1, 2), None).unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 2).unwrap();
@@ -5263,12 +5522,15 @@ pub(crate) mod tests {
         drop(expect_frame(&mut client, 6));
         expect_refused(&mut client, 4, Verb::OBSERVE, Refusal::RateLimited);
 
-        shared.view = None;
+        shared.set_view(&RealmId::new(crate::realm::WELL_KNOWN_REALM_ID), None);
         client.send_message(&capture_frame(), None).unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
         expect_refused(&mut client, 4, Verb::OBSERVE, Refusal::NoSurface);
 
-        shared.view = Some((crate::test_pattern::render(VIEW_W, VIEW_H), VIEW_W, VIEW_H));
+        shared.set_view(
+            &RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
+            Some((crate::test_pattern::render(VIEW_W, VIEW_H), VIEW_W, VIEW_H)),
+        );
         shared.now += Duration::from_secs(1);
         client.send_message(&capture_frame(), None).unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
@@ -5407,7 +5669,10 @@ pub(crate) mod tests {
         let verifier = demo_verifier();
         let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
         // Claimed dimensions disagree with the readback buffer.
-        shared.view = Some((vec![0u8; 16], VIEW_W, VIEW_H));
+        shared.set_view(
+            &RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
+            Some((vec![0u8; 16], VIEW_W, VIEW_H)),
+        );
         client.send_message(&capture_frame(), None).unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
         expect_refused(&mut client, 4, Verb::OBSERVE, Refusal::Internal);
@@ -5710,7 +5975,10 @@ pub(crate) mod tests {
             vec![0x20u8; (VIEW_W * VIEW_H * 4) as usize],
             crate::test_pattern::render(VIEW_W, VIEW_H),
         ] {
-            shared.view = Some((view, VIEW_W, VIEW_H));
+            shared.set_view(
+                &RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
+                Some((view, VIEW_W, VIEW_H)),
+            );
             client.send_message(&capture_frame(), None).unwrap();
             process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
             let frame = expect_frame(&mut client, 6);

@@ -423,6 +423,13 @@ pub(crate) mod tests {
         frame
     }
 
+    /// The wire bytes a capture of `rgba` must carry: the same xrgb8888
+    /// conversion [`render_frame`] performs, so a cross-module test can state
+    /// "this realm's view, byte for byte" without restating the swizzle.
+    pub(crate) fn xrgb_of(rgba: &[u8]) -> Vec<u8> {
+        rgba_to_xrgb8888(rgba)
+    }
+
     /// Read the whole memfd back through `pread` (offset-independent: the
     /// server's writes advanced the shared file offset).
     fn read_memfd(fd: OwnedFd, len: usize) -> Vec<u8> {

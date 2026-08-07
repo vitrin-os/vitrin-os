@@ -260,8 +260,9 @@ class ConsentInjector:
             raise InjectorFailed(f"short occlusion window: {len(pixels)} of {size} bytes")
         return out, pixels
 
-    def band(self, timeout: float = 30.0) -> dict[str, int]:
-        """The trusted-band witness (issue #139), as ten integers.
+    def band(self, timeout: float = 30.0) -> dict[str, object]:
+        """The trusted-band witness (issue #139), as ten numbers plus the
+        bound realm's id.
 
         Deliberately returns **no pixels and no descriptor**, and that is not
         a convenience of this method -- it is the shape of the reply. The
@@ -273,6 +274,14 @@ class ConsentInjector:
         safer field ("do the band's rows equal the client's?") is a
         brute-force oracle, and `tests/integration/test_real_trust_band.py`
         for the gate that reads this.
+
+        The `realm` key names **which realm** the pixel-derived fields are
+        about (WS-E.1.3, issue #209): `tracks_view`, `probe_changes` and
+        `probe_fnv` are statements about the realm bound to the output, and a
+        caller comparing them against another realm's frame would be checking
+        a number against the wrong picture. `None` when nothing is bound (the
+        core sends `-`). Configuration, not a secret, so it does not weaken
+        the report's secret-independence rule.
 
         Raises `InjectorFailed` if the core sent a descriptor with the reply:
         that would mean pixels travelled, which nothing about this request may
@@ -292,15 +301,22 @@ class ConsentInjector:
             "view_w",
             "view_h",
         )
-        if len(fields) != len(keys) + 2:  # verb + scalars + the hex digest
+        # verb + scalars + the hex digest + the bound realm's id
+        if len(fields) != len(keys) + 3:
             raise InjectorFailed(f"malformed `band` reply: {fields!r}")
         if len(self._fds) != fds_before:
             raise InjectorFailed(
                 "the core sent a descriptor with a `band` reply; this request must never "
                 "move pixels (issue #85: the indicator reaches no descriptor in any build)"
             )
-        out = {key: int(value) for key, value in zip(keys, fields[1:])}
-        out["probe_fnv"] = int(fields[-1], 16)
+        out: dict[str, object] = {
+            key: int(value) for key, value in zip(keys, fields[1 : 1 + len(keys)])
+        }
+        # Indexed positionally rather than from the end: the realm id was
+        # appended after the digest, so `fields[-1]` is no longer the digest.
+        out["probe_fnv"] = int(fields[1 + len(keys)], 16)
+        realm = fields[2 + len(keys)]
+        out["realm"] = None if realm == "-" else realm
         return out
 
     def decide(self, token: str, choice: str, timeout: float = 30.0) -> str:
@@ -363,6 +379,8 @@ class Core:
         shim: str | os.PathLike[str] | None = None,
         command: str | os.PathLike[str] | None = None,
         args: list[str] | None = None,
+        realm_args: dict[str, list[str]] | None = None,
+        realm_commands: dict[str, str | os.PathLike[str]] | None = None,
         env_allow: tuple[str, ...] = (),
         extra_env: dict[str, str] | None = None,
         log_file: str | os.PathLike[str] | None = None,
@@ -444,12 +462,25 @@ class Core:
                 # needs (the cross-realm actuation guard, WS-E.1.2). Default
                 # empty, so every existing real-app caller still writes the
                 # single table it always did.
+                # `realm_args`/`realm_commands` override `args`/`command`
+                # for the realms they name, so two realms can run the same
+                # app with different arguments (two `solid-client`s painting
+                # two colours) or two different apps entirely (a static one
+                # beside an animating one). Both are what a cross-realm
+                # capture test needs to tell one realm's pixels from
+                # another's (WS-E.1.3, issue #209): with identical realms a
+                # leak is invisible, because there is nothing to leak.
+                # Unnamed realms take `command`/`args` unchanged, so every
+                # existing caller is untouched.
+                per_args = realm_args or {}
+                per_command = realm_commands or {}
                 self.realm.write_text(
                     "".join(
                         "[[realm]]\n"
                         f'id = "{rid}"\n'
-                        f"command = {_toml_string(os.fspath(command))}\n"
-                        f"args = {_toml_string_array(args or [])}\n"
+                        "command = "
+                        f"{_toml_string(os.fspath(per_command.get(rid, command)))}\n"
+                        f"args = {_toml_string_array(per_args.get(rid, args or []))}\n"
                         f"env_allow = {_toml_string_array(list(env_allow))}\n"
                         for rid in ("realm-0", *realms)
                     )
@@ -475,8 +506,13 @@ class Core:
             str(shim_bin),
         ]
         # The P1.8.5 core-internal capture (issue #107): when set, the core
-        # mirrors every composited realm-view readback to this file as raw
-        # RGBA, the frame the fidelity gate compares an `observe()` against.
+        # mirrors every live realm's composited realm-view readback to
+        # `PATH.<realm-id>` as raw RGBA, the frame the fidelity gate compares
+        # an `observe()` against. Readers must go through
+        # `capture_dump_path()`; nothing is written to the bare PATH itself
+        # (WS-E.1.3, issue #209 -- an unqualified dump would name *a* view the
+        # moment a second realm exists, and a gate whose ground truth is a
+        # guess is worse than no gate).
         if capture_dump is not None:
             argv += ["--capture-dump", str(capture_dump)]
         # The consent-injector channel (issue #138): an inherited AF_UNIX
@@ -790,6 +826,20 @@ def require_binaries() -> None:
 # -- shared agent-side helpers (used by more than one test module) ----------
 
 ALL_VERBS = ("observe", "actuate.pointer", "actuate.text")
+
+
+def capture_dump_path(base, realm: str = "realm-0"):
+    """Where the core writes `realm`'s `--capture-dump` frame.
+
+    `vitrind --capture-dump PATH` writes one file **per live realm**, at
+    `PATH.<realm-id>`, and never PATH itself (WS-E.1.3, issue #209): while a
+    session held one realm, PATH unambiguously named the one view the M1.3
+    fidelity gate compares an agent's `observe()` against; with several it
+    would name whichever realm the writer happened to mean. Every reader in
+    this suite goes through here so the gate's ground truth stays a named
+    realm rather than an assumption.
+    """
+    return pathlib.Path(f"{base}.{realm}")
 
 
 def whole_realm_grant(conn, verbs=ALL_VERBS, realm="realm-0"):

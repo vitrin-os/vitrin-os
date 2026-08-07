@@ -94,10 +94,13 @@ separately choreographed demo:
    desktop's mouse pointer — travels to the URL bar, then text appears
    character by character per the `text-input-v3`-avoiding keymap
    technique, D7. The crosshair is **nested-only**: `vitrind --nested`
-   always composites it, a headless run only with `--agent-cursor`, and it
-   is drawn into human-visible output alone — the agent's own captured
+   composites it with no opt-in, a headless run only with `--agent-cursor`,
+   and it is drawn into human-visible output alone — the agent's own captured
    frames never contain it, which is why the captured frames show the page
-   and no cursor.
+   and no cursor. (It is drawn for the realm the output is bound to; the demo
+   runs one realm, so that is this one. In a multi-realm session an agent
+   acting in a hidden realm draws no crosshair — a published limit, see
+   `docs/book/src/limits.md`.)
 5. **Do the thing.** This is the beat the demo exists for. The agent was
    handed a **task record it did not author** (`--task K=V`, order-preserving)
    and now fills it: for each field it locates that field by its **marker

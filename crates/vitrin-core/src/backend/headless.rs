@@ -119,9 +119,10 @@ use tracing::info;
 
 use crate::consent::{ConsentSurface, TrustedIndicator};
 use crate::deadman::DeadManConfig;
+use crate::grants::RealmId;
 use crate::input::{InputRouter, NoopHook};
 use crate::recorder::Recorder;
-use crate::scene::Scene;
+use crate::scene::{RealmScenes, Scene};
 use crate::session::{self, Runtime, RuntimeSeed};
 use crate::test_pattern;
 
@@ -253,9 +254,12 @@ fn readback_region(
 ///
 /// # `agent_cursor`: why this backend's sprite is opt-in and nested's is not
 ///
-/// `--agent-cursor` (D-019). The nested backend always composites the agent
-/// cursor sprite: a human is watching that window, and drawing nothing there
-/// is the defect this whole change fixes. Here it is **off unless asked for**,
+/// `--agent-cursor` (D-019). The nested backend composites the agent cursor
+/// sprite with no opt-in: a human is watching that window, and drawing nothing
+/// there is the defect this whole change fixes. (Neither backend draws it for
+/// a realm the output is not bound to -- `session::post_dispatch` withholds
+/// the position, WS-E.1.3 -- which is a limit on *both* and not what this
+/// argument is about.) Here it is **off unless asked for**,
 /// and the reason is a real gate rather than caution:
 /// [`super::band_witness`] measures this backend's human-visible framebuffer
 /// against the realm view byte for byte, and
@@ -832,8 +836,24 @@ impl session::RuntimeHost for HeadlessState {
 }
 
 impl session::Presenter for HeadlessView {
-    fn scene(&mut self) -> &mut Scene {
-        &mut self.scene
+    fn scene_mut(&mut self, realm: &RealmId) -> &mut Scene {
+        self.scenes.scene_mut(realm)
+    }
+
+    fn scene(&self, realm: &RealmId) -> Option<&Scene> {
+        self.scenes.scene(realm)
+    }
+
+    fn focused(&self) -> Option<&RealmId> {
+        self.scenes.focused()
+    }
+
+    fn bind_output(&mut self, realm: &RealmId) {
+        self.scenes.bind(realm);
+    }
+
+    fn unbind_output(&mut self) {
+        self.scenes.unbind();
     }
 
     fn view_size(&self) -> (u32, u32) {
@@ -849,7 +869,21 @@ impl session::Presenter for HeadlessView {
         Ok(session::Presentation::Completed)
     }
 
-    /// The retained realm view, read back tightly packed.
+    /// **This realm's** latest completed view, tightly packed.
+    ///
+    /// Two sources, one composition (WS-E.1.3):
+    ///
+    /// - **The bound realm** reads back the retained view framebuffer — the
+    ///   exact bytes this backend last composited for the output. Unchanged
+    ///   from before this issue, which is what keeps the P1.3.2/P1.3.6
+    ///   goldens and the M1.3 fidelity gate byte-exact.
+    /// - **A hidden realm** composes its own scene at the same view size.
+    ///   That is not a second implementation: this backend's own tests pin
+    ///   the retained readback as a byte-for-byte identity of
+    ///   [`Scene::compose`] (`retained_framebuffer_is_the_capture_source`),
+    ///   so the two paths are the same function reached two ways — the
+    ///   identical argument that lets the nested backend serve captures at
+    ///   all (P1.3.8).
     ///
     /// A readback failure yields `None` rather than an error: this is called
     /// on the redraw path, where the alternative is tearing down a session
@@ -857,8 +891,18 @@ impl session::Presenter for HeadlessView {
     /// chokepoint's `no_surface` refusal — the same answer a capture gets
     /// before any surface exists. Never the *output* image: that one carries
     /// the consent overlay, which no capture may ever contain.
-    fn view_rgba(&mut self) -> Option<Vec<u8>> {
-        self.latest_frame_rgba().ok()
+    fn view_rgba(&mut self, realm: &RealmId) -> Option<Vec<u8>> {
+        if self.scenes.focused() == Some(realm) {
+            return self.latest_frame_rgba().ok();
+        }
+        let (w, h) = (
+            self.output.size.w.max(0) as u32,
+            self.output.size.h.max(0) as u32,
+        );
+        if w == 0 || h == 0 {
+            return None;
+        }
+        Some(self.scenes.scene(realm)?.compose(w, h))
     }
 
     /// Take the router's agent-owned position for the sprite (D-019) — but
@@ -897,13 +941,14 @@ impl session::Presenter for HeadlessView {
     /// because `teardown_view` carries no default.
     fn teardown_view<R>(
         &mut self,
+        realm: &RealmId,
         f: impl for<'v> FnOnce(
             &'v mut Scene,
             Option<&'v mut dyn crate::lifecycle::RetainedOutput>,
             Option<&'v mut dyn crate::dmabuf::DmabufImporter>,
         ) -> R,
     ) -> R {
-        f(&mut self.scene, Some(&mut self.output), None)
+        f(self.scenes.scene_mut(realm), Some(&mut self.output), None)
     }
 }
 
@@ -911,11 +956,14 @@ impl session::Presenter for HeadlessView {
 /// [`Scene`], the consent surface, and the two retained images the module
 /// docs describe.
 pub(crate) struct HeadlessView {
-    /// The realm's scene (P1.3.3): the single-maximized client surface, or
-    /// the deterministic background when none is committed. The shim-facing
-    /// protocol server (P1.3.4) commits into it and calls
-    /// [`redraw`](Self::redraw); the realm object (P1.5.1) hangs off it.
-    scene: Scene,
+    /// **Every realm's scene, and the one bound to the output** (P1.3.3;
+    /// WS-E.1.3, issue #209). Each scene is a single-maximized client
+    /// surface, or the deterministic background when that realm has
+    /// committed nothing. The shim-facing protocol server (P1.3.4) commits
+    /// into the committing realm's own scene and calls
+    /// [`redraw`](Self::redraw), which composites the **bound** one; the
+    /// realm object (P1.5.1) hangs off it.
+    scenes: RealmScenes,
     /// The renderer and the two retained images, in their own struct.
     ///
     /// **The split is load-bearing, not tidiness.** A realm's death borrows
@@ -996,7 +1044,10 @@ impl HeadlessView {
         let view_framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
         let output_framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
         Ok(Self {
-            scene: Scene::new(),
+            // The virtual output never resizes, so this size is the one every
+            // realm's view is ever composed at and `set_view_size` has nothing
+            // further to say on this backend.
+            scenes: RealmScenes::new((size.w.max(0) as u32, size.h.max(0) as u32)),
             output: HeadlessOutput {
                 renderer,
                 consent: ConsentSurface::new(indicator),
@@ -1036,7 +1087,34 @@ impl HeadlessView {
     /// uploads once per (size, scene, consent) change rather than once per
     /// frame.
     fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
-        self.output.present(&self.scene)
+        // **The bound realm's** scene, and never a hidden one's: this is the
+        // output, and the output shows one realm (WS-E.1.3 decision 3). With
+        // nothing bound it is a permanently empty scene, which composes the
+        // documented deterministic background.
+        self.output
+            .present(self.scenes.bound(), self.scenes.focused())
+    }
+
+    /// The single realm the pre-WS-E.1.3 tests in this module drive:
+    /// `realm-0`, bound to the output and minted on first use.
+    ///
+    /// A named test helper rather than a `scene` field so those tests keep
+    /// reading as "the realm commits, the output shows it" while the
+    /// multi-realm tests below have to name their realms explicitly. Binding
+    /// here is what makes it the *output's* realm, which is what every one of
+    /// them then asserts about.
+    #[cfg(test)]
+    fn scene_for_test(&mut self) -> &mut Scene {
+        let realm = RealmId::new(crate::realm::WELL_KNOWN_REALM_ID);
+        self.scenes.bind(&realm);
+        self.scenes.scene_mut(&realm)
+    }
+
+    /// The scene the output composites — the read-only half of
+    /// [`Self::scene_for_test`].
+    #[cfg(test)]
+    fn bound_scene(&self) -> &Scene {
+        self.scenes.bound()
     }
 
     /// The capture service's pixel source (P1.3.6): the **latest completed
@@ -1179,7 +1257,19 @@ impl HeadlessOutput {
     /// One [`Scene::compose`] call feeds both images, so the realm view an
     /// agent may capture and the output a human sees are the same
     /// composition, differing only by the overlay (module docs).
-    fn present(&mut self, scene: &Scene) -> Result<(), Box<dyn Error>> {
+    fn present(
+        &mut self,
+        scene: &Scene,
+        // The realm `scene` belongs to, for the trusted-band witness's report
+        // (issue #139 + WS-E.1.3): every pixel-derived field it exports is a
+        // statement about one realm's view, and it must say which. Unused
+        // outside a `consent-injector` build, where the witness does not
+        // exist — the underscore is the honest spelling of that, not a
+        // dropped argument.
+        #[cfg_attr(not(feature = "consent-injector"), allow(unused_variables))] realm: Option<
+            &RealmId,
+        >,
+    ) -> Result<(), Box<dyn Error>> {
         let (w, h) = (self.size.w.max(0) as u32, self.size.h.max(0) as u32);
         let view = scene.compose(w, h);
         composite(
@@ -1224,7 +1314,8 @@ impl HeadlessOutput {
         // did not is the safer of the two asymmetries: it can only over-report
         // composites, never miss one that reached the screen.
         #[cfg(feature = "consent-injector")]
-        self.band_witness.observe(&witnessed_view, &output, w, h);
+        self.band_witness
+            .observe(&witnessed_view, &output, w, h, realm);
         composite(
             &mut self.renderer,
             &mut self.output_framebuffer,
@@ -1278,7 +1369,11 @@ impl crate::lifecycle::RetainedOutput for HeadlessOutput {
     /// become a second place a realm's death is decided (above). The scrub
     /// removes the dead realm's *pixels*, which is all it is for.
     fn scrub_retained_frame(&mut self) -> Result<(), Box<dyn Error>> {
-        self.present(&Scene::new())
+        // No realm: this composites an *empty* scene, which belongs to no
+        // realm at all. Naming the dying realm here would tell the witness
+        // that realm's view is what the output now tracks, which is the
+        // opposite of what a scrub means.
+        self.present(&Scene::new(), None)
     }
 }
 
@@ -1586,7 +1681,7 @@ mod tests {
         .expect("headless state under pixman");
 
         let pixels = client_pixels(SW, SH);
-        state.scene.commit(
+        state.scene_for_test().commit(
             SurfaceContent::from_rgba(pixels.clone(), SW, SH).expect("well-formed content"),
         );
         state.redraw().expect("composite the committed surface");
@@ -1599,7 +1694,7 @@ mod tests {
 
         // The realm dies: the scene loses its surface (what the death
         // funnel does through `ShimServer::connection_closed`)...
-        state.scene.clear_surface();
+        state.scene_for_test().clear_surface();
         assert_eq!(
             state.latest_frame_rgba().expect("readback"),
             painted,
@@ -1673,7 +1768,7 @@ mod tests {
         )
         .expect("headless state under pixman");
         state
-            .scene
+            .scene_for_test()
             .commit(SurfaceContent::from_rgba(from_fd, SW, SH).expect("well-formed content"));
         state.redraw().expect("composite the committed surface");
 
@@ -1682,7 +1777,7 @@ mod tests {
         let retained = state.latest_frame_rgba().expect("readback");
         assert_eq!(
             retained,
-            state.scene.compose(VW, VH),
+            state.bound_scene().compose(VW, VH),
             "retained framebuffer must be the shared Scene::compose output"
         );
 
@@ -1739,6 +1834,97 @@ mod tests {
         assert_eq!(served, expected, "capture must serve the composed view");
     }
 
+    /// **A hidden realm's capture is its own view, and the bound realm's is
+    /// still the retained readback** (WS-E.1.3, issue #209).
+    ///
+    /// This backend serves two sources: the bound realm reads back the
+    /// retained pixman framebuffer — unchanged, which is what keeps the
+    /// P1.3.2/P1.3.6 goldens and the M1.3 fidelity gate byte-exact — and a
+    /// hidden realm composes its own scene at the same view size. The test
+    /// asserts both, *and* that the two sources agree for the bound realm, so
+    /// "two paths, one composition" is checked rather than argued.
+    #[test]
+    fn a_hidden_realms_capture_is_its_own_view_never_the_outputs() {
+        use crate::grants::RealmId;
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+        use crate::session::Presenter;
+
+        const VW: u32 = 96;
+        const VH: u32 = 64;
+        let event_loop: EventLoop<'static, ()> = EventLoop::try_new().expect("calloop event loop");
+        let mut state = HeadlessView::new(
+            (VW as i32, VH as i32).into(),
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+            false,
+        )
+        .expect("headless state under pixman");
+
+        let (bound, hidden) = (RealmId::new("realm-0"), RealmId::new("realm-b"));
+        // Different fixtures: the bound realm fills the view, the hidden one
+        // is letterboxed, so the two compositions cannot coincide.
+        state
+            .scene_mut(&bound)
+            .commit(SurfaceContent::from_rgba(client_pixels(VW, VH), VW, VH).expect("content"));
+        state
+            .scene_mut(&hidden)
+            .commit(SurfaceContent::from_rgba(client_pixels(32, 24), 32, 24).expect("content"));
+        state.bind_output(&bound);
+        state.redraw().expect("composite the bound realm");
+
+        let got_bound = state.view_rgba(&bound).expect("the bound realm has a view");
+        let got_hidden = state
+            .view_rgba(&hidden)
+            .expect("a hidden realm still has a view");
+        let want_bound = state
+            .scenes
+            .scene(&bound)
+            .expect("bound scene")
+            .compose(VW, VH);
+        let want_hidden = state
+            .scenes
+            .scene(&hidden)
+            .expect("hidden scene")
+            .compose(VW, VH);
+        // Diagnosed rather than dumped: two view-sized buffers in an
+        // `assert_eq!` message is a wall of bytes nobody reads, and the fact
+        // that matters is *whose* pixels came back.
+        let whose = |got: &[u8]| match got {
+            g if g == want_bound => "the BOUND realm's",
+            g if g == want_hidden => "the HIDDEN realm's",
+            _ => "neither realm's",
+        };
+
+        // The bound realm's answer is the retained framebuffer, and it is
+        // also exactly `Scene::compose` — the two sources agree.
+        assert!(
+            got_bound == state.latest_frame_rgba().expect("readback"),
+            "the bound realm's capture must be the retained readback"
+        );
+        assert_eq!(
+            whose(&got_bound),
+            "the BOUND realm's",
+            "...which is byte-for-byte the one shared composition"
+        );
+
+        // The hidden realm's answer is its own scene, not the output's.
+        assert_eq!(
+            whose(&got_hidden),
+            "the HIDDEN realm's",
+            "a hidden realm's capture returned {} pixels: this backend must compose that \
+             realm's own scene, never hand back the output's retained frame",
+            whose(&got_hidden)
+        );
+        assert!(
+            want_bound != want_hidden,
+            "the two realms' compositions must differ, or this test proves nothing"
+        );
+
+        // A realm nothing has touched has no view at all, which the
+        // chokepoint turns into `no_surface`.
+        assert!(state.view_rgba(&RealmId::new("realm-z")).is_none());
+    }
+
     /// The P1.3.8 acceptance, cross-backend: the nested backend serves the
     /// **same bare-scene bytes** the headless backend does for an identical
     /// scene (issue #116).
@@ -1746,7 +1932,7 @@ mod tests {
     /// Both are [`Scene::compose`]. Headless retains it in a pixman image and
     /// reads it back; the nested backend composes it on the CPU on demand
     /// ([`crate::backend::winit::capture_pixels`]). This drives *both* real
-    /// capture paths against one shared scene and asserts they are
+    /// capture paths against the same one scene and asserts they are
     /// byte-identical — no winit window, no GL, no display, because pixman is
     /// CPU and `capture_pixels` needs no renderer at all. It is the concrete
     /// form of the transitive equality winit's
@@ -1781,7 +1967,7 @@ mod tests {
         )
         .expect("headless state under pixman");
         state
-            .scene
+            .scene_for_test()
             .commit(SurfaceContent::from_rgba(client_pixels(SW, SH), SW, SH).expect("content"));
         state.redraw().expect("composite the committed surface");
 
@@ -1789,7 +1975,7 @@ mod tests {
         let headless_capture = state.latest_frame_rgba().expect("headless readback");
         // Nested capture: the bare scene composed on the CPU, from the SAME
         // scene object that fed the headless readback above.
-        let nested_capture = capture_pixels(&state.scene, size).expect("a nonzero view");
+        let nested_capture = capture_pixels(state.bound_scene(), size).expect("a nonzero view");
 
         // The P1.3.8 requirement: same scene, same pixels, byte for byte.
         assert_eq!(
@@ -1797,7 +1983,7 @@ mod tests {
             "nested and headless captures must be byte-identical for the same scene"
         );
         // ...and both are exactly the one shared composition.
-        assert_eq!(nested_capture, state.scene.compose(VW, VH));
+        assert_eq!(nested_capture, state.bound_scene().compose(VW, VH));
 
         // Overlay excluded on the nested side too: a prompt on the
         // human-visible composition changes it, but the nested capture is
@@ -1805,7 +1991,8 @@ mod tests {
         // carry a card.
         let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
         consent.show_for_test(prompt_fixture());
-        let human_visible = super::super::compose_human_visible(&state.scene, &mut consent, VW, VH);
+        let human_visible =
+            super::super::compose_human_visible(state.bound_scene(), &mut consent, VW, VH);
         assert_ne!(
             nested_capture, human_visible,
             "the nested capture must exclude the consent overlay"
@@ -1893,7 +2080,7 @@ mod tests {
 
         // A realm that has painted, so the test distinguishes "the overlay is
         // absent" from "nothing was ever drawn".
-        state.scene.commit(
+        state.scene_for_test().commit(
             SurfaceContent::from_rgba(client_pixels(SW, SH), SW, SH).expect("well-formed content"),
         );
         state.redraw().expect("composite the committed surface");
@@ -1967,7 +2154,7 @@ mod tests {
         );
         assert_eq!(
             view,
-            state.scene.compose(VW, VH),
+            state.bound_scene().compose(VW, VH),
             "the capture source must be exactly Scene::compose -- the overlay \
              composites at the output stage, above this"
         );
@@ -2080,7 +2267,7 @@ mod tests {
 
         // A realm that has painted, so "the sprite is absent from the
         // capture" is distinguishable from "nothing was ever drawn".
-        state.scene.commit(
+        state.scene_for_test().commit(
             SurfaceContent::from_rgba(client_pixels(SW, SH), SW, SH).expect("well-formed content"),
         );
         state.redraw().expect("composite the committed surface");
@@ -2160,7 +2347,7 @@ mod tests {
         );
         assert_eq!(
             view,
-            state.scene.compose(VW, VH),
+            state.bound_scene().compose(VW, VH),
             "the capture source must be exactly Scene::compose -- the sprite composites \
              at the output stage, above this"
         );
@@ -2228,7 +2415,7 @@ mod tests {
             false,
         )
         .expect("headless state under pixman");
-        state.scene.commit(
+        state.scene_for_test().commit(
             SurfaceContent::from_rgba(client_pixels(VW, VH), VW, VH).expect("well-formed content"),
         );
         state.redraw().expect("composite");
@@ -2423,7 +2610,7 @@ mod tests {
             };
             let conn = spawned.connection_mut();
             let committed = server
-                .handle_message(msg, &mut state.scene, None, &mut |frame| {
+                .handle_message(msg, state.scene_for_test(), None, &mut |frame| {
                     conn.send_message(frame, None)
                 })
                 .expect("the C shim must not violate the shim protocol");
@@ -2541,7 +2728,7 @@ mod tests {
         )
         .expect("headless state under pixman");
         state
-            .scene
+            .scene_for_test()
             .commit(SurfaceContent::from_rgba(client_pixels(200, 150), 200, 150).expect("content"));
 
         for prompt_up in [false, true] {
@@ -2556,7 +2743,7 @@ mod tests {
             }
             assert_eq!(
                 state.latest_output_rgba().expect("readback"),
-                super::super::compose_human_visible(&state.scene, &mut expected, VW, VH),
+                super::super::compose_human_visible(state.bound_scene(), &mut expected, VW, VH),
                 "retained output must be the shared compose (prompt_up = {prompt_up})"
             );
         }
@@ -2597,7 +2784,7 @@ mod tests {
         .expect("headless state under pixman");
 
         let painted = client_pixels(300, 200);
-        state.scene.commit(
+        state.scene_for_test().commit(
             SurfaceContent::from_rgba(painted.clone(), 300, 200).expect("well-formed content"),
         );
         state.output.consent.show_for_test(prompt_fixture());
@@ -2607,7 +2794,7 @@ mod tests {
 
         // The realm dies: the scene loses its surface (the death funnel), and
         // the funnel scrubs the retained images.
-        state.scene.clear_surface();
+        state.scene_for_test().clear_surface();
         state.output.scrub_retained_frame().expect("scrub");
 
         // The capture source is the empty-scene background, byte for byte...
@@ -2753,7 +2940,12 @@ mod tests {
                     // No dmabuf importer on the headless path (P1.3.5):
                     // pixman has no GPU import, so every dmabuf commit
                     // resolves as the designed shm-fallback event.
-                    match server.handle_message(msg, &mut state.headless.scene, None, &mut send) {
+                    match server.handle_message(
+                        msg,
+                        state.headless.scene_for_test(),
+                        None,
+                        &mut send,
+                    ) {
                         Ok(false) => {}
                         Ok(true) => {
                             // Presentation, headless: the composite
@@ -2795,7 +2987,7 @@ mod tests {
                     if let Some(server) = state.server.take() {
                         server.connection_closed(
                             &crate::grants::RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
-                            &mut state.headless.scene,
+                            state.headless.scene_for_test(),
                             None,
                             &mut state.router,
                         );
@@ -2841,7 +3033,7 @@ mod tests {
         // After shim death the scene composes the deterministic background.
         assert!(state.server.is_none(), "server forgotten on disconnect");
         assert_eq!(
-            state.headless.scene.compose(W, H),
+            state.headless.bound_scene().compose(W, H),
             test_pattern::render(W, H),
             "shim death must drop the surface from the scene"
         );

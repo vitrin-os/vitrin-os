@@ -216,6 +216,7 @@ from harness import (
     ConsentInjector,
     CoreFailed,
     IntegrationTest,
+    capture_dump_path,
     children_of,
     comm_of,
     descendant_named,
@@ -388,7 +389,12 @@ class RealTrustBand(IntegrationTest):
         self.app_bin = str(pathlib.Path(app).resolve())
         self.work = pathlib.Path(tempfile.mkdtemp(prefix="vitrin-band-"))
         self.addCleanup(shutil.rmtree, self.work, True)
+        #: The `--capture-dump` base the core is launched with. Nothing is
+        #: written here: the core writes one frame per realm at
+        #: `PATH.<realm-id>` (WS-E.1.3), so readers use `self.dump_path`.
         self.dump = str(self.work / "internal.rgba")
+        #: `realm-0`'s dump -- the realm this gate's grant names.
+        self.dump_path = str(capture_dump_path(self.dump))
         self.core_log = self.work / "core.log"
         #: Read from the core once the channel is up; never hard-coded, so a
         #: change to `TRUST_BAND_HEIGHT` cannot leave this measuring the wrong
@@ -496,7 +502,7 @@ class RealTrustBand(IntegrationTest):
         stable = 0
         last: bytes | None = None
         while time.monotonic() < deadline:
-            frame = _read_dump(self.dump, REALM_WH)
+            frame = _read_dump(self.dump_path, REALM_WH)
             band_ok = (
                 _off_colour_rgba(_rgba_rows(frame, REALM_WH[0], 0, self.band_h), want) == 0
             )

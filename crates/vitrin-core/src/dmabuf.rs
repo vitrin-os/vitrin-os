@@ -144,6 +144,7 @@
 //! Only the *tests* need a buffer allocator (GBM), which is why the
 //! `gpu-tests` cargo feature exists; see `Cargo.toml`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -156,6 +157,7 @@ use smithay::utils::{Physical, Rectangle, Size, Transform};
 use vitrin_protocol::generated::vitrin_view::Format;
 
 use crate::consent::{TrustedIndicator, TRUST_BAND_HEIGHT};
+use crate::grants::RealmId;
 use crate::scene::{layout, BYTES_PER_PIXEL, LETTERBOX_RGBA};
 
 /// Counter of core-side CPU copies of client pixels — the zero-copy
@@ -256,9 +258,12 @@ pub(crate) enum ImportDenied {
 
 /// The importer seam between the shim protocol server and a GPU renderer.
 ///
-/// Exactly one importer serves a shim connection for its lifetime (it holds
-/// the retained zero-copy buffer between commits); the embedder passes the
-/// same one to every `handle_message`/`connection_closed` call, or `None`
+/// One importer serves one shim connection -- that is, one realm. It is
+/// constructed fresh per dispatch (see [`GlesDmabufImporter`]), but always
+/// over the **same slot**: the embedder builds every
+/// `handle_message`/`connection_closed` importer for a realm over that realm's
+/// own [`RealmGpuContent`] entry, so the retained zero-copy buffer persists
+/// between that realm's commits and no other realm can reach it. `None`
 /// forever on GPU-less paths.
 pub(crate) trait DmabufImporter {
     /// The D3 allowlist check: is `format` (with the implied linear
@@ -344,6 +349,80 @@ pub(crate) struct GpuContent {
     texture: GlesTexture,
     width: u32,
     height: u32,
+}
+
+/// **One retained zero-copy slot per realm** (WS-E.1.3, issue #209) — the
+/// GPU-side twin of [`crate::scene::RealmScenes`], and for the same
+/// confidentiality reason.
+///
+/// # Why this is not one slot
+///
+/// It was one, and that was the defect. A single `Option<GpuContent>` for the
+/// whole session is written by *whichever* realm's shim last imported a
+/// dmabuf, so with `--dmabuf` a **hidden** realm's commit took over the
+/// human-visible window: the frame path presented the one retained texture without
+/// ever asking which realm the output was bound to. That falsifies the
+/// published claim that only the bound realm is on screen, on the one path a
+/// human actually looks at, and it is the same class of bug the scene split
+/// closed — the last committer owning the only thing there is to present.
+///
+/// It also made teardown session-wide. [`crate::session::Presenter::teardown_view`]
+/// names the dying realm and hands out *its* scene, but the importer it lends
+/// held the one slot, so any realm's death cleared whichever realm's retained
+/// content happened to be resident.
+///
+/// # The shape
+///
+/// A slot is reached only by naming a realm ([`Self::slot_mut`], [`Self::of`]).
+/// There is deliberately **no** "the content" accessor: the frame path asks
+/// `backend::winit`'s `zero_copy_source`, which takes the bound realm and can
+/// therefore be read — and tested — as the selection it is.
+///
+/// Generic in `C` for one reason, stated plainly because an unused type
+/// parameter is otherwise a smell: a [`GpuContent`] holds a [`GlesTexture`]
+/// and cannot be minted without a live GL context, and D-019(4) records
+/// headless as the only backend CI can run. The stand-in lets the display-free
+/// tests drive the *real* store and the *real* selection function rather than
+/// a paraphrase of them. Nothing outside `#[cfg(test)]` ever instantiates it
+/// at anything but the default.
+pub(crate) struct RealmGpuContent<C = GpuContent> {
+    /// `Option<C>` rather than a bare `C` because
+    /// [`GlesDmabufImporter::content`] borrows the slot itself: an import
+    /// fills it, [`DmabufImporter::clear`] empties it, and the importer must
+    /// be able to do both through one `&mut`. An empty slot left behind by a
+    /// realm's death is kept rather than removed — dropping a [`GpuContent`]
+    /// outside [`DmabufImporter::clear`] would skip the GPU sync that clear
+    /// performs, and the map is bounded by [`crate::realm::MAX_REALMS`]
+    /// `Option`s either way.
+    slots: BTreeMap<RealmId, Option<C>>,
+}
+
+impl<C> RealmGpuContent<C> {
+    /// No realm, nothing retained.
+    pub fn new() -> Self {
+        Self {
+            slots: BTreeMap::new(),
+        }
+    }
+
+    /// **This realm's** retained-content slot, minted empty on first use —
+    /// the one mutable accessor, and it always names a realm.
+    ///
+    /// What [`GlesDmabufImporter`] is built over, on both of the nested
+    /// backend's paths: the shim dispatch that imports
+    /// (`Presenter::scene_and_importer`, keyed by the realm whose connection
+    /// is being serviced) and the death funnel that clears
+    /// (`Presenter::teardown_view`, keyed by the dying realm). Neither can
+    /// reach a sibling's texture.
+    pub fn slot_mut(&mut self, realm: &RealmId) -> &mut Option<C> {
+        self.slots.entry(realm.clone()).or_default()
+    }
+
+    /// This realm's retained content, if it has imported one and nothing has
+    /// cleared it since.
+    pub fn of(&self, realm: &RealmId) -> Option<&C> {
+        self.slots.get(realm).and_then(|slot| slot.as_ref())
+    }
 }
 
 /// The real importer: wraps the embedder's `GlesRenderer` (the nested

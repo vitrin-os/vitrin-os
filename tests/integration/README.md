@@ -242,7 +242,44 @@ cannot silently drift.
 
   ```bash
   meson setup shim/build shim && meson compile -C shim/build
-  VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" bash tests/integration/run.sh
+  bash tests/integration/run.sh   # picks the shim up on its own; see below
+  ```
+- **A skipped ladder is never silent, and never a pass by accident** (#229).
+  The per-module skip above is deliberate, but it used to be undetectable:
+  `run.sh` never mentioned `VITRIN_C_SHIM_BIN`, so a run without a built shim
+  collected 97 tests, skipped the 25 that make this directory a gate, and
+  exited **0** — indistinguishable, in everything a caller inspects, from a
+  full mock-free pass. A gate that does not *run* proves exactly as much as
+  one that does not *exist*, which is the failure the named-gate lists above
+  already exist to prevent. It was not theoretical: #212's
+  `test_input_switch.py` was authored, "verified" against this script, and had
+  never once executed — two real routing bugs were sitting behind it.
+
+  `run.sh` now: **auto-resolves** `shim/build/vitrin-shim` when the variable is
+  unset (nobody who built the shim should also have to remember the knob —
+  forgetting it *was* the failure mode); **fails** when the variable is set but
+  does not name an executable, because that is a misconfiguration rather than a
+  machine state; **announces the mode** before the first test; and **itemises
+  every skip** after the last one, on success as much as on failure — the
+  failure being guarded against is a success.
+
+  `VITRIN_REQUIRE_REAL_APPS=1` makes a degraded run a hard failure. **CI sets
+  it**, so if the shim build step ever silently stops producing a binary, the
+  `integration` job goes red instead of green-with-no-evidence.
+
+  What is deliberately *not* enforced is `skipped == 0`. Some skips are honest
+  machine states — no GTK dev headers at `meson setup`, no `node` on `PATH` —
+  and `test_real_gtk.py` already draws that line ("a loud SKIP, not a fail —
+  unlike a missing shim, which is a misconfig"). An absent GTK probe cannot be
+  mistaken for a passing GTK gate; an absent shim silently took the whole
+  ladder with it.
+
+  One caller-side trap this cannot fix: `bash run.sh | tail` reports **`tail`'s**
+  exit status, not the suite's, so the habitual "run it and read the end" makes
+  any failure invisible. Redirect and check `$?` instead:
+
+  ```bash
+  bash tests/integration/run.sh > /tmp/integ.log 2>&1; echo "EXIT=$?"
   ```
 - **The named gates must exist.** `run.sh` carries two lists —
   `MILESTONE_GATES` and `PROPERTY_GATES` — and fails before any test runs if

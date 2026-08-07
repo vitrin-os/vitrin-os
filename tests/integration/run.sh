@@ -139,6 +139,65 @@ INJECTORS=vitrin-core/dead-man-injector,vitrin-core/consent-injector,vitrin-core
 echo "==> building workspace with $INJECTORS"
 cargo build --workspace --features "$INJECTORS"
 
+# ---- The C shim: resolve it, and never let its absence be SILENT ---------
+#
+# Every module in the real-app ladder skips itself when `VITRIN_C_SHIM_BIN` is
+# unset. That skip is deliberate and stays (README: it is the local-dev path
+# for anyone without a C toolchain). What was NOT deliberate is that it was
+# invisible: this script never mentioned the variable, so a run without a built
+# shim collected 97 tests, skipped the 25 that make this a gate, and exited
+# **0** -- byte-identical, in exit status, to a full mock-free pass.
+#
+# That is the same defect as the missing-gate check above, one step later: a
+# gate that does not RUN proves exactly as much as a gate that does not EXIST.
+# It is not hypothetical either. A brand-new mock-free gate (#212's
+# `test_input_switch.py`) was authored, "verified" against this script, and had
+# in fact never executed once; two real routing bugs were sitting behind it.
+# Issue #229.
+#
+# Three changes, in increasing order of how much they can save you:
+#
+#  1. AUTO-RESOLVE. If the shim has been built where `meson setup shim/build`
+#     puts it, use it. Nobody who has done the work should have to also
+#     remember the variable, and forgetting it was the whole failure mode.
+#  2. VALIDATE. Set-but-wrong is a misconfiguration, not a machine state, so it
+#     fails here rather than 25 times inside setUp.
+#  3. ANNOUNCE. The mode is printed before the first test and the skips are
+#     itemised after the last one, so "what did this run actually prove" is
+#     answerable from the log alone rather than by counting.
+#
+# `VITRIN_REQUIRE_REAL_APPS=1` turns a degraded run into a failure. CI sets it:
+# CI builds the shim itself, so a skipped ladder there means that build step
+# broke, and the one thing this suite must never do is stay green while the
+# evidence quietly stops being collected.
+DEFAULT_SHIM="shim/build/vitrin-shim"
+if [ -z "${VITRIN_C_SHIM_BIN:-}" ] && [ -x "$REPO/$DEFAULT_SHIM" ]; then
+  export VITRIN_C_SHIM_BIN="$REPO/$DEFAULT_SHIM"
+  echo "==> C shim auto-resolved: $DEFAULT_SHIM (export VITRIN_C_SHIM_BIN to override)"
+fi
+
+if [ -n "${VITRIN_C_SHIM_BIN:-}" ] && [ ! -x "${VITRIN_C_SHIM_BIN}" ]; then
+  echo "ERROR: VITRIN_C_SHIM_BIN=${VITRIN_C_SHIM_BIN} is not an executable file." >&2
+  echo "       It is SET, so a real-app run was requested; refusing to fall back to" >&2
+  echo "       a component-only run that would look identical in the exit code." >&2
+  echo "       Build it:  meson setup shim/build shim && meson compile -C shim/build" >&2
+  exit 1
+fi
+
+if [ -n "${VITRIN_C_SHIM_BIN:-}" ]; then
+  echo "==> mode: FULL -- the real-app ladder will run against $VITRIN_C_SHIM_BIN"
+elif [ "${VITRIN_REQUIRE_REAL_APPS:-0}" = "1" ]; then
+  echo "ERROR: VITRIN_REQUIRE_REAL_APPS=1, but no C shim was found or named." >&2
+  echo "       The real-app ladder would skip and this suite would exit 0 having" >&2
+  echo "       proved none of what it is cited for. Refusing to report that as a pass." >&2
+  echo "       Build it:  meson setup shim/build shim && meson compile -C shim/build" >&2
+  exit 1
+else
+  echo "==> mode: COMPONENT-ONLY -- no C shim, so the real-app ladder will SKIP."
+  echo "    This run CANNOT be cited as mock-free evidence for any milestone."
+  echo "    For the full suite:  meson setup shim/build shim && meson compile -C shim/build"
+fi
+
 # `python3` on the runner is 3.12, clearing the SDK's >= 3.11 floor (D8).
 PY="${PYTHON:-python3}"
 "$PY" - <<'EOF'
@@ -152,5 +211,55 @@ echo "==> running headless integration suite"
 
 # `-v` because a CI log that says only "6 tests passed" cannot tell you
 # *which* acceptance criterion regressed when one later fails.
+#
+# Deliberately NOT `exec`. The census below has to read what actually ran, and
+# `exec` replaces this shell with Python -- which is precisely why a skipped
+# ladder could never be noticed from here before. Losing one process is a
+# trivial price for the suite being able to describe its own coverage.
+LOG="$(mktemp -t vitrin-integration-XXXXXX.log)"
+trap 'rm -f "$LOG"' EXIT
+
+set +e
 PYTHONPATH="$REPO/sdk/python/src" VITRIN_REPO="$REPO" \
-  exec "$PY" -m unittest discover -s tests/integration -p 'test_*.py' -v
+  "$PY" -m unittest discover -s tests/integration -p 'test_*.py' -v 2>&1 | tee "$LOG"
+status=${PIPESTATUS[0]}
+set -e
+
+# ---- The census: what this run did NOT prove ------------------------------
+#
+# Printed unconditionally, including on success, because the failure mode this
+# guards against IS a success. Skips are itemised rather than counted: "25
+# skipped" invites the reader to assume they know which 25, and the two that
+# matter are never the two they picture.
+#
+# Note what this does NOT do: fail on any skip. Some skips are honest machine
+# states rather than misconfigurations -- no GTK dev headers at `meson setup`,
+# no `node` on PATH -- and `test_real_gtk.py` already draws that line in as
+# many words ("a loud SKIP, not a fail -- unlike a missing shim, which is a
+# misconfig"). Turning those into failures would make the suite unrunnable on
+# ordinary developer machines, which buys nothing: an absent GTK probe cannot
+# be mistaken for a passing GTK gate, whereas an absent shim silently took the
+# whole ladder with it.
+skipped=$(grep -c '\.\.\. skipped' "$LOG" || true)
+if [ "$skipped" -ne 0 ]; then
+  echo ""
+  echo "==> $skipped test(s) SKIPPED. This run did not exercise:"
+  grep '\.\.\. skipped' "$LOG" | sed 's/^/      /'
+fi
+
+# The one skip class that is always a misconfiguration, checked even though the
+# gate above should have made it unreachable: a guard worth having is worth
+# having twice when the thing it protects is "did we actually collect the
+# evidence we are about to claim".
+shim_skips=$(grep -c 'VITRIN_C_SHIM_BIN is unset' "$LOG" || true)
+if [ "$shim_skips" -ne 0 ] && [ "${VITRIN_REQUIRE_REAL_APPS:-0}" = "1" ]; then
+  echo "" >&2
+  echo "ERROR: $shim_skips test(s) skipped for want of VITRIN_C_SHIM_BIN under" >&2
+  echo "       VITRIN_REQUIRE_REAL_APPS=1. The real-app ladder did not run." >&2
+  exit 1
+fi
+
+if [ "$status" -eq 0 ] && [ "$skipped" -eq 0 ]; then
+  echo "==> full suite: no skips, every named gate ran."
+fi
+exit "$status"

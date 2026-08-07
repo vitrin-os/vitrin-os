@@ -765,6 +765,17 @@ jobs:
         # available here".
         env:
           VITRIN_C_SHIM_BIN: ${{ runner.temp }}/shim-build/vitrin-shim
+          # ...and this makes the line above load-bearing rather than hopeful.
+          # Setting VITRIN_C_SHIM_BIN only means the ladder CAN run; it does not
+          # mean it DID. If the "Build the C shim" step above ever produces
+          # nothing at that path, every real-app module skips itself and this
+          # job stays green having collected none of the evidence the
+          # milestones are cited on -- 97 tests, 25 skipped, exit 0, identical
+          # to a full pass in everything CI looks at. That is issue #229, and
+          # it already cost one brand-new gate (#212's test_input_switch.py)
+          # its entire first life: authored, "verified", never once executed.
+          # With this set, run.sh refuses to report a skipped ladder as a pass.
+          VITRIN_REQUIRE_REAL_APPS: 1
           # The GTK rung (test_real_gtk.py) runs here: shim/ci/install-deps.sh
           # installs libgtk-3-dev, so the shim build above produced
           # gtk-entry-probe beside vitrin-shim, and the gate resolves it as a

@@ -135,6 +135,13 @@ Input is origin-tagged at the core: the router knows which events came from
 a human device and which came from an agent's actuation call, and the human
 wins because the code says so, not because it arrived first.
 
+**Preemption is per realm**, and if you run several that matters: your hand on
+the keyboard suspends agents acting on the realm *you* are in, not agents
+working in the other fifteen. The dead-man switch below is deliberately the
+opposite — it is session-wide, because an off-switch scoped to whatever you
+happen to be looking at is not an off-switch. The narrowing of `preempted` is
+published as a limit ([limits](limits.md)).
+
 ## The dead-man switch
 
 Hold Escape for one second. Every live grant is revoked.

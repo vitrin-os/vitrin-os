@@ -85,7 +85,8 @@
 //!
 //! A tap's buffered press is handed back to the embedder by
 //! [`DeadManSwitch::take_replay`] and routed through
-//! [`InputRouter::route`](crate::input::InputRouter::route) again, exactly
+//! [`InputRouter::route_physical`](crate::input::InputRouter::route_physical)
+//! again, exactly
 //! like a fresh intake event. Two consequences worth stating:
 //!
 //! - **B2 is intact.** The replayed event is the *original* [`SeatInput`]
@@ -514,7 +515,8 @@ impl std::fmt::Display for HoldError {
 ///
 /// A value rather than a direct call into the grant table, for the same
 /// reason [`crate::consent::grab::Decision`] is one: the hook runs inside
-/// [`InputRouter::route`](crate::input::InputRouter::route) and the router
+/// [`InputRouter::route_physical`](crate::input::InputRouter::route_physical)
+/// and the router
 /// holds no authority state and must never grow any
 /// ([`crate::input`]'s module docs). The embedder drains this and applies it
 /// where the table actually lives.
@@ -556,8 +558,7 @@ pub(crate) struct DeadManEffect {
 /// that keeps the chord from reaching the confined app.
 ///
 /// Shared between the router's hook and the embedder by `Rc<RefCell<..>>` —
-/// the shape [`crate::input::PresenceHook`] established and
-/// [`crate::consent::grab::ConsentGrab`] followed.
+/// the shape [`crate::consent::grab::ConsentGrab`] also follows.
 ///
 /// **Field ownership is the safety invariant** (module docs, tension 1), and
 /// it is a *read* invariant, which is the half that matters: the hold state
@@ -1048,10 +1049,9 @@ pub(crate) fn apply(
 pub(crate) struct DeadManHook<H: PreemptionHook> {
     switch: Rc<RefCell<DeadManSwitch>>,
     /// The dispatch turn's instant, shared with the embedder. The hook trait
-    /// carries no clock by design (the router never reads one), so the
-    /// embedder advances this cell — the arrangement
-    /// [`crate::input::PresenceHook`] and
-    /// [`crate::consent::grab::ConsentGate`] both use.
+    /// carries no clock by design, so the embedder advances this cell — the
+    /// arrangement [`crate::consent::grab::ConsentGate`] and the router's own
+    /// presence record both use.
     now: Rc<Cell<Instant>>,
     inner: H,
 }
@@ -1063,6 +1063,12 @@ impl<H: PreemptionHook> DeadManHook<H> {
 }
 
 impl<H: PreemptionHook> PreemptionHook for DeadManHook<H> {
+    /// The human's off-switch is **session-wide by construction** (WS-E.1.6):
+    /// no hook is told which realm an event was addressed to
+    /// ([`crate::input::PreemptionHook`]), so a chord held while realm B is
+    /// bound cannot do anything but revoke every grant, including grants over
+    /// realm A. The arming and the hold tracking are here, in `observe`, which
+    /// is why the realm has to be absent *here* and not merely from `gate`.
     fn observe(&mut self, input: &SeatInput) {
         self.switch
             .borrow_mut()
@@ -2048,6 +2054,113 @@ mod tests {
         .is_empty());
     }
 
+    /// **The off-switch is session-wide, and the per-realm router did not
+    /// scope it** (WS-E.1.6, issue #212, acceptance criterion 4, second half).
+    ///
+    /// A chord held while realm B is bound revokes grants over realm A. Both
+    /// halves are driven for real: the chord goes through the **router**, on
+    /// the physical path, with the human's attention bound to a realm that no
+    /// grant here names — so a watcher that had learned about realms would
+    /// have every opportunity to miss it — and the revocation goes through the
+    /// same [`apply`] `Runtime::apply_dead_man` calls.
+    ///
+    /// **What is structural here, stated exactly, because the first draft of
+    /// this comment overclaimed it.** [`PreemptionHook::gate`] is never told
+    /// which realm an event was addressed to, so a realm-scoped *gate* — a
+    /// consent grab that seized input for one realm and not another — is
+    /// inexpressible. The **off-switch is not in the gate**: the chord is
+    /// armed and tracked in [`DeadManHook::observe`], which *is* handed the
+    /// realm either, and issue #212's review is why: for one review cycle it
+    /// *was* handed one (per-realm presence was a hook then), which made the
+    /// off-switch's session-wide scope a **convention** — a single early
+    /// `return` inside this very method away from being false — while three
+    /// doc comments called it inexpressible. Presence moved above the stack
+    /// into [`crate::input::InputRouter`] itself, the realm left the trait,
+    /// and the claim is structural again. This test drives the chord through
+    /// the router anyway, with the human's attention bound to a realm no grant
+    /// here names, because a structural argument is worth exactly as much as
+    /// the wiring underneath it.
+    #[test]
+    fn a_chord_held_in_one_realm_revokes_grants_over_every_realm() {
+        use crate::input::{InputRouter, NoopHook};
+
+        let now = Instant::now();
+        let who = identity(PROMPT_IDENTITY);
+        let mut table = GrantTable::new();
+        // Two grants, over two realms, for the same principal.
+        let in_a = grant_for(&mut table, &who, now);
+        let in_b = table
+            .insert(
+                GrantSpec {
+                    principal_id: who.clone(),
+                    realm_id: RealmId::new("realm-b"),
+                    resource_ref: ResourceRef::WholeRealm,
+                    verbs: Verb::OBSERVE,
+                    expiry: None,
+                    max_event_rate: NonZeroU32::new(20).unwrap(),
+                    persistence: PersistenceRung::WhileRunning,
+                    issuer: Issuer::HumanConsent,
+                },
+                now,
+            )
+            .expect("a valid row");
+        let mut registry =
+            PetitionRegistry::new(ConsentPolicy::Interactive, PetitionConfig::default());
+        let mut scratch = Scratch::new();
+
+        // The router, with the watcher stacked exactly as the nested backend
+        // stacks it, and the human's attention on **realm-b**.
+        let switch = Rc::new(RefCell::new(switch()));
+        let clock = Rc::new(Cell::new(now));
+        let mut router = InputRouter::detached(DeadManHook::new(
+            Rc::clone(&switch),
+            Rc::clone(&clock),
+            NoopHook,
+        ));
+        assert!(router.bind_to(&RealmId::new("realm-b")).is_none());
+
+        // The chord goes down, through the physical path, into realm-b.
+        let view = (64, 48);
+        assert!(
+            router
+                .route_physical(crate::input::tests::chord_press(), view, Some(view))
+                .is_none(),
+            "the gate withholds the chord's press from the app, as it always has"
+        );
+        let held = crate::deadman::DEFAULT_HOLD;
+        clock.set(now + held);
+        switch.borrow_mut().fire_if_due(now + held);
+        let trigger = switch
+            .borrow_mut()
+            .take_trigger()
+            .expect("a completed hold must fire whatever realm is bound");
+
+        // ...and it revokes both realms' grants, through the same function
+        // `Runtime::apply_dead_man` calls.
+        let effect = apply(
+            &trigger,
+            &mut table,
+            &mut registry,
+            &mut scratch.recorder,
+            now + held,
+        );
+        assert_eq!(
+            effect.revoked.len(),
+            2,
+            "the off-switch must revoke every grant in the session, not only those over the \
+             realm the human happened to be looking at"
+        );
+        for (row, realm) in [(in_a, "realm-0"), (in_b, "realm-b")] {
+            assert!(
+                matches!(
+                    table.check_use_grant(row, &who, Verb::OBSERVE, now + held),
+                    Err(crate::grants::RefusalReason::Revoked)
+                ),
+                "the grant over {realm} must be revoked"
+            );
+        }
+    }
+
     #[test]
     fn the_next_use_through_the_real_chokepoint_is_refused_revoked() {
         // The latency criterion, bounded rather than timed. "Revocation
@@ -2062,7 +2175,6 @@ mod tests {
         // the table query underneath it.
         use crate::capture::RealmViewFrame;
         use crate::enforcement::{Chokepoint, UseEnv, UseKind, UseOutcome, UseRequest};
-        use crate::input::PhysicalPresence;
 
         const W: u32 = 32;
         const H: u32 = 24;
@@ -2082,7 +2194,10 @@ mod tests {
             width: W,
             height: H,
         };
-        let presence = PhysicalPresence::new();
+        let presence = crate::input::PhysicalPresenceMap::new();
+        // The realm the grant row names, and so the realm an admitted
+        // actuation is addressed to (WS-E.1.6).
+        let grant_realm = crate::grants::RealmId::new("realm-0");
         let mut chokepoint = Chokepoint::new();
 
         let attempt = |chokepoint: &mut Chokepoint,
@@ -2103,14 +2218,13 @@ mod tests {
                     UseEnv {
                         realm_view: Some(&frame),
                         presence: &presence,
-                        // The seat serves this grant's realm: the
-                        // cross-realm guard is not this test's subject and
-                        // must not silently supply its refusals.
-                        seat_reaches_grant_realm: true,
-                        actuations: &mut |_input| {},
+                        // No human anywhere: preemption is not this test's
+                        // subject and must not silently supply its refusals.
+                        physical_realm: None,
+                        actuations: &mut |_realm, _input| {},
+                        grant_realm: Some(&grant_realm),
                         // No layout use here; the sink must still exist,
                         // and a layout act reaching it would be the bug.
-                        grant_realm: None,
                         layout: &mut |act| panic!("no layout act expected: {act:?}"),
                     },
                     now,

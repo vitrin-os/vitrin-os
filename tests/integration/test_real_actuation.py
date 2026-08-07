@@ -5,9 +5,10 @@ through the real core, with an effect the agent confirms by its own observe().
 `test_real_capture_fidelity.py` (P1.8.5) proved the agent *observes* a real app
 through the real chokepoint. This is the actuation half: every seat event
 originates from `grant.pointer`/`grant.text` through the real enforcement
-chokepoint (`session.rs` `route_seat`), the input router, and the shim's real
-`wl_seat` — no `mock_core --input`, no mock shim — and the real app's response
-is asserted through the agent's *own* capture, not an out-of-band core report.
+chokepoint (`session.rs` `route_seat`), the input router — addressed to the
+realm the **grant** names since WS-E.1.6/#212 — and the shim's real `wl_seat`
+— no `mock_core --input`, no mock shim — and the real app's response is
+asserted through the agent's *own* capture, not an out-of-band core report.
 It closes the gap `test_actuation.py` leaves open: that suite asserts only the
 recorder's `use_decision` parameters against the mock; the D10 click-on-surface
 case was deferred to the (broken) #43 demo.
@@ -114,14 +115,6 @@ def _require_shim(test: IntegrationTest) -> pathlib.Path:
             "run was requested; refusing to skip a requested gate (CI misconfig)."
         )
     return shim_bin
-
-
-#: How long the cross-realm gate waits for an app to report a click that must
-#: never arrive. Generous by two orders of magnitude on purpose — a delivered
-#: click reaches its app in milliseconds — and the test *measures* a real
-#: delivery in the same run and fails if it took longer than this, so the
-#: number cannot quietly stop being evidence.
-_NO_HIT_WINDOW_S = 3.0
 
 
 def _hits(log: pathlib.Path) -> list[str]:
@@ -328,46 +321,43 @@ class RealActuationPointer(IntegrationTest):
 
 
 class RealActuationCrossRealm(IntegrationTest):
-    """WS-E.1.2 (#208) review, HIGH 1: a grant naming realm A cannot actuate
-    into realm B's app — proved by **the app's own receipt**, not by the core
-    agreeing with itself.
+    """WS-E.1.6 (#212): **a grant naming realm B actuates into realm B's app,
+    while realm A is the one on screen** — proved by each app's own receipt,
+    not by the core agreeing with itself.
 
-    Two realms, each a real `click-target` under the real C shim. The session
-    has one input router and one delivery target (`session::seat_target`, the
-    first still-serving realm in id order — `realm-0` here, since `realm-0` <
-    `second`), so an actuation admitted under a grant over `second` would be
-    delivered into `realm-0`'s app: an agent driving an app it holds no
-    authority over. The core refuses it instead (`internal`, the IDL's
-    "server-side failure during this use … delivery"), and WS-E.1.6 (#212)
-    replaces the refusal with per-realm routing.
+    # What this test used to assert, and why it is inverted
 
-    **The evidence is `click-target`'s own `HIT sx=… sy=…` line**, which it
-    prints when a press lands inside its target — the app saying it was
-    clicked, on the app's own stdout, inherited by the core and captured
-    here. Both clicks use the *same* coordinates, in this order:
+    WS-E.1.2 raised `MAX_REALMS` above 1 while the session still had one input
+    router and one delivery target, so an actuation admitted under a grant
+    naming any *other* realm would have been delivered into a sibling's app.
+    The stopgap refused it `internal`, and this class asserted the refusal —
+    that exactly one `HIT` line appeared, and that the cross-realm click
+    reached nobody.
 
-    1. under the grant over `second` (not the seat's realm) → must refuse,
-    2. under the grant over `realm-0` (the seat's realm) → must land.
+    #212 replaced the refusal with real per-realm routing, so the property is
+    now the opposite: **both** clicks land, each in the realm its own grant
+    names. Two realms, two real `click-target`s under two real C shims, one
+    click through each grant, and:
 
-    So `HIT` appearing exactly **once** is the whole claim: the second click
-    proves the coordinates really are inside a target and that the guard did
-    not simply break actuation, and the first therefore delivered nothing.
-    A guard-less core prints it twice.
+    1. each app reports its own `HIT` (two lines, not one),
+    2. the flight recorder's `seat_delivered` names **both** realms — which is
+       what says the two clicks went to two different apps rather than one app
+       being clicked twice,
+    3. and each agent's own `observe()` of its own realm shows that realm's
+       surface flipped to the hit colour, which is the app-side, agent-visible
+       half that no core-internal record could stand in for.
 
-    The line carries no realm id, which is why the count carries the proof
-    rather than the identity. Nothing here asserts *which* app is on screen:
-    the output is bound to one realm (WS-E.1.3, the first to attach), and
-    this test deliberately does not depend on that binding -- it is about
-    delivery, and delivery follows `seat_target`, not the output.
+    The realm on screen is `realm-0` throughout (nothing here moves the
+    binding), so the `second` grant's click is the one that could only work if
+    delivery follows the **grant** rather than the output.
     """
 
     TARGET = RealActuationPointer.TARGET
+    HIT = RealActuationPointer.HIT
     MIN_TARGET_PIXELS = RealActuationPointer.MIN_TARGET_PIXELS
 
-    #: The extra realm. Ordered *after* `realm-0`, so the seat target is
-    #: `realm-0` and a grant over this one is the cross-realm case. When
-    #: #212 lands, routing stops being id-ordered and this setup is what has
-    #: to be revisited — the claim above does not.
+    #: The extra realm. Ordered *after* `realm-0`, so `realm-0` is the realm
+    #: the output binds to and a grant over this one is the hidden-realm case.
     OTHER = "second"
 
     def setUp(self) -> None:
@@ -390,12 +380,7 @@ class RealActuationCrossRealm(IntegrationTest):
         )
 
     def _two_live_apps(self, core):
-        """Both realms really are running an app, before anything is clicked.
-
-        Load-bearing for the negative half: a refusal is only evidence if
-        there was an app on the other side that a delivered click would have
-        reached.
-        """
+        """Both realms really are running an app, before anything is clicked."""
         deadline = time.monotonic() + 20.0
         shims: list[int] = []
         while time.monotonic() < deadline:
@@ -440,119 +425,141 @@ class RealActuationCrossRealm(IntegrationTest):
             time.sleep(0.1)
         self.fail("no click-target ever painted a locatable target; there is nothing to click")
 
-    def test_a_grant_over_one_realm_cannot_click_into_a_siblings_app(self):
+    def _await_flip(self, grant, timeout=15.0):
+        """Observe until this realm's surface is dominated by the hit colour."""
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                frame = grant.observe()
+            except errors.NoSurface:
+                time.sleep(0.05)
+                continue
+            except errors.RateLimited as rl:
+                time.sleep(max(rl.retry_after_ms / 1000.0, 0.05))
+                continue
+            colour, share = dominant_colour(frame)
+            last = (colour, share)
+            if colour == self.HIT and share >= 90:
+                return share
+            time.sleep(0.1)
+        return None
+
+    def _dominant(self, grant, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                last = dominant_colour(grant.observe())
+                return last
+            except errors.NoSurface:
+                time.sleep(0.05)
+            except errors.RateLimited as rl:
+                time.sleep(max(rl.retry_after_ms / 1000.0, 0.05))
+        self.fail("could not observe this realm at all")
+
+    def test_a_grant_over_a_hidden_realm_clicks_into_its_own_realms_app(self):
         core = self._two_realm_core()
         self._two_live_apps(core)
 
         conn = core.connect()
-        # The seat's realm and the other one. Both grants are whole-realm and
-        # identical in every way except the realm they name — which is the
+        # The realm on screen and the hidden one. Both grants are whole-realm
+        # and identical in every way except the realm they name — which is the
         # only variable this test has.
-        served = whole_realm_grant(conn, realm="realm-0")
-        unserved = whole_realm_grant(conn, realm=self.OTHER)
+        shown = whole_realm_grant(conn, realm="realm-0")
+        hidden = whole_realm_grant(conn, realm=self.OTHER)
 
-        cx, cy = self._locate_target(served)
+        # Both apps are the same program at the same view size, so one
+        # location serves both.
+        cx, cy = self._locate_target(shown)
 
-        # No app has been clicked yet, so no app has latched a HIT. That is
-        # what makes step (1)'s silence readable: the FIRST hit line to
-        # appear names whichever click reached an app.
+        # No app has been clicked yet.
         log = self.work / "core.log"
         self.assertEqual(_hits(log), [])
 
-        # (1) The cross-realm click. `click()` sends move + press + release
-        # and then syncs, so all three are on the wire before the barrier
-        # raises the refusal they were coalesced into — the whole click was
-        # refused, not merely its first event.
-        with self.assertRaises(errors.OperationFailed):
-            unserved.pointer.click(cx, cy)
-        # Nothing queued behind it: the connection is still serving, which is
-        # what "recoverable" means.
-        conn.sync(unserved)
+        # (1) THE CLICK THIS ISSUE EXISTS FOR: into the realm that is **not**
+        # on screen. Before #212 this was refused `internal` and reached
+        # nobody.
+        hidden.pointer.click(cx, cy)
+        conn.sync(hidden)
 
-        # **The app's receipt, read live.** `click-target` prints and
-        # `fflush`es `HIT` the moment a press lands inside its target, so if
-        # this actuation were delivered anywhere, an app would say so within
-        # milliseconds. Step (2) below measures how fast that actually is on
-        # this machine, and asserts it — so this window is not a guess about
-        # timing, it is bounded by a measurement taken in the same run.
-        time.sleep(_NO_HIT_WINDOW_S)
-        self.assertEqual(
-            _hits(log),
-            [],
-            "an app reported being clicked after an actuation whose grant names a realm the "
-            "seat does not serve: the click was delivered into an app the grant confers no "
-            "authority over",
-        )
-
-        # (2) The same click under the grant over the realm the seat serves.
-        # It lands — which is what makes (1)'s silence mean something rather
-        # than meaning the guard broke actuation, and which times the window
-        # above.
-        #
-        # The pause first refills `served`'s token bucket (20/s, one second
-        # of burst) after the observe loop, so a click that must land is
-        # never refused `rate_limited` for reasons this test is not about.
-        time.sleep(1.2)
-        started = time.monotonic()
-        served.pointer.click(cx, cy)
-        conn.sync(served)
-        deadline = started + 15.0
-        landed = None
-        while time.monotonic() < deadline:
-            if _hits(log):
-                landed = time.monotonic() - started
-                break
-            time.sleep(0.02)
+        flipped = self._await_flip(hidden)
         self.assertIsNotNone(
-            landed,
-            "the click under the grant over the seat's own realm never reached an app: the "
-            "guard has broken actuation rather than confined it",
+            flipped,
+            "the hidden realm's app never flipped to the hit colour: an actuation under a "
+            "grant over a realm the output is not showing must still reach that realm's "
+            "app, which is the whole of WS-E.1.6",
         )
-        self.assertLess(
-            landed,
-            _NO_HIT_WINDOW_S,
-            f"a delivered click took {landed:.2f}s to reach its app, which is longer than the "
-            f"{_NO_HIT_WINDOW_S}s window step (1) waited before concluding nothing was "
-            "delivered — that window is now too short to be evidence",
+
+        # ...and the realm on screen was NOT clicked. This is the half a core
+        # that simply delivered everything to the output's realm would fail.
+        colour, _share = self._dominant(shown)
+        self.assertNotEqual(
+            colour,
+            self.HIT,
+            "the realm on screen flipped when a grant over a DIFFERENT realm clicked: the "
+            "actuation followed the output instead of its grant, which is an agent driving "
+            "an app it holds no authority over",
+        )
+
+        # (2) The same click under the grant over the realm on screen also
+        # lands — so (1) is not "routing is broken in a way that happens to
+        # favour the hidden realm".
+        time.sleep(1.2)  # refill the 20/s bucket after the observe loop
+        shown.pointer.click(cx, cy)
+        conn.sync(shown)
+        self.assertIsNotNone(
+            self._await_flip(shown),
+            "the click under the grant over the realm on screen never landed",
         )
 
         conn.close()
         core.terminate()
         out = core.output()
 
+        # (3) Each app's own receipt: two HIT lines, one per app.
         hits = [ln for ln in out.splitlines() if ln.startswith("HIT ")]
         self.assertEqual(
             len(hits),
-            1,
-            "exactly one click-target may report a HIT: the one clicked through the grant "
-            f"over the realm the seat serves. Got {hits}.",
+            2,
+            f"each click-target must report exactly one HIT of its own. Got {hits}.",
         )
 
-        # The journal's side of the same fact, and the reason it can state it
-        # at all: `seat_delivered` now names the realm that received the
-        # event (the second review's MEDIUM 4). Every delivery in this run
-        # went to the seat's realm.
+        # (4) The journal's side, and the one that names realms: deliveries
+        # went to BOTH realms. A core delivering everything to one target
+        # would show one realm here however many HITs appeared.
         delivered = [e for e in core.entries() if e["kind"] == "seat_delivered"]
-        self.assertTrue(delivered, f"the admitted click must be journalled; kinds={core.kinds()}")
+        self.assertTrue(delivered, f"the clicks must be journalled; kinds={core.kinds()}")
         self.assertEqual(
             {e["realm"] for e in delivered},
-            {"realm-0"},
-            f"no delivery may name a realm other than the seat's: {delivered}",
+            {"realm-0", self.OTHER},
+            f"every delivery named one realm: seat delivery did not follow the grant. "
+            f"{delivered}",
         )
+        self.assertEqual(
+            {e["origin"] for e in delivered},
+            {"emulated"},
+            "every one of these is an agent's actuation, and the tag must say so (B2)",
+        )
+
+        # (5) ...and nothing was refused `internal`: the cross-realm guard is
+        # gone, not merely quieter.
         refusals = [
             e
             for e in core.entries()
             if e["kind"] == "use_decision" and e.get("refusal") == "internal"
         ]
-        self.assertTrue(
-            refusals, f"the cross-realm actuation must be recorded as refused; got {refusals}"
+        self.assertEqual(
+            refusals,
+            [],
+            f"an actuation was refused `internal`: WS-E.1.2's cross-realm stopgap is back. "
+            f"{refusals}",
         )
 
         print(
             f"\n[real-actuation] two realms, two click-targets; a grant over {self.OTHER!r} "
-            f"clicked ({cx}, {cy}) and no app reported a HIT within {_NO_HIT_WINDOW_S}s; the "
-            f"same click under the grant over 'realm-0' was received by its app in "
-            f"{landed:.2f}s"
+            f"(not the realm on screen) clicked ({cx}, {cy}) and THAT app flipped, while "
+            f"the realm on screen stayed untouched until its own grant clicked it"
         )
 
 

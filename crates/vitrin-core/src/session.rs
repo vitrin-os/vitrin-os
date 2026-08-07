@@ -108,7 +108,7 @@ use crate::dmabuf::DmabufImporter;
 use crate::enforcement::{LayoutAct, LayoutMode};
 use crate::grants::{GrantTable, RealmId};
 use crate::identity::StaticVerifier;
-use crate::input::{InputRouter, PhysicalPresence, PreemptionHook, SeatInput};
+use crate::input::{InputRouter, PhysicalPresenceMap, PreemptionHook, SeatInput};
 use crate::lifecycle::{
     DeathCause, Hangup, RealmLifecycle, RealmTeardown, RetainedOutput, ShutdownTiming,
 };
@@ -204,8 +204,10 @@ pub(crate) struct RuntimeSeed {
 /// Generic over the preemption hook so the session's input router is the
 /// backend's own router — the one the consent grab and the dead-man watcher
 /// are already stacked into — rather than a second router the two could drift
-/// apart from. One router serves however many realms the session holds; see
-/// [`seat_target`] for which of them a delivery reaches.
+/// apart from. One router serves however many realms the session holds, with
+/// one seat's state per realm inside it; which realm a delivery reaches is
+/// [`seat_target`]'s answer for the *human's* input and the grant's own realm
+/// for an agent's ([`route_seat`]).
 pub(crate) struct Runtime<H: PreemptionHook> {
     /// The capability kernel's long-lived state. Grouped in its own struct so
     /// a [`ServerCtx`] can be built from one disjoint field borrow while the
@@ -236,8 +238,10 @@ pub(crate) struct Runtime<H: PreemptionHook> {
     /// because a shim whose connection nothing services blocks on `configure`
     /// forever. Spawning first and wiring after is a permanent, silent hang.
     pub realms: BTreeMap<RealmId, RealmRuntime>,
-    /// The realm's input router: chokepoint-admitted agent actuations and
-    /// (nested) physical input converge here before delivery to the shim.
+    /// The session's input router: chokepoint-admitted agent actuations and
+    /// (nested) physical input converge here before delivery to the shim,
+    /// each addressed by its own rule and each landing in its own realm's
+    /// seat state (WS-E.1.6).
     pub router: InputRouter<H>,
     /// The core-known shim binary the spawn manager execs (issue #103), from
     /// the seed. [`start_realm`] reads it to build the spawn's [`SpawnPaths`];
@@ -283,9 +287,20 @@ pub(crate) struct Kernel {
     pub grants: GrantTable,
     pub realms: RealmRegistry,
     pub recorder: Recorder,
-    /// Physical-input presence, fed at the router's hook point; the
-    /// chokepoint's `preempted` judgement reads it.
-    pub presence: PhysicalPresence,
+    /// Physical-input presence **per realm**, fed at the router's hook point;
+    /// the chokepoint's `preempted` judgement reads it (WS-E.1.6, issue #212 —
+    /// it was one session-wide tracker, which refused an agent in realm B
+    /// because a human was typing in realm A).
+    ///
+    /// **The router's own map, not a second one.** [`Runtime::new`] takes this
+    /// handle out of the router it is handed
+    /// ([`InputRouter::presence`]) rather than minting one, so a kernel that
+    /// judges `preempted` against a map nothing writes is unconstructible. It
+    /// was constructible until issue #212's review, and every shipped
+    /// `vitrind` was in exactly that state: `PresenceHook` was an optional
+    /// member of the hook stack and no backend included it, so `preempted`
+    /// could not fire while the book described it as live behaviour.
+    pub presence: std::rc::Rc<std::cell::RefCell<PhysicalPresenceMap>>,
 }
 
 /// The realm's live shim session: the protocol server, the out-of-band send
@@ -420,8 +435,10 @@ pub(crate) trait Presenter {
     /// the `vitrin_layout_focus` facet, the enforcement chokepoint and
     /// [`apply_layout`]. **Where the human's input goes as a result** is
     /// answered on the same line — [`seat_target`] follows this binding, which
-    /// is D-018(2)'s fifth ordering rule. Where an *agent's* actuation goes
-    /// is still WS-E.1.6's (issue #212).
+    /// is D-018(2)'s fifth ordering rule. Where an *agent's* actuation goes is
+    /// deliberately **not** answered here: since WS-E.1.6 (issue #212) it goes
+    /// to the realm its own grant names, so moving the output moves the human
+    /// and nobody else.
     ///
     /// Two other callers remain and neither is a policy:
     /// [`start_one_realm_in`] at first attach and
@@ -674,6 +691,9 @@ impl<H: PreemptionHook> Runtime<H> {
     /// Build the loop-resident runtime from the seed and the backend's own
     /// input router.
     pub fn new(seed: RuntimeSeed, router: InputRouter<H>) -> Self {
+        // Before the router moves into the struct: the kernel's presence map
+        // *is* the router's, so there is no wiring step a backend can skip.
+        let presence = router.presence();
         let RuntimeSeed {
             listener,
             verifier,
@@ -695,7 +715,7 @@ impl<H: PreemptionHook> Runtime<H> {
                 grants,
                 realms,
                 recorder,
-                presence: PhysicalPresence::new(),
+                presence,
             },
             listener: Some(listener),
             conns: BTreeMap::new(),
@@ -1087,14 +1107,32 @@ fn start_one_realm_in<H: RuntimeHost>(
     //
     // Deliberately the same realm `seat_target` names — realms attach in the
     // registry's id order, and `seat_target` takes the first still-serving
-    // realm in id order — so the realm a human is looking at is the realm an
-    // actuation reaches. They are still independent choices in separate
-    // functions, which is why the chokepoint's step-5d comparison stays
-    // fail-closed rather than being relaxed on the strength of this comment.
+    // realm in id order — so the realm a human is looking at is the realm the
+    // human's own input reaches. (An *agent's* actuation follows its grant's
+    // realm and never this, since WS-E.1.6.)
     {
         let (runtime, view) = host.split();
         if view.focused().is_none() {
             view.bind_output(realm_id);
+            // ...and the ROUTER is told in the same breath, because it keeps
+            // its own record of who holds the human's attention and it is the
+            // only thing that knows which presses that realm is holding.
+            //
+            // Binding the scene alone leaves the two disagreeing: the scene
+            // shows realm-0 and physical input reaches it (`physical_seat_target`
+            // reads the realms and the scenes, not this), while the router still
+            // reads `None`. The first `layout_focus` then finds no debtor —
+            // `InputRouter::bind_to` returns early on `self.bound.replace(..)?`
+            // — and pays no releases, so a key held across the FIRST switch of
+            // a session latches forever in the app being left. That is the
+            // common case, not an edge one: the first switch is the one that
+            // moves you off the realm you started in.
+            let owed = runtime.router.bind_to(realm_id);
+            debug_assert!(
+                owed.is_none(),
+                "the first bind can owe nothing: this branch runs only when the scene has \
+                 no binding, so no realm has held the human's attention yet"
+            );
             tracing::info!(realm = %realm_id, "output bound to the first realm to attach");
         }
         // The bound realm's view has changed under the output; nothing has
@@ -1295,14 +1333,13 @@ fn with_realm_teardown<H: RuntimeHost, T>(
 ///   attach, now also applied when the realm it picked stops existing. A realm
 ///   dying is not a principal exercising authority, so it must not consult
 ///   one.
-/// - It keeps the step-5d stopgap **fail-closed rather than relaxed**. The
-///   chokepoint refuses an actuation whose grant names a realm other than the
-///   one [`seat_target`] serves (`enforcement.rs` step 5d, owned by issue
-///   #212). That refusal is safe precisely because the visible realm and the
-///   seat's target are two independent placeholders that *agree*; picking any
-///   other realm here would make the human watch realm X while every admitted
-///   actuation went to realm Y, which is the one direction a stopgap must
-///   never move.
+/// - It keeps the realm a human **watches** and the realm their own input
+///   **reaches** equal. Those are one question ([`seat_target`] answers both),
+///   so picking any other realm here would make the human watch realm X and
+///   type into realm Y — the split D-018(2)'s fifth ordering rule forbids,
+///   arrived at by a death instead of by a verb. (An *agent's* actuation is
+///   unaffected either way: since WS-E.1.6 it follows its grant's realm, so a
+///   death that moves the output moves nothing of theirs.)
 /// - Unbinding instead — the other narrow option — is a different way of being
 ///   stuck: it composites the deterministic background while a live sibling
 ///   paints, which is the state this function exists to leave. So it is the
@@ -1693,7 +1730,13 @@ fn dispatch_principal<H: RuntimeHost>(
             // the same `Runtime`. Collecting into a local and routing after
             // the borrows end costs one small allocation per actuating
             // message and keeps the borrow structure honest.
-            let mut seat: Vec<SeatInput> = Vec::new();
+            //
+            // **Each event carries its own destination** since WS-E.1.6: the
+            // realm the grant it was admitted under names. A bare
+            // `Vec<SeatInput>` made "which realm" a question the delivery site
+            // had to answer for itself, and there was exactly one answer it
+            // could give — whichever realm the session was showing.
+            let mut seat: Vec<(RealmId, SeatInput)> = Vec::new();
             // Chokepoint-admitted layout acts, collected for exactly the
             // reason `seat` is: applying one needs `&mut` on the presenter
             // and on a realm's outbox, and `ServerCtx` already holds the
@@ -1777,20 +1820,38 @@ fn dispatch_principal<H: RuntimeHost>(
                         height,
                     })
                 };
-                // **The write-side half of the same question** ([`route_seat`]
-                // is where an admitted actuation actually goes). Resolved here
-                // for the same reason the frame is: only the embedder knows
-                // it, and the chokepoint must be handed the *comparison*, not
-                // the machinery. `seat_target` is asked once per dispatch turn
-                // because it is one answer for the whole session — unlike
-                // liveness, which is a question per realm.
-                let seat_target_realm =
+                // **Where the human's own hand currently is** — the realm
+                // physical input follows, which a `layout_focus` holder moves.
+                // The chokepoint consults it for one judgement only:
+                // `preempted` for a *layout* request, the one attention-shaped
+                // use that steals from wherever the human already is rather
+                // than acting on the realm its grant names. Asked once per
+                // dispatch turn because it is one answer for the whole session
+                // — unlike liveness, which is a question per realm.
+                //
+                // Until WS-E.1.6 this was the write-side *comparison* ("does
+                // the session's one seat serve this grant's realm"), and an
+                // actuation that failed it was refused `internal`. Seat
+                // delivery is per realm now, so there is nothing to compare.
+                let physical_realm =
                     seat_target(realms, view.focused()).map(|(realm_id, _)| realm_id);
                 let Some(state) = conns.get_mut(&id) else {
                     return;
                 };
-                let mut actuations = |input: SeatInput| seat.push(input);
+                // The realm is cloned into the batch rather than borrowed: the
+                // batch outlives this borrow of `realms`, and `route_seat`
+                // needs to know each event's destination after the connection
+                // dispatch has finished.
+                let mut actuations =
+                    |realm: &RealmId, input: SeatInput| seat.push((realm.clone(), input));
                 let mut layout = |act: LayoutAct| layout_acts.push(act);
+                // Borrowed for this one message's dispatch and dropped with
+                // `ctx` at the end of the block. Nothing between here and
+                // there routes input — the router's own `borrow_mut` runs in
+                // `route_physical_turn`/`route_seat`, after the connection
+                // dispatch has finished — so this borrow cannot collide with
+                // the tap that writes the map.
+                let presence = kernel.presence.borrow();
                 let mut ctx = ServerCtx {
                     verifier: &kernel.verifier,
                     petitions: &mut kernel.petitions,
@@ -1799,8 +1860,8 @@ fn dispatch_principal<H: RuntimeHost>(
                     now,
                     realm_view: &realm_view,
                     realm_is_live: &realm_is_live,
-                    seat_target_realm,
-                    presence: &kernel.presence,
+                    physical_realm,
+                    presence: &presence,
                     actuations: &mut actuations,
                     layout: &mut layout,
                     recorder: &mut kernel.recorder,
@@ -1833,13 +1894,14 @@ fn dispatch_principal<H: RuntimeHost>(
                 close_principal(host, id, CloseCause::CoreInitiated);
                 return;
             }
-            // Layout first, then input. A `focus` in the same dispatch turn
-            // as an actuation must have moved the binding before
-            // `route_seat` asks `seat_target` where input goes — otherwise
-            // the round in which a shell focuses a realm would still deliver
-            // that round's input to the realm it focused away from, which is
-            // the split the fifth ordering rule forbids, one dispatch turn
-            // wide.
+            // Layout first, then input, and the reason survived WS-E.1.6
+            // in a narrower form. An admitted actuation now carries its own
+            // realm, so this ordering no longer decides where it lands — but
+            // a `focus` in the same dispatch turn still has to move the
+            // binding before anything else runs, because `apply_layout` is
+            // where the realm being left is paid the physical presses it is
+            // holding. Deferring that past the round's deliveries would leave
+            // the drain chasing a binding that had already moved.
             apply_layout(host, layout_acts);
             route_seat(host, seat);
         }
@@ -1856,9 +1918,18 @@ fn dispatch_principal<H: RuntimeHost>(
     }
 }
 
-/// **The realm every seat delivery goes to.** The realm the output is bound
-/// to, when one is bound and still serving; otherwise the first
+/// **The realm the human's own physical input goes to.** The realm the output
+/// is bound to, when one is bound and still serving; otherwise the first
 /// still-serving realm in id order.
+///
+/// # One question, not two, since WS-E.1.6 (issue #212)
+///
+/// This used to be "the realm *every* seat delivery goes to" — the human's and
+/// every agent's alike — because the router held one realm's worth of state
+/// and so exactly one realm could be its target. That is no longer true: the
+/// router keeps a seat per realm and an admitted actuation carries the realm
+/// its grant names ([`route_seat`]). So this function answers the *physical*
+/// half only, which is the half no grant addresses.
 ///
 /// # The binding half is not a placeholder — it is D-018's fifth ordering rule
 ///
@@ -1871,32 +1942,18 @@ fn dispatch_principal<H: RuntimeHost>(
 /// `vitrin_layout_focus`, SCENE AUTHORITY's fifth rule). So the binding is
 /// consulted **first**, and no verb set separates the two halves.
 ///
-/// # The fallback half still is a placeholder
+/// # The fallback half is a default, and now a small one
 ///
 /// With nothing bound — before the first realm attaches, or after the bound
-/// one died with no sibling to take the output — this still answers "the
-/// first still-serving realm in id order", and that is
-/// WS-E.1.6's to replace along with the rest of the routing model.
-/// Addressing seat events to a realm is two questions no delivery site is
-/// allowed to answer on its own — which realm a grant's actuation targets,
-/// and which realm physical input follows — and both are WS-E.1.6's,
-/// alongside the per-realm [`PhysicalPresence`] the preemption judgement
-/// reads.
+/// one died with no sibling to take the output — this answers "the first
+/// still-serving realm in id order". A human types into whatever that names,
+/// and mis-aiming it is a **usability** bug: no authority rides on it, because
+/// physical input is authorized by nothing and addressed by attention alone.
+/// The bug it used to be able to cause — an *agent's* authorized keystroke
+/// landing in a realm its grant does not name — is structurally gone, because
+/// the agent path no longer consults this function at all.
 ///
-/// The scene is no longer shared, so "there is only one place input could
-/// go" is no longer the reason this survives. What survives instead is
-/// narrower and does not depend on the rendering model at all: there is
-/// **one router** — one implicit-grab state, one pointer position, one
-/// generation binding, shared between the human's physical input and every
-/// agent's admitted actuation — so exactly one realm can be its target at a
-/// time, and *something* has to name that realm. Naming it in **one**
-/// function is what stops the choice being mistaken for a decision, and what
-/// keeps the agent path ([`route_seat`]), the physical path
-/// (`backend::winit::route_physical_inputs`) and the router's generation
-/// binding from disagreeing about it. The eventual policy — a router per
-/// realm — replaces this body and nothing else.
-///
-/// The relationship with the output binding is now the reverse of what it
+/// The relationship with the output binding is the reverse of what it once
 /// was: [`start_one_realm_in`] and [`rebind_output_after_death`] pick a
 /// realm and *bind* it, and this function follows that binding rather than
 /// re-deriving the same rule beside it. Both orders keep "the realm a human
@@ -1907,33 +1964,18 @@ fn dispatch_principal<H: RuntimeHost>(
 /// entry until shutdown (the registry and the runtime both outlive the
 /// process), so skipping to the first realm that still holds a
 /// [`ShimServer`] is what keeps one realm's death from silently swallowing
-/// every actuation aimed at the session.
+/// the human's input for the rest of the session.
 ///
-/// # An agent never crosses realms on this placeholder
+/// # What the chokepoint still asks it
 ///
-/// Being a placeholder is survivable for *physical* input, which no grant
-/// addresses: a human types into whatever this names, and mis-aiming it is
-/// a usability bug. It is **not** survivable for an agent's actuation,
-/// which is authorized against a named realm — delivering it here when the
-/// grant names another realm would actuate an app the grant confers no
-/// authority over, which is an authority bug and a write.
-///
-/// So the actuation path does not reach this function trusting it: the
-/// chokepoint compares this target with the grant's own realm
-/// ([`enforcement::UseEnv::seat_reaches_grant_realm`], fed from
-/// [`dispatch_principal`]) and **refuses** `internal` when they differ, so
-/// nothing crosses. That guard and this placeholder are removed together
-/// by WS-E.1.6 (issue #212), which routes per realm instead.
-///
-/// # What serving `layout_focus` did to that guard
-///
-/// It armed it. Before, the target was a fixed property of the deployment
-/// and no client could move it; now a `layout_focus` holder chooses it, and
-/// so chooses which *other* principals' actuations step 5d refuses. That
-/// cross-principal denial-of-service surface is created here, is bounded
-/// (recoverable, journaled, no token spent, no `once` rung burnt), and is
-/// published in `docs/book/src/limits.md`. It closes when #212 delivers to
-/// a hidden realm instead of refusing.
+/// One thing: `preempted` for a **layout** request
+/// ([`enforcement::UseEnv::physical_realm`], fed from [`dispatch_principal`]).
+/// A layout act is not delivered into a realm; it moves what the human is
+/// looking at, so the human it can steal from is the one wherever this
+/// function points. The comparison it used to feed — "does the session's one
+/// seat serve this grant's realm", refused `internal` when it did not — is
+/// deleted, and with it the cross-principal denial-of-service surface a
+/// `layout_focus` holder had over *other* principals' actuations.
 ///
 /// # Private, and that is the fifth ordering rule's enforcement
 ///
@@ -1946,7 +1988,7 @@ fn dispatch_principal<H: RuntimeHost>(
 /// and the only thing outside it may call is [`physical_seat_target`], which
 /// takes the scene registry and has no such argument to get wrong.
 ///
-/// [`enforcement::UseEnv::seat_reaches_grant_realm`]: crate::enforcement::UseEnv::seat_reaches_grant_realm
+/// [`enforcement::UseEnv::physical_realm`]: crate::enforcement::UseEnv::physical_realm
 fn seat_target<'r>(
     realms: &'r BTreeMap<RealmId, RealmRuntime>,
     focused: Option<&RealmId>,
@@ -1983,14 +2025,22 @@ fn seat_target<'r>(
 /// human's own keyboard and pointer move with the picture, in one act, per
 /// SCENE AUTHORITY's fifth ordering rule.
 ///
-/// It is not enough for the realm being left. The router's pairing table is a
-/// record of the presses **that app** was told about, and the next delivery
-/// round calls [`InputRouter::bind_to`] with the new target, which forgets
-/// that table without a word. Every entry in it is then a press whose release
-/// the app can never receive — a latched `Ctrl` in an app the human can no
-/// longer even see, since the output has moved. So the losing realm is paid
-/// what it is owed *here*, before the binding moves, through the same seat
-/// funnel an ordinary release takes.
+/// It is not enough for the realm being left. That realm's pairing tables are
+/// a record of the presses **its app** was told about, and the human's next
+/// release is addressed to the realm that just gained the binding. Every
+/// physical entry left behind is then a press whose release the losing app can
+/// never receive — a latched `Ctrl`, or a wedged pointer grab, in an app the
+/// human can no longer even see, since the output has moved. So the losing
+/// realm is paid what it is owed *here*, before the binding moves, through the
+/// same seat funnel an ordinary release takes: [`InputRouter::bind_to`] drains
+/// the keys and the buttons and hands them back, naming the realm they are
+/// owed to.
+///
+/// **An agent's held presses in that realm are deliberately untouched**, which
+/// is what changed at WS-E.1.6: the agent still reaches the realm it holds a
+/// grant over, so it can still release its own key, and synthesising one here
+/// would invent an act the principal never performed and attribute it to the
+/// human on the wire and in the journal.
 ///
 /// This is the same failure WS-E.1.2 fixed one layer down (a sibling realm's
 /// death resetting the shared router and latching a key in the survivor), and
@@ -2034,26 +2084,29 @@ fn apply_layout<H: RuntimeHost>(host: &mut H, acts: Vec<LayoutAct>) {
                 if view.focused() == Some(&realm) {
                     continue;
                 }
-                // The releases the realm losing the seat is owed, delivered
-                // before the binding moves (see above). The router names its
-                // own debtor — that is exactly what `bound_realm` is — so
-                // nothing here has to guess which app saw the presses.
+                // The releases the realm losing the human's attention is
+                // owed, delivered before the binding moves (see above).
+                // `bind_to` names its own debtor and hands back exactly what
+                // that app is owed, so nothing here has to guess which app saw
+                // the presses — or which of them were the human's.
                 let Runtime {
                     router,
                     realms,
                     kernel,
                     ..
                 } = &mut *runtime;
-                if let Some(losing) = router.bound_realm().cloned() {
-                    if losing != realm {
-                        for delivery in router.release_held() {
-                            tracing::debug!(
-                                realm = %losing,
-                                "releasing a press held across a focus change so it cannot latch \
-                                 in an app the human can no longer see"
-                            );
-                            deliver_seat_to(realms, &mut kernel.recorder, &losing, &delivery);
-                        }
+                if let Some((losing, owed)) = router.bind_to(&realm) {
+                    // `bind_to` has already forgotten `losing`'s physical
+                    // presence — one act with the drain, inside the router, so
+                    // no call site can pay the releases and leave the realm
+                    // "owned" (`InputRouter::forget_presence_of`).
+                    for delivery in owed {
+                        tracing::debug!(
+                            realm = %losing,
+                            "releasing a press held across a focus change so it cannot latch \
+                             in an app the human can no longer see"
+                        );
+                        deliver_seat_to(realms, &mut kernel.recorder, &losing, &delivery);
                     }
                 }
                 tracing::info!(%realm, "layout_focus: the output and the human's input move here");
@@ -2251,8 +2304,9 @@ pub(crate) fn deliver_physical(
     deliver_seat_to(realms, recorder, realm_id, &delivery);
 }
 
-/// One turn of the human's own physical input: bind the router's generation,
-/// map through the target realm's geometry, route, and deliver.
+/// One turn of the human's own physical input: bind the human's attention to
+/// the realm the output shows, pay whatever the realm being left is owed, map
+/// through the target realm's geometry, route, and deliver.
 ///
 /// **The display-free tail of the nested backend's input handler**, split out
 /// for the reason [`crate::backend::winit::route_turn`] and `deadman_tick`
@@ -2262,15 +2316,42 @@ pub(crate) fn deliver_physical(
 /// reviewer could revert with the suite still green.
 ///
 /// All three seat questions this turn asks are answered by
-/// [`physical_seat_target`] — the surface geometry to map with, the router
-/// generation to bind, and the shim to deliver to — so they cannot disagree
-/// about which realm the human is typing into.
+/// [`physical_seat_target`] — the surface geometry to map with, the realm to
+/// bind the human's attention to, and the shim to deliver to — so they cannot
+/// disagree about which realm the human is typing into.
+///
+/// `switch` is `None` on a backend with no dead-man watcher stacked (a
+/// `physical-input-injector` headless build); see
+/// [`crate::backend::winit::route_turn`].
+///
+/// `now` is **this turn's one clock sample**, and it is a parameter rather
+/// than something read here because the embedder has already taken it for the
+/// consent grab and the dead-man watcher and every event of the turn must be
+/// judged against the same instant. It is pushed straight into the router's
+/// presence tap ([`InputRouter::observe_at`]) before anything is routed: the
+/// tap's timestamps and the chokepoint's `preempted` window are then one
+/// timeline by construction, and there is no separate "remember to advance the
+/// presence clock" step an embedder can omit — which is the class of omission
+/// that left `preempted` unreachable in every shipped build until issue #212's
+/// review.
+///
+/// # The drain, and why it is here as well as in [`apply_layout`]
+///
+/// [`InputRouter::bind_to`] hands back the physical presses the realm being
+/// left is owed, and they are delivered *to that realm* before this turn's
+/// events are routed. In the ordinary run `apply_layout` has already paid
+/// them at the instant the binding moved, so this finds nothing — but the
+/// binding can also move without any layout act at all
+/// (`rebind_output_after_death`, or the first realm attaching), and a drain
+/// that only ran on the verb would miss those. Paying twice is impossible:
+/// the drains empty the table.
 pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
     runtime: &mut Runtime<H>,
     scenes: &crate::scene::realms::RealmScenes,
-    switch: &std::cell::RefCell<crate::deadman::DeadManSwitch>,
+    switch: Option<&std::cell::RefCell<crate::deadman::DeadManSwitch>>,
     inputs: impl IntoIterator<Item = SeatInput>,
     view: (u32, u32),
+    now: Instant,
 ) {
     let Runtime {
         router,
@@ -2278,6 +2359,9 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
         kernel,
         ..
     } = runtime;
+    // The turn's instant, into the tap, before a single event of it is
+    // observed (doc comment above).
+    router.observe_at(now);
     // **The seat target's own surface geometry** (WS-E.1.3): the router maps
     // view coordinates to surface coordinates through `layout::place`, so it
     // must be handed the geometry of the surface the event is about. With one
@@ -2288,12 +2372,26 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
         .and_then(|(realm_id, _)| scenes.scene(realm_id))
         .and_then(|scene| scene.surface_size());
     // Before the routing, not after: the routing writes this turn's presses
-    // into the router's pairing table, and that debt has to be on record as
-    // *this realm's* from the first one — otherwise a sibling realm dying
-    // mid-session would clear a key this app is still holding
-    // (`crate::input::InputRouter::reset_for`).
+    // into the bound realm's pairing table, and that debt has to be on record
+    // as *this realm's* from the first one.
     if let Some((realm_id, _)) = physical_seat_target(realms, scenes) {
-        router.bind_to(realm_id);
+        let realm_id = realm_id.clone();
+        if let Some((losing, owed)) = router.bind_to(&realm_id) {
+            // The human's attention left `losing`, so their next release is
+            // addressed elsewhere: pay that app its releases. `bind_to` has
+            // already dropped that realm's physical presence, or a button held
+            // across the move would keep it "owned" — and every agent in it
+            // refused `preempted` — for the stale-hold ceiling with nobody
+            // touching it (`InputRouter::forget_presence_of`).
+            for delivery in owed {
+                tracing::debug!(
+                    realm = %losing,
+                    "releasing a press held across a binding change so it cannot latch in an \
+                     app the human can no longer see"
+                );
+                deliver_seat_to(realms, &mut kernel.recorder, &losing, &delivery);
+            }
+        }
     }
     crate::backend::winit::route_turn(router, switch, inputs, view, surface, &mut |delivery| {
         deliver_physical(realms, scenes, &mut kernel.recorder, delivery)
@@ -2301,13 +2399,14 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
 }
 
 /// Route chokepoint-admitted actuations through the session's router toward
-/// the target realm's shim seat.
+/// **each one's own granted realm's** shim seat.
 ///
 /// The router is the same one the backend's physical input flows through, so
-/// implicit grabs and pointer state are shared between an agent's actuations
-/// and a human's — which is what makes the preemption hook meaningful. The
-/// origin tag rides the wire on every event and is never constructed or
-/// rewritten here (backward requirement B2): this path only addresses.
+/// within a realm the implicit grab and the pointer state are shared between
+/// an agent's actuations and a human's — which is what makes the preemption
+/// hook meaningful. The origin tag rides the wire on every event and is never
+/// constructed or rewritten here (backward requirement B2): this path only
+/// addresses.
 ///
 /// Every event that actually reaches the shim's seat is recorded, tagged with
 /// that origin ([`crate::recorder::Event::SeatDelivered`], issue #83): the
@@ -2316,19 +2415,29 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
 /// Shape only — the kind and the tag, never coordinates, keysym, or typed
 /// bytes — so the audit entry can never become a keylogger.
 ///
-/// # Which realm, with more than one attached
+/// # Which realm, with more than one attached (WS-E.1.6, issue #212)
 ///
-/// Whichever [`seat_target`] names — the realm the output is bound to when
-/// one is, and otherwise the first still-serving realm in id order (see that
-/// function for which half is D-018's fifth ordering rule and which half is
-/// still WS-E.1.6's placeholder).
+/// **The realm named on the pair**, which the chokepoint took from the grant
+/// row the use was admitted under ([`enforcement::UseEnv::grant_realm`], fed
+/// from [`dispatch_principal`]'s actuation sink). Not [`seat_target`], which
+/// is now the *physical* path's question alone: an agent must be able to work
+/// in a realm the human is not looking at, and that is the whole
+/// concurrent-operation claim.
 ///
-/// This function is therefore reached only by actuations whose grant names
-/// **that** realm: the chokepoint refuses the rest before they become
-/// `SeatInput`s at all (`enforcement`, step 5d). Nothing here re-checks it,
-/// and nothing here should — a delivery site that made its own authority
-/// judgement would be the second enforcement site this crate does not have.
-fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
+/// Until this landed the session had one delivery target, so an actuation
+/// whose grant named any other realm was refused `internal` at the
+/// chokepoint's step 5d rather than delivered into a sibling's app. That
+/// stopgap is **gone**: the realm travels with the event, so there is nothing
+/// left to compare and nothing to refuse.
+///
+/// Nothing here re-checks the authority that named the realm, and nothing here
+/// should — a delivery site that made its own authority judgement would be the
+/// second enforcement site this crate does not have. What it does re-check is
+/// **liveness**, which is not authority: a realm whose shim died between
+/// admission and delivery drops the event, exactly as it always did.
+///
+/// [`enforcement::UseEnv::grant_realm`]: crate::enforcement::UseEnv::grant_realm
+fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<(RealmId, SeatInput)>) {
     if seat.is_empty() {
         return;
     }
@@ -2340,32 +2449,33 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
         kernel,
         ..
     } = runtime;
-    let focused = view.focused().cloned();
-    let Some((realm_id, realm)) = seat_target(realms, focused.as_ref()) else {
-        return;
-    };
-    let Some(server) = realm.server.as_ref() else {
-        return;
-    };
-    // **The target realm's own surface geometry**, read after the target is
-    // known rather than before (WS-E.1.3). The router maps view coordinates
-    // to surface coordinates through `layout::place`, so it must be handed
-    // the geometry of the surface the event is about; with one scene those
-    // were the same thing, and with several a hidden realm's committed size
-    // would silently place a click for the realm being typed into.
-    let surface = view.scene(realm_id).and_then(|scene| scene.surface_size());
-    // Before the first `route`: the router's pairing table and implicit
-    // grab are a record of what *this realm's app* was told, so the realm
-    // has to be on record before anything is added to them. It is what
-    // makes a sibling realm's death leave this state alone
-    // ([`crate::input::InputRouter::reset_for`]).
-    router.bind_to(realm_id);
-    let outbox = &realm.outbox;
-    for input in seat {
-        let Some(delivery) = router.route(input, view_size, surface) else {
+    // A shim that has stopped reading gets nothing more this round -- a
+    // property of a *batch*, and now a property per realm rather than per
+    // round: one wedged realm must not silence a sibling's actuations.
+    let mut wedged: Vec<RealmId> = Vec::new();
+    for (target, input) in seat {
+        if wedged.contains(&target) {
+            continue;
+        }
+        // Liveness, never authority. A realm's shim can die between admission
+        // and delivery, which is a runtime condition; the authority question
+        // was settled at the chokepoint and is not re-asked here.
+        let Some((realm_id, realm)) = realms.get_key_value(&target) else {
             continue;
         };
-        let mut send = |frame: &[u8]| outbox.send(frame);
+        let Some(server) = realm.server.as_ref() else {
+            continue;
+        };
+        // **The granted realm's own surface geometry** (WS-E.1.3). The router
+        // maps view coordinates to surface coordinates through
+        // `layout::place`, so it must be handed the geometry of the surface
+        // the event is about -- which is this grant's realm, whether or not
+        // that realm is the one on screen.
+        let surface = view.scene(realm_id).and_then(|scene| scene.surface_size());
+        let Some(delivery) = router.route_emulated(realm_id, input, view_size, surface) else {
+            continue;
+        };
+        let mut send = |frame: &[u8]| realm.outbox.send(frame);
         match server.deliver_seat_event(&delivery, &mut send) {
             // Recorded only when it went out (a seat the shim has not minted
             // yet drops the event — nothing was delivered, so nothing is
@@ -2381,7 +2491,7 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<SeatInput>) {
                 // the next dispatch, through the one funnel that classifies
                 // deaths.
                 tracing::warn!(realm = %realm_id, %err, "seat delivery to the realm failed");
-                break;
+                wedged.push(target);
             }
         }
     }
@@ -2586,19 +2696,23 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
         // a hover). Drawing only — the shim's delivery already happened
         // inside the round, through `route_seat`, and is unaffected.
         //
-        // **Gated on the bound realm** (WS-E.1.3): the sprite is painted in
-        // the output's coordinates over the output's realm, so an agent
-        // pointing inside a *hidden* realm has no position that means
-        // anything in the picture the human is looking at, and drawing one
-        // anyway would put a crosshair over an unrelated app. The router
-        // knows which realm its pointer state is owed to; the presenter knows
-        // which realm the output shows; the sprite is drawn only when they
-        // agree. The consequence is a real weakening of D-019 and is
-        // published as a limit, not smoothed over.
-        let cursor = runtime
-            .router
-            .agent_pointer()
-            .filter(|_| runtime.router.bound_realm() == view.focused());
+        // **Resolved from the bound realm** (WS-E.1.3, sharpened by
+        // WS-E.1.6): the sprite is painted in the output's coordinates over
+        // the output's realm, so the position drawn must be *that realm's*
+        // agent pointer. An agent pointing inside a hidden realm has no
+        // position that means anything in the picture the human is looking at,
+        // and drawing one anyway would put a crosshair over an unrelated app.
+        // Since the router keeps one agent pointer per realm, this is a lookup
+        // by the realm the output shows rather than a filter on a single
+        // session-wide position — a hidden realm's agent motion can no longer
+        // even overwrite the position the visible realm would draw. The
+        // consequence, that a hidden realm's agent draws nothing at all, is a
+        // real weakening of D-019 and is published as a limit, not smoothed
+        // over.
+        let cursor = view
+            .focused()
+            .cloned()
+            .and_then(|focused| runtime.router.agent_pointer(&focused));
         if view.set_agent_cursor(cursor) {
             runtime.dirty = true;
             view.request_present();
@@ -3097,7 +3211,7 @@ mod tests {
                 EventLoop::try_new().expect("event loop");
             let handle = event_loop.handle();
             let mut host = TestHost {
-                runtime: Runtime::new(seed, InputRouter::new(NoopHook)),
+                runtime: Runtime::new(seed, InputRouter::detached(NoopHook)),
                 view: TestView {
                     scenes: crate::scene::RealmScenes::new(VIEW),
                     redraws: 0,
@@ -3984,9 +4098,12 @@ mod tests {
         // change's placeholder routing could hide.
         route_seat(
             &mut rig.host,
-            vec![SeatInput::emulated(crate::input::SeatInputKind::Text {
-                text: "after".into(),
-            })],
+            vec![(
+                RealmId::new("editor"),
+                SeatInput::emulated(crate::input::SeatInputKind::Text {
+                    text: "after".into(),
+                }),
+            )],
         );
 
         shutdown_realm(&mut rig.host);
@@ -4018,11 +4135,10 @@ mod tests {
     /// is dropped, and the key latches in a live app with nothing in the
     /// journal to say so — no delivery happened, so nothing was recorded.
     ///
-    /// The victim is deliberately **not** the delivery target: ids sort
-    /// `browser` < `realm-0`, so [`seat_target`] binds the router to
-    /// `browser` and `realm-0` is the sibling whose death must be
-    /// inconsequential. Killing the target instead would prove nothing —
-    /// clearing *is* right there.
+    /// The victim is deliberately **not** the realm the actuation names: the
+    /// grant below is over `browser`, and `realm-0` is the sibling whose
+    /// death must be inconsequential. Killing `browser` instead would prove
+    /// nothing — clearing *is* right there.
     #[test]
     fn a_realms_death_does_not_clear_a_surviving_realms_held_key() {
         let _fd = crate::capture::tests::fd_lock();
@@ -4051,20 +4167,32 @@ mod tests {
         const SHIFT_L: u32 = 0xffe1;
         route_seat(
             &mut rig.host,
-            vec![SeatInput::emulated(crate::input::SeatInputKind::Key {
-                keysym: SHIFT_L,
-                state: vitrin_protocol::generated::vitrin_shim_seat::KeyState::Pressed,
-            })],
+            vec![(
+                RealmId::new("browser"),
+                SeatInput::emulated(crate::input::SeatInputKind::Key {
+                    keysym: SHIFT_L,
+                    state: vitrin_protocol::generated::vitrin_shim_seat::KeyState::Pressed,
+                }),
+            )],
         );
         assert_eq!(
-            rig.host.runtime.router.bound_realm(),
-            Some(&RealmId::new("browser")),
-            "the delivery target owns the router's generation"
-        );
-        assert_eq!(
-            rig.host.runtime.router.held_keys().len(),
+            rig.host
+                .runtime
+                .router
+                .held_keys(&RealmId::new("browser"))
+                .len(),
             1,
-            "the press was delivered, so its release is owed"
+            "the press was delivered into the realm the grant named, so its release is \
+             owed there"
+        );
+        assert!(
+            rig.host
+                .runtime
+                .router
+                .held_keys(&RealmId::new("realm-0"))
+                .is_empty(),
+            "and nothing was recorded against the sibling: an actuation is addressed by \
+             its grant's realm, never by whichever realm the session happens to serve"
         );
 
         // The *other* realm dies, through the real funnel: a real kill, the
@@ -4087,28 +4215,34 @@ mod tests {
         reap_realm(&mut rig.host);
 
         assert_eq!(
-            rig.host.runtime.router.held_keys().len(),
+            rig.host
+                .runtime
+                .router
+                .held_keys(&RealmId::new("browser"))
+                .len(),
             1,
             "a sibling's death must not forget what the survivor's app is holding -- a \
              session-wide reset here latches the key down in a live app forever"
-        );
-        assert_eq!(
-            rig.host.runtime.router.bound_realm(),
-            Some(&RealmId::new("browser")),
-            "and the surviving generation still belongs to the realm that owns it"
         );
 
         // The proof at the app: the release still pairs, so it is still
         // delivered rather than dropped as unpaired.
         route_seat(
             &mut rig.host,
-            vec![SeatInput::emulated(crate::input::SeatInputKind::Key {
-                keysym: SHIFT_L,
-                state: vitrin_protocol::generated::vitrin_shim_seat::KeyState::Released,
-            })],
+            vec![(
+                RealmId::new("browser"),
+                SeatInput::emulated(crate::input::SeatInputKind::Key {
+                    keysym: SHIFT_L,
+                    state: vitrin_protocol::generated::vitrin_shim_seat::KeyState::Released,
+                }),
+            )],
         );
         assert!(
-            rig.host.runtime.router.held_keys().is_empty(),
+            rig.host
+                .runtime
+                .router
+                .held_keys(&RealmId::new("browser"))
+                .is_empty(),
             "the release paired with the press"
         );
 
@@ -4155,10 +4289,16 @@ mod tests {
         route_seat(
             &mut rig.host,
             vec![
-                SeatInput::emulated(crate::input::SeatInputKind::Text { text: "hi".into() }),
-                SeatInput::emulated(crate::input::SeatInputKind::Text {
-                    text: "there".into(),
-                }),
+                (
+                    RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
+                    SeatInput::emulated(crate::input::SeatInputKind::Text { text: "hi".into() }),
+                ),
+                (
+                    RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
+                    SeatInput::emulated(crate::input::SeatInputKind::Text {
+                        text: "there".into(),
+                    }),
+                ),
             ],
         );
         shutdown_realm(&mut rig.host);
@@ -5126,12 +5266,11 @@ mod tests {
     /// 1. The output moves to the survivor rather than staying on the corpse.
     /// 2. What it composites is the survivor's own pixels, not the background
     ///    — byte-exact, because "bound somewhere" is not the claim.
-    /// 3. It moves to the realm [`seat_target`] serves. The chokepoint's
-    ///    step-5d guard refuses an actuation whose grant names a realm other
-    ///    than the seat's target; that refusal is safe because the two
-    ///    placeholders agree, and a rebind that broke the agreement would leave
-    ///    a human watching one realm while every admitted actuation drove
-    ///    another.
+    /// 3. It moves to the realm [`seat_target`] serves — so the realm a human
+    ///    watches and the realm their own keystrokes reach stay equal, which
+    ///    is D-018(2)'s fifth ordering rule arrived at by a death rather than
+    ///    by a verb. A rebind that broke the agreement would leave a human
+    ///    watching one realm while typing into another.
     #[test]
     fn the_output_leaves_a_dead_realm_for_a_live_sibling() {
         let _fd = crate::capture::tests::fd_lock();
@@ -5177,8 +5316,8 @@ mod tests {
             seat_target(&rig.host.runtime.realms, rig.host.view.focused())
                 .map(|(realm_id, _)| realm_id),
             Some(&survivor),
-            "and it must land on the realm the seat serves, or the step-5d stopgap starts \
-             refusing every actuation the human can see the effect of"
+            "and it must land on the realm the human's own input follows, or the human \
+             watches one realm while typing into another"
         );
 
         // What the output composites is the survivor's own view, not the
@@ -5231,18 +5370,18 @@ mod tests {
         let hidden = RealmId::new("realm-b");
         assert_eq!(rig.host.view.focused(), Some(&bound));
 
-        // An agent moves its pointer while the router is serving the bound
-        // realm: the sprite's position is offered.
-        rig.host.runtime.router.bind_to(&bound);
-        rig.host.runtime.router.route(
+        // An agent moves its pointer inside the realm on the output: the
+        // sprite's position is offered.
+        rig.host.runtime.router.route_emulated(
+            &bound,
             SeatInput::emulated(crate::input::SeatInputKind::Motion { x: 12.0, y: 9.0 }),
             VIEW,
             Some(VIEW),
         );
         assert_eq!(
-            rig.host.runtime.router.agent_pointer(),
+            rig.host.runtime.router.agent_pointer(&bound),
             Some((12.0, 9.0)),
-            "fixture check: the router holds an agent-owned position"
+            "fixture check: the router holds an agent-owned position for that realm"
         );
         rig.host.view.cursor_offered = None;
         post_dispatch(&mut rig.host);
@@ -5252,21 +5391,47 @@ mod tests {
             "the bound realm's agent pointer must reach the sprite"
         );
 
-        // The router is now serving a hidden realm. The same pointer must
-        // NOT be offered: it is a position in another realm's view.
-        rig.host.runtime.router.bind_to(&hidden);
-        rig.host.runtime.router.route(
+        // A second agent motion, this time inside the HIDDEN realm. It must
+        // not be offered -- it is a position in another realm's view -- and,
+        // since WS-E.1.6, it must not disturb the bound realm's position
+        // either: the two realms hold two pointers.
+        rig.host.runtime.router.route_emulated(
+            &hidden,
             SeatInput::emulated(crate::input::SeatInputKind::Motion { x: 30.0, y: 20.0 }),
             VIEW,
             Some(VIEW),
+        );
+        assert_eq!(
+            rig.host.runtime.router.agent_pointer(&bound),
+            Some((12.0, 9.0)),
+            "a hidden realm's agent motion must not move the visible realm's sprite"
         );
         rig.host.view.cursor_offered = None;
         post_dispatch(&mut rig.host);
         assert_eq!(
             rig.host.view.cursor_offered,
-            Some(None),
-            "an agent pointing inside a HIDDEN realm must draw no sprite on the output"
+            Some(Some((12.0, 9.0))),
+            "the visible realm's own sprite is still the one drawn"
         );
+
+        // ...and with the output on the hidden realm's side of the pair, the
+        // sprite that is drawn is THAT realm's.
+        rig.host.view.bind_output(&hidden);
+        rig.host.view.cursor_offered = None;
+        post_dispatch(&mut rig.host);
+        assert_eq!(
+            rig.host.view.cursor_offered,
+            Some(Some((30.0, 20.0))),
+            "the sprite follows the output's realm, not a session-wide position"
+        );
+
+        // A realm with no agent motion at all offers nothing, which is what
+        // keeps a crosshair off an app no agent is pointing into.
+        let untouched = RealmId::new("realm-c");
+        rig.host.view.scenes.bind(&untouched);
+        rig.host.view.cursor_offered = None;
+        post_dispatch(&mut rig.host);
+        assert_eq!(rig.host.view.cursor_offered, Some(None));
     }
 
     // ---------------------------------------------------------------------
@@ -5728,9 +5893,9 @@ mod tests {
         rig.pump(Duration::from_millis(400));
         assert_eq!(await_resolution(&mut watcher), Outcome::Granted);
 
-        // Focus first: the holder's actuation is refused unless the seat
-        // serves its realm (the chokepoint's step-5d stopgap), and the sprite
-        // is drawn only for the realm on the output (D-019, amended).
+        // Focus first: the sprite is drawn only for the realm on the output
+        // (D-019, amended by WS-E.1.3), so the holder's actuation has to be
+        // into the realm this test then inspects.
         send_focus(&mut holder);
         rig.pump(Duration::from_millis(300));
         assert_eq!(rig.host.view.focused(), Some(&b));
@@ -5862,9 +6027,10 @@ mod tests {
                 route_physical_turn(
                     &mut rig.host.runtime,
                     &rig.host.view.scenes,
-                    &switch,
+                    Some(&switch),
                     crate::input::physical_key(EVDEV_A, Some(KEYSYM_A), state),
                     VIEW,
+                    Instant::now(),
                 );
             }
         };
@@ -6067,7 +6233,9 @@ mod tests {
 
         // (a) The human's own hand owns the target: a focus is preempted.
         // Fed at the router's hook point, exactly as the backends feed it.
-        rig.host.runtime.kernel.presence.note(
+        rig.host.runtime.kernel.presence.borrow_mut().note(
+            // The realm physical input is addressed to -- the bound one.
+            rig.host.view.focused(),
             vitrin_protocol::generated::vitrin_shim_seat::Origin::Physical,
             &SeatInputKind::Motion { x: 1.0, y: 1.0 },
             Instant::now(),
@@ -6092,7 +6260,12 @@ mod tests {
         // this case is proved on its own gate rather than inheriting (a)'s.
         rig.pump(Duration::from_millis(700));
         assert!(
-            !rig.host.runtime.kernel.presence.owns_target(Instant::now()),
+            !rig.host
+                .runtime
+                .kernel
+                .presence
+                .borrow()
+                .owns_target(rig.host.view.focused(), Instant::now()),
             "fixture check: (a)'s physical presence must have gone stale, or this case \
              would pass on the preemption gate and say nothing about 5b"
         );
@@ -6177,6 +6350,170 @@ mod tests {
             rig.host.view.focused(),
             Some(&RealmId::new("realm-c")),
             "and the refused focus must not have bound the output to the vacant realm"
+        );
+    }
+
+    /// **The human's hand really reaches the chokepoint, and reaches only the
+    /// realm the hand is in** — issue #212's acceptance criterion 3, driven
+    /// through the production wiring rather than by feeding the map by hand.
+    ///
+    /// Every other `preempted` test in this crate writes `Kernel::presence`
+    /// directly, which asks the chokepoint a question about a map a test
+    /// filled in. That left the *feeder* untested, and the feeder was missing:
+    /// from P1.4.4 until this issue's review, `PresenceHook` was an optional
+    /// member of the router's hook stack and **no shipping backend included
+    /// it**, so `preempted` could not fire in any `vitrind` ever built while
+    /// the book described it as live behaviour. `InputRouter` now holds the
+    /// tap unconditionally and `Runtime::new` takes the kernel's map out of
+    /// the router, so the two cannot be different objects — this test is what
+    /// pins that they are not.
+    ///
+    /// Three cases, in one order chosen so none of them can pass vacuously:
+    ///
+    /// - a real physical event routed through [`route_physical_turn`] into
+    ///   the **bound** realm leaves an agent over the **other** realm
+    ///   admitted — and the map is asserted to still own the bound realm at
+    ///   that instant, so "admitted" is not "the window had expired";
+    /// - a second physical event, then an agent over the **bound** realm, is
+    ///   refused `preempted`;
+    /// - the same agent, once the window has gone stale, is admitted again —
+    ///   so the refusal above came from the human's hand and not from
+    ///   anything else about that grant.
+    #[test]
+    fn a_humans_physical_input_preempts_agents_in_its_own_realm_and_no_other() {
+        use vitrin_protocol::generated::vitrin_actuator_pointer::requests::Move;
+        use vitrin_protocol::generated::vitrin_grant::{events::Refused, Refusal};
+        use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rig, a, b) = two_realm_rig("preempt-per-realm");
+        commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
+        commit_into(&mut rig, &b, VIEW.0, VIEW.1, 0x99);
+        assert_eq!(
+            physical_seat_target(&rig.host.runtime.realms, &rig.host.view.scenes)
+                .map(|(realm_id, _)| realm_id.clone()),
+            Some(a.clone()),
+            "fixture check: the human's input starts on realm-a, so realm-b is the realm \
+             nobody is looking at"
+        );
+
+        // Two principals, one per realm, holding `actuate.pointer` and
+        // nothing else — no layout verb, because D-022(5) would refuse the
+        // second holder `layout_held` at admission and this test would be
+        // about that instead.
+        let mut in_a = agent(&rig.socket);
+        send_preamble_as(&mut in_a, DEMO_IDENTITY, TOKEN, "realm-a");
+        send_petition_for(&mut in_a, Verb::ACTUATE_POINTER);
+        let mut in_b = agent(&rig.socket);
+        send_preamble_as(&mut in_b, OTHER_IDENTITY, OTHER_TOKEN, "realm-b");
+        send_petition_for(&mut in_b, Verb::ACTUATE_POINTER);
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(await_resolution(&mut in_a), Outcome::Granted);
+        assert_eq!(await_resolution(&mut in_b), Outcome::Granted);
+
+        let cookie = std::cell::Cell::new(9100u32);
+        let next_refusal = |rig: &mut Rig, client: &mut Connection| -> Option<Refusal> {
+            let fence = cookie.get() + 1;
+            cookie.set(fence);
+            client
+                .send_message(
+                    &vitrin_handshake::requests::Sync { cookie: fence }.encode(HANDSHAKE_ID),
+                    None,
+                )
+                .expect("sync");
+            rig.pump(Duration::from_millis(200));
+            let mut found = None;
+            for _ in 0..256 {
+                let Ok(Some(msg)) = client.recv_message() else {
+                    break;
+                };
+                if msg.header.object_id == GRANT_ID && msg.header.opcode == Refused::OPCODE {
+                    let (_, e) = Refused::decode(&msg.bytes, msg.fd).expect("decode refused");
+                    found.get_or_insert(e.code);
+                    continue;
+                }
+                if msg.header.object_id == HANDSHAKE_ID
+                    && msg.header.opcode == vitrin_handshake::events::Done::OPCODE
+                {
+                    let (_, done) = vitrin_handshake::events::Done::decode(&msg.bytes, msg.fd)
+                        .expect("decode done");
+                    if done.cookie == fence {
+                        break;
+                    }
+                }
+            }
+            found
+        };
+
+        // A real keystroke through the entry point both backends call. No
+        // hand-written presence anywhere in this test: if the router does not
+        // feed the kernel's map, every case below reports "admitted".
+        const EVDEV_A: u32 = 30;
+        const KEYSYM_A: u32 = 0x61;
+        let tap = |rig: &mut Rig| {
+            for state in [KeyState::Pressed, KeyState::Released] {
+                route_physical_turn(
+                    &mut rig.host.runtime,
+                    &rig.host.view.scenes,
+                    None,
+                    crate::input::physical_key(EVDEV_A, Some(KEYSYM_A), state),
+                    VIEW,
+                    Instant::now(),
+                );
+            }
+        };
+
+        // (a) A hand in realm-a leaves an agent in realm-b working.
+        tap(&mut rig);
+        in_b.send_message(&Move { x: 7, y: 5 }.encode(7), None)
+            .expect("move in realm-b");
+        assert_eq!(
+            next_refusal(&mut rig, &mut in_b),
+            None,
+            "a human typing in realm-a must not suspend an agent working in realm-b: that \
+             is the concurrent-operation claim the whole project rests on"
+        );
+        assert!(
+            rig.host
+                .runtime
+                .kernel
+                .presence
+                .borrow()
+                .owns_target(Some(&a), Instant::now()),
+            "fixture check: the human must still own realm-a here, or (a) passed because \
+             the hold window had expired and says nothing about per-realm narrowing"
+        );
+
+        // (b) ...and suspends an agent in realm-a.
+        tap(&mut rig);
+        in_a.send_message(&Move { x: 7, y: 5 }.encode(7), None)
+            .expect("move in realm-a");
+        assert_eq!(
+            next_refusal(&mut rig, &mut in_a),
+            Some(Refusal::Preempted),
+            "an agent actuating the realm the human's own hand is in must be refused \
+             `preempted` — and it reaches the chokepoint only because the router feeds \
+             `Kernel::presence`, which no shipping backend did before issue #212's review"
+        );
+
+        // (c) The control: the same grant, the same request, no hand.
+        rig.pump(crate::input::PHYSICAL_HOLD_WINDOW + Duration::from_millis(200));
+        assert!(
+            !rig.host
+                .runtime
+                .kernel
+                .presence
+                .borrow()
+                .owns_target(Some(&a), Instant::now()),
+            "fixture check: the hold window must have expired"
+        );
+        in_a.send_message(&Move { x: 7, y: 5 }.encode(7), None)
+            .expect("move in realm-a, hands off");
+        assert_eq!(
+            next_refusal(&mut rig, &mut in_a),
+            None,
+            "with no hand on the input the very same actuation is admitted, so (b)'s \
+             refusal was the human's presence and nothing else about this grant"
         );
     }
 
@@ -6436,12 +6773,13 @@ mod tests {
         route_physical_turn(
             &mut rig.host.runtime,
             &rig.host.view.scenes,
-            &switch,
+            Some(&switch),
             crate::input::physical_key(EVDEV_LEFTCTRL, Some(KEYSYM_CONTROL_L), KeyState::Pressed),
             VIEW,
+            Instant::now(),
         );
         assert_eq!(
-            rig.host.runtime.router.held_keys(),
+            rig.host.runtime.router.held_keys(&a),
             [(KEYSYM_CONTROL_L, Origin::Physical)],
             "fixture check: the router must believe realm-a's app is holding the key, or \
              there is nothing for the focus change to strand"
@@ -6457,9 +6795,14 @@ mod tests {
             "fixture check: the focus request must have moved the output"
         );
         assert!(
-            rig.host.runtime.router.held_keys().is_empty(),
-            "the router must not still believe a key is held: the table it kept was \
-             realm-a's, and the binding has left realm-a"
+            rig.host.runtime.router.held_keys(&a).is_empty(),
+            "the losing realm's app must not still be believed to hold the key: the drain \
+             paid it, so the table is empty and the release really went out"
+        );
+        assert!(
+            rig.host.runtime.router.held_keys(&b).is_empty(),
+            "and nothing was moved into the realm that gained the output, which never saw \
+             the press go down"
         );
 
         // The journal records delivery *shape* only — never the key state,

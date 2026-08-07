@@ -242,7 +242,7 @@
 //! size, which would shift the whole button row and could turn a click aimed
 //! at Deny into an Allow. So the view is not cached at arm time; the embedder
 //! feeds it with [`ConsentGrab::set_view`] **from the same value it passes to
-//! [`crate::input::InputRouter::route`], in the same step** — see the nested
+//! [`crate::input::InputRouter::route_physical`], in the same step** — see the nested
 //! backend's `handle_input`, where the two sit on adjacent lines and read one
 //! local. A view that could drift is a view that came from somewhere else.
 //!
@@ -359,8 +359,9 @@ struct ArmedPrompt {
 /// between the router (which owns the gate) and the embedder (which raises
 /// and lowers prompts and drains decisions).
 ///
-/// Shared by `Rc<RefCell<..>>`, the shape [`crate::input::PresenceHook`]
-/// already established for hook-side state the embedder also touches.
+/// Shared by `Rc<RefCell<..>>`, the shape every piece of hook-side state the
+/// embedder also touches uses (the dead-man switch, the router's presence
+/// record).
 #[derive(Debug)]
 pub(crate) struct ConsentGrab {
     prompt: Option<ArmedPrompt>,
@@ -407,7 +408,7 @@ impl ConsentGrab {
     /// Tell the grab the size of the view pointer events arrive in.
     ///
     /// MUST be called with the same `view` the embedder passes to
-    /// [`crate::input::InputRouter::route`], in the same step — module docs
+    /// [`crate::input::InputRouter::route_physical`], in the same step — module docs
     /// explain why a view sourced anywhere else is a correctness hazard
     /// rather than a stale cache.
     pub fn set_view(&mut self, view: (u32, u32)) {
@@ -669,7 +670,7 @@ impl ConsentGrab {
     /// enforce should be held by visibility, not by a comment saying who
     /// the only caller is. This module's own tests still model a physical
     /// event by calling the *private* [`Self::judge_parts`] directly, which
-    /// is the accommodation [`crate::input::PhysicalPresence::note`] makes
+    /// is the accommodation [`crate::input::PhysicalPresenceMap::note`] makes
     /// too — the difference is that it is no longer part of the surface any
     /// other module can reach.
     ///
@@ -852,12 +853,11 @@ fn card_local(view_coord: f64, origin: i32) -> Option<i32> {
 pub(crate) struct ConsentGate<H: PreemptionHook> {
     grab: Rc<RefCell<ConsentGrab>>,
     /// The dispatch turn's instant, shared with the embedder that drives
-    /// [`crate::input::InputRouter::route`] — the shape
-    /// [`crate::input::PresenceHook`] already established for exactly this
-    /// problem: the hook trait carries no clock (the router never reads
-    /// one), and the grab needs one for its guard interval and its deadline
-    /// backstop. The embedder advances this cell to the same single-sample
-    /// `now` the rest of the turn uses.
+    /// [`crate::input::InputRouter::route_physical`] — the shape the router's
+    /// own presence record also uses for exactly this problem: the hook trait
+    /// carries no clock, and the grab needs one for its guard interval and its
+    /// deadline backstop. The embedder advances this cell to the same
+    /// single-sample `now` the rest of the turn uses.
     now: Rc<Cell<Instant>>,
     inner: H,
 }
@@ -869,6 +869,10 @@ impl<H: PreemptionHook> ConsentGate<H> {
 }
 
 impl<H: PreemptionHook> PreemptionHook for ConsentGate<H> {
+    /// The grab is **session-wide**, and no hook is told which realm an event
+    /// was addressed to (WS-E.1.6, [`crate::input::PreemptionHook`]) — so a
+    /// prompt that consumed input for one realm and not another is not
+    /// something this file could express if it wanted to.
     fn observe(&mut self, input: &SeatInput) {
         // Never consuming, never conditional: the tap must see the raw
         // event stream even while this gate is swallowing all of it.

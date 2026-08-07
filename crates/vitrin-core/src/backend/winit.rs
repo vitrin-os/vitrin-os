@@ -1030,7 +1030,8 @@ impl<F: FnMut(NestedWinitEvent)> ApplicationHandler for NestedWinitEventsApp<'_,
 ///   situation as a nested core that does not.
 ///
 /// A release admitted this way is still *paired*: the router delivers a
-/// release only if it delivered its press ([`input::InputRouter::route`]),
+/// release only if it delivered its press
+/// ([`input::InputRouter::route_physical`]),
 /// so a synthetic release for a key the app never saw pressed goes nowhere.
 /// The Wayland half of the same hazard — `wl_keyboard.leave` emits no key
 /// events at all — is covered by [`NestedState::handle_focus`], which pays
@@ -1252,8 +1253,10 @@ pub(crate) struct NestedState {
     grab: Rc<RefCell<ConsentGrab>>,
     /// The dispatch turn's instant, shared with the router's
     /// [`ConsentGate`]. The hook trait carries no clock by design, so the
-    /// embedder that drives `route` advances this cell first — the same
-    /// arrangement `input::PresenceHook` uses. The grab reads it for its
+    /// embedder that drives `route` advances this cell first, and
+    /// `session::route_physical_turn` hands the same sample to the router's
+    /// presence record (`input::InputRouter::observe_at`). The grab reads it
+    /// for its
     /// guard interval (a press must not decide before the human could have
     /// read the card) and its deadline backstop (a grab must not outlive
     /// its petition).
@@ -1427,11 +1430,21 @@ fn run_inner(
         hold_ms = dead_man.hold.as_millis(),
         "dead-man switch armed: holding this key revokes every grant in the session"
     );
-    let router = input::InputRouter::new(ConsentGate::new(
-        Rc::clone(&grab),
+    // The physical-presence map the chokepoint judges `preempted` against.
+    // Handed to the router, which feeds it at its own tap and hands the same
+    // handle on to `Runtime::new` for the kernel — one map, and no wiring step
+    // here to forget (`input::InputRouter`'s "Presence is not a stackable
+    // hook"). On the same `now` cell the grab and the watcher read, so all
+    // three see the dispatch turn's single sampled instant.
+    let router = input::InputRouter::new(
+        Rc::new(RefCell::new(input::PhysicalPresenceMap::new())),
         Rc::clone(&now),
-        DeadManHook::new(Rc::clone(&deadman), Rc::clone(&now), input::NoopHook),
-    ));
+        ConsentGate::new(
+            Rc::clone(&grab),
+            Rc::clone(&now),
+            DeadManHook::new(Rc::clone(&deadman), Rc::clone(&now), input::NoopHook),
+        ),
+    );
     // The session's trusted indicator, minted in `run_session` before the
     // listener accepted anyone (issue #85). Read by `Copy` before the seed is
     // consumed into the runtime below.
@@ -1679,24 +1692,37 @@ pub(crate) fn arm_deadman_timer<D: DeadManHost + 'static>(
 /// sink and assert the drain really happens: deleting it costs the confined
 /// app its Escape key permanently, which is the exact harm tap-through
 /// exists to prevent, and nothing else in the suite notices.
+///
+/// Every event here is **physical**, so it is addressed by the human's
+/// attention ([`input::InputRouter::route_physical`]) — the replay included,
+/// since a withheld chord press is a physical event this core deferred rather
+/// than a new one it invented.
+///
+/// `switch` is an `Option` because one backend genuinely has no dead-man
+/// watcher: a `physical-input-injector` headless build stacks `NoopHook`
+/// (`crate::backend::headless`), so nothing can arm a hold and there is no
+/// replay to drain. Passing `None` there is what keeps the injector on **this**
+/// path rather than on a second, weaker one of its own.
 pub(crate) fn route_turn<H: input::PreemptionHook>(
     router: &mut input::InputRouter<H>,
-    switch: &RefCell<DeadManSwitch>,
+    switch: Option<&RefCell<DeadManSwitch>>,
     inputs: impl IntoIterator<Item = input::SeatInput>,
     view: (u32, u32),
     surface: Option<(u32, u32)>,
     deliver: &mut dyn FnMut(input::SeatDelivery),
 ) {
     for input in inputs {
-        if let Some(delivery) = router.route(input, view, surface) {
+        if let Some(delivery) = router.route_physical(input, view, surface) {
             deliver(delivery);
         }
     }
     // A separate statement from the loop so the switch's borrow ends before
     // routing re-enters the hook that holds it.
-    let replay = switch.borrow_mut().take_replay();
+    let replay = switch
+        .map(|switch| switch.borrow_mut().take_replay())
+        .unwrap_or_default();
     for replayed in replay {
-        if let Some(delivery) = router.route(replayed, view, surface) {
+        if let Some(delivery) = router.route_physical(replayed, view, surface) {
             deliver(delivery);
         }
     }
@@ -1807,7 +1833,17 @@ impl NestedState {
         // `self.runtime` is borrowed mutably, so they are split here rather
         // than reached through `&mut self` twice.
         let scenes = &self.view.scenes;
-        session::route_physical_turn(&mut self.runtime, scenes, &self.deadman, inputs, view);
+        session::route_physical_turn(
+            &mut self.runtime,
+            scenes,
+            Some(&self.deadman),
+            inputs,
+            view,
+            // The very sample taken above, not a second `Instant::now()`: the
+            // grab, the watcher and the presence tap all judge this turn
+            // against one instant.
+            self.now.get(),
+        );
         // Backstop 2 of 3 for the elapse check (`crate::deadman`): the
         // switch is already being asked about this turn's events, so ask it
         // about the clock too. `OffChain` — a host input event is not a
@@ -1847,11 +1883,20 @@ impl NestedState {
     ///
     /// Keys an *agent* is holding are not touched, which is why the router
     /// method is [`input::InputRouter::release_physical_keys`] and not a blanket
-    /// drain: both origins share one router (`session::route_seat`), the host
-    /// window's keyboard focus is not part of an agent's actuation path, and
-    /// a release synthesised for an agent's key would reach the shim and the
-    /// flight recorder tagged as the human's. That method's docs carry the
-    /// full argument and the one bounded imprecision.
+    /// drain: both origins share a realm's seat state (`session::route_seat`),
+    /// the host window's keyboard focus is not part of an agent's actuation
+    /// path, and a release synthesised for an agent's key would reach the shim
+    /// and the flight recorder tagged as the human's. That method's docs carry
+    /// the full argument and the one bounded imprecision.
+    ///
+    /// **Keys only, and buttons deliberately not** — the asymmetry with
+    /// [`input::InputRouter::bind_to`]'s drain, which pays both. This event is
+    /// the host telling the core its window lost *keyboard* focus; winit
+    /// reports pointer state separately (a `CursorLeft`, and on a real drag the
+    /// host keeps sending motion), so synthesising a button release here would
+    /// end a drag the human is still making. A realm switch is the other case:
+    /// there the human's next release is addressed to a different realm
+    /// whatever the host does, so both tables have to be paid.
     ///
     /// Ordering: the hold is forgotten *before* the drain, so a chord in
     /// progress is already cancelled when the releases go out. The chord's
@@ -1869,9 +1914,10 @@ impl NestedState {
         // takes: the router hands back the deliveries while the sink reaches
         // the realm's shim session. The releases a focus change owes an app
         // must reach the app that was *told* about the presses, which is the
-        // realm the output is bound to — `session::deliver_physical` reads
-        // that binding from the scene registry itself, so this site has no
-        // binding to get wrong.
+        // realm the human's input is bound to — the router names its own
+        // debtor (`bound_realm`), and `session::deliver_physical` resolves the
+        // same binding from the scene registry, so this site has no binding to
+        // get wrong.
         let scenes = &self.view.scenes;
         let session::Runtime {
             router,
@@ -1879,7 +1925,10 @@ impl NestedState {
             kernel,
             ..
         } = &mut self.runtime;
-        for delivery in router.release_physical_keys() {
+        let Some(bound) = router.bound_realm().cloned() else {
+            return;
+        };
+        for delivery in router.release_physical_keys(&bound) {
             debug!("releasing a key held across focus loss so it cannot latch in the app");
             session::deliver_physical(realms, scenes, &mut kernel.recorder, delivery);
         }
@@ -3738,11 +3787,14 @@ mod tests {
         // ever replayed.
         let deadman = Rc::new(RefCell::new(DeadManSwitch::new(DeadManConfig::default())));
         let now = Rc::new(Cell::new(Instant::now()));
-        let mut router = input::InputRouter::new(DeadManHook::new(
+        let mut router = input::InputRouter::detached(DeadManHook::new(
             Rc::clone(&deadman),
             Rc::clone(&now),
             input::NoopHook,
         ));
+        // The human's attention has to be somewhere for a physical delivery
+        // to have a destination (WS-E.1.6).
+        assert!(router.bind_to(&crate::input::tests::test_realm()).is_none());
         let view = (640u32, 480u32);
         let surface = Some(view);
         let mut delivered: Vec<input::SeatDeliveryKind> = Vec::new();
@@ -3751,7 +3803,7 @@ mod tests {
         // tap-or-chord question.
         route_turn(
             &mut router,
-            &deadman,
+            Some(&deadman),
             [crate::input::tests::chord_press()],
             view,
             surface,
@@ -3767,7 +3819,7 @@ mod tests {
             .observe_event(&crate::input::tests::chord_release(), now.get());
         route_turn(
             &mut router,
-            &deadman,
+            Some(&deadman),
             [crate::input::tests::chord_release()],
             view,
             surface,
@@ -3814,7 +3866,7 @@ mod tests {
         // handle, which is only possible if they are the same cell.
         let deadman = Rc::new(RefCell::new(DeadManSwitch::new(DeadManConfig::default())));
         let now = Rc::new(Cell::new(Instant::now()));
-        let mut router = input::InputRouter::new(DeadManHook::new(
+        let mut router = input::InputRouter::detached(DeadManHook::new(
             Rc::clone(&deadman),
             Rc::clone(&now),
             input::NoopHook,
@@ -3822,7 +3874,7 @@ mod tests {
         let view = (640u32, 480u32);
 
         assert_eq!(deadman.borrow().deadline(), None);
-        let _ = router.route(crate::input::tests::chord_press(), view, Some(view));
+        let _ = router.route_physical(crate::input::tests::chord_press(), view, Some(view));
         assert_eq!(
             deadman.borrow().deadline(),
             Some(now.get() + crate::deadman::DEFAULT_HOLD),

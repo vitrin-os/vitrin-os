@@ -294,10 +294,10 @@
 //! | `session::shutdown_realm` | one ladder became one ladder per realm |
 //! | `session::emit_presented` | one shim server became every shim server |
 //! | `session::dispatch_principal`'s liveness derivation | `is_some_and` over "the" realm became a **per-realm** question (`ServerCtx::realm_is_live`), applied by `principal::serve_facet_use` to the realm the grant row names. "Is *any* realm live" was the obvious rewrite and is fail-**open** across realms: a dead realm's grant would clear `no_surface` on a living sibling's account and be served a frame anyway. (Which frame changed under WS-E.1.3 -- per-realm scenes and a per-realm, pruned capture cache mean the fail-open reading would now serve the dead realm's own stale composition rather than the sibling's pixels. Milder, still forbidden: `no_surface` is documented as "never a stale frame") |
-//! | `session::route_seat` | reached for "the" realm; now takes `session::seat_target`, the one function that names the delivery target, and binds the input router's generation to it |
-//! | `crate::input::InputRouter` | one router serves the session, so its per-shim-generation state had to learn *whose* generation it is (`bind_to` / `reset_for`): an unconditional reset on any realm's death latches a key down in a surviving realm's app |
+//! | `session::route_seat` | reached for "the" realm; WS-E.1.2 pointed it at `session::seat_target`, and WS-E.1.6 replaced that with the realm each admitted actuation's own **grant** names, carried on the event |
+//! | `crate::input::InputRouter` | one router serves the session, so its per-shim-generation state had to learn *whose* generation it is (`bind_to` / `reset_for`): an unconditional reset on any realm's death latches a key down in a surviving realm's app. WS-E.1.6 finished the job -- the state is a map keyed by realm, so there is no shared table left to clear by accident |
 //! | `crate::shim::ShimServer::connection_closed` | takes the dying realm's id, for that scoped reset |
-//! | `backend::winit::deliver_physical` / `route_physical_inputs` | took `&Option<RealmRuntime>`; now share `seat_target` with the agent path and bind the same generation |
+//! | `backend::winit::deliver_physical` / `route_physical_inputs` | took `&Option<RealmRuntime>`; now resolve the realm through `session::physical_seat_target` (the human's attention), which since WS-E.1.6 the agent path no longer shares |
 //! | `vitrin_ipc::paths` | still derives every path from the id, but the runtime directory is *flat*, so free-form ids made two realms able to claim one entry (`foo` vs `foo.lock`); the tree's namespace is now stated there and enforced by `reject_runtime_name_collisions` |
 //! | `tests/integration/harness.py`, `examples/realm.toml` | wrote and taught the exactly-one rule at length |
 //!
@@ -341,7 +341,7 @@
 //! |---|---|---|
 //! | ~~[`crate::scene::Scene`] -- one scene, at most one committed surface~~ | ~~every realm's shim commits into the same scene, so the last committer wins and only one realm is ever visible~~ **Closed by WS-E.1.3**: one [`crate::scene::Scene`] per realm, held in [`crate::scene::RealmScenes`], with exactly one bound to the output. Every realm still holds at most one surface -- that is the MVP's single-maximized model *per app*, and `scene::layout` says it must never grow | -- |
 //! | ~~`session::Runtime::view_cache` / `principal::ServerCtx::realm_view`~~ | ~~one frame for the whole session, not one per realm: while two realms are **live**, a capture under a grant over realm A can carry realm B's pixels~~ **Closed by WS-E.1.3**: the cache is keyed by realm and `ServerCtx::realm_view` is a *function of the realm id*, applied to the realm the grant row names, so there is no "the view" left to hand the chokepoint by mistake | -- |
-//! | [`crate::input::InputRouter`], `PhysicalPresence` | one router and one presence tracker for the session, so `session::seat_target` picks one realm to deliver to and a human at the keyboard preempts agent actuation in *every* realm at once. The router's *state* is scoped to the realm it was bound to, so a realm's death no longer clears a sibling's; what is still shared is the router itself | WS-E.1.6 |
+//! | ~~[`crate::input::InputRouter`], `PhysicalPresence`~~ | ~~one router and one presence tracker for the session, so `session::seat_target` picks one realm to deliver to and a human at the keyboard preempts agent actuation in *every* realm at once~~ **Closed by WS-E.1.6**: the router holds one [`crate::input::RealmSeat`] per realm and two named addressing rules (physical follows the bound realm, an agent's actuation follows its grant's realm), and presence is a [`crate::input::PhysicalPresenceMap`] keyed the same way. What is still shared, deliberately, is the **hook stack** -- the consent grab and the dead-man watcher must see every physical event whatever realm is bound, and `PreemptionHook::gate` is not even told the realm so a realm-scoped gate is inexpressible | -- |
 //! | The **output**: one view size, one bound realm, one retained framebuffer pair | every realm's shim is configured with the output's geometry and every realm's view composes at it; a hidden realm renders but is never presented. Deliberate and permanent at this layer -- WS-E.1.3 decision 3 (no stacking, no overlap, no resize) and PRD §5.1, which exiles window-management policy from the core | -- (by design) |
 //! | [`crate::scene::layout`] | single-maximized placement, the MVP's whole layout policy | D-018 |
 //!
@@ -489,6 +489,15 @@ pub(crate) const CONFIG_FILE_NAME: &str = "realm.toml";
 /// counted here and never was -- see "What no number here bounds"). A cap
 /// whose worst case is a single-digit percentage of RAM is not the thing
 /// that will fail first.
+///
+/// **WS-E.1.6 (issue #212) added per-realm state and it does not move this
+/// number.** The input router now holds one [`crate::input::RealmSeat`] per
+/// realm and one [`crate::input::PhysicalPresence`] per realm the human has
+/// been in. Measured on x86-64: 96 bytes and 40 bytes respectively, plus each
+/// one's `Vec` heap for the presses actually outstanding. Sixteen realms is
+/// therefore about **2 KiB**, against 500 MiB of pixels. It is recorded here
+/// because this constant's justification has been wrong three times by
+/// *asserting* a cost instead of measuring one -- not because 2 KiB matters.
 ///
 /// **What to re-derive from if the cap is ever raised** -- and it is a
 /// different number from last time, so inheriting *this* paragraph would

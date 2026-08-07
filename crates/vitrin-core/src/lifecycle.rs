@@ -1491,7 +1491,7 @@ mod tests {
                 log,
                 scene: Scene::new(),
                 shim: None,
-                router: InputRouter::new(NoopHook),
+                router: InputRouter::detached(NoopHook),
                 retained: FakeRetained::new(),
                 realms: crate::realm::tests::registry_with(&["realm-0"]),
             }

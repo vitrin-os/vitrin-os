@@ -330,53 +330,65 @@ class OneRealmDies(IntegrationTest):
 
 
 class CrossRealmActuation(IntegrationTest):
-    """An actuation is refused unless its grant names the realm the seat serves.
+    """**Each grant's actuation reaches its own realm** (WS-E.1.6, issue #212).
 
     The write-side twin of the capture test above, at the wire level and
-    against the mock shim — so it runs everywhere, including on a machine
-    with no built C shim. `test_real_actuation.py`'s `RealActuationCrossRealm`
-    is the same claim proved by a real app's own receipt; this one proves
-    what the *agent* is told and what the journal records.
+    against the mock shim — so it runs everywhere, including on a machine with
+    no built C shim. `test_real_actuation.py`'s `RealActuationCrossRealm` is
+    the same claim proved by a real app's own receipt; this one proves what the
+    *agent* is told and what the journal records.
 
-    Note which realm the seat serves: `session::seat_target` takes the first
-    still-serving realm in **id order**, and `browser` sorts before both
-    `editor` and `realm-0`. So the well-known realm is *not* the delivery
-    target here, which is exactly the configuration where the missing guard
-    would have sent a `realm-0` grant's keystrokes into the browser.
+    # What this asserted before, and why it is inverted
+
+    WS-E.1.2 raised `MAX_REALMS` above 1 while the session still had one input
+    router and one delivery target, so an actuation under a grant naming any
+    other realm would have been delivered into a sibling's app. The stopgap
+    refused it `internal`, and this test asserted the refusal — that exactly
+    one text delivery happened, into the realm the seat served, and that the
+    other was journalled `internal`.
+
+    #212 replaced the refusal with per-realm routing, so the property is now
+    that **both** actuations are delivered, each into the realm its own grant
+    names, and that the journal says so realm by realm. `browser` sorts before
+    `realm-0`, so `realm-0` is deliberately *not* the realm the output binds
+    to — which makes its delivery the one that could only happen if seat
+    delivery follows the grant rather than the binding.
     """
 
-    def test_only_a_grant_over_the_served_realm_may_actuate(self):
-        from vitrin_os import errors
-
+    def test_each_grants_actuation_reaches_its_own_realm(self):
         # `seat=True`: the mock shims mint their seat objects, so an admitted
         # actuation is really delivered rather than dropped for want of one —
-        # without it the negative half would pass for the wrong reason.
+        # without it this would pass for the wrong reason.
         with self.core(realms=EXTRA_REALMS, seat=True) as core:
             conn = core.connect()
-            served = whole_realm_grant(conn, realm="browser")
-            unserved = whole_realm_grant(conn, realm="realm-0")
-            # A committed surface, so neither actuation can refuse
-            # `no_surface` — the refusal below has to be the routing guard
-            # and nothing else.
-            capture_when_ready(served)
+            bound = whole_realm_grant(conn, realm="browser")
+            hidden = whole_realm_grant(conn, realm="realm-0")
+            # A committed surface in each, so neither actuation can refuse
+            # `no_surface` — what is being measured is routing and nothing
+            # else.
+            capture_when_ready(bound)
+            capture_when_ready(hidden)
 
-            with self.assertRaises(errors.OperationFailed):
-                unserved.text.type("into the wrong app")
-            # Recoverable: the connection is still serving.
-            conn.sync(unserved)
-
-            served.text.type("into the right one")
-            conn.sync(served)
+            hidden.text.type("into the realm nobody is watching")
+            conn.sync(hidden)
+            bound.text.type("into the realm on screen")
+            conn.sync(bound)
             conn.close()
 
-        # One delivery, and it names the realm that received it (the field
-        # added by the second WS-E.1.2 review: without it the journal could
-        # say a keystroke was delivered and not to whom).
+        # Two deliveries, each naming its own realm. A core that still had one
+        # delivery target would name one realm twice — or, with the old
+        # stopgap, deliver once and refuse once.
         delivered = [e for e in core.entries() if e["kind"] == "seat_delivered"]
         self.assertEqual(
-            [(e["realm"], e["event"]) for e in delivered],
-            [("browser", "text")],
-            f"exactly one text delivery, into the seat's realm; got {delivered}",
+            sorted((e["realm"], e["event"]) for e in delivered),
+            [("browser", "text"), ("realm-0", "text")],
+            f"each actuation must be delivered into the realm ITS OWN grant names; got "
+            f"{delivered}",
+        )
+        self.assertEqual(
+            {e["origin"] for e in delivered},
+            {"emulated"},
+            "both are agents' actuations, and the tag must say so (B2)",
         )
         refused = [
             e
@@ -384,9 +396,10 @@ class CrossRealmActuation(IntegrationTest):
             if e["kind"] == "use_decision" and e.get("refusal") == "internal"
         ]
         self.assertEqual(
-            len(refused),
-            1,
-            f"the cross-realm actuation must be journalled as refused internal; got {refused}",
+            refused,
+            [],
+            f"nothing may be refused `internal`: WS-E.1.2's cross-realm stopgap is deleted, "
+            f"not merely quieter. Got {refused}",
         )
 
 

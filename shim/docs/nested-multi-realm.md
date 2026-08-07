@@ -17,6 +17,7 @@ machine-checkable and are checked:
 | A **hidden** realm keeps being paced and keeps repainting | `test_two_realms.py`'s `RealTwoRealmsHiddenKeepsPainting` (a paced `damage-client` off-screen beside a static `solid-client` on it); `session.rs`'s `a_hidden_realm_is_paced_and_its_capture_keeps_changing` | headless |
 | The nested window composes the **bound** realm, and a bind re-uploads its texture | `backend/winit.rs`'s `the_window_shows_the_bound_realm_and_a_bind_re_uploads` — display-free assertions on `window_pixels` and `TextureKey` only | none (pure functions) |
 | **A human sees the right realm in the host window** | *this page* | nested, by hand |
+| **A real key held across a real focus switch is released into the realm being left** | *this page*, step 9 (WS-E.1.6/#212) | nested, by hand |
 
 The fourth is not automatable here and the reason is structural rather than a
 missing budget: **GitHub runners have no display**, and D-019(4) records
@@ -62,10 +63,10 @@ sed -i "s#REPO#$PWD#g" /tmp/two-realms.toml
 ```
 
 `realm-0` is mandatory in every configuration and sorts first, so it is the
-realm the output binds to; `second` is the hidden one. (Which realm gets the
-output is a **placeholder** — the first to attach — because *who may move the
-binding* is a separate authority question, WS-E.1.4/#210. When that lands,
-this page grows a step for moving it.)
+realm the output binds to at startup; `second` is the hidden one. Moving the
+binding afterwards is a client's to do, through the `layout.focus` grant verb
+(WS-E.1.4/#210) — step 8 below does it, and step 9 uses it for the one thing
+about **input routing** that no CI gate can reach.
 
 Then, from inside your nesting host:
 
@@ -123,10 +124,12 @@ target/debug/vitrind --nested --consent=auto-approve \
    already asserts those colours byte-exactly; what you are confirming here
    is that the *nested* backend serves them too, since it composes captures
    on the CPU rather than reading its window back.
-4. **The agent cursor follows the visible realm only.** Actuate a pointer move
-   under the grant over `realm-0` and watch the cyan crosshair appear in the
-   window. Do the same under the grant over `second` and **no sprite appears
-   at all** — the sprite is painted in the output's coordinates over the
+4. **The agent cursor follows the visible realm only — but the actuation does
+   not.** Actuate a pointer move under the grant over `realm-0` and watch the
+   cyan crosshair appear in the window. Do the same under the grant over
+   `second`: the click really is **delivered into `second`'s app** (WS-E.1.6
+   routes per realm; before it, the core refused this `internal`) and yet
+   **no sprite appears at all** — the sprite is painted in the output's coordinates over the
    output's realm, so an agent acting inside a hidden realm draws nothing.
    That is a *published limit*, not a defect to file: it reintroduces, for
    hidden realms, exactly the "the human cannot see that an agent is acting"
@@ -160,9 +163,85 @@ target/debug/vitrind --nested --consent=auto-approve \
 7. **Kill the *visible* realm's app** (`pkill -f 'colour 0000ff'`). The window
    turns **red**: the output does not stay bound to a realm that is gone, it
    moves to the first still-serving realm in id order — the same rule
-   `session::seat_target` uses, so the realm you are watching and the realm an
-   actuation reaches keep agreeing. Kill `second` too and the window falls back
-   to the deterministic background, because now nothing is serving.
+   `session::physical_seat_target` uses, so the realm you are watching and the
+   realm **your own** keystrokes reach keep agreeing. (An *agent's* actuation
+   never followed this; since WS-E.1.6 it goes to the realm its own grant
+   names, watched or not.) Kill `second` too and the window falls back to the
+   deterministic background, because now nothing is serving.
+
+8. **Move the output with a real `focus`, and watch the human's input move
+   with it.** Two realms are running; bind the output to the red one from a
+   client, then type into it.
+
+   ```bash
+   PYTHONPATH="$PWD/sdk/python/src" python3 - <<'PY'
+   import os, time
+   import vitrin_os
+
+   socket = os.path.join(
+       os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid()),
+       "vitrin-0", "core.sock",
+   )
+   conn = vitrin_os.connect(
+       socket,
+       identity="vitrin://local/agent/demo",
+       credential=open("examples/principals.toml").read().split('"')[-2],
+   )
+   grant = conn.request_grant(realm="second", verbs=("observe", "layout.focus"))
+   grant.await_consent()
+   time.sleep(3)          # time to put your hands on the keyboard, for step 9
+   grant.focus()
+   conn.sync()
+   print("focused 'second'")
+   PY
+   ```
+
+   The window turns **red**, and — this is the part to check by eye — the
+   human's keyboard and pointer go with it. Replace `solid-client` with
+   `input-echo-client` in the realm file if you want to read that back: it
+   prints one `IN ...` line per event it receives, on the core's stdout.
+
+9. **THE STEP NO CI GATE CAN REACH: hold a real key across a real switch.**
+   This is issue #212's manual criterion and it is the reason this section
+   exists. Run the previous step again with `input-echo-client` in **both**
+   realms, and this time **hold a physical modifier down** — Left Ctrl is a
+   good choice, because it is in the core's layout-invariant scancode table
+   and so resolves without any host keymap — from before `grant.focus()` fires
+   until well after it does.
+
+   ```toml
+   # in /tmp/two-realms.toml, for this step only
+   command = "REPO/shim/build/input-echo-client"
+   args = ["--run-ms", "600000"]
+   ```
+
+   What must happen, in the core's stdout:
+
+   - **before** the focus: `realm-0`'s app prints
+     `IN key keycode=... state=1 ... name=Control_L` — the press.
+   - **at** the focus, with your finger still down: `realm-0`'s app prints the
+     matching `state=0` **release**. Nobody let go. The core sent it because
+     your real release is now addressed to `second`, and an entry left behind
+     would latch `Ctrl` down in an app you can no longer see.
+   - `second`'s app prints **nothing** for that key. It never saw the press,
+     so it is owed no release.
+   - when you actually let go, nothing further arrives anywhere: the release
+     pairs with no delivered press in `second` and is dropped.
+
+   **The app cannot tell that synthesised release from a real one, and that is
+   the published cost** (`docs/book/src/limits.md`, and
+   `InputRouter::bind_to`'s own docs). The alternative is a latched modifier
+   forever. If instead you see `realm-0` *keep* believing Ctrl is down — every
+   later keystroke in it arriving shifted or Ctrl-modified once you focus back
+   — the drain did not run, and `InputRouter::bind_to` is where to look.
+
+   Why this is not a CI gate: `SeatInput::physical` is private to
+   `crate::input`, its only production producer is the nested backend's winit
+   intake, headless has no input device, and headless is the only backend CI
+   runs (D-019(4)). The `physical-input-injector` build
+   (`tests/integration/test_input_switch.py`) covers the *routing* half in CI
+   through the same `intake_physical` entry point — a real finger on a real
+   key across a real host compositor is what only this page can hold.
 
 ## What a failure here looks like
 

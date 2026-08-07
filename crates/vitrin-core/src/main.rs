@@ -493,6 +493,16 @@ enum Action {
         /// `a_plain_build_cannot_name_the_consent_injector_flag`.
         #[cfg(feature = "consent-injector")]
         consent_injector_fd: Option<std::os::fd::RawFd>,
+        /// The `--physical-input-fd N` channel (issue #212): an inherited
+        /// `AF_UNIX`/`SOCK_STREAM` socketpair end on which a harness makes
+        /// physical-origin seat input happen in this headless session.
+        ///
+        /// `#[cfg(feature = "physical-input-injector")]`, so a deployment
+        /// build cannot even **name** the flag: `parse_args` has no arm for it
+        /// and exits with ``unknown argument `--physical-input-fd` ``. Pinned
+        /// by `a_plain_build_cannot_name_the_physical_input_flag`.
+        #[cfg(feature = "physical-input-injector")]
+        physical_input_fd: Option<std::os::fd::RawFd>,
     },
     Help,
     Version,
@@ -544,6 +554,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut agent_cursor = false;
     #[cfg(feature = "consent-injector")]
     let mut consent_injector_fd: Option<std::os::fd::RawFd> = None;
+    #[cfg(feature = "physical-input-injector")]
+    let mut physical_input_fd: Option<std::os::fd::RawFd> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg {
@@ -617,7 +629,15 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     "`--consent-injector-fd` requires an inherited descriptor number \
                      (e.g. `--consent-injector-fd 7`)",
                 )?;
-                set_injector_fd(&mut consent_injector_fd, value)?;
+                set_injector_fd(&mut consent_injector_fd, "--consent-injector-fd", value)?;
+            }
+            #[cfg(feature = "physical-input-injector")]
+            "--physical-input-fd" => {
+                let value = args.next().ok_or(
+                    "`--physical-input-fd` requires an inherited descriptor number \
+                     (e.g. `--physical-input-fd 7`)",
+                )?;
+                set_injector_fd(&mut physical_input_fd, "--physical-input-fd", value)?;
             }
             "--help" | "-h" => return Ok(Action::Help),
             "--version" | "-V" => return Ok(Action::Version),
@@ -629,7 +649,12 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             other => {
                 #[cfg(feature = "consent-injector")]
                 if let Some(value) = other.strip_prefix("--consent-injector-fd=") {
-                    set_injector_fd(&mut consent_injector_fd, value)?;
+                    set_injector_fd(&mut consent_injector_fd, "--consent-injector-fd", value)?;
+                    continue;
+                }
+                #[cfg(feature = "physical-input-injector")]
+                if let Some(value) = other.strip_prefix("--physical-input-fd=") {
+                    set_injector_fd(&mut physical_input_fd, "--physical-input-fd", value)?;
                     continue;
                 }
                 if let Some(value) = other.strip_prefix("--consent=") {
@@ -719,6 +744,22 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         );
     }
 
+    // `--physical-input-fd` names a channel that exists on the headless
+    // backend only (issue #212): a nested session has a real human at a real
+    // keyboard, and the adoption, the calloop source and the routing turn all
+    // live in `backend::headless`. A nested run with the flag would silently
+    // ignore it, which is the "instrumented from the outside, plain in
+    // behaviour" state the consent channel's own guard exists to prevent.
+    #[cfg(feature = "physical-input-injector")]
+    if physical_input_fd.is_some() && !matches!(mode, Some(Mode::Headless)) {
+        return Err(
+            "`--physical-input-fd` requires `--headless`: the channel feeds the headless \
+             backend's physical intake, and a nested session already has a real human at a \
+             real keyboard."
+                .into(),
+        );
+    }
+
     // `--help`/`--version` already returned above, so only the run modes
     // remain to resolve; `--size` is meaningless without `--headless`.
     match (mode, size) {
@@ -775,6 +816,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             agent_cursor,
             #[cfg(feature = "consent-injector")]
             consent_injector_fd,
+            #[cfg(feature = "physical-input-injector")]
+            physical_input_fd,
         }),
         (None, Some(_)) => Err("`--size` requires `--headless`".into()),
         (None, None) => Err("no mode given (expected `--nested` or `--headless`)".into()),
@@ -799,17 +842,25 @@ const HEADLESS_INTERACTIVE_REFUSAL: &str =
 /// `AF_UNIX`/`SOCK_STREAM` socket is checked at adoption
 /// (`consent::injector::validate_injector_fd`), which is also a startup
 /// error. Both halves fail closed, and neither is a warning.
-#[cfg(feature = "consent-injector")]
-fn set_injector_fd(slot: &mut Option<std::os::fd::RawFd>, value: &str) -> Result<(), String> {
+///
+/// `flag` is a parameter rather than a constant because a second injector
+/// channel now takes the same shape (`--physical-input-fd`, issue #212) and
+/// two copies of these four rules would be two things to keep right.
+#[cfg(any(feature = "consent-injector", feature = "physical-input-injector"))]
+fn set_injector_fd(
+    slot: &mut Option<std::os::fd::RawFd>,
+    flag: &str,
+    value: &str,
+) -> Result<(), String> {
     if slot.is_some() {
-        return Err("`--consent-injector-fd` given more than once".into());
+        return Err(format!("`{flag}` given more than once"));
     }
-    let number: std::os::fd::RawFd = value.parse().map_err(|_| {
-        format!("`--consent-injector-fd` `{value}`: not a descriptor number (e.g. `7`)")
-    })?;
+    let number: std::os::fd::RawFd = value
+        .parse()
+        .map_err(|_| format!("`{flag}` `{value}`: not a descriptor number (e.g. `7`)"))?;
     if number < 3 {
         return Err(format!(
-            "`--consent-injector-fd {number}`: 0, 1 and 2 are this process's own standard \
+            "`{flag} {number}`: 0, 1 and 2 are this process's own standard \
              descriptors; the channel must be inherited on 3 or above"
         ));
     }
@@ -1006,6 +1057,8 @@ fn main() -> ExitCode {
             agent_cursor,
             #[cfg(feature = "consent-injector")]
             consent_injector_fd,
+            #[cfg(feature = "physical-input-injector")]
+            physical_input_fd,
         } => {
             init_tracing();
             #[cfg(feature = "consent-injector")]
@@ -1027,6 +1080,8 @@ fn main() -> ExitCode {
                         agent_cursor,
                         #[cfg(feature = "consent-injector")]
                         consent_injector_fd,
+                        #[cfg(feature = "physical-input-injector")]
+                        physical_input_fd,
                         seed,
                     )
                 },
@@ -1964,6 +2019,8 @@ mod tests {
                 dead_man: DeadManConfig::default(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
+                #[cfg(feature = "physical-input-injector")]
+                physical_input_fd: None,
             })
         );
     }
@@ -1987,6 +2044,8 @@ mod tests {
                 dead_man: DeadManConfig::default(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
+                #[cfg(feature = "physical-input-injector")]
+                physical_input_fd: None,
             })
         );
         assert_eq!(
@@ -2003,6 +2062,8 @@ mod tests {
                 dead_man: DeadManConfig::default(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
+                #[cfg(feature = "physical-input-injector")]
+                physical_input_fd: None,
             })
         );
     }
@@ -2029,6 +2090,8 @@ mod tests {
                     dead_man: DeadManConfig::default(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
+                    #[cfg(feature = "physical-input-injector")]
+                    physical_input_fd: None,
                 })
             );
         }
@@ -2094,6 +2157,104 @@ mod tests {
             assert!(
                 err.contains("unknown argument") && err.contains("--consent-injector-fd"),
                 "the flag must be an unknown argument, not a recognised-and-ignored one: {err}"
+            );
+        }
+    }
+
+    /// **A deployment build cannot even name the physical-input hook** (issue
+    /// #212, the same compile-time half as the consent channel's).
+    ///
+    /// `--physical-input-fd` has no parse arm without the feature, so it falls
+    /// through to the unknown-argument error like any typo. It matters more
+    /// here than for either existing injector, because this is the one hook
+    /// that can mint **physical-origin** input: a build that cannot name it
+    /// cannot be talked into producing one.
+    #[cfg(not(feature = "physical-input-injector"))]
+    #[test]
+    fn a_plain_build_cannot_name_the_physical_input_flag() {
+        for args in [
+            vec!["--headless", "--physical-input-fd", "7"],
+            vec!["--headless", "--physical-input-fd=7"],
+            vec!["--nested", "--physical-input-fd=7"],
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err(&format!("{args:?} must not parse in a deployment build"));
+            assert!(
+                err.contains("unknown argument") && err.contains("--physical-input-fd"),
+                "the flag must be an unknown argument, not a recognised-and-ignored one: {err}"
+            );
+        }
+    }
+
+    /// **An instrumented build parses the flag in both spellings, once**
+    /// (issue #212).
+    ///
+    /// The shape checks are the consent channel's, shared with it since both
+    /// go through `set_injector_fd`: a repeat is refused, a non-number is
+    /// refused, and a descriptor this process's own stdio occupies is refused
+    /// — the last because adopting 0/1/2 would take the core's log away from
+    /// it and turn every `tracing::warn!` into channel garbage.
+    #[cfg(feature = "physical-input-injector")]
+    #[test]
+    fn the_physical_input_flag_parses_once_and_fails_closed() {
+        for args in [
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--physical-input-fd",
+                "7",
+            ],
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--physical-input-fd=7",
+            ],
+        ] {
+            match parse_args(args.clone()) {
+                Ok(Action::RunHeadless {
+                    physical_input_fd, ..
+                }) => assert_eq!(physical_input_fd, Some(7)),
+                other => panic!("{args:?} must parse as an instrumented headless run: {other:?}"),
+            }
+        }
+        for (args, needle) in [
+            (
+                vec![
+                    "--headless",
+                    "--consent=auto-approve",
+                    "--physical-input-fd=7",
+                    "--physical-input-fd=8",
+                ],
+                "given more than once",
+            ),
+            (
+                vec![
+                    "--headless",
+                    "--consent=auto-approve",
+                    "--physical-input-fd=not-a-number",
+                ],
+                "not a descriptor number",
+            ),
+            (
+                vec![
+                    "--headless",
+                    "--consent=auto-approve",
+                    "--physical-input-fd=1",
+                ],
+                "standard descriptors",
+            ),
+            // Headless only: a nested run has a real human, and the channel's
+            // whole machinery lives on the other backend.
+            (
+                vec!["--nested", "--physical-input-fd=7"],
+                "requires `--headless`",
+            ),
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err(&format!("{args:?} must be refused at parse time"));
+            assert!(
+                err.contains(needle) && err.contains("--physical-input-fd"),
+                "the refusal must name the flag and the reason: {err}"
             );
         }
     }
@@ -2229,6 +2390,8 @@ mod tests {
                 dead_man: DeadManConfig::default(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
+                #[cfg(feature = "physical-input-injector")]
+                physical_input_fd: None,
             })
         );
         for args in [
@@ -2258,6 +2421,8 @@ mod tests {
                     dead_man: DeadManConfig::default(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
+                    #[cfg(feature = "physical-input-injector")]
+                    physical_input_fd: None,
                 })
             );
         }
@@ -2312,6 +2477,8 @@ mod tests {
                     dead_man: DeadManConfig::default(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
+                    #[cfg(feature = "physical-input-injector")]
+                    physical_input_fd: None,
                 })
             );
         }
@@ -2382,6 +2549,8 @@ mod tests {
                     dead_man: DeadManConfig::default(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
+                    #[cfg(feature = "physical-input-injector")]
+                    physical_input_fd: None,
                 })
             );
         }
@@ -2445,6 +2614,8 @@ mod tests {
                     dead_man: DeadManConfig::default(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
+                    #[cfg(feature = "physical-input-injector")]
+                    physical_input_fd: None,
                 })
             );
         }
@@ -2944,6 +3115,8 @@ mod tests {
                     dead_man: DeadManConfig::default(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
+                    #[cfg(feature = "physical-input-injector")]
+                    physical_input_fd: None,
                 })
             );
         }
@@ -3008,6 +3181,8 @@ mod tests {
                 dead_man: DeadManConfig::default(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
+                #[cfg(feature = "physical-input-injector")]
+                physical_input_fd: None,
             })
         );
     }

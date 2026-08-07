@@ -652,9 +652,9 @@ jobs:
               missing=1
             fi
           done
-          for gate in test_real_trust_band.py; do
+          for gate in test_real_trust_band.py test_input_switch.py; do
             if [ ! -f "tests/integration/$gate" ]; then
-              echo "::error::named property gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with issue #139's evidence contributing nothing. Restore it, or retire it from run.sh's PROPERTY_GATES, this list, and tests/integration/README.md's gate table together."
+              echo "::error::named property gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with that property's evidence contributing nothing. Restore it, or retire it from run.sh's PROPERTY_GATES, this list, and tests/integration/README.md's gate table together."
               missing=1
             fi
           done
@@ -663,7 +663,7 @@ jobs:
           # run.sh's would hand the gates a binary missing a hook they depend
           # on, and every symptom of that is a confusing timeout somewhere
           # else. Assert the two agree, here, in seconds.
-          expected='INJECTORS=vitrin-core/dead-man-injector,vitrin-core/consent-injector'
+          expected='INJECTORS=vitrin-core/dead-man-injector,vitrin-core/consent-injector,vitrin-core/physical-input-injector'
           if ! grep -qxF "$expected" tests/integration/run.sh; then
             echo "::error::tests/integration/run.sh no longer declares '$expected'. The warm-build step in this job hard-codes that same feature list and runs first, so the two must match exactly -- update both together."
             missing=1
@@ -722,15 +722,22 @@ jobs:
         #   - `vitrin-core/dead-man-injector` (issue #109): otherwise no
         #     SIGUSR1 handler is installed, and `test_real_deadman.py` sends
         #     the core one.
+        #   - `vitrin-core/physical-input-injector` (issue #212): otherwise
+        #     `--physical-input-fd N` is an unknown argument and the core
+        #     exits at parsing, so `test_input_switch.py` cannot make
+        #     physical-origin input happen at all. CI has no input device and
+        #     headless is the only backend it runs (D-019(4)), so this is the
+        #     only way the "physical input follows the bound realm" half of
+        #     #212 has a mock-free gate.
         #   - `vitrin-core/consent-injector` (issue #138): otherwise
         #     `--headless --consent=interactive --consent-injector-fd N` is
         #     refused at startup and the core `test_real_consent.py` drives
         #     never binds its socket.
-        # Both features are purely additive and never enabled in a deployment
+        # All three features are purely additive and never enabled in a deployment
         # build (see their docs in crates/vitrin-core/Cargo.toml), so they
         # change nothing else this job builds or runs.
         if: hashFiles('tests/integration/run.sh') != ''
-        run: cargo build --workspace --features vitrin-core/dead-man-injector,vitrin-core/consent-injector
+        run: cargo build --workspace --features vitrin-core/dead-man-injector,vitrin-core/consent-injector,vitrin-core/physical-input-injector
 
       - name: Build the C shim (for the real-app gate)
         # tests/integration/test_real_app.py runs the real core -> real C shim

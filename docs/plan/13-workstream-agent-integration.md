@@ -125,7 +125,7 @@ dropping `internal` — will fail a test that checks it against the IDL:
 | `expired` (1) | `GrantExpired` | Your authority ran out. Petition again if the task still stands. |
 | `revoked` (2) | `Revoked` | **A human revoked you. Stop. Do not petition again in this session.** |
 | `rate_limited` (3) | `RateLimited` | You are too fast. Wait `retry_after_ms`. |
-| `preempted` (4) | `Preempted` | **A human is using the machine. Yield, back off, do not race.** |
+| `preempted` (4) | `Preempted` | **A human is working in the realm you are acting on. Yield, back off, do not race.** (Per realm, not per session: another agent in another realm is unaffected, and so are you if you move to one.) |
 | `consent_held` (5) | `ConsentHeld` | A prompt is up; a human is deciding. Wait, do not act. |
 | `no_surface` (6) | `NoSurface` | Nothing to act on yet. Cheap to retry. |
 | `internal` (7) | `OperationFailed` | The core tried and failed on its own side. Not your fault and not a permission problem; retry once, then report rather than loop. |

@@ -2280,7 +2280,7 @@ mod tests {
         process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
         assert!(importer.holds_content);
 
-        let mut router = crate::input::InputRouter::new(crate::input::NoopHook);
+        let mut router = crate::input::InputRouter::detached(crate::input::NoopHook);
         server.connection_closed(
             &crate::grants::RealmId::new("realm-0"),
             &mut scene,
@@ -2566,12 +2566,10 @@ mod tests {
         use crate::input::{InputRouter, NoopHook, SeatInput, SeatInputKind};
         use vitrin_protocol::generated::vitrin_actuator_pointer::ButtonState;
         let realm = crate::grants::RealmId::new("realm-0");
-        let mut router = InputRouter::new(NoopHook);
-        // The router's state is per shim generation, and a generation
-        // belongs to one realm: bind before routing, exactly as the two
-        // delivery sites do, or the scoped reset below has nothing of this
-        // realm's to forget.
-        router.bind_to(&realm);
+        let mut router = InputRouter::detached(NoopHook);
+        // The router's seat state is per realm and per shim generation, so
+        // every route below names the realm, exactly as `session::route_seat`
+        // does -- or the scoped reset has nothing of this realm's to forget.
         let view = (VIEW_W, VIEW_H);
         let surface = Some((VIEW_W, VIEW_H));
         let button = |state| SeatInputKind::Button {
@@ -2579,14 +2577,16 @@ mod tests {
             state,
         };
         assert!(router
-            .route(
+            .route_emulated(
+                &realm,
                 SeatInput::emulated(SeatInputKind::Motion { x: 1.0, y: 1.0 }),
                 view,
                 surface,
             )
             .is_some());
         assert!(router
-            .route(
+            .route_emulated(
+                &realm,
                 SeatInput::emulated(button(ButtonState::Pressed)),
                 view,
                 surface
@@ -2600,7 +2600,8 @@ mod tests {
         // No grab survived the generation: the stale release is unpaired
         // at the next shim's seat and dropped.
         assert!(router
-            .route(
+            .route_emulated(
+                &realm,
                 SeatInput::emulated(button(ButtonState::Released)),
                 view,
                 surface

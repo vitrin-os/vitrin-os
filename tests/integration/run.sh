@@ -64,6 +64,8 @@ PROPERTY_GATES=(
   test_two_realms.py            # cross-realm capture confidentiality (#209)
   test_layout.py                # layout_focus moves the output; captures stay
                                 # per-realm afterwards (#210)
+  test_input_switch.py          # physical input follows the binding, an agent's
+                                # actuation follows its grant (#212)
 )
 missing=()
 for gate in "${MILESTONE_GATES[@]}" "${PROPERTY_GATES[@]}"; do
@@ -123,7 +125,17 @@ fi
 # MUST recompile. A gate that can run against the wrong binary reports
 # something other than what it claims, which is the one thing this suite exists
 # to not do.
-INJECTORS=vitrin-core/dead-man-injector,vitrin-core/consent-injector
+# - `vitrin-core/physical-input-injector` (issue #212): `test_input_switch.py`
+#   runs the core under `--headless --physical-input-fd N` and makes
+#   physical-origin seat input happen over the inherited socketpair, through
+#   the SAME `input::intake_physical` entry point the nested backend's winit
+#   handler uses. CI has no input device and headless is the only backend it
+#   runs (D-019(4)), so without this the "physical input follows the bound
+#   realm" half of #212 has no mock-free gate at all. A plain build does not
+#   know the flag and exits at argument parsing, so that test fails naming
+#   this rebuild rather than skipping. Same two-gate posture as the consent
+#   channel: the feature alone changes nothing at runtime without the flag.
+INJECTORS=vitrin-core/dead-man-injector,vitrin-core/consent-injector,vitrin-core/physical-input-injector
 echo "==> building workspace with $INJECTORS"
 cargo build --workspace --features "$INJECTORS"
 

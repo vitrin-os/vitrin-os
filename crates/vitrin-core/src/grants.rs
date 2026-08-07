@@ -956,7 +956,11 @@ impl GrantTable {
     ///   `principal::PrincipalServer::serve_facet_use`);
     /// - **write**: an actuation admitted under this grant must not be
     ///   delivered into a *sibling's* app (the same two sites, feeding
-    ///   `enforcement::UseEnv::seat_reaches_grant_realm`).
+    ///   `enforcement::UseEnv::grant_realm`, which travels with the event to
+    ///   `session::route_seat` and *is* the delivery address). Until WS-E.1.6
+    ///   it fed `seat_reaches_grant_realm`, a comparison against the session's
+    ///   one seat target; there is nothing left to compare because the realm
+    ///   now goes with the event.
     ///
     /// Deliberately not an authority judgement -- it reports the row's
     /// target so the caller can resolve the *environment* for it. Whether a

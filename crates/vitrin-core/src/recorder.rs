@@ -787,12 +787,15 @@ pub(crate) enum Event<'a> {
     /// forbids.
     SeatDelivered {
         /// **Which realm's app received it** -- the one fact that makes this
-        /// entry answerable rather than merely present. The delivery target
-        /// is chosen at *runtime* (`session::seat_target`), so it is not
-        /// derivable from the grant row [`Event::UseDecision`] names, and
-        /// with several realms attached the two can differ. Without it the
-        /// journal can say a keystroke was delivered and not which app got
-        /// it, which is not an audit trail.
+        /// entry answerable rather than merely present. Chosen at *runtime*
+        /// by whichever addressing rule the event answers to: an agent's
+        /// actuation goes to the realm its grant names, a human's physical
+        /// input to the realm their attention is bound to
+        /// (`session::route_seat` and `session::physical_seat_target`).
+        /// Physical input crosses no chokepoint at all, so for half these
+        /// entries there is no grant row to derive a realm from; without this
+        /// field the journal can say a keystroke was delivered and not which
+        /// app got it, which is not an audit trail.
         realm: &'a RealmId,
         /// The seat event kind -- `motion`/`button`/`scroll`/`key`/`text`,
         /// from [`crate::input::SeatDelivery::event_label`].

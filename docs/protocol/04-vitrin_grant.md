@@ -521,6 +521,20 @@ launch is never refused `no_surface`. `capacity` concerns creating a realm and
 so reaches only `realm_launch`. A code's absence from a verb's reachable set
 is a property of the operation, never a promise the code is unused.
 
+**What "the target" is, when a deployment serves several realms** — an
+implementation note, not a wire rule. The IDL says `preempted` means "physical
+human input owns **the target** right now" and deliberately does not say what
+the target is; that is the server's to decide, and a client must not assume
+either answer. The reference core (WS-E.1.6) judges it **per realm**: an
+actuation's target is the realm its own grant names, so a human working in one
+realm does not preempt an agent working in another, and a layout request's
+target is the realm the human's own input currently follows, since a layout act
+moves what the human is looking at rather than being delivered into a realm.
+Before that it answered session-wide, which refused strictly more. Either
+reading satisfies the IDL, so an agent that treats `preempted` as "yield and
+retry" is correct against both — which is the only behaviour the wire actually
+requires.
+
 **The layout verbs are refused `no_surface`, `preempted` and `consent_held`**,
 and each is deliberate. `no_surface`: focusing a realm with no live view would
 bind the output to nothing and arranging one has no geometry to arrange — the

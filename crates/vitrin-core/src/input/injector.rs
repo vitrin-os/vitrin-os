@@ -69,11 +69,22 @@
 //!                     button <evdev-code> <press|release>
 //!                     scroll <vertical|horizontal> <v120>
 //!                     key <evdev-scancode> <press|release>
+//!                     attention                      (one whole chord tap)
 //!
 //!   core -> harness   vitrin-physical-input 1        (banner, once)
 //!                     ack <injected-event-count>     (per accepted request)
 //!                     err <reason>                   (per rejected request)
 //! ```
+//!
+//! `attention` is the *configured* attention chord (WS-E.1.7,
+//! [`crate::attention::AttentionChord`]), pressed and released — one line
+//! because the chord is a tap and half a tap is not a gesture. It is **not** a
+//! second path: it resolves to the chord's own evdev scancode and goes through
+//! the same [`super::physical_key`] the `key` line does, twice, so `attention`
+//! and `key 125 press` + `key 125 release` are the identical two calls. It
+//! exists so a harness names the *gesture* rather than a scancode it had to
+//! guess, and so a run started with `--attention-chord rsuper` is exercised
+//! with `rsuper` without the harness knowing.
 //!
 //! `ack` counts the [`super::SeatInput`]s the intake produced, not the
 //! deliveries: whether an event reaches an app is the router's and the shim's
@@ -113,6 +124,17 @@ pub(crate) enum Request {
     /// A key by Linux evdev **scancode** (`KEY_ESC` = 1), resolved to a
     /// keysym by the core's own layout-invariant table.
     Key { evdev: u32, pressed: bool },
+    /// One whole tap of **this run's configured attention chord** (WS-E.1.7):
+    /// press then release, through the same [`super::physical_key`] every
+    /// other key goes through, on the scancode
+    /// [`crate::attention::AttentionChord`] carries.
+    ///
+    /// A distinct request rather than two `key` lines because the chord is a
+    /// *tap* — half of one is not a gesture, and a harness that sent only the
+    /// press would leave the core believing the key is held. It carries no
+    /// argument for the same reason the wire event does not: which key it is
+    /// is the core's own configuration, not the peer's to choose.
+    Attention,
 }
 
 /// Parse one line into a [`Request`], or `None` for anything else.
@@ -147,6 +169,7 @@ pub(crate) fn parse_request(line: &str) -> Option<Request> {
             evdev: fields.next()?.parse().ok()?,
             pressed: parse_press(fields.next()?)?,
         },
+        "attention" => Request::Attention,
         _ => return None,
     };
     if fields.next().is_some() {
@@ -182,13 +205,21 @@ fn parse_finite(field: &str) -> Option<f64> {
 ///
 /// `view` is the realm-view size in pixels, passed to `intake_physical` as the
 /// space absolute positions resolve into — the same argument the nested
-/// backend passes its host window size.
+/// backend passes its host window size. `attention` is **this run's configured
+/// attention chord**, a parameter rather than a constant so the `attention`
+/// line presses the key the operator actually chose — a hard-coded 125 would
+/// be a second, silently-wrong path the moment anyone passed
+/// `--attention-chord rsuper`.
 ///
 /// Returns an empty vector where the real intake would also produce nothing (a
 /// `scroll` rounding to zero, a `key` whose scancode is outside the
 /// layout-invariant table), so an `ack 0` means "the core's own intake made
 /// nothing of this", never "the channel dropped it".
-pub(crate) fn intake(request: Request, view: (i32, i32)) -> Vec<SeatInput> {
+pub(crate) fn intake(
+    request: Request,
+    view: (i32, i32),
+    attention: crate::attention::AttentionChord,
+) -> Vec<SeatInput> {
     match request {
         Request::Motion { x, y } => super::intake_physical::<SyntheticHost>(
             &InputEvent::PointerMotionAbsolute {
@@ -245,6 +276,19 @@ pub(crate) fn intake(request: Request, view: (i32, i32)) -> Vec<SeatInput> {
                 vitrin_protocol::generated::vitrin_shim_seat::KeyState::Released
             },
         ),
+        // The whole tap, through the **same** `physical_key` the `key` arm
+        // uses, on the chord's own scancode: `attention` is a name for a
+        // gesture, never a second way into the core.
+        Request::Attention => {
+            use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+            let mut out = super::physical_key(attention.evdev(), None, KeyState::Pressed);
+            out.extend(super::physical_key(
+                attention.evdev(),
+                None,
+                KeyState::Released,
+            ));
+            out
+        }
     }
 }
 
@@ -545,8 +589,17 @@ mod tests {
 
     const VIEW: (i32, i32) = (640, 480);
 
+    fn chord() -> crate::attention::AttentionChord {
+        crate::attention::AttentionChord::parse(crate::attention::DEFAULT_CHORD)
+            .expect("the default attention chord parses")
+    }
+
     #[test]
-    fn the_vocabulary_is_exactly_four_verbs_and_nothing_decorated() {
+    fn the_vocabulary_is_exactly_five_verbs_and_nothing_decorated() {
+        assert_eq!(parse_request("attention"), Some(Request::Attention));
+        // Argument-free: which key it is is the core's configuration, not the
+        // peer's to choose, so a decorated line is a different message.
+        assert_eq!(parse_request("attention super"), None);
         assert_eq!(
             parse_request("motion 12.5 -3"),
             Some(Request::Motion { x: 12.5, y: -3.0 })
@@ -601,7 +654,7 @@ mod tests {
         // `intake_physical`/`physical_key` produce, tagged by the one
         // constructor that can tag it, and nothing here builds a `SeatInput`
         // of its own.
-        let motion = intake(Request::Motion { x: 4.0, y: 9.0 }, VIEW);
+        let motion = intake(Request::Motion { x: 4.0, y: 9.0 }, VIEW, chord());
         assert_eq!(motion.len(), 1);
         assert_eq!(motion[0].origin(), Origin::Physical);
         assert_eq!(motion[0].kind(), &SeatInputKind::Motion { x: 4.0, y: 9.0 });
@@ -612,6 +665,7 @@ mod tests {
                 pressed: true,
             },
             VIEW,
+            chord(),
         );
         assert_eq!(
             button[0].kind(),
@@ -627,6 +681,7 @@ mod tests {
                 value120: 120,
             },
             VIEW,
+            chord(),
         );
         assert_eq!(
             scroll[0].kind(),
@@ -644,11 +699,57 @@ mod tests {
                 pressed: true,
             },
             VIEW,
+            chord(),
         );
         assert_eq!(
             key[0].kind(),
             &SeatInputKind::Key {
                 keysym: 0xff1b,
+                state: KeyState::Pressed
+            }
+        );
+    }
+
+    #[test]
+    fn the_attention_line_is_one_whole_tap_of_the_configured_chord() {
+        // Two events, not one: the chord is a *tap*, and a harness that sent
+        // only the press would leave the core believing the key is held.
+        // Both come out of the same `physical_key` a `key` line uses, on the
+        // chord's own scancode -- `attention` names a gesture, it is never a
+        // second way into the core.
+        let chord = chord();
+        let tap = intake(Request::Attention, VIEW, chord);
+        let by_hand: Vec<_> = intake(
+            Request::Key {
+                evdev: chord.evdev(),
+                pressed: true,
+            },
+            VIEW,
+            chord,
+        )
+        .into_iter()
+        .chain(intake(
+            Request::Key {
+                evdev: chord.evdev(),
+                pressed: false,
+            },
+            VIEW,
+            chord,
+        ))
+        .collect();
+        assert_eq!(tap.len(), 2);
+        assert_eq!(
+            tap.iter().map(|i| i.kind()).collect::<Vec<_>>(),
+            by_hand.iter().map(|i| i.kind()).collect::<Vec<_>>(),
+            "`attention` must be exactly the two `key` calls, never a third path"
+        );
+        for event in &tap {
+            assert_eq!(event.origin(), Origin::Physical);
+        }
+        assert_eq!(
+            tap[0].kind(),
+            &SeatInputKind::Key {
+                keysym: 0xffeb,
                 state: KeyState::Pressed
             }
         );
@@ -667,7 +768,8 @@ mod tests {
                 evdev: KEY_A,
                 pressed: true
             },
-            VIEW
+            VIEW,
+            chord(),
         )
         .is_empty());
         // A scroll that rounds to nothing is not a zero-valued event.
@@ -676,7 +778,8 @@ mod tests {
                 horizontal: false,
                 value120: 0
             },
-            VIEW
+            VIEW,
+            chord(),
         )
         .is_empty());
     }

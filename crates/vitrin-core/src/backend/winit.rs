@@ -204,6 +204,18 @@ struct TextureKey {
     /// two positions that would draw byte-identical sprites compare equal and
     /// cost no re-upload, and two that would not, do not.
     agent_cursor: Option<(i32, i32)>,
+    /// Whether the human's attention window is open (WS-E.1.7, issue #232),
+    /// and so whether `window_pixels` drew the marker beside the trusted band.
+    ///
+    /// In the key for the same reason every other field here is: it is a
+    /// visible element that changes independently of all of them. Without it
+    /// the cache short-circuits the one call that would draw the marker *or
+    /// erase it*, so pressing the key changed nothing on screen in the only
+    /// backend where a human can press it — decision 8's "the human sees
+    /// something" silently not holding. A bool rather than a deadline, because
+    /// what the pixels depend on is open-or-not, and putting an `Instant` in a
+    /// `PartialEq` cache key would re-upload every frame for a whole second.
+    attention: bool,
 }
 
 /// How many distinct fill levels the hold indicator has. Twenty steps across
@@ -220,6 +232,7 @@ impl TextureKey {
         consent: &ConsentSurface,
         hold: Option<f64>,
         agent_cursor: Option<(f64, f64)>,
+        attention: bool,
     ) -> Self {
         Self {
             size,
@@ -228,6 +241,7 @@ impl TextureKey {
             consent_generation: consent.generation(),
             hold_bucket: hold.map(|p| (p.clamp(0.0, 1.0) * HOLD_STEPS) as u8),
             agent_cursor: agent_cursor.and_then(|(x, y)| crate::cursor::hotspot(x, y)),
+            attention,
         }
     }
 }
@@ -290,10 +304,11 @@ fn window_pixels(
     consent: &mut ConsentSurface,
     hold: Option<f64>,
     agent_cursor: Option<(f64, f64)>,
+    attention: bool,
     size: Size<i32, Physical>,
 ) -> Vec<u8> {
     let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
-    let mut pixels = super::compose_human_visible(scene, consent, w, h);
+    let mut pixels = super::compose_human_visible(scene, consent, w, h, attention);
     if let Some((x, y)) = agent_cursor {
         crate::cursor::composite_agent_cursor(&mut pixels, w, h, x, y);
     }
@@ -1225,6 +1240,19 @@ pub(crate) struct NestedView {
     /// sprite would silently be the one issue #85 was about, one property
     /// milder.
     agent_cursor: Option<(f64, f64)>,
+    /// Whether the human's **attention window** is open right now (WS-E.1.7),
+    /// pushed here once per dispatch round by
+    /// [`session::Presenter::set_attention`].
+    ///
+    /// A copy rather than a borrow of the signal, for exactly the reason
+    /// [`Self::agent_cursor`] is one: the composite happens on the host's frame
+    /// clock, after the dispatch round that gated the press has ended. Read by
+    /// the CPU path through [`window_pixels`]; the zero-copy dmabuf path draws
+    /// no marker, which is a **cosmetic** gap rather than the band's kind — the
+    /// marker asserts nothing about authenticity and carries no session secret,
+    /// so a frame missing it is a frame the human has to check by other means
+    /// rather than a frame that can lie to them.
+    attention: bool,
 }
 
 /// Per-run state of the nested backend: its presentation half, the session
@@ -1237,7 +1265,7 @@ pub(crate) struct NestedState {
     /// second one, so an agent's chokepoint-admitted actuations and a human's
     /// physical input share one implicit-grab and pointer state — which is
     /// what makes the preemption hook mean anything.
-    runtime: Runtime<ConsentGate<DeadManHook<input::NoopHook>>>,
+    runtime: Runtime<ConsentGate<DeadManHook<crate::attention::AttentionHook<input::NoopHook>>>>,
     /// The consent input grab (P1.7.2), shared with the router's gate:
     /// while a prompt is up it owns physical input, and a click on one of
     /// the card's buttons becomes a petition decision here.
@@ -1308,7 +1336,11 @@ pub(crate) struct NestedState {
 /// `no_surface` judgement gates actuation — an agent can observe *and* actuate
 /// under `--nested`, not only under `--headless`. Everything else — petitions,
 /// consent, the physical dead-man switch — was already identical to headless.
-pub fn run(dead_man: DeadManConfig, seed: RuntimeSeed) -> (Recorder, Result<(), Box<dyn Error>>) {
+pub fn run(
+    dead_man: DeadManConfig,
+    attention: crate::attention::AttentionChord,
+    seed: RuntimeSeed,
+) -> (Recorder, Result<(), Box<dyn Error>>) {
     // The seed is consumed the moment the state is built; until then it is
     // still ours, and either way the recorder must come back so `run_session`
     // can write the footer it owes. Threading it through two slots keeps `?`
@@ -1316,7 +1348,7 @@ pub fn run(dead_man: DeadManConfig, seed: RuntimeSeed) -> (Recorder, Result<(), 
     // four-line `match`.
     let mut seed = Some(seed);
     let mut recovered = None;
-    let result = run_inner(dead_man, &mut seed, &mut recovered);
+    let result = run_inner(dead_man, attention, &mut seed, &mut recovered);
     let recorder = recovered
         .or_else(|| seed.take().map(|seed| seed.recorder))
         .expect("the seed is either still unconsumed or its recorder was recovered");
@@ -1325,6 +1357,7 @@ pub fn run(dead_man: DeadManConfig, seed: RuntimeSeed) -> (Recorder, Result<(), 
 
 fn run_inner(
     dead_man: DeadManConfig,
+    attention: crate::attention::AttentionChord,
     seed: &mut Option<RuntimeSeed>,
     recovered: &mut Option<Recorder>,
 ) -> Result<(), Box<dyn Error>> {
@@ -1436,13 +1469,41 @@ fn run_inner(
     // here to forget (`input::InputRouter`'s "Presence is not a stackable
     // hook"). On the same `now` cell the grab and the watcher read, so all
     // three see the dispatch turn's single sampled instant.
+    // The attention signal (WS-E.1.7). Minted here and handed to the hook
+    // alone: `Runtime::new` takes it back **out of the router**
+    // (`InputRouter::attention`), exactly as it does the presence map, so the
+    // kernel's signal and the hook's are one object by construction and there
+    // is no wiring step here to forget.
+    info!(
+        chord = attention.name(),
+        window_ms = crate::attention::ATTENTION_WINDOW.as_millis(),
+        "attention key armed: tapping it lifts `preempted` for one layout use by a holder \
+         of layout authority. It delegates nothing -- every authority exercised afterwards \
+         came from a grant a human approved on a consent card"
+    );
     let router = input::InputRouter::new(
         Rc::new(RefCell::new(input::PhysicalPresenceMap::new())),
         Rc::clone(&now),
+        // The stacking WS-E.1.7 decision 11 fixes, outermost first: the
+        // consent grab, the dead-man watcher, then the attention key. Both
+        // hooks above short-circuit the one below, so a raised prompt or a
+        // dead-man chord press wins over -- and is never delayed by -- a
+        // mechanism whose worst failure is a focus change that does not
+        // happen.
         ConsentGate::new(
             Rc::clone(&grab),
             Rc::clone(&now),
-            DeadManHook::new(Rc::clone(&deadman), Rc::clone(&now), input::NoopHook),
+            DeadManHook::new(
+                Rc::clone(&deadman),
+                Rc::clone(&now),
+                crate::attention::AttentionHook::new(
+                    Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
+                        attention,
+                    ))),
+                    Rc::clone(&now),
+                    input::NoopHook,
+                ),
+            ),
         ),
     );
     // The session's trusted indicator, minted in `run_session` before the
@@ -1469,6 +1530,7 @@ fn run_inner(
             // No agent has moved a pointer yet; the first emulated motion
             // establishes it (`InputRouter::agent_pointer`).
             agent_cursor: None,
+            attention: false,
         },
         runtime: Runtime::new(
             seed.take().expect("the seed is consumed exactly once"),
@@ -2151,6 +2213,7 @@ impl NestedState {
             &self.view.consent,
             hold,
             agent_cursor,
+            self.view.attention,
         );
         // The scene's own pending damage (P1.3.9, issue #117), drained here
         // at most once per redraw whenever the scene changed — regardless of
@@ -2173,6 +2236,7 @@ impl NestedState {
                 &mut self.view.consent,
                 hold,
                 agent_cursor,
+                self.view.attention,
                 size,
             );
             let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
@@ -2360,7 +2424,7 @@ pub(crate) fn next_frame(hold: Option<f64>, elapsed: Duration) -> NextFrame {
 }
 
 impl session::RuntimeHost for NestedState {
-    type Hook = ConsentGate<DeadManHook<input::NoopHook>>;
+    type Hook = ConsentGate<DeadManHook<crate::attention::AttentionHook<input::NoopHook>>>;
     type View = NestedView;
 
     fn split(&mut self) -> (&mut Runtime<Self::Hook>, &mut NestedView) {
@@ -2561,6 +2625,17 @@ impl session::Presenter for NestedView {
         true
     }
 
+    /// The attention marker (WS-E.1.7): a plain `bool`, because unlike the
+    /// cursor there is no position to quantise -- the window is open or it is
+    /// not.
+    fn set_attention(&mut self, open: bool) -> bool {
+        if self.attention == open {
+            return false;
+        }
+        self.attention = open;
+        true
+    }
+
     /// The scene, `None` for the retained half, and the dmabuf importer
     /// bound to this backend's live `GlesRenderer` (P1.3.5, issue #117).
     ///
@@ -2662,6 +2737,38 @@ mod tests {
     /// composition, card rows and all; with none up they are the bare realm
     /// view. A regression that dropped the overlay from the upload — which
     /// previously passed the entire suite — fails here.
+    /// **The nested hook stack is `ConsentGate` outside `DeadManHook` outside
+    /// `AttentionHook`** (WS-E.1.7 decision 11), pinned as a fact about the
+    /// type rather than as a comment beside the constructor.
+    ///
+    /// The order is the decision: a consent prompt and a dead-man chord press
+    /// must each short-circuit *before* the attention key, whose worst failure
+    /// is a focus change that does not happen and which must never be able to
+    /// delay the human's off-switch or open a window while the human is
+    /// answering a security question. Reordering the three is a one-line edit
+    /// that changes no behaviour any other test in this crate observes — the
+    /// two chord vocabularies are disjoint, so neither hook sees the other's
+    /// key — which is exactly why the order needs a tripwire of its own.
+    ///
+    /// Read off `type_name`, because nested generic arguments appear in
+    /// left-to-right stacking order there and nowhere else this cheaply.
+    #[test]
+    fn the_nested_stack_is_consent_then_dead_man_then_attention() {
+        let name = std::any::type_name::<<NestedState as session::RuntimeHost>::Hook>();
+        let at = |needle: &str| {
+            name.find(needle)
+                .unwrap_or_else(|| panic!("the nested stack must carry {needle}: {name}"))
+        };
+        let (consent, dead, attention) =
+            (at("ConsentGate"), at("DeadManHook"), at("AttentionHook"));
+        assert!(
+            consent < dead && dead < attention,
+            "the nested hook stack must be ConsentGate<DeadManHook<AttentionHook<..>>>: a \
+             prompt and the human's off-switch each short-circuit before the attention key, \
+             never after it. Got {name}"
+        );
+    }
+
     #[test]
     fn the_nested_window_uploads_the_consent_overlay() {
         const W: i32 = 800;
@@ -2677,7 +2784,7 @@ mod tests {
         // the top (issue #85). Below the band it is the realm view byte for
         // byte; the band itself is the session colour, present on the
         // human-visible upload and never in the capture (Scene::compose).
-        let plain = window_pixels(&scene, &mut consent, None, None, size);
+        let plain = window_pixels(&scene, &mut consent, None, None, false, size);
         let composed = scene.compose(W as u32, H as u32);
         let band_bytes =
             crate::consent::TRUST_BAND_HEIGHT as usize * W as usize * crate::scene::BYTES_PER_PIXEL;
@@ -2708,7 +2815,7 @@ mod tests {
         // there — see `window_pixels` and D-019). What must never drift is the
         // shared composition underneath, which is what this pins.
         consent.show_for_test(prompt_fixture());
-        let with_prompt = window_pixels(&scene, &mut consent, None, None, size);
+        let with_prompt = window_pixels(&scene, &mut consent, None, None, false, size);
         assert_ne!(
             with_prompt, plain,
             "the prompt must change what is uploaded"
@@ -2717,7 +2824,7 @@ mod tests {
         expected.show_for_test(prompt_fixture());
         assert_eq!(
             with_prompt,
-            super::super::compose_human_visible(&scene, &mut expected, W as u32, H as u32),
+            super::super::compose_human_visible(&scene, &mut expected, W as u32, H as u32, false),
             "nested must upload the same composition headless retains, so the \
              two backends cannot drift in what a human sees"
         );
@@ -2785,14 +2892,28 @@ mod tests {
         let mut consent = ConsentSurface::new(indicator);
         for hold in [None, Some(0.0), Some(0.5), Some(1.0)] {
             assert_eq!(
-                band_px(&window_pixels(&scene, &mut consent, hold, None, size)),
+                band_px(&window_pixels(
+                    &scene,
+                    &mut consent,
+                    hold,
+                    None,
+                    false,
+                    size
+                )),
                 indicator.color(),
                 "the CPU path dropped the trusted band (hold={hold:?})"
             );
         }
         consent.show_for_test(prompt_fixture());
         assert_eq!(
-            band_px(&window_pixels(&scene, &mut consent, None, None, size)),
+            band_px(&window_pixels(
+                &scene,
+                &mut consent,
+                None,
+                None,
+                false,
+                size
+            )),
             indicator.color(),
             "a raised prompt must not cover the band it is checked against"
         );
@@ -2803,7 +2924,14 @@ mod tests {
         let mut idle = ConsentSurface::new(indicator);
         for aim in [(0.0, 0.0), (W as f64 / 2.0, 0.0), (W as f64 / 2.0, 3.0)] {
             assert_eq!(
-                band_px(&window_pixels(&scene, &mut idle, None, Some(aim), size)),
+                band_px(&window_pixels(
+                    &scene,
+                    &mut idle,
+                    None,
+                    Some(aim),
+                    false,
+                    size
+                )),
                 indicator.color(),
                 "an agent's cursor at {aim:?} painted into the trusted band"
             );
@@ -2883,8 +3011,8 @@ mod tests {
         // Path 1, the CPU texture upload: the sprite's colours really appear,
         // and only when a cursor is shown.
         let mut consent = ConsentSurface::new(indicator);
-        let without = window_pixels(&scene, &mut consent, None, None, size);
-        let with = window_pixels(&scene, &mut consent, None, Some(at), size);
+        let without = window_pixels(&scene, &mut consent, None, None, false, size);
+        let with = window_pixels(&scene, &mut consent, None, Some(at), false, size);
         assert_ne!(with, without, "the CPU path dropped the agent cursor");
         let count = |px: &[u8], rgba: [u8; 4]| {
             px.chunks_exact(crate::scene::BYTES_PER_PIXEL)
@@ -2969,7 +3097,7 @@ mod tests {
         let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
         consent.show_for_test(prompt_fixture());
         let human_visible =
-            super::super::compose_human_visible(&scene, &mut consent, W as u32, H as u32);
+            super::super::compose_human_visible(&scene, &mut consent, W as u32, H as u32, false);
         assert_ne!(
             capture, human_visible,
             "the human-visible window carries the prompt; the capture must not"
@@ -2987,7 +3115,7 @@ mod tests {
         // mid-hold differs from the capture, which carries neither the trusted
         // band nor the indicator — it is the bare view, unchanged.
         let mut idle = ConsentSurface::new(TrustedIndicator::for_test());
-        let with_hold = window_pixels(&scene, &mut idle, Some(0.5), None, size);
+        let with_hold = window_pixels(&scene, &mut idle, Some(0.5), None, false, size);
         assert_ne!(
             capture, with_hold,
             "the dead-man hold indicator must never reach the capture"
@@ -2996,7 +3124,7 @@ mod tests {
         // And so is the agent cursor (D-019, IDL ordering invariant 4): the
         // window carries it, the capture does not, and not one pixel of either
         // sprite colour appears in the composed realm view.
-        let with_cursor = window_pixels(&scene, &mut idle, None, Some((400.0, 300.0)), size);
+        let with_cursor = window_pixels(&scene, &mut idle, None, Some((400.0, 300.0)), false, size);
         assert_ne!(
             capture, with_cursor,
             "the agent cursor must never reach the capture"
@@ -3069,30 +3197,45 @@ mod tests {
 
         // Bound to A: the window is A's composition, byte for byte.
         scenes.bind(&a);
-        let window_a = window_pixels(scenes.bound(), &mut consent, None, None, size);
+        let window_a = window_pixels(scenes.bound(), &mut consent, None, None, false, size);
         assert_eq!(
             window_a,
             super::super::compose_human_visible(
                 scenes.scene(&a).unwrap(),
                 &mut ConsentSurface::new(TrustedIndicator::for_test()),
                 W as u32,
-                H as u32
+                H as u32,
+                false
             ),
             "the host window must be the bound realm's own composition"
         );
-        let key_a =
-            TextureKey::current(size, scenes.focused(), scenes.bound(), &consent, None, None);
+        let key_a = TextureKey::current(
+            size,
+            scenes.focused(),
+            scenes.bound(),
+            &consent,
+            None,
+            None,
+            false,
+        );
 
         // Bound to B: different pixels, and a different key even though every
         // other field is identical.
         scenes.bind(&b);
-        let window_b = window_pixels(scenes.bound(), &mut consent, None, None, size);
+        let window_b = window_pixels(scenes.bound(), &mut consent, None, None, false, size);
         assert!(
             window_a != window_b,
             "binding the output to another realm must change what the window shows"
         );
-        let key_b =
-            TextureKey::current(size, scenes.focused(), scenes.bound(), &consent, None, None);
+        let key_b = TextureKey::current(
+            size,
+            scenes.focused(),
+            scenes.bound(),
+            &consent,
+            None,
+            None,
+            false,
+        );
         assert_eq!(
             key_a.scene_generation, key_b.scene_generation,
             "fixture check: the scene counters really do coincide, so the key below \
@@ -3223,52 +3366,54 @@ mod tests {
         let mut scene = Scene::new();
         let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
 
-        let base = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
+        let base = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
         assert_eq!(
             base,
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None),
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false),
             "an unchanged output must not force a re-upload"
         );
 
         // A prompt going up, and coming back down, both re-upload.
         consent.show_for_test(prompt_fixture());
-        let shown = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
+        let shown = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
         assert_ne!(base, shown, "a prompt appearing must re-upload");
         consent.dismiss_for_test();
-        let dismissed = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
+        let dismissed =
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
         assert_ne!(shown, dismissed, "a prompt going away must re-upload");
 
         // The queue advancing to a different petition re-uploads too, so the
         // window cannot keep showing a decided petition's card.
         consent.show_for_test(prompt_fixture());
-        let first = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
+        let first = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
         let mut next = prompt_fixture();
         next.principal =
             crate::identity::PrincipalIdentity::parse("vitrin://local/agent/other").unwrap();
         consent.show_for_test(next);
         assert_ne!(
             first,
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None),
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false),
             "a different petition must re-upload"
         );
 
         // And the two pre-existing inputs still matter.
-        let held = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
+        let held = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
         scene.commit(SurfaceContent::from_rgba(client_pixels(64, 48), 64, 48).expect("content"));
         assert_ne!(
             held,
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None),
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false),
             "a scene commit must re-upload"
         );
         assert_ne!(
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None),
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false),
             TextureKey::current(
                 size_of(640, 480),
                 Some(&realm),
                 &scene,
                 &consent,
                 None,
-                None
+                None,
+                false
             ),
             "a resize must re-upload"
         );
@@ -3277,7 +3422,8 @@ mod tests {
         // sprite left out of the key would move only when something else
         // happened to change, which for an agent hovering over a static app
         // is never — the operator watches a frozen crosshair.
-        let no_cursor = TextureKey::current(size, Some(&realm), &scene, &consent, None, None);
+        let no_cursor =
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
         let at_100 = TextureKey::current(
             size,
             Some(&realm),
@@ -3285,6 +3431,7 @@ mod tests {
             &consent,
             None,
             Some((100.0, 100.0)),
+            false,
         );
         assert_ne!(
             no_cursor, at_100,
@@ -3298,7 +3445,8 @@ mod tests {
                 &scene,
                 &consent,
                 None,
-                Some((140.0, 100.0))
+                Some((140.0, 100.0)),
+                false
             ),
             "an agent cursor MOVING must re-upload"
         );
@@ -3310,7 +3458,8 @@ mod tests {
                 &scene,
                 &consent,
                 None,
-                Some((100.4, 99.8))
+                Some((100.4, 99.8)),
+                false
             ),
             "a sub-pixel move draws the same sprite and must not re-upload"
         );
@@ -3322,9 +3471,36 @@ mod tests {
                 &scene,
                 &consent,
                 None,
-                Some((f64::NAN, 0.0))
+                Some((f64::NAN, 0.0)),
+                false
             ),
             "a position that is not a number draws no sprite, so it is no transition"
+        );
+
+        // The attention marker (WS-E.1.7, issue #232) is the newest visible
+        // element and fell into exactly the trap this test exists for: it was
+        // drawn by `window_pixels` and absent from the key, so the cache
+        // short-circuited the only call that would paint it. Pressing the key
+        // changed nothing on the human's screen -- in the one backend where a
+        // human can press it -- and every test stayed green, because nothing
+        // else in the key had changed.
+        //
+        // Both directions are asserted. Erasing the marker when the window
+        // lapses matters as much as drawing it: a marker that stayed up would
+        // tell the human a defence is lifted when it is not, which is worse
+        // than never drawing one.
+        let closed = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
+        let open = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, true);
+        assert_ne!(
+            closed, open,
+            "the attention window OPENING must re-upload: the marker is drawn by \
+             `window_pixels` and nothing else in the key changes when the human \
+             presses the chord"
+        );
+        assert_ne!(
+            open, closed,
+            "...and CLOSING must re-upload too, or the marker outlives the window \
+             and tells the human a lifted defence is still lifted"
         );
     }
 
@@ -3349,14 +3525,14 @@ mod tests {
 
         // No hold: the window is the ordinary human-visible composition,
         // byte for byte. The indicator costs an idle session nothing.
-        let idle = window_pixels(&scene, &mut consent, None, None, size);
+        let idle = window_pixels(&scene, &mut consent, None, None, false, size);
         assert_eq!(
             idle,
-            super::super::compose_human_visible(&scene, &mut consent, W as u32, H as u32)
+            super::super::compose_human_visible(&scene, &mut consent, W as u32, H as u32, false)
         );
 
         // Mid-hold: the top edge changes, and nothing below the bar does.
-        let holding = window_pixels(&scene, &mut consent, Some(0.5), None, size);
+        let holding = window_pixels(&scene, &mut consent, Some(0.5), None, false, size);
         assert_ne!(holding, idle, "a hold in progress must be visible");
         let below = (8 * W * 4) as usize;
         assert_eq!(
@@ -3368,8 +3544,8 @@ mod tests {
         // It is drawn above a consent card, so a prompt cannot hide the fact
         // that the human is mid-gesture on the off-switch.
         consent.show_for_test(prompt_fixture());
-        let prompt_only = window_pixels(&scene, &mut consent, None, None, size);
-        let prompt_and_hold = window_pixels(&scene, &mut consent, Some(0.9), None, size);
+        let prompt_only = window_pixels(&scene, &mut consent, None, None, false, size);
+        let prompt_and_hold = window_pixels(&scene, &mut consent, Some(0.9), None, false, size);
         assert_ne!(prompt_and_hold, prompt_only);
 
         // And every visible step of the fill re-uploads.
@@ -3382,6 +3558,7 @@ mod tests {
                 &consent,
                 Some(f64::from(step) / 10.0),
                 None,
+                false,
             ));
         }
         keys.dedup();
@@ -3391,8 +3568,8 @@ mod tests {
             keys.len()
         );
         assert_ne!(
-            TextureKey::current(size, Some(&realm), &scene, &consent, Some(1.0), None),
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None),
+            TextureKey::current(size, Some(&realm), &scene, &consent, Some(1.0), None, false),
+            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false),
             "the indicator disappearing must re-upload too"
         );
     }

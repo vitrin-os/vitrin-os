@@ -29,6 +29,12 @@
 //! - the capture mechanics entry [`crate::capture::render_frame`] and the
 //!   emulated-input constructor `SeatInput::emulated` each have exactly
 //!   one caller outside their home modules -- here, *after* admission;
+//! - and [`GrantTable::holds_verb`] -- the attention event's **delivery
+//!   filter**, added by WS-E.1.7 -- is named by the scan **as an exclusion**:
+//!   zero occurrences in this file, exactly one outside the grant table. It
+//!   is a query about who to *tell*, never about who may *act*, and pinning
+//!   it by name is what keeps that distinction from being re-established by
+//!   accident every time someone reads the list;
 //!
 //! all four are asserted by this module's `single_enforcement_path` test,
 //! which scans the crate's sources -- the reviewer's grep, run by CI.
@@ -72,13 +78,13 @@
 //!       hold never masks the realm's death. A launch is exempt because a
 //!       vacant realm is the state `realm_launch` exists to leave (IDL
 //!       `refusal`: "a launch is never refused no_surface").
-//!    b. `consent_held` (attention-shaped -- actuation *and* layout, see
-//!       [`UseKind::attention_shaped`]): the principal's own prompt is
+//!    b. `consent_held` (attention-contending -- actuation *and* layout, see
+//!       [`UseKind::contends_for_attention`]): the principal's own prompt is
 //!       up ([`PetitionRegistry::prompt_up_for`] -- the mapping is
 //!       documented in [`crate::petitions`]). Layout joined at WS-E.1.4
 //!       because a principal that could fullscreen over its own pending
 //!       card would be arranging the decision it is waiting on.
-//!    c. `preempted` (attention-shaped, same set): physical human input
+//!    c. `preempted` (attention-contending, same set): physical human input
 //!       owns **the realm this use acts on**
 //!       ([`PhysicalPresenceMap::owns_target`], fed per realm at the
 //!       input router's hook point). Moving the output out from under a
@@ -93,6 +99,21 @@
 //!       because a human was typing in realm A, which is the
 //!       concurrent-operation claim denied for no reason a human could
 //!       see.
+//!
+//!       **`preempted` is conditional here since WS-E.1.7 (issue #232), and
+//!       only for the two layout verbs.** Nested inside 5c, strictly after
+//!       5b, is the human's own attention window ([`crate::attention`]): a
+//!       core-owned Super tap opens a one-second, single-use window in which
+//!       a `layout_focus`/`layout_arrange` use by a principal the `attention`
+//!       event reached is **not** refused `preempted`. It exists because a
+//!       human at an in-realm shell otherwise cannot ask it to switch realms
+//!       — the Enter that sends the request is the physical input that
+//!       forbids it. Seat-delivered uses are untouched: a hand still mutes an
+//!       agent actuating into the realm the hand is in, and no human gesture
+//!       can lift that. **The press delegates nothing** — it withdraws a
+//!       transient courtesy the core extends to the human's typing, and every
+//!       authority exercised afterwards came from a grant approved on a
+//!       consent card.
 //!    d. `rate_limited`: the per-grant token bucket -- deliberately the
 //!       **last** gate, so a token is consumed if and only if the use is
 //!       otherwise admitted: quota meters what would actually happen, and
@@ -114,7 +135,11 @@
 //!    the origin tag says who really caused it) and handed to the
 //!    embedder's delivery sink **naming the grant's own realm** (WS-E.1.6:
 //!    the sink addresses per realm, so an actuation reaches the app its
-//!    grant is over whether or not a human is looking at it).
+//!    grant is over whether or not a human is looking at it). **The
+//!    attention window is claimed here too** (WS-E.1.7), and only when 5c's
+//!    exemption really did suppress a refusal: a refused use never burns
+//!    it, exactly as a refused use never burns a `once` rung, and a use that
+//!    needed no exemption leaves it open for the one that does.
 //!
 //! # The gate this chain no longer has (WS-E.1.6, issue #212)
 //!
@@ -321,14 +346,21 @@ impl UseKind {
         !matches!(self, UseKind::Capture | UseKind::Launch)
     }
 
-    /// Whether this use is **attention-shaped**: it moves, or competes
-    /// for, the thing the human is looking at or touching. The two
-    /// actuations are; so are both layout requests, which is why they meet
+    /// Whether this use **contends for the human's attention**: it moves, or
+    /// competes for, the thing the human is looking at or touching. The two
+    /// actuations do; so do both layout requests, which is why they meet
     /// `consent_held` and `preempted` on the same terms (IDL
-    /// `vitrin_grant.refusal`). A capture is not (observation is
-    /// concurrent by design) and neither is a launch (it creates a realm
+    /// `vitrin_grant.refusal`). A capture does not (observation is
+    /// concurrent by design) and neither does a launch (it creates a realm
     /// rather than competing for one).
-    fn attention_shaped(&self) -> bool {
+    ///
+    /// **Named for what it means, not for the noun it used to share.** It was
+    /// called `attention-shaped` until WS-E.1.7 (issue #232), which put a wire
+    /// event *named* `attention` a few lines below meaning something entirely
+    /// different -- the human's own signal, which *lifts* a refusal this
+    /// predicate selects for. A free rename then; a permanent reading hazard
+    /// in the one function where misreading it is most expensive.
+    fn contends_for_attention(&self) -> bool {
         matches!(
             self,
             UseKind::Pointer(_)
@@ -336,6 +368,21 @@ impl UseKind {
                 | UseKind::LayoutFocus
                 | UseKind::LayoutArrange(_)
         )
+    }
+
+    /// The two **layout** uses, and only those — the exact set the human's
+    /// attention key may lift `preempted` for
+    /// ([`crate::attention::AttentionSignal::exempt`], WS-E.1.7).
+    ///
+    /// A strict subset of [`Self::contends_for_attention`], and the difference
+    /// between the two is the whole security claim: an actuation delivered
+    /// through the seat is **never** exempted, so a human's hand still mutes an
+    /// agent acting in the realm the hand is in, and no gesture of theirs can
+    /// lift that. Deliberately a named predicate beside its superset rather
+    /// than a `match` arm at the chokepoint, so the two sets sit next to each
+    /// other and a future verb has to choose between them on purpose.
+    pub(crate) fn is_layout(&self) -> bool {
+        matches!(self, UseKind::LayoutFocus | UseKind::LayoutArrange(_))
     }
 
     /// Whether this use is **delivered into a realm through that realm's
@@ -370,6 +417,23 @@ pub(crate) struct UseEnv<'a> {
     /// reads is chosen at the gate, from [`Self::grant_realm`] or
     /// [`Self::physical_realm`] — see step 5c.
     pub presence: &'a PhysicalPresenceMap,
+    /// **The human's own attention signal** (WS-E.1.7, issue #232): the short,
+    /// single-use window a core-owned Super tap opens, read by exactly one
+    /// judgement — the exemption nested inside step 5c, for the two layout
+    /// verbs only.
+    ///
+    /// A `&RefCell` rather than a borrow of the contents, because this is the
+    /// one environment fact the chokepoint **writes**: the window is claimed at
+    /// step-6 admission, and only when the exemption actually suppressed a
+    /// refusal. It is the same `Rc<RefCell<_>>` the router's hook opens
+    /// ([`crate::session::Kernel::attention`]), reached through the router, so
+    /// it cannot be a second signal nothing writes.
+    ///
+    /// **It delegates nothing.** The press is the human saying their hand is
+    /// off this app, not authorising anything: every authority exercised after
+    /// it came from a grant approved on a consent card. See
+    /// [`crate::attention`].
+    pub attention: &'a std::cell::RefCell<crate::attention::AttentionSignal>,
     /// **The realm the human's physical input currently follows**, or `None`
     /// when no realm is bound (`session::physical_seat_target`, which follows
     /// the output binding a `layout_focus` holder moves).
@@ -446,6 +510,13 @@ pub(crate) enum UseOutcome {
         /// the active-to-spent grant lifecycle transition, reported at the
         /// instant it happens.
         spent_once: bool,
+        /// Whether this admission **spent the human's attention window**
+        /// (WS-E.1.7): `true` exactly when step 5c would have refused
+        /// `preempted` and the exemption suppressed it. Carried out through
+        /// the return value for the same reason `spent_once` is -- the
+        /// recorder observes the chokepoint through its outcome and never
+        /// appears inside it, so a journal exists without a third code path.
+        attention_claimed: bool,
     },
     /// Refused with this code; `voiced` says whether a `refused` event
     /// was actually emitted (`false` = coalesced away under the delivery
@@ -616,6 +687,12 @@ impl Chokepoint {
     {
         let verb = req.kind.verb();
         let coalescible = req.kind.coalescible();
+        // The human's attention window, iff step 5c below actually used it to
+        // suppress a `preempted` refusal. Declared out here because it is
+        // *spent* at step 6 and nowhere else: a use refused by a later gate
+        // (the bucket is the only one) drops it unclaimed, exactly as a refused
+        // use never burns a `once` rung.
+        let mut exemption: Option<crate::attention::Exemption> = None;
 
         // The decision chain (module docs). Every early exit is a typed
         // refusal -- fail closed: no path falls through to the operation
@@ -643,7 +720,7 @@ impl Chokepoint {
             if !matches!(req.kind, UseKind::Launch) && live_view(env.realm_view).is_none() {
                 break 'decide Err(Refuse::code(Refusal::NoSurface));
             }
-            if req.kind.attention_shaped() {
+            if req.kind.contends_for_attention() {
                 // **Whose realm the human's hand has to be in** for this use
                 // to be preempted (5c below), and the one place the two
                 // answers are chosen between (WS-E.1.6, issue #212).
@@ -668,7 +745,7 @@ impl Chokepoint {
                 } else {
                     env.physical_realm
                 };
-                // 5b, consent_held (attention-shaped uses only): the
+                // 5b, consent_held (attention-contending uses only): the
                 // principal's own prompt is up. A layout request meets
                 // this on the same terms an actuation does, and for a
                 // sharper reason: the prompt IS the human's attention, and
@@ -681,14 +758,59 @@ impl Chokepoint {
                 if petitions.prompt_up_for(req.principal) {
                     break 'decide Err(Refuse::code(Refusal::ConsentHeld));
                 }
-                // 5c, preempted (attention-shaped uses only): physical
+                // 5c, preempted (attention-contending uses only): physical
                 // human input owns the target right now. A focus request
                 // yields to a hand on the keyboard for the same reason a
                 // synthetic click does -- moving the output out from under
                 // a human mid-keystroke is the theft this verb is
                 // separately attenuable in order to bound.
                 if env.presence.owns_target(preempted_by, now) {
-                    break 'decide Err(Refuse::code(Refusal::Preempted));
+                    // ...**unless the human just said their hand is off it**
+                    // (WS-E.1.7, issue #232). The exemption nests inside 5c
+                    // and strictly after 5b, and it is narrow in three
+                    // independent ways:
+                    //
+                    // - **Layout only.** A seat-delivered use is untouched: a
+                    //   human's hand still mutes an agent actuating into the
+                    //   realm the hand is in, and no human gesture can lift
+                    //   that. What the attention key answers is the loop a
+                    //   human is *in* -- the Enter that tells a shell to
+                    //   switch realms is the physical input that forbids the
+                    //   switch.
+                    // - **This principal only**, and only if the `attention`
+                    //   event actually reached it at press time
+                    //   (`AttentionSignal::exempt`). A grant resolving inside
+                    //   the window cannot race in.
+                    // - **Once.** `Exemption` is not `Copy`, cannot be minted
+                    //   outside `crate::attention`, and is consumed by `claim`
+                    //   at step 6 -- so one press admits at most one layout
+                    //   use and a second claim is a compile error.
+                    //
+                    // It **delegates nothing**: the press is the human making
+                    // a statement about their own input state, and every
+                    // authority exercised after it came from a grant a human
+                    // approved on a consent card naming this principal and
+                    // this realm. A client that provokes the press gains
+                    // timing, never authority.
+                    //
+                    // 5b is never exempted, and the order is what says so: a
+                    // prompt up means the human is answering a security
+                    // question, and a principal that could focus or fullscreen
+                    // over its own pending card would be arranging the
+                    // decision it is waiting on. (`ConsentGate` also consumes
+                    // the chord before the attention hook sees it, so a window
+                    // cannot open while a prompt is up -- but a window opened
+                    // *before* the prompt went up must still meet
+                    // `consent_held`, and only 5b-before-5c gives that answer.)
+                    // The layout-only restriction is inside `exempt` (which
+                    // takes the kind) rather than a `match` arm here: it is the
+                    // sharpest claim this mechanism makes and it needs one home
+                    // with one test reading it, not an arm whose widening the
+                    // whole suite tolerated.
+                    exemption = env.attention.borrow().exempt(req.principal, &req.kind, now);
+                    if exemption.is_none() {
+                        break 'decide Err(Refuse::code(Refusal::Preempted));
+                    }
                 }
             }
             // Step 5d, the rate constraint -- the final gate, so a token
@@ -723,6 +845,21 @@ impl Chokepoint {
         // fails it below (`internal`) -- fail-closed, never
         // authority-expanding (the grant table's documented decision).
         let spent_once = grants.commit_use(allowed.grant_id);
+        // **The window is claimed here, at admission, and nowhere else.** Not
+        // at the gate, because a use the bucket then refused would have burnt
+        // the human's press for nothing; and not unconditionally, because
+        // `exemption` is `Some` only when 5c really did find the human's hand
+        // on the target and really did suppress the refusal. A use that needed
+        // no exemption (`owns_target` false) leaves the window open for the one
+        // that does. Same rule, and the same reason, as "a refused use never
+        // burns a `once`".
+        let attention_claimed = match exemption.take() {
+            Some(exemption) => {
+                env.attention.borrow_mut().claim(exemption);
+                true
+            }
+            None => false,
+        };
         if let Some(state) = self.states.get_mut(&req.grant_wire_id) {
             state.clear_mutes();
         }
@@ -759,6 +896,7 @@ impl Chokepoint {
                                 digest,
                             }),
                             spent_once,
+                            attention_claimed,
                         })
                     }
                     Err(err) => {
@@ -823,6 +961,7 @@ impl Chokepoint {
                     // An actuation delivers no observation to identify.
                     frame: None,
                     spent_once,
+                    attention_claimed,
                 })
             }
             UseKind::LayoutFocus | UseKind::LayoutArrange(_) => {
@@ -867,6 +1006,7 @@ impl Chokepoint {
                     // A layout act delivers no observation to identify.
                     frame: None,
                     spent_once,
+                    attention_claimed,
                 })
             }
             UseKind::Launch => {
@@ -1361,6 +1501,33 @@ mod tests {
                 path.display()
             );
         }
+
+        // (6) The attention event's **delivery filter** (WS-E.1.7), excluded
+        // from the enforcement path **by name rather than by accident**: it is
+        // a query about who to *tell*, not about who may *act*, and the one
+        // thing that would quietly turn it into a second authority site is a
+        // call from inside the chokepoint. So the census is exact in both
+        // directions -- zero here, exactly one non-test caller outside the
+        // grant table, which is `session::open_attention_window`.
+        let delivery_filter = format!("holds_{}", "verb");
+        let mut filter_callers = 0;
+        for (path, text) in &sources {
+            let hits = count(text, &delivery_filter);
+            if path.ends_with("grants.rs") {
+                continue;
+            }
+            assert!(
+                !path.ends_with("enforcement.rs") || hits == 0,
+                "the attention delivery filter must never be called from the \
+                 enforcement chokepoint: it says who to TELL, never who may ACT"
+            );
+            filter_callers += hits;
+        }
+        assert_eq!(
+            filter_callers, 1,
+            "the attention delivery filter has exactly one non-test caller \
+             outside the grant table"
+        );
     }
 
     #[test]

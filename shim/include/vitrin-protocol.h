@@ -315,7 +315,7 @@ static inline vitrin_decode_status_t vitrin_frame_header_decode(
 /* test_header_compiles.c) checks its own list length against this with */
 /* _Static_assert, so a message added to the IDL cannot ship without a */
 /* compile-time proof that its marshal functions type-check. */
-#define VITRIN_MESSAGE_COUNT 36
+#define VITRIN_MESSAGE_COUNT 37
 
 /* ==================================================================== */
 /* Section 1: per-interface metadata and enums.                          */
@@ -383,11 +383,11 @@ static inline bool vitrin_handshake_error_is_valid(uint32_t v) {
     }
 }
 
-/* ==== vitrin_principal (version 1) ==== */
+/* ==== vitrin_principal (version 2) ==== */
 /* the authenticated principal */
 
 #define VITRIN_PRINCIPAL_INTERFACE_NAME "vitrin_principal"
-#define VITRIN_PRINCIPAL_INTERFACE_VERSION 1u
+#define VITRIN_PRINCIPAL_INTERFACE_VERSION 2u
 
 /* ==== vitrin_realm (version 1) ==== */
 /* realm address */
@@ -1487,6 +1487,95 @@ static inline vitrin_decode_status_t vitrin_principal_evt_bound_decode(
     size_t pos = VITRIN_HEADER_LEN;
     vitrin_decode_status_t st_identity = vitrin_raw_read_string(in, in_len, &pos, 2048u, &out->identity);
     if (st_identity != VITRIN_DECODE_OK) { return st_identity; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `attention` (opcode 1) on `vitrin_principal`.
+ *
+ * the human asked for their attention to move
+ */
+typedef struct {
+    /* no arguments -- a truly empty struct is not portable standard C */
+    char reserved;
+} vitrin_principal_evt_attention_t;
+
+#define VITRIN_PRINCIPAL_EVT_ATTENTION_OPCODE ((uint8_t)1)
+#define VITRIN_PRINCIPAL_EVT_ATTENTION_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_PRINCIPAL_EVT_ATTENTION_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_principal_evt_attention_encode(const vitrin_principal_evt_attention_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_PRINCIPAL_EVT_ATTENTION_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_PRINCIPAL_EVT_ATTENTION_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    (void)msg;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_principal_evt_attention_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_principal_evt_attention_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_PRINCIPAL_EVT_ATTENTION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_PRINCIPAL_EVT_ATTENTION_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_PRINCIPAL_EVT_ATTENTION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    out->reserved = 0;
     if (pos != in_len) {
         return VITRIN_DECODE_ERR_TRAILING_BYTES;
     }

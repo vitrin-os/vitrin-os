@@ -1,6 +1,6 @@
 # vitrin_principal — the authenticated principal, root of the connection's authority chain
 
-**Interface version:** 1 · **Connection class:** principal · **Messages:** 1 request + 1 event
+**Interface version:** 2 · **Connection class:** principal · **Messages:** 1 request + 2 events
 
 ## Purpose
 
@@ -12,6 +12,15 @@ two narrow powers: it can mint an address handle for a realm
 ([`get_realm`](#get_realm)), and, through that handle, it can petition for
 authority (`vitrin_realm.request_grant`). It confers no capability of its own;
 naming a realm is not authority over it.
+
+**Since version 2 it is also where session-level facts about the *human* arrive**,
+and that is a widening of "root of the connection's authority chain" rather than a
+restatement of it. [`attention`](#attention) is about the human, not about this
+principal's authority, and it lives here because its scope is the connection and this
+is the only object whose scope is the connection. The alternatives were weighed and
+are worse — see [Growth](#growth). The cost is named rather than left implicit: an
+event on this object need not be an authority fact, and this page is the record a
+later, less defensible session fact would be citing as precedent.
 
 In the object graph the principal sits directly below the connection bootstrap.
 Object 1 of a principal connection is [`vitrin_handshake`](01-vitrin_handshake.md);
@@ -137,6 +146,54 @@ ahead of any event caused by requests the client pipelined after `hello`.
 **Failure modes.** None on this event itself; failure of the handshake it
 concludes is fatal and carried by `vitrin_handshake.error`, not here.
 
+### attention
+
+```
+attention()                                              (since version 2)
+```
+
+No arguments. **It confers nothing.**
+
+The human pressed the compositor's own attention key. What that means is a
+statement the human made about *their own input state* — "my hand is off this app
+right now" — which withdraws a transient courtesy the server extends to a human's
+typing: for a short, server-chosen, single-use window, a use of
+[`layout_focus`](17-vitrin_layout_focus.md) or
+[`layout_arrange`](18-vitrin_layout_arrange.md) by a principal this event reached is
+**not** refused [`preempted`](04-vitrin_grant.md#refusal). It is not a confirmation,
+it is not a consent decision, and it delegates no authority whatsoever: everything
+the client may do afterwards, it could already do. A client that provokes the press
+gains **timing**, never authority.
+
+**Why it exists.** Without it, a human at a shell running *inside* a realm cannot ask
+that shell to change the layout: the keystroke that sends the request is itself the
+physical input that makes the request meet `preempted`, and repeating it re-arms the
+window — a deterministic loop rather than a race.
+
+**Who receives it.** Only principals holding a live grant carrying `layout_focus` or
+`layout_arrange`. Every other client stays silent, because an unconditional event
+would be a free keystroke-timing oracle for every connected client. The server also
+does not deliver the keypress to any confined application — the key is consumed — for
+the same reason.
+
+**No arguments, and that is permanent.** A window length was considered and refused:
+signatures are immutable, the window is a server-side security parameter the server
+must stay free to shorten, and a client that built a timer off it would be building a
+retry policy that belongs nowhere. An honest client sends its already-staged request
+immediately and shows the `preempted` refusal if it lost the race.
+
+**Not a promise the window is yours.** Any recipient may use it and the first
+admitted use consumes it; a server cannot know which of two layout holders the human
+meant, and choosing would be window-management policy. Receiving this event is
+therefore not a guarantee that a subsequent layout request is admitted.
+
+**Delivery class:** an **unsolicited event**, not a terminal: it answers no request,
+and there is deliberately no request on this interface that asks for it. It is not
+coalesced — one press is one event — and a version-1 connection never receives it.
+
+**Failure modes.** None. A client that cannot act on it does nothing; a client that
+holds no layout verb never sees it.
+
 ## Flows
 
 `vitrin_principal` participates in the prelude common to every principal-side
@@ -175,6 +232,23 @@ this same prelude and diverge only at the petition's outcome, which is carried o
 [`vitrin_grant.resolved`](04-vitrin_grant.md), never here.
 
 ## Growth
+
+**Why `attention` is on this interface and not another** — the alternatives were
+weighed and each is worse:
+
+- an event on [`vitrin_layout_focus`](17-vitrin_layout_focus.md), which that page's
+  own Growth section invites, restates one human keypress once per *facet*: a shell
+  holding focus **and** arrange grants over twelve realms would receive twenty-four
+  events per press;
+- a new `vitrin_attention` interface minted from this one would confer no authority,
+  so it could only be filtered by "whoever minted it" — which re-opens the free
+  keystroke-timing oracle for every principal;
+- minting it from [`vitrin_grant`](04-vitrin_grant.md) puts us back on per-grant
+  duplication.
+
+**No verb bit governs it**, and that is a positive decision rather than an economy: a
+grantable "receive the human's attention key" verb would put a delegation framing on
+the wire for a signal that delegates nothing.
 
 The interface descriptions name one purely-additive seam for this object.
 

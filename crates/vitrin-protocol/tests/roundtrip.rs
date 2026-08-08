@@ -49,6 +49,7 @@ type HandshakeDone = gen::vitrin_handshake::events::Done;
 
 type GetRealm = gen::vitrin_principal::requests::GetRealm;
 type Bound = gen::vitrin_principal::events::Bound;
+type Attention = gen::vitrin_principal::events::Attention;
 
 type RequestGrant = gen::vitrin_realm::requests::RequestGrant;
 
@@ -198,6 +199,7 @@ impl_message!(
     HandshakeDone,
     GetRealm,
     Bound,
+    Attention,
     RequestGrant,
     GetLauncher,
     Resolved,
@@ -318,6 +320,13 @@ fn get_realm() -> impl Strategy<Value = GetRealm> {
 
 fn bound() -> impl Strategy<Value = Bound> {
     bounded_string(2048).prop_map(|identity| Bound { identity })
+}
+
+/// `vitrin_principal.attention` carries no arguments, forever (IDL): the
+/// window's length is a server-side security parameter, not something a client
+/// may build a timer off. Same shape as `vitrin_shim_surface.commit`.
+fn attention() -> impl Strategy<Value = Attention> {
+    Just(Attention {})
 }
 
 fn request_grant() -> impl Strategy<Value = RequestGrant> {
@@ -629,6 +638,7 @@ roundtrip_test!(roundtrip_vitrin_handshake_done, handshake_done());
 
 roundtrip_test!(roundtrip_vitrin_principal_get_realm, get_realm());
 roundtrip_test!(roundtrip_vitrin_principal_bound, bound());
+roundtrip_test!(roundtrip_vitrin_principal_attention, attention());
 
 roundtrip_test!(roundtrip_vitrin_realm_request_grant, request_grant());
 

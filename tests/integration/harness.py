@@ -101,6 +101,7 @@ class PhysicalInputInjector:
         button <evdev-code> press|release
         scroll vertical|horizontal <v120>
         key <evdev-scancode> press|release
+        attention                       (one whole tap of the configured chord)
 
     Each becomes a host event handed to the core's **production** intake
     (`input::intake_physical`, or `input::physical_key` for keys), tagged
@@ -117,6 +118,14 @@ class PhysicalInputInjector:
     Keys are limited to the core's layout-invariant scancode table (Escape,
     Enter, Tab, arrows, modifiers, F-keys, space) because a headless core has
     no host keymap to ask and the core is forbidden to grow one.
+
+    `attention` (WS-E.1.7, issue #232) is one whole tap -- press then release --
+    of **this run's configured attention chord**, resolved core-side and fed to
+    the same `input::physical_key` a `key` line uses. It is a name for a
+    *gesture*, never a second way into the core: a harness that sent only the
+    press would leave the core believing the key is held, and one that
+    hard-coded a scancode would press the wrong key the moment a run passed
+    `--attention-chord rsuper`.
     """
 
     #: `KEY_LEFTCTRL` -- a modifier, in the layout-invariant table, and the
@@ -196,6 +205,16 @@ class PhysicalInputInjector:
 
     def key(self, evdev: int, pressed: bool) -> None:
         self._expect_ack(f"key {evdev} {'press' if pressed else 'release'}", 1)
+
+    def attention(self) -> None:
+        """Tap the core's attention key: press and release, `ack 2`.
+
+        Two intake events, because the chord is a tap. The core consumes both,
+        so no app in any realm sees it -- which is why the evidence that it
+        happened is the `attention` wire event and the flight recorder, never
+        an app's own output.
+        """
+        self._expect_ack("attention", 2)
 
     def click(self, x: float, y: float, code: int | None = None) -> None:
         """Move, press, release -- the human's version of `grant.pointer.click`."""

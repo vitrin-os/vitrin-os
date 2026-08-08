@@ -18,6 +18,7 @@ machine-checkable and are checked:
 | The nested window composes the **bound** realm, and a bind re-uploads its texture | `backend/winit.rs`'s `the_window_shows_the_bound_realm_and_a_bind_re_uploads` — display-free assertions on `window_pixels` and `TextureKey` only | none (pure functions) |
 | **A human sees the right realm in the host window** | *this page* | nested, by hand |
 | **A real key held across a real focus switch is released into the realm being left** | *this page*, step 9 (WS-E.1.6/#212) | nested, by hand |
+| **A real Super press on real hardware opens the attention window** | *this page*, step 10 (WS-E.1.7/#232) | nested, by hand |
 
 The fourth is not automatable here and the reason is structural rather than a
 missing budget: **GitHub runners have no display**, and D-019(4) records
@@ -242,6 +243,70 @@ target/debug/vitrind --nested --consent=auto-approve \
    (`tests/integration/test_input_switch.py`) covers the *routing* half in CI
    through the same `intake_physical` entry point — a real finger on a real
    key across a real host compositor is what only this page can hold.
+
+10. **THE OTHER STEP NO CI GATE CAN REACH: press a real Super key.**
+    Issue #232's manual criterion, and the exact counterpart of step 9 — CI can
+    prove what a completed attention press *does*, never that a real finger on a
+    real key produces one. The `physical-input-injector` build
+    (`tests/integration/test_attention.py`) covers the consequence half through
+    the same `physical_key` entry point; a real keyboard is what only this page
+    can hold.
+
+    Set up as in step 8 (two realms, a client holding `layout.focus` over
+    `second`), and this time **type into `realm-0` immediately before asking
+    for the switch** — which is the whole scenario: in an in-realm shell the
+    Enter that sends `focus()` is the physical input that forbids it.
+
+    ```
+    # with the demo agent, or any client holding layout.focus over `second`
+    #   1. put your hand on the keyboard: type anything into realm-0
+    #   2. within half a second, have the client call grant.focus()
+    ```
+
+    What must happen:
+
+    - **Without** pressing Super: the client is refused
+      `Preempted`, the window keeps showing `realm-0`, and the core's stdout
+      carries no `attention_pressed` entry. That is the loop this key exists to
+      close, seen from the human's side.
+    - **Tap Super** (left Super by default; `--attention-chord rsuper` for the
+      right one). Three things must be true at once:
+      - the confined app in `realm-0` prints **nothing** for that key — run
+        `input-echo-client` there and watch: the chord is **consumed**, so no
+        app in any realm ever learns the human pressed it;
+      - a small marker appears in the host window **just below** the trusted
+        band, for about a second — beside the band, never inside it. If it
+        overlaps the band, the band's "exactly one correct appearance" property
+        is broken and that is a defect, not a cosmetic one;
+      - the flight recorder gains an `attention_pressed` entry with
+        `"chord":"super"`, `"opened":true` and a `notified` count equal to the
+        number of clients holding a layout verb.
+    - **Now** have the client call `grant.focus()` again, with your hand still
+      on the keyboard: it is admitted, the window shows `second`, and the
+      journal gains an `attention_claimed` entry naming that principal.
+    - **Immediately ask for a second layout change** (`focus` back, or
+      `set_fullscreen`), still with your hand on the keyboard: it must be
+      refused `Preempted`. One press admits **one** layout use, and a holder
+      that could focus, then fullscreen, then focus again would be spending one
+      human gesture three times.
+
+    Two things this step must **not** show, and each is a real defect if it
+    does:
+
+    - the dead-man switch behaving any differently. Hold Escape for a second
+      while tapping Super in the same moment: the revocation must fire exactly
+      as it does in `shim/docs/firefox.md` §9, and the hold bar must stay
+      visible *over* the attention marker. `DeadManHook` is stacked outside
+      `AttentionHook` precisely so a chord press wins.
+    - the attention marker appearing in an agent's captured frame. Take a
+      capture while the window is open and compare it against
+      `--capture-dump`: the marker is drawn on the human-visible side of the
+      output-stage fork, so a capture that contains it is the same class of
+      leak issue #85 is about.
+
+    Why this is not a CI gate: identical to step 9's reasoning.
+    `SeatInput::physical` is private, headless has no input device, and headless
+    is the only backend CI runs (D-019(4)).
 
 ## What a failure here looks like
 

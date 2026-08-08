@@ -66,6 +66,7 @@ type HandshakeError = gen::vitrin_handshake::events::Error;
 type HandshakeDone = gen::vitrin_handshake::events::Done;
 type GetRealm = gen::vitrin_principal::requests::GetRealm;
 type Bound = gen::vitrin_principal::events::Bound;
+type Attention = gen::vitrin_principal::events::Attention;
 type RequestGrant = gen::vitrin_realm::requests::RequestGrant;
 type GetLauncher = gen::vitrin_grant::requests::GetLauncher;
 type GetLayoutFocus = gen::vitrin_grant::requests::GetLayoutFocus;
@@ -210,6 +211,7 @@ impl_decode_msg_no_fd!(
     HandshakeDone,
     GetRealm,
     Bound,
+    Attention,
     RequestGrant,
     GetLauncher,
     Resolved,
@@ -263,6 +265,7 @@ static DECODERS: &[Decoder] = decoder_table!(
     HandshakeDone,
     GetRealm,
     Bound,
+    Attention,
     RequestGrant,
     GetLauncher,
     Resolved,

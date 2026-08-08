@@ -66,6 +66,9 @@ PROPERTY_GATES=(
                                 # per-realm afterwards (#210)
   test_input_switch.py          # physical input follows the binding, an agent's
                                 # actuation follows its grant (#212)
+  test_attention.py             # the human's attention key lifts `preempted` for
+                                # exactly one layout use, and only for principals
+                                # holding layout authority (#232)
 )
 missing=()
 for gate in "${MILESTONE_GATES[@]}" "${PROPERTY_GATES[@]}"; do
@@ -135,6 +138,12 @@ fi
 #   know the flag and exits at argument parsing, so that test fails naming
 #   this rebuild rather than skipping. Same two-gate posture as the consent
 #   channel: the feature alone changes nothing at runtime without the flag.
+#   `test_attention.py` (issue #232) rides the same channel and the same
+#   argument: the attention chord is physical input, so its *trigger* is
+#   unreachable here without the injector, and its `attention` line presses the
+#   run's configured chord through the same `physical_key`. What stays outside
+#   CI, and is a runbook step in `shim/docs/nested-multi-realm.md` rather than a
+#   criterion, is that a real Super press on real hardware produces one.
 INJECTORS=vitrin-core/dead-man-injector,vitrin-core/consent-injector,vitrin-core/physical-input-injector
 echo "==> building workspace with $INJECTORS"
 cargo build --workspace --features "$INJECTORS"

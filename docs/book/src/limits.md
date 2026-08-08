@@ -132,22 +132,54 @@ yield to a hand anywhere the human is: those move what you are looking at
 rather than being delivered into a realm, so they are judged against the realm
 your input is following.
 
-**You cannot switch realms in the same half-second you typed, and a
-keyboard-driven switcher feels this constantly.** Because layout requests
-yield to a hand, any physical input marks the realm you are in as yours for
-500 ms, and a `focus` or `set_fullscreen` arriving inside that window is
-refused `preempted`. That is correct for the case the rule was written for —
-an agent must not move the output out from under someone mid-keystroke — but
-it lands hardest on the most ordinary human action there is. Type `focus
-editor` into a shell and press Enter, and the Enter is itself the physical
-input that preempts the request the Enter just sent. The refusal is
-recoverable and the same request succeeds a moment later, but nothing in the
-core retries it, and a client that shows refusals rather than hiding them
-(which is the behaviour this project asks of clients) will show this one
-often. There is no attention key and no core-owned "the human meant this"
-signal that would distinguish a switch the human just asked for from a
-switch an agent attempted while they typed; naming that gap is not filling
-it.
+**You cannot switch realms in the same half-second you typed — unless you tap
+Super first.** Because layout requests yield to a hand, any physical input marks
+the realm you are in as yours for 500 ms, and a `focus` or `set_fullscreen`
+arriving inside that window is refused `preempted`. That is correct for the case
+the rule was written for — an agent must not move the output out from under
+someone mid-keystroke — but it lands hardest on the most ordinary human action
+there is: type `focus editor` into a shell and press Enter, and the Enter is
+itself the physical input that preempts the request the Enter just sent.
+
+The core therefore owns a second key, **Super** (configurable to right-Super,
+and to nothing else). Tapping it opens a one-second, single-use window in which
+a layout request from a principal holding layout authority is not refused
+`preempted`, and it sends those principals a one-bit `attention` event so they
+know to send the request they had staged. The key is **consumed**: no app in any
+realm ever sees it, which is also why it cannot be used as a keystroke-timing
+oracle. **It delegates nothing** — everything the client does afterwards it
+could already do; what you withdrew was a courtesy the core was extending to
+your own typing.
+
+What it costs you:
+
+- **The core eats Super, everywhere.** A nested compositor, a VM viewer, or a
+  remote-desktop client running in a realm loses that key with no pass-through
+  and no way to ask for one. The only remedy is `--attention-chord rsuper`,
+  which is not really a remedy.
+- **The window is session-wide.** If two clients hold layout authority, either
+  of them may consume the press — the core cannot know which one you meant, and
+  choosing would be window-management policy it deliberately does not have. Your
+  own switch then silently fails and the other one lands. The claim is journaled
+  with the principal that took it, and the grant is revocable, and it is still a
+  hole.
+- **A client can ask you to press it.** A shell printing "press Super to apply"
+  is doing the right thing; a malicious one printing the same string and banking
+  the timing is indistinguishable from it. What bounds this is that the press
+  confers no authority the client did not already hold — but a human who learns
+  "press Super when the screen tells me to" has learned a habit an attacker can
+  invoke.
+- **`preempted` on the layout verbs is now conditional on core state you cannot
+  see.** An agent reading its own journal can no longer reconstruct why one
+  `focus` landed and an identical one did not.
+- **Other principals lose a guarantee nobody tells them they lost.** "A human
+  typing means nobody moves the output" was true for 500 ms at a time and is now
+  suspendable by a gesture no wire event announces to anyone but layout holders.
+
+While the window is open the core draws a small marker just below the trusted
+band — never inside it, because the band has exactly one correct appearance and
+that is the whole of its value. **A focus change that happened with no marker up
+was not yours.**
 
 **Switching realms mid-gesture releases what you were holding, into the realm
 you left.** A key or pointer button you are physically holding when the output

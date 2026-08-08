@@ -133,7 +133,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 
 | Stage | Delivers | Est. |
 |---|---|---|
-| **1 — multi-app, nested** | Runtime app launch · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · a shell client (switcher + launcher) | 7–9 w |
+| **1 — multi-app, nested** | Runtime app launch · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · ~~a core-owned attention key~~ (**landed**, WS-E.1.7/#232: a tapped, consumed Super lifts `preempted` for one layout use and delivers `vitrin_principal.attention`, so an in-realm shell can switch realms at all) · a shell client (switcher + launcher) | 7–9 w |
 | **2 — livable** | Cross-realm clipboard · core-drawn lock screen on the consent stack · status in the trusted band · human screenshot | 4–6 w |
 | **3 — bare metal** | The keymap decision · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
 | **4 — long tail** | X11 (defers to E3.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |
@@ -142,6 +142,12 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 and unserved, and multi-realm is Phase-3 fleet work; both get built here
 regardless of whether Stage 3 ever happens. Stages 3–4 are not dual-use, and
 that is where the schedule risk concentrates.
+
+**Stage 3's keymap decision is untouched by WS-E.1.7.** The attention key is
+drawn from `invariant_keysym` — the two Super scancodes — and needs no keymap,
+no modifier resolution, and nothing like `Super+1`..`Super+9`. That was a
+deliberate limit rather than an accident: a hotkey would have pre-empted the
+decision below.
 
 **Stage 3's first task is a decision, not code.** The core holds no keymap by
 design — `vitrin_shim_seat.key` carries keysyms *"precisely so no keymap lives
@@ -272,16 +278,57 @@ this workstream owns, not inherits:
   focus loss — but it now happens on every switcher keypress rather than only
   on alt-tab. Published in `docs/book/src/limits.md`.
 
-- **`PhysicalPresence` is still fed by nothing in production** (pre-existing,
-  surfaced by WS-E.1.6, no owner). `PresenceHook` is the tap that feeds it and
-  it is constructed in tests only: the nested backend's router stacks
-  `ConsentGate<DeadManHook<NoopHook>>` and the headless one stacks `NoopHook`,
-  so no shipping build ever calls `PhysicalPresence::note` and the `preempted`
-  refusal cannot fire at runtime. Making presence per-realm makes it *correct*
-  per realm; it does not make it *reachable*. Wiring the hook is a behaviour
-  change (agents would start being refused when a human types, for the first
-  time) and was deliberately left outside #212's scope rather than smuggled in
-  with it.
+- ~~**`PhysicalPresence` is still fed by nothing in production**~~
+  (pre-existing, surfaced by WS-E.1.6, **closed by WS-E.1.6/#212 itself**).
+  `PresenceHook` was an *optional* member of the router's hook stack and no
+  shipping backend included it, so no build ever called
+  `PhysicalPresence::note` and the `preempted` refusal could not fire at
+  runtime while the book described it as live behaviour. #212's review deleted
+  the hook: `InputRouter` holds the presence map itself, above the stack, writes
+  it in `route_into`, and `Runtime::new` takes the kernel's map *out of the
+  router* — so a router that does not feed presence, or a kernel whose presence
+  is not its router's, is now unconstructible rather than a mistake nobody made
+  on purpose. (This bullet described the state during #212 and was left
+  uncorrected when it landed; corrected in place by WS-E.1.7, which had to read
+  the hook stack to add to it.)
+
+- **The core owns a second physical chord, and it eats Super** (created by
+  WS-E.1.7/#232, no owner). Tapping Super opens a one-second, single-use window
+  in which a layout holder is not refused `preempted`, and delivers an
+  argument-free `attention` event to every layout holder. It closes the loop
+  that made an in-realm shell unusable — the Enter that sends `focus editor` is
+  the physical input that forbids it — and it costs the human that key
+  **everywhere**: a nested compositor, a VM viewer or a remote-desktop client in
+  a realm loses it with no pass-through and no way to ask for one. That is the
+  cost `deadman.rs` refused to pay for Escape, paid here for a different key on
+  the argument that every desktop already reserves it. The only remedy is
+  `--attention-chord rsuper`, which is not a remedy. Published in
+  `docs/book/src/limits.md`.
+
+- **The attention window is session-wide, and the delivered-to set only narrows
+  it** (created by WS-E.1.7, and unfixable here — D-023(2)). Any principal the
+  `attention` event reached may claim the window; the core cannot tell which of
+  two layout holders the human meant. Fixing it means choosing a shell, which is
+  the window-management policy PRD §5.1 exiles from the core, and the mapping
+  that would make it structural — "the principal that draws in the bound realm"
+  — does not exist, because a realm and a principal connection have no binding
+  (#211's decision 2 names the same gap). A second holder can consume a press the
+  human aimed at the shell; the human's own switch then silently fails and the
+  thief's lands. It is journaled with the claiming principal and the grant is
+  revocable, and it is still a hole. Published in `docs/book/src/limits.md`.
+
+- **`preempted` on the layout verbs is conditional on invisible core state**
+  (created by WS-E.1.7, no owner). An agent reading its own journal can no longer
+  reconstruct why one `focus` landed and an identical one did not without
+  correlating the core's attention entries, which it cannot see. The refusal used
+  to mean one thing. Published in `docs/book/src/limits.md`.
+
+- **Two indicators now compete for the top strip, and a third is scheduled**
+  (created by WS-E.1.7, owner: whoever lands WS-E.2.3/#215 second). The dead-man
+  hold bar, the attention marker, and #215's clock/battery/focused-realm strip
+  were each designed without the others. Nobody has designed that strip as a
+  whole, and each issue that adds to it is deciding the layout of a surface whose
+  whole purpose is being unambiguous.
 
 ## 7. Safety rule, non-negotiable
 

@@ -887,6 +887,20 @@ impl<H: PreemptionHook> PreemptionHook for ConsentGate<H> {
             Gate::Deliver => self.inner.gate(input),
         }
     }
+
+    /// Forwarded, never answered here: this gate carries no attention signal
+    /// of its own (WS-E.1.7). Being *outside*
+    /// [`crate::attention::AttentionHook`] is the whole of decision 6 of issue
+    /// #232 — while a prompt is up this gate consumes the chord, so an
+    /// attention window cannot even open while the human is answering a
+    /// security question, and a window opened *before* the prompt went up must
+    /// still meet the chokepoint's `consent_held` at step 5b, which is judged
+    /// strictly before the exemption.
+    fn attention(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>> {
+        self.inner.attention()
+    }
 }
 
 #[cfg(test)]
@@ -1227,6 +1241,64 @@ mod tests {
         assert!(
             grab.take_decision().is_none(),
             "a press the guard rejected cannot be committed by a late release"
+        );
+    }
+
+    /// **A raised prompt consumes the attention chord before the attention
+    /// hook ever sees it** (WS-E.1.7 decision 6, the `ConsentGate`-outside
+    /// half).
+    ///
+    /// Driven through the real stack shape the nested backend builds —
+    /// `ConsentGate<AttentionHook<NoopHook>>`, minus the dead-man watcher,
+    /// which sits between them and is irrelevant to this claim — so "the
+    /// window cannot even open while a prompt is up" is a property of the
+    /// stacking order rather than of a check inside the attention module.
+    /// Reverting `ConsentGate::gate`'s short-circuit, or moving the attention
+    /// hook outside this one, turns this red.
+    #[test]
+    fn a_raised_prompt_consumes_the_attention_chord_before_the_hook_sees_it() {
+        use crate::attention::{AttentionChord, AttentionHook, AttentionSignal, DEFAULT_CHORD};
+        use crate::input::{Gate, NoopHook, PreemptionHook};
+        use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+
+        let (grab, _surface, _registry, _petition, t0) = armed();
+        let chord = AttentionChord::parse(DEFAULT_CHORD).expect("the default chord parses");
+        let signal = Rc::new(RefCell::new(AttentionSignal::new(chord)));
+        let now = Rc::new(Cell::new(t0));
+        let mut stack = ConsentGate::new(
+            Rc::new(RefCell::new(grab)),
+            Rc::clone(&now),
+            AttentionHook::new(Rc::clone(&signal), Rc::clone(&now), NoopHook),
+        );
+
+        // The human's real chord press, through the production intake.
+        let pressed = crate::input::physical_key(chord.evdev(), None, KeyState::Pressed);
+        assert_eq!(
+            pressed.len(),
+            1,
+            "fixture: the chord survives the intake table"
+        );
+        assert_eq!(stack.gate(&pressed[0]), Gate::Consume);
+        assert!(
+            signal.borrow_mut().take_pending().is_none(),
+            "a chord pressed while a consent prompt is up must open no window at all: the \
+             grab consumed it, and the human is answering a security question rather than \
+             saying anything about the app their hand is on"
+        );
+
+        // ...and with no prompt up, the identical press reaches the hook. The
+        // control half, so the assertion above cannot pass because the gate
+        // never fires at all.
+        let idle = Rc::new(RefCell::new(ConsentGrab::new()));
+        let mut idle_stack = ConsentGate::new(
+            idle,
+            Rc::clone(&now),
+            AttentionHook::new(Rc::clone(&signal), now, NoopHook),
+        );
+        assert_eq!(idle_stack.gate(&pressed[0]), Gate::Consume);
+        assert!(
+            signal.borrow_mut().take_pending().is_some(),
+            "control: with no prompt up the same press must reach the attention hook"
         );
     }
 
@@ -1885,6 +1957,18 @@ mod tests {
         impl PreemptionHook for Spy {
             fn observe(&mut self, _input: &SeatInput) {
                 self.observed.set(self.observed.get() + 1);
+            }
+
+            // A terminal test double owns no attention signal. Spelled out because
+            // `PreemptionHook::attention` deliberately has no default: a wrapping
+            // hook that inherited `None` would silently disable the human's
+            // attention key, which is the shape of the bug #212's review found in
+            // `PresenceHook`.
+            fn attention(
+                &self,
+            ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>>
+            {
+                None
             }
             fn gate(&mut self, _input: &SeatInput) -> Gate {
                 self.gated.set(self.gated.get() + 1);

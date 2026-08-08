@@ -440,7 +440,54 @@ mod tests {
     /// that had been deleted.
     fn human_visible(view: &[u8], indicator: TrustedIndicator) -> Vec<u8> {
         let mut surface = ConsentSurface::new(indicator);
-        crate::backend::human_visible_from_view(view.to_vec(), &mut surface, W, H)
+        crate::backend::human_visible_from_view(view.to_vec(), &mut surface, W, H, false)
+    }
+
+    /// **The attention marker actually reaches the human's output** (WS-E.1.7,
+    /// issue #232) — driven through the real shared composite, not a
+    /// hand-rolled marker, for exactly the reason `human_visible` above gives:
+    /// a test that painted its own would pass over a deleted
+    /// `composite_attention_marker`.
+    ///
+    /// It had no reader at all when it landed: deleting the composite call left
+    /// the whole suite green, so "the human sees something" — decision 8, the
+    /// answer to *"what tells them what they just confirmed?"* — rested on
+    /// nothing. Two directions, both load-bearing. Drawing it is what makes the
+    /// gesture visible; **erasing** it is what stops the marker outliving the
+    /// window and telling the human a defence is lifted when it has closed.
+    #[test]
+    fn the_attention_marker_reaches_the_human_output_and_leaves_the_band_alone() {
+        let view = client_view([0x20, 0x20, 0x20]);
+        let mut closed_surface = ConsentSurface::new(TrustedIndicator::for_test());
+        let closed =
+            crate::backend::human_visible_from_view(view.clone(), &mut closed_surface, W, H, false);
+        let mut open_surface = ConsentSurface::new(TrustedIndicator::for_test());
+        let open =
+            crate::backend::human_visible_from_view(view.clone(), &mut open_surface, W, H, true);
+
+        assert_ne!(
+            closed, open,
+            "an open attention window must change the human-visible output: the marker is \
+             the only thing telling the human a defence is currently lifted"
+        );
+
+        // ...and it must not have got there by touching the trusted band. The
+        // band's whole value is that its secret colour has exactly ONE correct
+        // appearance; a band that sometimes carries a marker is a band whose
+        // correct appearance is fuzzier, which is #215's rule for the clock and
+        // battery applied here for the same reason.
+        let band_bytes = (W as usize) * (crate::consent::TRUST_BAND_HEIGHT as usize) * 4;
+        assert_eq!(
+            closed[..band_bytes],
+            open[..band_bytes],
+            "the marker must be drawn BESIDE the trusted band, never in it"
+        );
+        assert_ne!(
+            closed[band_bytes..],
+            open[band_bytes..],
+            "...which means the change has to be somewhere below the band -- if this fails \
+             with the assertion above passing, the marker was drawn nowhere at all"
+        );
     }
 
     /// The realm every fixture below binds to the output, so a report names
@@ -491,6 +538,7 @@ mod tests {
             &mut surface,
             CARD_W,
             CARD_H,
+            false,
         )
     }
 
@@ -514,8 +562,13 @@ mod tests {
                 2 => surface.dismiss_for_test(),
                 _ => {}
             }
-            let output =
-                crate::backend::human_visible_from_view(view.clone(), &mut surface, CARD_W, CARD_H);
+            let output = crate::backend::human_visible_from_view(
+                view.clone(),
+                &mut surface,
+                CARD_W,
+                CARD_H,
+                false,
+            );
             witness.observe(view, &output, CARD_W, CARD_H, Some(&bound()));
         }
         let report = witness.report();

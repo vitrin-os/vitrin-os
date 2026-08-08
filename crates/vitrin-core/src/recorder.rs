@@ -852,6 +852,60 @@ pub(crate) enum Event<'a> {
         /// `petition_resolved` entry at delivery.
         denied_petitions: usize,
     },
+    /// The human tapped the core's **attention key** (WS-E.1.7, issue #232).
+    ///
+    /// Written for **every** press the gate admitted, whether or not it opened
+    /// a window, and that second half is load-bearing for the same reason
+    /// [`Event::DeadManTriggered`]'s is: a session where the human pressed the
+    /// key and nobody held layout authority would otherwise be
+    /// indistinguishable, from the log alone, from one where they never
+    /// touched it — so "the key works" would be unverifiable exactly when
+    /// somebody is trying to find out why their switch did nothing.
+    ///
+    /// An emulated key carrying the chord's keysym produces **no** entry,
+    /// because it never reaches the gate's press arm at all
+    /// ([`crate::attention::AttentionSignal::gate_event`]'s origin check).
+    AttentionPressed {
+        /// The configured chord's name (`super`), from a closed vocabulary
+        /// ([`crate::attention::AttentionChord`]) -- never free-form text.
+        chord: &'static str,
+        /// Whether a window actually opened. `false` when the `attention`
+        /// event reached nobody: a window no principal may claim is not open,
+        /// and recording it as one would overstate what the human's gesture
+        /// did.
+        opened: bool,
+        /// How many live **connections** were sent the event.
+        ///
+        /// Deliberately not the same number as the delivered-to set's size,
+        /// and the difference matters when reading a journal: the set that may
+        /// claim the window is keyed by **principal**, while this counts the
+        /// sockets the event went out on. One identity holding two connections
+        /// — which the delivery filter allows on purpose — is two here and one
+        /// there. Read this as "how loudly did the press go out", never as
+        /// "how many parties may now claim it"; for the latter, the
+        /// `AttentionClaimed` entry names the principal that actually did.
+        notified: usize,
+    },
+    /// One layout use **spent the human's attention window** (WS-E.1.7): step
+    /// 5c would have refused it `preempted` and the exemption suppressed that.
+    ///
+    /// Recorded beside [`Event::GrantSpent`], from the chokepoint's returned
+    /// outcome and never from inside it, so the journal exists without a third
+    /// code path through the enforcement chain. One press produces at most one
+    /// of these, which is what makes "did the human's own switch land, or did
+    /// somebody else's" answerable from the log — the single narrowing
+    /// available against a session-wide window (issue #232 decision 10).
+    AttentionClaimed {
+        connection: ConnectionId,
+        /// The principal that spent it -- named explicitly rather than left to
+        /// be joined through the connection, because "who took the human's
+        /// press" is the question this entry exists to answer.
+        principal: &'a PrincipalIdentity,
+        /// The grant row the admitted use was under.
+        grant_id: GrantId,
+        /// Which layout verb spent it.
+        verb: Verb,
+    },
     /// One grant row deleted outright by connection teardown -- the way a
     /// version-1 grant most commonly dies (they die with their
     /// connection).
@@ -1003,6 +1057,8 @@ impl Event<'_> {
             Event::GrantExpired { .. } => "grant_expired",
             Event::GrantRevoked { .. } => "grant_revoked",
             Event::DeadManTriggered { .. } => "dead_man_triggered",
+            Event::AttentionPressed { .. } => "attention_pressed",
+            Event::AttentionClaimed { .. } => "attention_claimed",
             Event::GrantRemoved { .. } => "grant_removed",
             Event::RealmSpawned { .. } => "realm_spawned",
             Event::RealmSpawnFailed { .. } => "realm_spawn_failed",
@@ -1267,6 +1323,26 @@ impl Event<'_> {
                 field_u64(out, "revoked_grants", revoked_grants as u64);
                 field_u64(out, "denied_petitions", denied_petitions as u64);
             }
+            Event::AttentionPressed {
+                chord,
+                opened,
+                notified,
+            } => {
+                field_str(out, "chord", chord);
+                field_bool(out, "opened", opened);
+                field_u64(out, "notified", notified as u64);
+            }
+            Event::AttentionClaimed {
+                connection,
+                principal,
+                grant_id,
+                verb,
+            } => {
+                field_display(out, "connection", connection);
+                field_str(out, "principal", principal.as_str());
+                field_display(out, "grant_id", grant_id);
+                field_str(out, "verb", verb_label(verb));
+            }
             Event::GrantRemoved {
                 connection,
                 grant_id,
@@ -1472,11 +1548,28 @@ fn write_string_array(out: &mut String, k: &str, values: &[String]) {
 /// The single verb a facet use exercises. Falls back to `unknown` rather
 /// than panicking or lying if a future multi-bit value ever reaches here;
 /// `verbs_bits` on petition entries always carries the exact mask.
+/// The IDL's own spelling of a single verb bit, for the journal.
+///
+/// **Every bit in [`Verb::VALID_MASK`] is named**, and that is a correction
+/// rather than a completion: this covered exactly the three version-1 verbs, so
+/// `layout_focus`, `layout_arrange`, `realm_launch` and `observe_cursor` all
+/// rendered as `"unknown"` — a `use_decision` line that could not say which
+/// verb was decided. It was found by WS-E.1.7, whose own journal assertions are
+/// about the two layout verbs; `every_verb_bit_has_a_journal_label` keeps the
+/// next appended bit from re-opening it silently.
+///
+/// `"unknown"` survives for a value that is not a single defined bit (a mask, or
+/// zero), which the chokepoint cannot produce — one facet, one verb — but which
+/// this function must still be total for.
 fn verb_label(verb: Verb) -> &'static str {
     match verb {
         Verb::OBSERVE => "observe",
         Verb::ACTUATE_POINTER => "actuate_pointer",
         Verb::ACTUATE_TEXT => "actuate_text",
+        Verb::OBSERVE_CURSOR => "observe_cursor",
+        Verb::LAYOUT_ARRANGE => "layout_arrange",
+        Verb::LAYOUT_FOCUS => "layout_focus",
+        Verb::REALM_LAUNCH => "realm_launch",
         _ => "unknown",
     }
 }
@@ -2218,6 +2311,37 @@ fn wall_ms() -> u64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// **Every verb bit the wire defines has a journal label** (WS-E.1.7).
+    ///
+    /// `verb_label` covered exactly the three version-1 verbs, so a
+    /// `use_decision` for `layout_focus`, `layout_arrange`, `realm_launch` or
+    /// `observe_cursor` said `"unknown"` — a decision line that could not name
+    /// what was decided, which is the one thing a replay reader needs from it.
+    /// Pinned against `VALID_MASK` rather than against a list, so an appended
+    /// verb bit turns this red instead of quietly rendering as `"unknown"`.
+    #[test]
+    fn every_verb_bit_has_a_journal_label() {
+        for bit in 0..32u32 {
+            let value = 1u32 << bit;
+            if Verb::VALID_MASK & value == 0 {
+                continue;
+            }
+            let verb = Verb::from_bits(value).expect("a bit inside VALID_MASK is valid");
+            assert_ne!(
+                super::verb_label(verb),
+                "unknown",
+                "verb bit {value} is defined on the wire and has no journal label"
+            );
+        }
+        // ...and a value that is not a single defined bit stays total rather
+        // than panicking: the chokepoint cannot produce one (one facet, one
+        // verb), and this function must be total anyway.
+        assert_eq!(
+            super::verb_label(Verb::from_bits(0).expect("zero decodes")),
+            "unknown"
+        );
+    }
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
@@ -2870,6 +2994,7 @@ pub(crate) mod tests {
                 digest: ObservationDigest::of(b"pixels"),
             }),
             spent_once: false,
+            attention_claimed: false,
         };
         let refused = UseOutcome::Refused {
             code: Refusal::RateLimited,
@@ -3475,6 +3600,7 @@ pub(crate) mod tests {
             grant: GrantId::from_u64_for_test(1),
             frame: None,
             spent_once: false,
+            attention_claimed: false,
         };
         for (i, detail) in [
             ActuationDetail::Motion { x: -7, y: 1024 },
@@ -3537,6 +3663,7 @@ pub(crate) mod tests {
             grant: GrantId::from_u64_for_test(1),
             frame: None,
             spent_once: false,
+            attention_claimed: false,
         };
         let detail = ActuationDetail::of(&UseKind::Text(SeatInputKind::Text {
             text: secret.to_string(),
@@ -3600,6 +3727,7 @@ pub(crate) mod tests {
                 digest: ObservationDigest::of(b"pixels"),
             }),
             spent_once: false,
+            attention_claimed: false,
         };
         assert_eq!(
             ActuationDetail::of(&UseKind::Capture),
@@ -3746,6 +3874,7 @@ pub(crate) mod tests {
                     digest,
                 }),
                 spent_once: false,
+                attention_claimed: false,
             };
             rec.record(Event::UseDecision {
                 connection: ConnectionId::from_u64_for_test(1),

@@ -185,12 +185,23 @@ and the set is exactly
 | `revoked` | the grant was revoked |
 | `rate_limited` | the grant's token bucket is empty; `retry_after_ms` > 0 |
 | `no_surface` | the granted realm has no live view |
-| `preempted` | physical human input owns the target right now |
+| `preempted` | physical human input owns the target right now — **conditional**, see below |
 | `consent_held` | this principal's own consent prompt is up |
 | `internal` | a server-side failure carrying out the arrangement |
 
 `no_surface` here means what it says: an app that has committed nothing has
 neither an own size to return to nor a buffer to fill the output with.
+
+**`preempted` is conditional on exactly the terms
+[`focus`](17-vitrin_layout_focus.md#failure-modes)'s is**: while the human's
+attention signal ([`vitrin_principal.attention`](02-vitrin_principal.md#attention),
+version 2) is live for a principal, that principal's `set_fullscreen` is not
+refused `preempted`. The signal lifts it for **both** layout verbs or for
+neither — `fullscreen on<Enter>` hits the identical loop that
+`focus editor<Enter>` does, and the harm profiles argue *for* including
+arrangement rather than against: a stolen focus moves the human's keystrokes
+into another realm, while a stolen `set_fullscreen` resizes the view and cannot
+stack, occlude the consent surface, or move anything.
 
 ## Enums
 

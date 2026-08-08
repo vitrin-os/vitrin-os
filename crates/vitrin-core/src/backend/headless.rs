@@ -150,6 +150,59 @@ use crate::consent::{ConsentSurface, TrustedIndicator};
 use crate::deadman::DeadManConfig;
 use crate::grants::RealmId;
 use crate::input::{InputRouter, NoopHook, PhysicalPresenceMap};
+
+/// **This backend's hook stack**, and the one thing about it that is not
+/// [`NoopHook`] (WS-E.1.7, issue #232).
+///
+/// A plain headless build stacks nothing: there is no chord to hold, no prompt
+/// for a human to click, and — structurally — no physical input at all, since
+/// `SeatInput::physical` is private to `crate::input` and this backend calls no
+/// intake. A `physical-input-injector` build **does** have physical input, so
+/// it stacks [`crate::attention::AttentionHook`] and nothing else: the
+/// attention key is the one core-owned chord whose consequence *and* whose
+/// trigger are both reachable from the injector channel, which is what gives
+/// `tests/integration/test_attention.py` a mock-free gate.
+///
+/// It deliberately does **not** stack the consent grab or the dead-man watcher
+/// here. Those two are nested-mode policies with their own injectors
+/// (`consent-injector`, `dead-man-injector`), and inventing a hook stack no
+/// backend actually runs would prove something about a configuration nobody
+/// ships. What it costs is stated rather than implied: an attention press on
+/// *this* backend meets no consent gate above it, so the "a prompt consumes the
+/// chord" half of decision 6 is a nested-mode and unit-test property, exactly
+/// as `preempted`'s detection half is.
+#[cfg(feature = "physical-input-injector")]
+type HeadlessHook = crate::attention::AttentionHook<NoopHook>;
+#[cfg(not(feature = "physical-input-injector"))]
+type HeadlessHook = NoopHook;
+
+/// Build [`HeadlessHook`] on **the router's own clock cell**. Two bodies
+/// rather than one with a `cfg` inside, so the plain build's router provably
+/// carries no cell and no signal beyond what it already had.
+///
+/// The cell is a parameter rather than something this mints, and that is the
+/// bug it exists to prevent: `route_physical_turn` advances the router's cell
+/// through [`InputRouter::observe_at`], so a hook holding a *second* cell would
+/// time every attention press at process start and the window would be
+/// permanently expired by the time the chokepoint asked.
+#[cfg(feature = "physical-input-injector")]
+fn headless_hook(
+    attention: crate::attention::AttentionChord,
+    now: &std::rc::Rc<std::cell::Cell<std::time::Instant>>,
+) -> HeadlessHook {
+    crate::attention::AttentionHook::new(
+        std::rc::Rc::new(std::cell::RefCell::new(
+            crate::attention::AttentionSignal::new(attention),
+        )),
+        std::rc::Rc::clone(now),
+        NoopHook,
+    )
+}
+
+#[cfg(not(feature = "physical-input-injector"))]
+fn headless_hook(_now: &std::rc::Rc<std::cell::Cell<std::time::Instant>>) -> HeadlessHook {
+    NoopHook
+}
 use crate::recorder::Recorder;
 use crate::scene::{RealmScenes, Scene};
 use crate::session::{self, Runtime, RuntimeSeed};
@@ -304,6 +357,8 @@ fn readback_region(
 pub fn run(
     size: (u32, u32),
     dead_man: DeadManConfig,
+    #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
+    attention: crate::attention::AttentionChord,
     agent_cursor: bool,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
     #[cfg(feature = "physical-input-injector")] physical_input_fd: Option<std::os::fd::RawFd>,
@@ -319,6 +374,7 @@ pub fn run(
     let result = run_inner(
         size,
         dead_man,
+        attention,
         agent_cursor,
         #[cfg(feature = "consent-injector")]
         consent_injector_fd,
@@ -337,6 +393,8 @@ fn run_inner(
     size: (u32, u32),
     #[cfg_attr(not(feature = "dead-man-injector"), allow(unused_variables))]
     dead_man: DeadManConfig,
+    #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
+    attention: crate::attention::AttentionChord,
     agent_cursor: bool,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
     #[cfg(feature = "physical-input-injector")] physical_input_fd: Option<std::os::fd::RawFd>,
@@ -448,6 +506,7 @@ fn run_inner(
         indicator,
         agent_cursor,
     )?;
+    let now_cell = std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now()));
     let mut state = HeadlessState {
         view,
         // Headless stacks **no policy hook** — there is no chord to hold and
@@ -463,11 +522,16 @@ fn run_inner(
             seed.take().expect("the seed is consumed exactly once"),
             InputRouter::new(
                 std::rc::Rc::new(std::cell::RefCell::new(PhysicalPresenceMap::new())),
-                // Nothing else on this backend reads the clock cell — there
-                // is no grab and no watcher stacked — so the router keeps the
-                // only handle and `route_physical_turn` is the one writer.
-                std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now())),
-                NoopHook,
+                // The turn's instant, shared with whatever the stack carries:
+                // `route_physical_turn` is the one writer
+                // (`InputRouter::observe_at`), and a hook holding a second
+                // cell would judge every press against process start.
+                std::rc::Rc::clone(&now_cell),
+                headless_hook(
+                    #[cfg(feature = "physical-input-injector")]
+                    attention,
+                    &now_cell,
+                ),
             ),
         ),
         loop_handle: event_loop.handle(),
@@ -484,6 +548,8 @@ fn run_inner(
         injector,
         #[cfg(feature = "physical-input-injector")]
         physical_input,
+        #[cfg(feature = "physical-input-injector")]
+        attention_chord: attention,
     };
 
     // Readiness for the injector channel. The `Injector` itself lives in the
@@ -593,7 +659,7 @@ fn run_inner(
 /// unimplementable and force a `RefCell` into the compositor's dispatch path.
 pub(crate) struct HeadlessState {
     view: HeadlessView,
-    runtime: Runtime<NoopHook>,
+    runtime: Runtime<HeadlessHook>,
     loop_handle: LoopHandle<'static, HeadlessState>,
     /// Set when a composite failure stops the loop, so [`run`] propagates it
     /// as an error (and `main` as a non-zero exit) instead of masking a
@@ -624,6 +690,12 @@ pub(crate) struct HeadlessState {
     /// what it produced.
     #[cfg(feature = "physical-input-injector")]
     physical_input: Option<crate::input::injector::Injector>,
+    /// This run's configured attention chord (WS-E.1.7), so the channel's
+    /// `attention` line presses the key the operator actually chose rather
+    /// than a scancode the harness guessed. The same value the hook above was
+    /// built with, by construction: both come from `run_inner`'s one argument.
+    #[cfg(feature = "physical-input-injector")]
+    attention_chord: crate::attention::AttentionChord,
 }
 
 /// The `physical-input-injector` build's channel service (issue #212): read
@@ -663,7 +735,11 @@ impl HeadlessState {
                 injector.reject("unknown request");
                 continue;
             };
-            let inputs = crate::input::injector::intake(request, (view.0 as i32, view.1 as i32));
+            let inputs = crate::input::injector::intake(
+                request,
+                (view.0 as i32, view.1 as i32),
+                self.attention_chord,
+            );
             let produced = inputs.len();
             session::route_physical_turn(
                 &mut self.runtime,
@@ -897,10 +973,10 @@ impl HeadlessState {
 }
 
 impl session::RuntimeHost for HeadlessState {
-    type Hook = NoopHook;
+    type Hook = HeadlessHook;
     type View = HeadlessView;
 
-    fn split(&mut self) -> (&mut Runtime<NoopHook>, &mut HeadlessView) {
+    fn split(&mut self) -> (&mut Runtime<HeadlessHook>, &mut HeadlessView) {
         (&mut self.runtime, &mut self.view)
     }
 
@@ -1087,6 +1163,21 @@ impl session::Presenter for HeadlessView {
         true
     }
 
+    /// The attention marker, on this backend too (WS-E.1.7). Unlike the agent
+    /// cursor this needs no flag: it is drawn in
+    /// [`super::human_visible_from_view`], the *shared* output-stage fork both
+    /// backends reach, so gating it here would make the two backends present
+    /// different human-visible output for the same session state -- which is
+    /// the drift that step exists to prevent. A plain headless build never
+    /// sees a `true` anyway: nothing can press a physical chord there.
+    fn set_attention(&mut self, open: bool) -> bool {
+        if self.output.attention == open {
+            return false;
+        }
+        self.output.attention = open;
+        true
+    }
+
     /// All three, lent to `f`: the scene and retained image from the two
     /// fields the struct was split into for exactly this call (see
     /// [`HeadlessView::output`]); no importer, since this backend has no GPU
@@ -1158,6 +1249,14 @@ pub(crate) struct HeadlessOutput {
     /// The virtual display's **human-visible output**: the realm view with
     /// the consent overlay on top. Never read by the capture path.
     output_framebuffer: Image<'static, 'static>,
+    /// Whether the human's **attention window** is open right now (WS-E.1.7),
+    /// offered once per dispatch round by `Presenter::set_attention` and read
+    /// by [`Self::present`], which passes it to the shared output-stage fork.
+    ///
+    /// Presentation state about the *human*, not about a realm's content, so
+    /// [`Self::scrub_retained_frame`] leaves it alone: a realm dying must not
+    /// silently change what the human is being told about their own window.
+    attention: bool,
     size: Size<i32, Physical>,
     /// The trusted-band witness (issue #139), on a `consent-injector` build
     /// only. Reads the two buffers [`Self::present`] already holds and keeps
@@ -1212,6 +1311,7 @@ impl HeadlessView {
                 band_witness: super::band_witness::BandWitness::new(),
                 draw_agent_cursor: agent_cursor,
                 agent_cursor: None,
+                attention: false,
             },
             loop_signal,
         })
@@ -1441,7 +1541,8 @@ impl HeadlessOutput {
         // backends call. `view` is moved in rather than recomposed, so "the
         // two images differ only by the overlay" is a property of the code
         // and not of a comment.
-        let mut output = super::human_visible_from_view(view, &mut self.consent, w, h);
+        let mut output =
+            super::human_visible_from_view(view, &mut self.consent, w, h, self.attention);
         // The agent cursor sprite (D-019), opt-in here and only here: the
         // nested backend always draws it, this one draws it when the run
         // passed `--agent-cursor` (see [`Self::draw_agent_cursor`]). Applied
@@ -2146,7 +2247,7 @@ mod tests {
         let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
         consent.show_for_test(prompt_fixture());
         let human_visible =
-            super::super::compose_human_visible(state.bound_scene(), &mut consent, VW, VH);
+            super::super::compose_human_visible(state.bound_scene(), &mut consent, VW, VH, false);
         assert_ne!(
             nested_capture, human_visible,
             "the nested capture must exclude the consent overlay"
@@ -2897,7 +2998,13 @@ mod tests {
             }
             assert_eq!(
                 state.latest_output_rgba().expect("readback"),
-                super::super::compose_human_visible(state.bound_scene(), &mut expected, VW, VH),
+                super::super::compose_human_visible(
+                    state.bound_scene(),
+                    &mut expected,
+                    VW,
+                    VH,
+                    false
+                ),
                 "retained output must be the shared compose (prompt_up = {prompt_up})"
             );
         }
@@ -2975,7 +3082,13 @@ mod tests {
         expected.show_for_test(prompt_fixture());
         assert_eq!(
             state.latest_output_rgba().expect("readback"),
-            super::super::compose_human_visible(&crate::scene::Scene::new(), &mut expected, VW, VH),
+            super::super::compose_human_visible(
+                &crate::scene::Scene::new(),
+                &mut expected,
+                VW,
+                VH,
+                false
+            ),
             "after a scrub the human-visible image must still be the shared \
              composition with the prompt on it"
         );

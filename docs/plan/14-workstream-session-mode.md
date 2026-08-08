@@ -542,6 +542,60 @@ this workstream owns, not inherits:
   correct behaviour and it is also a restriction people will hit before they
   understand why.
 
+- **A locked screen an agent can still watch** (created by WS-E.2.2/#214,
+  and **decided rather than deferred** — [D-025](20-decision-log.md#d-025)).
+  The lock screen consumes every physical event and covers the output, and it
+  does not touch a grant: an `observe` holder keeps capturing the realm across
+  a lock and an `actuate_*` holder keeps acting. Correct against the IDL
+  (observation is concurrent by design), argued, taken to the maintainer in
+  plain terms on 2026-08-08, and genuinely surprising to a human — which is
+  why it is on the lock card itself as well as in
+  `docs/book/src/limits.md`, rather than in a code comment. The instrument for
+  "stop everything" remains the dead-man chord, which fires while locked.
+- **In nested mode the lock screen locks a window** (created by WS-E.2.2, and
+  a Stage-3 item by construction). `vitrind` is a client of the host
+  compositor; the host owns the real session and anyone can alt-tab away.
+  Stages 1–2 therefore ship a privacy cover, not an authentication boundary
+  for the seat. Published.
+- **No protection against VT switching, and the fix is a worse trade**
+  (created by WS-E.2.2, owner: whoever lands the DRM backend). On bare DRM
+  `Ctrl-Alt-F<n>` walks past the lock unless the core inhibits it, and
+  inhibiting it means a session a human cannot leave when the compositor
+  wedges. §7's safety rule and this item point at the same Stage-3 decision.
+  Published.
+- **A passphrase is nested-only, because the core holds no keymap** (created
+  by WS-E.2.2, closed only by Stage 3 answering the keymap question). `--lock-passphrase-file`
+  is refused at startup with `--headless`, naming the reason. Without it the
+  lock is an unauthenticated privacy screen and the card says so. Growing an
+  xkbcommon keymap was refused here rather than deferred quietly:
+  `input/mod.rs:106-109` records that a real keymap moves key pairing from the
+  keysym to the scancode — a router invariant the dead-man switch depends on —
+  and that is Stage 3's decision, which a lock-screen issue must not pre-empt.
+- **A KDF is now in the TCB, and it processes operator-supplied input**
+  (created by WS-E.2.2, no owner). Four crates (`argon2`, `base64ct`,
+  `blake2`, `subtle`), measured rather than estimated, inside the most
+  privileged component. Unlike fontdue — whose justification turns on "the
+  only bytes it parses are a compile-time constant" — this one really does
+  process bytes an operator supplied, though never bytes that arrived over the
+  wire. Issue #201 records that `deny.toml` and the `cargo-deny` job still do
+  not exist, so `crates/vitrin-core/Cargo.toml`'s comment is the only place
+  this budget is checked.
+- **A fourth gate in the input stack, and a fourth chord taken from every
+  app** (created by WS-E.2.2). `deadman.rs` spends its module docs proving no
+  gate bug can stop the off-switch; every gate added is a new chance for that
+  proof to stop being true. The compensating controls are structural rather
+  than documentary — the lock's policy implements `ConsumingGate`, which has
+  no observation method, so the observe tap is forwarded by code in
+  `crate::input` that has no notion a lock exists — plus an adversarial test
+  through the real stack. What it also costs: `--dead-man-chord delete` is now
+  refused on an otherwise default command line, because the default lock chord
+  is `ctrl+alt+delete`.
+- **New always-resident core state on the frame path** (created by WS-E.2.2).
+  A second `ConsentSurface`-shaped cost: one more `Option<LockContent>`, one
+  more cached raster and one more generation counter per backend, and a raised
+  lock forces the CPU compositing path exactly as a consent card does — which
+  on the WS-E laptop means the zero-copy dmabuf branch is off for as long as
+  the screen is locked.
 - **Two indicators now compete for the top strip, and a third is scheduled**
   (created by WS-E.1.7, owner: whoever lands WS-E.2.3/#215 second). The dead-man
   hold bar, the attention marker, and #215's clock/battery/focused-realm strip

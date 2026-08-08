@@ -545,15 +545,22 @@ impl AttentionSignal {
 }
 
 /// The attention key attached at the router's preemption hook point: the
-/// **innermost** hook, under the consent grab and the dead-man watcher.
+/// **innermost** hook, under everything.
 ///
-/// `InputRouter<ConsentGate<DeadManHook<AttentionHook<NoopHook>>>>`, and the
-/// order is the decision rather than an arrangement:
+/// [`crate::backend::winit::NestedHook`] is where the whole order is written
+/// down; here it matters that this is the bottom of it, and that every position
+/// above is a decision rather than an arrangement:
 ///
+/// - a **raised lock screen** (WS-E.2.2) is outermost and consumes every
+///   physical event, so no attention window can open while nobody is at the
+///   keyboard;
 /// - a **consent prompt** consumes the chord before this hook sees it, so a
 ///   window cannot even open while the human is answering a security question;
 /// - a **dead-man chord press** short-circuits here for the same reason, so the
 ///   human's off-switch can never be delayed by this hook's bookkeeping;
+/// - a **clipboard chord** sits between them and this hook, outside it because
+///   [`AttentionHook`] consumes both Supers and a modifier matcher below would
+///   have a permanently wrong `super` bit (WS-E.2.1);
 /// - and this hook implements [`PreemptionHook::gate`] **only**. Detection for
 ///   the dead-man lives in `observe`, which is unconditional and unstoppable;
 ///   putting attention in `gate` is what makes it suppressible by everything
@@ -622,7 +629,7 @@ impl<H: PreemptionHook> PreemptionHook for AttentionHook<H> {
 /// `view` must be `width * height * 4` RGBA8888. A dimension mismatch is
 /// refused rather than panicking, as elsewhere in the presentation path.
 pub(crate) fn composite_attention_marker(view: &mut [u8], width: u32, height: u32) {
-    use crate::consent::canvas::{Canvas, Rect};
+    use crate::paint::canvas::{Canvas, Rect};
 
     /// Marker height in pixels, and its width. Small, fixed, and at the
     /// origin: it says "a window is open" and nothing else, so it needs no

@@ -302,14 +302,22 @@ struct SceneTexture {
 fn window_pixels(
     scene: &Scene,
     consent: &mut ConsentSurface,
+    lock: &mut crate::lock::LockSurface,
     hold: Option<f64>,
     agent_cursor: Option<(f64, f64)>,
     attention: bool,
     size: Size<i32, Physical>,
 ) -> Vec<u8> {
     let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
-    let mut pixels = super::compose_human_visible(scene, consent, w, h, attention);
+    let mut pixels = super::compose_human_visible(scene, consent, lock, w, h, attention);
     if let Some((x, y)) = agent_cursor {
+        // Deliberately drawn even over a raised lock screen (WS-E.2.2). It
+        // looks wrong for a moment and is the honest choice: a lock does not
+        // suspend an agent's grants (D-025), so an agent really is pointing
+        // somewhere, and D-019's whole warrant is that a human can see when one
+        // is acting. Hiding the sprite behind the lock would make the surface
+        // that says "agents keep working" the one surface on which they
+        // invisibly do.
         crate::cursor::composite_agent_cursor(&mut pixels, w, h, x, y);
     }
     if let Some(progress) = hold {
@@ -336,10 +344,13 @@ fn window_pixels(
 ///   `--dmabuf` a hidden realm's commit took over the human's window and
 ///   falsified the published "only the bound realm is on screen" claim on the
 ///   one path a human actually looks at.
-/// - **An overlay needs the window.** A consent card (P1.7.1) or a dead-man
-///   hold indicator (P1.7.3) is up, and neither can be composited onto a GPU
-///   texture on this path — see [`NestedState::try_redraw`], which carries that
-///   seam's full argument.
+/// - **An overlay needs the window.** A consent card (P1.7.1), a dead-man
+///   hold indicator (P1.7.3) or a **lock screen** (WS-E.2.2) is up, and none of
+///   them can be composited onto a GPU texture on this path — see
+///   [`NestedState::try_redraw`], which carries that seam's full argument. The
+///   lock is the one whose omission would be a *security* regression rather
+///   than a cosmetic one: presenting the client's texture zero-copy while the
+///   lock consumed every key would put the app on screen behind the lock.
 ///
 /// A free function rather than a method on either argument because it is a
 /// judgement *between* them, and split out for the reason [`window_pixels`] is:
@@ -348,6 +359,33 @@ fn window_pixels(
 /// can run). This is the part of that frame path a display-free test can hold,
 /// and `a_hidden_realms_dmabuf_import_is_never_what_the_window_presents` holds
 /// it.
+/// **Which overlays need the CPU compositing path this frame**, and therefore
+/// forbid the zero-copy dmabuf branch.
+///
+/// Three causes, and the third is a *security* one rather than a cosmetic one:
+///
+/// - a **dead-man hold** is animating (P1.7.3);
+/// - a **consent card** is up (P1.7.1);
+/// - a **lock screen** is up (WS-E.2.2, issue #214). The zero-copy branch
+///   presents the confined client's own texture with no core composite at all,
+///   so a locked session that took it would put the app on screen, full-window,
+///   with the lock nowhere on it — while the gate consumed every key. That is a
+///   second human-visible path exactly as issue #85's trusted band found, closed
+///   here for the same reason and in the same place.
+///
+/// A free function rather than three `||`s inside [`NestedState::try_redraw`],
+/// for the reason [`window_pixels`] and [`zero_copy_source`] are split out:
+/// presenting needs an EGL context and a host window, so CI cannot drive
+/// `try_redraw` at all (D-019(4)), and a decision written inline there is a
+/// decision nothing can pin. `every_overlay_forces_the_cpu_path` pins it.
+fn overlay_needs_the_window(
+    hold: Option<f64>,
+    consent: &ConsentSurface,
+    lock: &crate::lock::LockSurface,
+) -> bool {
+    hold.is_some() || consent.prompt().is_some() || lock.is_raised()
+}
+
 fn zero_copy_source<'a, C>(
     scenes: &RealmScenes,
     content: &'a RealmGpuContent<C>,
@@ -1196,6 +1234,14 @@ pub(crate) struct NestedView {
     /// petition's card here and lowers it again when the petition is decided
     /// or leaves the table. It is empty only while no petition is pending.
     consent: ConsentSurface,
+    /// The lock surface (WS-E.2.2, issue #214): the opaque cover and card
+    /// composited above everything but the trusted band while the session is
+    /// locked. Driven by [`session::service_lock_round`] on the same
+    /// once-per-dispatch cadence [`Self::consent`] is, from the very same
+    /// [`crate::lock::LockScreen`] the router's outermost gate judges against —
+    /// so "the pixels are up" and "physical input is being consumed" are one
+    /// state rather than two that can drift.
+    lock: crate::lock::LockSurface,
     /// This session's trusted indicator (issue #85), the same value
     /// [`Self::consent`] frames its prompts and paints its band in.
     ///
@@ -1257,6 +1303,39 @@ pub(crate) struct NestedView {
 
 /// Per-run state of the nested backend: its presentation half, the session
 /// runtime, and the dead-man / consent wiring the host window feeds.
+/// **The nested backend's whole hook stack, named once.**
+///
+/// Spelled as a type alias rather than inline at the construction site because
+/// the ORDER is the decision (WS-E.1.7 decision 11, extended by WS-E.2.2), and
+/// a decision written in two places is a decision that drifts. Outermost first:
+///
+/// 1. [`crate::lock::LockGate`] — consumes *all* physical input while the
+///    session is locked, so nothing below it can be answered, chorded or typed
+///    at by somebody who is not there. Outermost because a lock that something
+///    else could preempt is not a lock; its `observe` tap is unconditional **by
+///    construction** ([`crate::input::ConsumingGate`]), so being outermost costs
+///    the dead-man switch nothing.
+/// 2. [`ConsentGate`] — a raised prompt owns physical input.
+/// 3. [`DeadManHook`] — the human's off-switch; detection in `observe`, which
+///    every hook above forwards unconditionally.
+/// 4. [`crate::clipboard::ClipboardHook`] — outside the attention hook because
+///    that hook eats both Supers, and a modifier matcher inside it would have a
+///    permanently wrong `super` bit (WS-E.2.1).
+/// 5. [`crate::attention::AttentionHook`] — innermost, therefore suppressible
+///    by everything above, which is the correct posture for a mechanism whose
+///    worst failure is a focus change that does not happen.
+///
+/// `the_lock_gate_is_the_outermost_hook` pins position 1 against this alias,
+/// because [`crate::lock::gate`] tracks chord modifiers in its `judge` and that
+/// is sound *only* while nothing above it can eat an event.
+pub(crate) type NestedHook = crate::lock::LockGate<
+    ConsentGate<
+        DeadManHook<
+            crate::clipboard::ClipboardHook<crate::attention::AttentionHook<input::NoopHook>>,
+        >,
+    >,
+>;
+
 pub(crate) struct NestedState {
     view: NestedView,
     /// The session runtime ([`crate::session`]): the core socket's listener,
@@ -1265,13 +1344,7 @@ pub(crate) struct NestedState {
     /// second one, so an agent's chokepoint-admitted actuations and a human's
     /// physical input share one implicit-grab and pointer state — which is
     /// what makes the preemption hook mean anything.
-    runtime: Runtime<
-        ConsentGate<
-            DeadManHook<
-                crate::clipboard::ClipboardHook<crate::attention::AttentionHook<input::NoopHook>>,
-            >,
-        >,
-    >,
+    runtime: Runtime<NestedHook>,
     /// The consent input grab (P1.7.2), shared with the router's gate:
     /// while a prompt is up it owns physical input, and a click on one of
     /// the card's buttons becomes a petition decision here.
@@ -1305,6 +1378,18 @@ pub(crate) struct NestedState {
     /// petition registry (see [`DeadManHost::on_trigger`]), rather than
     /// being logged and dropped.
     deadman: Rc<RefCell<DeadManSwitch>>,
+    /// The lock screen's state (WS-E.2.2, issue #214), shared with the
+    /// router's **outermost** gate: whether the session is locked, the
+    /// passphrase being typed at it, and the facts the recorder is owed.
+    ///
+    /// Shared rather than mirrored, for the reason [`Self::grab`] is: the
+    /// alternative is a window in which the pixels say "locked" and the gate
+    /// does not, which is a lock screen an app can type through.
+    lock: Rc<RefCell<crate::lock::LockScreen>>,
+    /// The dead-man chord's name, carried here for one purpose: the lock card
+    /// tells the human what *does* revoke an agent's authority, and an
+    /// instruction naming the wrong key would be worse than none.
+    deadman_chord: &'static str,
     /// Whether a one-shot timer is outstanding for the armed hold, so an
     /// arming keypress does not insert a fresh calloop source per event.
     deadman_timer_armed: bool,
@@ -1346,6 +1431,7 @@ pub fn run(
     dead_man: DeadManConfig,
     attention: crate::attention::AttentionChord,
     clipboard: crate::chord::Trigger,
+    lock: crate::lock::LockConfig,
     seed: RuntimeSeed,
 ) -> (Recorder, Result<(), Box<dyn Error>>) {
     // The seed is consumed the moment the state is built; until then it is
@@ -1355,7 +1441,14 @@ pub fn run(
     // four-line `match`.
     let mut seed = Some(seed);
     let mut recovered = None;
-    let result = run_inner(dead_man, attention, clipboard, &mut seed, &mut recovered);
+    let result = run_inner(
+        dead_man,
+        attention,
+        clipboard,
+        lock,
+        &mut seed,
+        &mut recovered,
+    );
     let recorder = recovered
         .or_else(|| seed.take().map(|seed| seed.recorder))
         .expect("the seed is either still unconsumed or its recorder was recovered");
@@ -1366,9 +1459,21 @@ fn run_inner(
     dead_man: DeadManConfig,
     attention: crate::attention::AttentionChord,
     clipboard: crate::chord::Trigger,
+    lock: crate::lock::LockConfig,
     seed: &mut Option<RuntimeSeed>,
     recovered: &mut Option<Recorder>,
 ) -> Result<(), Box<dyn Error>> {
+    // **The passphrase file, before anything else exists.** Read here rather
+    // than at parse time because `Action` must stay `PartialEq` and printable,
+    // and read *first* because a session that came up with an unreadable,
+    // malformed or world-readable passphrase file would be a session whose lock
+    // cannot be answered -- the fail-open configuration trap `realm.rs` and
+    // `deadman.rs` both refuse. `?` here is a non-zero exit with the reason
+    // named, before the listener accepts anyone.
+    let verifier = match lock.passphrase.as_deref() {
+        Some(path) => Some(crate::lock::passphrase::PassphraseFile::load(path)?),
+        None => None,
+    };
     let mut event_loop: EventLoop<'static, NestedState> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
@@ -1509,35 +1614,57 @@ fn run_inner(
              CONSUMED in every realm, so an app that binds them loses them"
         );
     }
+    // The lock screen (WS-E.2.2), named in full at startup for the reason the
+    // attention and clipboard chords are: it is a key the core takes away from
+    // every app in every realm, and it is the one whose consequence a human
+    // most needs to have been told about before it happens to them.
+    let lock_screen = Rc::new(RefCell::new(crate::lock::LockScreen::new(
+        lock.chord,
+        lock.idle,
+        verifier,
+        Instant::now(),
+    )));
+    {
+        let screen = lock_screen.borrow();
+        info!(
+            chord = screen.chord_spelling(),
+            idle_s = lock.idle.map(|d| d.as_secs()),
+            passphrase = matches!(
+                screen.unlock_method(),
+                crate::lock::UnlockMethod::Passphrase
+            ),
+            "lock screen armed: the chord takes every physical event away from every realm \
+             until a human answers. It does NOT suspend an agent's grants -- an observe \
+             holder keeps capturing across a lock (see docs/book/src/limits.md); the \
+             instrument that stops everything is still the dead-man chord, which fires while \
+             locked"
+        );
+    }
     let router = input::InputRouter::new(
         Rc::new(RefCell::new(input::PhysicalPresenceMap::new())),
         Rc::clone(&now),
-        // The stacking WS-E.1.7 decision 11 fixes, outermost first: the
-        // consent grab, the dead-man watcher, the clipboard chords, then the
-        // attention key. Every hook above short-circuits the ones below, so a
-        // raised prompt or a dead-man chord press wins over -- and is never
-        // delayed by -- a mechanism whose worst failure is a convenience that
-        // does not happen.
-        //
-        // **The clipboard sits OUTSIDE the attention hook, and that is not
-        // arbitrary** (WS-E.2.1): `AttentionHook` consumes both Super keys, so a
-        // modifier matcher stacked *inside* it would never see a Super press and
-        // its `super` bit would be permanently wrong. Harmless for this issue's
-        // two chords, and a trap laid for whichever of WS-E.2.2/2.4 wants one.
-        ConsentGate::new(
-            Rc::clone(&grab),
+        // `NestedHook`, built. The order is that alias's doc comment, which is
+        // the single place this decision is written down: the lock outermost,
+        // then the consent grab, the dead-man watcher, the clipboard chords and
+        // the attention key.
+        crate::lock::lock_gate(
+            Rc::clone(&lock_screen),
             Rc::clone(&now),
-            DeadManHook::new(
-                Rc::clone(&deadman),
+            ConsentGate::new(
+                Rc::clone(&grab),
                 Rc::clone(&now),
-                crate::clipboard::ClipboardHook::new(
-                    Rc::clone(&clipboard_signal),
-                    crate::attention::AttentionHook::new(
-                        Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
-                            attention,
-                        ))),
-                        Rc::clone(&now),
-                        input::NoopHook,
+                DeadManHook::new(
+                    Rc::clone(&deadman),
+                    Rc::clone(&now),
+                    crate::clipboard::ClipboardHook::new(
+                        Rc::clone(&clipboard_signal),
+                        crate::attention::AttentionHook::new(
+                            Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
+                                attention,
+                            ))),
+                            Rc::clone(&now),
+                            input::NoopHook,
+                        ),
                     ),
                 ),
             ),
@@ -1561,6 +1688,7 @@ fn run_inner(
             // every later change through `RealmScenes::set_view_size`.
             scenes: RealmScenes::new((backend_size.w.max(0) as u32, backend_size.h.max(0) as u32)),
             consent: ConsentSurface::new(indicator),
+            lock: crate::lock::LockSurface::new(indicator),
             indicator,
             texture: None,
             dmabuf_content: RealmGpuContent::new(),
@@ -1576,6 +1704,8 @@ fn run_inner(
         grab,
         now,
         deadman,
+        lock: lock_screen,
+        deadman_chord: dead_man.chord.name(),
         deadman_timer_armed: false,
         loop_signal: event_loop.get_signal(),
         loop_handle: event_loop.handle(),
@@ -2133,7 +2263,7 @@ impl NestedState {
         // the overlay check below feed the same instant so a hold that
         // completes mid-frame is judged consistently within it.
         let hold = self.deadman.borrow().hold_progress(Instant::now());
-        let overlay_up = hold.is_some() || self.view.consent.prompt().is_some();
+        let overlay_up = overlay_needs_the_window(hold, &self.view.consent, &self.view.lock);
 
         // Zero-copy dmabuf presentation (P1.3.5, issue #117): **the bound
         // realm** has a retained GPU import and neither overlay needs the
@@ -2271,6 +2401,7 @@ impl NestedState {
             let pixels = window_pixels(
                 self.view.scenes.bound(),
                 &mut self.view.consent,
+                &mut self.view.lock,
                 hold,
                 agent_cursor,
                 self.view.attention,
@@ -2461,11 +2592,7 @@ pub(crate) fn next_frame(hold: Option<f64>, elapsed: Duration) -> NextFrame {
 }
 
 impl session::RuntimeHost for NestedState {
-    type Hook = ConsentGate<
-        DeadManHook<
-            crate::clipboard::ClipboardHook<crate::attention::AttentionHook<input::NoopHook>>,
-        >,
-    >;
+    type Hook = NestedHook;
     type View = NestedView;
 
     fn split(&mut self) -> (&mut Runtime<Self::Hook>, &mut NestedView) {
@@ -2498,6 +2625,36 @@ impl session::RuntimeHost for NestedState {
         let mut grab = grab.borrow_mut();
         if session::service_consent_round(&mut grab, &mut self.runtime, &mut self.view.consent, now)
         {
+            self.runtime.dirty = true;
+            self.view.backend.window().request_redraw();
+        }
+    }
+
+    /// Drive the lock screen for this dispatch round (WS-E.2.2, issue #214).
+    ///
+    /// Same shape as [`Self::service_consent`] above and for the same borrow
+    /// reason: the `Rc` is cloned first so the `RefMut` borrows nothing of
+    /// `self`, leaving `&mut self.runtime` and `&mut self.view.lock` as two
+    /// disjoint field borrows. A `true` return means visible output changed, so
+    /// the frame is dirtied and a redraw is requested — the same path every
+    /// other visible transition here takes.
+    ///
+    /// The nested backend is the only one that overrides the trait's no-op, and
+    /// for a stronger reason than consent's: it is the only backend with a
+    /// physical input device, and a lock a session cannot dismiss is a wedge.
+    /// `main` refuses every `--lock-*` flag with `--headless` so that
+    /// asymmetry is a startup error rather than a discovery.
+    fn service_lock(&mut self, now: Instant) {
+        let screen = Rc::clone(&self.lock);
+        let mut screen = screen.borrow_mut();
+        if session::service_lock_round(
+            &mut screen,
+            &mut self.view.lock,
+            &mut self.runtime,
+            &self.grab,
+            self.deadman_chord,
+            now,
+        ) {
             self.runtime.dirty = true;
             self.view.backend.window().request_redraw();
         }
@@ -2769,6 +2926,86 @@ mod tests {
         (w, h).into()
     }
 
+    /// **`LockGate` is the outermost hook, and this is a compile-time
+    /// assertion of it** (WS-E.2.2, issue #214).
+    ///
+    /// Not decoration. [`crate::lock::gate`] tracks its chord's modifier state
+    /// inside `judge` rather than in an `observe` it deliberately does not
+    /// have, and that is sound *only* while nothing above it can consume an
+    /// event — at any inner position a consumed Shift release would leave the
+    /// matcher believing Shift is held, and the lock chord would start firing
+    /// on gestures the human did not make (or stop firing on ones they did).
+    ///
+    /// A type-level check rather than a behavioural one because the property is
+    /// about the *stack's shape*: `assert_lock_outermost` accepts only a
+    /// `PhantomData<LockGate<_>>`, so this stops compiling the moment
+    /// [`NestedHook`] is reordered. A behavioural test would go red later, in
+    /// some unrelated chord case, with a much worse error message.
+    #[test]
+    fn the_lock_gate_is_the_outermost_hook() {
+        use std::marker::PhantomData;
+        fn assert_lock_outermost<H: input::PreemptionHook>(
+            _: PhantomData<crate::lock::LockGate<H>>,
+        ) {
+        }
+        assert_lock_outermost(PhantomData::<NestedHook>);
+    }
+
+    /// **Every overlay forces the CPU path**, the lock included (WS-E.2.2).
+    ///
+    /// The lock's row is the one that matters: without it a locked session
+    /// takes the zero-copy branch and presents the confined app's own texture
+    /// full-window, with the lock screen nowhere on it, while the gate is
+    /// consuming every key. That is not a cosmetic regression — it is the app
+    /// on display behind a lock — and before this function existed the
+    /// condition lived inline in `try_redraw`, which no test on a display-free
+    /// runner can reach.
+    #[test]
+    fn every_overlay_forces_the_cpu_path() {
+        let indicator = TrustedIndicator::for_test();
+        let idle_consent = ConsentSurface::new(indicator);
+        let idle_lock = no_lock();
+
+        // The control FIRST: with nothing up, the zero-copy branch is allowed.
+        // Without this the three assertions below would pass against a function
+        // that always answered `true`.
+        assert!(!overlay_needs_the_window(None, &idle_consent, &idle_lock));
+
+        // A hold.
+        assert!(overlay_needs_the_window(
+            Some(0.5),
+            &idle_consent,
+            &idle_lock
+        ));
+        // A consent card.
+        let mut prompt = ConsentSurface::new(indicator);
+        prompt.show_for_test(prompt_fixture());
+        assert!(overlay_needs_the_window(None, &prompt, &idle_lock));
+        // A lock screen.
+        let mut locked = no_lock();
+        locked.raise(crate::lock::tests::lock_fixture());
+        assert!(
+            overlay_needs_the_window(None, &idle_consent, &locked),
+            "a raised lock MUST force the CPU path: the zero-copy branch presents the \
+             client's own texture, so a locked session that took it would show the app \
+             full-window with the lock nowhere on it"
+        );
+        // ...and lowering it gives the branch back, so the test is measuring
+        // the lock's state and not the surface's existence.
+        locked.lower();
+        assert!(!overlay_needs_the_window(None, &idle_consent, &locked));
+    }
+
+    /// A lock surface with nothing raised, for the many composite tests that
+    /// are about the *other* overlays.
+    ///
+    /// A fresh one per call rather than a shared fixture: [`LockSurface`]
+    /// carries a generation counter and a raster cache, and a shared instance
+    /// would let one test's raise change what the next test measures.
+    fn no_lock() -> crate::lock::LockSurface {
+        crate::lock::LockSurface::new(crate::consent::TrustedIndicator::for_test())
+    }
+
     /// Nested mode must actually put the prompt in the host window.
     ///
     /// This is the acceptance criterion's nested half, held as far as a
@@ -2832,7 +3069,15 @@ mod tests {
         // the top (issue #85). Below the band it is the realm view byte for
         // byte; the band itself is the session colour, present on the
         // human-visible upload and never in the capture (Scene::compose).
-        let plain = window_pixels(&scene, &mut consent, None, None, false, size);
+        let plain = window_pixels(
+            &scene,
+            &mut consent,
+            &mut no_lock(),
+            None,
+            None,
+            false,
+            size,
+        );
         let composed = scene.compose(W as u32, H as u32);
         let band_bytes =
             crate::consent::TRUST_BAND_HEIGHT as usize * W as usize * crate::scene::BYTES_PER_PIXEL;
@@ -2863,7 +3108,15 @@ mod tests {
         // there — see `window_pixels` and D-019). What must never drift is the
         // shared composition underneath, which is what this pins.
         consent.show_for_test(prompt_fixture());
-        let with_prompt = window_pixels(&scene, &mut consent, None, None, false, size);
+        let with_prompt = window_pixels(
+            &scene,
+            &mut consent,
+            &mut no_lock(),
+            None,
+            None,
+            false,
+            size,
+        );
         assert_ne!(
             with_prompt, plain,
             "the prompt must change what is uploaded"
@@ -2872,7 +3125,14 @@ mod tests {
         expected.show_for_test(prompt_fixture());
         assert_eq!(
             with_prompt,
-            super::super::compose_human_visible(&scene, &mut expected, W as u32, H as u32, false),
+            super::super::compose_human_visible(
+                &scene,
+                &mut expected,
+                &mut no_lock(),
+                W as u32,
+                H as u32,
+                false
+            ),
             "nested must upload the same composition headless retains, so the \
              two backends cannot drift in what a human sees"
         );
@@ -2943,6 +3203,7 @@ mod tests {
                 band_px(&window_pixels(
                     &scene,
                     &mut consent,
+                    &mut no_lock(),
                     hold,
                     None,
                     false,
@@ -2957,6 +3218,7 @@ mod tests {
             band_px(&window_pixels(
                 &scene,
                 &mut consent,
+                &mut no_lock(),
                 None,
                 None,
                 false,
@@ -2975,6 +3237,7 @@ mod tests {
                 band_px(&window_pixels(
                     &scene,
                     &mut idle,
+                    &mut no_lock(),
                     None,
                     Some(aim),
                     false,
@@ -3059,8 +3322,24 @@ mod tests {
         // Path 1, the CPU texture upload: the sprite's colours really appear,
         // and only when a cursor is shown.
         let mut consent = ConsentSurface::new(indicator);
-        let without = window_pixels(&scene, &mut consent, None, None, false, size);
-        let with = window_pixels(&scene, &mut consent, None, Some(at), false, size);
+        let without = window_pixels(
+            &scene,
+            &mut consent,
+            &mut no_lock(),
+            None,
+            None,
+            false,
+            size,
+        );
+        let with = window_pixels(
+            &scene,
+            &mut consent,
+            &mut no_lock(),
+            None,
+            Some(at),
+            false,
+            size,
+        );
         assert_ne!(with, without, "the CPU path dropped the agent cursor");
         let count = |px: &[u8], rgba: [u8; 4]| {
             px.chunks_exact(crate::scene::BYTES_PER_PIXEL)
@@ -3144,8 +3423,14 @@ mod tests {
         // `Scene::compose`, in `human_visible_from_view`).
         let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
         consent.show_for_test(prompt_fixture());
-        let human_visible =
-            super::super::compose_human_visible(&scene, &mut consent, W as u32, H as u32, false);
+        let human_visible = super::super::compose_human_visible(
+            &scene,
+            &mut consent,
+            &mut no_lock(),
+            W as u32,
+            H as u32,
+            false,
+        );
         assert_ne!(
             capture, human_visible,
             "the human-visible window carries the prompt; the capture must not"
@@ -3163,7 +3448,15 @@ mod tests {
         // mid-hold differs from the capture, which carries neither the trusted
         // band nor the indicator — it is the bare view, unchanged.
         let mut idle = ConsentSurface::new(TrustedIndicator::for_test());
-        let with_hold = window_pixels(&scene, &mut idle, Some(0.5), None, false, size);
+        let with_hold = window_pixels(
+            &scene,
+            &mut idle,
+            &mut no_lock(),
+            Some(0.5),
+            None,
+            false,
+            size,
+        );
         assert_ne!(
             capture, with_hold,
             "the dead-man hold indicator must never reach the capture"
@@ -3172,7 +3465,15 @@ mod tests {
         // And so is the agent cursor (D-019, IDL ordering invariant 4): the
         // window carries it, the capture does not, and not one pixel of either
         // sprite colour appears in the composed realm view.
-        let with_cursor = window_pixels(&scene, &mut idle, None, Some((400.0, 300.0)), false, size);
+        let with_cursor = window_pixels(
+            &scene,
+            &mut idle,
+            &mut no_lock(),
+            None,
+            Some((400.0, 300.0)),
+            false,
+            size,
+        );
         assert_ne!(
             capture, with_cursor,
             "the agent cursor must never reach the capture"
@@ -3245,12 +3546,21 @@ mod tests {
 
         // Bound to A: the window is A's composition, byte for byte.
         scenes.bind(&a);
-        let window_a = window_pixels(scenes.bound(), &mut consent, None, None, false, size);
+        let window_a = window_pixels(
+            scenes.bound(),
+            &mut consent,
+            &mut no_lock(),
+            None,
+            None,
+            false,
+            size,
+        );
         assert_eq!(
             window_a,
             super::super::compose_human_visible(
                 scenes.scene(&a).unwrap(),
                 &mut ConsentSurface::new(TrustedIndicator::for_test()),
+                &mut no_lock(),
                 W as u32,
                 H as u32,
                 false
@@ -3270,7 +3580,15 @@ mod tests {
         // Bound to B: different pixels, and a different key even though every
         // other field is identical.
         scenes.bind(&b);
-        let window_b = window_pixels(scenes.bound(), &mut consent, None, None, false, size);
+        let window_b = window_pixels(
+            scenes.bound(),
+            &mut consent,
+            &mut no_lock(),
+            None,
+            None,
+            false,
+            size,
+        );
         assert!(
             window_a != window_b,
             "binding the output to another realm must change what the window shows"
@@ -3573,14 +3891,37 @@ mod tests {
 
         // No hold: the window is the ordinary human-visible composition,
         // byte for byte. The indicator costs an idle session nothing.
-        let idle = window_pixels(&scene, &mut consent, None, None, false, size);
+        let idle = window_pixels(
+            &scene,
+            &mut consent,
+            &mut no_lock(),
+            None,
+            None,
+            false,
+            size,
+        );
         assert_eq!(
             idle,
-            super::super::compose_human_visible(&scene, &mut consent, W as u32, H as u32, false)
+            super::super::compose_human_visible(
+                &scene,
+                &mut consent,
+                &mut no_lock(),
+                W as u32,
+                H as u32,
+                false
+            )
         );
 
         // Mid-hold: the top edge changes, and nothing below the bar does.
-        let holding = window_pixels(&scene, &mut consent, Some(0.5), None, false, size);
+        let holding = window_pixels(
+            &scene,
+            &mut consent,
+            &mut no_lock(),
+            Some(0.5),
+            None,
+            false,
+            size,
+        );
         assert_ne!(holding, idle, "a hold in progress must be visible");
         let below = (8 * W * 4) as usize;
         assert_eq!(
@@ -3592,8 +3933,24 @@ mod tests {
         // It is drawn above a consent card, so a prompt cannot hide the fact
         // that the human is mid-gesture on the off-switch.
         consent.show_for_test(prompt_fixture());
-        let prompt_only = window_pixels(&scene, &mut consent, None, None, false, size);
-        let prompt_and_hold = window_pixels(&scene, &mut consent, Some(0.9), None, false, size);
+        let prompt_only = window_pixels(
+            &scene,
+            &mut consent,
+            &mut no_lock(),
+            None,
+            None,
+            false,
+            size,
+        );
+        let prompt_and_hold = window_pixels(
+            &scene,
+            &mut consent,
+            &mut no_lock(),
+            Some(0.9),
+            None,
+            false,
+            size,
+        );
         assert_ne!(prompt_and_hold, prompt_only);
 
         // And every visible step of the fill re-uploads.

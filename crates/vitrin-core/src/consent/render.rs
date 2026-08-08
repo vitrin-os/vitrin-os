@@ -43,16 +43,16 @@
 
 use vitrin_protocol::generated::vitrin_grant::Verb;
 
-use super::canvas::{Canvas, Rect};
-use super::text::Text;
 use super::{Choice, PromptContent};
+use crate::paint::canvas::{Canvas, Rect};
+use crate::paint::text::Text;
 use crate::scene::BYTES_PER_PIXEL;
 
 // ---------------------------------------------------------------------------
 // Type sizes
 // ---------------------------------------------------------------------------
 
-/// Title size. Also pins `super::text::GEOMETRY_SCALE` — the largest size the
+/// Title size. Also pins `crate::paint::text::GEOMETRY_SCALE` — the largest size the
 /// prompt uses is what fontdue's geometry preprocessing should be tuned for.
 pub(super) const TITLE_PX: f32 = 19.0;
 /// The anti-spoofing subtitle and the field labels: small, quiet, secondary.

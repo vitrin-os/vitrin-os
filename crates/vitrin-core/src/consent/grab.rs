@@ -234,7 +234,7 @@
 //!
 //! Hit-testing uses [`super::render::Card::buttons`] — card-local rectangles
 //! produced by the same pass that painted them — translated by the same
-//! [`super::centered`] the compositor positions the card with. Renderer and
+//! [`crate::paint::centered`] the compositor positions the card with. Renderer and
 //! grab cannot disagree about where a button is, because neither computes a
 //! layout the other does not.
 //!
@@ -291,7 +291,9 @@ use crate::petitions::{PetitionId, PetitionRegistry, PromptRoute};
 use crate::recorder::{Event, Recorder};
 
 use super::render::ChoiceBox;
-use super::{centered, Choice, ConsentSurface};
+use crate::paint::centered;
+
+use super::{Choice, ConsentSurface};
 
 /// How long after a prompt appears its buttons refuse to arm (module docs:
 /// the guard interval).
@@ -617,6 +619,41 @@ impl ConsentGrab {
     }
 
     /// The petition whose prompt currently holds the grab, if any.
+    /// **Restart the guard interval, because the card just became visible.**
+    ///
+    /// [`GUARD_INTERVAL`] exists so a press already travelling toward the
+    /// screen when a prompt appears cannot commit a grant the human never read.
+    /// It runs from `raised_at` — which is correct exactly while "raised" and
+    /// "visible" mean the same thing, and they stopped meaning the same thing
+    /// when WS-E.2.2 added a lock screen that composites an OPAQUE cover over
+    /// the card.
+    ///
+    /// A prompt raised while the session is locked spends its whole guard
+    /// behind that cover. The human comes back, unlocks, sees a card for the
+    /// first time — and the first pointer press commits it, with a guard that
+    /// expired minutes ago in a frame nobody could see. `LockGate` being
+    /// outermost keeps the prompt *unanswerable* while locked, which is why
+    /// this is not a live clickjack; it does not make the card *visible*, which
+    /// is what the guard is actually about.
+    ///
+    /// So the embedder calls this when the lock lowers with a prompt still up.
+    /// Only the guard restarts: the petition's own `deadline` is deliberately
+    /// untouched, since that bounds how long the human has to decide and a lock
+    /// does not buy them more of it.
+    pub fn restart_guard(&mut self, now: Instant) -> bool {
+        match self.prompt.as_mut() {
+            Some(prompt) => {
+                prompt.raised_at = now;
+                // Anything armed under the stale guard is disarmed with it: a
+                // press that landed while the card was hidden must not survive
+                // into the visible round.
+                self.armed = None;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn armed_petition(&self) -> Option<PetitionId> {
         self.prompt.as_ref().map(|p| p.petition)
     }
@@ -1226,6 +1263,68 @@ mod tests {
             click(&mut grab, target, awake(t0));
             assert_eq!(grab.take_decision(), Some(Decision { petition, choice }));
         }
+    }
+
+    /// **A prompt hidden behind the lock screen gets its guard back when the
+    /// human can finally see it** (WS-E.2.2 review).
+    ///
+    /// The guard runs from `raised_at`, which was correct while "raised" and
+    /// "visible" meant the same thing. WS-E.2.2's lock composites an OPAQUE
+    /// cover over the card, so a prompt raised while the session is locked
+    /// spends its entire `GUARD_INTERVAL` behind that cover. Without
+    /// [`ConsentGrab::restart_guard`] the human returns, unlocks, sees a card
+    /// for the first time, and the very first press commits it — the guard
+    /// having expired minutes earlier in frames nobody could look at.
+    ///
+    /// `LockGate` being outermost keeps the prompt *unanswerable* while locked,
+    /// which is why this was never a live clickjack. It does not make the card
+    /// *visible*, and visibility is what the guard is about.
+    #[test]
+    fn a_prompt_uncovered_by_an_unlock_gets_a_fresh_guard() {
+        let (mut grab, _surface, _registry, petition, t0) = armed();
+        let target = center_of(&grab, Choice::Allow(PersistenceRung::WhileRunning));
+
+        // Thirty seconds pass with the card hidden behind the lock -- sixty
+        // times the guard, and deliberately still inside the petition's own
+        // consent deadline, because past that the grab retires the prompt and
+        // the test would be about expiry instead. Under the old rule the guard
+        // is long gone by now and the next press would decide.
+        let uncovered = t0 + Duration::from_secs(30);
+        assert!(
+            grab.restart_guard(uncovered),
+            "there is a prompt up, so the guard must actually restart"
+        );
+
+        click(&mut grab, target, uncovered);
+        assert!(
+            grab.take_decision().is_none(),
+            "the first press after an unlock must decide nothing: the human has only just \
+             been shown the card, whatever the clock says about when it was raised"
+        );
+
+        // ...and it is answerable once they have had time to read it, from the
+        // moment it became visible. The guard delays; it never disables.
+        click(
+            &mut grab,
+            target,
+            uncovered + GUARD_INTERVAL + Duration::from_millis(1),
+        );
+        assert_eq!(
+            grab.take_decision(),
+            Some(Decision {
+                petition,
+                choice: Choice::Allow(PersistenceRung::WhileRunning)
+            }),
+            "the restarted guard must still expire, or an unlock would wedge the prompt"
+        );
+
+        // With no prompt up there is nothing to restart, and saying so is how
+        // the embedder knows it did not silently no-op.
+        let mut idle = ConsentGrab::new();
+        assert!(
+            !idle.restart_guard(uncovered),
+            "no prompt, no guard to move"
+        );
     }
 
     #[test]

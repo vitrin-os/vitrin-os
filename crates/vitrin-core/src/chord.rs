@@ -302,7 +302,6 @@ impl ModChord {
     /// Deliberately strict. A tolerant parser here would accept two spellings of
     /// one gesture and an operator's config file would stop being a record of
     /// what the core owns.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn parse(spec: &str) -> Result<Self, ChordSpecError> {
         let mut parts = spec.split('+');
         let mut mods = Vec::new();
@@ -320,6 +319,19 @@ impl ModChord {
             return Err(ChordSpecError::UnknownKey);
         }
         Self::new(&mods, Trigger::parse(last)?)
+    }
+
+    /// The trigger key's keysym, for `main`'s startup collision check against
+    /// the core's other chord owners.
+    ///
+    /// Deliberately the *trigger* rather than the whole chord: two gestures
+    /// that differ only in their modifier set are told apart perfectly well by
+    /// [`ChordMatcher`], but an operator reading two flags should not have to
+    /// reason about modifier-set equality to know whether their keys collide,
+    /// and the dead-man watcher's `observe` tap does not care about modifiers
+    /// at all -- it sees the trigger's press whatever else is held.
+    pub fn trigger_keysym(&self) -> u32 {
+        self.trigger.keysym
     }
 
     /// Human-facing spelling, rebuilt from the parsed parts rather than echoed

@@ -11,6 +11,22 @@
 //! [`PromptContent`], and [`ConsentSurface`] composites it over the composed
 //! view at the backend output stage.
 //!
+//! **This is no longer the only core-drawn card, and the argument above is why
+//! rather than a reason to be surprised.** [`crate::lock`] (WS-E.2.2, issue
+//! #214) draws a second one for exactly the same reason, one authority claim
+//! over: a lock screen claims *nothing behind me can see your input*, and only
+//! the component that owns input routing can make that true. It composites at
+//! the same output-stage fork, one step **after** this surface and before the
+//! trusted band, and it is opaque — so a raised lock covers a prompt. That is
+//! correct rather than a conflict: [`crate::lock::LockGate`] is stacked outside
+//! [`grab::ConsentGate`], so while the lock is up the grab's judgement never
+//! runs, nothing arms, and the hidden petition resolves `timed_out` — refusal.
+//! A card hidden behind a lock is an *inert* card, not an unanswerable one.
+//!
+//! The pieces both cards are drawn with — the canvas, the glyph engine, the one
+//! `centered` — moved to [`crate::paint`] when the second one arrived, because
+//! two rasterizers in one TCB is two places for a golden to drift.
+//!
 //! # Where the overlay composites, and why that is structural
 //!
 //! `docs/protocol/05-vitrin_consent.md` is normative: "The consent overlay is
@@ -79,7 +95,7 @@
 //! regular, core-owned and not group/other-writable, and whose `command`
 //! passed the transitive not-writable audit. So it is trusted in exactly the
 //! sense `principals.toml`'s identities are trusted — and, like them, it is
-//! still put through [`text`]'s ASCII-printable substitution below, because
+//! still put through [`crate::paint::text`]'s ASCII-printable substitution, because
 //! "trusted" is not "verified to be renderable".
 //!
 //! Where those values come from is **convention**, not structure, and the
@@ -94,7 +110,7 @@
 //! core-validated typed value, so an agent still could not put a glyph on
 //! screen.
 //!
-//! [`text`] then adds a last-moment defense: anything outside ASCII
+//! [`crate::paint::text`] adds a last-moment defense: anything outside ASCII
 //! printables is substituted before glyph selection, so no bidi override or
 //! combining-mark stack could make one string render as another even if a
 //! future change widened what may be shown.
@@ -120,7 +136,7 @@
 //! half (P1.7.2): the input grab that makes a shown prompt exclusive, and
 //! the routing of a click into a petition resolution. The seam between them
 //! is small and deliberate — [`Card::buttons`] reports every choice's
-//! rectangle in card-local pixels, [`centered`] places the card in the view,
+//! rectangle in card-local pixels, [`crate::paint::centered`] places the card,
 //! and [`grab::ConsentGrab::raise`] is the single call that shows the
 //! prompt, marks it shown in the petition registry (making the enforcement
 //! chokepoint's `consent_held` refusal true), and seizes physical input, so
@@ -173,7 +189,6 @@
 //! [`PersistenceRung`]: crate::grants::PersistenceRung
 //! [`Card::buttons`]: render::Card::buttons
 
-pub(crate) mod canvas;
 pub(crate) mod grab;
 mod indicator;
 /// The `consent-injector` channel's vocabulary (issue #138).
@@ -187,13 +202,13 @@ mod indicator;
 #[cfg(any(test, feature = "consent-injector"))]
 pub(crate) mod injector;
 pub(crate) mod render;
-mod text;
 
 use vitrin_protocol::generated::vitrin_grant::Verb;
 
 use crate::grants::{PersistenceRung, RealmId};
 use crate::identity::PrincipalIdentity;
-use canvas::{Canvas, Rect};
+use crate::paint::canvas::{Canvas, Rect};
+use crate::paint::centered;
 pub(crate) use indicator::TrustedIndicator;
 use render::Card;
 
@@ -529,7 +544,18 @@ impl ConsentSurface {
     ///
     /// So the human-visible output restricted to *this* rectangle is
     /// byte-identical to `render::rasterize(prompt)`, which is indicator-free
-    /// by construction. `the_card_footprint_carries_no_indicator_pixel` in
+    /// by construction.
+    ///
+    /// **The lock screen would falsify that sentence, and cannot be up here**
+    /// (WS-E.2.2). [`crate::lock::LockSurface::composite_over`] runs one step
+    /// after this surface's and paints an *opaque* cover over the whole view,
+    /// so a raised lock would make this rectangle read back as lock pixels
+    /// rather than card pixels. It cannot happen in the build this accessor
+    /// exists for: the occlusion export is `consent-injector`, which is
+    /// headless-only, and `main` refuses every `--lock-*` flag with `--headless`
+    /// at startup. Stated rather than left to be re-derived, because the
+    /// conclusion here — "nothing but the card is exported" — is a secrecy
+    /// claim, and a secrecy claim whose premise moved is worse than none. `the_card_footprint_carries_no_indicator_pixel` in
     /// this module's tests turns that structural argument into a checked
     /// fact, so a future reordering of `composite_over` fails a test rather
     /// than silently starting to export the session secret.
@@ -638,16 +664,6 @@ impl ConsentSurface {
     }
 }
 
-/// Center a `w x h` box in a `view_w x view_h` view. Truncating division, so
-/// an odd leftover pixel lands on the right/bottom — deterministically, which
-/// is what the golden needs.
-fn centered(w: u32, h: u32, view_w: u32, view_h: u32) -> (i32, i32) {
-    (
-        (view_w as i64 - w as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32 / 2,
-        (view_h as i64 - h as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32 / 2,
-    )
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -751,7 +767,7 @@ pub(crate) mod tests {
     /// this repository controls end to end: the font is vendored and embedded
     /// (`assets/fonts/README.md`), fontdue's architecture-dependent SIMD
     /// coverage accumulator is disabled (this crate's `Cargo.toml`), and
-    /// every other pixel is integer math ([`super::canvas`]). So the same
+    /// every other pixel is integer math ([`crate::paint::canvas`]). So the same
     /// bytes are expected on any machine, in debug and release alike.
     ///
     /// Regeneration — only when the prompt's design deliberately changes —
@@ -1191,7 +1207,14 @@ pub(crate) mod tests {
 
         // Capture path vs human-visible path off the same scene + prompt.
         let capture = scene.compose(W, H);
-        let human = crate::backend::compose_human_visible(&scene, &mut consent, W, H, false);
+        let human = crate::backend::compose_human_visible(
+            &scene,
+            &mut consent,
+            &mut crate::lock::LockSurface::new(TrustedIndicator::for_test()),
+            W,
+            H,
+            false,
+        );
 
         // The frame is in the human output...
         let card = render::rasterize(&prompt_fixture());
@@ -1245,6 +1268,7 @@ pub(crate) mod tests {
         let human = crate::backend::human_visible_from_view(
             flat_view(W, H, [40, 40, 40]),
             &mut consent,
+            &mut crate::lock::LockSurface::new(TrustedIndicator::for_test()),
             W,
             H,
             false,

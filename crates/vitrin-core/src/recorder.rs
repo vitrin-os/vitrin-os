@@ -1075,6 +1075,49 @@ pub(crate) enum Event<'a> {
         /// A fixed label from a closed vocabulary -- never free-form text.
         reason: &'static str,
     },
+    /// The session's physical input was taken away from every realm
+    /// (WS-E.2.2, issue #214): a lock screen went up.
+    ///
+    /// A session-level fact with no principal and no realm, exactly like
+    /// [`Event::DeadManTriggered`]: no wire message locks this session, and
+    /// the only two things that can are the human's own chord and the human's
+    /// own absence.
+    SessionLocked {
+        /// `chord` or `idle`, from [`crate::lock::LockCause::label`] -- a
+        /// closed vocabulary, never free-form text.
+        cause: &'static str,
+        /// Whether unlocking needs a passphrase. On the line because a journal
+        /// reader deciding how much a `session_unlocked` entry is worth needs
+        /// to know whether anything was proved; an unauthenticated privacy
+        /// screen and a passphrase-backed lock produce the same entry shape and
+        /// mean very different things.
+        passphrase: bool,
+        /// How many realms the session was holding when it locked.
+        realms: usize,
+    },
+    /// One unlock attempt, accepted or refused (WS-E.2.2).
+    ///
+    /// **One entry per attempt, never a summary**, which is the whole reason
+    /// this is a separate variant from [`Event::SessionUnlocked`]: a failed
+    /// unlock is a security fact, and the *rate* is the signal. Three refusals
+    /// a second apart and three a day apart are different sessions, and a
+    /// summarised count cannot tell them apart. An accepted attempt is recorded
+    /// too, so a session with one wrong guess before the right one is not
+    /// reconstructible as one with none.
+    ///
+    /// Carries **nothing** about what was typed -- not the bytes, not a digest,
+    /// and not the length. The secrecy contract [`Event::HandshakeBound`]
+    /// applies to credentials is stricter here: a length is a real narrowing of
+    /// an offline search, and there is no reconstruction question it answers.
+    ///
+    /// An emulated key carrying a passphrase character produces **no** entry at
+    /// all -- it never reaches the gate's press arm
+    /// ([`crate::lock::gate`]'s origin check), so an agent cannot even make the
+    /// journal say it tried.
+    UnlockAttempted { accepted: bool },
+    /// The lock came down: the session's physical input reaches realms again
+    /// (WS-E.2.2). Always preceded by an accepted [`Event::UnlockAttempted`].
+    SessionUnlocked,
     RealmDied {
         realm: &'a RealmId,
         /// The shim that was serving the realm. It may already be reaped.
@@ -1145,6 +1188,9 @@ impl Event<'_> {
             Event::ClipboardPromoted { .. } => "clipboard_promoted",
             Event::ClipboardOffered { .. } => "clipboard_offered",
             Event::ClipboardRefused { .. } => "clipboard_refused",
+            Event::SessionLocked { .. } => "session_locked",
+            Event::UnlockAttempted { .. } => "unlock_attempted",
+            Event::SessionUnlocked => "session_unlocked",
             Event::RealmDied { .. } => "realm_died",
             Event::RealmExited { .. } => "realm_exited",
             Event::ConnectionTeardown { .. } => "connection_teardown",
@@ -1515,6 +1561,21 @@ impl Event<'_> {
                 field_str(out, "gesture", gesture);
                 field_str(out, "reason", reason);
             }
+            Event::SessionLocked {
+                cause,
+                passphrase,
+                realms,
+            } => {
+                field_str(out, "cause", cause);
+                field_bool(out, "passphrase", passphrase);
+                field_u64(out, "realms", realms as u64);
+            }
+            Event::UnlockAttempted { accepted } => {
+                field_bool(out, "accepted", accepted);
+            }
+            // No body: the entry IS the fact. Deliberately carrying nothing
+            // about the attempt that succeeded (see the variant's docs).
+            Event::SessionUnlocked => {}
             Event::RealmDied { realm, pid, cause } => {
                 field_display(out, "realm", realm);
                 field_u64(out, "pid", u64::from(pid));

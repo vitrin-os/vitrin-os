@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: MPL-2.0
-//! The consent surface's pixel primitives: a borrowed RGBA8888 canvas and
-//! the handful of operations the prompt is drawn from — rectangle fill,
-//! rectangle stroke, whole-canvas darkening (the scrim), and a clipped
-//! opaque blit.
+//! The core's pixel primitives: a borrowed RGBA8888 canvas and the handful of
+//! operations every trusted surface is drawn from — rectangle fill, rectangle
+//! stroke, whole-canvas darkening (the scrim), and a clipped opaque blit.
 //!
 //! **Integer math only, deliberately.** This is the same posture
 //! [`crate::scene`] takes for the realm view ("integer math only, no
 //! filtering, no renderer state") and it exists here for the same reason:
-//! the P1.7.1 golden asserts exact pixels, and every floating-point
+//! the P1.7.1 and WS-E.2.2 goldens assert exact pixels, and every floating-point
 //! operation in a rasterizer is a chance for two machines to disagree in
-//! the low bit. The only floating point anywhere in the consent surface is
-//! inside glyph rasterization ([`super::text`]), which fontdue does on one
+//! the low bit. The only floating point anywhere in a core-drawn
+//! surface is inside glyph rasterization ([`super::text`]), which fontdue does on one
 //! scalar IEEE-754 path (see this crate's `Cargo.toml` for why its SIMD
 //! feature is off) — everything that composites those glyph bitmaps, and
 //! every shape around them, is `u32` arithmetic here.
@@ -18,8 +17,8 @@
 //! Not a general 2D library and not trying to become one: there are no
 //! paths, no curves, no transforms, and no rounded corners. Rounded corners
 //! in particular were considered and dropped — they need per-pixel coverage,
-//! i.e. a path rasterizer, which is exactly the dependency
-//! [`super`] declines to put in the TCB to make a dialog look softer.
+//! i.e. a path rasterizer, which is exactly the dependency [`super`] declines
+//! to put in the TCB to make a dialog look softer.
 
 use crate::scene::BYTES_PER_PIXEL;
 
@@ -37,9 +36,10 @@ pub(crate) struct Rect {
 
 impl Rect {
     /// Whether `(px, py)` lies inside this rectangle — the hit test the
-    /// P1.7.2 input grab will run against [`super::Card::buttons`]. Kept
-    /// here, beside the geometry it tests, so the renderer and the decision
-    /// wiring can never disagree about where a button is.
+    /// P1.7.2 input grab runs against
+    /// [`crate::consent::render::Card::buttons`]. Kept here, beside the
+    /// geometry it tests, so the renderer and the decision wiring can never
+    /// disagree about where a button is.
     pub fn contains(&self, px: i32, py: i32) -> bool {
         // i64 offsets, so a point at `i32::MIN` against an origin at
         // `i32::MAX` subtracts without overflowing.

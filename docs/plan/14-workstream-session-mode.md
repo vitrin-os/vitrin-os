@@ -156,7 +156,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 |---|---|---|
 | **1 — multi-app, nested** | ~~Runtime app launch~~ (**landed**, WS-E.1.1/#207: `autostart = false` templates, a served `realm_launch` verb, core-minted `<template>.<n>` instance ids, `capacity` at `MAX_REALMS`, and `realm_spawned` naming who asked) · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · ~~a core-owned attention key~~ (**landed**, WS-E.1.7/#232: a tapped, consumed Super lifts `preempted` for one layout use and delivers `vitrin_principal.attention`, so an in-realm shell can switch realms at all) · a shell client (switcher + launcher) | 7–9 w |
 | **2 — livable** | ~~Cross-realm clipboard~~ (**landed**, WS-E.2.1/#213: a core-held single slot the core *pulls* into on Ctrl-Shift-Insert and offers on Shift-Insert, `text/plain;charset=utf-8` at 60 KiB, plus the modifier-aware chord matcher 2.2 and 2.4 consume — §4.1, [D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing)) · ~~core-drawn lock screen on the consent stack~~ (**landed**, WS-E.2.2/#214) · ~~status in the trusted band~~ (**landed**, WS-E.2.3/#215) · ~~human screenshot~~ (**landed**, WS-E.2.4/#216: `ctrl+print` writes one PNG of the REALM VIEW into one audited `--screenshot-dir`, touching no grant — §6) | 4–6 w |
-| **3 — bare metal** | The keymap decision · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
+| **3 — bare metal** | ~~The keymap decision~~ (**landed**, WS-E.3.1/#217: xkbcommon in the core behind the off-by-default `session-keymap` feature, fed a pre-compiled keymap **file** and never a layout name, keysyms normalised to one Unicode convention, and key pairing moved to the scancode — §4, [D-028](20-decision-log.md#d-028--a-bare-metal-session-interprets-the-keyboard-inside-the-core-from-a-pre-compiled-keymap-file-and-key-pairing-moves-to-the-scancode)) · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
 | **4 — long tail** | X11 (defers to E3.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |
 
 **Stage 1 is the one that is genuinely dual-use.** Layout verbs are allocated
@@ -164,19 +164,36 @@ and unserved, and multi-realm is Phase-3 fleet work; both get built here
 regardless of whether Stage 3 ever happens. Stages 3–4 are not dual-use, and
 that is where the schedule risk concentrates.
 
-**Stage 3's keymap decision is untouched by WS-E.1.7.** The attention key is
+**Stage 3's keymap decision was untouched by WS-E.1.7.** The attention key is
 drawn from `invariant_keysym` — the two Super scancodes — and needs no keymap,
 no modifier resolution, and nothing like `Super+1`..`Super+9`. That was a
 deliberate limit rather than an accident: a hotkey would have pre-empted the
 decision below.
 
-**Stage 3's first task is a decision, not code.** The core holds no keymap by
-design — `vitrin_shim_seat.key` carries keysyms *"precisely so no keymap lives
-here"*. libinput gives evdev scancodes, and `invariant_keysym` covers Escape,
-arrows and modifiers and **not a single letter**. Either xkbcommon interprets
-physical input inside the core (zero new crates; it is already a mandatory
-Smithay dependency) or session mode cannot type. `input/mod.rs:109` already
-records the consequence: key pairing moves from the keysym to the scancode.
+**Stage 3's first task was a decision, and it is taken** —
+[D-028](20-decision-log.md#d-028--a-bare-metal-session-interprets-the-keyboard-inside-the-core-from-a-pre-compiled-keymap-file-and-key-pairing-moves-to-the-scancode),
+2026-08-08. The core held no keymap by design; libinput gives evdev scancodes,
+and `invariant_keysym` covers Escape, arrows and modifiers and **not a single
+letter**, so session mode could not type. xkbcommon now interprets physical
+input inside the core, and three things about that are worth carrying forward
+rather than rediscovering:
+
+- **"Zero new crates" was the wrong unit and this plan said it too.** The
+  package is already in `Cargo.lock` via smithay, but the shipped binary does
+  not link `libxkbcommon.so.0` — measured, zero `NEEDED` entries and zero
+  `xkb_*` undefined symbols. Adopting it costs the TCB 383 144 bytes of C, 87
+  `extern "C"` declarations and a parser over a ~73 KB file. It is therefore
+  behind an **off-by-default** `session-keymap` feature that WS-E.3.2 turns
+  on, and a default build must keep the old measurement byte for byte.
+- **The keymap is a file the operator names, never a layout name.**
+  `new_from_names` searches `~/.config/xkb` before the system path, and a
+  realm's app runs as the core's uid, so a name-resolved keymap is an
+  app-writable file the TCB parses.
+- **Key pairing moved to the scancode, and the release now carries the
+  keysym its own press delivered** — `input/mod.rs:109`'s warning, discharged.
+  The second half is the one that reaches the app: the shim binds a keycode
+  per keysym, so a release carrying the *release's* sym would strand the
+  pressed one down.
 
 ## 4.1 The cross-realm clipboard: five axes, each with what was rejected
 
@@ -234,7 +251,7 @@ the enforcement chokepoint with a verb of its own.
 |---|---|---|
 | **Ctrl-Shift-Insert (promote) / Shift-Insert (offer)** | The core eats both chords in every realm, unconditionally: an app that wants X11-style Shift-Insert primary paste loses it with no pass-through, exactly as [D-023](20-decision-log.md)'s cost note says of Super. `KEY_INSERT` is in `invariant_keysym` (`input/mod.rs:1265`) and is already in the dead-man vocabulary, and Shift-Insert is the *historical X11 clipboard chord*, so it is familiar rather than invented. | **ACCEPTED** |
 | Ctrl-Shift-C / Ctrl-Shift-V, the Qubes chord | **Not expressible.** `invariant_keysym` is a fixed scancode table containing no letters and no digits — asserted, not assumed (`input/mod.rs:1772-1774`: `KEY_A` → `None`). Letters arrive today only in nested mode, because winit's `logical_key` means the *host* compositor did the interpretation (#118). On bare DRM in Stage 3 there is no host, so this chord would work on the maintainer's laptop and stop working the day the workstream reached its point. | REJECTED |
-| Grow an xkbcommon keymap in the core so letters *are* expressible | `input/mod.rs:106-109` warns that a real keymap forces key pairing to move from the keysym to the scancode — a change to a **router invariant**, on the path the dead-man switch depends on — and it is an R7 dependency event on top. It is also Stage 3's decision (§4 above), and pre-empting it from a clipboard issue is exactly the drift the stage list exists to prevent. | REJECTED |
+| Grow an xkbcommon keymap in the core so letters *are* expressible | `input/mod.rs:106-109` warns that a real keymap forces key pairing to move from the keysym to the scancode — a change to a **router invariant**, on the path the dead-man switch depends on — and it is an R7 dependency event on top. It is also Stage 3's decision (§4 above), and pre-empting it from a clipboard issue is exactly the drift the stage list exists to prevent. | REJECTED **here**; taken at Stage 3 by [D-028](20-decision-log.md#d-028--a-bare-metal-session-interprets-the-keyboard-inside-the-core-from-a-pre-compiled-keymap-file-and-key-pairing-moves-to-the-scancode), which does not reopen the chord: the clipboard chord stays inside `invariant_keysym`, because a chord whose keysym moves with the layout is a gesture that stops working on somebody else's keyboard |
 | One chord plus a core-drawn direction picker | Needs a modal core-drawn surface for a several-times-a-minute act: Axis 3's consent-fatigue argument, one indirection over. | REJECTED |
 | Two more Super-based taps, in the attention chord's mould | The attention chord already consumes both Supers (D-023). A third and fourth Super gesture would be distinguishable only by timing, which is how a human accidentally revokes the wrong thing. | REJECTED |
 
@@ -563,7 +580,7 @@ this workstream owns, not inherits:
   inhibiting it means a session a human cannot leave when the compositor
   wedges. §7's safety rule and this item point at the same Stage-3 decision.
   Published.
-- **A passphrase is nested-only, because the core holds no keymap** (created
+- **A passphrase is nested-only, because a headless backend has no keyboard** (created
   by WS-E.2.2, closed only by Stage 3 answering the keymap question). `--lock-passphrase-file`
   is refused at startup with `--headless`, naming the reason. Without it the
   lock is an unauthenticated privacy screen and the card says so. Growing an

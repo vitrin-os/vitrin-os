@@ -431,7 +431,7 @@ impl AttentionSignal {
         if input.origin() != Origin::Physical {
             return Gate::Deliver;
         }
-        let SeatInputKind::Key { keysym, state } = input.kind() else {
+        let SeatInputKind::Key { keysym, state, .. } = input.kind() else {
             return Gate::Deliver;
         };
         if *keysym != self.chord.keysym {
@@ -695,7 +695,7 @@ pub(crate) fn composite_attention_marker(view: &mut [u8], width: u32, height: u3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{InputRouter, NoopHook, SeatInputKind};
+    use crate::input::{InputRouter, KeySource, NoopHook, SeatInputKind};
     use vitrin_protocol::generated::vitrin_grant::Verb;
 
     fn principal(name: &str) -> PrincipalIdentity {
@@ -708,6 +708,7 @@ mod tests {
 
     fn emulated_super(pressed: bool) -> SeatInput {
         SeatInput::emulated(SeatInputKind::Key {
+            source: KeySource::Keysym,
             keysym: 0xffeb,
             state: if pressed {
                 KeyState::Pressed

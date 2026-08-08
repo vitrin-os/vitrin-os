@@ -195,7 +195,14 @@ impl Trigger {
     /// [`crate::input::invariant_keysym`] in [`Self::parse`] rather than
     /// trusted, so this table can never drift into naming a scancode that
     /// produces a different key.
-    const VOCABULARY: &'static [(&'static str, u32, u32)] = &[
+    /// `(name, evdev scancode, keysym)` for every trigger a core-owned chord
+    /// may use.
+    ///
+    /// `pub(crate)` since WS-E.3.1 so [`crate::input::keymap::CoreKeymap`] can
+    /// refuse a keymap that does not agree with it. A layout that moves any of
+    /// these keys silently disarms the gesture bound to it — and one of those
+    /// gestures is the human's off-switch.
+    pub(crate) const VOCABULARY: &'static [(&'static str, u32, u32)] = &[
         ("esc", 1, 0xff1b),
         ("tab", 15, 0xff09),
         ("backspace", 14, 0xff08),
@@ -460,7 +467,7 @@ impl<K: Copy> ChordMatcher<K> {
         if input.origin() != Origin::Physical {
             return;
         }
-        let SeatInputKind::Key { keysym, state } = input.kind() else {
+        let SeatInputKind::Key { keysym, state, .. } = input.kind() else {
             return;
         };
         let Some(modifier) = Modifier::of_keysym(*keysym) else {
@@ -481,7 +488,7 @@ impl<K: Copy> ChordMatcher<K> {
         if input.origin() != Origin::Physical {
             return (Gate::Deliver, None);
         }
-        let SeatInputKind::Key { keysym, state } = input.kind() else {
+        let SeatInputKind::Key { keysym, state, .. } = input.kind() else {
             return (Gate::Deliver, None);
         };
         if Modifier::of_keysym(*keysym).is_some() {
@@ -519,12 +526,52 @@ impl<K: Copy> ChordMatcher<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::SeatInputKind;
+    use crate::input::{KeySource, SeatInputKind};
 
     const SHIFT_L: u32 = 0xffe1;
     const SHIFT_R: u32 = 0xffe2;
     const CTRL_L: u32 = 0xffe3;
     const INSERT: u32 = 0xff63;
+    /// The chord vocabulary and the layout-invariant table agree — **and that
+    /// is all this checks.**
+    ///
+    /// It was named `..._survives_a_core_that_owns_a_keymap`, which it never
+    /// established: it compares two `const` tables in this crate and never
+    /// constructs a keymap, so it could not observe anything WS-E.3.1 added.
+    /// The property it appeared to guard — that a real keymap still delivers
+    /// every core chord trigger — is enforced in
+    /// [`crate::input::keymap::CoreKeymap`]'s constructor and tested there,
+    /// against real keymaps, in both directions.
+    #[test]
+    fn the_chord_vocabulary_agrees_with_the_layout_invariant_table() {
+        assert_eq!(Trigger::VOCABULARY.len(), 28);
+        for (name, evdev, keysym) in Trigger::VOCABULARY {
+            assert_eq!(
+                crate::input::invariant_keysym(*evdev),
+                Some(*keysym),
+                "trigger `{name}` must still come off the layout-invariant table"
+            );
+            assert!(
+                crate::input::keysym_is_intakeable(*keysym),
+                "trigger `{name}` must still be deliverable"
+            );
+        }
+
+        assert_eq!(Modifier::TABLE.len(), 4);
+        for (name, _, left, right, evdev) in Modifier::TABLE {
+            assert_eq!(
+                crate::input::invariant_keysym(*evdev),
+                Some(*left),
+                "modifier `{name}`'s scancode must still resolve to its left keysym"
+            );
+            for (side, keysym) in [("left", left), ("right", right)] {
+                assert!(
+                    crate::input::keysym_is_intakeable(*keysym),
+                    "modifier `{name}` ({side}) must still be deliverable"
+                );
+            }
+        }
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Act {
@@ -534,6 +581,7 @@ mod tests {
 
     fn key(keysym: u32, pressed: bool) -> SeatInputKind {
         SeatInputKind::Key {
+            source: KeySource::Keysym,
             keysym,
             state: if pressed {
                 KeyState::Pressed

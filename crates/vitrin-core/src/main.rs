@@ -469,9 +469,11 @@ USAGE:
                                 `--nested` ONLY: the chord that raises the lock
                                 screen (WS-E.2.2). MOD[+MOD...]+KEY; modifiers
                                 ctrl, shift, alt, super; the key must be
-                                layout-invariant and non-modifier (the core
-                                holds no keymap, so letters and digits are not
-                                in the vocabulary). Default:
+                                layout-invariant and non-modifier -- a chord
+                                key whose keysym moved with the layout would
+                                be a gesture that stops working on somebody
+                                else's keyboard, so letters and digits are not
+                                in the vocabulary on any backend. Default:
                                 ctrl+alt+delete. The chord is CONSUMED -- no
                                 confined app sees it. Startup FAILS if its key
                                 is also --dead-man-chord's, --attention-chord's
@@ -488,10 +490,10 @@ USAGE:
                                 regular file, owned by this uid, mode 600 --
                                 stricter than realm.toml's rule, because whoever
                                 can READ it gets an offline attack. REJECTED
-                                with --headless, naming the reason: no keymap
-                                lives in the core, so a backend with no host
-                                compositor delivers no letters and the
-                                passphrase could never be typed. WITHOUT this flag the lock is an
+                                with --headless, naming the reason: a headless
+                                backend has no keyboard and no keymap, so it
+                                delivers no letters and the passphrase could
+                                never be typed. WITHOUT this flag the lock is an
                                 unauthenticated privacy screen dismissed by
                                 Enter, and the card says so.
 
@@ -1312,9 +1314,9 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     // separately because they have different reasons** (WS-E.2.2, issue #214).
     //
     // The passphrase first, so its message wins when both flags are given: it
-    // names the *keymap*, which is the fact a reader most needs (the core holds
-    // no keymap, so a keyless backend's alphabet has no letters in it -- see
-    // `crate::lock`). The other two flags are refused for a different and
+    // names the *keymap*, which is the fact a reader most needs (a headless
+    // backend has neither a host to interpret a layout nor a keymap of its
+    // own, so its alphabet has no letters in it -- see `crate::lock`). The other two flags are refused for a different and
     // blunter reason: a headless session has no physical input device at all,
     // so a lock it raised could never be dismissed. Both are startup errors
     // with a non-zero exit, on `HEADLESS_INTERACTIVE_REFUSAL`'s precedent,
@@ -2007,7 +2009,7 @@ fn lock_hash_from_stdin() -> Result<String, String> {
         lock::passphrase::wipe(&mut buf);
         return Err(format!(
             "the passphrase contains a control byte (0x{bad:02x}) the unlock screen has no way \
-             to type: the core holds no keymap and `invariant_keysym` cannot deliver it. \
+             to type: no keymap resolves a control byte and `invariant_keysym` cannot deliver it. \
              Accepting it here would lock the session with no way in."
         ));
     }

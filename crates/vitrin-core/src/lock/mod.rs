@@ -139,7 +139,7 @@ use render::Card;
 /// and the message the test asserts are one string.
 pub(crate) const PASSPHRASE_NEEDS_A_KEYMAP: &str =
     "`--lock-passphrase-file` needs a backend that can deliver letters and digits, and \
-     `--headless` cannot: the core holds no keymap, so a headless session's input intake \
+     `--headless` cannot: a headless session has no keyboard and no keymap, so its input intake \
      produces only the layout-invariant scancode table (function keys, arrows, editing keys, \
      modifiers) -- no letter and no digit, so the passphrase could never be typed and the \
      session would come up locked-out-able with no way in. Run `--nested`, where the host \

@@ -94,9 +94,11 @@ attention marker) that no client can add to.
 
 **A principal cannot receive physical input either, so no client has a
 hotkey.** There is no `observe_input` verb and none is designed. The core owns
-exactly two physical chords — the dead-man switch and the attention key — and
-owns both *precisely because* the human's off-switch and the human's
-attention gesture must not depend on a client being alive and correct. A
+four physical gestures — the dead-man switch, the attention key, the two
+clipboard chords and the lock chord — and owns them *precisely because* the
+human's off-switch, the human's attention gesture, a cross-realm transfer and
+the act of locking a screen must not depend on a client being alive and
+correct. A
 convenience hotkey is not in that class and must not borrow that warrant, so
 "Super+Tab switches windows" is not a missing feature: it would mean the core
 reserving a chord on behalf of whichever client asked first, which is
@@ -337,6 +339,64 @@ are consumed by the core in every realm, with no pass-through and no way to ask
 for one. Shift-Insert is the historical X11 primary-paste chord, so an app that
 binds it loses it. `--clipboard-key` moves both to another key, which is not a
 remedy so much as a different loss.
+
+**The lock screen does not lock out agents, and this is the single most
+surprising thing on this page.** As of WS-E.2.2 there is a lock screen:
+Ctrl-Alt-Delete (or `--lock-idle SECS` of no physical input) covers the output
+with a core-drawn card and takes **every physical event** away from every realm
+until you type your passphrase. What it does not do is touch a grant. An agent
+holding `observe` **keeps capturing the realm across a lock**, frame for frame,
+exactly as if you were sitting there; one holding `actuate_pointer` or
+`actuate_text` keeps acting.
+
+That is a decision, not a gap somebody forgot to close. Observation is
+concurrent by design in the wire protocol (`vitrin_view`), so `preempted` and
+`consent_held` never refuse a capture, and a lock takes away **your** input, not
+an agent's authority. Three alternatives were considered and rejected: a new
+refusal code (a v0 wire-semantic change, which belongs to the protocol track);
+blanking the realm view so agents receive black frames (a lie by omission — the
+agent is never told why it sees black); and routing the lock through the
+enforcement chokepoint as a synthetic human principal (which invents a wire
+principal the identity layer does not have).
+
+The instrument for "stop everything" is unchanged and still works while locked:
+**hold the dead-man chord**, which revokes every grant in the session, denies
+every pending petition and clears the clipboard slot. The lock card says all of
+this on the card itself, in the same words, because a human who locks a screen
+and walks away should not learn it from a documentation page.
+
+**In nested mode the lock screen locks a window, not a session.** `vitrind`
+runs as a client of your real compositor, which is above it and owns the actual
+session: anyone can alt-tab away from the locked window, and the host's own
+screen lock is still the thing protecting the machine. Treat the nested lock as
+what it is — a privacy cover over the realms `vitrind` is showing — and not as
+an authentication boundary for the seat.
+
+**There is no protection against VT switching, on any backend.** Nothing
+inhibits `Ctrl-Alt-F<n>`. On the nested backend that is the host's business and
+outside this project's reach; on a future DRM backend it would be a real escape
+from the lock, and inhibiting it means a session you cannot leave when the
+compositor wedges. That trade is not decided, and it will be decided by whoever
+lands the DRM backend rather than pre-empted here.
+
+**Without `--lock-passphrase-file` the lock is a privacy screen, and it says
+so.** Enter dismisses it, with no authentication of any kind. The passphrase
+path exists (Argon2id, one digest per session, one journal entry per attempt
+including the failures) and it is refused at startup with `--headless`, for a
+reason worth stating plainly: **the core holds no keymap**. Letters and digits
+reach it today only because the host compositor interprets the layout in nested
+mode. On a backend with no host, the deliverable alphabet is function keys,
+arrows, editing keys and modifiers — no letter and no digit — so a passphrase
+would be unenterable, and a session that came up that way would be locked out
+rather than locked.
+
+**A fourth chord is now taken from every app, and it constrains the other
+three.** Ctrl-Alt-Delete is consumed in every realm. It also means
+`--dead-man-chord delete` is refused at startup on an otherwise default command
+line: the dead-man switch detects in the router's unconditional observe tap, so
+a lock chord sharing its key would arm your off-switch every single time you
+locked your screen. `--lock-chord` moves it, which — as with the clipboard — is
+a different loss rather than a remedy.
 
 **Identities are static tokens.** Listed in `principals.toml`. The IDL is
 shaped for SPIFFE/OIDC credentials; the machinery is not here yet.

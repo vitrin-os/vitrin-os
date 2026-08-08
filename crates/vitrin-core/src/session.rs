@@ -739,6 +739,25 @@ pub(crate) trait RuntimeHost: Sized + 'static {
     /// startup (issue #90 scope 4), so no petition can silently pend under a
     /// backend that could never raise a prompt to answer it.
     fn service_consent(&mut self, _now: Instant) {}
+
+    /// Service one turn of the lock screen (WS-E.2.2, issue #214): raise it if
+    /// the session has gone idle, mirror the gate's state onto the surface, and
+    /// journal the facts the gate queued. Called once per dispatch round from
+    /// [`post_dispatch`], immediately after [`Self::service_consent`] and
+    /// before the dirty gate.
+    ///
+    /// **After consent, deliberately.** A round that raises a prompt and then
+    /// locks must end with the lock on top, and — more importantly — the
+    /// journal must read in the order the human experienced: the petitioner was
+    /// shown a card, and then the session locked with nobody there to answer it.
+    ///
+    /// The default is a **no-op**, on [`Self::service_consent`]'s terms and for
+    /// a sharper reason: a backend with no physical input device could raise a
+    /// lock it has no way to dismiss, which is a wedge rather than a
+    /// degradation. `main` therefore refuses every `--lock-*` flag with
+    /// `--headless` at startup, so no configuration can reach this default with
+    /// a lock armed behind it.
+    fn service_lock(&mut self, _now: Instant) {}
 }
 
 impl<H: PreemptionHook> Runtime<H> {
@@ -1697,6 +1716,125 @@ pub(crate) fn service_consent_round<H: PreemptionHook>(
         }
     }
 
+    changed
+}
+
+/// Drive the lock screen for one dispatch round (WS-E.2.2, issue #214):
+/// raise it if the session has gone idle, mirror the gate's state onto the
+/// surface, and journal every fact the gate produced.
+///
+/// Returns whether human-visible output changed, so the caller marks the frame
+/// dirty — [`service_consent_round`]'s contract, so a lock appearing and a
+/// prompt appearing take the same path to the screen.
+///
+/// # Why the embedder does this and the gate cannot
+///
+/// The gate runs inside [`crate::input::InputRouter::route_physical`], which
+/// holds no recorder and no realm registry and must never grow either — the
+/// division [`crate::clipboard`] and [`crate::attention`] already make. So
+/// [`LockScreen`] decides *whether* the session is locked and queues the facts;
+/// this function, which owns the registry and the recorder, decides what the
+/// card says and what the journal records.
+///
+/// # The two states are mirrored, never duplicated
+///
+/// [`LockScreen`] is the single source of truth: [`LockSurface`] is told what
+/// it already decided. A surface raised without the gate would be pixels with
+/// no grab behind them — a lock screen an app can type through, which is worse
+/// than no lock at all — and a gate raised without the surface would consume
+/// every key with nothing on screen to explain why. Both are impossible while
+/// this is the only place either is raised in production.
+pub(crate) fn service_lock_round<H: PreemptionHook>(
+    screen: &mut crate::lock::LockScreen,
+    surface: &mut crate::lock::LockSurface,
+    runtime: &mut Runtime<H>,
+    // Required, not `Option`: an unlock has to restart the consent guard (see
+    // the `Unlocked` arm below), and a parameter a caller may omit is the shape
+    // this codebase has already had to un-ship twice -- an optional hook that
+    // no backend stacked, and a defaulted trait method that silently disabled
+    // the attention key. A caller with no prompt passes its own grab anyway.
+    grab: &std::cell::RefCell<ConsentGrab>,
+    deadman_chord: &'static str,
+    now: Instant,
+) -> bool {
+    // The idle raise first, so a session that went idle this round locks on
+    // this round's frame rather than the next one.
+    screen.tick(now);
+
+    // The realms named on the card: every realm still admitting petitions, in
+    // registry order. Deliberately the *live* set rather than every configured
+    // row — an exited realm keeps its id in the registry
+    // (`RealmRegistry::mark_exited`), and naming a dead app on a lock screen
+    // would tell a returning human their session is holding something it is
+    // not.
+    let realms: Vec<crate::grants::RealmId> = runtime
+        .kernel
+        .realms
+        .iter()
+        .filter(|realm| realm.admits_petitions())
+        .map(|realm| realm.id().clone())
+        .collect();
+
+    let mut changed = false;
+    match screen.cause() {
+        Some(cause) => {
+            let content = crate::lock::LockContent {
+                cause,
+                realms: realms.clone(),
+                unlock: screen.unlock_method(),
+                deadman_chord,
+            };
+            // `raise` is idempotent for identical content, so calling it every
+            // round costs nothing and does not invalidate the raster at frame
+            // cadence. It is still worth calling every round: a realm dying
+            // behind the lock changes what the card should say.
+            let before = surface.generation();
+            surface.raise(content);
+            changed |= surface.generation() != before;
+        }
+        None => {
+            let before = surface.generation();
+            surface.lower();
+            changed |= surface.generation() != before;
+        }
+    }
+
+    // Journal last, from facts the gate queued rather than from the state
+    // above: an unlock that raced a realm death must still produce its
+    // entries, and deriving them from the surface would lose the *attempts*
+    // entirely (a wrong passphrase changes no pixel).
+    for entry in screen.take_journal() {
+        let event = match entry {
+            crate::lock::LockJournal::Locked { cause } => crate::recorder::Event::SessionLocked {
+                cause: cause.label(),
+                passphrase: screen.unlock_method() == crate::lock::UnlockMethod::Passphrase,
+                realms: realms.len(),
+            },
+            crate::lock::LockJournal::Attempted { accepted } => {
+                crate::recorder::Event::UnlockAttempted { accepted }
+            }
+            crate::lock::LockJournal::Unlocked => {
+                // **The consent guard restarts here, not at raise.** A prompt
+                // raised while the lock was up spent its whole
+                // `GUARD_INTERVAL` behind an opaque cover, so without this the
+                // human returns, unlocks, sees a card for the first time, and
+                // the first pointer press commits it with a guard that expired
+                // while nobody could see the card. The lock kept it
+                // *unanswerable*, which is not the same as *visible*, and the
+                // guard is about visible.
+                //
+                // Only the guard moves; the petition's own deadline does not.
+                // A lock does not buy the human more time to decide.
+                if grab.borrow_mut().restart_guard(now) {
+                    tracing::debug!(
+                        "consent guard restarted: a prompt became visible when the lock lowered"
+                    );
+                }
+                crate::recorder::Event::SessionUnlocked
+            }
+        };
+        runtime.kernel.recorder.record(event);
+    }
     changed
 }
 
@@ -3402,6 +3540,12 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
     // reads `dirty`. Backends that cannot host a prompt inherit the trait's
     // no-op and pay nothing here.
     host.service_consent(Instant::now());
+    // ...and the lock, on the same terms and immediately after: raising or
+    // lowering it is exactly what makes the frame dirty. Sampling `Instant::now()`
+    // a second time rather than threading one turn instant through both is the
+    // shape `service_consent` already set here; the two are microseconds apart
+    // and neither compares against the other's sample.
+    host.service_lock(Instant::now());
     let fatal = {
         let (runtime, view) = host.split();
         // Also before the dirty gate, and for the same shape of reason: an
@@ -3633,6 +3777,14 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
+    /// A lock surface with nothing raised, for composite assertions about the
+    /// *other* overlays. A fresh one per call: [`crate::lock::LockSurface`]
+    /// carries a generation counter and a raster cache, so a shared instance
+    /// would let one caller's raise change what the next one measures.
+    fn no_lock() -> crate::lock::LockSurface {
+        crate::lock::LockSurface::new(crate::consent::TrustedIndicator::for_test())
+    }
+
     use calloop::{EventLoop, LoopSignal};
     use vitrin_ipc::Connection;
     use vitrin_protocol::generated::vitrin_grant::Outcome;
@@ -3736,6 +3888,7 @@ mod tests {
             crate::backend::compose_human_visible(
                 self.scenes.bound(),
                 &mut self.consent,
+                &mut no_lock(),
                 w,
                 h,
                 false,
@@ -4130,6 +4283,123 @@ mod tests {
             crate::recorder::tests::cleanup(&self.log);
             std::fs::remove_dir_all(&self.dir).ok();
         }
+    }
+
+    /// **The embedder round mirrors the gate onto the surface and writes the
+    /// journal the gate cannot** (WS-E.2.2, issue #214).
+    ///
+    /// `LockScreen` is the single source of truth: it decides whether the
+    /// session is locked and queues the facts; `service_lock_round` decides
+    /// what the card says and what the flight recorder records. A surface
+    /// raised without the gate is pixels with no grab behind them — a lock
+    /// screen an app can type through — and a gate raised without the surface
+    /// is every key vanishing with nothing on screen to explain it. This drives
+    /// the real function against the real registry and reads the real log.
+    ///
+    /// Note what is asserted about the failed attempt: **exactly one entry, and
+    /// it carries nothing about what was typed.** Issue #214 asks for the count;
+    /// the secrecy half is checked here because a length is a real narrowing of
+    /// an offline search and nothing here needs one.
+    #[test]
+    fn the_lock_round_mirrors_the_gate_and_journals_every_attempt() {
+        use crate::lock::{LockCause, LockScreen, LockSurface};
+
+        let mut rig = Rig::new(
+            "lock-round",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let t0 = Instant::now();
+        let mut screen = LockScreen::new(
+            crate::chord::ModChord::parse(crate::lock::DEFAULT_LOCK_CHORD).unwrap(),
+            None,
+            None,
+            t0,
+        );
+        let mut surface = LockSurface::new(crate::consent::TrustedIndicator::for_test());
+        // No prompt is up in these cases, so `restart_guard` answers `false`;
+        // the parameter is required rather than optional precisely so a caller
+        // cannot forget the case where one IS up.
+        let grab_for_lock_tests = std::cell::RefCell::new(ConsentGrab::new());
+
+        // Unlocked: the round changes nothing and raises nothing.
+        assert!(!service_lock_round(
+            &mut screen,
+            &mut surface,
+            &mut rig.host.runtime,
+            &grab_for_lock_tests,
+            "esc",
+            t0
+        ));
+        assert!(!surface.is_raised());
+
+        // Locked: the round raises the surface once, and only once.
+        screen.raise(LockCause::Chord);
+        assert!(service_lock_round(
+            &mut screen,
+            &mut surface,
+            &mut rig.host.runtime,
+            &grab_for_lock_tests,
+            "esc",
+            t0
+        ));
+        assert!(surface.is_raised(), "the pixels must follow the gate");
+        assert!(
+            !service_lock_round(
+                &mut screen,
+                &mut surface,
+                &mut rig.host.runtime,
+                &grab_for_lock_tests,
+                "esc",
+                t0
+            ),
+            "an idempotent round must not invalidate the raster at frame cadence"
+        );
+
+        // One failed attempt, then an accepted one, journalled through the
+        // round rather than by the gate.
+        screen.journal_for_test(crate::lock::LockJournal::Attempted { accepted: false });
+        screen.journal_for_test(crate::lock::LockJournal::Attempted { accepted: true });
+        screen.journal_for_test(crate::lock::LockJournal::Unlocked);
+        service_lock_round(
+            &mut screen,
+            &mut surface,
+            &mut rig.host.runtime,
+            &grab_for_lock_tests,
+            "esc",
+            t0,
+        );
+
+        let entries = rig.entries();
+        let of_kind = |kind: &str| -> Vec<&crate::recorder::tests::Json> {
+            entries.iter().filter(|e| e.str("kind") == kind).collect()
+        };
+        let locked = of_kind("session_locked");
+        assert_eq!(locked.len(), 1, "one lock, one entry");
+        assert_eq!(locked[0].str("cause"), "chord");
+        assert!(!locked[0].bool("passphrase"));
+        assert_eq!(locked[0].u64("realms"), 1);
+
+        let attempts = of_kind("unlock_attempted");
+        assert_eq!(
+            attempts.len(),
+            2,
+            "one entry per attempt, never a summary: the rate is the signal"
+        );
+        assert!(!attempts[0].bool("accepted"));
+        assert!(attempts[1].bool("accepted"));
+        for attempt in &attempts {
+            // The secrecy contract: no bytes, no digest, and NOT a length.
+            for forbidden in ["bytes", "digest", "length", "passphrase", "attempt"] {
+                assert!(
+                    attempt.path(forbidden).is_none(),
+                    "an unlock attempt must carry nothing about what was typed ({forbidden})"
+                );
+            }
+        }
+        assert_eq!(of_kind("session_unlocked").len(), 1);
     }
 
     struct ConsentPolicyArg {

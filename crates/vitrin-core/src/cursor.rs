@@ -53,11 +53,11 @@
 //!
 //! Integer math, const colours, no image assets, no allocation — the posture
 //! [`crate::deadman::composite_hold_indicator`] established for a code-drawn
-//! human-visible overlay, and [`crate::consent::canvas`]'s reasoning for why
+//! human-visible overlay, and [`crate::paint::canvas`]'s reasoning for why
 //! a rasterizer dependency does not enter the TCB to make a shape prettier.
 
-use crate::consent::canvas::{Canvas, Rect};
 use crate::consent::TRUST_BAND_HEIGHT;
+use crate::paint::canvas::{Canvas, Rect};
 
 /// Half-length of each crosshair arm, in view pixels.
 const ARM: u32 = 9;

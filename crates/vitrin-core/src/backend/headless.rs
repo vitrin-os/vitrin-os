@@ -1271,6 +1271,22 @@ pub(crate) struct HeadlessOutput {
     /// view on the human-visible side of the output stage only. Always
     /// present, empty until P1.7.2 puts a petition up.
     consent: ConsentSurface,
+    /// The lock surface (WS-E.2.2, issue #214). **Always present and
+    /// permanently empty on this backend**, and that is the honest shape rather
+    /// than a `cfg`: [`super::human_visible_from_view`] is the one
+    /// overlay-application step both backends reach, so the parameter has to be
+    /// *something*, and a backend-shaped `Option` would make "both backends
+    /// composite the same way" true only by inspection.
+    ///
+    /// Nothing raises it here. A headless session has no physical input device
+    /// ([`crate::input`]: `SeatInput::physical` is private and this backend
+    /// calls no intake), so a lock it raised could never be dismissed — which is
+    /// why `main` refuses every `--lock-*` flag with `--headless` at startup
+    /// rather than arming a wedge. Its *compositing* is still exercised here, by
+    /// this module's own tests, which is what gives "the lock reaches
+    /// human-visible output and never a capture" a home on the one backend CI
+    /// can run (D-019(4)).
+    lock: crate::lock::LockSurface,
     /// The composed **realm view**, retained across the process lifetime
     /// (PRD Doc 2 §9) so an internal capture reads composited pixels, not a
     /// freshly cleared buffer. Overlay-free by construction — this is what
@@ -1334,6 +1350,7 @@ impl HeadlessView {
             output: HeadlessOutput {
                 renderer,
                 consent: ConsentSurface::new(indicator),
+                lock: crate::lock::LockSurface::new(indicator),
                 view_framebuffer,
                 output_framebuffer,
                 size,
@@ -1571,8 +1588,14 @@ impl HeadlessOutput {
         // backends call. `view` is moved in rather than recomposed, so "the
         // two images differ only by the overlay" is a property of the code
         // and not of a comment.
-        let mut output =
-            super::human_visible_from_view(view, &mut self.consent, w, h, self.attention);
+        let mut output = super::human_visible_from_view(
+            view,
+            &mut self.consent,
+            &mut self.lock,
+            w,
+            h,
+            self.attention,
+        );
         // The agent cursor sprite (D-019), opt-in here and only here: the
         // nested backend always draws it, this one draws it when the run
         // passed `--agent-cursor` (see [`Self::draw_agent_cursor`]). Applied
@@ -1722,6 +1745,14 @@ mod tests {
     use crate::test_pattern;
     use calloop::EventLoop;
     use smithay::utils::{Physical, Size};
+
+    /// A lock surface with nothing raised, for composite assertions about the
+    /// *other* overlays. A fresh one per call: [`crate::lock::LockSurface`]
+    /// carries a generation counter and a raster cache, so a shared instance
+    /// would let one caller's raise change what the next one measures.
+    fn no_lock() -> crate::lock::LockSurface {
+        crate::lock::LockSurface::new(crate::consent::TrustedIndicator::for_test())
+    }
 
     const WIDTH: u32 = 1280;
     const HEIGHT: u32 = 800;
@@ -2276,8 +2307,14 @@ mod tests {
         // carry a card.
         let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
         consent.show_for_test(prompt_fixture());
-        let human_visible =
-            super::super::compose_human_visible(state.bound_scene(), &mut consent, VW, VH, false);
+        let human_visible = super::super::compose_human_visible(
+            state.bound_scene(),
+            &mut consent,
+            &mut no_lock(),
+            VW,
+            VH,
+            false,
+        );
         assert_ne!(
             nested_capture, human_visible,
             "the nested capture must exclude the consent overlay"
@@ -2494,6 +2531,158 @@ mod tests {
             state.latest_output_rgba().expect("readback"),
             clean_output,
             "a dismissed prompt must leave no pixels behind"
+        );
+    }
+
+    /// **The lock screen reaches the human-visible framebuffer and is
+    /// byte-absent from a capture of the same instant** (WS-E.2.2, issue #214,
+    /// acceptance criterion 2).
+    ///
+    /// The shape of
+    /// [`a_prompt_reaches_human_visible_output_but_never_a_capture`] above,
+    /// deliberately, because it is the same structural claim about the same
+    /// fork — and the claim is *load-bearing in the opposite direction* here.
+    /// For the consent card, "an agent cannot watch it" is the guarantee. For
+    /// the lock, the guarantee is the one nobody expects: an agent holding
+    /// `observe` keeps receiving the realm view **across a lock**, unchanged,
+    /// because the lock composites downstream of `Scene::compose`. That is the
+    /// owner's decision (D-025), and this is the test that says it is really
+    /// what the code does rather than what a doc comment claims.
+    ///
+    /// The negative half is the one that would pass vacuously, so the run of
+    /// bytes it searches for is asserted to be **present in the output** first.
+    #[test]
+    fn the_lock_screen_reaches_human_visible_output_but_never_a_capture() {
+        use crate::capture::{render_frame, RealmViewFrame};
+        use crate::lock::tests::lock_fixture;
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+
+        let _fd = crate::capture::tests::fd_lock();
+        const VW: u32 = 800;
+        const VH: u32 = 600;
+        const SW: u32 = 400;
+        const SH: u32 = 300;
+
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessView> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+            false,
+        )
+        .expect("headless state under pixman");
+
+        // A realm that has painted, so "the lock is absent from the capture" is
+        // distinguishable from "nothing was ever drawn".
+        state.scene_for_test().commit(
+            SurfaceContent::from_rgba(client_pixels(SW, SH), SW, SH).expect("well-formed content"),
+        );
+        state.redraw().expect("composite the committed surface");
+        let clean_view = state.latest_frame_rgba().expect("readback");
+        let clean_output = state.latest_output_rgba().expect("readback");
+
+        // The lock goes up.
+        state.output.lock.raise(lock_fixture());
+        state.redraw().expect("recomposite with the lock up");
+
+        // --- Human-visible side: the cover and the card are really there. ---
+        let output = state.latest_output_rgba().expect("readback");
+        assert_ne!(output, clean_output, "the lock must change the output");
+        let card = crate::lock::render::rasterize(&lock_fixture());
+        let (cx, cy) = state
+            .output
+            .lock
+            .card_origin(VW, VH)
+            .expect("a lock is up, so the card has an origin");
+        assert!(cx >= 0 && cy >= 0, "the card fits in an {VW}x{VH} view");
+        for row in 0..card.height {
+            let d = ((cy as u32 + row) as usize * VW as usize + cx as usize)
+                * test_pattern::BYTES_PER_PIXEL;
+            let s = row as usize * card.width as usize * test_pattern::BYTES_PER_PIXEL;
+            let run = card.width as usize * test_pattern::BYTES_PER_PIXEL;
+            assert_eq!(
+                &output[d..d + run],
+                &card.rgba[s..s + run],
+                "card row {row} must appear verbatim in the human-visible output"
+            );
+        }
+        // The cover is OPAQUE, not a scrim: the bottom-left pixel is the lock's
+        // own colour and carries nothing of the client's. Below the trusted band
+        // and outside the centered card, so it isolates the cover.
+        let bl = (VH as usize - 1) * VW as usize * test_pattern::BYTES_PER_PIXEL;
+        assert_eq!(
+            &output[bl..bl + 4],
+            &crate::lock::render::COVER_RGBA[..],
+            "the lock cover must replace the realm view, not darken it"
+        );
+
+        // --- Agent side: the capture is the realm view, unchanged. ---
+        let view = state.latest_frame_rgba().expect("readback");
+        assert!(
+            view == clean_view,
+            "a lock being up must not move a single pixel of the realm view: an observe \
+             grant keeps capturing across a lock (D-025), published in \
+             docs/book/src/limits.md rather than quietly fixed here"
+        );
+        assert!(
+            view == state.bound_scene().compose(VW, VH),
+            "the capture source must be exactly Scene::compose -- the lock composites at the \
+             output stage, above this"
+        );
+        assert_ne!(view, output, "...and the two really do differ now");
+
+        // The delivered artifact, not just the retained image.
+        let (frame, _digest) = render_frame(&RealmViewFrame {
+            rgba: &view,
+            width: VW,
+            height: VH,
+        })
+        .expect("render the retained view");
+        let served = {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::File::from(frame.fd);
+            let mut buf = vec![0u8; (frame.stride * frame.height) as usize];
+            file.read_exact_at(&mut buf, 0).expect("read served frame");
+            buf
+        };
+        let swizzle = |rgba: &[u8]| -> Vec<u8> {
+            rgba.chunks_exact(4)
+                .flat_map(|px| [px[2], px[1], px[0], 0xff])
+                .collect()
+        };
+        assert!(
+            served == swizzle(&clean_view),
+            "the served capture must be the lock-free realm view"
+        );
+        // Byte-absence, pixel level. Negative claims are the ones that pass
+        // vacuously, so the run being searched for is asserted PRESENT in the
+        // output first -- which makes "absent from the capture" a statement
+        // about a pattern that demonstrably exists.
+        let card_row = &card.rgba[..card.width as usize * test_pattern::BYTES_PER_PIXEL];
+        let card_row_wire = swizzle(card_row);
+        assert!(
+            swizzle(&output)
+                .windows(card_row_wire.len())
+                .any(|w| w == card_row_wire),
+            "the searched-for run must exist in the human-visible output, or the absence \
+             assertion below proves nothing"
+        );
+        assert!(
+            !served
+                .windows(card_row_wire.len())
+                .any(|w| w == card_row_wire),
+            "a row of lock-screen pixels reached a capture"
+        );
+
+        // Taking the lock down restores the human-visible output exactly.
+        state.output.lock.lower();
+        state.redraw().expect("recomposite with the lock down");
+        assert_eq!(
+            state.latest_output_rgba().expect("readback"),
+            clean_output,
+            "a lowered lock must leave no pixels behind"
         );
     }
 
@@ -3036,6 +3225,7 @@ mod tests {
                 super::super::compose_human_visible(
                     state.bound_scene(),
                     &mut expected,
+                    &mut no_lock(),
                     VW,
                     VH,
                     false
@@ -3120,6 +3310,7 @@ mod tests {
             super::super::compose_human_visible(
                 &crate::scene::Scene::new(),
                 &mut expected,
+                &mut no_lock(),
                 VW,
                 VH,
                 false

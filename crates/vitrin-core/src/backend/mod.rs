@@ -24,7 +24,12 @@
 //! everything a human sees comes from here. The overlay is applied only on
 //! this side, so `docs/protocol/05-vitrin_consent.md`'s "it never appears in
 //! captured frames" holds by construction rather than by a check (the full
-//! argument is in [`crate::consent`]'s module docs). The trusted indicator
+//! argument is in [`crate::consent`]'s module docs). The **lock screen**
+//! (WS-E.2.2, [`crate::lock`]) is applied at the same step and inherits the
+//! identical property: an agent holding `observe` keeps receiving the realm
+//! view across a lock and never sees the lock itself — which is the mechanical
+//! half of the decision D-025 records, and is published in
+//! `docs/book/src/limits.md` rather than left to be discovered. The trusted indicator
 //! (issue #85) — the always-present band and the per-prompt frame — lives on
 //! this side too, and is invisible to a capture for exactly the same reason.
 //! So does the **agent cursor sprite** (D-019, [`crate::cursor`]), which is
@@ -83,6 +88,7 @@ pub mod headless;
 pub mod winit;
 
 use crate::consent::ConsentSurface;
+use crate::lock::LockSurface;
 use crate::scene::Scene;
 
 /// Apply the consent overlay to an **already-composed** realm view, yielding
@@ -122,6 +128,7 @@ use crate::scene::Scene;
 pub(crate) fn human_visible_from_view(
     mut view: Vec<u8>,
     consent: &mut ConsentSurface,
+    lock: &mut LockSurface,
     width: u32,
     height: u32,
     attention: bool,
@@ -130,6 +137,15 @@ pub(crate) fn human_visible_from_view(
     // client content — and even the scrim — never sits over the one strip the
     // human reads the session colour from.
     consent.composite_over(&mut view, width, height);
+    // ...then the lock screen (WS-E.2.2, issue #214), which is an OPAQUE cover
+    // rather than a scrim and therefore hides everything drawn so far,
+    // deliberately including a consent card. A prompt raised while the human is
+    // away is also *inert* while the lock is up — `LockGate` is outermost, so
+    // the consent grab's judgement never runs — so hiding it is not concealing
+    // an answerable decision; it resolves `timed_out`, which is refusal. Before
+    // the band, because the band's whole value is having exactly one correct
+    // appearance and nothing may sit on it, core-drawn or not.
+    lock.composite_over(&mut view, width, height);
     consent.composite_trust_band(&mut view, width, height);
     // ...and, while the human's attention window is open, a marker **beside**
     // the band and never inside it (WS-E.1.7, issue #232). After the band so
@@ -160,6 +176,7 @@ pub(crate) fn human_visible_from_view(
 pub(crate) fn compose_human_visible(
     scene: &Scene,
     consent: &mut ConsentSurface,
+    lock: &mut LockSurface,
     width: u32,
     height: u32,
     attention: bool,
@@ -167,6 +184,7 @@ pub(crate) fn compose_human_visible(
     human_visible_from_view(
         scene.compose(width, height),
         consent,
+        lock,
         width,
         height,
         attention,

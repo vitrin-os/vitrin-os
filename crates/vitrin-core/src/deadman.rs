@@ -11,38 +11,67 @@
 //! event queue, a timer that never fires, a partially-consumed chord. Each
 //! of those is named below at the code that answers it.
 //!
-//! # The core owns a second physical chord now, and this one's warrant is
-//! unchanged by it
+//! # The core owns three more physical gestures now, and this one's warrant is
+//! unchanged by every one of them
 //!
 //! Until WS-E.1.7 (issue #232) this module said the core owns **exactly one**
 //! physical chord, because the human's off-switch must not depend on a client.
-//! That sentence is now false: [`crate::attention`] owns a second, and it is
-//! written out here rather than quietly left, because a stale claim in the one
-//! module whose value is that nothing can defeat it is worse than none.
+//! That sentence has now been false three times over, and each time it was
+//! rewritten rather than quietly left, because a stale claim in the one module
+//! whose value is that nothing can defeat it is worse than none:
+//! [`crate::attention`] owns the attention key (WS-E.1.7), [`crate::clipboard`]
+//! owns the two clipboard chords (WS-E.2.1, D-024), and [`crate::lock`] owns
+//! the lock chord (WS-E.2.2, D-025).
 //!
 //! **What has not changed is the argument.** The warrant this module claims is
 //! narrow and stays narrow: *an off-switch may not depend on a client, so the
 //! core owns the key that fires it.* It was never "the core may own chords in
-//! general", and admitting a neighbour must not be read as generalising it. A
-//! third chord would have to make its own case from scratch, against this
-//! module's own bar, and the presumption is still against one.
+//! general", and admitting neighbours must not be read as generalising it.
+//! Each of the three made its own case from scratch against this module's own
+//! bar — D-023 for the attention key, D-024 for the clipboard pair, D-025 for
+//! the lock — and the presumption is still against the next one.
 //!
-//! The two are kept structurally apart at every level, so that nothing about
-//! the neighbour can weaken this switch:
+//! **The lock chord is the one that had to be answered directly**, because
+//! unlike the other two it consumes *every* physical event while it is raised
+//! ([`crate::lock::gate`]). A gate that could swallow this switch's chord would
+//! leave a human who cannot revoke strictly worse off locked than unlocked. It
+//! cannot, and not because that module gets it right: its policy implements
+//! [`crate::input::ConsumingGate`], a trait with **no observation method**, and
+//! the tap is forwarded by [`crate::input::GateOnlyHook`] — code in a module
+//! with no notion that a lock exists. `the_dead_man_chord_arms_and_fires_through_a_locked_gate`
+//! holds the consequence against the real stack.
 //!
-//! - **Disjoint vocabularies.** [`Chord::VOCABULARY`] excludes every modifier
-//!   (below, and for its own reason); the attention vocabulary is *nothing
-//!   but* the two Super keys. They cannot collide even before the startup
-//!   equality check `main.rs` keeps as defence in depth.
+//! They are kept structurally apart at every level, so that nothing about a
+//! neighbour can weaken this switch:
+//!
+//! - **Disjoint vocabularies, and one check that is genuinely reachable.**
+//!   [`Chord::VOCABULARY`] excludes every modifier (below, and for its own
+//!   reason); the attention vocabulary is *nothing but* the two Super keys, so
+//!   those two cannot collide even before `main.rs`'s startup equality check.
+//!   The clipboard trigger and the lock chord's trigger **can**: both draw from
+//!   [`crate::chord::Trigger`]'s vocabulary, which overlaps this one on every
+//!   editing and function key. `main.rs` refuses at startup, and the reason is
+//!   this module's own: detection here is in the unconditional `observe` tap,
+//!   so a neighbour sharing this chord's key would arm the human's off-switch
+//!   every time they used it, and **no hook ordering can prevent that** —
+//!   nothing is allowed to blind that tap. (Concretely: the default lock chord
+//!   is `ctrl+alt+delete`, so `--dead-man-chord delete` is refused.)
 //! - **Different halves of the hook.** This switch detects in
 //!   [`DeadManSwitch::observe_event`], reached from
 //!   [`PreemptionHook::observe`] — unconditional, unstoppable, owning all its
-//!   own state. The attention key only ever gates, so it is suppressible by
-//!   this hook, by a consent prompt, and by anything else above it.
+//!   own state. The attention key, the clipboard chords and the lock all gate
+//!   only, so all three are suppressible by this hook, by a consent prompt, and
+//!   by anything above them. The lock is *outermost* and therefore suppresses
+//!   the other two — but it still cannot touch the tap this switch rides.
 //! - **Stacking order.** [`DeadManHook`] is stacked *outside*
-//!   `AttentionHook`, so a chord press wins: an attention press in the same
-//!   dispatch round changes nothing this switch does, which is asserted rather
-//!   than argued (`an_attention_press_in_the_same_round_changes_nothing_here`).
+//!   `ClipboardHook` and `AttentionHook`, so a chord press wins: an attention
+//!   press in the same dispatch round changes nothing this switch does, which is
+//!   asserted rather than argued
+//!   (`an_attention_press_in_the_same_round_changes_nothing_here`). It is stacked
+//!   *inside* [`crate::lock::LockGate`], which costs this switch nothing:
+//!   `gate`'s only job here is keeping the chord key from reaching the confined
+//!   app, and while the session is locked nothing reaches the confined app at
+//!   all.
 //! - **Draw order.** [`composite_hold_indicator`] stays the last thing
 //!   composited, so the attention marker — drawn beside the trusted band,
 //!   further down the frame — can never hide a hold in progress.
@@ -1191,7 +1220,7 @@ impl<H: PreemptionHook> PreemptionHook for DeadManHook<H> {
 ///
 /// `progress` is clamped; `view` must be `width * height * 4` RGBA8888.
 pub(crate) fn composite_hold_indicator(view: &mut [u8], width: u32, height: u32, progress: f64) {
-    use crate::consent::canvas::{Canvas, Rect};
+    use crate::paint::canvas::{Canvas, Rect};
 
     /// Bar height in pixels: readable at a glance, small enough that it never
     /// occludes anything the human is working with.

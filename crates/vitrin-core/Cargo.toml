@@ -211,6 +211,86 @@ blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
 # same treatment: a caret requirement would let an unrelated `cargo update`
 # turn the consent golden red on a PR that never touched the renderer.
 fontdue = { version = "=0.9.3", default-features = false }
+# The lock screen's password KDF (WS-E.2.2, `crate::lock::passphrase`). This is
+# the first dependency in the TCB that processes **operator-supplied** input
+# rather than a compile-time constant, and that difference is why it gets its
+# own justification instead of riding fontdue's.
+#
+# # Crate count, measured rather than estimated
+#
+# **SIX**, not four, and the first count here was wrong in a way worth keeping
+# on the record: it said four (`argon2`, `base64ct`, `blake2`, `subtle`) and
+# separately claimed `password-hash` and an RNG crate had been kept out. Both
+# halves were false. Counted against `main`'s `Cargo.lock` (245 packages ->
+# 251), the new packages are:
+#
+#     argon2  base64ct  blake2  subtle  password-hash  rand_core@0.6.4
+#
+# and what brings the last two in is the `alloc` feature itself, which the old
+# comment described as adding "no crate at all":
+#
+#     vitrin-core -> argon2/alloc -> argon2/password-hash
+#                 -> password-hash -> rand_core@0.6.4
+#
+# (`cargo tree -p vitrin-core --edges normal,features -i argon2` shows it.)
+# In argon2 0.5 `alloc` is defined as `["password-hash/alloc"]`, so no
+# configuration of this dependency allocates its own memory block without also
+# pulling the PHC-string parser. Nothing in `lock::passphrase` uses that parser
+# -- it imports `Algorithm`, `Argon2`, `Params`, `Version` and `argon2::Error`,
+# and stores a raw digest rather than a PHC string -- so this is surface the
+# TCB carries without calling.
+#
+# **This exceeds issue #214's own budget** of "3-5 transitive dependencies
+# inside the most privileged component". Recorded rather than rounded down,
+# because #201 records that `deny.toml` and the `cargo-deny` job still do not
+# exist -- so this comment is the only place the budget is checked at all, and a
+# budget checked only by a comment that was measured wrong is not checked.
+#
+# The way out, if six is judged too many: drop `alloc` and call
+# `hash_password_into_with_memory` with a block this crate owns. That removes
+# `password-hash` and `rand_core` and costs a hand-managed KDF memory block
+# inside the TCB. A real trade rather than an oversight, and it belongs to
+# whoever lands #201's `deny.toml` with the whole graph in front of them.
+#
+# Default features are off but for `alloc`. `rand` (salt generation from an RNG
+# crate) and `std` really are excluded, and really do add surface for jobs this
+# core does itself. `password-hash` is NOT excluded, whatever the earlier
+# wording here implied: `alloc` enables it transitively, as traced above.
+# `alloc` is what lets Argon2 allocate its own memory
+# block, which is the whole mechanism of a memory-hard KDF; without it the
+# caller must hand over a pre-sized block, which would put the parameter
+# arithmetic this core is refusing to reimplement back in this file. The salt is drawn from
+# the same `getrandom` the trusted indicator uses (`crate::consent::indicator`),
+# and the file format is parsed by `crate::lock::passphrase`'s own strict
+# reader, on the `crate::toml_subset` precedent — the core already refuses to
+# take a general parser for a file only it writes.
+#
+# # Why Argon2id specifically, and why a KDF at all
+#
+# The file holds a hash of a passphrase that unlocks a session. Anyone who can
+# read it can attack it offline, at their own pace, on their own hardware, so
+# the only defence is making each guess expensive in *memory* as well as time —
+# which is the whole point of Argon2id and the reason a plain BLAKE3 of the
+# passphrase (zero new crates, already a dependency) was rejected. Argon2id is
+# the RFC 9106 recommendation and the OWASP default; the parameters are pinned
+# in `crate::lock::passphrase` and carried in the file so an operator can raise
+# them without a rebuild.
+#
+# NOT pinned exactly, unlike smithay and fontdue: no golden depends on it, and
+# for a security-relevant crate the ability to take a patch release without
+# editing this file is worth more than reproducibility of a byte nobody
+# compares. The KDF *identity* is pinned instead — in the file format's
+# `argon2id` token, which `crate::lock::passphrase` refuses to read as anything
+# else — so a dependency bump cannot silently change what a stored hash means.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# Constant-time comparison of the derived key against the stored one, so a
+# wrong-passphrase attempt leaks no information about how wrong it was. Already
+# in the graph (argon2 -> blake2 -> digest -> subtle), so naming it directly
+# adds **zero** crates; it is named directly rather than reached through a
+# dependency's re-export because a `==` on two byte slices is exactly the kind
+# of thing that gets reintroduced by a well-meaning simplification, and an
+# import at the top of the file is what makes it obvious that it must not be.
+subtle = { version = "2.6", default-features = false }
 
 [features]
 # Compile the real-GPU dmabuf tests (P1.3.5). Requires a machine with a DRM

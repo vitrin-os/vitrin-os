@@ -440,7 +440,14 @@ mod tests {
     /// that had been deleted.
     fn human_visible(view: &[u8], indicator: TrustedIndicator) -> Vec<u8> {
         let mut surface = ConsentSurface::new(indicator);
-        crate::backend::human_visible_from_view(view.to_vec(), &mut surface, W, H, false)
+        crate::backend::human_visible_from_view(
+            view.to_vec(),
+            &mut surface,
+            &mut no_lock(),
+            W,
+            H,
+            false,
+        )
     }
 
     /// **The attention marker actually reaches the human's output** (WS-E.1.7,
@@ -459,11 +466,23 @@ mod tests {
     fn the_attention_marker_reaches_the_human_output_and_leaves_the_band_alone() {
         let view = client_view([0x20, 0x20, 0x20]);
         let mut closed_surface = ConsentSurface::new(TrustedIndicator::for_test());
-        let closed =
-            crate::backend::human_visible_from_view(view.clone(), &mut closed_surface, W, H, false);
+        let closed = crate::backend::human_visible_from_view(
+            view.clone(),
+            &mut closed_surface,
+            &mut no_lock(),
+            W,
+            H,
+            false,
+        );
         let mut open_surface = ConsentSurface::new(TrustedIndicator::for_test());
-        let open =
-            crate::backend::human_visible_from_view(view.clone(), &mut open_surface, W, H, true);
+        let open = crate::backend::human_visible_from_view(
+            view.clone(),
+            &mut open_surface,
+            &mut no_lock(),
+            W,
+            H,
+            true,
+        );
 
         assert_ne!(
             closed, open,
@@ -523,6 +542,13 @@ mod tests {
     const CARD_W: u32 = 640;
     const CARD_H: u32 = 480;
 
+    /// A lock surface with nothing raised. The witness's whole subject is the
+    /// trusted band, and a raised lock would cover the rows below it — a
+    /// different property, tested in `crate::lock`.
+    fn no_lock() -> crate::lock::LockSurface {
+        crate::lock::LockSurface::new(TrustedIndicator::for_test())
+    }
+
     fn flat(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
         [rgb[0], rgb[1], rgb[2], 0xff].repeat(width as usize * height as usize)
     }
@@ -536,6 +562,7 @@ mod tests {
         crate::backend::human_visible_from_view(
             flat(CARD_W, CARD_H, [0x00, 0x00, 0x00]),
             &mut surface,
+            &mut no_lock(),
             CARD_W,
             CARD_H,
             false,
@@ -565,6 +592,7 @@ mod tests {
             let output = crate::backend::human_visible_from_view(
                 view.clone(),
                 &mut surface,
+                &mut no_lock(),
                 CARD_W,
                 CARD_H,
                 false,

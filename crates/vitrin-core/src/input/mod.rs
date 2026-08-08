@@ -158,13 +158,17 @@
 //!    [`Gate::Consume`] and the pairing contract on [`PreemptionHook`]).
 //!
 //! Both sides are now taken, and the nested backend's router is
-//! `InputRouter<ConsentGate<DeadManHook<AttentionHook<NoopHook>>>>` — the
-//! stacking this hook point was designed for, reached without restructuring
-//! anything. The order is the decision, not the arrangement: a consent prompt
-//! consumes an event before the dead-man's *gate* half sees it, and both are
-//! outside the attention key, so the human's off-switch and the human's
-//! security question each short-circuit a mechanism whose worst failure is a
-//! focus change that does not happen.
+//! [`crate::backend::winit::NestedHook`] —
+//! `InputRouter<LockGate<ConsentGate<DeadManHook<ClipboardHook<AttentionHook<NoopHook>>>>>>`,
+//! the stacking this hook point was designed for, reached without restructuring
+//! anything. That alias is the **one** place the order is written down, because
+//! the order is the decision and a decision written twice drifts. A consent
+//! prompt consumes an event before the dead-man's *gate* half sees it, both are
+//! outside the clipboard and attention keys, and a raised lock is outside all
+//! four — so the human's off-switch and the human's security question each
+//! short-circuit a mechanism whose worst failure is a convenience that does not
+//! happen, and none of them can be answered by somebody who is not at the
+//! keyboard.
 //!
 //! [`crate::consent::grab::ConsentGate`] (P1.7.2) is the gate. Its policy
 //! lives entirely in that module; what matters here is that it honours the
@@ -184,6 +188,14 @@
 //! release's press too, so the pair is atomic and the app's accounting is never
 //! split. The router's per-keysym pairing is what
 //! proves it: the reconciliation finds no delivered press and does nothing.
+//!
+//! [`crate::lock::LockGate`] (WS-E.2.2, issue #214) is **outermost**, and it is
+//! the one gate in this stack that consumes *all* physical input rather than
+//! one key's worth. It is expressed through [`ConsumingGate`] rather than
+//! [`PreemptionHook`] precisely so it cannot reach [`observe`] — see that
+//! trait for the whole argument, which is that the human's off-switch detects
+//! in a tap nothing may be allowed to blind, and the sharpest possible way for
+//! a lock to be wrong is to blind it.
 //!
 //! [`crate::attention::AttentionHook`] (WS-E.1.7, issue #232) is innermost, and
 //! it implements `gate` **only**. It consumes the human's attention chord —
@@ -632,6 +644,105 @@ pub(crate) trait PreemptionHook {
     fn clipboard(
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>>;
+}
+
+/// A policy that may **only** consume, and is never handed the observe tap
+/// (WS-E.2.2, issue #214).
+///
+/// # What this exists to make unconstructible
+///
+/// Every hook in this stack must forward [`PreemptionHook::observe`]
+/// unconditionally, because the human's off-switch detects there
+/// ([`crate::deadman`]). Every hook that gets it wrong disables the off-switch
+/// silently, with every other test still green — and the failure is one
+/// keystroke to write: `if self.locked { return; }` at the top of an `observe`
+/// body. [`crate::lock::LockGate`] is the sharpest case in the tree, because it
+/// is the one gate that consumes **all** physical input: a lock that could
+/// swallow the dead-man chord would leave a human who cannot revoke *worse off*
+/// locked than unlocked, which inverts the whole safety argument for having a
+/// lock.
+///
+/// So the lock's policy does not implement [`PreemptionHook`] at all. It
+/// implements this — a trait with **no observation method** — and
+/// [`GateOnlyHook`] supplies the hook impl, forwarding `observe`, `attention`
+/// and `clipboard` verbatim. The tap is therefore implemented *in this module*,
+/// which has no `use crate::lock` and no notion of a lock existing; an edit
+/// inside `crate::lock` cannot make observation conditional because the code
+/// that observes is not reachable from there and the trait it calls through
+/// cannot express an observation.
+///
+/// This is the [#210](https://github.com/vitrin-os/vitrin-os/issues/210) /
+/// [#232](https://github.com/vitrin-os/vitrin-os/issues/232) shape — make the
+/// function private, make the method non-defaulted — applied one level up: make
+/// the *capability to get it wrong* absent from the type.
+///
+/// It is deliberately **not** retrofitted onto the existing hooks.
+/// [`crate::deadman::DeadManHook`] and [`crate::chord`]'s consumers genuinely
+/// need `observe` (the dead-man detects there; the chord matcher tracks
+/// modifiers there so a release a prompt swallowed still clears its bit), and a
+/// blanket rewrite would take that away from the two policies that must have
+/// it. What this says is narrower and true: **a policy that needs no
+/// observation must not be able to touch one.**
+pub(crate) trait ConsumingGate {
+    /// Judge one intake event. [`Gate::Consume`] stops it before mapping and
+    /// before the wire; [`Gate::Deliver`] passes it to the inner hook.
+    ///
+    /// Bound by the same pairing contract [`PreemptionHook`] states, with the
+    /// same razor: consuming a release whose press the *router* delivered
+    /// strands that press in the confined app.
+    fn judge(&mut self, input: &SeatInput) -> Gate;
+}
+
+/// A [`PreemptionHook`] built from a [`ConsumingGate`]: gates through `G`,
+/// forwards everything else to `H` **unconditionally and unconditionally-ably**
+/// (see [`ConsumingGate`] for what that buys).
+///
+/// Precedence matches the rest of the stack: when `G` consumes, the inner hook's
+/// gate is not consulted. The observe tap is passed through in every case,
+/// which is what keeps the dead-man watcher alive while this gate swallows the
+/// event stream whole.
+pub(crate) struct GateOnlyHook<G: ConsumingGate, H: PreemptionHook> {
+    gate: G,
+    inner: H,
+}
+
+impl<G: ConsumingGate, H: PreemptionHook> GateOnlyHook<G, H> {
+    pub fn new(gate: G, inner: H) -> Self {
+        Self { gate, inner }
+    }
+}
+
+impl<G: ConsumingGate, H: PreemptionHook> PreemptionHook for GateOnlyHook<G, H> {
+    /// **Unconditional, and unconditional by construction.** `G` has no
+    /// observation method, so no policy stacked here can be told about this
+    /// event at all, let alone stop it reaching the hooks below. The dead-man
+    /// switch's detection therefore survives any gate expressed this way.
+    fn observe(&mut self, input: &SeatInput) {
+        self.inner.observe(input);
+    }
+
+    fn gate(&mut self, input: &SeatInput) -> Gate {
+        match self.gate.judge(input) {
+            Gate::Consume => Gate::Consume,
+            Gate::Deliver => self.inner.gate(input),
+        }
+    }
+
+    /// Forwarded, never answered here — a gate-only policy owns no wiring
+    /// signal. Spelled rather than defaulted for the reason
+    /// [`PreemptionHook::attention`] gives at length.
+    fn attention(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>> {
+        self.inner.attention()
+    }
+
+    /// Forwarded, for the reason above.
+    fn clipboard(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
+        self.inner.clipboard()
+    }
 }
 
 /// The terminal hook: observes nothing, consumes nothing.
@@ -2136,6 +2247,21 @@ pub(crate) mod tests {
     // model "the human pressed a key" borrows it from here rather than
     // gaining the ability to forge an origin tag.
     // ------------------------------------------------------------------
+
+    /// **The general form**: one physical-origin event of any kind, for a
+    /// module whose fixtures are not a fixed pair of chord keys
+    /// ([`crate::lock`] types a whole alphabet at its gate, and
+    /// [`crate::chord`]'s consumers hold arbitrary modifier sets).
+    ///
+    /// Same warrant as the chord fixtures below and the same reason it lives
+    /// here: [`SeatInput::physical`] is private to this module, so this is the
+    /// only place in the crate that can mint a physical origin tag at all. A
+    /// module borrows one from here rather than gaining the ability to forge
+    /// one, and the production path stays what it was — the nested backend's
+    /// intake, and nothing else.
+    pub(crate) fn physical_for_test(kind: SeatInputKind) -> SeatInput {
+        SeatInput::physical(kind)
+    }
 
     /// XK_Escape — the default dead-man chord.
     pub(crate) const CHORD_KEYSYM: u32 = 0xff1b;

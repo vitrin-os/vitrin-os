@@ -26,7 +26,7 @@
 //!   tests, and each of those five carries its justification against R7 in
 //!   `Cargo.toml`. Note what is *not* there: no GUI toolkit and no vector
 //!   rasterizer — the consent surface composites its own shapes with integer
-//!   byte assembly (`consent::canvas`), exactly as `scene` does. The headless
+//!   byte assembly (`paint::canvas`), exactly as `scene` does. The headless
 //!   capture golden asserts against the deterministic test pattern
 //!   in-process, so it needs no image codec; PNG serialization is the SDK's
 //!   job (P1.8.2), never the core. There is deliberately no serialization
@@ -186,6 +186,28 @@ mod input;
 /// back.
 #[cfg_attr(not(test), allow(dead_code))]
 mod lifecycle;
+/// The lock screen (WS-E.2.2, issue #214): the core-drawn surface that takes
+/// the session's physical input away from every realm until a human proves
+/// they are there. A lock screen makes an authority claim — "nothing behind me
+/// can see your input" — and only the component that owns input routing can
+/// make that claim true, which is why this is core code and not a client
+/// (PRD §5.1 exiles window-management *policy*, never the trusted path).
+/// `lock::gate` is the outermost preemption hook and consumes ALL physical
+/// input while raised; `lock::LockSurface` composites at the same output-stage
+/// fork the consent card does, so it can no more reach a capture. Read
+/// `docs/book/src/limits.md` before believing this is a security boundary: it
+/// does not suspend an agent's grants, and in nested mode it locks a window
+/// rather than a session.
+#[cfg_attr(not(test), allow(dead_code))]
+mod lock;
+/// The rasterizer every core-drawn trusted surface shares (WS-E.2.2): the
+/// borrowed RGBA canvas, the embedded-font glyph engine, and the one placement
+/// function a core-drawn card is centered by. Moved out of `consent` when the
+/// lock screen arrived, because `deadman`, `cursor` and `attention` were
+/// already importing `consent::canvas` — a path that said the off-switch draws
+/// with the consent surface's private tools. It confers nothing and holds no
+/// session state; the authority claims stay in `consent` and `lock`.
+mod paint;
 /// The grant table v0 (P1.4.2): the in-memory PRD Doc 2 §5.2 grant store of
 /// the capability kernel — rows keyed by `identity`'s verifier-canonical
 /// principal, answering the enforcement chokepoint's grant-scoped use query
@@ -431,6 +453,55 @@ USAGE:
                                 fixed and deliberately not configurable: it
                                 is a security parameter, not an ergonomics
                                 one.
+    vitrind [--lock-chord CHORD]
+                                `--nested` ONLY: the chord that raises the lock
+                                screen (WS-E.2.2). MOD[+MOD...]+KEY; modifiers
+                                ctrl, shift, alt, super; the key must be
+                                layout-invariant and non-modifier (the core
+                                holds no keymap, so letters and digits are not
+                                in the vocabulary). Default:
+                                ctrl+alt+delete. The chord is CONSUMED -- no
+                                confined app sees it. Startup FAILS if its key
+                                is also --dead-man-chord's, --attention-chord's
+                                or --clipboard-key's.
+    vitrind [--lock-idle SECS]  `--nested` ONLY: raise the lock screen after
+                                SECS with no PHYSICAL input. An agent's
+                                actuations never postpone it -- a session an
+                                agent is working in is still a session the human
+                                left. Off by default; 0 is REFUSED rather than
+                                read as off (it would relock every round).
+    vitrind [--lock-passphrase-file PATH]
+                                `--nested` ONLY: unlock requires the passphrase
+                                whose Argon2id digest PATH holds. Absolute path,
+                                regular file, owned by this uid, mode 600 --
+                                stricter than realm.toml's rule, because whoever
+                                can READ it gets an offline attack. REJECTED
+                                with --headless, naming the reason: no keymap
+                                lives in the core, so a backend with no host
+                                compositor delivers no letters and the
+                                passphrase could never be typed. WITHOUT this flag the lock is an
+                                unauthenticated privacy screen dismissed by
+                                Enter, and the card says so.
+
+                                *** A LOCKED SCREEN DOES NOT SUSPEND AGENTS. ***
+                                An agent holding `observe` keeps capturing the
+                                realm across a lock, and one holding `actuate_*`
+                                keeps acting: observation is concurrent by
+                                design (protocol/vitrin-v0.xml, vitrin_view) and
+                                a lock takes away the HUMAN's input, not an
+                                agent's authority. The instrument for `stop
+                                everything` is still the dead-man chord, which
+                                revokes every grant and fires while locked. See
+                                docs/book/src/limits.md.
+    vitrind --lock-hash         Read a passphrase from STDIN (one line, trailing
+                                newline stripped) and print the single line a
+                                --lock-passphrase-file holds, then exit. The
+                                passphrase never appears in argv, which is
+                                world-readable through /proc. Use:
+                                  read -rs PASS
+                                  printf %s $PASS | vitrind --lock-hash \\
+                                    > ~/.config/vitrin/lock.hash
+                                  chmod 600 ~/.config/vitrin/lock.hash
     vitrind --agent-cursor      `--headless` ONLY: also composite the agent
                                 cursor sprite into this run's human-visible
                                 output. Nested mode needs no flag -- a human
@@ -505,6 +576,23 @@ enum Action {
         /// parse time exactly as the two chords above are, including the
         /// cross-flag refusal against both of them.
         clipboard: chord::Trigger,
+        /// The lock screen's policy (WS-E.2.2): chord, idle timeout, and the
+        /// optional passphrase file's PATH.
+        ///
+        /// **Nested only, and there is no field for it on
+        /// [`Action::RunHeadless`]** -- the three flags are refused with
+        /// `--headless` at parse time, each for its own named reason
+        /// ([`crate::lock::PASSPHRASE_NEEDS_A_KEYMAP`] and
+        /// [`LOCK_NEEDS_PHYSICAL_INPUT`]), rather than accepted as a silent
+        /// no-op. That is the `--agent-cursor` and `--size` posture, taken here
+        /// for a sharper reason: a headless idle raise really would fire, on a
+        /// backend with no device that could dismiss it.
+        ///
+        /// The passphrase is a path rather than a loaded digest because this
+        /// enum is `PartialEq` and printed in parse tests; the file is read at
+        /// the top of `backend::winit::run_inner`, before the listener accepts
+        /// anyone, so a bad one is still a startup failure.
+        lock: lock::LockConfig,
     },
     RunHeadless {
         size: (u32, u32),
@@ -588,6 +676,22 @@ enum Action {
     },
     Help,
     Version,
+    /// Read a passphrase from stdin and print one `--lock-passphrase-file`
+    /// line, then exit (WS-E.2.2, issue #214).
+    ///
+    /// Print-and-exit like [`Action::Help`], and mode-independent for the same
+    /// reason [`Action::PrintIsolation`] is: it answers a question about a file
+    /// format, not about a session, so it must answer identically whether or
+    /// not this machine can host one.
+    ///
+    /// It exists because a file format nobody can produce is a feature nobody
+    /// can use — an operator would hand-assemble the line, get the parameter
+    /// encoding subtly wrong, and discover it at the moment they are locked
+    /// out. The generator and the parser being one module is what makes that
+    /// checkable (`crate::lock::passphrase`).
+    ///
+    /// **Stdin, never argv.** `/proc/<pid>/cmdline` is world-readable.
+    LockHash,
     /// Probe this kernel's confinement facilities and exit (P2.6.1, #185).
     ///
     /// Print-and-exit like [`Action::Help`] and [`Action::Version`], and
@@ -635,6 +739,9 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut hold_ms: Option<u64> = None;
     let mut attention_chord: Option<attention::AttentionChord> = None;
     let mut clipboard_key: Option<chord::Trigger> = None;
+    let mut lock_chord: Option<chord::ModChord> = None;
+    let mut lock_idle: Option<Duration> = None;
+    let mut lock_passphrase: Option<PathBuf> = None;
     let mut agent_cursor = false;
     #[cfg(feature = "consent-injector")]
     let mut consent_injector_fd: Option<std::os::fd::RawFd> = None;
@@ -715,6 +822,30 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     .ok_or("`--attention-chord` requires a key (e.g. `--attention-chord super`)")?;
                 set_attention_chord(&mut attention_chord, value)?;
             }
+            "--lock-chord" => {
+                let value = args.next().ok_or(
+                    "`--lock-chord` requires a chord (e.g. `--lock-chord ctrl+alt+delete`)",
+                )?;
+                set_lock_chord(&mut lock_chord, value)?;
+            }
+            "--lock-idle" => {
+                let value = args.next().ok_or(
+                    "`--lock-idle` requires a whole number of seconds (e.g. `--lock-idle 300`)",
+                )?;
+                set_lock_idle(&mut lock_idle, value)?;
+            }
+            "--lock-passphrase-file" => {
+                let value = args.next().ok_or(
+                    "`--lock-passphrase-file` requires a path (e.g. \
+                     `--lock-passphrase-file ~/.config/vitrin/lock.hash`)",
+                )?;
+                set_path(
+                    &mut lock_passphrase,
+                    "--lock-passphrase-file",
+                    "passphrase file path",
+                    value,
+                )?;
+            }
             // Idempotent rather than "given more than once" -- a boolean
             // switch repeated says the same thing twice, unlike a valued flag
             // where the second value would have to win or lose silently.
@@ -742,6 +873,11 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             // probe of what this kernel offers must not be answerable only on
             // a command line that would otherwise have run.
             "--print-isolation" => return Ok(Action::PrintIsolation),
+            // Returns immediately, on the `--print-isolation` precedent above:
+            // it answers a question about a file format rather than about a
+            // session, so it must not depend on a command line that would
+            // otherwise have run.
+            "--lock-hash" => return Ok(Action::LockHash),
             other => {
                 #[cfg(feature = "consent-injector")]
                 if let Some(value) = other.strip_prefix("--consent-injector-fd=") {
@@ -773,6 +909,17 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_attention_chord(&mut attention_chord, value)?;
                 } else if let Some(value) = other.strip_prefix("--clipboard-key=") {
                     set_clipboard_key(&mut clipboard_key, value)?;
+                } else if let Some(value) = other.strip_prefix("--lock-chord=") {
+                    set_lock_chord(&mut lock_chord, value)?;
+                } else if let Some(value) = other.strip_prefix("--lock-idle=") {
+                    set_lock_idle(&mut lock_idle, value)?;
+                } else if let Some(value) = other.strip_prefix("--lock-passphrase-file=") {
+                    set_path(
+                        &mut lock_passphrase,
+                        "--lock-passphrase-file",
+                        "passphrase file path",
+                        value,
+                    )?;
                 } else {
                     return Err(format!("unknown argument `{other}`"));
                 }
@@ -856,6 +1003,97 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         }
     }
 
+    // Recorded before defaulting, because the headless refusal below asks what
+    // the OPERATOR passed and the default would answer for them.
+    let lock_chord_given = lock_chord.is_some();
+    let lock_chord = match lock_chord {
+        Some(chord) => chord,
+        None => chord::ModChord::parse(lock::DEFAULT_LOCK_CHORD)
+            .expect("the default lock chord is in the vocabulary"),
+    };
+    // **The lock chord may not share its trigger with any other core-owned
+    // chord**, and this is the fourth chord in the stack, so the check is
+    // written once over a list rather than three times over pairs.
+    //
+    // Reachable, unlike the dead-man/attention pair: `chord::Trigger`'s
+    // vocabulary and `deadman::Chord`'s overlap on every editing and function
+    // key, so `--dead-man-chord delete` on an otherwise default command line is
+    // a collision an operator can type today. The consequence is the one
+    // WS-E.2.1's own check names: the dead-man watcher detects in the router's
+    // UNCONDITIONAL observe tap, so a chord sharing its key would arm the
+    // human's off-switch every time they locked their screen, and no hook
+    // ordering can prevent it because nothing may blind that tap.
+    //
+    // The clipboard comparison is trigger-to-trigger and therefore *stricter*
+    // than it strictly needs to be: `ctrl+alt+delete` and `ctrl+shift+delete`
+    // are different gestures `ChordMatcher` would tell apart perfectly well.
+    // It is deliberate anyway — an operator reading `--lock-chord` and
+    // `--clipboard-key` should not have to reason about modifier-set equality
+    // to know whether their two keys collide, and the cost of the stricter rule
+    // is one more spelling they cannot use.
+    //
+    // **Skipped entirely under `--headless`**, where the lock cannot exist: the
+    // chord above was DEFAULTED, not asked for, so comparing it would make
+    // `--headless --dead-man-chord delete` exit non-zero citing a
+    // `--lock-chord` the operator never passed, for a lock that backend cannot
+    // raise. The headless block below refuses the flags that *were* passed,
+    // which is the honest half of this.
+    for (keysym, flag, name) in if matches!(mode, Some(Mode::Headless)) {
+        Vec::new()
+    } else {
+        vec![
+            (
+                dead_man.chord.keysym(),
+                "--dead-man-chord",
+                dead_man.chord.name(),
+            ),
+            (attention.keysym(), "--attention-chord", attention.name()),
+            (clipboard.keysym(), "--clipboard-key", clipboard.name()),
+        ]
+    } {
+        if lock_chord.trigger_keysym() == keysym {
+            return Err(format!(
+                "`--lock-chord` `{}` uses the same key as `{flag}` `{name}`: the core's \
+                 physical chords must not share a key. The dead-man watcher detects in the \
+                 router's UNCONDITIONAL observe tap, so a chord sharing its key would arm the \
+                 human's off-switch every time they used it -- and no hook ordering can \
+                 prevent that, because nothing is allowed to blind that tap",
+                lock_chord.spelling()
+            ));
+        }
+    }
+
+    // **The lock is nested-only, and both halves of that are refused
+    // separately because they have different reasons** (WS-E.2.2, issue #214).
+    //
+    // The passphrase first, so its message wins when both flags are given: it
+    // names the *keymap*, which is the fact a reader most needs (the core holds
+    // no keymap, so a keyless backend's alphabet has no letters in it -- see
+    // `crate::lock`). The other two flags are refused for a different and
+    // blunter reason: a headless session has no physical input device at all,
+    // so a lock it raised could never be dismissed. Both are startup errors
+    // with a non-zero exit, on `HEADLESS_INTERACTIVE_REFUSAL`'s precedent,
+    // because a session that comes up unanswerably locked -- or holding a
+    // passphrase nobody can type -- is the fail-open configuration trap
+    // `realm.rs` and `deadman.rs` both refuse.
+    //
+    // **All three `--lock-*` flags, not two.** `--lock-chord` was parsed and
+    // silently discarded under `--headless` while nine surfaces -- this help
+    // text, the refusal constants' own wording, four doc comments,
+    // `tests/integration/README.md` and `shim/docs/nested-lock-screen.md` --
+    // all said every `--lock-*` flag is refused there. Silently accepting a
+    // flag that cannot do anything is the same class of trap as the two below,
+    // just quieter. Ordering is deliberate: the passphrase message wins when
+    // several are given, because the keymap is the sharper reason.
+    if matches!(mode, Some(Mode::Headless)) {
+        if lock_passphrase.is_some() {
+            return Err(lock::PASSPHRASE_NEEDS_A_KEYMAP.into());
+        }
+        if lock_idle.is_some() || lock_chord_given {
+            return Err(LOCK_NEEDS_PHYSICAL_INPUT.into());
+        }
+    }
+
     // The injector channel's two companion refusals (issue #138), taken at
     // PARSE time rather than at first use, which is this parser's rule
     // everywhere else too:
@@ -933,6 +1171,11 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             dead_man,
             attention,
             clipboard,
+            lock: lock::LockConfig {
+                chord: lock_chord,
+                idle: lock_idle,
+                passphrase: lock_passphrase,
+            },
         }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
         // A headless core has no display to draw the consent prompt on and no
@@ -997,6 +1240,20 @@ const HEADLESS_INTERACTIVE_REFUSAL: &str =
      the consent prompt and no physical input device to answer it, so every petition would pend \
      until it timed out. Use `--consent=auto-approve` for a headless run, or `--nested` to \
      answer prompts on screen.";
+
+/// The `--lock-idle` / `--lock-chord` refusal under `--headless` (WS-E.2.2).
+///
+/// A different reason from [`crate::lock::PASSPHRASE_NEEDS_A_KEYMAP`] and
+/// therefore a different message: that one is about the *alphabet*, this one is
+/// about there being no input device at all. The idle raise is the dangerous
+/// half — it fires on a timer with no input needed, so a headless session with
+/// `--lock-idle` really would lock itself and then have nothing that could
+/// dismiss it.
+const LOCK_NEEDS_PHYSICAL_INPUT: &str =
+    "the `--lock-*` flags require `--nested`: a headless session has no physical input device \
+     at all (`SeatInput::physical` is private to the input module and this backend calls no \
+     intake), so a lock it raised could never be answered and the session would wedge with \
+     every key going nowhere. Run `--nested`, where a human is at the keyboard.";
 
 /// Record `--consent-injector-fd N` (issue #138), rejecting a repeat flag, a
 /// non-numeric value, and any descriptor number this process's own stdio
@@ -1088,6 +1345,56 @@ fn set_clipboard_key(slot: &mut Option<chord::Trigger>, value: &str) -> Result<(
         )
     })?;
     *slot = Some(trigger);
+    Ok(())
+}
+
+/// Record the `--lock-chord` gesture (WS-E.2.2), rejecting a repeat flag, a
+/// malformed spelling, and any key this build's input intake could not deliver.
+///
+/// The `--clipboard-key` precedent, one step up the vocabulary: this flag takes
+/// a whole modifier chord rather than a bare key, so the error names the
+/// *shape* as well as the accepted trigger list. The collision check against the
+/// other three core-owned chords lives in `parse_args`, where every half is
+/// resolved.
+fn set_lock_chord(slot: &mut Option<chord::ModChord>, value: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--lock-chord` given more than once".into());
+    }
+    let parsed = chord::ModChord::parse(value).map_err(|err| {
+        let accepted: Vec<&str> = chord::Trigger::vocabulary().collect();
+        format!(
+            "`--lock-chord` `{value}`: {err} (expected MOD[+MOD...]+KEY, e.g. \
+             `ctrl+alt+delete`; modifiers: ctrl, shift, alt, super; keys: {})",
+            accepted.join(", ")
+        )
+    })?;
+    *slot = Some(parsed);
+    Ok(())
+}
+
+/// Record the `--lock-idle` timeout in whole seconds (WS-E.2.2), rejecting a
+/// repeat flag and a zero.
+///
+/// **Zero is refused rather than read as "off"**, and that is the fail-closed
+/// reading rather than pedantry: `--lock-idle 0` would lock the session on the
+/// first dispatch round and every round after an unlock, which is a wedge
+/// dressed as a configuration. Omitting the flag is how an operator says "no
+/// idle lock", and there is exactly one spelling of it.
+fn set_lock_idle(slot: &mut Option<Duration>, value: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--lock-idle` given more than once".into());
+    }
+    let secs: u64 = value
+        .parse()
+        .map_err(|_| format!("`--lock-idle` `{value}` is not a whole number of seconds"))?;
+    if secs == 0 {
+        return Err(
+            "`--lock-idle 0` would raise the lock on the first dispatch round and again after \
+             every unlock. Omit the flag to run with no idle lock."
+                .into(),
+        );
+    }
+    *slot = Some(Duration::from_secs(secs));
     Ok(())
 }
 
@@ -1211,6 +1518,22 @@ fn main() -> ExitCode {
             println!("vitrind {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Action::LockHash => {
+            // Upstream of `init_tracing`, exactly as `Help` and
+            // `--print-isolation` are: the one line this prints is redirected
+            // straight into a file, and a log line interleaved into stdout
+            // would produce a passphrase file that does not parse.
+            match lock_hash_from_stdin() {
+                Ok(line) => {
+                    println!("{line}");
+                    ExitCode::SUCCESS
+                }
+                Err(msg) => {
+                    eprintln!("vitrind: {msg}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Action::PrintIsolation => {
             // Deliberately upstream of `init_tracing`, exactly as `Help` and
             // `Version` are: this output is byte-compared against a checked-in
@@ -1229,6 +1552,7 @@ fn main() -> ExitCode {
             dead_man,
             attention,
             clipboard,
+            lock,
         } => {
             init_tracing();
             run_session(
@@ -1241,7 +1565,7 @@ fn main() -> ExitCode {
                 // `--consent-injector-fd` is refused with `--nested` at parse
                 // time (issue #138), so a nested run is never instrumented.
                 false,
-                move |seed| backend::winit::run(dead_man, attention, clipboard, seed),
+                move |seed| backend::winit::run(dead_man, attention, clipboard, lock, seed),
             )
         }
         Action::RunHeadless {
@@ -1297,6 +1621,74 @@ fn main() -> ExitCode {
             )
         }
     }
+}
+
+/// Read one passphrase from stdin and derive its `--lock-passphrase-file` line
+/// (WS-E.2.2, issue #214).
+///
+/// One line, with a single trailing newline stripped (so `printf` and `echo`
+/// both work) and **nothing else trimmed** — a passphrase may legitimately
+/// begin or end with a space, and a generator that silently trimmed one would
+/// produce a file the lock screen can never be unlocked against.
+///
+/// An empty passphrase is refused: it would hash fine and unlock on a bare
+/// Enter, which is the privacy-screen behaviour an operator gets by **omitting**
+/// `--lock-passphrase-file`. Two ways to spell the same thing, one of which
+/// looks like authentication, is exactly the confusion this refusal removes.
+///
+/// The bytes are wiped before returning. Best-effort, for the reason
+/// [`lock::passphrase::wipe`] states.
+fn lock_hash_from_stdin() -> Result<String, String> {
+    use std::io::Read;
+
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("could not read the passphrase from stdin: {e}"))?;
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    if buf.is_empty() {
+        lock::passphrase::wipe(&mut buf);
+        return Err(
+            "the passphrase read from stdin is empty. Omit `--lock-passphrase-file` to run an \
+             unauthenticated privacy screen; do not configure one that unlocks on a bare Enter."
+                .into(),
+        );
+    }
+    // **Refuse anything the lock screen could never accept back.** Hashing it
+    // happily would produce a valid-looking file that locks a session with no
+    // way into it -- the fail-open configuration trap `realm.rs` and
+    // `deadman.rs` both refuse, arrived at from the other end. Two ways it
+    // happens, both silent until the human is already locked out:
+    //
+    //  * longer than `MAX_ATTEMPT_BYTES`, which is the cap the unlock buffer
+    //    stops accepting keystrokes at, so the typed attempt is truncated and
+    //    can never hash to this;
+    //  * a control character (an embedded tab or newline from a pasted or
+    //    heredoc'd passphrase), which the unlock path has no key sequence for
+    //    at all -- `invariant_keysym` cannot deliver one.
+    if buf.len() > lock::passphrase::MAX_ATTEMPT_BYTES {
+        let len = buf.len();
+        lock::passphrase::wipe(&mut buf);
+        return Err(format!(
+            "the passphrase is {len} bytes and the unlock buffer stops at {}. It would hash \
+             fine here and could never be typed back, locking the session with no way in.",
+            lock::passphrase::MAX_ATTEMPT_BYTES
+        ));
+    }
+    if let Some(bad) = buf.iter().find(|b| b.is_ascii_control()) {
+        let bad = *bad;
+        lock::passphrase::wipe(&mut buf);
+        return Err(format!(
+            "the passphrase contains a control byte (0x{bad:02x}) the unlock screen has no way \
+             to type: the core holds no keymap and `invariant_keysym` cannot deliver it. \
+             Accepting it here would lock the session with no way in."
+        ));
+    }
+    let line = lock::passphrase::hash_line(&buf).map_err(|e| format!("could not hash it: {e}"));
+    lock::passphrase::wipe(&mut buf);
+    line
 }
 
 /// Block, **process-wide and before any thread exists**, every signal this
@@ -2206,7 +2598,8 @@ mod tests {
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
-                clipboard: default_clipboard()
+                clipboard: default_clipboard(),
+                lock: default_lock()
             })
         );
     }
@@ -2325,7 +2718,8 @@ mod tests {
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
-                clipboard: default_clipboard()
+                clipboard: default_clipboard(),
+                lock: default_lock()
             })
         );
     }
@@ -2667,7 +3061,8 @@ mod tests {
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
-                clipboard: default_clipboard()
+                clipboard: default_clipboard(),
+                lock: default_lock()
             })
         );
     }
@@ -2728,7 +3123,8 @@ mod tests {
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
-                clipboard: default_clipboard()
+                clipboard: default_clipboard(),
+                lock: default_lock()
             })
         );
     }
@@ -2799,7 +3195,8 @@ mod tests {
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
-                clipboard: default_clipboard()
+                clipboard: default_clipboard(),
+                lock: default_lock()
             })
         );
     }
@@ -2868,7 +3265,8 @@ mod tests {
                 capture_dump: Some(PathBuf::from("/tmp/x.rgba")),
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
-                clipboard: default_clipboard()
+                clipboard: default_clipboard(),
+                lock: default_lock()
             })
         );
     }
@@ -3529,6 +3927,16 @@ mod tests {
         chord::Trigger::parse(clipboard::DEFAULT_TRIGGER).expect("the default parses")
     }
 
+    /// The lock policy a command line with no `--lock-*` flag resolves to:
+    /// the default chord armed, no idle raise, no passphrase.
+    fn default_lock() -> lock::LockConfig {
+        lock::LockConfig {
+            chord: chord::ModChord::parse(lock::DEFAULT_LOCK_CHORD).expect("the default parses"),
+            idle: None,
+            passphrase: None,
+        }
+    }
+
     /// The dead-man configuration this run resolved, whichever mode it named.
     fn dead_man_of(action: &Action) -> DeadManConfig {
         match action {
@@ -3679,6 +4087,216 @@ mod tests {
         );
     }
 
+    /// The lock policy a run resolved, whichever mode it named.
+    fn lock_of(action: &Action) -> lock::LockConfig {
+        match action {
+            Action::RunNested { lock, .. } => lock.clone(),
+            other => panic!("not a nested run action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_lock_flags_parse_both_spellings_and_default_independently() {
+        // The default, pinned for the reason the dead-man's and the attention
+        // key's are: a session that came up with a different lock chord than
+        // the documented one is a surprise at the moment somebody is trying to
+        // lock their screen.
+        let defaults = lock_of(&parse_args(["--nested"]).expect("defaults parse"));
+        assert_eq!(defaults.chord.spelling(), "ctrl+alt+delete");
+        assert_eq!(defaults.idle, None, "no idle raise unless asked for");
+        assert_eq!(defaults.passphrase, None);
+
+        for args in [
+            vec!["--nested", "--lock-chord", "super+f12"],
+            vec!["--nested", "--lock-chord=super+f12"],
+        ] {
+            let cfg =
+                lock_of(&parse_args(args.clone()).unwrap_or_else(|e| panic!("{args:?}: {e}")));
+            assert_eq!(cfg.chord.spelling(), "super+f12");
+            // The other halves keep their defaults rather than being reset.
+            assert_eq!(cfg.idle, None);
+            assert_eq!(dead_man_of(&parse_args(args).unwrap()).chord.name(), "esc");
+        }
+        for args in [
+            vec!["--nested", "--lock-idle", "300"],
+            vec!["--nested", "--lock-idle=300"],
+        ] {
+            let cfg =
+                lock_of(&parse_args(args.clone()).unwrap_or_else(|e| panic!("{args:?}: {e}")));
+            assert_eq!(cfg.idle, Some(Duration::from_secs(300)));
+            assert_eq!(cfg.chord.spelling(), "ctrl+alt+delete");
+        }
+        for args in [
+            vec![
+                "--nested",
+                "--lock-passphrase-file",
+                "/etc/vitrin/lock.hash",
+            ],
+            vec!["--nested", "--lock-passphrase-file=/etc/vitrin/lock.hash"],
+        ] {
+            let cfg =
+                lock_of(&parse_args(args.clone()).unwrap_or_else(|e| panic!("{args:?}: {e}")));
+            assert_eq!(
+                cfg.passphrase,
+                Some(PathBuf::from("/etc/vitrin/lock.hash")),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// **Issue #214 acceptance criterion 6**: a passphrase on a backend that
+    /// cannot deliver the alphabet is refused AT STARTUP, with a message naming
+    /// the reason, and the process exits non-zero.
+    ///
+    /// `parse_args` returning `Err` *is* the non-zero exit: `main` prints it
+    /// and returns `ExitCode::from(2)`, which
+    /// `a_parse_error_is_a_non_zero_exit_and_not_a_run` pins separately.
+    ///
+    /// The reason has to be *named*, not merely refused, because an operator
+    /// who reads only "not supported" will reasonably try to work around it —
+    /// and the workaround (grow a keymap) is a decision WS-E Stage 3 owns.
+    #[test]
+    fn a_passphrase_is_refused_on_a_backend_that_cannot_deliver_the_alphabet() {
+        let err = parse_args([
+            "--headless",
+            "--consent=auto-approve",
+            "--lock-passphrase-file",
+            "/etc/vitrin/lock.hash",
+        ])
+        .expect_err("a headless session could never type a passphrase");
+        assert!(err.contains("keymap"), "the reason must be named: {err}");
+        assert!(err.contains("letters and digits"), "{err}");
+        assert!(err.contains("--nested"), "the way out must be named: {err}");
+
+        // ...and the same file is accepted under `--nested`, so the refusal is
+        // about the BACKEND and not about the flag being unimplemented.
+        assert!(parse_args([
+            "--nested",
+            "--lock-passphrase-file",
+            "/etc/vitrin/lock.hash"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn an_idle_lock_is_refused_headless_for_a_different_named_reason() {
+        // Not the same refusal as the passphrase's, and deliberately not the
+        // same message: this one is about there being no input device at all,
+        // so a headless `--lock-idle` would fire on a timer and then have
+        // nothing that could dismiss it.
+        let err = parse_args(["--headless", "--consent=auto-approve", "--lock-idle", "60"])
+            .expect_err("a headless session could never dismiss a lock");
+        assert!(err.contains("no physical input device"), "{err}");
+        assert!(err.contains("wedge"), "{err}");
+
+        // The passphrase's message wins when both are given: it names the
+        // sharper fact.
+        let both = parse_args([
+            "--headless",
+            "--consent=auto-approve",
+            "--lock-idle",
+            "60",
+            "--lock-passphrase-file",
+            "/etc/vitrin/lock.hash",
+        ])
+        .expect_err("both are refused");
+        assert!(both.contains("keymap"), "{both}");
+    }
+
+    #[test]
+    fn a_session_never_comes_up_with_a_lock_chord_that_cannot_fire() {
+        // (1) Not a chord at all: a bare key belongs to `deadman::Chord`, and
+        // this parser refuses to become a second spelling of one.
+        let err = parse_args(["--nested", "--lock-chord", "delete"])
+            .expect_err("a bare key is not a modifier chord");
+        assert!(err.contains("at least one modifier"), "{err}");
+        assert!(err.contains("MOD[+MOD...]+KEY"), "{err}");
+
+        // (2) A key outside the vocabulary. The message must list what is in
+        // it, so an operator is not left guessing which keys the core can even
+        // see without a keymap.
+        let err = parse_args(["--nested", "--lock-chord", "ctrl+alt+q"])
+            .expect_err("`q` is layout-dependent and not in the vocabulary");
+        assert!(err.contains("unknown chord key"), "{err}");
+        assert!(err.contains("delete") && err.contains("f12"), "{err}");
+
+        // (3) The collision refusal, and it is REACHABLE from a plausible
+        // command line: `insert` is in both `deadman::Chord`'s vocabulary and
+        // `chord::Trigger`'s, so this is a mistake an operator can make today.
+        let err = parse_args([
+            "--nested",
+            "--lock-chord",
+            "ctrl+alt+insert",
+            "--clipboard-key",
+            "insert",
+        ])
+        .expect_err("the lock chord and the clipboard chord share a key");
+        assert!(err.contains("--clipboard-key"), "{err}");
+        assert!(err.contains("observe tap"), "the WHY must be named: {err}");
+
+        // ...and against the dead-man chord, which is the one that matters
+        // most: a lock chord sharing the off-switch's key would arm the
+        // off-switch every time the human locked their screen.
+        let err = parse_args([
+            "--nested",
+            "--lock-chord",
+            "ctrl+alt+f12",
+            "--dead-man-chord",
+            "f12",
+        ])
+        .expect_err("the lock chord and the dead-man chord share a key");
+        assert!(err.contains("--dead-man-chord"), "{err}");
+
+        // The default chord collides with nothing a default command line has.
+        assert!(parse_args(["--nested"]).is_ok());
+    }
+
+    #[test]
+    fn a_zero_idle_timeout_is_refused_rather_than_read_as_off() {
+        // `--lock-idle 0` would relock on the first round after every unlock.
+        // Refusing it means there is exactly one spelling of "no idle lock".
+        let err = parse_args(["--nested", "--lock-idle", "0"]).expect_err("zero is a wedge");
+        assert!(err.contains("Omit the flag"), "{err}");
+        assert!(parse_args(["--nested", "--lock-idle", "-1"]).is_err());
+        assert!(parse_args(["--nested", "--lock-idle", "abc"]).is_err());
+    }
+
+    #[test]
+    fn the_lock_flags_are_refused_twice_and_bare() {
+        for flag in ["--lock-chord", "--lock-idle", "--lock-passphrase-file"] {
+            assert!(
+                parse_args(["--nested", flag]).is_err(),
+                "`{flag}` takes the next argument; there is none"
+            );
+        }
+        for (flag, a, b) in [
+            ("--lock-chord", "ctrl+alt+delete", "ctrl+alt+f12"),
+            ("--lock-idle", "60", "120"),
+            ("--lock-passphrase-file", "/a/b", "/c/d"),
+        ] {
+            let err = parse_args(["--nested", flag, a, flag, b])
+                .expect_err("a valued flag repeated must not silently pick a winner");
+            assert!(err.contains("given more than once"), "{flag}: {err}");
+        }
+    }
+
+    #[test]
+    fn lock_hash_is_a_print_and_exit_action_independent_of_mode() {
+        // The `--print-isolation` posture: it answers a question about a file
+        // format, so it must answer it whatever else is on the command line --
+        // including a command line that would otherwise be refused.
+        assert_eq!(parse_args(["--lock-hash"]), Ok(Action::LockHash));
+        assert_eq!(
+            parse_args(["--headless", "--lock-hash"]),
+            Ok(Action::LockHash)
+        );
+        assert_eq!(
+            parse_args(["--nested", "--size", "1x1", "--lock-hash"]),
+            Ok(Action::LockHash),
+            "it wins over a refusal it is unrelated to"
+        );
+    }
+
     #[test]
     fn dead_man_flags_parse_both_spellings_and_default_independently() {
         for args in [
@@ -3700,17 +4318,25 @@ mod tests {
             assert_eq!(config.hold, std::time::Duration::from_millis(400));
             assert_eq!(config.chord.name(), "esc");
         }
-        // Both together.
+        // Both together. `home` rather than `delete` since WS-E.2.2: the
+        // default lock chord is `ctrl+alt+delete`, and the startup collision
+        // check refuses a dead-man chord that shares its trigger key -- because
+        // the switch detects in the router's unconditional observe tap, so
+        // every lock gesture would arm the human's off-switch. Changing the
+        // example is the honest fix; weakening the check would not be.
         let config = dead_man_of(
-            &parse_args([
-                "--nested",
-                "--dead-man-chord=delete",
-                "--dead-man-hold=2500",
-            ])
-            .expect("both parse"),
+            &parse_args(["--nested", "--dead-man-chord=home", "--dead-man-hold=2500"])
+                .expect("both parse"),
         );
-        assert_eq!(config.chord.name(), "delete");
+        assert_eq!(config.chord.name(), "home");
         assert_eq!(config.hold, std::time::Duration::from_millis(2500));
+
+        // ...and the collision the change above is about, asserted rather than
+        // implied: `--dead-man-chord delete` against the DEFAULT lock chord is
+        // a refusal an operator can reach with no `--lock-*` flag at all.
+        let err = parse_args(["--nested", "--dead-man-chord=delete"])
+            .expect_err("the default lock chord's key is spoken for");
+        assert!(err.contains("--lock-chord"), "{err}");
     }
 
     #[test]

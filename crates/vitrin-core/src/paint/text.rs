@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
-//! Text for the consent prompt: the bundled font, glyph rasterization, and
-//! the measure/wrap/draw operations [`super::render`] lays the card out with.
+//! Text for the core's trusted surfaces: the bundled font, glyph
+//! rasterization, and the measure/wrap/draw operations
+//! [`crate::consent::render`] and [`crate::lock::render`] lay their cards out
+//! with.
 //!
 //! # The font is embedded, never looked up
 //!
@@ -64,7 +66,7 @@ const FONT_LEN: usize = 410_820;
 /// README's SHA-256 is the authoritative check.
 const _: () = assert!(
     FONT_BYTES.len() == FONT_LEN,
-    "the vendored consent-prompt font changed; see crates/vitrin-core/assets/fonts/README.md"
+    "the vendored trusted-surface font changed; see crates/vitrin-core/assets/fonts/README.md"
 );
 
 /// What [`Text::draw`] renders in place of any non-ASCII-printable character
@@ -77,7 +79,7 @@ const SUBSTITUTE: char = '?';
 /// fontdue feeds this to its geometry preprocessing, so it is an input to
 /// rasterized output; leaving it at the crate's default would let a fontdue
 /// release move the golden with no change on our side. The value matches the
-/// prompt's largest type size (`super::render::TITLE_PX` = 19.0), which is
+/// prompt's largest type size (`crate::consent::render::TITLE_PX` = 19.0), which is
 /// what the setting is documented to optimize for.
 ///
 /// Deliberately a separate constant rather than an alias of `TITLE_PX`: this
@@ -107,7 +109,7 @@ fn font() -> &'static Font {
                 load_substitutions: false,
             },
         )
-        .expect("the bundled consent-prompt font is a compile-time constant and must parse")
+        .expect("the bundled trusted-surface font is a compile-time constant and must parse")
     })
 }
 
@@ -126,7 +128,8 @@ pub(crate) struct LineMetrics {
     pub height: u32,
 }
 
-/// The prompt's text engine: the shared face plus a per-instance glyph cache.
+/// The trusted surfaces' text engine: the shared face plus a per-instance
+/// glyph cache.
 ///
 /// Deliberately **not** a layout engine. There is no shaping, no kerning
 /// beyond the font's advance widths, no bidi, and no font fallback — the

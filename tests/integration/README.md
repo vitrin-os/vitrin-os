@@ -60,6 +60,32 @@ their value; they are just never a substitute for the named gate.
 | `test_shell.py` | The **shell-is-a-client property gate** (WS-E.1.5, issue #211) — mock-free, real-app, deliberately not a milestone gate. `examples/shell/run_shell.py` runs as a **separate host-side process** on the other end of a real socket, driven over pipes through its own documented output contract, because the whole claim (PRD §5.1, D-021(4)) is that the switcher is not core code and importing it would quietly weaken that. Two classes. **`RealShellSwitchesRealms`**: the shell holds one `realm.launch` grant per template (#211 decision 4), launches two real `click-target`s into two core-minted realms, and focuses each in turn — with every focus **confirmed by `--capture-dump`**, never by the shell's own account of it: the human's next physical click flips *that* realm's app in that realm's own core-internal dump while the realms left behind stay unflipped. It also asserts that a launch confers nothing, by the second `petition_requested` the shell has to raise over the id the core just minted. **`RealShellDeathAndDenial`**: under `--consent=interactive` with the consent channel answering cards, the shell is `SIGKILL`ed and both realms keep running with the realm it last bound **still receiving the human's physical input** — D-021's own stated cost, asserted as behaviour rather than described; a restarted shell then raises *fresh* petitions (new ids on the `raised` edges, new journal entries), and a **denied** `layout.focus` leaves `focus` showing the core's own `refused(layout.focus, not_granted)` with the bound realm unmoved, because the shell sends the request anyway rather than answering for the core. **Not asserted:** that a human sees any of it (no display on a runner, D-019(4)); that the shell is pleasant, or that a hotkey works — #211 says in as many words that the first is not measurable and the second does not exist. `preempted` handling belongs to `test_attention.py`: a host-side shell's keystrokes never reach `vitrind`, so this gate exercises none of it. That the client has no retry timer is a fact about reading `run_shell.py` and **not** something any assertion here observes — recorded that way because this table is the repo's answer to "what did this run actually prove", and code inspection laundered into it as evidence is the failure the table exists to prevent. | No — property gate (#211) |
 | `test_consent_injector.py` | **Component test.** The `consent-injector` channel's fail-closed matrix (no card up, a button the card does not draw, an unknown or spent token, an unparseable line, an over-long line, the peer disappearing) against the real core + `vitrin-mock-shim`. Explicitly **not** a milestone gate: it exists so the gate above stays about the milestone property rather than about the channel's error handling. | No |
 
+### The lock screen has no gate here, deliberately
+
+WS-E.2.2 (issue #214) added a core-drawn lock screen, and this suite has **no
+row for it and no file for it**. That is a decision, stated here rather than
+left as an apparent omission:
+
+- The lock is **nested-only**. Every `--lock-*` flag is refused at startup with
+  `--headless` — a headless session has no physical input device at all, so a
+  lock it raised (`--lock-idle` fires on a timer, with no input needed) could
+  never be dismissed, and the refusal is what keeps a wedge from being a
+  configuration. Headless is the only backend CI runs (D-019(4)).
+- The `physical-input-injector` channel, which gives the attention key and the
+  clipboard chords their mock-free gates, is headless-only for the same reason
+  and therefore cannot reach this one.
+
+A gate added here would have to either prove nothing or weaken that refusal, so
+what CI proves instead is the composite (`backend/headless.rs`'s
+`the_lock_screen_reaches_human_visible_output_but_never_a_capture` — the lock is
+on the human-visible framebuffer and byte-absent from the memfd a capture would
+seal), the golden, the gate's pairing behaviour and its recorder entries
+(`crates/vitrin-core/src/lock/`), and — the one that matters most — that the
+dead-man chord still arms and fires through the real hook stack while the lock
+consumes every event. The end-to-end claim is a dated manual runbook,
+`shim/docs/nested-lock-screen.md`, which is the split issue #214 asked for in as
+many words rather than a criterion that could never go green.
+
 ### What the consent gate still does not prove
 
 `test_real_consent.py` closes the gap this section used to describe. Two

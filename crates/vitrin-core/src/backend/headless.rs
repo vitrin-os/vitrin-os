@@ -179,8 +179,19 @@ use crate::input::{InputRouter, NoopHook, PhysicalPresenceMap};
 /// `tests/integration/test_real_clipboard.py` a mock-free gate. The order
 /// matches the nested backend's for the reason stated there — a modifier
 /// matcher inside the attention hook would never see a Super press.
+///
+/// WS-E.2.4 (issue #216) adds [`crate::screenshot::ScreenshotHook`] between the
+/// two, on identical grounds and in the nested backend's order: the screenshot
+/// chord's trigger *and* its whole effect are reachable from the injector
+/// channel, which is what gives `tests/integration/test_screenshot.py` a gate
+/// that presses a real key rather than asserting the effect half alone. What is
+/// **not** stacked here is still the consent grab, the dead-man watcher and the
+/// lock — so "a lock suppresses the screenshot key" stays a nested-mode and
+/// unit-test property, exactly as the attention key's equivalent does.
 #[cfg(feature = "physical-input-injector")]
-type HeadlessHook = crate::clipboard::ClipboardHook<crate::attention::AttentionHook<NoopHook>>;
+type HeadlessHook = crate::clipboard::ClipboardHook<
+    crate::screenshot::ScreenshotHook<crate::attention::AttentionHook<NoopHook>>,
+>;
 #[cfg(not(feature = "physical-input-injector"))]
 type HeadlessHook = NoopHook;
 
@@ -197,6 +208,7 @@ type HeadlessHook = NoopHook;
 fn headless_hook(
     attention: crate::attention::AttentionChord,
     clipboard: crate::chord::Trigger,
+    screenshot: crate::chord::ModChord,
     now: &std::rc::Rc<std::cell::Cell<std::time::Instant>>,
 ) -> HeadlessHook {
     crate::clipboard::ClipboardHook::new(
@@ -204,12 +216,18 @@ fn headless_hook(
             crate::clipboard::ClipboardSignal::new(clipboard)
                 .expect("the clipboard chord pair was validated at startup"),
         )),
-        crate::attention::AttentionHook::new(
+        crate::screenshot::ScreenshotHook::new(
             std::rc::Rc::new(std::cell::RefCell::new(
-                crate::attention::AttentionSignal::new(attention),
+                crate::screenshot::ScreenshotSignal::new(screenshot)
+                    .expect("the screenshot chord was validated at startup"),
             )),
-            std::rc::Rc::clone(now),
-            NoopHook,
+            crate::attention::AttentionHook::new(
+                std::rc::Rc::new(std::cell::RefCell::new(
+                    crate::attention::AttentionSignal::new(attention),
+                )),
+                std::rc::Rc::clone(now),
+                NoopHook,
+            ),
         ),
     )
 }
@@ -377,6 +395,8 @@ pub fn run(
     attention: crate::attention::AttentionChord,
     #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
     clipboard: crate::chord::Trigger,
+    #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
+    screenshot: crate::chord::ModChord,
     agent_cursor: bool,
     status: crate::status::StatusConfig,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
@@ -395,6 +415,7 @@ pub fn run(
         dead_man,
         attention,
         clipboard,
+        screenshot,
         agent_cursor,
         status,
         #[cfg(feature = "consent-injector")]
@@ -419,6 +440,8 @@ fn run_inner(
     attention: crate::attention::AttentionChord,
     #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
     clipboard: crate::chord::Trigger,
+    #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
+    screenshot: crate::chord::ModChord,
     agent_cursor: bool,
     status: crate::status::StatusConfig,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
@@ -558,6 +581,8 @@ fn run_inner(
                     attention,
                     #[cfg(feature = "physical-input-injector")]
                     clipboard,
+                    #[cfg(feature = "physical-input-injector")]
+                    screenshot,
                     &now_cell,
                 ),
             ),
@@ -580,6 +605,8 @@ fn run_inner(
         attention_chord: attention,
         #[cfg(feature = "physical-input-injector")]
         clipboard_trigger: clipboard,
+        #[cfg(feature = "physical-input-injector")]
+        screenshot_chord: screenshot,
     };
 
     // Readiness for the injector channel. The `Injector` itself lives in the
@@ -741,6 +768,10 @@ pub(crate) struct HeadlessState {
     /// a scancode the harness guessed.
     #[cfg(feature = "physical-input-injector")]
     clipboard_trigger: crate::chord::Trigger,
+    /// This run's configured screenshot chord (WS-E.2.4), so the channel's
+    /// `screenshot` line presses the gesture the operator actually chose.
+    #[cfg(feature = "physical-input-injector")]
+    screenshot_chord: crate::chord::ModChord,
 }
 
 /// The `physical-input-injector` build's channel service (issue #212): read
@@ -785,6 +816,7 @@ impl HeadlessState {
                 (view.0 as i32, view.1 as i32),
                 self.attention_chord,
                 self.clipboard_trigger,
+                self.screenshot_chord,
             );
             let produced = inputs.len();
             session::route_physical_turn(
@@ -3068,6 +3100,120 @@ mod tests {
             "a status-strip pixel reached a served capture: `vitrin_view.frame_ready` is \
              delivering human-visible output, and with it a clock an agent must not have"
         );
+    }
+
+    /// **The session's trusted-indicator secret reaches human-visible output
+    /// and never a screenshot file** (WS-E.2.4, issue #216).
+    ///
+    /// The sharpest question in the issue, asserted on real composited pixels
+    /// and on the real file on disk. `TrustedIndicator::for_test()` is
+    /// `0xFF00AA`, a colour nothing else in this composite paints, so a search
+    /// that finds the triple found the band or the card's ring and nothing
+    /// else.
+    ///
+    /// **Positive-first, for `the_status_strip_...`'s reason**: "absent from
+    /// the file" is a negative claim and negatives pass vacuously — a file that
+    /// was empty, or a session with no indicator, would satisfy it while
+    /// proving nothing. So the colour is located in the human-visible output
+    /// *first*, twice: in the always-present band, and then again in the
+    /// **ring around a raised consent card**, which is the case that kills the
+    /// "just crop the band's rows out" alternative — the ring is in the middle
+    /// of the output, not at the top.
+    ///
+    /// Why this matters rather than being tidy: the confined realm runs as this
+    /// core's uid, so a file the core writes is a file the app can read. A
+    /// screenshot carrying the band would hand a forger the one colour that
+    /// tells a genuine prompt from a painted replica, permanently, on the first
+    /// press of the key.
+    #[test]
+    fn the_trusted_indicator_reaches_human_visible_output_but_never_a_screenshot_file() {
+        use crate::consent::tests::prompt_fixture;
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+        use crate::screenshot::{capture_to_file, ScreenshotDir, ScreenshotGesture};
+
+        const VW: u32 = 800;
+        const VH: u32 = 600;
+        const BPP: usize = test_pattern::BYTES_PER_PIXEL;
+        let secret = crate::consent::TrustedIndicator::for_test().color();
+        // The RGB triple as it lands in an 8-bit truecolor PNG's pixel bytes.
+        let triple = [secret[0], secret[1], secret[2]];
+
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessView> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+            false,
+            crate::status::StatusConfig::off(),
+        )
+        .expect("headless state under pixman");
+        state.scene_for_test().commit(
+            SurfaceContent::from_rgba(client_pixels(VW, VH), VW, VH).expect("well-formed content"),
+        );
+        // A prompt up, so the ring is composited too: the band alone would let
+        // a crop pass this test, and a crop is exactly the design that was
+        // rejected.
+        state.output.consent.show_for_test(prompt_fixture());
+        state.redraw().expect("composite with a prompt up");
+
+        let output = state.latest_output_rgba().expect("readback");
+        let view = state.latest_frame_rgba().expect("readback");
+
+        // --- Positive control, twice. ---
+        let secret_px = |px: &[u8]| px.chunks_exact(BPP).filter(|p| *p == secret).count();
+        let band_rows = crate::consent::TRUST_BAND_HEIGHT as usize;
+        let band_bytes = band_rows * VW as usize * BPP;
+        assert!(
+            secret_px(&output[..band_bytes]) > 0,
+            "the trusted band is not on the human-visible output at all"
+        );
+        assert!(
+            secret_px(&output[band_bytes..]) > 0,
+            "the card's trusted ring is not on the human-visible output below the band -- \
+             without it this test would pass for a design that merely cropped the band"
+        );
+        assert_eq!(
+            secret_px(&view),
+            0,
+            "the secret reached the realm view, which is what a screenshot is taken from"
+        );
+
+        // --- The artifact on disk, not the buffer. ---
+        let dir = std::env::temp_dir().join(format!(
+            "vitrin-indicator-screenshot-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut target = ScreenshotDir::open(&dir).expect("a clean, private temp dir");
+        let (name, _digest) =
+            capture_to_file(&mut target, ScreenshotGesture::Full, &view, VW, VH).expect("written");
+        let png = std::fs::read(dir.join(&name)).expect("read the screenshot back");
+
+        // The encoder writes pixels literally (filter 0, stored DEFLATE
+        // blocks), so the triple would be findable in the file's bytes if it
+        // were in the picture -- proved by the same search over an encoding of
+        // the human-visible buffer, which DOES contain it.
+        let contains = |haystack: &[u8]| haystack.windows(3).any(|w| w == triple);
+        let rgb_of = |rgba: &[u8]| -> Vec<u8> {
+            rgba.chunks_exact(BPP)
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect()
+        };
+        assert!(
+            contains(&vitrin_png::encode_rgb(VW, VH, &rgb_of(&output))),
+            "the search itself is sound: encoding the HUMAN-VISIBLE buffer does put the \
+             secret in the file's bytes"
+        );
+        assert!(
+            !contains(&png),
+            "the session's trusted-indicator secret reached a file on disk, which any \
+             same-uid app can read: the forger now knows the colour"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **Without `--status`, the headless composite is unchanged.** The default

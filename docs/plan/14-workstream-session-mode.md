@@ -155,7 +155,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 | Stage | Delivers | Est. |
 |---|---|---|
 | **1 — multi-app, nested** | ~~Runtime app launch~~ (**landed**, WS-E.1.1/#207: `autostart = false` templates, a served `realm_launch` verb, core-minted `<template>.<n>` instance ids, `capacity` at `MAX_REALMS`, and `realm_spawned` naming who asked) · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · ~~a core-owned attention key~~ (**landed**, WS-E.1.7/#232: a tapped, consumed Super lifts `preempted` for one layout use and delivers `vitrin_principal.attention`, so an in-realm shell can switch realms at all) · a shell client (switcher + launcher) | 7–9 w |
-| **2 — livable** | ~~Cross-realm clipboard~~ (**landed**, WS-E.2.1/#213: a core-held single slot the core *pulls* into on Ctrl-Shift-Insert and offers on Shift-Insert, `text/plain;charset=utf-8` at 60 KiB, plus the modifier-aware chord matcher 2.2 and 2.4 consume — §4.1, [D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing)) · core-drawn lock screen on the consent stack · status in the trusted band · human screenshot | 4–6 w |
+| **2 — livable** | ~~Cross-realm clipboard~~ (**landed**, WS-E.2.1/#213: a core-held single slot the core *pulls* into on Ctrl-Shift-Insert and offers on Shift-Insert, `text/plain;charset=utf-8` at 60 KiB, plus the modifier-aware chord matcher 2.2 and 2.4 consume — §4.1, [D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing)) · ~~core-drawn lock screen on the consent stack~~ (**landed**, WS-E.2.2/#214) · ~~status in the trusted band~~ (**landed**, WS-E.2.3/#215) · ~~human screenshot~~ (**landed**, WS-E.2.4/#216: `ctrl+print` writes one PNG of the REALM VIEW into one audited `--screenshot-dir`, touching no grant — §6) | 4–6 w |
 | **3 — bare metal** | The keymap decision · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
 | **4 — long tail** | X11 (defers to E3.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |
 
@@ -645,6 +645,64 @@ this workstream owns, not inherits:
   becomes a rule the core must grant itself**, which is a real widening of that
   future sandbox and is recorded here so the ruleset's author does not have to
   rediscover it.
+
+- **A file on disk that is a picture of the human's screen** (created by
+  WS-E.2.4/#216, no owner until E2.6/E2.7 confine the core). The core already
+  writes the recorder's log and the `--capture-dump` diagnostic, so this is not
+  its first descriptor; it is the first whose *contents* are the screen. Every
+  screenshot is readable by every app in every realm, because everything runs
+  as one uid (D9). The mode is `600`, which is about other users and not about
+  the confined app. The directory is audited at startup and then **held open**
+  for the process's life, so the path is resolved exactly once, before any
+  client exists; until the core is confined, that audit is the whole of the
+  enforcement of the operator's choice.
+- **A vitrin screenshot cannot show a consent prompt, and that is the design**
+  (created by WS-E.2.4, and unfixable without giving up the trusted indicator).
+  The file is the **realm view**: no trusted band, no card, no ring, no lock
+  cover, no status strip, no agent cursor. "Send me a picture of that weird
+  dialog" is the single most useful thing a screenshot does and this one cannot
+  do it; the answer is a phone camera, which is worse than every other desktop
+  offers.
+
+  The reason is that the band's colour **is** the session secret
+  (`consent/indicator.rs`: *"never written to any descriptor or file"*), and a
+  same-uid app can read anything the core writes — so one screenshot of the
+  human-visible composite would end the indicator's usefulness for the rest of
+  the session. Two softer designs were examined by #216's implementation and
+  both are worse, which is why this bullet is a limit rather than a TODO:
+  - **Cropping the band's rows out does not close it.** A genuine consent card
+    is framed in the same colour in the *middle* of the output, so a crop
+    protects the secret only while no prompt is up — exactly when a screenshot
+    is least wanted.
+  - **Redacting by colour opens an oracle.** Replace every pixel equal to the
+    secret and an app can paint a field of candidate colours, ask the human for
+    a screenshot, and read back which of *its own* pixels were recoloured. A
+    ~22-bit secret (`TrustedIndicator::generate` scales each channel into
+    `[64, 255]`) falls in a handful of screenshots at 1080p. This is the sharper
+    of the two findings and it is recorded here because it looks thorough.
+
+  Published in `docs/book/src/limits.md` and in `--help`.
+- **A fifth core-owned chord, and the first one that pays a cost back**
+  (created by WS-E.2.4). Ctrl-PrintScreen is consumed in every realm. It is a
+  *chord* rather than #216's proposed bare `Print` for a structural reason —
+  `crate::chord::ModChord` refuses a modifier-less chord, so a bare-key gesture
+  would have meant a second matcher in the stack the off-switch lives in, which
+  is the thing [D-024](20-decision-log.md#d-024) exists to forbid — and the
+  side effect is that **bare PrintScreen is still delivered**, so an app that
+  binds it keeps it. That is the first time this workstream has taken a gesture
+  without taking the key. The collision check `main.rs` runs is now over five
+  chords rather than four.
+- **A PNG encoder is now TCB code** (created by WS-E.2.4). `crates/vitrin-png`
+  is the golden harness's hand-rolled artifact encoder, promoted to a
+  zero-dependency in-tree crate both it and `vitrin-core` depend on, because
+  *"no image codec in the core, in any dependency class"* is stated twice in
+  `crates/vitrin-core/Cargo.toml` and an external `png`/`image` crate would have
+  brought a **decoder**. The mitigating fact is that there is no decoder here at
+  all: it consumes a buffer the core composited and returns bytes the core
+  writes, so it never parses attacker input — the same argument `Cargo.toml`
+  already makes for fontdue. What it costs: ~130 lines written for test
+  artifacts must now be reviewed to a TCB bar, and that argument holds only for
+  as long as nothing else in the core feeds it bytes it did not itself produce.
 
 ### Measurements taken for WS-E.2.3
 

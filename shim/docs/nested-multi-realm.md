@@ -19,6 +19,7 @@ machine-checkable and are checked:
 | **A human sees the right realm in the host window** | *this page* | nested, by hand |
 | **A real key held across a real focus switch is released into the realm being left** | *this page*, step 9 (WS-E.1.6/#212) | nested, by hand |
 | **A real Super press on real hardware opens the attention window** | *this page*, step 10 (WS-E.1.7/#232) | nested, by hand |
+| **A real Ctrl-PrintScreen on real hardware writes a screenshot** | *this page*, step 11 (WS-E.2.4/#216) | nested, by hand |
 
 The fourth is not automatable here and the reason is structural rather than a
 missing budget: **GitHub runners have no display**, and D-019(4) records
@@ -307,6 +308,57 @@ target/debug/vitrind --nested --consent=auto-approve \
     Why this is not a CI gate: identical to step 9's reasoning.
     `SeatInput::physical` is private, headless has no input device, and headless
     is the only backend CI runs (D-019(4)).
+
+11. **A real Ctrl-PrintScreen, and the one thing the file must not contain.**
+    Issue #216's manual criterion. Unlike steps 9 and 10 the *effect* half is
+    now fully covered in CI, and so is the detection half through the injector
+    channel's `screenshot` line (`tests/integration/test_screenshot.py`) —
+    what only this page can hold is a real finger on a real PrintScreen key,
+    and a human's eye on what came out.
+
+    Start the session with a directory to write into:
+
+    ```
+    mkdir -p ~/Pictures/vitrin && chmod 700 ~/Pictures/vitrin
+    vitrind --nested --screenshot-dir ~/Pictures/vitrin
+    ```
+
+    (Without `--screenshot-dir` the chord is still **consumed** and writes
+    nothing — deliberately, so the key behaves identically whether or not it is
+    armed, and the log says so at startup.)
+
+    What must happen:
+
+    - Press **Ctrl-PrintScreen**. One file appears, named
+      `vitrin-<epoch>-0001.png`, mode `600`. Press it again: `-0002`, never an
+      overwrite.
+    - The confined app in the focused realm prints **nothing** for that chord —
+      run `input-echo-client` there and watch. A **bare** PrintScreen, on the
+      other hand, must reach it: the modifier is what leaves the app its key.
+    - **Open the file.** It is the realm's view and nothing else: no trusted
+      band across the top, no status strip, no agent cursor. If you can see the
+      band's colour in that file, stop — the session's trusted-indicator secret
+      has reached the disk, any app running as your uid can read it, and every
+      consent prompt for the rest of that session is forgeable. That is the
+      defect this design exists to make impossible.
+    - **Raise a consent prompt** (have an agent petition) and press the chord
+      while the card is up. Two things must be true: the file that appears
+      contains **no card and no trusted ring** — which is the case a
+      band-cropping design would have got wrong — and, if the prompt has
+      seized input, no file appears at all, because `ConsentGate` sits above
+      the screenshot hook and consumes the chord.
+    - **Lock the screen** (`ctrl+alt+delete` by default) and press the chord.
+      **Nothing must be written.** `LockGate` is the outermost hook, so a
+      person standing at a locked machine cannot photograph the session behind
+      it. This is the single most important line of this step.
+    - Hold Escape for a second while pressing the chord: the dead-man
+      revocation must fire exactly as usual. `DeadManHook` is stacked outside
+      the screenshot hook precisely so an off-switch press wins.
+
+    Why the detection half is a runbook step anyway: the injector build proves
+    a chord on real scancodes reaching the real hook stack, which is one step
+    short of a real device. `SeatInput::physical` is private and headless has
+    no input device (D-019(4)), so the last step belongs to a human.
 
 ## What a failure here looks like
 

@@ -24,10 +24,20 @@
 //!   [`crate::scene::Scene::compose`]. The capture service reads the bare
 //!   realm view, so the colour cannot leak through `vitrin_view.frame_ready`
 //!   — the same structural argument the overlay itself already relies on.
+//!   **And, since WS-E.2.4 (issue #216), the human's own screenshot key reads
+//!   that same bare realm view for exactly this reason** — the one place in the
+//!   core that writes pixels to a *file* a same-uid app can open. See
+//!   [`crate::screenshot`] for the two softer designs that were examined and
+//!   refused (cropping the band, which leaves the per-prompt frame; and
+//!   redacting by colour, which hands the app an oracle it can binary-search
+//!   the secret with). The cost — a screenshot that cannot show a consent
+//!   prompt — is published rather than paid quietly.
 //!
 //! # How the human learns it — and why not the log
 //!
-//! The secret is **never written to any descriptor or file.** That is not
+//! The secret is **never written to any descriptor or file** — including the
+//! files WS-E.2.4's screenshot key creates, which is why that key reads the
+//! realm view. That is not
 //! fastidiousness: the confined realm runs as the core's own uid (the
 //! `SO_PEERCRED` same-user policy), so anything the core writes to stdout or
 //! stderr is reachable by the app — directly if it inherits the fd, or through

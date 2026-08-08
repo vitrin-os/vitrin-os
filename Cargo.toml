@@ -10,7 +10,7 @@ edition = "2021"
 # reference implementation (vitrin-core, vitrin-ipc); Apache-2.0 covers
 # everything derived from protocol/vitrin-v0.xml (vitrin-protocol,
 # vitrin-scanner, xtask) and the conformance instruments (vitrin-golden,
-# vitrin-mock-shim).
+# vitrin-png, vitrin-mock-shim).
 # Minimum supported Rust version. The hard floor is std::io::pipe() (stable
 # since 1.87, used by the fd-bearing round-trip tests); the workspace is
 # developed and CI-verified on the exact toolchain pinned in

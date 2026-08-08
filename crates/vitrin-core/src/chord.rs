@@ -172,6 +172,12 @@ impl Modifiers {
 /// audits. Letters and digits are absent for the reason the whole core has no
 /// keymap: `invariant_keysym` returns `None` for them, so on a backend with no
 /// host compositor to interpret them (WS-E Stage 3) they do not exist.
+///
+/// `print` is the one row added after the fact (WS-E.2.4, issue #216), and it
+/// was added to [`crate::input::invariant_keysym`] **first**: this table is a
+/// selection from that one, never a source of new keys, so a name here that
+/// intake cannot deliver is refused by [`Self::parse`] rather than shipped as a
+/// dead gesture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Trigger {
     name: &'static str,
@@ -209,6 +215,7 @@ impl Trigger {
         ("f12", 88, 0xffc9),
         ("insert", 110, 0xff63),
         ("delete", 111, 0xffff),
+        ("print", 99, 0xff61),
         ("home", 102, 0xff50),
         ("end", 107, 0xff57),
         ("pageup", 104, 0xff55),
@@ -332,6 +339,26 @@ impl ModChord {
     /// at all -- it sees the trigger's press whatever else is held.
     pub fn trigger_keysym(&self) -> u32 {
         self.trigger.keysym
+    }
+
+    /// The evdev scancodes one press of this chord is spelled with: the
+    /// modifiers in [`Modifier::TABLE`] order, then the trigger.
+    ///
+    /// One consumer, the same one [`Trigger::evdev`] and [`Modifier::evdev`]
+    /// have: the `physical-input-injector` channel, which presses the
+    /// *configured* gesture through the production intake rather than a
+    /// scancode a harness guessed. Assembled here rather than in the channel so
+    /// a chord's spelling and the keys pressed for it cannot come from two
+    /// different places — that is exactly how a harness ends up proving
+    /// something about a gesture the operator did not configure.
+    #[cfg_attr(not(any(test, feature = "physical-input-injector")), allow(dead_code))]
+    pub fn scancodes(&self) -> (Vec<u32>, u32) {
+        let mods = Modifier::TABLE
+            .iter()
+            .filter(|(_, modifier, _, _, _)| self.mods.contains(*modifier))
+            .map(|(_, modifier, _, _, _)| modifier.evdev())
+            .collect();
+        (mods, self.trigger.evdev)
     }
 
     /// Human-facing spelling, rebuilt from the parsed parts rather than echoed

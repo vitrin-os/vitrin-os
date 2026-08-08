@@ -196,6 +196,15 @@ pub(crate) struct RuntimeSeed {
     /// nothing is written to the bare `PATH` at all — every dump names the
     /// realm it is of. See [`capture_dump_path`].
     pub capture_dump: Option<PathBuf>,
+    /// The audited `--screenshot-dir` (WS-E.2.4, issue #216), already opened
+    /// and validated by `main`'s argument parser, or `None` when the operator
+    /// passed no flag -- in which case the screenshot key writes nothing.
+    ///
+    /// Carried as an **open descriptor**, not a path: by the time it reaches
+    /// here the only thing that can be done with it is write a file the core
+    /// itself named, into the directory the core itself resolved before any
+    /// client existed.
+    pub screenshot_dir: Option<crate::screenshot::ScreenshotDir>,
 }
 
 /// Everything one running session owns that is not presentation, living in
@@ -333,6 +342,22 @@ pub(crate) struct Kernel {
     /// cannot reach, which is why [`crate::deadman::apply`] clears it
     /// explicitly.
     pub clipboard_slot: crate::clipboard::ClipboardSlot,
+    /// **The human's screenshot chord** (WS-E.2.4, issue #216): the queue the
+    /// hook writes a gesture into and [`drain_screenshot_gestures`] drains.
+    ///
+    /// Taken out of the router on the same terms as `clipboard` above, and for
+    /// the same reason.
+    pub screenshot: std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>,
+    /// **Where a screenshot goes**, or `None` when the operator passed no
+    /// `--screenshot-dir` and the feature is therefore off (WS-E.2.4).
+    ///
+    /// Kernel state rather than router state for [`Self::clipboard_slot`]'s
+    /// reason and one more: it is the *only* place in the session from which a
+    /// screenshot can be written, and the type it holds has no method that
+    /// takes a path. The dead-man switch deliberately does **not** clear it --
+    /// the off-switch destroys authority, and a human's own screenshot key is
+    /// not authority.
+    pub screenshot_dir: Option<crate::screenshot::ScreenshotDir>,
 }
 
 /// The realm's live shim session: the protocol server, the out-of-band send
@@ -809,6 +834,17 @@ impl<H: PreemptionHook> Runtime<H> {
                 crate::clipboard::ClipboardSignal::detached(),
             ))
         });
+        // ...and the screenshot chord queue (WS-E.2.4), on identical terms. A
+        // detached signal is the honest answer for a backend with no physical
+        // input device, and it is *also* what a session with no
+        // `--screenshot-dir` gets to drain: the two absences are separate facts
+        // -- "this build can press the key" and "this session has somewhere to
+        // put the file" -- and collapsing them would make one flag mean both.
+        let screenshot = router.screenshot().unwrap_or_else(|| {
+            std::rc::Rc::new(std::cell::RefCell::new(
+                crate::screenshot::ScreenshotSignal::detached(),
+            ))
+        });
         let RuntimeSeed {
             listener,
             verifier,
@@ -822,6 +858,7 @@ impl<H: PreemptionHook> Runtime<H> {
             // rest here, so the runtime deliberately drops it.
             indicator: _,
             capture_dump,
+            screenshot_dir,
         } = seed;
         Self {
             kernel: Kernel {
@@ -834,6 +871,8 @@ impl<H: PreemptionHook> Runtime<H> {
                 attention,
                 clipboard,
                 clipboard_slot: crate::clipboard::ClipboardSlot::new(),
+                screenshot,
+                screenshot_dir,
             },
             listener: Some(listener),
             conns: BTreeMap::new(),
@@ -2981,6 +3020,100 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
     // realm the output is bound to, the shim connection and the slot all in
     // scope at once.
     drain_clipboard_gestures(runtime, scenes, now);
+    // ...and the screenshot chord, last (WS-E.2.4, issue #216). Last because
+    // it is the only one of the three that writes to a filesystem: whatever
+    // its latency, an attention window and a clipboard gesture from the same
+    // turn are already resolved before a `write(2)` is attempted.
+    drain_screenshot_gestures(runtime, scenes, view);
+}
+
+/// Turn the human's queued screenshot chords into files on disk (WS-E.2.4,
+/// issue #216).
+///
+/// **The hook could not do any of this and must never be able to**, exactly as
+/// [`drain_clipboard_gestures`] explains: the gate runs inside
+/// `InputRouter::route_physical`, which is never told a realm, so it records
+/// *that a gesture happened* and this function — which owns the realm registry,
+/// the view cache and the audited directory — decides *what* is written.
+///
+/// **The pixels come from [`Runtime::view_cache`]**, the same map the
+/// enforcement chokepoint's `realm_view` is built from, for the realm
+/// [`physical_seat_target`] names — the realm the human's own keystrokes go to,
+/// which is the one they are looking at. Two consequences worth stating:
+///
+/// - It is the **realm view**, so no trusted band, no consent card, no lock
+///   cover, no status strip and no agent cursor is in it. That is a security
+///   decision with a real usability cost, argued in full in
+///   [`crate::screenshot`] and published in `docs/book/src/limits.md`.
+/// - It is the **latest completed** composite, never a fresh render — capture's
+///   own contract (`crate::capture`), inherited for free by reading the same
+///   cache rather than composing again.
+///
+/// **No grant is consulted, because there is nothing here to consult one
+/// with.** There is no principal, no facet and no verb in this function, and
+/// `enforcement.rs`'s source scan asserts that this file and
+/// `crate::screenshot` never name the chokepoint's identifiers.
+fn drain_screenshot_gestures<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    scenes: &crate::scene::realms::RealmScenes,
+    view: (u32, u32),
+) {
+    let gestures = runtime.kernel.screenshot.borrow_mut().take_pending();
+    if gestures.is_empty() {
+        return;
+    }
+    let target = physical_seat_target(&runtime.realms, scenes).map(|(id, _)| id.clone());
+    // This turn's output size, the same one the router mapped coordinates
+    // against. A cache entry refreshed at a *different* size -- possible for
+    // exactly one round across a resize -- fails the encoder's own length
+    // check and is journalled `encode_failed` rather than written at the wrong
+    // geometry.
+    let (width, height) = view;
+    for gesture in gestures {
+        let kernel = &mut runtime.kernel;
+        // Journalled rather than silent in every refusing branch: a human
+        // whose screenshot did not appear has no other instrument, and a
+        // dropped screenshot on a full disk is exactly the failure someone
+        // discovers a week later.
+        let fail = |kernel: &mut Kernel, realm: Option<&RealmId>, reason: &'static str| {
+            tracing::warn!(reason, "screenshot not written");
+            kernel
+                .recorder
+                .record(crate::recorder::Event::ScreenshotFailed { realm, reason });
+        };
+        let Some(dir) = kernel.screenshot_dir.as_mut() else {
+            // The key fired and the session has nowhere to put a file. Not an
+            // error the operator can act on mid-session, but the alternative
+            // is a key that silently does nothing, which is worse.
+            fail(kernel, target.as_ref(), "no_screenshot_dir");
+            continue;
+        };
+        let Some(realm_id) = target.as_ref() else {
+            fail(kernel, None, "no_bound_realm");
+            continue;
+        };
+        let Some(rgba) = runtime.view_cache.get(realm_id) else {
+            // The realm has no live view: it has never composited, or its shim
+            // is gone. The same fact the chokepoint turns into `no_surface`.
+            fail(kernel, Some(realm_id), "no_view");
+            continue;
+        };
+        match crate::screenshot::capture_to_file(dir, gesture, rgba, width, height) {
+            Ok((file, digest)) => {
+                tracing::info!(realm = %realm_id, file, "screenshot written");
+                kernel
+                    .recorder
+                    .record(crate::recorder::Event::ScreenshotWritten {
+                        realm: realm_id,
+                        width,
+                        height,
+                        digest: &digest,
+                        file: &file,
+                    });
+            }
+            Err(reason) => fail(kernel, Some(realm_id), reason),
+        }
+    }
 }
 
 /// Turn the human's queued clipboard chords into wire traffic (WS-E.2.1,
@@ -4078,8 +4211,18 @@ mod tests {
         }
     }
 
-    /// The rig's hook stack: the real innermost hook, and nothing above it.
-    type RigHook = crate::attention::AttentionHook<NoopHook>;
+    /// The rig's hook stack: the two real hooks whose signals the kernel reads
+    /// back out of the router, and nothing above them.
+    ///
+    /// Not `NoopHook`, and for one reason stated twice. `Runtime::new` takes
+    /// the attention signal (WS-E.1.7) and the screenshot signal (WS-E.2.4)
+    /// *out of the router it is handed*; a rig whose stack carried neither
+    /// would get detached signals nothing ever writes, and every test of either
+    /// mechanism would be asserting against a rig that structurally cannot do
+    /// the thing under test. The consent grab, the dead-man watcher and the
+    /// lock stay out, exactly as they were: this rig has no display to raise a
+    /// prompt on.
+    type RigHook = crate::screenshot::ScreenshotHook<crate::attention::AttentionHook<NoopHook>>;
 
     struct TestHost {
         runtime: Runtime<RigHook>,
@@ -4186,6 +4329,7 @@ mod tests {
                 shim: crate::spawn::tests::mock_shim_bin(),
                 indicator: crate::consent::TrustedIndicator::for_test(),
                 capture_dump: None,
+                screenshot_dir: None,
             };
             let event_loop: EventLoop<'static, TestHost> =
                 EventLoop::try_new().expect("event loop");
@@ -4206,17 +4350,28 @@ mod tests {
                             crate::input::PhysicalPresenceMap::new(),
                         )),
                         std::rc::Rc::clone(&now),
-                        crate::attention::AttentionHook::new(
+                        crate::screenshot::ScreenshotHook::new(
                             std::rc::Rc::new(std::cell::RefCell::new(
-                                crate::attention::AttentionSignal::new(
-                                    crate::attention::AttentionChord::parse(
-                                        crate::attention::DEFAULT_CHORD,
+                                crate::screenshot::ScreenshotSignal::new(
+                                    crate::chord::ModChord::parse(
+                                        crate::screenshot::DEFAULT_SCREENSHOT_CHORD,
                                     )
-                                    .expect("the default attention chord parses"),
-                                ),
+                                    .expect("the default screenshot chord parses"),
+                                )
+                                .expect("one binding is never a duplicate"),
                             )),
-                            now,
-                            NoopHook,
+                            crate::attention::AttentionHook::new(
+                                std::rc::Rc::new(std::cell::RefCell::new(
+                                    crate::attention::AttentionSignal::new(
+                                        crate::attention::AttentionChord::parse(
+                                            crate::attention::DEFAULT_CHORD,
+                                        )
+                                        .expect("the default attention chord parses"),
+                                    ),
+                                )),
+                                now,
+                                NoopHook,
+                            ),
                         ),
                     )
                 }),
@@ -4366,6 +4521,168 @@ mod tests {
         fn drop(&mut self) {
             crate::recorder::tests::cleanup(&self.log);
             std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    /// **The human's screenshot chord writes exactly one file of the focused
+    /// realm's view, journals it once, and consults no grant** (WS-E.2.4,
+    /// issue #216).
+    ///
+    /// The whole chain in one process, through the production entry points:
+    /// real physical key events (from `input::physical_key`, the only
+    /// physical-tagging path in the crate) into
+    /// [`route_physical_turn`], through the rig's real
+    /// [`ScreenshotHook`](crate::screenshot::ScreenshotHook), out of
+    /// [`drain_screenshot_gestures`], onto a real file in a real audited
+    /// directory, and into the real flight recorder.
+    ///
+    /// What each assertion is evidence *from*:
+    ///
+    /// 1. **One press, one file** — read off the directory, not off a counter.
+    /// 2. **Its bytes are the focused realm's view** — compared against a fresh
+    ///    encode of `Scene::compose` for that realm, so a screenshot of the
+    ///    wrong realm, or of a stale cache entry, fails. This is the assertion
+    ///    that would go green vacuously if it compared the file to itself.
+    /// 3. **Exactly one `screenshot_written`, and its digest is the digest of
+    ///    the bytes on disk** — so the journal identifies the artifact rather
+    ///    than describing an intention.
+    /// 4. **No grant, no principal, no use decision.** The rig has a grant
+    ///    table and a petition registry and this press touches neither: the
+    ///    journal carries no `use_decision` and no `grant_*` entry at all. A
+    ///    negative, so it is paired with the positive above — a run in which
+    ///    nothing happened would satisfy it.
+    #[test]
+    fn the_screenshot_chord_writes_the_focused_realms_view_and_touches_no_grant() {
+        use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "screenshot-chord",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let serve: &[&str] = &["--serve", "--seat"];
+        rig.start_realms(&[("realm-a", serve), ("realm-b", serve)]);
+        rig.pump(Duration::from_millis(400));
+        let (a, b) = (RealmId::new("realm-a"), RealmId::new("realm-b"));
+        // Two realms with visibly different content, so "it shot the focused
+        // one" is distinguishable from "it shot a realm".
+        commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
+        commit_into(&mut rig, &b, VIEW.0, VIEW.1, 0x99);
+
+        // The audited directory, opened exactly as `run_session` opens it.
+        let shots = rig.dir.join("shots");
+        std::fs::create_dir_all(&shots).expect("mkdir");
+        rig.host.runtime.kernel.screenshot_dir =
+            Some(crate::screenshot::ScreenshotDir::open(&shots).expect("a clean private dir"));
+
+        let chord = crate::chord::ModChord::parse(crate::screenshot::DEFAULT_SCREENSHOT_CHORD)
+            .expect("the default chord parses");
+        let (mods, trigger) = chord.scancodes();
+        let switch = std::cell::RefCell::new(crate::deadman::DeadManSwitch::new(
+            crate::deadman::DeadManConfig::default(),
+        ));
+        let press = |rig: &mut Rig, evdev: u32, state: KeyState| {
+            route_physical_turn(
+                &mut rig.host.runtime,
+                &rig.host.view.scenes,
+                Some(&switch),
+                crate::input::physical_key(evdev, None, state),
+                VIEW,
+                Instant::now(),
+            );
+        };
+        for evdev in &mods {
+            press(&mut rig, *evdev, KeyState::Pressed);
+        }
+        press(&mut rig, trigger, KeyState::Pressed);
+        press(&mut rig, trigger, KeyState::Released);
+        for evdev in mods.iter().rev() {
+            press(&mut rig, *evdev, KeyState::Released);
+        }
+
+        // 1. One press, one file.
+        let written: Vec<_> = std::fs::read_dir(&shots)
+            .expect("readdir")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(
+            written.len(),
+            1,
+            "one chord must write exactly one file, got {written:?}"
+        );
+        let bytes = std::fs::read(&written[0]).expect("read the screenshot");
+
+        // 2. The bytes are the FOCUSED realm's view, re-encoded independently.
+        let focused = rig
+            .host
+            .view
+            .scenes
+            .focused()
+            .cloned()
+            .expect("a realm is bound");
+        assert_eq!(
+            focused, a,
+            "the rig starts with the output on the first realm"
+        );
+        let expect_rgb = |realm: &RealmId| -> Vec<u8> {
+            rig.host
+                .view
+                .scenes
+                .scene(realm)
+                .expect("the realm has a scene")
+                .compose(VIEW.0, VIEW.1)
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect()
+        };
+        assert_eq!(
+            bytes,
+            vitrin_png::encode_rgb(VIEW.0, VIEW.1, &expect_rgb(&a)),
+            "the file must be the focused realm's view, byte for byte"
+        );
+        assert_ne!(
+            bytes,
+            vitrin_png::encode_rgb(VIEW.0, VIEW.1, &expect_rgb(&b)),
+            "...and the two realms really do compose differently, so the assertion \
+             above is about which realm was shot"
+        );
+
+        // 3. One journal entry, whose digest identifies the bytes on disk.
+        let entries = rig.entries();
+        let of_kind = |kind: &str| -> Vec<&crate::recorder::tests::Json> {
+            entries.iter().filter(|e| e.str("kind") == kind).collect()
+        };
+        let shots_logged = of_kind("screenshot_written");
+        assert_eq!(shots_logged.len(), 1, "exactly one entry per trigger");
+        let entry = shots_logged[0];
+        assert_eq!(entry.str("realm"), "realm-a");
+        assert_eq!(entry.u64("width"), u64::from(VIEW.0));
+        assert_eq!(entry.u64("height"), u64::from(VIEW.1));
+        assert_eq!(
+            entry.str("digest"),
+            crate::recorder::ObservationDigest::of(&bytes).to_hex(),
+            "the journal's digest must be the digest of the file on disk"
+        );
+        assert_eq!(
+            Some(entry.str("file")),
+            written[0].file_name().and_then(|n| n.to_str()),
+            "the entry names the file it wrote"
+        );
+        assert!(
+            of_kind("screenshot_failed").is_empty(),
+            "nothing failed on the way"
+        );
+
+        // 4. Nothing about authority happened.
+        for kind in ["use_decision", "grant_minted", "grant_removed"] {
+            assert!(
+                of_kind(kind).is_empty(),
+                "a human screenshot recorded a `{kind}`: it holds no grant and is no \
+                 principal"
+            );
         }
     }
 

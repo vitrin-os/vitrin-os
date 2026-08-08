@@ -599,6 +599,10 @@ impl<H: PreemptionHook> PreemptionHook for ClipboardHook<H> {
     fn clipboard(&self) -> Option<Rc<RefCell<ClipboardSignal>>> {
         Some(Rc::clone(&self.signal))
     }
+
+    fn screenshot(&self) -> Option<Rc<RefCell<crate::screenshot::ScreenshotSignal>>> {
+        self.inner.screenshot()
+    }
 }
 
 #[cfg(test)]

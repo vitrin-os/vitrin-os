@@ -1075,6 +1075,55 @@ pub(crate) enum Event<'a> {
         /// A fixed label from a closed vocabulary -- never free-form text.
         reason: &'static str,
     },
+    /// The human's screenshot chord wrote a file (WS-E.2.4, issue #216).
+    ///
+    /// **It journals for the same reason a capture does, and the reason is
+    /// B1.** The flight recorder identifies every observation made of a realm,
+    /// unconditionally and never sampled. A human screenshot is an observation
+    /// of the same realm that additionally leaves a file on disk that any
+    /// same-uid app can read; leaving it out would make a replay show every
+    /// agent capture and be silent about the human's, which is a hole in the
+    /// one surface this project offers for auditing what was seen.
+    ///
+    /// It carries **no principal and no grant fields, in any configuration**,
+    /// and that absence is the entry's point: a human is not a principal, and a
+    /// screenshot passed no enforcement decision, so a field naming one would
+    /// be a fiction a later reader would take for a fact.
+    ScreenshotWritten {
+        /// The realm whose view was written -- the one the human's input
+        /// follows, which is the one they are looking at.
+        realm: &'a RealmId,
+        width: u32,
+        height: u32,
+        /// BLAKE3 over the **file's bytes**, not over the pixels. The entry has
+        /// one job -- identify the artifact on disk -- and a digest of
+        /// something else could not do it. It is therefore deliberately *not*
+        /// comparable with a `use_decision`'s frame digest for the same frame;
+        /// see [`crate::capture::render_screenshot`].
+        digest: &'a ObservationDigest,
+        /// The file's name **within** the configured directory: one path
+        /// component, minted by the core from two integers
+        /// ([`crate::screenshot::ScreenshotDir::write`]). The directory itself
+        /// is not repeated per entry -- it is a session-wide constant the
+        /// startup log states once.
+        file: &'a str,
+    },
+    /// The human's screenshot chord produced no file (WS-E.2.4).
+    ///
+    /// Written for every refusing outcome -- no realm bound, no cached view,
+    /// the encoder refusing a degenerate readback, a full or unwritable
+    /// directory -- because a human asking "where did my screenshot go" has no
+    /// other instrument: the core has no surface on which to tell them. The
+    /// same argument, and the same shape, as
+    /// [`Event::ClipboardRefused`].
+    ScreenshotFailed {
+        /// The realm the gesture was aimed at, or `null` when none was bound.
+        realm: Option<&'a RealmId>,
+        /// A fixed label from a closed vocabulary -- never free-form text and
+        /// never an OS error string, which could carry bytes the core did not
+        /// choose.
+        reason: &'static str,
+    },
     /// The session's physical input was taken away from every realm
     /// (WS-E.2.2, issue #214): a lock screen went up.
     ///
@@ -1188,6 +1237,8 @@ impl Event<'_> {
             Event::ClipboardPromoted { .. } => "clipboard_promoted",
             Event::ClipboardOffered { .. } => "clipboard_offered",
             Event::ClipboardRefused { .. } => "clipboard_refused",
+            Event::ScreenshotWritten { .. } => "screenshot_written",
+            Event::ScreenshotFailed { .. } => "screenshot_failed",
             Event::SessionLocked { .. } => "session_locked",
             Event::UnlockAttempted { .. } => "unlock_attempted",
             Event::SessionUnlocked => "session_unlocked",
@@ -1559,6 +1610,27 @@ impl Event<'_> {
                     None => field_null(out, "realm"),
                 }
                 field_str(out, "gesture", gesture);
+                field_str(out, "reason", reason);
+            }
+            Event::ScreenshotWritten {
+                realm,
+                width,
+                height,
+                digest,
+                file,
+            } => {
+                field_display(out, "realm", realm);
+                field_u64(out, "width", u64::from(width));
+                field_u64(out, "height", u64::from(height));
+                field_str(out, "digest_alg", DIGEST_ALG);
+                field_str(out, "digest", &digest.to_hex());
+                field_str(out, "file", file);
+            }
+            Event::ScreenshotFailed { realm, reason } => {
+                match realm {
+                    Some(realm) => field_display(out, "realm", realm),
+                    None => field_null(out, "realm"),
+                }
                 field_str(out, "reason", reason);
             }
             Event::SessionLocked {

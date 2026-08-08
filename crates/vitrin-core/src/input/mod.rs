@@ -644,6 +644,21 @@ pub(crate) trait PreemptionHook {
     fn clipboard(
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>>;
+
+    /// The screenshot chord signal this stack carries, if any (WS-E.2.4, issue
+    /// #216).
+    ///
+    /// The same wiring accessor the two above are, for the same reason and with
+    /// the same **deliberate absence of a default**: a wrapping hook that forgot
+    /// to forward its inner hook's answer would silently report "no screenshot
+    /// chord", `Runtime::new` would fall back to a detached signal, and the
+    /// human's key would queue gestures into a `RefCell` the embedder never
+    /// drains — the key simply stops working, with every test still green. That
+    /// is `PresenceHook`'s failure exactly, and a defaulted method here would
+    /// re-open it a fourth time.
+    fn screenshot(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>>;
 }
 
 /// A policy that may **only** consume, and is never handed the observe tap
@@ -743,6 +758,13 @@ impl<G: ConsumingGate, H: PreemptionHook> PreemptionHook for GateOnlyHook<G, H> 
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
         self.inner.clipboard()
     }
+
+    /// Forwarded, for the reason above.
+    fn screenshot(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
+        self.inner.screenshot()
+    }
 }
 
 /// The terminal hook: observes nothing, consumes nothing.
@@ -775,6 +797,14 @@ impl PreemptionHook for NoopHook {
     fn clipboard(
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
+        None
+    }
+
+    /// The terminal hook owns no screenshot chord either, and says so out loud
+    /// for the reason above.
+    fn screenshot(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
         None
     }
 }
@@ -1312,6 +1342,16 @@ impl<H: PreemptionHook> InputRouter<H> {
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
         self.hook.clipboard()
+    }
+
+    /// The screenshot chord signal this router's hook stack carries (WS-E.2.4),
+    /// on the same terms as [`Self::attention`]: `Runtime::new` takes it *out of
+    /// the router it is handed*, so the embedder that drains the gestures and
+    /// the hook that queues them cannot be two different signals.
+    pub fn screenshot(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
+        self.hook.screenshot()
     }
 
     /// Set the presence tap's clock to this dispatch turn's instant.
@@ -2144,6 +2184,15 @@ fn char_keysym(ch: char) -> Option<u32> {
 /// always translates, from either path, and so are the two Super keys
 /// WS-E.1.7's attention chord is drawn from (`125`/`126` below).
 ///
+/// `KEY_SYSRQ` (99 → `XK_Print`) joined at WS-E.2.4 (issue #216) and belongs
+/// here **on this table's own terms**, not as a favour to the screenshot key:
+/// PrintScreen is one physical key at one scancode on every layout this table
+/// serves, and its keysym is not a function of any keymap. It is the only key
+/// added to the table since the core's first chord, and it is worth saying why
+/// the bar is that high — every row here is a key the core can name without a
+/// keymap, so a row that is *not* layout-invariant would let a chord mean one
+/// thing on a US layout and another on a Turkish one, silently.
+///
 /// `pub(crate)` for the two core-owned chord vocabularies, which assert against
 /// this table rather than restating it: [`crate::deadman::Chord::parse`]
 /// through [`keysym_is_intakeable`], and
@@ -2166,6 +2215,7 @@ pub(crate) fn invariant_keysym(evdev_code: u32) -> Option<u32> {
         88 => 0xffc9,                          // KEY_F12        -> XK_F12
         96 => 0xff8d,                          // KEY_KPENTER    -> XK_KP_Enter
         97 => 0xffe4,                          // KEY_RIGHTCTRL  -> XK_Control_R
+        99 => 0xff61,                          // KEY_SYSRQ      -> XK_Print
         100 => 0xffea,                         // KEY_RIGHTALT   -> XK_Alt_R
         102 => 0xff50,                         // KEY_HOME       -> XK_Home
         103 => 0xff52,                         // KEY_UP         -> XK_Up
@@ -2528,12 +2578,29 @@ pub(crate) mod tests {
         assert_eq!(invariant_keysym(68), Some(0xffc7)); // F10
         assert_eq!(invariant_keysym(87), Some(0xffc8)); // F11
         assert_eq!(invariant_keysym(88), Some(0xffc9)); // F12
+        assert_eq!(invariant_keysym(99), Some(0xff61)); // KEY_SYSRQ -> Print
         assert_eq!(invariant_keysym(105), Some(0xff51)); // Left
         assert_eq!(invariant_keysym(125), Some(0xffeb)); // Super_L
                                                          // Layout-dependent: letters, digits, punctuation.
         assert_eq!(invariant_keysym(30), None); // KEY_A
         assert_eq!(invariant_keysym(2), None); // KEY_1
         assert_eq!(invariant_keysym(51), None); // KEY_COMMA
+    }
+
+    /// WS-E.2.4 (issue #216): the screenshot chord's trigger key is reachable
+    /// from **both** halves of the table's contract — the scancode resolves,
+    /// and intake can actually deliver the keysym.
+    ///
+    /// The second half is the one that matters and the one that is easy to get
+    /// wrong by adding a `Trigger::VOCABULARY` row and forgetting this table:
+    /// `chord::Trigger::parse` refuses a key `keysym_is_intakeable` says no to,
+    /// so a session configured with such a chord would refuse to start rather
+    /// than come up with a gesture that silently never fires — but only because
+    /// this row exists.
+    #[test]
+    fn the_screenshot_trigger_is_intakeable() {
+        assert_eq!(invariant_keysym(99), Some(0xff61));
+        assert!(keysym_is_intakeable(0xff61));
     }
 
     // ------------------------------------------------------------------
@@ -3054,6 +3121,13 @@ pub(crate) mod tests {
         fn clipboard(
             &self,
         ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
+            None
+        }
+
+        // Not defaulted either, for `PreemptionHook::screenshot`'s reason.
+        fn screenshot(
+            &self,
+        ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
             None
         }
         fn gate(&mut self, input: &SeatInput) -> Gate {
@@ -3751,6 +3825,13 @@ pub(crate) mod tests {
         fn clipboard(
             &self,
         ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
+            None
+        }
+
+        // Not defaulted either, for `PreemptionHook::screenshot`'s reason.
+        fn screenshot(
+            &self,
+        ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
             None
         }
 

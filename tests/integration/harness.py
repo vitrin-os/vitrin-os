@@ -94,7 +94,7 @@ class PhysicalInputInjector:
     side.
 
     A `physical-input-injector`-feature `vitrind` invoked with
-    `--physical-input-fd N` speaks four request lines on the inherited
+    `--physical-input-fd N` speaks these request lines on the inherited
     socketpair (`crates/vitrin-core/src/input/injector.rs`)::
 
         motion <x> <y>                  (realm-view pixels)
@@ -102,6 +102,8 @@ class PhysicalInputInjector:
         scroll vertical|horizontal <v120>
         key <evdev-scancode> press|release
         attention                       (one whole tap of the configured chord)
+        clipboard promote|offer          (one whole modifier chord)
+        screenshot                       (one whole modifier chord)
 
     Each becomes a host event handed to the core's **production** intake
     (`input::intake_physical`, or `input::physical_key` for keys), tagged
@@ -118,6 +120,9 @@ class PhysicalInputInjector:
     Keys are limited to the core's layout-invariant scancode table (Escape,
     Enter, Tab, arrows, modifiers, F-keys, space) because a headless core has
     no host keymap to ask and the core is forbidden to grow one.
+
+    `screenshot` (WS-E.2.4, issue #216) is one whole chord of this run's
+    `--screenshot-chord`, on the same terms as `clipboard`.
 
     `attention` (WS-E.1.7, issue #232) is one whole tap -- press then release --
     of **this run's configured attention chord**, resolved core-side and fed to
@@ -233,6 +238,21 @@ class PhysicalInputInjector:
         self._expect_ack(
             f"clipboard {'promote' if promote else 'offer'}", 6 if promote else 4
         )
+
+    def screenshot(self) -> None:
+        """Chord the core's screenshot key (WS-E.2.4, #216).
+
+        One line is the whole configured chord -- modifiers down, trigger
+        down, trigger up, modifiers up. The ack count is the number of intake
+        events, so `ctrl+print` is 4; asserting it is what makes `ack` evidence
+        rather than decoration.
+
+        This is the line that makes issue #216's "CI cannot press a key"
+        criterion stale: it presses a REAL chord on real scancodes through the
+        same `input::physical_key` the nested backend's keyboard handler calls,
+        so the gate covers detection as well as effect.
+        """
+        self._expect_ack("screenshot", 4)
 
     def click(self, x: float, y: float, code: int | None = None) -> None:
         """Move, press, release -- the human's version of `grant.pointer.click`."""
@@ -558,6 +578,7 @@ class Core:
         capture_dump: str | os.PathLike[str] | None = None,
         consent_injector: bool = False,
         physical_input: bool = False,
+        screenshot_dir: str | os.PathLike[str] | None = None,
     ) -> None:
         self.runtime = pathlib.Path(runtime_dir or tempfile.mkdtemp(prefix="vitrin-it-"))
         self._owns_runtime = runtime_dir is None
@@ -697,6 +718,12 @@ class Core:
         # guess is worse than no gate).
         if capture_dump is not None:
             argv += ["--capture-dump", str(capture_dump)]
+        # The human's screenshot key (WS-E.2.4, issue #216). Absent = the chord
+        # is still consumed and writes nothing; present = the core audits the
+        # directory at startup and refuses to run if it is missing, a file, a
+        # symlink, or writable by group or other.
+        if screenshot_dir is not None:
+            argv += ["--screenshot-dir", str(screenshot_dir)]
         # The consent-injector channel (issue #138): an inherited AF_UNIX
         # SOCK_STREAM socketpair, one end passed to the core by NUMBER on the
         # command line. Deliberately not a bound path plus a nonce -- the

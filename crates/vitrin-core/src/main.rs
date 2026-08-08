@@ -304,6 +304,15 @@ mod realm;
 #[cfg_attr(not(test), allow(dead_code))]
 mod recorder;
 mod scene;
+/// **The human's screenshot key** (WS-E.2.4, issue #216): a core-owned chord
+/// that writes one PNG of the focused realm's view into one
+/// `--screenshot-dir`, and touches no grant at any point — there is no facet,
+/// no verb and no principal in it, because a human photographing their own
+/// screen is not an agent capability. It captures the realm view rather than
+/// human-visible output, so the session's trusted-indicator secret can never
+/// reach a file; the cost, that a vitrin screenshot cannot show a consent
+/// prompt, is published in `docs/book/src/limits.md`.
+mod screenshot;
 /// The runtime wiring (P1.M1.1, issue #77): the session state the backends'
 /// event loops carry, and the sources that make the capability kernel
 /// reachable from the wire -- the core socket's listener, one
@@ -548,6 +557,44 @@ USAGE:
                                 The sprite NEVER reaches a captured frame in
                                 either mode: it is drawn at the output stage,
                                 downstream of the composite a capture reads.
+    vitrind [--screenshot-dir PATH]
+                                Enable the human's SCREENSHOT KEY (WS-E.2.4)
+                                and write its PNGs into PATH. Absent = the key
+                                does nothing. PATH must be ABSOLUTE, exist, be
+                                a directory (not a symlink to one), be owned by
+                                root or this uid, and not be writable by group
+                                or other -- whoever can write or rename it
+                                chooses where pictures of the screen land.
+                                Startup FAILS naming the reason otherwise; the
+                                directory is opened ONCE and held, so no later
+                                rename or symlink can redirect a write. File
+                                names are minted by the core
+                                (vitrin-<epoch>-NNNN.png, mode 600) and nothing
+                                a client controls reaches a path component.
+
+                                *** A VITRIN SCREENSHOT SHOWS THE REALM ONLY.***
+                                It is the realm's view, NOT what you see: no
+                                trusted band, no consent prompt, no lock screen,
+                                no status strip, no agent cursor. The band's
+                                colour IS this session's secret, the confined
+                                app runs as this uid and can read any file the
+                                core writes, so a screenshot of it would hand a
+                                forger the one thing that tells a real prompt
+                                from a fake. You cannot screenshot a suspicious
+                                dialog; use a phone. See docs/book/src/limits.md.
+    vitrind [--screenshot-chord CHORD]
+                                The chord that takes one (WS-E.2.4).
+                                MOD[+MOD...]+KEY, same vocabulary as
+                                --lock-chord. Default: ctrl+print. NOT a bare
+                                Print -- the core's chord matcher requires a
+                                modifier, and the modifier is what leaves bare
+                                PrintScreen to the confined app. The chord is
+                                CONSUMED. Startup FAILS if its key is also
+                                --dead-man-chord's, --attention-chord's,
+                                --clipboard-key's or --lock-chord's, or if
+                                --screenshot-dir was not given (a configured
+                                gesture with nowhere to write is a key that
+                                silently does nothing).
     vitrind --help              Show this help.
     vitrind --version           Show the version.
     vitrind --print-isolation   Probe this kernel's confinement facilities --
@@ -623,6 +670,17 @@ enum Action {
         /// the top of `backend::winit::run_inner`, before the listener accepts
         /// anyone, so a bad one is still a startup failure.
         lock: lock::LockConfig,
+        /// The screenshot key's policy (WS-E.2.4, issue #216): the audited
+        /// `--screenshot-dir` (or `None`, meaning the key does nothing) and the
+        /// `--screenshot-chord` that takes one.
+        ///
+        /// Valid in **both** modes and carried on both variants, for `status`'s
+        /// reason below: a plain headless build has no device to press the
+        /// chord on, but the same command line must be accepted or refused
+        /// identically in both modes, and a `physical-input-injector` build
+        /// really can press it -- which is what gives this mechanism a
+        /// mock-free gate at all.
+        screenshot: screenshot::ScreenshotConfig,
         /// The status strip's policy (WS-E.2.3, issue #215): whether to draw
         /// one, how tall, and which clock.
         ///
@@ -712,6 +770,9 @@ enum Action {
         /// by `a_plain_build_cannot_name_the_physical_input_flag`.
         #[cfg(feature = "physical-input-injector")]
         physical_input_fd: Option<std::os::fd::RawFd>,
+        /// The screenshot key's policy (WS-E.2.4, issue #216). Accepted here
+        /// as well as on [`Action::RunNested`] -- see that variant's field.
+        screenshot: screenshot::ScreenshotConfig,
         /// The status strip's policy (WS-E.2.3, issue #215). Accepted here as
         /// well as on [`Action::RunNested`] -- see that variant's field for why
         /// this one is not backend-gated.
@@ -783,6 +844,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut attention_chord: Option<attention::AttentionChord> = None;
     let mut clipboard_key: Option<chord::Trigger> = None;
     let mut lock_chord: Option<chord::ModChord> = None;
+    let mut screenshot_dir: Option<PathBuf> = None;
+    let mut screenshot_chord: Option<chord::ModChord> = None;
     let mut lock_idle: Option<Duration> = None;
     let mut lock_passphrase: Option<PathBuf> = None;
     let mut agent_cursor = false;
@@ -873,6 +936,29 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     "`--lock-chord` requires a chord (e.g. `--lock-chord ctrl+alt+delete`)",
                 )?;
                 set_lock_chord(&mut lock_chord, value)?;
+            }
+            "--screenshot-dir" => {
+                let value = args.next().ok_or(
+                    "`--screenshot-dir` requires a directory path (e.g. \
+                     `--screenshot-dir /home/you/Pictures/vitrin`)",
+                )?;
+                set_path(
+                    &mut screenshot_dir,
+                    "--screenshot-dir",
+                    "directory path",
+                    value,
+                )?;
+            }
+            "--screenshot-chord" => {
+                let value = args.next().ok_or(
+                    "`--screenshot-chord` requires a chord (e.g. `--screenshot-chord ctrl+print`)",
+                )?;
+                set_mod_chord(
+                    &mut screenshot_chord,
+                    "--screenshot-chord",
+                    screenshot::DEFAULT_SCREENSHOT_CHORD,
+                    value,
+                )?;
             }
             "--lock-idle" => {
                 let value = args.next().ok_or(
@@ -973,6 +1059,20 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_attention_chord(&mut attention_chord, value)?;
                 } else if let Some(value) = other.strip_prefix("--clipboard-key=") {
                     set_clipboard_key(&mut clipboard_key, value)?;
+                } else if let Some(value) = other.strip_prefix("--screenshot-dir=") {
+                    set_path(
+                        &mut screenshot_dir,
+                        "--screenshot-dir",
+                        "directory path",
+                        value,
+                    )?;
+                } else if let Some(value) = other.strip_prefix("--screenshot-chord=") {
+                    set_mod_chord(
+                        &mut screenshot_chord,
+                        "--screenshot-chord",
+                        screenshot::DEFAULT_SCREENSHOT_CHORD,
+                        value,
+                    )?;
                 } else if let Some(value) = other.strip_prefix("--lock-chord=") {
                     set_lock_chord(&mut lock_chord, value)?;
                 } else if let Some(value) = other.strip_prefix("--lock-idle=") {
@@ -1068,8 +1168,10 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     }
 
     // Recorded before defaulting, because the headless refusal below asks what
-    // the OPERATOR passed and the default would answer for them.
+    // the OPERATOR passed and the default would answer for them. The screenshot
+    // chord is recorded here for the same reason one paragraph further down.
     let lock_chord_given = lock_chord.is_some();
+    let screenshot_chord_given = screenshot_chord.is_some();
     let lock_chord = match lock_chord {
         Some(chord) => chord,
         None => chord::ModChord::parse(lock::DEFAULT_LOCK_CHORD)
@@ -1126,6 +1228,85 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             ));
         }
     }
+
+    // **The fifth core-owned chord** (WS-E.2.4, issue #216). Same rule, same
+    // reason, one list longer: the dead-man watcher detects in the router's
+    // UNCONDITIONAL observe tap, so a chord sharing its key would arm the
+    // human's off-switch every time they took a screenshot, and no hook
+    // ordering can prevent that because nothing may blind that tap.
+    //
+    // Compared trigger-to-trigger, like `--lock-chord`'s check above and
+    // deliberately stricter than `ChordMatcher` needs, for that check's reason:
+    // an operator reading two flags should not have to reason about
+    // modifier-set equality to know whether their keys collide.
+    //
+    // **Not skipped under `--headless`**, unlike the lock's -- and the
+    // difference is real rather than an oversight. The lock cannot exist on
+    // that backend at all, so its DEFAULTED chord would name a flag the
+    // operator never passed; the screenshot key exists in both modes (a
+    // `physical-input-injector` build really presses it), so its chord is a
+    // thing this session owns and a collision is a thing this session has.
+    let screenshot_chord = screenshot_chord.unwrap_or_else(|| {
+        chord::ModChord::parse(screenshot::DEFAULT_SCREENSHOT_CHORD)
+            .expect("the default screenshot chord is in the vocabulary")
+    });
+    {
+        let mut owned = vec![
+            (
+                dead_man.chord.keysym(),
+                "--dead-man-chord",
+                dead_man.chord.name().to_string(),
+            ),
+            (
+                attention.keysym(),
+                "--attention-chord",
+                attention.name().to_string(),
+            ),
+            (
+                clipboard.keysym(),
+                "--clipboard-key",
+                clipboard.name().to_string(),
+            ),
+        ];
+        if !matches!(mode, Some(Mode::Headless)) {
+            owned.push((
+                lock_chord.trigger_keysym(),
+                "--lock-chord",
+                lock_chord.spelling(),
+            ));
+        }
+        for (keysym, flag, name) in owned {
+            if screenshot_chord.trigger_keysym() == keysym {
+                return Err(format!(
+                    "`--screenshot-chord` `{}` uses the same key as `{flag}` `{name}`: the \
+                     core's physical chords must not share a key. The dead-man watcher \
+                     detects in the router's UNCONDITIONAL observe tap, so a chord sharing \
+                     its key would arm the human's off-switch every time they used it -- \
+                     and no hook ordering can prevent that, because nothing is allowed to \
+                     blind that tap",
+                    screenshot_chord.spelling()
+                ));
+            }
+        }
+    }
+    // **A configured gesture with nowhere to write is a key that silently does
+    // nothing**, which is the fail-open configuration trap `Chord::parse`
+    // refuses for an undeliverable key and `realm.rs`'s loader refuses for an
+    // unauditable program. `--screenshot-dir` alone is fine (the chord
+    // defaults); `--screenshot-chord` alone is an operator who believes they
+    // configured a screenshot key.
+    if screenshot_dir.is_none() && screenshot_chord_given {
+        return Err(
+            "`--screenshot-chord` without `--screenshot-dir`: the chord would be consumed \
+             and write nothing, which is a key that silently does not work. Pass \
+             `--screenshot-dir PATH` as well, or drop the chord"
+                .into(),
+        );
+    }
+    let screenshot = screenshot::ScreenshotConfig {
+        dir: screenshot_dir,
+        chord: screenshot_chord,
+    };
 
     // **The lock is nested-only, and both halves of that are refused
     // separately because they have different reasons** (WS-E.2.2, issue #214).
@@ -1258,6 +1439,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 idle: lock_idle,
                 passphrase: lock_passphrase,
             },
+            screenshot,
             status,
         }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
@@ -1308,6 +1490,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             consent_injector_fd,
             #[cfg(feature = "physical-input-injector")]
             physical_input_fd,
+            screenshot,
             status,
         }),
         (None, Some(_)) => Err("`--size` requires `--headless`".into()),
@@ -1441,14 +1624,31 @@ fn set_clipboard_key(slot: &mut Option<chord::Trigger>, value: &str) -> Result<(
 /// other three core-owned chords lives in `parse_args`, where every half is
 /// resolved.
 fn set_lock_chord(slot: &mut Option<chord::ModChord>, value: &str) -> Result<(), String> {
+    set_mod_chord(slot, "--lock-chord", "ctrl+alt+delete", value)
+}
+
+/// Record a modifier-chord flag, rejecting a repeat and anything
+/// [`chord::ModChord::parse`] will not take.
+///
+/// One helper for `--lock-chord` (WS-E.2.2) and `--screenshot-chord`
+/// (WS-E.2.4): both take the same grammar from the same matcher, and two
+/// copies of the error text would drift into telling an operator two different
+/// vocabularies for one parser. `example` is the flag's own default, so the
+/// message shows the shape of the thing that flag actually configures.
+fn set_mod_chord(
+    slot: &mut Option<chord::ModChord>,
+    flag: &str,
+    example: &str,
+    value: &str,
+) -> Result<(), String> {
     if slot.is_some() {
-        return Err("`--lock-chord` given more than once".into());
+        return Err(format!("`{flag}` given more than once"));
     }
     let parsed = chord::ModChord::parse(value).map_err(|err| {
         let accepted: Vec<&str> = chord::Trigger::vocabulary().collect();
         format!(
-            "`--lock-chord` `{value}`: {err} (expected MOD[+MOD...]+KEY, e.g. \
-             `ctrl+alt+delete`; modifiers: ctrl, shift, alt, super; keys: {})",
+            "`{flag}` `{value}`: {err} (expected MOD[+MOD...]+KEY, e.g. \
+             `{example}`; modifiers: ctrl, shift, alt, super; keys: {})",
             accepted.join(", ")
         )
     })?;
@@ -1658,9 +1858,11 @@ fn main() -> ExitCode {
             attention,
             clipboard,
             lock,
+            screenshot,
             status,
         } => {
             init_tracing();
+            let screenshot_chord = screenshot.chord;
             run_session(
                 consent,
                 principals,
@@ -1668,10 +1870,21 @@ fn main() -> ExitCode {
                 realm,
                 shim,
                 capture_dump,
+                screenshot.dir,
                 // `--consent-injector-fd` is refused with `--nested` at parse
                 // time (issue #138), so a nested run is never instrumented.
                 false,
-                move |seed| backend::winit::run(dead_man, attention, clipboard, lock, status, seed),
+                move |seed| {
+                    backend::winit::run(
+                        dead_man,
+                        attention,
+                        clipboard,
+                        screenshot_chord,
+                        lock,
+                        status,
+                        seed,
+                    )
+                },
             )
         }
         Action::RunHeadless {
@@ -1696,9 +1909,11 @@ fn main() -> ExitCode {
             consent_injector_fd,
             #[cfg(feature = "physical-input-injector")]
             physical_input_fd,
+            screenshot,
             status,
         } => {
             init_tracing();
+            let screenshot_chord = screenshot.chord;
             #[cfg(feature = "consent-injector")]
             let instrumented = consent_injector_fd.is_some();
             #[cfg(not(feature = "consent-injector"))]
@@ -1710,6 +1925,7 @@ fn main() -> ExitCode {
                 realm,
                 shim,
                 capture_dump,
+                screenshot.dir,
                 instrumented,
                 move |seed| {
                     backend::headless::run(
@@ -1717,6 +1933,7 @@ fn main() -> ExitCode {
                         dead_man,
                         attention,
                         clipboard,
+                        screenshot_chord,
                         agent_cursor,
                         status,
                         #[cfg(feature = "consent-injector")]
@@ -1952,11 +2169,11 @@ fn block_loop_signals() -> std::io::Result<()> {
 /// - a standing, repeating warning ([`InjectorBanner`]), because a one-line
 ///   startup notice scrolls off and a session whose "interactive" consent can
 ///   be answered over a socket is not what the word normally promises.
-// Eight parameters, one over clippy's default: the run's five configured
-// paths, the consent policy, the instrumented-session marker (issue #138) and
-// the backend closure. Bundling them into a struct would hide the one thing
-// this signature is good for -- every startup input the session has is named
-// here, in the order `run_session`'s doc comment explains them.
+// Nine parameters, two over clippy's default: the run's six configured paths,
+// the consent policy, the instrumented-session marker (issue #138) and the
+// backend closure. Bundling them into a struct would hide the one thing this
+// signature is good for -- every startup input the session has is named here,
+// in the order `run_session`'s doc comment explains them.
 #[allow(clippy::too_many_arguments)]
 fn run_session<R>(
     consent: ConsentPolicy,
@@ -1965,6 +2182,7 @@ fn run_session<R>(
     realm_path: Option<PathBuf>,
     shim_path: Option<PathBuf>,
     capture_dump: Option<PathBuf>,
+    screenshot_dir: Option<PathBuf>,
     consent_injector: bool,
     backend: R,
 ) -> ExitCode
@@ -2131,6 +2349,36 @@ where
     };
     tracing::info!(shim = %shim.display(), "realm shim binary (execs the realm's app; audited at spawn)");
 
+    // The screenshot directory (WS-E.2.4, issue #216): opened and audited
+    // ONCE, here, before the listener below accepts anyone -- so no client is
+    // running when the path is resolved, and every later write is an `openat`
+    // relative to the descriptor this returns rather than a second walk of a
+    // name someone could have re-pointed in between.
+    //
+    // A refusal is fatal and names the reason. A screenshot key writing
+    // somewhere the operator did not ask for is the failure the whole audit
+    // exists to prevent, and "start anyway with the key disabled" would be a
+    // session that silently does not do what its command line says.
+    let screenshot_dir = match screenshot_dir {
+        Some(path) => match screenshot::ScreenshotDir::open(&path) {
+            Ok(dir) => {
+                tracing::info!(
+                    dir = %dir.path().display(),
+                    "screenshot key armed: it writes the REALM VIEW -- no trusted band, no \
+                     consent prompt, no lock screen, no status strip, no agent cursor. The \
+                     band's colour is this session's secret and the confined app can read \
+                     any file this core writes (see docs/book/src/limits.md)"
+                );
+                Some(dir)
+            }
+            Err(err) => {
+                tracing::error!("fatal: `--screenshot-dir {}`: {err}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     let seed = session::RuntimeSeed {
         listener,
         verifier,
@@ -2141,6 +2389,7 @@ where
         shim,
         indicator,
         capture_dump,
+        screenshot_dir,
     };
 
     let (mut recorder, result) = backend(seed);
@@ -2708,6 +2957,7 @@ mod tests {
                 attention: default_attention(),
                 clipboard: default_clipboard(),
                 lock: default_lock(),
+                screenshot: default_screenshot(),
                 status: status::StatusConfig::off(),
             })
         );
@@ -2736,6 +2986,7 @@ mod tests {
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
                 physical_input_fd: None,
+                screenshot: default_screenshot(),
                 status: status::StatusConfig::off(),
             })
         );
@@ -2764,6 +3015,7 @@ mod tests {
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
                 physical_input_fd: None,
+                screenshot: default_screenshot(),
                 status: status::StatusConfig::off(),
             })
         );
@@ -2785,6 +3037,7 @@ mod tests {
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
                 physical_input_fd: None,
+                screenshot: default_screenshot(),
                 status: status::StatusConfig::off(),
             })
         );
@@ -2816,6 +3069,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    screenshot: default_screenshot(),
                     status: status::StatusConfig::off(),
                 })
             );
@@ -2833,6 +3087,7 @@ mod tests {
                 attention: default_attention(),
                 clipboard: default_clipboard(),
                 lock: default_lock(),
+                screenshot: default_screenshot(),
                 status: status::StatusConfig::off(),
             })
         );
@@ -3123,6 +3378,7 @@ mod tests {
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
                 physical_input_fd: None,
+                screenshot: default_screenshot(),
                 status: status::StatusConfig::off(),
             })
         );
@@ -3157,6 +3413,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    screenshot: default_screenshot(),
                     status: status::StatusConfig::off(),
                 })
             );
@@ -3179,6 +3436,7 @@ mod tests {
                 attention: default_attention(),
                 clipboard: default_clipboard(),
                 lock: default_lock(),
+                screenshot: default_screenshot(),
                 status: status::StatusConfig::off(),
             })
         );
@@ -3220,6 +3478,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    screenshot: default_screenshot(),
                     status: status::StatusConfig::off(),
                 })
             );
@@ -3243,6 +3502,7 @@ mod tests {
                 attention: default_attention(),
                 clipboard: default_clipboard(),
                 lock: default_lock(),
+                screenshot: default_screenshot(),
                 status: status::StatusConfig::off(),
             })
         );
@@ -3299,6 +3559,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    screenshot: default_screenshot(),
                     status: status::StatusConfig::off(),
                 })
             );
@@ -3317,6 +3578,7 @@ mod tests {
                 attention: default_attention(),
                 clipboard: default_clipboard(),
                 lock: default_lock(),
+                screenshot: default_screenshot(),
                 status: status::StatusConfig::off(),
             })
         );
@@ -3371,6 +3633,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    screenshot: default_screenshot(),
                     status: status::StatusConfig::off(),
                 })
             );
@@ -3389,6 +3652,7 @@ mod tests {
                 attention: default_attention(),
                 clipboard: default_clipboard(),
                 lock: default_lock(),
+                screenshot: default_screenshot(),
                 status: status::StatusConfig::off(),
             })
         );
@@ -3655,6 +3919,10 @@ mod tests {
             Some(realm.clone()),
             None,
             None,
+            // No `--screenshot-dir`: this fixture is about the R6 registry
+            // guard, and a screenshot directory would be a second thing that
+            // could fail the startup it is measuring.
+            None,
             // Not an instrumented run: `--consent-injector-fd` is a headless
             // flag and this fixture drives `run_session` directly.
             false,
@@ -3692,6 +3960,7 @@ mod tests {
             Some(demo_registry),
             Some(log.clone()),
             Some(realm),
+            None,
             None,
             None,
             false,
@@ -3879,6 +4148,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    screenshot: default_screenshot(),
                     status: status::StatusConfig::off(),
                 })
             );
@@ -3948,6 +4218,7 @@ mod tests {
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
                 physical_input_fd: None,
+                screenshot: default_screenshot(),
                 status: status::StatusConfig::off(),
             })
         );
@@ -4155,6 +4426,13 @@ mod tests {
 
     /// The lock policy a command line with no `--lock-*` flag resolves to:
     /// the default chord armed, no idle raise, no passphrase.
+    /// The screenshot policy a command line with no `--screenshot-*` flag
+    /// resolves to: the default chord and **no directory**, so the key is
+    /// consumed and writes nothing (WS-E.2.4).
+    fn default_screenshot() -> screenshot::ScreenshotConfig {
+        screenshot::ScreenshotConfig::default()
+    }
+
     fn default_lock() -> lock::LockConfig {
         lock::LockConfig {
             chord: chord::ModChord::parse(lock::DEFAULT_LOCK_CHORD).expect("the default parses"),
@@ -4475,6 +4753,136 @@ mod tests {
 
         // The default chord collides with nothing a default command line has.
         assert!(parse_args(["--nested"]).is_ok());
+    }
+
+    /// The screenshot policy a run resolved, whichever mode it named.
+    fn screenshot_of(action: &Action) -> screenshot::ScreenshotConfig {
+        match action {
+            Action::RunNested { screenshot, .. } | Action::RunHeadless { screenshot, .. } => {
+                screenshot.clone()
+            }
+            other => panic!("not a run action: {other:?}"),
+        }
+    }
+
+    /// **The fifth core-owned chord's startup refusals** (WS-E.2.4, #216).
+    ///
+    /// Every one of them is a fail-open configuration trap this parser exists
+    /// to close: a screenshot key that silently never fires, or one that arms
+    /// the human's off-switch instead.
+    #[test]
+    fn a_session_never_comes_up_with_a_screenshot_key_that_cannot_fire() {
+        // The default, pinned for the reason the other four are: a session that
+        // came up with a different chord than the documented one surprises the
+        // human at the moment they are trying to use it.
+        let defaults = screenshot_of(&parse_args(["--nested"]).expect("defaults parse"));
+        assert_eq!(defaults.chord.spelling(), "ctrl+print");
+        assert_eq!(
+            defaults.dir, None,
+            "no directory unless asked for: the key is consumed and writes nothing"
+        );
+
+        // (1) A bare key is not a chord. `crate::chord` refuses one by
+        // construction, so #216's proposed bare `print` is inexpressible here
+        // rather than special-cased.
+        let err = parse_args(["--nested", "--screenshot-chord", "print"])
+            .expect_err("a bare key is not a modifier chord");
+        assert!(err.contains("at least one modifier"), "{err}");
+
+        // (2) A key outside the vocabulary, with the vocabulary in the message.
+        let err = parse_args(["--nested", "--screenshot-chord", "ctrl+q"])
+            .expect_err("`q` is layout-dependent");
+        assert!(err.contains("unknown chord key"), "{err}");
+        assert!(err.contains("print"), "the new key must be offered: {err}");
+
+        // (3) The collision refusal, against each of the four chords that came
+        // before, and REACHABLE from a plausible command line in every case:
+        // `print` is now in `chord::Trigger`'s vocabulary, so an operator can
+        // aim two gestures at it today.
+        for (flag, value) in [
+            ("--clipboard-key", "print"),
+            ("--lock-chord", "ctrl+alt+print"),
+        ] {
+            let err = parse_args([
+                "--nested",
+                "--screenshot-dir",
+                "/tmp",
+                "--screenshot-chord",
+                "ctrl+print",
+                flag,
+                value,
+            ])
+            .expect_err("two core-owned gestures on one key");
+            assert!(err.contains("print"), "{err}");
+            assert!(err.contains("observe tap"), "the WHY must be named: {err}");
+        }
+        // ...and against the off-switch, which is the one that matters most.
+        let err = parse_args([
+            "--nested",
+            "--screenshot-dir",
+            "/tmp",
+            "--screenshot-chord",
+            "ctrl+f12",
+            "--dead-man-chord",
+            "f12",
+        ])
+        .expect_err("the screenshot chord and the dead-man chord share a key");
+        assert!(err.contains("--dead-man-chord"), "{err}");
+
+        // (4) A configured gesture with nowhere to write. The chord would be
+        // consumed and produce nothing, which is a key that silently does not
+        // work -- the exact class of trap (1)-(3) exist to close.
+        let err = parse_args(["--nested", "--screenshot-chord", "ctrl+f11"])
+            .expect_err("a chord with no directory writes nothing");
+        assert!(err.contains("--screenshot-dir"), "{err}");
+        assert!(err.contains("silently"), "the WHY must be named: {err}");
+
+        // The other direction is fine: a directory alone arms the default
+        // chord, which is the ordinary way to turn the feature on.
+        let cfg = screenshot_of(
+            &parse_args(["--nested", "--screenshot-dir", "/tmp/shots"]).expect("dir alone parses"),
+        );
+        assert_eq!(cfg.dir.as_deref(), Some(Path::new("/tmp/shots")));
+        assert_eq!(cfg.chord.spelling(), "ctrl+print");
+
+        // Both spellings of both flags, and a repeat is refused rather than
+        // silently picking a winner.
+        for args in [
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--screenshot-dir",
+                "/tmp/shots",
+                "--screenshot-chord",
+                "super+f5",
+            ],
+            vec![
+                "--headless",
+                "--consent=auto-approve",
+                "--screenshot-dir=/tmp/shots",
+                "--screenshot-chord=super+f5",
+            ],
+        ] {
+            let cfg = screenshot_of(&parse_args(args.clone()).expect("both spellings parse"));
+            assert_eq!(
+                cfg.dir.as_deref(),
+                Some(Path::new("/tmp/shots")),
+                "{args:?}"
+            );
+            assert_eq!(cfg.chord.spelling(), "super+f5", "{args:?}");
+        }
+        for (flag, value) in [
+            ("--screenshot-dir", "/tmp/shots"),
+            ("--screenshot-chord", "ctrl+f11"),
+        ] {
+            let err = parse_args(["--nested", flag, value, flag, value])
+                .expect_err("a valued flag repeated must not silently pick a winner");
+            assert!(err.contains("given more than once"), "{err}");
+            assert!(
+                parse_args(["--nested", flag]).is_err(),
+                "a bare flag takes the next argument; there is none"
+            );
+        }
     }
 
     #[test]

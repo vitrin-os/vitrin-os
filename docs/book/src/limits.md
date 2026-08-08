@@ -133,11 +133,11 @@ fourth core-owned gesture for a status bar. Four further limits belong with it:
 
 **A principal cannot receive physical input either, so no client has a
 hotkey.** There is no `observe_input` verb and none is designed. The core owns
-four physical gestures — the dead-man switch, the attention key, the two
-clipboard chords and the lock chord — and owns them *precisely because* the
-human's off-switch, the human's attention gesture, a cross-realm transfer and
-the act of locking a screen must not depend on a client being alive and
-correct. A
+five physical gestures — the dead-man switch, the attention key, the two
+clipboard chords, the lock chord and the screenshot key — and owns them
+*precisely because* the human's off-switch, the human's attention gesture, a
+cross-realm transfer, the act of locking a screen and a picture of one's own
+screen must not depend on a client being alive and correct. A
 convenience hotkey is not in that class and must not borrow that warrant, so
 "Super+Tab switches windows" is not a missing feature: it would mean the core
 reserving a chord on behalf of whichever client asked first, which is
@@ -436,6 +436,75 @@ line: the dead-man switch detects in the router's unconditional observe tap, so
 a lock chord sharing its key would arm your off-switch every single time you
 locked your screen. `--lock-chord` moves it, which — as with the clipboard — is
 a different loss rather than a remedy.
+
+**A vitrin screenshot shows the realm, not what you saw — and it cannot show a
+consent prompt.** As of WS-E.2.4 there is a screenshot key: with
+`--screenshot-dir PATH`, Ctrl-PrintScreen writes one PNG of the focused realm's
+view into that directory. No grant is involved at any point — a human
+photographing their own screen is not an agent capability — and the core mints
+the filename itself, so nothing a client controls reaches a path component.
+
+What the file contains is the limit, and it is a deliberate one: **the realm's
+view only.** No trusted band, no consent card, no trusted ring, no lock screen,
+no status strip, no agent cursor. So the single most useful thing a screenshot
+does — "send me a picture of that weird dialog" — is the thing this one cannot
+do. The correct answer today is a phone camera, and that is worse than every
+other desktop offers.
+
+The reason is the trusted band, whose colour **is** this session's secret. The
+confined realm runs as the core's own uid, so any file the core writes is a
+file any app can read: a screenshot carrying the band would hand a forger the
+one thing that distinguishes a genuine consent prompt from a painted replica,
+permanently, on the first press of the key. Two softer designs were examined
+and both are worse. Cropping the band's rows out does not close it — a genuine
+consent card is framed in the same colour, in the middle of the output, so a
+crop protects the secret only while no prompt is up, which is exactly when you
+want the screenshot. Replacing every pixel equal to the secret hands the app an
+**oracle**: an app paints a field of candidate colours, you take a screenshot,
+and it reads back which of its own pixels were recoloured — a ~22-bit secret
+falls in a handful of screenshots at 1080p.
+
+Four more things belong with it:
+
+- **The screenshots are readable by every app in every realm.** They are files
+  written as your uid, and there is no sandbox (above, D9). The file mode is
+  `600`, which keeps them from *other users* and does nothing whatsoever about
+  the confined app. This page creates no new hole — that is D9 — but this
+  feature creates the files.
+- **A fifth chord is taken from every app.** Ctrl-PrintScreen is consumed in
+  every realm. It is a *chord* rather than a bare PrintScreen deliberately, and
+  that is the one cost this feature pays back: bare PrintScreen is still
+  delivered, so an app that binds it keeps it. `--screenshot-chord` moves the
+  gesture, and — as with the clipboard and the lock — that is a different loss
+  rather than a remedy. It may not share a key with any of the other four
+  gestures; startup refuses it if it does.
+- **A wrong `--screenshot-dir` puts pictures of your screen somewhere you did
+  not intend, and nothing below the core enforces the choice.** The directory
+  is audited at startup (absolute, existing, a directory, not a symlink, not
+  group- or world-writable) and then held open for the process's life, so no
+  later rename or planted symlink can redirect a write. Until E2.6/E2.7 confine
+  the core, that audit is the whole of the enforcement.
+- **The screenshot key does not work through a lock or a consent prompt** —
+  each of those consumes *all* physical input while it is up, so the chord never
+  reaches the screenshot hook. The lock one is deliberate rather than
+  incidental: a person standing at your locked machine must not be able to write
+  the session behind it to a file.
+- **Pressing it stalls the compositor for about 70 ms.** Measured, not
+  estimated: 71.7 ms in a release build to encode one 2560x1600 frame into a
+  12.3 MB PNG, and the encode runs synchronously on the event-loop thread inside
+  the input round. At 240 Hz that is roughly seventeen dropped frames — a
+  visible hitch on every press, and longer on a larger panel. It is bounded (one
+  press, one encode, no queue) and it is not a correctness problem, but a human
+  will see it. Moving the encode off the compositor thread is issue #240.
+- **It DOES work during a dead-man hold, and that is deliberate.** An earlier
+  version of this page said otherwise and was simply wrong: `DeadManHook::gate`
+  consumes only its own chord's key and delivers every other, so Ctrl+Print
+  reaches the screenshot hook mid-hold and a file is written. The behaviour is
+  the intended one — the off-switch destroys *authority*, and a human
+  photographing their own screen is not authority — but it means the dead-man
+  chord is not a way to stop a screenshot you have already started, and a
+  screenshot taken during a hold captures the session as it was before the
+  revocation landed.
 
 **Identities are static tokens.** Listed in `principals.toml`. The IDL is
 shaped for SPIFFE/OIDC credentials; the machinery is not here yet.

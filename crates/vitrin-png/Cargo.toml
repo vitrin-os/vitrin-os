@@ -1,0 +1,23 @@
+[package]
+name = "vitrin-png"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+rust-version.workspace = true
+description = "Hand-rolled, encode-only PNG writer (WS-E.2.4): 8-bit truecolor, stored-block DEFLATE, no dependencies. Shared by the golden harness and the trusted core so neither pulls an image codec (plan risk R7)."
+publish = false
+
+# Deliberately zero dependencies, and that is the whole reason this crate
+# exists as a crate. It was `vitrin-golden/src/png.rs` (P1.9.2); WS-E.2.4
+# (issue #216) gave the trusted core a screenshot key that has to write an
+# image, and "no image codec in the core, in any dependency class" is a rule
+# `crates/vitrin-core/Cargo.toml` states twice. Copying the encoder into the
+# core would have made two copies of the same arithmetic, one of them inside
+# the TCB and reviewed to a weaker bar; depending on `vitrin-golden` would
+# have put a test harness in the TCB's dependency graph. One in-tree crate,
+# reviewed once, consumed by both.
+#
+# Apache-2.0 rather than MPL-2.0: the root NOTICE puts the conformance
+# instruments on the Apache side, this file came from one of them, and an
+# MPL-2.0 core linking an Apache-2.0 crate is the direction that works.
+[dependencies]

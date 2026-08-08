@@ -1855,6 +1855,7 @@ dependencies = [
  "vitrin-png",
  "vitrin-protocol",
  "wayland-egl",
+ "xkbcommon",
 ]
 
 [[package]]

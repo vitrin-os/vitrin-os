@@ -107,6 +107,12 @@ THIRD-PARTY — not ours to license
   - crates/vitrin-core/assets/fonts/ — Liberation Sans, SIL Open Font
     License 1.1, with the license text alongside it. Vendored, not
     relicensed by anything in this file.
+  - crates/vitrin-core/tests/fixtures/keymap-*.xkb — the compiled form of
+    xkeyboard-config's `us`, `us+lv3:caps_switch_latch` and `tr` layout
+    data (MIT/X11), emitted by
+    libxkbcommon's `xkbcli compile-keymap`. Test fixtures, never linked
+    into any shipped artifact; see the README beside them for provenance
+    and how to regenerate.
   - shim/subprojects/ — wlroots and wayland-protocols and the transitive
     Meson subprojects they pull in (libdrm, pixman, libxkbcommon, wayland,
     seatd, libliftoff, libdisplay-info, v4l-utils). Only the .wrap files

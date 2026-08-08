@@ -1024,7 +1024,11 @@ mod tests {
     }
 
     fn key(keysym: u32, state: KeyState) -> SeatInputKind {
-        SeatInputKind::Key { keysym, state }
+        SeatInputKind::Key {
+            source: crate::input::KeySource::Keysym,
+            keysym,
+            state,
+        }
     }
 
     /// A grab with the fixture prompt up, shown at [`VIEW`], plus the

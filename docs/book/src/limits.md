@@ -422,12 +422,33 @@ lands the DRM backend rather than pre-empted here.
 so.** Enter dismisses it, with no authentication of any kind. The passphrase
 path exists (Argon2id, one digest per session, one journal entry per attempt
 including the failures) and it is refused at startup with `--headless`, for a
-reason worth stating plainly: **the core holds no keymap**. Letters and digits
-reach it today only because the host compositor interprets the layout in nested
-mode. On a backend with no host, the deliverable alphabet is function keys,
-arrows, editing keys and modifiers — no letter and no digit — so a passphrase
-would be unenterable, and a session that came up that way would be locked out
-rather than locked.
+reason worth stating plainly: **a headless core holds no keymap and has no
+keyboard**. Letters and digits reach a nested core only because the host
+compositor interprets the layout; with no host and no device there is nothing
+to type with at all, so a passphrase would be unenterable and a session that
+came up that way would be locked out rather than locked.
+
+**That sentence used to say "the core holds no keymap", full stop, and it was
+about to stop being true.** WS-E.3.1
+([D-028](https://github.com/vitrin-os/vitrin-os/issues/217)) puts an xkb keymap
+inside the core for the bare-metal backend — behind an off-by-default build
+feature, so a nested or headless `vitrind` links no `libxkbcommon` at all and
+this paragraph still describes it exactly. Two things follow that are worth
+knowing before that backend exists. The keymap is a **pre-compiled file an
+operator points the core at**, never a layout name: libxkbcommon's name
+resolution searches `~/.config/xkb` before the system path, and a realm's app
+runs as the core's own uid, so a name-resolved keymap would be an app-writable
+file the trusted core parses. And the core will link 383 KB of C it does not
+link today, which is a real increase in the trusted computing base, stated here
+rather than in a changelog.
+
+**Turkish, and every other layout whose letters are not Latin-1, is where this
+gets sharp.** The lock passphrase reads a keysym as a codepoint, and
+libxkbcommon reports `ğ ş ı İ` as *legacy* keysyms whose number is not their
+codepoint — while `ö ç ü` are Latin-1 and are. The core normalises both into
+one convention so all of them type, but the failure it is avoiding is worth
+naming: some of your letters working and some of them silently vanishing looks
+like a typo, not a bug, and it would be discovered at a lock screen.
 
 **A fourth chord is now taken from every app, and it constrains the other
 three.** Ctrl-Alt-Delete is consumed in every realm. It also means

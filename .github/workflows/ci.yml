@@ -3,7 +3,9 @@ name: CI
 # Phase-1 pipeline (P1.9.1). Jobs mirror the components the issue names, so
 # each acceptance criterion is a visible check on every PR:
 #
-#   rust          fmt + clippy + workspace tests (debug AND release)
+#   rust          fmt + clippy + workspace tests (debug AND release), plus
+#                 two feature slices: gpu-tests (compile-check only) and
+#                 session-keymap (clippy + tests, WS-E.3.1/D-028)
 #   codegen-diff  IDL schema validation + regeneration honesty (the P1.1.2
 #                 contract: checked-in generated code matches vitrin-v0.xml)
 #   shim          the C side, in a container with NO Rust toolchain -- the
@@ -149,6 +151,25 @@ jobs:
         # linking, so the runner needs no libgbm/EGL (gbm-sys links only at
         # final-binary link time, which check/clippy skip).
         run: cargo clippy -p vitrin-core --all-targets --features gpu-tests -- -D warnings
+
+      - name: vitrin-core session-keymap slice (clippy + tests)
+        # The core's own xkb keymap (WS-E.3.1, decision D-028) hides behind
+        # the `session-keymap` feature, because linking libxkbcommon into a
+        # nested or headless TCB is exactly what the gate exists to prevent
+        # -- every step above therefore builds WITHOUT it, and that is the
+        # measurement the feature's whole cost argument rests on (`readelf -d
+        # target/release/vitrind` must show no NEEDED entry matching `xkb`).
+        #
+        # But two of issue #217's four required unit tests -- a Shift-held
+        # press resolving to `A`, and the resolve-before-update ordering --
+        # cannot exist without a keymap, so they would run nowhere at all
+        # without this step. Unlike the gpu-tests slice above this one really
+        # RUNS the tests: libxkbcommon-dev is already installed for the
+        # winit backend, the keymaps are checked-in fixtures, and none of it
+        # needs a seat or a device.
+        run: |
+          cargo clippy -p vitrin-core --all-targets --features session-keymap -- -D warnings
+          cargo test -p vitrin-core --features session-keymap
 
   codegen-diff:
     name: codegen-diff (IDL schema + regeneration honesty)

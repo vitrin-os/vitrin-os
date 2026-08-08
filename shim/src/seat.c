@@ -74,7 +74,18 @@ _Static_assert(VITRIN_ORIGIN_UNSET == 0,
  * event individually (the host's own auto-repeat included), and agent text
  * is a run of explicit press/release pairs. A client repeat timer running
  * on top of that would invent keystrokes nobody sent -- which is precisely
- * the "no duplicates" the acceptance criteria demand. */
+ * the "no duplicates" the acceptance criteria demand.
+ *
+ * This stays 0 on a bare-metal core too, and that is a decision rather than
+ * an omission (vitrin decision D-028(5), issue #217). Off a host there IS no
+ * host auto-repeat: libinput synthesizes none, so a held key would not repeat
+ * at all. Re-enabling `wlr_keyboard_set_repeat_info` here is the
+ * architecturally correct Wayland answer and is refused because repeat is
+ * SEAT-WIDE: this seat carries an agent's actuations beside the human's, the
+ * repeat machinery cannot see the per-event `origin` tag, and repeating an
+ * agent's held key is exactly the invented keystroke the paragraph above
+ * forbids. The core repeats instead, for physical-origin presses only,
+ * because it is the only side that still has the tag. */
 #define VITRIN_REPEAT_RATE_HZ 0
 #define VITRIN_REPEAT_DELAY_MS 0
 

@@ -749,7 +749,7 @@ impl DeadManSwitch {
         if input.origin() != Origin::Physical {
             return;
         }
-        let SeatInputKind::Key { keysym, state } = input.kind() else {
+        let SeatInputKind::Key { keysym, state, .. } = input.kind() else {
             return;
         };
         if *keysym != self.config.chord.keysym {
@@ -991,7 +991,7 @@ impl DeadManSwitch {
         if input.origin() != Origin::Physical {
             return Gate::Deliver;
         }
-        let SeatInputKind::Key { keysym, state } = input.kind() else {
+        let SeatInputKind::Key { keysym, state, .. } = input.kind() else {
             return Gate::Deliver;
         };
         if *keysym != self.config.chord.keysym {

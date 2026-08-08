@@ -109,7 +109,7 @@
 //! the app never saw pressed, and no delivered press is ever left
 //! stranded by someone else's release.
 //!
-//! **Keys pair the same way, per keysym.** Keys carry no geometry, so they
+//! **Keys pair the same way, per key.** Keys carry no geometry, so they
 //! never route on position — but the razor above is not about geometry, it
 //! is about the app's press/release accounting, and a keyboard has exactly
 //! the same accounting. Without pairing, any policy that stops a key
@@ -117,13 +117,34 @@
 //! promises to reconcile what it stops) would leave the app believing a
 //! key is still held: a latched `Ctrl`/`Alt`/`Super` silently rewrites the
 //! meaning of every keystroke the app receives afterwards, and a latched
-//! letter autorepeats. So the router tracks the keysyms whose press it
+//! letter autorepeats. So the router tracks the keys whose press it
 //! delivered and drops any release that does not pair with one, exactly as
-//! it does for button codes. Pairing by keysym rather than by scancode is
-//! sound here because [`invariant_keysym`] is a fixed scancode→keysym
-//! table with no modifier resolution — the same physical key yields the
-//! same keysym on press and on release, by construction. If the core ever
-//! grows a real keymap, pairing must move to the scancode.
+//! it does for button codes.
+//!
+//! **What a press and its release pair BY is now the key, not the keysym**
+//! (WS-E.3.1, issue #217, decision D-028(3) — this paragraph is the
+//! discharge of the warning that used to stand here). It was the keysym for
+//! as long as every key in this core came from a fixed scancode→keysym table
+//! or from a host that had already resolved it, so the same physical key
+//! yielded the same keysym on press and on release by construction. A real
+//! keymap ([`keymap::CoreKeymap`]) breaks that: press `a` with Shift held,
+//! release it after Shift is up, and the release resolves to `a` where the
+//! press resolved to `A`. Pairing by keysym would find nothing, drop the
+//! release, and leave the app holding a key forever. So an event carries a
+//! [`KeySource`] — the evdev scancode where a device is behind it, the
+//! keysym where none is (an agent's actuation names a keysym and nothing
+//! else) — and [`RealmSeat::pressed_keys`] pairs on that.
+//!
+//! **And the release delivers the PRESS's keysym**, which is the half that
+//! is easy to stop one step short of. Pairing correctly inside the core is
+//! worth nothing if the wire then carries `a` for a release whose press
+//! carried `A`: the shim binds a dynamic keycode per keysym (`shim/src/
+//! seat.c`), so the app would be told to release a keycode it never held
+//! while the one it *is* holding stays down — the same latched key, one
+//! layer further out, where the core can no longer see it. The pairing
+//! entry therefore remembers the delivered keysym ([`HeldKey`]) and both the
+//! ordinary release path and the drains send that one back. The drains
+//! always did; the ordinary path had no reason to until now.
 //!
 //! # The preemption hook (defined now, consumed by P1.7.x)
 //!
@@ -245,10 +266,18 @@
 //!
 //! The full argument, including what stays session-wide and what a bind
 //! change costs the app it leaves, is on [`InputRouter`] itself.
-//! - **Keyboard interpretation never lands here.** Keys travel as
-//!   xkbcommon keysyms and the core does *no keymap interpretation* (IDL
-//!   `vitrin_shim_seat.key`); see [`invariant_keysym`] for what nested
-//!   intake can honestly translate today and why.
+//! - **Keyboard interpretation is a per-backend property, not a core
+//!   property** — and saying otherwise was the substance of what WS-E.3.1
+//!   (issue #217, decision D-028) had to correct in the IDL. Keys travel as
+//!   xkbcommon keysyms in every configuration, and the wire is unchanged.
+//!   *Where the keysym came from* differs: nested mode gets it from winit's
+//!   already-interpreted `logical_key` ([`host_keysym`], issue #118) and the
+//!   core interprets nothing; headless has no keyboard; and a bare-metal
+//!   backend gets an evdev scancode from libinput and nothing else, so the
+//!   core resolves it itself through [`keymap::CoreKeymap`]. See
+//!   [`invariant_keysym`] for the fixed subset every backend can translate
+//!   with no keymap at all, which is the one the core's own chords are
+//!   drawn from.
 
 use smithay::backend::input as host;
 use smithay::backend::input::{
@@ -267,11 +296,101 @@ use crate::scene::layout;
 /// domain, the kernel's `KEY_*` constants are not.
 const XKB_KEYCODE_OFFSET: u32 = 8;
 
+/// The `keysymdef.h` convention for a keysym that is not its own codepoint:
+/// codepoints below `0x100` are their own keysym, everything else is
+/// `0x0100_0000 | codepoint`.
+///
+/// One definition for the whole core, because three places now depend on the
+/// same convention and a convention spelled three times drifts:
+/// [`host_keysym`] encodes nested input with it, [`keymap::CoreKeymap`]
+/// normalises a real keymap's legacy keysyms into it (D-028(1)), and
+/// [`crate::lock::gate`]'s `printable` decodes the lock passphrase with it.
+pub(crate) const UNICODE_KEYSYM_BASE: u32 = 0x0100_0000;
+
 /// Continuous (pixel-delta) scroll converted to wire `value120`: one wheel
 /// notch = 120 = 15 pixels, the conventional libinput/toolkit equivalence.
 /// Any fixed choice works; this one keeps a three-notch wheel and a 45 px
 /// touchpad fling the same size in the app.
 const V120_PER_SCROLL_PIXEL: f64 = 120.0 / 15.0;
+
+/// What is behind a key event — the question "what does this release pay
+/// down?" (D-028(3), issue #217).
+///
+/// Until the core grew a keymap, the answer was always "the keysym", and
+/// that was sound because [`invariant_keysym`] is a fixed table with no
+/// modifier resolution: the same physical key produced the same keysym on
+/// press and on release, by construction. A real keymap breaks it — press
+/// `a` with Shift down, release it after Shift is up, and the release
+/// resolves to `a` where the press resolved to `A` — so the identity has to
+/// come from the device instead. This enum is that identity, and it is a
+/// type rather than an `Option<u32>` so that "which of the two keys does
+/// this event pair by" has one answer per event and no default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeySource {
+    /// A real key on a real keyboard, named by its **evdev** scancode (the
+    /// kernel's `KEY_*` domain, xkb's minus [`XKB_KEYCODE_OFFSET`]). Pairs
+    /// by that number, so a press and its release pair however the modifier
+    /// state moved in between.
+    Device(u32),
+    /// No device behind it: an agent's chokepoint-admitted key actuation,
+    /// or a core-synthesised one. Pairs by keysym, which is the only
+    /// identity such an event has — and it is sound for the same reason it
+    /// used to be sound for everything: an actuator names a keysym directly,
+    /// so it names the same one on the way back up.
+    ///
+    /// Unconstructed outside tests today, and carrying the same
+    /// `allow(dead_code)` [`SeatInput::emulated`] carries for the same
+    /// reason: v0's agent actuation path is `vitrin_shim_seat.text`, not
+    /// `key` (the IDL says so in as many words), so every key event a
+    /// shipping build produces has a real key behind it. The variant is here
+    /// because [`RealmSeat::pressed_keys`]'s whole mixed-origin argument is
+    /// about the day that stops being true, and because the alternative — a
+    /// bare `u32` scancode — would force an agent's keysym-only actuation to
+    /// invent one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Keysym,
+}
+
+impl KeySource {
+    /// The identity this event's press and release pair by.
+    fn pairing(self, keysym: u32) -> KeyPairing {
+        match self {
+            Self::Device(scancode) => KeyPairing::Scancode(scancode),
+            Self::Keysym => KeyPairing::Keysym(keysym),
+        }
+    }
+}
+
+/// A key's pairing identity, as stored in [`RealmSeat::pressed_keys`].
+///
+/// Two variants rather than one `u32` because the two spaces genuinely do
+/// not overlap and must never be compared: evdev 30 is `KEY_A` and keysym 30
+/// is nothing at all, so a `Scancode(30)` press must not be paid down by a
+/// `Keysym(30)` release. Deriving it from [`KeySource`] rather than storing
+/// it at construction is what keeps the two consistent — there is no way to
+/// hand-build an entry whose pairing disagrees with its event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyPairing {
+    Scancode(u32),
+    Keysym(u32),
+}
+
+/// One delivered-and-unreleased key press ([`RealmSeat::pressed_keys`]).
+///
+/// Three fields where there used to be two, and the third is the correction
+/// D-028(3) forces: the entry remembers **the keysym the app was actually
+/// told about**, so both the ordinary release path and the drains can send
+/// that one back. Sending the *release's own* keysym would hand the shim a
+/// keysym it never bound a keycode for, and the app would keep the press's
+/// keycode held forever — the same latched-modifier failure the pairing
+/// table exists to prevent, moved one layer down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldKey {
+    pairing: KeyPairing,
+    /// The keysym delivered with the press.
+    keysym: u32,
+    origin: Origin,
+}
 
 /// What one input event *does*, in realm-view coordinates, with no origin
 /// attached — the payload half of [`SeatInput`]. Only ever travels wrapped
@@ -285,8 +404,15 @@ pub(crate) enum SeatInputKind {
     Button { button: u32, state: ButtonState },
     /// High-resolution scroll; one wheel notch = ±120.
     Scroll { axis: Axis, value120: i32 },
-    /// A key as an xkbcommon keysym, already modifier-resolved.
-    Key { keysym: u32, state: KeyState },
+    /// A key as an xkbcommon keysym, already modifier-resolved — plus what
+    /// the router pairs its press and release by ([`KeySource`]). The keysym
+    /// is what goes on the wire; the source is what makes the release find
+    /// its own press once a keymap can resolve the two differently.
+    Key {
+        source: KeySource,
+        keysym: u32,
+        state: KeyState,
+    },
     /// A Unicode string (the agent text-actuation path in v0; human
     /// input-method text becomes its physical twin in a later phase).
     /// Constructed by the enforcement chokepoint's actuation intake
@@ -1099,7 +1225,7 @@ pub(crate) struct RealmSeat {
     /// per-code, never per-`(code, origin)`: the app has one pointer, and
     /// its grab state counts presses, not who made them.
     pressed: Vec<(u32, Origin)>,
-    /// Delivered-and-unreleased key presses as `(keysym, origin)`, same
+    /// Delivered-and-unreleased key presses as [`HeldKey`], same
     /// multiset discipline as [`Self::pressed`] and for the same razor: a key
     /// release is delivered iff its own press was (module docs). Keys hold
     /// no implicit grab — they carry no geometry — so this is *only*
@@ -1115,10 +1241,10 @@ pub(crate) struct RealmSeat {
     /// one: minting `Origin::Physical` for an agent's key would forge the
     /// physical-vs-emulated distinction (B2) on the wire *and* in the flight
     /// recorder — the exact thing [`SeatInput::physical`]'s privacy makes a
-    /// compile error at intake. Pairing itself stays per-keysym, not
-    /// per-`(keysym, origin)`: the app has one keyboard, and its latch state
+    /// compile error at intake. Pairing itself stays per-[`KeyPairing`], not
+    /// per-`(pairing, origin)`: the app has one keyboard, and its latch state
     /// counts presses, not who made them.
-    pressed_keys: Vec<(u32, Origin)>,
+    pressed_keys: Vec<HeldKey>,
 }
 
 impl RealmSeat {
@@ -1135,25 +1261,31 @@ impl RealmSeat {
         }
     }
 
-    /// Remove one delivered-press entry for `keysym`, if any; returns
-    /// whether one existed (i.e. whether a release of this keysym pairs
-    /// with a delivered press). The keyboard twin of
+    /// Remove one delivered-press entry matching `pairing`, if any, and
+    /// return **the keysym that press delivered**. `None` means this release
+    /// pairs with nothing the app was told about. The keyboard twin of
     /// [`Self::release_pressed`].
     ///
-    /// Matches on the keysym alone, never on the origin: the app has one
-    /// keyboard and its latch state counts presses, so a release must be able
-    /// to pay down any outstanding press of that keysym. The entry's tag is
-    /// carried for the benefit of the drains, which are the only readers of
-    /// it — see [`Self::pressed_keys`] for the bound on how far a
-    /// mixed-origin overlap can skew it.
-    fn release_pressed_key(&mut self, keysym: u32) -> bool {
-        match self.pressed_keys.iter().position(|&(k, _)| k == keysym) {
-            Some(i) => {
-                self.pressed_keys.remove(i);
-                true
-            }
-            None => false,
-        }
+    /// Two things it deliberately does not match on.
+    ///
+    /// Not the **origin**: the app has one keyboard and its latch state
+    /// counts presses, so a release must be able to pay down any outstanding
+    /// press of that key. The entry's tag is carried for the benefit of the
+    /// drains, which are the only readers of it — see [`Self::pressed_keys`]
+    /// for the bound on how far a mixed-origin overlap can skew it.
+    ///
+    /// Not the release's own **keysym** (D-028(3)): under a real keymap the
+    /// release of a key pressed with Shift down resolves to a different
+    /// keysym than its press did, so matching on it would drop the release,
+    /// leave a phantom entry here, and latch a key in the app. The keysym
+    /// the caller wants is the one this returns — the press's — because
+    /// that is the one the shim bound a keycode for.
+    fn release_pressed_key(&mut self, pairing: KeyPairing) -> Option<u32> {
+        let i = self
+            .pressed_keys
+            .iter()
+            .position(|e| e.pairing == pairing)?;
+        Some(self.pressed_keys.remove(i).keysym)
     }
 
     /// Whether the last known pointer position lies over the placed
@@ -1568,11 +1700,16 @@ impl<H: PreemptionHook> InputRouter<H> {
     /// this module can otherwise observe it without consuming it (the drains
     /// drain).
     #[cfg(test)]
-    pub fn held_keys(&self, realm: &crate::grants::RealmId) -> &[(u32, Origin)] {
+    pub fn held_keys(&self, realm: &crate::grants::RealmId) -> Vec<(u32, Origin)> {
         self.seats
             .get(realm)
-            .map(|seat| seat.pressed_keys.as_slice())
-            .unwrap_or(&[])
+            .map(|seat| {
+                seat.pressed_keys
+                    .iter()
+                    .map(|e| (e.keysym, e.origin))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The buttons the router believes `realm`'s app is holding, same
@@ -1648,16 +1785,20 @@ impl<H: PreemptionHook> InputRouter<H> {
         let Some(seat) = self.seats.get_mut(realm) else {
             return released;
         };
-        seat.pressed_keys.retain(|&(keysym, origin)| {
-            if origin != Origin::Physical {
+        seat.pressed_keys.retain(|entry| {
+            if entry.origin != Origin::Physical {
                 return true;
             }
             released.push(SeatDelivery {
                 // The tag is read back off the entry, never minted: see the
                 // origin argument above.
-                origin,
+                origin: entry.origin,
                 kind: SeatDeliveryKind::Key {
-                    keysym,
+                    // And so is the keysym — the one the PRESS delivered, so
+                    // the app releases the keycode it is actually holding
+                    // (D-028(3)). This was already true here and is now true
+                    // of the ordinary release path too.
+                    keysym: entry.keysym,
                     state: KeyState::Released,
                 },
             });
@@ -1870,10 +2011,11 @@ impl<H: PreemptionHook> InputRouter<H> {
                         seat.release_pressed(*button);
                     }
                     SeatInputKind::Key {
+                        source,
                         keysym,
                         state: KeyState::Released,
                     } => {
-                        seat.release_pressed_key(*keysym);
+                        seat.release_pressed_key(source.pairing(*keysym));
                     }
                     _ => {}
                 }
@@ -1895,19 +2037,37 @@ impl<H: PreemptionHook> InputRouter<H> {
             // iff its own press was, per keysym, so no policy that stops a
             // key release can leave a latched modifier behind in the app
             // (module docs).
-            SeatInputKind::Key { keysym, state } => match state {
+            SeatInputKind::Key {
+                source,
+                keysym,
+                state,
+            } => match state {
                 KeyState::Pressed => {
                     // The tag rides into the pairing table with the press, so
                     // whatever synthesises this key's release later reads it
                     // back rather than assuming one ([`RealmSeat::pressed_keys`]).
-                    seat.pressed_keys.push((keysym, origin));
+                    // So does the keysym, for the release below.
+                    seat.pressed_keys.push(HeldKey {
+                        pairing: source.pairing(keysym),
+                        keysym,
+                        origin,
+                    });
                     SeatDeliveryKind::Key { keysym, state }
                 }
                 KeyState::Released => {
-                    if !seat.release_pressed_key(keysym) {
-                        return None;
+                    // Two things happen here, and the second is D-028(3).
+                    // The release pairs by the KEY (scancode where a device
+                    // is behind it), so a modifier that moved between press
+                    // and release cannot make it miss. And what goes on the
+                    // wire is the keysym the PRESS delivered, not this
+                    // event's own: the shim bound a keycode for that one, so
+                    // sending any other would leave the app holding a key it
+                    // is never told to release.
+                    let pressed_keysym = seat.release_pressed_key(source.pairing(keysym))?;
+                    SeatDeliveryKind::Key {
+                        keysym: pressed_keysym,
+                        state,
                     }
-                    SeatDeliveryKind::Key { keysym, state }
                 }
             },
             SeatInputKind::Text { text } => SeatDeliveryKind::Text { text },
@@ -2101,6 +2261,48 @@ pub(crate) fn physical_key(
     }
 }
 
+/// Mint the physical [`SeatInput`]s for one keyboard event a **libinput
+/// backend** delivered, resolving it through the core's own keymap
+/// (WS-E.3.1, decision D-028(1)).
+///
+/// The bare-metal twin of [`physical_key`], and the third of the three key
+/// paths this crate now has: the synthetic-backend table, nested's
+/// `logical_key`, and this. It mints the same `Origin::Physical` tag through
+/// the same [`SeatInput::physical`] constructor and produces the same
+/// [`KeySource::Device`] pairing identity, so nothing downstream — the
+/// router, the chord matchers, the drains, the recorder — can tell which
+/// backend a key came from, which is the whole reason the wire needed no
+/// change.
+///
+/// Feature-gated with `CoreKeymap` itself: see `Cargo.toml`'s
+/// `session-keymap` block for why nested and headless must not pay for it.
+/// #218 (WS-E.3.2) is the caller.
+#[cfg(feature = "session-keymap")]
+#[allow(
+    dead_code,
+    reason = "WS-E.3.2 (#218) adds the libinput arm that calls it"
+)]
+pub(crate) fn keymap_key(
+    keymap: &mut keymap::CoreKeymap,
+    evdev: u32,
+    state: KeyState,
+) -> Vec<SeatInput> {
+    match keymap.resolve(evdev, state) {
+        Some(keysym) => vec![SeatInput::physical(SeatInputKind::Key {
+            source: KeySource::Device(evdev),
+            keysym,
+            state,
+        })],
+        None => {
+            tracing::trace!(
+                evdev,
+                "key dropped at intake: the keymap binds no symbol to it"
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Resolve one keyboard event to its wire [`SeatInputKind`], preferring the
 /// host's interpreted `host_keysym` and falling back to the layout-invariant
 /// scancode table ([`invariant_keysym`]). `None` when neither yields a keysym —
@@ -2112,14 +2314,27 @@ fn resolve_key_seat(
     state: KeyState,
 ) -> Option<SeatInputKind> {
     let keysym = host_keysym.or_else(|| invariant_keysym(evdev))?;
-    Some(SeatInputKind::Key { keysym, state })
+    Some(SeatInputKind::Key {
+        // There is a real key behind this, so it pairs by the scancode
+        // (D-028(3)) — even in nested mode, where the host's interpretation
+        // happens to be stable across a press/release pair today. Making the
+        // nested path depend on that stability would be relying on the
+        // *host's* keymap not changing under it, which is not the core's to
+        // promise.
+        source: KeySource::Device(evdev),
+        keysym,
+        state,
+    })
 }
 
 /// Resolve winit's interpreted `logical_key` to an X keysym — the #118 seam
 /// that lets nested typing carry layout-*dependent* keys (letters, digits,
-/// punctuation) at all: producing their keysym needs the interpretation the
-/// host's keymap already performed, which the core is forbidden to redo (no
-/// keymap lives here; see [`invariant_keysym`]).
+/// punctuation) at all: producing their keysym needs an interpretation, and
+/// under a host the host has already done it — redoing it here would mean
+/// disagreeing with the compositor the human is actually typing into. A
+/// *bare-metal* core has no such host and does its own, through
+/// [`keymap::CoreKeymap`] (D-028); this seam is nested's, and
+/// [`invariant_keysym`] is the subset both share.
 ///
 /// Only [`smithay::reexports::winit::keyboard::Key::Character`] resolves to
 /// something — a named key (`Enter`, `ArrowLeft`, a bare modifier) or a dead
@@ -2171,14 +2386,17 @@ fn char_keysym(ch: char) -> Option<u32> {
 /// every keyboard layout. This is a fixed constant table (kernel
 /// `input-event-codes.h` on the left, X11 `keysymdef.h` on the right) —
 /// the keyboard analogue of the evdev `BTN_*` codes the button path
-/// already speaks — **not** keymap interpretation, which the IDL keeps out
-/// of the core (`vitrin_shim_seat.key`: keysyms travel the wire precisely
-/// so no keymap lives here).
+/// already speaks — **not** keymap interpretation. It is what every backend
+/// can name *without* a keymap, which is a narrower and more durable claim
+/// than the one the IDL used to make (D-028 corrected "no keymap
+/// interpretation happens inside the core": a bare-metal backend does its
+/// own, through [`keymap::CoreKeymap`]). This table is what the core's own
+/// chords are drawn from precisely because it is the part no keymap moves.
 ///
 /// Layout-*dependent* keys (letters, digits, punctuation) return `None`
-/// here, because producing their keysym requires the interpreted key the
-/// host already computed — [`host_keysym`] resolves those, and
-/// [`resolve_key_seat`] prefers it over this table. This subset is chosen so
+/// here. Under a host, [`host_keysym`] resolves those and
+/// [`resolve_key_seat`] prefers it over this table; on bare metal
+/// [`keymap_key`] resolves them instead. This table never guesses at one. This subset is chosen so
 /// the consent / revocation paths never depend on the host resolving
 /// anything: Escape — P1.7.3's hold-Esc chord — is layout-invariant and
 /// always translates, from either path, and so are the two Super keys
@@ -2256,6 +2474,15 @@ pub(crate) fn keysym_is_intakeable(keysym: u32) -> bool {
     (0u32..256).any(|code| invariant_keysym(code) == Some(keysym))
 }
 
+/// The core's own keymap (WS-E.3.1, issue #217; decision D-028) — the state
+/// machine that turns an evdev scancode into a keysym on a backend that has
+/// no host to have done it already. Gated on `session-keymap` in full,
+/// because linking `libxkbcommon.so.0` into the TCB is exactly what a nested
+/// or headless build must not do; see the feature's block in `Cargo.toml`
+/// for the measured cost and the two structural bounds on what it may read.
+#[cfg(feature = "session-keymap")]
+pub(crate) mod keymap;
+
 /// A synthetic Smithay input backend, shared by this module's unit tests and
 /// by the `physical-input-injector` build — see the module's own docs for why
 /// there is exactly one copy.
@@ -2315,12 +2542,19 @@ pub(crate) mod tests {
 
     /// XK_Escape — the default dead-man chord.
     pub(crate) const CHORD_KEYSYM: u32 = 0xff1b;
+    /// The scancode that keysym comes off — `KEY_ESC`. Named because the
+    /// fixtures below now carry a [`KeySource::Device`], and a scancode that
+    /// did not match its keysym would make every one of them a fiction.
+    const CHORD_EVDEV: u32 = 1;
     /// XK_Return — a layout-invariant key that is *not* the chord.
     const NON_CHORD_KEYSYM: u32 = 0xff0d;
+    /// `KEY_ENTER`, the scancode `NON_CHORD_KEYSYM` comes off.
+    const NON_CHORD_EVDEV: u32 = 28;
 
     /// The human pressing the dead-man chord key.
     pub(crate) fn chord_press() -> SeatInput {
         SeatInput::physical(SeatInputKind::Key {
+            source: KeySource::Device(CHORD_EVDEV),
             keysym: CHORD_KEYSYM,
             state: KeyState::Pressed,
         })
@@ -2329,6 +2563,7 @@ pub(crate) mod tests {
     /// The human releasing it.
     pub(crate) fn chord_release() -> SeatInput {
         SeatInput::physical(SeatInputKind::Key {
+            source: KeySource::Device(CHORD_EVDEV),
             keysym: CHORD_KEYSYM,
             state: KeyState::Released,
         })
@@ -2338,6 +2573,7 @@ pub(crate) mod tests {
     /// switch.
     pub(crate) fn emulated_chord_press() -> SeatInput {
         SeatInput::emulated(SeatInputKind::Key {
+            source: KeySource::Keysym,
             keysym: CHORD_KEYSYM,
             state: KeyState::Pressed,
         })
@@ -2347,6 +2583,7 @@ pub(crate) mod tests {
     /// the human has in progress.
     pub(crate) fn emulated_chord_release() -> SeatInput {
         SeatInput::emulated(SeatInputKind::Key {
+            source: KeySource::Keysym,
             keysym: CHORD_KEYSYM,
             state: KeyState::Released,
         })
@@ -2360,6 +2597,7 @@ pub(crate) mod tests {
     /// A physical key that is not the chord.
     pub(crate) fn other_key_press() -> SeatInput {
         SeatInput::physical(SeatInputKind::Key {
+            source: KeySource::Device(NON_CHORD_EVDEV),
             keysym: NON_CHORD_KEYSYM,
             state: KeyState::Pressed,
         })
@@ -2368,6 +2606,7 @@ pub(crate) mod tests {
     /// Its release.
     pub(crate) fn other_key_release() -> SeatInput {
         SeatInput::physical(SeatInputKind::Key {
+            source: KeySource::Device(NON_CHORD_EVDEV),
             keysym: NON_CHORD_KEYSYM,
             state: KeyState::Released,
         })
@@ -2421,6 +2660,7 @@ pub(crate) mod tests {
         assert_eq!(
             flat[2].kind(),
             &SeatInputKind::Key {
+                source: KeySource::Device(28),
                 keysym: 0xff0d, // KEY_ENTER -> XK_Return
                 state: KeyState::Pressed,
             }
@@ -2488,6 +2728,7 @@ pub(crate) mod tests {
         assert_eq!(
             esc[0].kind(),
             &SeatInputKind::Key {
+                source: KeySource::Device(1),
                 keysym: 0xff1b,
                 state: KeyState::Released,
             }
@@ -2507,6 +2748,7 @@ pub(crate) mod tests {
         assert_eq!(
             physical_key(30, Some(0x0061), KeyState::Pressed)[0].kind(),
             &SeatInputKind::Key {
+                source: KeySource::Device(30),
                 keysym: 0x0061,
                 state: KeyState::Pressed,
             },
@@ -2516,6 +2758,7 @@ pub(crate) mod tests {
         assert_eq!(
             resolve_key_seat(1, Some(0x0041), KeyState::Pressed),
             Some(SeatInputKind::Key {
+                source: KeySource::Device(1),
                 keysym: 0x0041,
                 state: KeyState::Pressed,
             }),
@@ -2524,6 +2767,7 @@ pub(crate) mod tests {
         assert_eq!(
             resolve_key_seat(1, None, KeyState::Released),
             Some(SeatInputKind::Key {
+                source: KeySource::Device(1),
                 keysym: 0xff1b,
                 state: KeyState::Released,
             }),
@@ -2964,6 +3208,7 @@ pub(crate) mod tests {
             .is_none());
         let key = router.route_physical(
             phys(SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym: 0xff0d,
                 state: KeyState::Pressed,
             }),
@@ -3072,6 +3317,7 @@ pub(crate) mod tests {
         assert!(router.route_physical(phys(scroll()), view, None).is_none());
         let key = router.route_physical(
             phys(SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym: 0xff1b,
                 state: KeyState::Pressed,
             }),
@@ -3375,6 +3621,7 @@ pub(crate) mod tests {
             .route_physical(phys(press()), view, surface)
             .is_some());
         let key_down = || SeatInputKind::Key {
+            source: KeySource::Keysym,
             keysym: 0xffe1, // Shift_L: the modifier a latch is worst for
             state: KeyState::Pressed,
         };
@@ -3403,6 +3650,7 @@ pub(crate) mod tests {
         // still delivered. Under an unscoped reset it would be dropped as
         // unpaired and Shift would latch down for good.
         let key_up = SeatInputKind::Key {
+            source: KeySource::Keysym,
             keysym: 0xffe1,
             state: KeyState::Released,
         };
@@ -3474,6 +3722,7 @@ pub(crate) mod tests {
             let bytes = deliver(
                 &mut router,
                 SeatInputKind::Key {
+                    source: KeySource::Keysym,
                     keysym: 0xff0d,
                     state: KeyState::Pressed,
                 },
@@ -3529,6 +3778,7 @@ pub(crate) mod tests {
                 (scroll(), "scroll"),
                 (
                     SeatInputKind::Key {
+                        source: KeySource::Keysym,
                         keysym: 0xff0d,
                         state: KeyState::Pressed,
                     },
@@ -3756,6 +4006,7 @@ pub(crate) mod tests {
         let delivery = router
             .route_physical(
                 phys(SeatInputKind::Key {
+                    source: KeySource::Keysym,
                     keysym: 0xff1b,
                     state: KeyState::Pressed,
                 }),
@@ -4017,6 +4268,7 @@ pub(crate) mod tests {
             phys(press()),
             phys(scroll()),
             phys(SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym: 0xff0d,
                 state: KeyState::Pressed,
             }),
@@ -4087,10 +4339,12 @@ pub(crate) mod tests {
             press(),
             scroll(),
             SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym: 0xff0d,
                 state: KeyState::Pressed,
             },
             SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym: 0xff1b, // Escape, reserved for P1.7.3
                 state: KeyState::Pressed,
             },
@@ -4131,6 +4385,7 @@ pub(crate) mod tests {
             press(),
             scroll(),
             SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym: 0xff1b, // Escape: the revocation chord itself
                 state: KeyState::Pressed,
             },
@@ -4216,7 +4471,11 @@ pub(crate) mod tests {
         // dropped here, not leaked.
         const SHIFT_L: u32 = 0xffe1;
         const CTRL_L: u32 = 0xffe3;
-        let key = |keysym, state| SeatInputKind::Key { keysym, state };
+        let key = |keysym, state| SeatInputKind::Key {
+            source: KeySource::Keysym,
+            keysym,
+            state,
+        };
 
         let mut rig = Grabbed::new();
         let (mut registry, petition) = pending_petition();
@@ -4963,6 +5222,7 @@ pub(crate) mod tests {
                 router
                     .route_physical(
                         phys(SeatInputKind::Key {
+                            source: KeySource::Keysym,
                             keysym,
                             state: KeyState::Pressed
                         }),
@@ -5023,6 +5283,7 @@ pub(crate) mod tests {
             router
                 .route_physical(
                     phys(SeatInputKind::Key {
+                        source: KeySource::Keysym,
                         keysym: NON_CHORD_KEYSYM,
                         state: KeyState::Released
                     }),
@@ -5083,10 +5344,12 @@ pub(crate) mod tests {
 
         for input in [
             SeatInput::emulated(SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym: AGENT_KEY,
                 state: KeyState::Pressed,
             }),
             phys(SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym: HUMAN_KEY,
                 state: KeyState::Pressed,
             }),
@@ -5127,6 +5390,7 @@ pub(crate) mod tests {
             .route_emulated(
                 &test_realm(),
                 SeatInput::emulated(SeatInputKind::Key {
+                    source: KeySource::Keysym,
                     keysym: AGENT_KEY,
                     state: KeyState::Released,
                 }),
@@ -5252,6 +5516,7 @@ pub(crate) mod tests {
             .is_some());
         for input in [
             phys(SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym: HUMAN_KEY,
                 state: KeyState::Pressed,
             }),
@@ -5270,6 +5535,7 @@ pub(crate) mod tests {
                 .route_emulated(
                     &a,
                     SeatInput::emulated(SeatInputKind::Key {
+                        source: KeySource::Keysym,
                         keysym: AGENT_KEY,
                         state: KeyState::Pressed,
                     }),
@@ -5330,6 +5596,7 @@ pub(crate) mod tests {
             .route_emulated(
                 &a,
                 SeatInput::emulated(SeatInputKind::Key {
+                    source: KeySource::Keysym,
                     keysym: AGENT_KEY,
                     state: KeyState::Released,
                 }),
@@ -5347,6 +5614,7 @@ pub(crate) mod tests {
             router
                 .route_physical(
                     phys(SeatInputKind::Key {
+                        source: KeySource::Keysym,
                         keysym: HUMAN_KEY,
                         state: KeyState::Released
                     }),
@@ -5603,5 +5871,293 @@ pub(crate) mod tests {
             "the human's next release is addressed to realm-b, so realm-a's held set can \
              never be paid down and must not keep it owned"
         );
+    }
+
+    // ==================================================================
+    // WS-E.3.1 (issue #217, decision D-028): the core can interpret a
+    // keymap, so a press and its release no longer resolve to the same
+    // keysym — and pairing had to move off it.
+    //
+    // Two of the four criteria are here and two are in
+    // `super::keymap::tests`, and the split is the point rather than an
+    // accident: these two are properties the DEFAULT build must keep true,
+    // so they run with `session-keymap` OFF, where there is no keymap at
+    // all. The two that need one cannot.
+    // ==================================================================
+
+    /// #217 acceptance criterion (b): a key whose press and release resolve
+    /// to **different** keysyms leaves the pairing table empty.
+    ///
+    /// This is the router half of `super::keymap::tests::
+    /// a_real_keymap_can_resolve_one_keys_press_and_release_to_different_syms`,
+    /// which demonstrates on a real `us+lv3:caps_switch_latch` keyboard that
+    /// such a key exists. Here the two syms are supplied directly, because
+    /// what is under test is the router with no keymap in the build.
+    ///
+    /// Three assertions, and the third is the one a keysym-paired router
+    /// would fail even if it somehow passed the first two: the release the
+    /// APP receives must carry the **press's** keysym. The shim binds a
+    /// dynamic keycode per keysym, so a release carrying the other sym would
+    /// release a keycode the app never held and leave the real one down.
+    #[test]
+    fn a_key_whose_press_and_release_resolve_to_different_syms_leaves_no_held_key() {
+        const KEY_A: u32 = 30;
+        const SHIFTED: u32 = 0x0041; // `A`, what the press resolved to
+        const UNSHIFTED: u32 = 0x0061; // `a`, what the release resolved to
+
+        let mut router = router();
+        let view = (100u32, 80u32);
+        let surface = Some((100u32, 80u32));
+
+        let down = router
+            .route_physical(
+                phys(SeatInputKind::Key {
+                    source: KeySource::Device(KEY_A),
+                    keysym: SHIFTED,
+                    state: KeyState::Pressed,
+                }),
+                view,
+                surface,
+            )
+            .expect("a key press routes");
+        assert_eq!(
+            down.kind(),
+            &SeatDeliveryKind::Key {
+                keysym: SHIFTED,
+                state: KeyState::Pressed
+            }
+        );
+        assert_eq!(
+            router.held_keys(&test_realm()),
+            [(SHIFTED, Origin::Physical)]
+        );
+
+        let up = router
+            .route_physical(
+                phys(SeatInputKind::Key {
+                    source: KeySource::Device(KEY_A),
+                    keysym: UNSHIFTED,
+                    state: KeyState::Released,
+                }),
+                view,
+                surface,
+            )
+            .expect("the release pairs by scancode, not by keysym");
+        assert_eq!(
+            up.kind(),
+            &SeatDeliveryKind::Key {
+                keysym: SHIFTED,
+                state: KeyState::Released
+            },
+            "the release must carry the keysym the PRESS delivered, or the shim releases a \
+             keycode the app never held"
+        );
+        assert!(
+            router.held_keys(&test_realm()).is_empty(),
+            "nothing may be left held: a latched modifier rewrites every later keystroke"
+        );
+    }
+
+    /// The other side of the same razor, so criterion (b) cannot be met by a
+    /// router that simply stopped pairing at all: a release of a **different
+    /// key** must still be dropped, and the first key must still be held.
+    #[test]
+    fn pairing_by_scancode_still_drops_a_release_whose_own_press_was_never_delivered() {
+        let mut router = router();
+        let view = (100u32, 80u32);
+        let surface = Some((100u32, 80u32));
+
+        assert!(router
+            .route_physical(
+                phys(SeatInputKind::Key {
+                    source: KeySource::Device(30),
+                    keysym: 0x0041,
+                    state: KeyState::Pressed,
+                }),
+                view,
+                surface,
+            )
+            .is_some());
+        // Same keysym, different key. Under keysym pairing this would have
+        // paid down the press above.
+        assert!(
+            router
+                .route_physical(
+                    phys(SeatInputKind::Key {
+                        source: KeySource::Device(48),
+                        keysym: 0x0041,
+                        state: KeyState::Released,
+                    }),
+                    view,
+                    surface,
+                )
+                .is_none(),
+            "a release must pair with ITS OWN key's press, not with any press of that keysym"
+        );
+        assert_eq!(
+            router.held_keys(&test_realm()),
+            [(0x0041, Origin::Physical)]
+        );
+        // And an agent's keysym-identified release cannot pay down a
+        // device's press either: the two identities do not overlap.
+        assert!(router
+            .route_emulated(
+                &test_realm(),
+                SeatInput::emulated(SeatInputKind::Key {
+                    source: KeySource::Keysym,
+                    keysym: 0x0041,
+                    state: KeyState::Released,
+                }),
+                view,
+                surface,
+            )
+            .is_none());
+        assert_eq!(
+            router.held_keys(&test_realm()),
+            [(0x0041, Origin::Physical)]
+        );
+    }
+
+    /// #217 acceptance criterion (d): `keysym_is_intakeable` still answers
+    /// `true` for the **default dead-man chord**.
+    ///
+    /// The claim it makes changed even though the answer did not, and that
+    /// is why this is a test rather than a comment. Before D-028 the
+    /// intakeable set was the whole set of keysyms any backend could
+    /// produce. Now a bare-metal backend can produce a keysym for every key
+    /// on the board, so the invariant table is a *subset* — the check still
+    /// holds (everything in the table is still deliverable) but it no longer
+    /// bounds what is deliverable. What it must never stop doing is admitting
+    /// the human's off-switch, on every backend, whatever the layout.
+    #[test]
+    fn the_default_dead_man_chord_is_still_intakeable_under_a_core_that_owns_a_keymap() {
+        let chord = crate::deadman::Chord::parse(crate::deadman::DEFAULT_CHORD)
+            .expect("the default chord is in the vocabulary");
+        assert!(
+            keysym_is_intakeable(chord.keysym()),
+            "the human's off-switch must be deliverable on every backend"
+        );
+        // And it is layout-invariant for the reason that matters: it comes
+        // out of the fixed scancode table, which no keymap moves.
+        assert_eq!(invariant_keysym(1), Some(chord.keysym()));
+        // The other two core-owned chord vocabularies get the same check
+        // one module over, where their tables live:
+        // `crate::chord::tests::every_chord_vocabulary_keysym_survives_a_core_that_owns_a_keymap`.
+    }
+
+    /// The keymap is reached by **file**, never by layout name — D-028(2),
+    /// enforced against the source rather than against the API.
+    ///
+    /// `xkb::Keymap::new_from_names` searches `~/.config/xkb` before
+    /// `/usr/share/X11/xkb` and honours `XKB_*`, and a realm's app runs as
+    /// the core's uid with confinement still ahead of us — so a name-resolved
+    /// keymap is an app-writable file the TCB parses. `crate::input::keymap`
+    /// is built so it cannot happen (`NO_DEFAULT_INCLUDES |
+    /// NO_ENVIRONMENT_NAMES`, and only a `from_string` constructor), and this
+    /// is the guard that keeps a later edit from quietly reintroducing it.
+    ///
+    /// It runs in the **default** build on purpose: that is the
+    /// configuration in which `crate::input::keymap` is not even compiled,
+    /// so nothing else in CI would notice.
+    #[test]
+    fn no_source_file_resolves_a_keymap_by_name() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0usize;
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("the crate's src/ is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("a readable source file");
+                checked += 1;
+                // Spelled split so this test is not its own violation, and
+                // the name-constructor pattern carries its `(` so
+                // `crate::input::keymap`'s docs can still say what they
+                // refuse to call.
+                for forbidden in [concat!("new_from_", "names("), concat!("XKB_", "DEFAULT_")] {
+                    assert!(
+                        !text.contains(forbidden),
+                        "{} mentions `{forbidden}`: the core resolves its keymap from a file \
+                         the operator names, never from a layout name (D-028(2))",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(
+            checked > 20,
+            "fixture check: the sweep found only {checked} source files, so it is not \
+             actually looking at the crate"
+        );
+    }
+
+    /// #217 acceptance criterion (a): a press taken with Shift held resolves
+    /// to `A`, and its release — taken after Shift is up, so the keymap now
+    /// says `a` — still pairs and is still delivered.
+    ///
+    /// End to end over a real `us` keymap and the real router, because the
+    /// two halves are only interesting together: the keymap is what makes
+    /// the two keysyms differ, and the router is what has to survive it.
+    #[cfg(feature = "session-keymap")]
+    #[test]
+    fn a_shift_held_press_resolves_to_capital_a_and_its_release_still_pairs() {
+        use super::keymap::CoreKeymap;
+        const KEY_A: u32 = 30;
+        const KEY_LEFTSHIFT: u32 = 42;
+
+        let mut keymap = CoreKeymap::from_text(include_str!("../../tests/fixtures/keymap-us.xkb"))
+            .expect("the us fixture compiles");
+        let mut router = router();
+        let view = (100u32, 80u32);
+        let surface = Some((100u32, 80u32));
+
+        let route = |keymap: &mut CoreKeymap, router: &mut InputRouter<NoopHook>, evdev, state| {
+            let inputs = keymap_key(keymap, evdev, state);
+            assert_eq!(inputs.len(), 1, "one key event in, one out");
+            inputs
+                .into_iter()
+                .map(|i| router.route_physical(i, view, surface))
+                .next()
+                .unwrap()
+        };
+
+        assert!(route(&mut keymap, &mut router, KEY_LEFTSHIFT, KeyState::Pressed).is_some());
+        let down = route(&mut keymap, &mut router, KEY_A, KeyState::Pressed)
+            .expect("the shifted press is delivered");
+        assert_eq!(
+            down.kind(),
+            &SeatDeliveryKind::Key {
+                keysym: 0x0041,
+                state: KeyState::Pressed
+            },
+            "Shift held must resolve KEY_A to `A`, which is the whole reason the core \
+             grew a keymap"
+        );
+
+        // Shift up FIRST, so the keymap now resolves KEY_A to `a`.
+        assert!(route(&mut keymap, &mut router, KEY_LEFTSHIFT, KeyState::Released).is_some());
+        assert_eq!(
+            keymap.resolve(KEY_A, KeyState::Released),
+            Some(0x0061),
+            "fixture check: without Shift the SAME key resolves to `a`, or this test is \
+             not testing anything"
+        );
+        let up = route(&mut keymap, &mut router, KEY_A, KeyState::Released)
+            .expect("the release must still pair — by scancode");
+        assert_eq!(
+            up.kind(),
+            &SeatDeliveryKind::Key {
+                keysym: 0x0041,
+                state: KeyState::Released
+            },
+            "and must carry the press's keysym, so the app releases the key it is holding"
+        );
+        assert!(router.held_keys(&test_realm()).is_empty());
     }
 }

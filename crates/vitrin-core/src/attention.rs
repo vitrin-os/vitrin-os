@@ -593,6 +593,12 @@ impl<H: PreemptionHook> PreemptionHook for AttentionHook<H> {
     fn attention(&self) -> Option<Rc<RefCell<AttentionSignal>>> {
         Some(Rc::clone(&self.signal))
     }
+
+    fn clipboard(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
+        self.inner.clipboard()
+    }
 }
 
 /// Paint the open-window marker onto **human-visible** output.

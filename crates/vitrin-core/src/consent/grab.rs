@@ -901,6 +901,12 @@ impl<H: PreemptionHook> PreemptionHook for ConsentGate<H> {
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>> {
         self.inner.attention()
     }
+
+    fn clipboard(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
+        self.inner.clipboard()
+    }
 }
 
 #[cfg(test)]
@@ -1967,6 +1973,12 @@ mod tests {
             fn attention(
                 &self,
             ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>>
+            {
+                None
+            }
+            fn clipboard(
+                &self,
+            ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>>
             {
                 None
             }

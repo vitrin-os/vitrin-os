@@ -219,9 +219,22 @@ acknowledgement carrying the tag, which is a protocol-track change.
 set here because GDK treats it as a prerequisite for having a seat at all:
 GTK 4 refuses to open the display without it and GTK 3 opens the display but
 never constructs a `GdkSeat`, so **no GTK app can receive keyboard input**.
-It grants nothing across the realm boundary — one client per shim means both
-ends of any transfer are the same app, and v0 has no clipboard message on the
-wire at all.
+That global still grants nothing across the realm boundary — one client per
+shim means both ends of any transfer *through it* are the same app.
+
+**The last clause of that sentence used to be "and v0 has no clipboard message
+on the wire at all". It does now** (WS-E.2.1, issue #213,
+[D-024](../docs/plan/20-decision-log.md)). Version 2 adds three
+`vitrin_shim_session` messages and `src/clipboard.c` serves them, so a human
+can copy in one realm and paste in another. Read the difference carefully,
+because it is the whole trust argument: the channel does **not** run through
+`wl_data_device_manager`, and no client can reach it at any verb set. The core
+*asks* (`request_selection`), this shim *answers once* (`selection`), and a
+second, separate physical human gesture makes the core *offer*
+(`offer_selection`) to some other realm. There is deliberately no message by
+which a shim announces a copy, so an ordinary in-app Ctrl-C is still nothing
+but an in-app Ctrl-C. `text/plain;charset=utf-8` only, 60 KiB, cleared on a
+timeout, on the source realm's death and on a dead-man trigger.
 
 ### The upstream link, in one pass
 

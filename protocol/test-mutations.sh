@@ -106,6 +106,40 @@ check_rejected drop-arg-summary \
 check_rejected string-summary-without-bound \
   's|summary="realm name (max 64 bytes); |summary="realm name; |'
 
+# --- WS-E.2.1 (issue #213): the cross-realm clipboard messages ---------------
+#
+# Each of these is pinned on a message this issue ADDED, so they exercise the
+# schema against the newest surface rather than against the oldest.
+
+# The byte cap is the whole of what bounds a clipboard payload, and it lives in
+# a machine-readable summary token. Dropping it from `selection`'s `data` must
+# be a schema failure, not a message that silently accepts any length: the
+# generated decoder reads the bound out of this token, so a missing one is an
+# unbounded string argument in the trusted core's shim path.
+check_rejected clipboard-data-without-bound \
+  's|summary="the selection as UTF-8, empty unless status is ok (max 61440 bytes)"|summary="the selection as UTF-8, empty unless status is ok"|'
+
+# The clipboard payload is a string, and the closed set of seven admits no
+# `array` -- a payload that arrived as an array would have no bound token, no
+# UTF-8 validation and no NUL rule.
+check_rejected clipboard-data-as-array \
+  's|<arg name="data" type="string" summary="the selection as UTF-8, empty unless status is ok (max 61440 bytes)"/>|<arg name="data" type="array" summary="the selection as UTF-8, empty unless status is ok (max 61440 bytes)"/>|'
+
+# Enum entry values are required and immutable. An unvalued `selection_status`
+# entry would leave the wire value to document order, which is exactly the
+# renumbering hazard the "values are immutable" rule exists to forbid.
+check_rejected clipboard-status-entry-without-value \
+  's|<entry name="too_large" value="3" summary="the selection exceeds data'"'"'s byte bound"/>|<entry name="too_large" summary="the selection exceeds data'"'"'s byte bound"/>|'
+
+# Enum references are legal only on int and uint arguments: `status` may not be
+# carried by the string beside it.
+check_rejected clipboard-status-enum-on-string \
+  's|<arg name="mime" type="string" summary="MIME type of data, empty unless status is ok (max 32 bytes)"/>|<arg name="mime" type="string" enum="selection_status" summary="MIME type of data, empty unless status is ok (max 32 bytes)"/>|'
+
+# Every enum carries a description.
+check_rejected clipboard-status-without-description \
+  '/<enum name="selection_status">/,/<\/enum>/{/<description summary="why a selection answer carries no data">/,/<\/description>/d}'
+
 if [ "$fail" -ne 0 ]; then
   echo "test-mutations: FAILURES"
   exit 1

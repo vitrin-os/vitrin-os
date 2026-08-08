@@ -97,7 +97,8 @@
 
     DELIVERY CLASSIFICATION. Requests are classified reply-bearing (hello,
     sync, request_grant, capture_frame, launch), fire-and-forget (move,
-    button, scroll, type, attach, damage, commit, focus, set_fullscreen),
+    button, scroll, type, attach, damage, commit, focus, set_fullscreen,
+    selection),
     or structural mints
     (get_realm, create_surface, get_seat, get_launcher, get_layout_focus,
     get_layout_arrange), which are neither
@@ -136,11 +137,17 @@
     (error.message is never machine-parsed); a newer client willing to
     speak an older version reconnects offering a lower integer -
     convergence by descending reoffer, bounded by the client's own
-    maximum. Two versions exist: 1, and 2, which appends the
+    maximum. Two versions exist: 1, and 2. Version 2 appends the
     realm_launch verb, vitrin_grant.get_launcher and the vitrin_launcher
-    interface. Nothing else changed - every version-1 signature is
+    interface; vitrin_grant.get_layout_focus and get_layout_arrange with
+    the vitrin_layout_focus and vitrin_layout_arrange facets;
+    vitrin_principal.attention; and the three cross-realm clipboard
+    messages on vitrin_shim_session (request_selection, selection,
+    offer_selection) with the selection_status enum. Nothing was changed -
+    every version-1 signature is
     byte-identical at version 2, which is what "strictly additive" means
-    here. A version-1 connection therefore never sees a since="2" opcode
+    here, and this enumeration is appended to rather than rewritten
+    whenever a since="2" message lands. A version-1 connection therefore never sees a since="2" opcode
     and needs no change; sending one on it is fatal "invalid_opcode".
     Growth is Wayland-style: new
     messages are appended with since attributes (opcodes are implicit
@@ -1293,7 +1300,7 @@
     </request>
   </interface>
 
-  <interface name="vitrin_shim_session" version="1">
+  <interface name="vitrin_shim_session" version="2">
     <description summary="shim connection bootstrap">
       The connection-lifecycle object of a shim connection, implicit
       object 1. Authentication is structural: the inherited socketpair is
@@ -1352,6 +1359,104 @@
       </description>
       <arg name="seat" type="new_id" interface="vitrin_shim_seat" summary="the new seat"/>
     </request>
+
+    <event name="request_selection" since="2">
+      <description summary="ask this realm for its current selection">
+        THE CORE PULLS; A SHIM NEVER PUSHES. This is the first half of the
+        human's cross-realm copy gesture, and it is sent only because a
+        human at the physical keyboard pressed the core's promote chord
+        while the output was bound to this realm. There is deliberately NO
+        selection_changed event: a shim that forwarded every app-side copy
+        upstream would make every ordinary in-app copy a cross-realm event,
+        which is an ambient channel wearing a broker's clothes. Because the
+        core only ever asks, a realm cannot place anything where another
+        realm could reach it, at any moment of its own choosing - which is
+        what makes "cannot be triggered or forced by any realm" literally
+        true rather than a design intention.
+
+        The shim answers with exactly one selection request carrying this
+        serial. A shim with nothing to offer still answers, with status
+        empty: silence is indistinguishable from a hung shim and would make
+        the core wait on an untrusted peer. An answer whose serial is not
+        the outstanding one is stale (a second gesture superseded it) and is
+        discarded; a serial is never reused within a connection.
+      </description>
+      <arg name="serial" type="uint" summary="names the answer this request expects"/>
+    </event>
+
+    <request name="selection" since="2">
+      <description summary="answer request_selection with the app's current selection">
+        Fire-and-forget: there is no terminal event and no acknowledgement,
+        because the human's gesture is the transaction and the core has
+        nothing to tell the shim about it. What the core does with the
+        answer is the human's business, not the realm's, and a shim that
+        learned whether its bytes were accepted would learn something about
+        another realm.
+
+        Only text/plain;charset=utf-8 crosses. A shim whose app offers no
+        selection, or offers only other types, or offers bytes that are not
+        well-formed UTF-8, answers status empty or wrong_type and sends no
+        data; a selection above the byte bound answers too_large. The shim
+        is expected to make that judgement rather than let the bound decide
+        it: a data string past its bound is fatal "invalid_argument", which
+        on a shim connection means log-and-close, and a human copying a
+        large file must not kill their own app's shim. The bound is stated
+        here and is immutable; raising it is a new message, never an edit.
+
+        mime and data MUST be empty unless status is ok, and the core
+        ignores them in that case rather than treating a decorated refusal
+        as data. The core validates the type against its own allow-list
+        regardless of what this says: a shim is untrusted, and a status of
+        ok is a claim, not a credential.
+      </description>
+      <arg name="serial" type="uint" summary="the serial of the request_selection being answered"/>
+      <arg name="status" type="uint" enum="selection_status" summary="whether data follows, and why not"/>
+      <arg name="mime" type="string" summary="MIME type of data, empty unless status is ok (max 32 bytes)"/>
+      <arg name="data" type="string" summary="the selection as UTF-8, empty unless status is ok (max 61440 bytes)"/>
+    </request>
+
+    <event name="offer_selection" since="2">
+      <description summary="offer the core-held clipboard to this realm">
+        The second half of the human's gesture, and a SEPARATE, LATER,
+        PHYSICAL act: the human pressed the core's offer chord while the
+        output was bound to this realm. One gesture transfers nothing -
+        promoting places bytes in the core's slot and reaches no other
+        realm, offering reads that slot and never writes it - and the two
+        chords are distinct, so no single press can do both.
+
+        The shim makes the payload its app's ordinary selection (a
+        shim-owned data source on its own seat). It does NOT paste: the
+        human still presses their app's own paste, exactly as the Qubes
+        model this follows separates "move the clipboard into the target"
+        from "paste it there". The core sends no offer with an empty slot,
+        so receiving this always means there is something to install.
+
+        Sent to exactly one realm per gesture. The core never fans an offer
+        out, and never sends one on the source realm's behalf: a slot
+        promoted in a realm is not offered back to it unless the human
+        gestures there.
+      </description>
+      <arg name="mime" type="string" summary="MIME type of data (max 32 bytes)"/>
+      <arg name="data" type="string" summary="the clipboard contents as UTF-8 (max 61440 bytes)"/>
+    </event>
+
+    <enum name="selection_status">
+      <description summary="why a selection answer carries no data">
+        Answers are exhaustive rather than optional: every request_selection
+        gets exactly one selection, and a shim with nothing to give says so.
+        The three refusing entries are distinguished because they mean
+        different things to a human debugging a clipboard that did not work
+        - "I selected nothing", "I selected a picture", and "I selected too
+        much" are three different mistakes with three different fixes - and
+        because the core journals which one it saw, with no content.
+
+        Entries are appended, never renumbered, like every enum here.
+      </description>
+      <entry name="ok" value="0" summary="mime and data carry the app's selection"/>
+      <entry name="empty" value="1" summary="the app has no selection at all"/>
+      <entry name="wrong_type" value="2" summary="the selection is not well-formed text/plain;charset=utf-8"/>
+      <entry name="too_large" value="3" summary="the selection exceeds data's byte bound"/>
+    </enum>
   </interface>
 
   <interface name="vitrin_shim_surface" version="1">

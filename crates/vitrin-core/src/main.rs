@@ -80,6 +80,23 @@
 /// at every level — see that module's "neighbour, never sibling" table.
 mod attention;
 mod backend;
+/// The general **modifier-aware chord matcher** (WS-E.2.1, issue #213):
+/// modifier state tracked from the keysyms `input` already delivers, exact
+/// set-equality matching, and the physical-origin razor at both halves. Shared
+/// infrastructure by decision, not by accident — `deadman::Chord` excludes
+/// every modifier for its own good reason and `attention::AttentionChord` is
+/// nothing but modifiers, so neither can express `ctrl+shift+insert`, and
+/// D-024 makes this the matcher WS-E.2.2 and WS-E.2.4 consume rather than
+/// each adding a parallel one to the stack the human's off-switch lives in.
+mod chord;
+/// The **cross-realm clipboard** (WS-E.2.1, issue #213, D-024): one core-held
+/// slot, `text/plain;charset=utf-8` only, capped and time-limited, filled only
+/// by the human's promote chord and read only by their offer chord. The core
+/// PULLS — a shim can never push, because filling the slot needs a
+/// `PendingPromotion` only a human's gesture mints — and it is the first place
+/// the trusted core retains bytes an application authored, which is a cost the
+/// maintainer accepted knowingly rather than one this module mitigates away.
+mod clipboard;
 /// Capture-frame mechanics (P1.3.6): the sealed-memfd pixel path behind
 /// `vitrin_view.frame_ready`. Pure mechanics — the authority decision on
 /// every capture lives in `enforcement` (P1.4.4), whose single-path test
@@ -372,6 +389,17 @@ USAGE:
                                 the real-app fidelity test to prove the capture
                                 path adds no distortion; off by default, and not
                                 a wire feature. Written atomically each redraw.
+    vitrind [--clipboard-key KEY]
+                                Trigger key for the cross-realm clipboard
+                                (WS-E.2.1): ctrl+shift+KEY promotes the focused
+                                realm's selection into the core's single slot,
+                                shift+KEY offers that slot to the focused realm.
+                                Default: insert. Must be a layout-invariant,
+                                non-modifier key this build's input intake can
+                                deliver and must not collide with the dead-man
+                                or attention chords; startup FAILS otherwise.
+                                Both chords are CONSUMED in every realm, so an
+                                app that binds shift+KEY loses it.
     vitrind [--dead-man-chord KEY]
                                 Key for the dead-man switch: holding it
                                 revokes every grant in the session at once.
@@ -472,6 +500,11 @@ enum Action {
         /// `dead_man.chord` is, including the cross-flag refusal that the two
         /// may not name the same key.
         attention: attention::AttentionChord,
+        /// The `--clipboard-key` trigger (WS-E.2.1): the non-modifier half of
+        /// the two cross-realm clipboard chords. Resolved and validated at
+        /// parse time exactly as the two chords above are, including the
+        /// cross-flag refusal against both of them.
+        clipboard: chord::Trigger,
     },
     RunHeadless {
         size: (u32, u32),
@@ -507,6 +540,14 @@ enum Action {
         /// `attention` line presses **this** chord through the production
         /// intake, which is what gives the mechanism a mock-free gate.
         attention: attention::AttentionChord,
+        /// The `--clipboard-key` trigger (WS-E.2.1), validated here for the
+        /// same reason `attention` is: both modes must accept or refuse the
+        /// same command line. A plain headless build has no physical input
+        /// device to chord on, so it never reads this past
+        /// `backend::headless::run`'s signature; a `physical-input-injector`
+        /// build reads it so the channel's `clipboard` line chords the key the
+        /// operator actually chose.
+        clipboard: chord::Trigger,
         /// `--agent-cursor` (D-019): composite the agent cursor sprite into
         /// this run's human-visible output.
         ///
@@ -593,6 +634,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut chord: Option<deadman::Chord> = None;
     let mut hold_ms: Option<u64> = None;
     let mut attention_chord: Option<attention::AttentionChord> = None;
+    let mut clipboard_key: Option<chord::Trigger> = None;
     let mut agent_cursor = false;
     #[cfg(feature = "consent-injector")]
     let mut consent_injector_fd: Option<std::os::fd::RawFd> = None;
@@ -661,6 +703,12 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 )?;
                 set_hold(&mut hold_ms, value)?;
             }
+            "--clipboard-key" => {
+                let value = args
+                    .next()
+                    .ok_or("`--clipboard-key` requires a key (e.g. `--clipboard-key insert`)")?;
+                set_clipboard_key(&mut clipboard_key, value)?;
+            }
             "--attention-chord" => {
                 let value = args
                     .next()
@@ -723,6 +771,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_hold(&mut hold_ms, value)?;
                 } else if let Some(value) = other.strip_prefix("--attention-chord=") {
                     set_attention_chord(&mut attention_chord, value)?;
+                } else if let Some(value) = other.strip_prefix("--clipboard-key=") {
+                    set_clipboard_key(&mut clipboard_key, value)?;
                 } else {
                     return Err(format!("unknown argument `{other}`"));
                 }
@@ -766,6 +816,44 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             attention.name(),
             dead_man.chord.name()
         ));
+    }
+
+    let clipboard = clipboard_key.unwrap_or_else(|| {
+        chord::Trigger::parse(clipboard::DEFAULT_TRIGGER)
+            .expect("the default clipboard trigger is in the vocabulary")
+    });
+    // **The clipboard's trigger may not be either core-owned chord's key, and
+    // unlike the pair above this one is genuinely reachable** (WS-E.2.1):
+    // `insert` is in BOTH `deadman::Chord::VOCABULARY` and
+    // `chord::Trigger::VOCABULARY`, so `--dead-man-chord insert` on a default
+    // command line is a real collision an operator can type today.
+    //
+    // What it would do is the reason it is refused rather than ordered. The
+    // dead-man watcher detects in `observe`, which is unconditional and runs
+    // for events any gate consumes -- so holding ctrl+shift+insert for a second
+    // would arm and fire the human's off-switch while they were copying text,
+    // and no ordering of the hook stack can prevent that, because the whole
+    // point of `observe` is that nothing can blind it. Fail closed at startup,
+    // exactly as `Chord::parse` does for a key intake cannot deliver.
+    for owned in [
+        (
+            dead_man.chord.keysym(),
+            "--dead-man-chord",
+            dead_man.chord.name(),
+        ),
+        (attention.keysym(), "--attention-chord", attention.name()),
+    ] {
+        let (keysym, flag, name) = owned;
+        if clipboard.keysym() == keysym {
+            return Err(format!(
+                "`--clipboard-key` `{}` names the same key as `{flag}` `{name}`: the core's \
+                 physical chords must not share a key. The dead-man watcher detects in the \
+                 router's UNCONDITIONAL observe tap, so holding the clipboard chord would \
+                 arm the human's off-switch -- and no hook ordering can prevent that, \
+                 because nothing is allowed to blind that tap",
+                clipboard.name()
+            ));
+        }
     }
 
     // The injector channel's two companion refusals (issue #138), taken at
@@ -844,6 +932,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             capture_dump,
             dead_man,
             attention,
+            clipboard,
         }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
         // A headless core has no display to draw the consent prompt on and no
@@ -887,6 +976,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             capture_dump,
             dead_man,
             attention,
+            clipboard,
             agent_cursor,
             #[cfg(feature = "consent-injector")]
             consent_injector_fd,
@@ -978,15 +1068,31 @@ fn set_chord(slot: &mut Option<deadman::Chord>, value: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// Record the `--attention-chord` key (WS-E.1.7), rejecting a repeat flag and
+/// Record the `--clipboard-key` trigger (WS-E.2.1), rejecting a repeat flag and
 /// any key this build's input intake could not deliver.
 ///
-/// The `--dead-man-chord` precedent exactly, including naming every accepted
-/// key rather than saying "unknown" — the vocabulary is two words long and an
-/// operator who guessed `meta` or `win` should be told what to write. The
-/// *collision* check against the dead-man chord is not here: it needs both
-/// halves resolved, so it lives in `parse_args` beside the other cross-flag
-/// refusals.
+/// The `--dead-man-chord` precedent exactly, including naming every accepted key
+/// rather than saying "unknown". The *collision* checks against the two
+/// core-owned chords are not here: they need every half resolved, so they live
+/// in `parse_args` beside the other cross-flag refusals — and one of them is
+/// reachable from a plausible command line, unlike the pair above it.
+fn set_clipboard_key(slot: &mut Option<chord::Trigger>, value: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--clipboard-key` given more than once".into());
+    }
+    let trigger = chord::Trigger::parse(value).map_err(|err| {
+        let accepted: Vec<&str> = chord::Trigger::vocabulary().collect();
+        format!(
+            "`--clipboard-key` `{value}`: {err} (accepted: {})",
+            accepted.join(", ")
+        )
+    })?;
+    *slot = Some(trigger);
+    Ok(())
+}
+
+/// Record the `--attention-chord` key (WS-E.1.7), rejecting a repeat flag and
+/// any key this build's input intake could not deliver.
 fn set_attention_chord(
     slot: &mut Option<attention::AttentionChord>,
     value: &str,
@@ -1122,6 +1228,7 @@ fn main() -> ExitCode {
             capture_dump,
             dead_man,
             attention,
+            clipboard,
         } => {
             init_tracing();
             run_session(
@@ -1134,7 +1241,7 @@ fn main() -> ExitCode {
                 // `--consent-injector-fd` is refused with `--nested` at parse
                 // time (issue #138), so a nested run is never instrumented.
                 false,
-                move |seed| backend::winit::run(dead_man, attention, seed),
+                move |seed| backend::winit::run(dead_man, attention, clipboard, seed),
             )
         }
         Action::RunHeadless {
@@ -1153,6 +1260,7 @@ fn main() -> ExitCode {
             // SIGUSR1-synthesized trigger reports (issue #109).
             dead_man,
             attention,
+            clipboard,
             agent_cursor,
             #[cfg(feature = "consent-injector")]
             consent_injector_fd,
@@ -1177,6 +1285,7 @@ fn main() -> ExitCode {
                         size,
                         dead_man,
                         attention,
+                        clipboard,
                         agent_cursor,
                         #[cfg(feature = "consent-injector")]
                         consent_injector_fd,
@@ -2096,7 +2205,8 @@ mod tests {
                 shim: None,
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
-                attention: default_attention()
+                attention: default_attention(),
+                clipboard: default_clipboard()
             })
         );
     }
@@ -2119,6 +2229,7 @@ mod tests {
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
+                clipboard: default_clipboard(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
@@ -2145,6 +2256,7 @@ mod tests {
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
+                clipboard: default_clipboard(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
@@ -2164,6 +2276,7 @@ mod tests {
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
+                clipboard: default_clipboard(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
@@ -2193,6 +2306,7 @@ mod tests {
                     capture_dump: None,
                     dead_man: DeadManConfig::default(),
                     attention: default_attention(),
+                    clipboard: default_clipboard(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -2210,7 +2324,8 @@ mod tests {
                 shim: None,
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
-                attention: default_attention()
+                attention: default_attention(),
+                clipboard: default_clipboard()
             })
         );
     }
@@ -2495,6 +2610,7 @@ mod tests {
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
+                clipboard: default_clipboard(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
@@ -2527,6 +2643,7 @@ mod tests {
                     capture_dump: None,
                     dead_man: DeadManConfig::default(),
                     attention: default_attention(),
+                    clipboard: default_clipboard(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -2549,7 +2666,8 @@ mod tests {
                 shim: None,
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
-                attention: default_attention()
+                attention: default_attention(),
+                clipboard: default_clipboard()
             })
         );
     }
@@ -2585,6 +2703,7 @@ mod tests {
                     capture_dump: None,
                     dead_man: DeadManConfig::default(),
                     attention: default_attention(),
+                    clipboard: default_clipboard(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -2608,7 +2727,8 @@ mod tests {
                 shim: None,
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
-                attention: default_attention()
+                attention: default_attention(),
+                clipboard: default_clipboard()
             })
         );
     }
@@ -2659,6 +2779,7 @@ mod tests {
                     capture_dump: None,
                     dead_man: DeadManConfig::default(),
                     attention: default_attention(),
+                    clipboard: default_clipboard(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -2677,7 +2798,8 @@ mod tests {
                 shim: Some(PathBuf::from("/opt/vitrin/vitrin-shim")),
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
-                attention: default_attention()
+                attention: default_attention(),
+                clipboard: default_clipboard()
             })
         );
     }
@@ -2726,6 +2848,7 @@ mod tests {
                     capture_dump: Some(PathBuf::from("/tmp/internal.rgba")),
                     dead_man: DeadManConfig::default(),
                     attention: default_attention(),
+                    clipboard: default_clipboard(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -2744,7 +2867,8 @@ mod tests {
                 shim: None,
                 capture_dump: Some(PathBuf::from("/tmp/x.rgba")),
                 dead_man: DeadManConfig::default(),
-                attention: default_attention()
+                attention: default_attention(),
+                clipboard: default_clipboard()
             })
         );
     }
@@ -3229,6 +3353,7 @@ mod tests {
                     capture_dump: None,
                     dead_man: DeadManConfig::default(),
                     attention: default_attention(),
+                    clipboard: default_clipboard(),
                     #[cfg(feature = "consent-injector")]
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
@@ -3296,6 +3421,7 @@ mod tests {
                 capture_dump: None,
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
+                clipboard: default_clipboard(),
                 #[cfg(feature = "consent-injector")]
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
@@ -3397,6 +3523,10 @@ mod tests {
     /// default is a change these tests follow rather than one they pin twice.
     fn default_attention() -> attention::AttentionChord {
         attention::AttentionChord::parse(attention::DEFAULT_CHORD).expect("the default parses")
+    }
+
+    fn default_clipboard() -> chord::Trigger {
+        chord::Trigger::parse(clipboard::DEFAULT_TRIGGER).expect("the default parses")
     }
 
     /// The dead-man configuration this run resolved, whichever mode it named.

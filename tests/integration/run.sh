@@ -74,6 +74,12 @@ PROPERTY_GATES=(
                                 # output, and killing it leaves both realms
                                 # running with the last-bound one still taking
                                 # the human's input (#211)
+  test_real_clipboard.py        # WS-E.2.1 (#213): text copied in one realm
+                                # reaches another ONLY after two distinct human
+                                # chords, and one gesture transfers nothing. Two
+                                # real shims, two real Wayland clients, and the
+                                # journal grepped for the literal string it must
+                                # not contain.
   test_launch.py                # a consented `realm_launch` grant makes the
                                 # TRUSTED CORE fork a process, and the journal
                                 # names who asked (#207). The one gate covering

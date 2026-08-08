@@ -49,6 +49,7 @@
 #include <wlr/util/log.h>
 
 #include "ledger.h"
+#include "clipboard.h"
 #include "server.h"
 
 /* Decline server-side decorations: whenever a client asks for a decoration
@@ -214,18 +215,32 @@ bool vitrin_create_globals(struct vitrin_shim *s) {
 	 * -- text arriving in a GTK text field -- is not merely unproven, it is
 	 * unreachable.
 	 *
-	 * IT GRANTS NOTHING ACROSS THE REALM BOUNDARY, which is why it can be
-	 * added without touching the confinement argument. A shim serves exactly
-	 * one client on exactly one private socket, and `wl_data_device_manager`
-	 * mediates selection and drag-and-drop BETWEEN CLIENTS OF THIS SEAT --
-	 * of which there is one. Both ends of any transfer are the same app, so
-	 * this is app-internal clipboard: the cut/copy/paste a text entry's own
-	 * context menu needs. There is no wire path from here to the core (v0
-	 * has no clipboard message at all), so cross-realm clipboard remains
-	 * exactly where it belongs, unbuilt, and the core's to mediate when it
-	 * is built. */
+	 * THIS GLOBAL STILL GRANTS NOTHING ACROSS THE REALM BOUNDARY. A shim
+	 * serves exactly one client on exactly one private socket, and
+	 * `wl_data_device_manager` mediates selection and drag-and-drop BETWEEN
+	 * CLIENTS OF THIS SEAT -- of which there is one. Both ends of any
+	 * transfer through it are the same app, so this is app-internal
+	 * clipboard: the cut/copy/paste a text entry's own context menu needs.
+	 *
+	 * WHAT CHANGED (WS-E.2.1, issue #213, D-024). This comment used to add
+	 * that "cross-realm clipboard remains exactly where it belongs, unbuilt,
+	 * and the core's to mediate when it is built". It is built, and the core
+	 * does mediate it -- so that sentence is gone rather than left standing.
+	 * The channel does NOT run through this global: it is three
+	 * `vitrin_shim_session` messages the CORE initiates, driven by two
+	 * physical human chords and reachable by no client at any verb set (see
+	 * clipboard.h). What this global gives it is only an app-side clipboard
+	 * to read from and to install into.
+	 *
+	 * The listener that makes even the app-internal half work is wired
+	 * immediately below: without a `request_set_selection` handler wlroots
+	 * never installs a selection at all, so this global advertised a
+	 * clipboard that did nothing even within one app. */
 	if (wlr_data_device_manager_create(s->display) == NULL) {
 		wlr_log(WLR_ERROR, "wlr_data_device_manager_create failed");
+		return false;
+	}
+	if (!vitrin_clipboard_wire(s)) {
 		return false;
 	}
 

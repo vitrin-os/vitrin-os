@@ -249,6 +249,7 @@ shim_exe = executable(
     'src/output.c',
     'src/xdg.c',
     'src/seat.c',
+    'src/clipboard.c',
     'src/wire.c',
     'src/upstream.c',
     'src/ledger.c',
@@ -304,6 +305,7 @@ if wlcs_opt.enabled() or (wlcs_opt.auto() and wlcs_dep.found())
       'src/output.c',
       'src/xdg.c',
       'src/seat.c',
+      'src/clipboard.c',
       'src/wire.c',
       'src/upstream.c',
       'src/ledger.c',
@@ -367,6 +369,23 @@ damage_client = executable(
 solid_client = executable(
   'solid-client',
   files('tests/solid_client.c'),
+  xdg_shell_client_header,
+  xdg_shell_code,
+  include_directories: inc,
+  dependencies: [wayland_client],
+)
+
+# The WS-E.2.1 cross-realm clipboard gate's app (issue #213): a bare
+# wl_shm + xdg-shell + wl_data_device client that owns a selection with a
+# KNOWN string and writes whatever selection it is later offered into a file.
+# Neither half is reproducibly obtainable from a general-purpose app in CI --
+# a terminal cannot be made to put a chosen string on its clipboard without a
+# human's mouse, and cannot be made to report what it received at all. Co-built
+# with vitrin-shim so the gate resolves it as a sibling, exactly as it resolves
+# click-target.
+clipboard_peer = executable(
+  'clipboard-peer',
+  files('tests/clipboard_peer.c'),
   xdg_shell_client_header,
   xdg_shell_code,
   include_directories: inc,

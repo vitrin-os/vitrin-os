@@ -22,6 +22,7 @@
 #include <wayland-server-core.h>
 
 #include "ledger.h"
+#include "clipboard.h"
 #include "seat.h"
 #include "upstream.h"
 
@@ -119,6 +120,11 @@ struct vitrin_shim {
 	 * the pointer/keyboard state the core's `vitrin_shim_seat` events are
 	 * replayed through. Lives beside the `wl_seat` it drives. */
 	struct vitrin_seat_replay replay;
+	/* The cross-realm clipboard's shim half (WS-E.2.1, clipboard.h): the
+	 * `request_set_selection` listener that makes the app's own clipboard
+	 * work, plus the two directions the CORE drives. Nothing here ever
+	 * speaks upstream unasked. */
+	struct vitrin_clipboard clipboard;
 	struct wlr_xdg_decoration_manager_v1 *xdg_decoration;
 	struct wl_listener new_deco; /* xdg_decoration.new_toplevel_decoration */
 

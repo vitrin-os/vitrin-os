@@ -300,6 +300,44 @@ bounded only by the grant's rate ceiling and expiry, not by a count. A
 long-lived session driven by an agent launching on a timer will grow that
 table without limit.
 
+**A human can now move text between two realms, and that is a channel with a
+stated bandwidth.** Copy-paste between realms exists as of WS-E.2.1: pressing
+Ctrl-Shift-Insert asks the realm you are looking at for its selection and puts
+it in a single core-held slot; pressing Shift-Insert in another realm offers
+that slot to *that* realm's app, which you then paste into with the app's own
+paste key. Two gestures, one direction each, and **no client can trigger,
+force or observe either** — the core asks, and there is no message by which an
+app or a shim can announce a copy.
+
+Read the rest as a bound rather than as an absence, because that is what it is:
+
+- `text/plain;charset=utf-8` only. No images, no rich text, no file paths.
+- **60 KiB** at a time (61 440 bytes), measured against real file sizes and
+  against the wire's own 64 KiB frame ceiling — a larger cap is not expressible
+  without handing the trusted core a shim-controlled memory mapping.
+- The slot is cleared after two minutes, when the realm its contents came from
+  dies, and whenever the dead-man switch fires. Nothing tells you it was
+  cleared; a gesture that finds an empty slot simply does nothing.
+- **Two colluding realms can therefore move ~60 KiB per human gesture pair.**
+  Qubes accepts the same bound. The honest statement is the bound, never
+  "there is no channel"; the PRD's threat-model row was edited rather than left
+  standing.
+
+**The trusted core now stores bytes an application authored.** Nothing else in
+it does — it holds client *pixels* it never interprets and typed values it
+validated itself. A password copied from a manager transits `vitrind` and rests
+in that slot until one of the three clearing rules fires. The cap, the
+one-type allow-list, the digest-only journaling (the flight recorder records a
+length and a BLAKE3 digest, never content) and the three clears bound it; none
+removes it. This was decided deliberately, with that cost stated, and it is the
+first time this project has made that trade.
+
+**Two more keys are taken from every app.** Ctrl-Shift-Insert and Shift-Insert
+are consumed by the core in every realm, with no pass-through and no way to ask
+for one. Shift-Insert is the historical X11 primary-paste chord, so an app that
+binds it loses it. `--clipboard-key` moves both to another key, which is not a
+remedy so much as a different loss.
+
 **Identities are static tokens.** Listed in `principals.toml`. The IDL is
 shaped for SPIFFE/OIDC credentials; the machinery is not here yet.
 

@@ -1020,6 +1020,7 @@ pub(crate) fn apply(
     grants: &mut GrantTable,
     petitions: &mut PetitionRegistry,
     attention: &RefCell<crate::attention::AttentionSignal>,
+    clipboard: &mut crate::clipboard::ClipboardSlot,
     recorder: &mut Recorder,
     now: Instant,
 ) -> DeadManEffect {
@@ -1030,6 +1031,14 @@ pub(crate) fn apply(
     // that is exactly why it is cheap to do and worth doing: it means the
     // window's lifetime never has to be reasoned about across a revocation.
     attention.borrow_mut().clear();
+    // **Not** belt and braces, unlike the line above (WS-E.2.1, issue #213).
+    // The clipboard slot is the one piece of session state the grant sweep
+    // below cannot reach: it holds bytes an application authored, it is
+    // reachable by a physical gesture rather than by any grant, and revoking
+    // every grant in the session leaves it exactly where it was. A human who
+    // has just hit the off-switch is not, in the same second, leaving a copied
+    // password in the trusted core. The count is logged, never the content.
+    let clipboard_cleared = clipboard.clear();
     // Every principal holding a row, not one (module docs: an off-switch that
     // revoked a single identity is defeated by an attacker holding two). The
     // ids are collected before mutating, because `rows` borrows the table.
@@ -1093,6 +1102,7 @@ pub(crate) fn apply(
         principals = principals.len(),
         revoked = revoked.len(),
         denied = denied.len(),
+        clipboard_cleared,
         "dead-man switch applied"
     );
 
@@ -1153,6 +1163,12 @@ impl<H: PreemptionHook> PreemptionHook for DeadManHook<H> {
     /// worst failure is a focus change that does not happen.
     fn attention(&self) -> Option<Rc<RefCell<crate::attention::AttentionSignal>>> {
         self.inner.attention()
+    }
+
+    fn clipboard(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
+        self.inner.clipboard()
     }
 }
 
@@ -1471,6 +1487,7 @@ mod tests {
             &mut table,
             &mut registry,
             &signal,
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             t0,
         );
@@ -2099,6 +2116,7 @@ mod tests {
             &mut table,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             now,
         );
@@ -2143,6 +2161,7 @@ mod tests {
             &mut table,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             now,
         );
@@ -2183,6 +2202,7 @@ mod tests {
             &mut table,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             now,
         );
@@ -2224,6 +2244,7 @@ mod tests {
             &mut table,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             now,
         );
@@ -2271,6 +2292,7 @@ mod tests {
             &mut table,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             now,
         );
@@ -2285,6 +2307,66 @@ mod tests {
         assert!(
             crate::recorder::tests::of_kind(&entries, "grant_revoked").is_empty(),
             "nothing was revoked, so nothing may claim to have been"
+        );
+    }
+
+    /// **The off-switch empties the clipboard slot** (WS-E.2.1, issue #213,
+    /// acceptance criterion 4).
+    ///
+    /// Unlike the attention window's clear beside it, this one is **not** belt
+    /// and braces: sealing the grant table reaches every grant and every
+    /// petition and reaches the clipboard slot not at all. The slot holds bytes
+    /// an application authored, it is filled by a physical gesture rather than
+    /// by any grant, and a human who has just hit the off-switch is not, in the
+    /// same second, leaving a copied password in the trusted core.
+    ///
+    /// Driven through the real [`apply`], with a slot filled through the real
+    /// promotion path, so a change that stopped calling `clear` fails here
+    /// rather than in a mock.
+    #[test]
+    fn the_off_switch_empties_the_clipboard_slot() {
+        let now = Instant::now();
+        let mut table = GrantTable::new();
+        let mut registry =
+            PetitionRegistry::new(ConsentPolicy::Interactive, PetitionConfig::default());
+        let mut scratch = Scratch::new();
+
+        let mut clipboard = crate::clipboard::ClipboardSlot::new();
+        let realm = crate::grants::RealmId::new("realm-0");
+        let serial = clipboard.open_promotion(realm.clone());
+        let ticket = clipboard
+            .claim_answer(&realm, serial)
+            .expect("the answer matches the promotion");
+        clipboard
+            .fill(
+                ticket,
+                crate::clipboard::CLIPBOARD_MIME,
+                "a copied password",
+                now,
+            )
+            .expect("a well-formed selection fills the slot");
+        assert!(
+            clipboard.peek(now).is_some(),
+            "fixture: the slot must hold something, or this proves nothing"
+        );
+
+        apply(
+            &Trigger {
+                chord: "esc",
+                held: DEFAULT_HOLD,
+            },
+            &mut table,
+            &mut registry,
+            &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut clipboard,
+            &mut scratch.recorder,
+            now,
+        );
+
+        assert!(
+            clipboard.peek(now).is_none(),
+            "the off-switch must leave no copied application bytes behind it: the grant \
+             sweep cannot reach the clipboard slot, so `apply` has to clear it explicitly"
         );
     }
 
@@ -2310,6 +2392,7 @@ mod tests {
                 &mut table,
                 &mut registry,
                 &RefCell::new(crate::attention::AttentionSignal::detached()),
+                &mut crate::clipboard::ClipboardSlot::new(),
                 &mut scratch.recorder,
                 now
             )
@@ -2322,6 +2405,7 @@ mod tests {
             &mut table,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             now
         )
@@ -2417,6 +2501,7 @@ mod tests {
             &mut table,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             now + held,
         );
@@ -2539,6 +2624,7 @@ mod tests {
             &mut grants,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             now,
         );
@@ -2603,6 +2689,7 @@ mod tests {
             &mut grants,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             now,
         );
@@ -2653,6 +2740,7 @@ mod tests {
             &mut grants,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             now,
         );
@@ -2676,6 +2764,7 @@ mod tests {
             &mut grants,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             much_later,
         );
@@ -2797,6 +2886,7 @@ mod tests {
             &mut table,
             &mut registry,
             &RefCell::new(crate::attention::AttentionSignal::detached()),
+            &mut crate::clipboard::ClipboardSlot::new(),
             &mut scratch.recorder,
             now,
         );

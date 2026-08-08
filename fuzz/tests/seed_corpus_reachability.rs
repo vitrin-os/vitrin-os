@@ -107,14 +107,30 @@ fn decoder_table_order() -> Vec<String> {
         + "decoder_table!(".len();
     // The invocation's arguments are bare type identifiers separated by
     // commas, so the first `)` after it is its close.
-    let close = src[open..]
+    //
+    // Line comments are stripped **before** that search, not filtered out
+    // after it: a `//` comment inside the invocation containing a `)` or a `,`
+    // would otherwise truncate or corrupt the parse, and the failure mode is a
+    // silently short table that still compares equal to nothing. That is not
+    // hypothetical -- WS-E.2.1 wrote exactly such a comment and this parser
+    // reported a 4-entry table. The invocation should carry no comments at all
+    // (its own doc comment says so); this makes the rule enforce itself rather
+    // than depend on being read.
+    let body: String = src[open..]
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(at) => &line[..at],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let close = body
         .find(')')
-        .expect("the decoder_table! invocation must be closed")
-        + open;
-    src[open..close]
+        .expect("the decoder_table! invocation must be closed");
+    body[..close]
         .split(',')
         .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.starts_with("//"))
+        .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
 }

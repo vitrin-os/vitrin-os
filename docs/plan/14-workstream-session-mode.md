@@ -132,10 +132,19 @@ None of these is DRM work. The backend is not the binding constraint.
    management: focus and fullscreen-or-not, with no `place`, `resize`, `raise`
    or stacking request in existence. The shell is
    therefore still a **client**, never core code.
-4. **No cross-realm clipboard.** `wl_data_device_manager` is per-shim and
-   `shim/src/globals.c` states it *"GRANTS NOTHING ACROSS THE REALM
-   BOUNDARY"*. Copy-paste between apps does not exist. It is a cross-realm
-   mediator, i.e. a capability design, not plumbing.
+4. ~~**No cross-realm clipboard.**~~ **Closed by WS-E.2.1 (#213)**, on the
+   narrowest path that closes it: a **core-held single slot**, filled only
+   when the human presses Ctrl-Shift-Insert in the realm the output is bound
+   to and offered only when they press Shift-Insert in another,
+   `text/plain;charset=utf-8` only, 60 KiB, cleared on timeout, on the
+   source realm's death and on a dead-man trigger. `wl_data_device_manager`
+   is still per-shim and still mediates nothing across the boundary itself —
+   what changed is that the core now mediates, which is what
+   `shim/src/globals.c` always said would happen *"when it is built"*. The
+   design and every rejected option are §4.1; the decision is
+   [D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing).
+   It was a capability design and not plumbing, and it stayed one: the
+   options table landed before a line of it was written.
 
 ## 4. Stages
 
@@ -146,7 +155,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 | Stage | Delivers | Est. |
 |---|---|---|
 | **1 — multi-app, nested** | ~~Runtime app launch~~ (**landed**, WS-E.1.1/#207: `autostart = false` templates, a served `realm_launch` verb, core-minted `<template>.<n>` instance ids, `capacity` at `MAX_REALMS`, and `realm_spawned` naming who asked) · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · ~~a core-owned attention key~~ (**landed**, WS-E.1.7/#232: a tapped, consumed Super lifts `preempted` for one layout use and delivers `vitrin_principal.attention`, so an in-realm shell can switch realms at all) · a shell client (switcher + launcher) | 7–9 w |
-| **2 — livable** | Cross-realm clipboard · core-drawn lock screen on the consent stack · status in the trusted band · human screenshot | 4–6 w |
+| **2 — livable** | ~~Cross-realm clipboard~~ (**landed**, WS-E.2.1/#213: a core-held single slot the core *pulls* into on Ctrl-Shift-Insert and offers on Shift-Insert, `text/plain;charset=utf-8` at 60 KiB, plus the modifier-aware chord matcher 2.2 and 2.4 consume — §4.1, [D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing)) · core-drawn lock screen on the consent stack · status in the trusted band · human screenshot | 4–6 w |
 | **3 — bare metal** | The keymap decision · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
 | **4 — long tail** | X11 (defers to E3.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |
 
@@ -168,6 +177,144 @@ arrows and modifiers and **not a single letter**. Either xkbcommon interprets
 physical input inside the core (zero new crates; it is already a mandatory
 Smithay dependency) or session mode cannot type. `input/mod.rs:109` already
 records the consequence: key pairing moves from the keysym to the scancode.
+
+## 4.1 The cross-realm clipboard: five axes, each with what was rejected
+
+Stage 2's first deliverable (WS-E.2.1, issue #213), written out here rather
+than in the issue because the issue closes and this does not. Landed as
+**[D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing)**.
+
+The whole of it is a **capability design**, not plumbing: [PRD](../PRD.md) §15's
+first threat row lists *"reach the session's real seat/clipboard/a11y bus"*
+among the things a malicious app cannot do, so every option below is a
+deliberate, bounded hole in a published claim, and the argument for the bound
+is the artifact.
+
+### Axis 1 — where the bytes live
+
+| Option | Cost | Verdict |
+|---|---|---|
+| **(a) A core-held single slot** — PRD §11's Qubes model | **For the first time the TCB retains bytes an application authored.** The core holds client *pixels* it never interprets and typed values it validated itself; a clipboard slot is neither. A password copied from a manager rests in `vitrind`'s address space with a lifetime, so a compromised core exposes whatever was last copied. | **ACCEPTED — the maintainer's own call, asked and answered 2026-08-08.** He was given (b), (c) and "don't build it" in plain terms, was told this cost in exactly these words, and chose (a) anyway. |
+| (b) No buffer: a direct A→B pipe the core brokers at paste time | Tempting — the TCB never stores app bytes. But it requires **both realms alive simultaneously** (copy, close the app, paste is then impossible, which no human expects), and it **leaks a timing signal back to A**: A learns exactly when B pasted. That is a covert channel in the wrong direction — from the *sink* back to the *source* — and the whole point of the mediator is that a realm learns nothing about another. | REJECTED |
+| (c) A per-realm broker each realm pulls from | Multiplies state by `MAX_REALMS` without changing the trust question: the bytes are still core-side, there are now sixteen places for them to be, and the lifetime rule has to hold in all of them. Strictly worse than (a) on every axis and better on none. | REJECTED |
+| (d) Do not build it | Genuinely available, and offered. Copy-paste between apps is the single most-used cross-app act on a desktop; a session mode without it is not one a maintainer daily-drives, which is WS-E's entire purpose. | REJECTED by the maintainer, 2026-08-08 |
+
+### Axis 2 — push or pull
+
+| Option | Cost | Verdict |
+|---|---|---|
+| **The core PULLS: `request_selection` → `selection` → `offer_selection`** | Two round trips per gesture instead of a cached answer, and the source realm must still be alive at *promote* time (not at paste time — that is (b)'s failure, and this does not inherit it). | **ACCEPTED** |
+| A `selection_changed` event the shim pushes on every app-side copy | **Every ordinary Ctrl-C becomes a cross-realm event.** An ambient channel wearing a broker's clothes: the human never asked, the core learns every copy the human makes inside every realm, and the Qubes phrase this design quotes — *"fully controlled by the user, it cannot be triggered/forced by any"* realm — stops being literally true. | REJECTED |
+| A hybrid: the shim pushes a *notification* only (MIME + length, no bytes), the core pulls the bytes on the gesture | Looks like a compromise and is not. A per-copy cross-realm signal is still a per-copy cross-realm signal: it is a free keystroke-timing oracle over the human's own editing, available to nobody who asked for it, and it buys only the ability to grey out a menu item that does not exist. | REJECTED |
+
+The wire shape is the mechanism, not a restatement of it: **there is no message
+by which a shim can put bytes in the slot unasked.** `selection` is answerable
+only against an outstanding, core-minted promotion ticket (`clipboard.rs`'s
+`PendingPromotion`, which is not `Clone`, has no public constructor and is
+consumed by value), so an unsolicited `selection` from a compromised shim has
+nothing to consume and fills nothing. "The core pulls" is a type, not a rule.
+
+### Axis 3 — is the human path grant-governed?
+
+| Option | Cost | Verdict |
+|---|---|---|
+| **No. The human's gesture is a fact the core acts on, journaled — the dead-man switch's precedent** | An authority-bearing act with no grant behind it, so `known-limit` grows and a reader who expects every channel to appear in the grant table will not find this one. Mitigated by journaling both halves and by the fact that the *only* actor is the human at the physical keyboard. | **ACCEPTED** |
+| A `clipboard` verb bit for the human path | **The human is not a wire principal in v0.** A verb keys on a `PrincipalIdentity` bound at `hello`; the human has none, so the bit would name a principal that is not the actor. Inventing one touches `identity.rs`, `principals.toml`, the grant table and the consent surface at once, and burns an immutable bitfield entry on authority nobody can hold. | REJECTED |
+| A consent prompt per transfer | Strictly stronger on attribution, and refused for [D-023](20-decision-log.md#d-023--the-core-owns-a-second-physical-chord-a-tapped-consumed-attention-key-that-lifts-preempted-for-the-two-layout-verbs-only-and-delegates-nothing)(2)'s reason, which applies harder here: copy-paste is a several-times-a-minute act, and a modal card on it trains reflexive clicking on the one surface in this system whose entire worth is that a human reads it. Q9 already tracks consent fatigue as a live problem. | REJECTED |
+
+**The agent-facing clipboard verb is E3.5's and is not built here.** What this
+axis owes E3.5 is only that the shape must not foreclose it, and it does not:
+`offer_selection` is addressed to a realm and carries no notion of who asked,
+so an agent-facing `vitrin_grant` facet can later reach the same slot through
+the enforcement chokepoint with a verb of its own.
+
+### Axis 4 — the gesture, and why it cannot be Ctrl-Shift-C
+
+| Option | Cost | Verdict |
+|---|---|---|
+| **Ctrl-Shift-Insert (promote) / Shift-Insert (offer)** | The core eats both chords in every realm, unconditionally: an app that wants X11-style Shift-Insert primary paste loses it with no pass-through, exactly as [D-023](20-decision-log.md)'s cost note says of Super. `KEY_INSERT` is in `invariant_keysym` (`input/mod.rs:1265`) and is already in the dead-man vocabulary, and Shift-Insert is the *historical X11 clipboard chord*, so it is familiar rather than invented. | **ACCEPTED** |
+| Ctrl-Shift-C / Ctrl-Shift-V, the Qubes chord | **Not expressible.** `invariant_keysym` is a fixed scancode table containing no letters and no digits — asserted, not assumed (`input/mod.rs:1772-1774`: `KEY_A` → `None`). Letters arrive today only in nested mode, because winit's `logical_key` means the *host* compositor did the interpretation (#118). On bare DRM in Stage 3 there is no host, so this chord would work on the maintainer's laptop and stop working the day the workstream reached its point. | REJECTED |
+| Grow an xkbcommon keymap in the core so letters *are* expressible | `input/mod.rs:106-109` warns that a real keymap forces key pairing to move from the keysym to the scancode — a change to a **router invariant**, on the path the dead-man switch depends on — and it is an R7 dependency event on top. It is also Stage 3's decision (§4 above), and pre-empting it from a clipboard issue is exactly the drift the stage list exists to prevent. | REJECTED |
+| One chord plus a core-drawn direction picker | Needs a modal core-drawn surface for a several-times-a-minute act: Axis 3's consent-fatigue argument, one indirection over. | REJECTED |
+| Two more Super-based taps, in the attention chord's mould | The attention chord already consumes both Supers (D-023). A third and fourth Super gesture would be distinguishable only by timing, which is how a human accidentally revokes the wrong thing. | REJECTED |
+
+A chord this backend cannot deliver is **refused at startup**, exactly as
+`deadman::Chord::parse` refuses one — same `keysym_is_intakeable` check, same
+fail-closed posture, because a session that comes up with a clipboard gesture
+that can never fire is the same trap one gesture milder.
+
+### Axis 5 — what may cross, and for how long
+
+| Option | Cost | Verdict |
+|---|---|---|
+| **`text/plain;charset=utf-8` only** | No image, no rich text, no files. A human copying a screenshot between realms gets nothing and no error they can see. | **ACCEPTED** |
+| Any `image/*` type | A decoder in the TCB. *"No image codec in the core, in any dependency class"* is a rule `crates/vitrin-core/Cargo.toml` states twice, and it is stated twice because it is the single largest memory-unsafety surface a compositor can acquire. | REJECTED |
+| `text/uri-list` | A path is a **designation**, and designation belongs to the powerbox (E2.6). A clipboard that moves paths is a file-transfer channel wearing a clipboard's clothes, and it would cross the confinement boundary Phase 2 is being built to draw. | REJECTED |
+| **Hard cap: 61 440 bytes (60 KiB), measured** | 3.4% of this repo's own text files could not be copied whole. See below — the number is measured, not asserted. | **ACCEPTED** |
+| A 1 MiB cap, as the issue proposed | **Not expressible on this wire.** The frame header's `size` is a `u16`, so a whole frame is ≤ 65 535 bytes and the largest string a `selection` can carry is 65 476. 1 MiB would have to travel as an **fd**, which puts a shim-controlled mapping inside the TCB and re-opens the size-lie and SIGBUS class the buffer path already spends `invalid_buffer` on — to carry a clipboard. | REJECTED |
+| Cleared on paste | Humans paste twice. Surprising in the way that makes people stop trusting a mechanism. | REJECTED |
+| Never cleared | A copied password resident for the life of the session. | REJECTED |
+| **Cleared on timeout, on the source realm's death, and on a dead-man trigger** | Three clearing rules to keep consistent instead of zero. | **ACCEPTED** |
+
+**Measuring the cap, because `MAX_REALMS` was argued wrongly three times before
+anyone measured it.** Two bounds meet here and only one of them is a choice.
+
+*The wire bound is not a choice.* A `selection` frame is 8 bytes of header +
+`serial` (4) + `status` (4) + the MIME string at its declared bound (4 + 32) +
+the data string's own 4-byte length: **56 bytes of overhead** against a
+65 535-byte ceiling, leaving **65 476** bytes of payload once 4-aligned.
+Nothing above that is sendable without an fd.
+
+*The use bound is measured — and the first measurement was wrong, which is
+recorded here rather than quietly replaced.* The proxy for "a human selects all
+and copies" is the size of a real text file. The original figures were taken by
+globbing the working tree, which at the time held **~40 scratch worktrees under
+`.claude/`, a vendored wlroots checkout and generated build output** — so ~96%
+of the 6 550 files counted were not this repository's source at all, and none of
+the five published statistics reproduced. The population was the error, not the
+arithmetic, and it is precisely the failure mode this section was written to
+avoid (`MAX_REALMS = 16` was argued wrongly three times before anyone measured
+it). Re-measured over `git ls-files` — the 310 tracked, non-binary text files
+that actually are this repository:
+
+| | |
+|---|---|
+| median | **11 410 B** |
+| p90 | **53 286 B** |
+| p95 | **106 707 B** |
+| p99 | **240 239 B** |
+| max | **400 932 B** |
+
+Whole-file coverage by cap:
+
+| Cap | Files copyable whole |
+|---|---|
+| 4 KiB | 24.84% |
+| 32 KiB | 80.65% |
+| **60 KiB (chosen)** | **92.26%** |
+| 65 476 B (the frame maximum) | 92.90% |
+| 1 MiB (inexpressible) | 100% |
+
+So the last 4 036 bytes the frame could carry buy **0.64 percentage points** —
+five times what the bad measurement claimed, and still not enough to justify
+spending every byte of framing headroom on them.
+
+**What this population is not.** It is one systems repository: prose-heavy
+Markdown and Rust, no minified assets, no CSV, no logs, no notebooks. It stands
+in for "a developer copies a file" and for nothing else, and a deployment whose
+users copy spreadsheets would measure differently. The cap is chosen against
+that stated proxy, not against a claim about text in general. 60 KiB leaves 4 039 bytes spare — room for
+`selection` to gain an argument in a later version without the cap moving, which
+matters because the cap lives in the IDL's immutable `(max N bytes)` token and
+so cannot move. That, and not roundness, is why the number is 61 440.
+
+### What this costs, stated as bandwidth rather than as absence
+
+Two colluding realms can move **60 KiB per human gesture pair**. Qubes accepts
+the same class of bound. The honest statement is the bound; *"there is no
+channel"* stops being true the moment this lands, which is why PRD §15's threat
+row and `docs/book/src/limits.md` are edited in the same commit rather than
+left standing.
 
 ## 5. The target machine, and why no number here generalizes
 
@@ -334,6 +481,35 @@ this workstream owns, not inherits:
   human aimed at the shell; the human's own switch then silently fails and the
   thief's lands. It is journaled with the claiming principal and the grant is
   revocable, and it is still a hole. Published in `docs/book/src/limits.md`.
+
+- **A cross-realm channel exists now, with a stated bandwidth** (created by
+  WS-E.2.1/#213, no owner). [PRD](../PRD.md) §15's first threat row used to say
+  a malicious app cannot *"reach the session's real seat/clipboard/a11y bus"*.
+  After #213 it can reach a **clipboard** — through a human gesture, one
+  direction at a time, `text/plain;charset=utf-8` only, 60 KiB at a time. Two
+  colluding realms can therefore move 60 KiB per human gesture pair. The honest
+  statement is that bound, never *"there is no channel"*; the PRD row is edited
+  rather than left standing, and the channel is published in
+  `docs/book/src/limits.md`. See §4.1 for the bound's derivation.
+
+- **The TCB stores application-authored bytes for the first time** (created by
+  WS-E.2.1, and the maintainer's own accepted cost — [D-024](20-decision-log.md)).
+  Nothing else in the core does: it holds client *pixels* it never interprets and
+  typed values it validated itself. A password copied from a manager now transits
+  `vitrind` and rests in a slot with a lifetime, so a compromised core exposes
+  whatever was copied last. The cap, the one-MIME allow-list, digest-only
+  journaling, the idle timeout, the source-realm-death clear and the dead-man
+  clear bound it; **none removes it**. Published in `docs/book/src/limits.md`.
+
+- **The core eats two more physical chords, and one of them is a paste key**
+  (created by WS-E.2.1, no owner). Ctrl-Shift-Insert and Shift-Insert are
+  consumed in every realm, unconditionally. Shift-Insert is the historical X11
+  primary-paste chord, so an app that binds it loses it with no pass-through and
+  no way to ask for one — the third time this workstream has paid that price
+  (Escape refused it, Super paid it in D-023). What makes it affordable rather
+  than merely paid: the loss is *inside* the realm only, both halves of each
+  press are consumed so no app can even tell, and the gesture the human lost is
+  the gesture they are being given across realms instead.
 
 - **`preempted` on the layout verbs is conditional on invisible core state**
   (created by WS-E.1.7, no owner). An agent reading its own journal can no longer

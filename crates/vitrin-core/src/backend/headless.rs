@@ -171,8 +171,16 @@ use crate::input::{InputRouter, NoopHook, PhysicalPresenceMap};
 /// *this* backend meets no consent gate above it, so the "a prompt consumes the
 /// chord" half of decision 6 is a nested-mode and unit-test property, exactly
 /// as `preempted`'s detection half is.
+///
+/// Since WS-E.2.1 (issue #213) the injector build stacks
+/// [`crate::clipboard::ClipboardHook`] **above** the attention hook as well, on
+/// the same grounds: the clipboard chords' consequence *and* their trigger are
+/// both reachable from the injector channel, which is what gives
+/// `tests/integration/test_real_clipboard.py` a mock-free gate. The order
+/// matches the nested backend's for the reason stated there — a modifier
+/// matcher inside the attention hook would never see a Super press.
 #[cfg(feature = "physical-input-injector")]
-type HeadlessHook = crate::attention::AttentionHook<NoopHook>;
+type HeadlessHook = crate::clipboard::ClipboardHook<crate::attention::AttentionHook<NoopHook>>;
 #[cfg(not(feature = "physical-input-injector"))]
 type HeadlessHook = NoopHook;
 
@@ -188,14 +196,21 @@ type HeadlessHook = NoopHook;
 #[cfg(feature = "physical-input-injector")]
 fn headless_hook(
     attention: crate::attention::AttentionChord,
+    clipboard: crate::chord::Trigger,
     now: &std::rc::Rc<std::cell::Cell<std::time::Instant>>,
 ) -> HeadlessHook {
-    crate::attention::AttentionHook::new(
+    crate::clipboard::ClipboardHook::new(
         std::rc::Rc::new(std::cell::RefCell::new(
-            crate::attention::AttentionSignal::new(attention),
+            crate::clipboard::ClipboardSignal::new(clipboard)
+                .expect("the clipboard chord pair was validated at startup"),
         )),
-        std::rc::Rc::clone(now),
-        NoopHook,
+        crate::attention::AttentionHook::new(
+            std::rc::Rc::new(std::cell::RefCell::new(
+                crate::attention::AttentionSignal::new(attention),
+            )),
+            std::rc::Rc::clone(now),
+            NoopHook,
+        ),
     )
 }
 
@@ -359,6 +374,8 @@ pub fn run(
     dead_man: DeadManConfig,
     #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
     attention: crate::attention::AttentionChord,
+    #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
+    clipboard: crate::chord::Trigger,
     agent_cursor: bool,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
     #[cfg(feature = "physical-input-injector")] physical_input_fd: Option<std::os::fd::RawFd>,
@@ -375,6 +392,7 @@ pub fn run(
         size,
         dead_man,
         attention,
+        clipboard,
         agent_cursor,
         #[cfg(feature = "consent-injector")]
         consent_injector_fd,
@@ -395,6 +413,8 @@ fn run_inner(
     dead_man: DeadManConfig,
     #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
     attention: crate::attention::AttentionChord,
+    #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
+    clipboard: crate::chord::Trigger,
     agent_cursor: bool,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
     #[cfg(feature = "physical-input-injector")] physical_input_fd: Option<std::os::fd::RawFd>,
@@ -530,6 +550,8 @@ fn run_inner(
                 headless_hook(
                     #[cfg(feature = "physical-input-injector")]
                     attention,
+                    #[cfg(feature = "physical-input-injector")]
+                    clipboard,
                     &now_cell,
                 ),
             ),
@@ -550,6 +572,8 @@ fn run_inner(
         physical_input,
         #[cfg(feature = "physical-input-injector")]
         attention_chord: attention,
+        #[cfg(feature = "physical-input-injector")]
+        clipboard_trigger: clipboard,
     };
 
     // Readiness for the injector channel. The `Injector` itself lives in the
@@ -696,6 +720,11 @@ pub(crate) struct HeadlessState {
     /// built with, by construction: both come from `run_inner`'s one argument.
     #[cfg(feature = "physical-input-injector")]
     attention_chord: crate::attention::AttentionChord,
+    /// This run's configured clipboard trigger key (WS-E.2.1), so the channel's
+    /// `clipboard` line chords the key the operator actually chose rather than
+    /// a scancode the harness guessed.
+    #[cfg(feature = "physical-input-injector")]
+    clipboard_trigger: crate::chord::Trigger,
 }
 
 /// The `physical-input-injector` build's channel service (issue #212): read
@@ -739,6 +768,7 @@ impl HeadlessState {
                 request,
                 (view.0 as i32, view.1 as i32),
                 self.attention_chord,
+                self.clipboard_trigger,
             );
             let produced = inputs.len();
             session::route_physical_turn(

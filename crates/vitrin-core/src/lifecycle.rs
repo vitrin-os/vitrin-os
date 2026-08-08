@@ -481,6 +481,19 @@ pub(crate) struct RealmTeardown<'a, 'v, H: PreemptionHook> {
     /// is: not every embedder has one, and `lifecycle` must not name a
     /// backend type.
     pub retained: Option<&'v mut dyn RetainedOutput>,
+    /// The cross-realm clipboard slot (WS-E.2.1), so a dying realm's copied
+    /// bytes leave with it.
+    ///
+    /// Here rather than at the connection-close site because **this** is the
+    /// funnel every death reaches. `close_realm` covers only the shim-socket
+    /// paths (`Message`/`Disconnected`/`Fault`); the SIGCHLD reap path comes
+    /// through `collect_exit` -> `reap_realm` -> `die`, and `hang_up()` retires
+    /// the connection registration so the pending EOF is never dispatched and
+    /// `close_realm` never runs. Clearing the slot only there made "cleared on
+    /// the source realm's death" false for the ordinary case of an app simply
+    /// exiting -- while D-024(5), `limits.md` and `clipboard.rs` all published
+    /// it as a mitigation.
+    pub clipboard: &'a mut crate::clipboard::ClipboardSlot,
     /// The core's single realm registry: where the terminal state lands,
     /// and through it the single vacancy predicate.
     pub realms: &'a mut RealmRegistry,
@@ -1051,6 +1064,19 @@ impl RealmLifecycle {
         //     fail-open: the chokepoint's `no_surface` refusal rests on
         //     `view_is_live`, which is already `false` -- this step only
         //     removes the bytes that refusal is protecting.
+        // 1c. ...and the clipboard slot, if this realm is the one that filled
+        //     it. Same reasoning as the retained frame above: clearing the
+        //     scene does not reach it, and the bytes are the human's, not the
+        //     app's, so they must not outlive the realm they were copied from.
+        //     Unconditional call, `forget_realm` decides -- so a sibling's
+        //     death cannot drop the human's clipboard.
+        if teardown.clipboard.forget_realm(&self.realm_id) {
+            tracing::debug!(
+                realm = %self.realm_id,
+                "clipboard slot cleared: the realm that filled it died"
+            );
+        }
+
         if let Some(retained) = teardown.retained.take() {
             if let Err(err) = retained.scrub_retained_frame() {
                 tracing::error!(
@@ -1479,6 +1505,7 @@ mod tests {
         shim: Option<ShimServer>,
         router: InputRouter<NoopHook>,
         retained: FakeRetained,
+        clipboard: crate::clipboard::ClipboardSlot,
         realms: RealmRegistry,
     }
 
@@ -1493,6 +1520,7 @@ mod tests {
                 shim: None,
                 router: InputRouter::detached(NoopHook),
                 retained: FakeRetained::new(),
+                clipboard: crate::clipboard::ClipboardSlot::default(),
                 realms: crate::realm::tests::registry_with(&["realm-0"]),
             }
         }
@@ -1505,6 +1533,7 @@ mod tests {
                 importer: None,
                 router: &mut self.router,
                 retained: Some(&mut self.retained),
+                clipboard: &mut self.clipboard,
                 realms: &mut self.realms,
                 recorder: &mut self.recorder,
             }
@@ -2586,6 +2615,74 @@ mod tests {
             rig.retained.scrubs, 1,
             "the scrub rides the death latch: one death, one scrub"
         );
+    }
+
+    /// Fill the slot through the real promotion handshake, so the fixture
+    /// cannot construct a state production never produces.
+    fn fill_slot(slot: &mut crate::clipboard::ClipboardSlot, realm: &RealmId, text: &str) {
+        let serial = slot.open_promotion(realm.clone());
+        let ticket = slot
+            .claim_answer(realm, serial)
+            .expect("the promotion this test just opened must be claimable");
+        slot.fill(
+            ticket,
+            crate::clipboard::CLIPBOARD_MIME,
+            text,
+            Instant::now(),
+        )
+        .expect("fixture text is in-policy");
+    }
+
+    /// **A dying realm takes the clipboard bytes it copied with it — on the
+    /// REAP path, not only on a socket close.**
+    ///
+    /// The gap this pins: `forget_realm` was called only from
+    /// `session::close_realm`, reachable only from `dispatch_shim`'s
+    /// `Message`/`Disconnected`/`Fault` arms. An app that simply exits comes
+    /// through `collect_exit` -> `reap_realm` -> `die`, and `hang_up()` retires
+    /// the connection registration so the pending EOF is never dispatched --
+    /// so `close_realm` never ran and the plaintext outlived the realm, while
+    /// D-024(5) and `limits.md` published "cleared on the source realm's
+    /// death" as a mitigation the maintainer weighed when accepting a
+    /// core-held slot.
+    ///
+    /// Driven through `die`'s own funnel, and asserting the sibling case too:
+    /// a realm's death must not drop a clipboard the human filled from
+    /// somewhere else.
+    #[test]
+    fn a_dying_realm_clears_only_its_own_clipboard_bytes() {
+        let _fd = fd_lock();
+        let mut rig = Rig::new("lifecycle-clipboard");
+        let mut life = rig.spawn_program("/bin/sh", &["-c", "exec sleep 300"]);
+
+        // Filled from a SIBLING: this death must leave it alone.
+        fill_slot(
+            &mut rig.clipboard,
+            &RealmId::new("realm-other"),
+            "sibling copy",
+        );
+        life.note_connection_closed(DeathCause::ConnectionClosed, &mut rig.teardown());
+        assert!(
+            rig.clipboard.peek(Instant::now()).is_some(),
+            "a realm's death must not drop a clipboard the human filled from another realm"
+        );
+
+        // Filled from THIS realm: the death takes it.
+        let mut rig2 = Rig::new("lifecycle-clipboard-own");
+        let mut life2 = rig2.spawn_program("/bin/sh", &["-c", "exec sleep 300"]);
+        let own = life2.realm_id().clone();
+        fill_slot(&mut rig2.clipboard, &own, "secret");
+        assert!(
+            rig2.clipboard.peek(Instant::now()).is_some(),
+            "fixture check: the slot starts full"
+        );
+        life2.note_connection_closed(DeathCause::ConnectionClosed, &mut rig2.teardown());
+        assert!(
+            rig2.clipboard.peek(Instant::now()).is_none(),
+            "the realm that filled the slot died: its bytes must go with it, on THIS funnel              rather than on a socket-close path a reaped app never reaches"
+        );
+        let _ = life.shutdown(quick_timing(), &mut rig.teardown());
+        let _ = life2.shutdown(quick_timing(), &mut rig2.teardown());
     }
 
     #[test]

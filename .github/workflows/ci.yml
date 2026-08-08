@@ -656,7 +656,7 @@ jobs:
           # drifted -- it carried two of the five gates run.sh named, so the
           # guard against gate drift had silently drifted, which is the same
           # defect one level up. Edit both, and README.md's table, together.
-          for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_launch.py test_shell.py; do
+          for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_real_clipboard.py test_launch.py test_shell.py; do
             if [ ! -f "tests/integration/$gate" ]; then
               echo "::error::named property gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with that property's evidence contributing nothing. Restore it, or retire it from run.sh's PROPERTY_GATES, this list, and tests/integration/README.md's gate table together."
               missing=1
@@ -900,6 +900,23 @@ jobs:
         run: |
           cargo fuzz build --sanitizer none protocol_decode
           cargo fuzz build --sanitizer none ipc_framing
+
+      - name: Seed-corpus reachability (fuzz/ is its own workspace, so `cargo test` must be run in it)
+        # WS-E.2.1 (#213). `fuzz/` is deliberately NOT a member of the root
+        # workspace, so `cargo test --workspace` never collected
+        # `fuzz/tests/seed_corpus_reachability.rs` and no job ran it here
+        # either -- the exact "a gate whose absence is invisible" shape #229
+        # names. It had been failing on `main`: `protocol_decode.rs`'s
+        # `DECODERS` table had drifted out of IDL declaration order, so
+        # `attach_with_fd` -- the one seed that exercises the fd path -- was
+        # handing its fd to `get_seat` and dying on `FdCountMismatch` before it
+        # reached a single byte of `attach`.
+        #
+        # `--check` first, so a stale generator is a clear message rather than a
+        # confusing test failure; then the real-decoder proof.
+        run: |
+          python3 fuzz/seed_corpus.py --check
+          cargo test --manifest-path fuzz/Cargo.toml
 
       - name: Replay the checked-in seed corpus (every past regression stays a permanent test)
         # One file at a time, never a directory: a directory argument is

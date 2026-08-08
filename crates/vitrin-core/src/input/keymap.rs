@@ -706,6 +706,31 @@ mod tests {
         );
     }
 
+    /// **A real Turkish keymap delivers every core chord trigger** — the
+    /// positive half of the constructor's guard.
+    ///
+    /// `a_keymap_that_disarms_a_core_chord_cannot_be_constructed` proves the
+    /// guard REFUSES a bad keymap. On its own that is satisfiable by a guard
+    /// that refuses everything, and `chord.rs`'s table-vs-table test cannot
+    /// tell the difference because it never builds a keymap. This is the other
+    /// direction, against the layout the maintainer actually types on: all 28
+    /// triggers resolve to exactly the keysym the vocabulary names.
+    #[test]
+    fn a_real_turkish_keymap_delivers_every_core_chord_trigger() {
+        let mut keymap = CoreKeymap::from_text(TR_KEYMAP).expect("the tr fixture compiles");
+        for (name, evdev, expected) in crate::chord::Trigger::VOCABULARY {
+            let got = keymap.resolve(*evdev, KeyState::Pressed);
+            assert_eq!(
+                got,
+                Some(*expected),
+                "trigger `{name}` (evdev {evdev}) must resolve to {expected:#x} on a real tr \
+                 keymap; a layout that moves it disarms the gesture bound to it"
+            );
+            // Release, so the modifier state does not carry between iterations.
+            keymap.resolve(*evdev, KeyState::Released);
+        }
+    }
+
     /// The keypad keeps its identity. `keysym_to_utf32` maps `KP_7` to `'7'`,
     /// so a blanket re-encode would tell an app the human pressed the top-row
     /// digit — information the wire cannot recover.

@@ -532,20 +532,18 @@ mod tests {
     const SHIFT_R: u32 = 0xffe2;
     const CTRL_L: u32 = 0xffe3;
     const INSERT: u32 = 0xff63;
-
-    /// WS-E.3.1 (issue #217, D-028): the core can now interpret a keymap on a
-    /// bare-metal backend, so "which keysym does this scancode produce" stops
-    /// being a constant for most of the keyboard. Every key **this** module's
-    /// two vocabularies name must stay in the part that is still constant —
-    /// [`crate::input::invariant_keysym`]'s fixed table — because a chord
-    /// whose keysym moved with the layout is a human gesture that stops
-    /// working on somebody else's keyboard.
+    /// The chord vocabulary and the layout-invariant table agree — **and that
+    /// is all this checks.**
     ///
-    /// The counts are asserted so the sweep cannot silently shrink to
-    /// nothing, and they are the numbers the tables actually hold: 28
-    /// triggers, 4 modifiers with a left and a right keysym each.
+    /// It was named `..._survives_a_core_that_owns_a_keymap`, which it never
+    /// established: it compares two `const` tables in this crate and never
+    /// constructs a keymap, so it could not observe anything WS-E.3.1 added.
+    /// The property it appeared to guard — that a real keymap still delivers
+    /// every core chord trigger — is enforced in
+    /// [`crate::input::keymap::CoreKeymap`]'s constructor and tested there,
+    /// against real keymaps, in both directions.
     #[test]
-    fn every_chord_vocabulary_keysym_survives_a_core_that_owns_a_keymap() {
+    fn the_chord_vocabulary_agrees_with_the_layout_invariant_table() {
         assert_eq!(Trigger::VOCABULARY.len(), 28);
         for (name, evdev, keysym) in Trigger::VOCABULARY {
             assert_eq!(

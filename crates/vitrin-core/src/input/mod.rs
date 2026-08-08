@@ -2454,12 +2454,25 @@ pub(crate) fn invariant_keysym(evdev_code: u32) -> Option<u32> {
 /// Whether nested intake can ever produce `keysym` — i.e. whether some evdev
 /// scancode maps to it through [`invariant_keysym`].
 ///
-/// Exists for **two** callers and one hazard, and the second caller is why the
+/// Exists for several callers and one hazard, and the extra callers are why the
 /// hazard is stated as a class rather than as one switch:
 /// [`crate::deadman::Chord::parse`] validates the configured dead-man chord
 /// against it, and [`crate::attention::AttentionChord::parse`] the attention
 /// chord (WS-E.1.7), so a session can never come up with a core-owned chord
-/// whose key intake silently drops. Asking the real table rather than restating
+/// whose key intake silently drops.
+///
+/// # What it does NOT promise on bare metal (WS-E.3.1)
+///
+/// This answers about [`invariant_keysym`] — the fixed scancode table the
+/// NESTED and headless paths use. A `session-keymap` build resolves keys
+/// through the operator's keymap instead, where a keysym is whatever the layout
+/// says, so "intakeable" here is not a statement about what that build will
+/// deliver. Answering `true` and then never firing is exactly the late
+/// discovery this function exists to prevent, so the bare-metal half is checked
+/// somewhere else and by construction:
+/// [`crate::input::keymap::CoreKeymap`] refuses to be built from a keymap that
+/// does not deliver every [`crate::chord::Trigger::VOCABULARY`] entry. Two
+/// checks, two paths, neither standing in for the other. Asking the real table rather than restating
 /// it is the whole point — a hand-maintained copy of the mapping would be free
 /// to drift, and the symptom of that drift is a chord that never fires, which
 /// is the worst possible thing to discover late. The two failures are not the

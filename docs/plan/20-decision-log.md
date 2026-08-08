@@ -382,6 +382,33 @@ realm view -> consent overlay -> lock cover -> STATUS STRIP -> trusted band
 
 ---
 
+### D-028 — The DRM bring-up escape route is VT switching and an installer USB, not SSH
+
+**Status:** accepted (2026-08-09) — amends the escape-route requirement in issue **#220** (WS-E.3.4) and the standing safety rule in workstream [WS-E](14-workstream-session-mode.md) §7; implemented by [`docs/drm-bringup.md`](../drm-bringup.md)
+
+**What was required.** Issue #220's decision 3 requires that the DRM bring-up runbook's step 0 be *"an isolated VT **and** an SSH session from a second machine"*, and calls it **non-negotiable**, on the grounds that a DRM backend started from inside the live session takes DRM master away from the running compositor and the worse failures leave the panel in an unrecoverable mode with no console to fix it from. [WS-E §7](14-workstream-session-mode.md) states the same requirement as the workstream's standing rule.
+
+**What was decided instead.** The maintainer declined the SSH half, on 2026-08-09, in these words: *"Nah we have arch installer disk, we can do chroot if something goes really wrong. I dont want to run ssh server, no need to open another security layer."* The trade being made is explicit and is his to make: a permanently listening remote-access service on the machine that is about to become his daily driver, against a slower recovery path in a failure mode that may never occur.
+
+**The escape route this machine actually has**, verified read-only on 2026-08-09 and written into the runbook in this order:
+
+1. **VT switching, first line.** `Ctrl+Alt+F1` returns to Hyprland, which holds `seat0` on `tty1`. `logind` is active and grants the display to whichever VT is active, so this is ordinary and reversible rather than a rescue. It survives on purpose: this configuration's keybind wrapper skips `F1`–`F12` precisely so `Ctrl+Alt+F<n>` stays reachable. `tty2`–`tty6` are free and `NAutoVTs` is at its default of 6, so a login prompt is one chord away.
+2. **The maintainer's remote control is NOT an escape route, and the runbook says so rather than omitting it.** `wayvnc` runs as a client of Hyprland over `wlr-screencopy`, bound to `127.0.0.1:5900` and reached over Tailscale — it runs *through the desktop*, so it dies with the display and can neither show `vitrind`'s output nor give a shell. Naming it as a fallback would be worse than leaving it out, because it would be reached for in exactly the situation where it is guaranteed to be gone.
+3. **Arch installer USB and `arch-chroot`, last line.** Real, and slower by orders of magnitude: physical presence, a power cycle, mount, chroot, edit, reboot. Minutes to tens of minutes, against seconds for a console command.
+
+**The cost, stated rather than argued.** **A wedged DRM master with no live console is now a reboot, where #220's design assumed it was a command.** SSH's specific value was a *second, independent* path to a shell that does not depend on the display, the seat, or the local keyboard — and none of the three above has that property. VT switching depends on the local keyboard not being wedged; the USB path depends on a power cycle having already happened. There is no substitute for the property that was given up, only a slower path around it.
+
+Two secondary findings, both recorded because they change what recovery is available:
+
+- **`Alt+SysRq` is not a safety net here as configured.** `/proc/sys/kernel/sysrq` is `16` — sync only — with no `sysctl.d` override. `REISUB` does not work, and neither does `r` (unraw), the one that recovers a keyboard a wedged compositor left grabbed. The runbook offers `sysctl kernel.sysrq=1` as an explicit, temporary, security-traded pre-step (anyone at the physical keyboard can then reboot the machine unauthenticated) rather than assuming it.
+- **`seatd` is installed but not running and the operator is not in a `seat` group**, so `libseat` must use its logind backend — which grants devices only to a session logind considers *active on its own VT*. That makes "log in on the VT" load-bearing rather than optional, and makes `LIBSEAT_BACKEND=seatd` a configuration mistake rather than a bring-up finding.
+
+**What this does not change.** The hazard itself, and the rule that follows from it: **never take the human's live display out from under them.** No Stage-3 task runs from inside the live session, with or without SSH. WS-E §7 is amended to describe the substitute route rather than to soften the rule.
+
+**Why an entry at all.** #220 called its requirement non-negotiable, and it was negotiated. Silently writing the runbook as though SSH existed, or writing it against SSH that is not there, would each have produced a document that fails at the moment it is needed. The decision is recorded so that the next person reading #220 finds the amendment beside the requirement instead of concluding the runbook missed it.
+
+---
+
 
 ## Part B — Open questions (PRD §20), with owners and decide-by gates
 

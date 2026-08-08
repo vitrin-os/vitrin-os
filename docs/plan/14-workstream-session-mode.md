@@ -322,10 +322,15 @@ Every WS-E estimate is measured against hardware chosen for being easy:
 
 - One connected output, eDP-1, 2560×1600@240, **scale 1** — no fractional
   scaling anywhere in the workstream.
-- eDP-1 is on `card1` = **i915**. The discrete NVIDIA GPU's connector is
-  disconnected and `nvidia_drm` is not loaded, so scanout *and* render are
-  Intel: no PRIME, no multi-GPU renderer, the most well-trodden path in
-  Wayland.
+- eDP-1 is on `card1` = **i915**, and it is the only `connected` connector on
+  the machine — so scanout *and* render are Intel: no PRIME, no multi-GPU
+  renderer, the most well-trodden path in Wayland.
+- **`nvidia_drm` *is* loaded, and `/dev/dri/card2` exists.** An earlier version
+  of this line said it was not, and that was wrong (re-checked 2026-08-09). All
+  four of `card2`'s connectors are `disconnected`, so it can light nothing — but
+  it is a second DRM device that udev enumeration will find, so a backend taking
+  "the first card" can take the one with no output. `docs/drm-bringup.md` carries
+  it as bring-up hazard H1.
 - 2560×1600@240 means CPU compositing is not viable (~16 MB/frame), so
   GLES+GBM is mandatory rather than optional — which on Intel is also the easy
   path.
@@ -741,9 +746,19 @@ reader can re-run them rather than trust them.
 
 **A DRM backend takes DRM master and the seat. Running one from inside the live
 session kills that session.** Every Stage-3 task runs on an isolated VT or a
-second machine, with an SSH escape route. This is the same hazard class as
-injecting input into a live session, and it is written here so no task has to
-rediscover it.
+second machine, never from inside the running desktop. This is the same hazard
+class as injecting input into a live session, and it is written here so no task
+has to rediscover it.
+
+**The escape route is VT switching and an installer USB, not SSH.** This rule
+originally required an SSH session from a second machine;
+[D-028](20-decision-log.md#d-028--the-drm-bring-up-escape-route-is-vt-switching-and-an-installer-usb-not-ssh)
+(2026-08-09) records the maintainer's decision not to run an sshd, the route
+that replaces it, and its cost — **a wedged DRM master with no live console is a
+reboot rather than a command.** The step-by-step version, written against this
+machine's actual VTs, cards and connectors, is
+[`docs/drm-bringup.md`](../drm-bringup.md) step 0. The rule above is unchanged;
+only the recovery path is.
 
 ## 8. What this workstream is not
 

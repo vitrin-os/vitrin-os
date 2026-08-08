@@ -358,6 +358,18 @@ That is the complete list of what confines a realm right now.
   privileged helper); **P13** closes it with a loopback-only network
   namespace plus an empty mount namespace, so that there is nothing to
   reach rather than nothing advertised.
+- **On bare metal, a realm's app can plausibly open `/dev/input/event*` and
+  keylog the human (published ahead of the code, closes with E2.6/E2.7).**
+  This is the sandbox hole above pointed at the one device the architecture
+  exists to mediate. `logind` ACLs the active session's input nodes to that
+  user, and the app runs as the core's own uid with no namespace, so it can
+  open them directly — bypassing the input router, the human/agent origin tag,
+  the consent grab and the lock screen, none of which it goes through. **It is
+  not reachable today**: there is no DRM/KMS backend, and under `--nested` the
+  host compositor is the only reader of those devices. It becomes reachable the
+  moment a bare-metal backend lands (WS-E.3.2), and it is written here first
+  rather than with that code. `crates/vitrin-core/src/spawn/isolation.rs`
+  already probes the facilities that would close it and enforces none of them.
 - **Same-uid separation is not attempted.** The `0700` runtime directory
   bounds other *users* on the machine, not other processes of this user.
   Note what the realm's `XDG_RUNTIME_DIR` therefore is and is not: its value,

@@ -483,6 +483,62 @@ jobs:
             echo "not a test result -- see \`shim/wlcs/README.md\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  vkms-advisory:
+    name: "vkms-advisory (virtual KMS capability probe, ADVISORY: never blocks a PR)"
+    runs-on: ubuntu-latest
+    # ADVISORY, per issue #220 decision 4, on the wlcs-advisory precedent above
+    # and enforced by the SAME TWO independent mechanisms, for the same reason
+    # (either alone is one bad rebase away from silently gating merges):
+    #   1. continue-on-error here, at the job level.
+    #   2. .github/vkms/run-advisory.sh itself always exits 0.
+    #
+    # WHAT THIS JOB IS FOR, and the sentence that must survive every edit:
+    # it does NOT prove the DRM backend lights a panel, presents a frame, or
+    # delivers an input event. GitHub runners have no display controller and no
+    # seat, so no green check in this repository will ever prove those. The only
+    # evidence for them is docs/drm-bringup.md, executed by a human on one
+    # machine and dated. This job measures ONE thing runners can answer: whether
+    # a virtual KMS device offers a usable GBM + EGL/GLES scanout path at all --
+    # which issue #220 decision 5 records as UNKNOWN until measured, because
+    # vkms exposes no render node. Writing a criterion about it before measuring
+    # would be writing one that may never legitimately go green.
+    #
+    # The most dangerous artifact in #220 is a VKMS job that WORKS: a green tick
+    # exercising a virtual connector under software rendering, in a repo whose
+    # readers are trained to trust green ticks, will be cited as evidence the
+    # backend runs on hardware. Hence the job name, the step summary and the
+    # limits.md entry all carrying what it does not cover, and the word
+    # "advisory" in the name itself.
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install the probe's build dependencies
+        # libdrm/gbm/egl/gles headers only -- the probe is ~200 lines of C and
+        # links nothing from this repository. `|| true` for the same reason the
+        # wlcs job uses it: a package that stops being installable on a future
+        # runner image is a setup gap this job declares, not a red tick.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libdrm-dev libgbm-dev libegl-dev libgles-dev pkg-config || true
+
+      - name: "Load vkms if available, probe it, and publish what it did and did not cover"
+        # Every branch of this script writes to $GITHUB_STEP_SUMMARY -- either
+        # what it exercised and what it did not, or an explicit declared skip
+        # naming why. Never a silent pass. (#220 acceptance criterion 4.)
+        run: bash .github/vkms/run-advisory.sh "${RUNNER_TEMP}/vkms-advisory-out"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vkms-advisory-results
+          path: ${{ runner.temp }}/vkms-advisory-out/
+          retention-days: 14
+
   conformance:
     name: conformance (real C shim against the real Rust core)
     runs-on: ubuntu-latest

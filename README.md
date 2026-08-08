@@ -152,6 +152,19 @@ What exists today, on `main`:
   [`examples/agent-demo/run_demo.py`](examples/agent-demo/run_demo.py) is
   the demo agent and doubles as the M1.5 integration test; run it with
   `cargo xtask demo` (see [Quickstart](#quickstart) below).
+- **The switcher, as a client**
+  ([`examples/shell/`](examples/shell/README.md)) — moving the output between
+  realms and launching a realm template are done by an ordinary SDK client
+  holding `layout.focus`, `layout.arrange` and `realm.launch` through the
+  normal consent path, because PRD §5.1 keeps window-management policy out of
+  the core. It is **not** a desktop shell and does not become one: it is
+  line-oriented because a principal cannot draw (`vitrin_view` is
+  capture-only; there is no principal-facing surface interface), and it has no
+  hotkey because a principal cannot receive physical input (there is no
+  `observe_input` verb). Both are structural gaps, both are published in
+  [`docs/book/src/limits.md`](docs/book/src/limits.md), and so is the cost:
+  kill the shell and the session survives with the last-focused realm still
+  taking your input, but nothing can re-aim it until you start one again.
 - **CI** — [.github/workflows/ci.yml](.github/workflows/ci.yml): Rust
   fmt/clippy/tests (debug + release), IDL schema validation and
   generated-code drift checking, a Rust-free container build of the C shim,
@@ -382,6 +395,7 @@ The spawn path and every decision above are documented in full in
 | [`shim/`](shim/README.md) | The wlroots-based per-app Wayland shim (C + Meson, outside the Cargo workspace) |
 | [`sdk/python/`](sdk/python) | The pure-Python agent SDK (`vitrin_os` package, D8) |
 | [`examples/agent-demo/run_demo.py`](examples/agent-demo/run_demo.py) | The Phase-1 demo agent — also the M1.5 integration test, run via `cargo xtask demo` |
+| [`examples/shell/run_shell.py`](examples/shell/README.md) | The switcher and launcher, as an ordinary SDK client — **not** a desktop shell; line-oriented because a principal cannot draw, and hotkey-free because a principal cannot receive physical input |
 | [`tests/integration/`](tests/integration/README.md) | Drives the shipped `vitrind` binary + real shim + real apps over a real socket |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | CI: schema validation, Rust + C tests, codegen drift check, headless integration suite |
 

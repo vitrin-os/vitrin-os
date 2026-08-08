@@ -69,6 +69,11 @@ PROPERTY_GATES=(
   test_attention.py             # the human's attention key lifts `preempted` for
                                 # exactly one layout use, and only for principals
                                 # holding layout authority (#232)
+  test_shell.py                 # the switcher and launcher is an ordinary SDK
+                                # client: a separate host-side process moves the
+                                # output, and killing it leaves both realms
+                                # running with the last-bound one still taking
+                                # the human's input (#211)
   test_launch.py                # a consented `realm_launch` grant makes the
                                 # TRUSTED CORE fork a process, and the journal
                                 # names who asked (#207). The one gate covering

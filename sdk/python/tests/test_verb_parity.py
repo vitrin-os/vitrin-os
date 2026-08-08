@@ -72,6 +72,34 @@ def test_verb_mask_covers_exactly_the_defined_bits() -> None:
     assert protocol.VERB_MASK == defined
 
 
+def test_the_unserved_marker_is_actually_a_phrase_the_idl_uses() -> None:
+    """The served/unserved split below is derived from a STRING MATCH.
+
+    That derivation has a vacuity mode the assertion after it cannot see: if
+    the IDL rephrased its unserved entries, every verb would read as served,
+    and a hand-edit of `VERBS_SERVED_IN_VERSION_1` to "all of them" would make
+    the two agree again — a green test asserting nothing, exactly the shape
+    D-017 recorded. So pin that the phrase is still load-bearing: at least one
+    entry carries it, and at least one does not.
+
+    At wire version 2 the unserved side is `observe_cursor` alone;
+    `realm_launch` stays out of the SERVED set for a reason about the version
+    rather than the deployment (a version-1 connection cannot mint
+    `vitrin_launcher` at all), and the IDL's own summary says so, which is why
+    deriving from the IDL rather than from a second list is the point.
+    """
+    summaries = [(e.get("summary") or "") for e in _verb_entries()]
+    marked = [s for s in summaries if UNSERVED_MARKER in s]
+    assert marked, (
+        f"no vitrin_grant.verb entry says {UNSERVED_MARKER!r} any more. Either every "
+        "verb became served — in which case say so here deliberately — or the IDL "
+        "rephrased and this whole derivation silently became a tautology."
+    )
+    assert len(marked) < len(summaries), (
+        "every verb entry is marked unserved, so the derivation cannot discriminate"
+    )
+
+
 def test_served_set_matches_the_idl_summaries() -> None:
     """The served/unserved split tracks the IDL, not this file's memory.
 

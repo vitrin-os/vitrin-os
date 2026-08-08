@@ -71,6 +71,7 @@
 //!                     key <evdev-scancode> <press|release>
 //!                     attention                      (one whole chord tap)
 //!                     clipboard <promote|offer>      (one whole modifier chord)
+//!                     screenshot                     (one whole modifier chord)
 //!
 //!   core -> harness   vitrin-physical-input 1        (banner, once)
 //!                     ack <injected-event-count>     (per accepted request)
@@ -96,6 +97,17 @@
 //! the modifiers' and the trigger's own scancodes, so `clipboard promote` and
 //! the five `key` lines that spell it are the identical five calls. Which key
 //! it chords is this run's `--clipboard-key`, not the peer's to choose.
+//!
+//! `screenshot` is the same idea again (WS-E.2.4, [`crate::screenshot`]): one
+//! line is the whole configured chord, pressed through [`super::physical_key`]
+//! on the modifiers' and the trigger's own scancodes, so `screenshot` and the
+//! four `key` lines that spell `ctrl+print` are the identical four calls.
+//!
+//! It matters more here than for the two above, and the reason is issue #216's
+//! own "CI cannot press a key" criterion: with this line CI *can*, so the
+//! screenshot gate covers the **detection** half — a real chord on real
+//! scancodes reaching the real hook stack — as well as the effect half, rather
+//! than asserting the effect and leaving the key to a manual runbook.
 //!
 //! `ack` counts the [`super::SeatInput`]s the intake produced, not the
 //! deliveries: whether an event reaches an app is the router's and the shim's
@@ -157,6 +169,11 @@ pub(crate) enum Request {
     /// harness means is genuinely the harness's to say — they are two different
     /// gestures, not two spellings of one.
     Clipboard { promote: bool },
+    /// One whole chord of **this run's configured screenshot gesture**
+    /// (WS-E.2.4). No argument: there is one screenshot chord, and which keys
+    /// it is spelled with is this run's `--screenshot-chord`, not the peer's to
+    /// choose.
+    Screenshot,
 }
 
 /// Parse one line into a [`Request`], or `None` for anything else.
@@ -192,6 +209,7 @@ pub(crate) fn parse_request(line: &str) -> Option<Request> {
             pressed: parse_press(fields.next()?)?,
         },
         "attention" => Request::Attention,
+        "screenshot" => Request::Screenshot,
         "clipboard" => Request::Clipboard {
             promote: match fields.next()? {
                 "promote" => true,
@@ -249,6 +267,7 @@ pub(crate) fn intake(
     view: (i32, i32),
     attention: crate::attention::AttentionChord,
     clipboard: crate::chord::Trigger,
+    screenshot: crate::chord::ModChord,
 ) -> Vec<SeatInput> {
     match request {
         Request::Motion { x, y } => super::intake_physical::<SyntheticHost>(
@@ -320,38 +339,46 @@ pub(crate) fn intake(
             out
         }
         // The whole chord, through the **same** `physical_key` every other key
-        // goes through, on the configured trigger's own scancode. Modifiers
-        // are released in reverse order, which is not cosmetic: the core's
-        // matcher tracks press and release per modifier, and a harness that
-        // released them in press order would still be correct here but would
-        // stop resembling a human, which is the only thing this channel is for.
+        // goes through, on the configured trigger's own scancode (see
+        // `chord_events`).
         Request::Clipboard { promote } => {
-            use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
             let mut mods = Vec::new();
             if promote {
                 mods.push(crate::chord::Modifier::Ctrl.evdev());
             }
             mods.push(crate::chord::Modifier::Shift.evdev());
-            let mut out = Vec::new();
-            for evdev in &mods {
-                out.extend(super::physical_key(*evdev, None, KeyState::Pressed));
-            }
-            out.extend(super::physical_key(
-                clipboard.evdev(),
-                None,
-                KeyState::Pressed,
-            ));
-            out.extend(super::physical_key(
-                clipboard.evdev(),
-                None,
-                KeyState::Released,
-            ));
-            for evdev in mods.iter().rev() {
-                out.extend(super::physical_key(*evdev, None, KeyState::Released));
-            }
-            out
+            chord_events(&mods, clipboard.evdev())
+        }
+        // WS-E.2.4, and the chord's own scancodes rather than a list assembled
+        // here: `ModChord::scancodes` is the single place a gesture's spelling
+        // becomes keys, so `--screenshot-chord super+f5` is exercised as
+        // `super+f5` without this channel knowing.
+        Request::Screenshot => {
+            let (mods, trigger) = screenshot.scancodes();
+            chord_events(&mods, trigger)
         }
     }
+}
+
+/// Press `mods`, tap `trigger`, release `mods` in **reverse** order, all
+/// through the same [`super::physical_key`] a bare `key` line uses.
+///
+/// The reverse release is not cosmetic: the core's matcher tracks press and
+/// release per modifier, and a harness that released them in press order would
+/// still be correct here but would stop resembling a human, which is the only
+/// thing this channel is for.
+fn chord_events(mods: &[u32], trigger: u32) -> Vec<SeatInput> {
+    use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+    let mut out = Vec::new();
+    for evdev in mods {
+        out.extend(super::physical_key(*evdev, None, KeyState::Pressed));
+    }
+    out.extend(super::physical_key(trigger, None, KeyState::Pressed));
+    out.extend(super::physical_key(trigger, None, KeyState::Released));
+    for evdev in mods.iter().rev() {
+        out.extend(super::physical_key(*evdev, None, KeyState::Released));
+    }
+    out
 }
 
 /// The live channel: the adopted socketpair end and the reassembly buffer for
@@ -661,8 +688,14 @@ mod tests {
             .expect("the default clipboard trigger parses")
     }
 
+    /// This build's default screenshot chord (WS-E.2.4).
+    fn shot() -> crate::chord::ModChord {
+        crate::chord::ModChord::parse(crate::screenshot::DEFAULT_SCREENSHOT_CHORD)
+            .expect("the default screenshot chord parses")
+    }
+
     #[test]
-    fn the_vocabulary_is_exactly_six_verbs_and_nothing_decorated() {
+    fn the_vocabulary_is_exactly_seven_verbs_and_nothing_decorated() {
         assert_eq!(parse_request("attention"), Some(Request::Attention));
         // Argument-free: which key it is is the core's configuration, not the
         // peer's to choose, so a decorated line is a different message.
@@ -680,6 +713,13 @@ mod tests {
         assert_eq!(parse_request("clipboard"), None);
         assert_eq!(parse_request("clipboard paste"), None);
         assert_eq!(parse_request("clipboard promote extra"), None);
+        // The seventh (WS-E.2.4). Asserted HERE and not only in the screenshot
+        // module's own test: this is the test whose stated job is that the
+        // vocabulary is CLOSED, so a verb it does not mention is a verb this
+        // test does not actually pin.
+        assert_eq!(parse_request("screenshot"), Some(Request::Screenshot));
+        assert_eq!(parse_request("screenshot full"), None);
+        assert_eq!(parse_request("screenshots"), None);
         assert_eq!(
             parse_request("motion 12.5 -3"),
             Some(Request::Motion { x: 12.5, y: -3.0 })
@@ -734,7 +774,13 @@ mod tests {
         // `intake_physical`/`physical_key` produce, tagged by the one
         // constructor that can tag it, and nothing here builds a `SeatInput`
         // of its own.
-        let motion = intake(Request::Motion { x: 4.0, y: 9.0 }, VIEW, chord(), trigger());
+        let motion = intake(
+            Request::Motion { x: 4.0, y: 9.0 },
+            VIEW,
+            chord(),
+            trigger(),
+            shot(),
+        );
         assert_eq!(motion.len(), 1);
         assert_eq!(motion[0].origin(), Origin::Physical);
         assert_eq!(motion[0].kind(), &SeatInputKind::Motion { x: 4.0, y: 9.0 });
@@ -747,6 +793,7 @@ mod tests {
             VIEW,
             chord(),
             trigger(),
+            shot(),
         );
         assert_eq!(
             button[0].kind(),
@@ -764,6 +811,7 @@ mod tests {
             VIEW,
             chord(),
             trigger(),
+            shot(),
         );
         assert_eq!(
             scroll[0].kind(),
@@ -783,6 +831,7 @@ mod tests {
             VIEW,
             chord(),
             trigger(),
+            shot(),
         );
         assert_eq!(
             key[0].kind(),
@@ -801,7 +850,7 @@ mod tests {
         // chord's own scancode -- `attention` names a gesture, it is never a
         // second way into the core.
         let chord = chord();
-        let tap = intake(Request::Attention, VIEW, chord, trigger());
+        let tap = intake(Request::Attention, VIEW, chord, trigger(), shot());
         let by_hand: Vec<_> = intake(
             Request::Key {
                 evdev: chord.evdev(),
@@ -810,6 +859,7 @@ mod tests {
             VIEW,
             chord,
             trigger(),
+            shot(),
         )
         .into_iter()
         .chain(intake(
@@ -820,6 +870,7 @@ mod tests {
             VIEW,
             chord,
             trigger(),
+            shot(),
         ))
         .collect();
         assert_eq!(tap.len(), 2);
@@ -841,6 +892,68 @@ mod tests {
     }
 
     #[test]
+    fn the_screenshot_line_is_the_configured_chord_and_nothing_else() {
+        // Four events for `ctrl+print`: Ctrl down, Print down, Print up, Ctrl
+        // up -- the whole chord, because half a chord is not a gesture and a
+        // harness that sent only the press would leave the core believing Ctrl
+        // is held. Every one of them comes out of the same `physical_key` a
+        // `key` line uses, so this is a *name* for a gesture and never a second
+        // way into the core.
+        let shot_chord = shot();
+        let whole = intake(Request::Screenshot, VIEW, chord(), trigger(), shot_chord);
+        let (mods, key) = shot_chord.scancodes();
+        assert_eq!(mods, vec![29], "ctrl");
+        assert_eq!(key, 99, "KEY_SYSRQ");
+        let by_hand: Vec<_> = [(29, true), (99, true), (99, false), (29, false)]
+            .into_iter()
+            .flat_map(|(evdev, pressed)| {
+                intake(
+                    Request::Key { evdev, pressed },
+                    VIEW,
+                    chord(),
+                    trigger(),
+                    shot_chord,
+                )
+            })
+            .collect();
+        assert_eq!(whole.len(), 4);
+        assert_eq!(
+            whole.iter().map(|i| i.kind()).collect::<Vec<_>>(),
+            by_hand.iter().map(|i| i.kind()).collect::<Vec<_>>(),
+            "`screenshot` must be exactly the four `key` calls, never a third path"
+        );
+        for event in &whole {
+            assert_eq!(event.origin(), Origin::Physical);
+        }
+        assert_eq!(
+            whole[1].kind(),
+            &SeatInputKind::Key {
+                keysym: 0xff61,
+                state: KeyState::Pressed
+            },
+            "the trigger really is XK_Print"
+        );
+
+        // It presses THIS RUN's chord, not a constant: a run configured with
+        // `super+f5` is exercised with `super+f5` without the harness knowing.
+        let other = crate::chord::ModChord::parse("super+f5").expect("in the vocabulary");
+        let whole = intake(Request::Screenshot, VIEW, chord(), trigger(), other);
+        assert_eq!(
+            whole[1].kind(),
+            &SeatInputKind::Key {
+                keysym: 0xffc2,
+                state: KeyState::Pressed
+            },
+            "F5, because that is what this run configured"
+        );
+
+        // The vocabulary is closed: `screenshot` takes no argument.
+        assert_eq!(parse_request("screenshot"), Some(Request::Screenshot));
+        assert_eq!(parse_request("screenshot full"), None);
+        assert_eq!(parse_request("screenshots"), None);
+    }
+
+    #[test]
     fn intake_produces_nothing_where_the_real_intake_produces_nothing() {
         // A layout-DEPENDENT key: the core has no keymap and refuses to
         // invent one, so this is dropped at intake exactly as it would be from
@@ -856,6 +969,7 @@ mod tests {
             VIEW,
             chord(),
             trigger(),
+            shot(),
         )
         .is_empty());
         // A scroll that rounds to nothing is not a zero-valued event.
@@ -867,6 +981,7 @@ mod tests {
             VIEW,
             chord(),
             trigger(),
+            shot(),
         )
         .is_empty());
     }

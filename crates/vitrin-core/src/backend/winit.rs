@@ -1406,7 +1406,13 @@ pub(crate) struct NestedView {
 /// 4. [`crate::clipboard::ClipboardHook`] — outside the attention hook because
 ///    that hook eats both Supers, and a modifier matcher inside it would have a
 ///    permanently wrong `super` bit (WS-E.2.1).
-/// 5. [`crate::attention::AttentionHook`] — innermost, therefore suppressible
+/// 5. [`crate::screenshot::ScreenshotHook`] — WS-E.2.4. Below the lock, so a
+///    locked session cannot be photographed by whoever is standing at it;
+///    below the clipboard, its peer, because the clipboard moves an app's
+///    bytes across a realm boundary and this only reads; above the attention
+///    hook, for the clipboard's own reason (a modifier matcher inside it would
+///    never see a Super press).
+/// 6. [`crate::attention::AttentionHook`] — innermost, therefore suppressible
 ///    by everything above, which is the correct posture for a mechanism whose
 ///    worst failure is a focus change that does not happen.
 ///
@@ -1416,7 +1422,9 @@ pub(crate) struct NestedView {
 pub(crate) type NestedHook = crate::lock::LockGate<
     ConsentGate<
         DeadManHook<
-            crate::clipboard::ClipboardHook<crate::attention::AttentionHook<input::NoopHook>>,
+            crate::clipboard::ClipboardHook<
+                crate::screenshot::ScreenshotHook<crate::attention::AttentionHook<input::NoopHook>>,
+            >,
         >,
     >,
 >;
@@ -1516,6 +1524,7 @@ pub fn run(
     dead_man: DeadManConfig,
     attention: crate::attention::AttentionChord,
     clipboard: crate::chord::Trigger,
+    screenshot: crate::chord::ModChord,
     lock: crate::lock::LockConfig,
     status: crate::status::StatusConfig,
     seed: RuntimeSeed,
@@ -1531,6 +1540,7 @@ pub fn run(
         dead_man,
         attention,
         clipboard,
+        screenshot,
         lock,
         status,
         &mut seed,
@@ -1542,10 +1552,17 @@ pub fn run(
     (recorder, result)
 }
 
+// Eight parameters, one over clippy's default, and each is one of this
+// session's five core-owned gestures or one of the two slots `run` threads the
+// seed and the recorder back through. Bundling the chords into a struct would
+// hide the one thing this signature is good for: every physical gesture this
+// build owns is named here, once.
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     dead_man: DeadManConfig,
     attention: crate::attention::AttentionChord,
     clipboard: crate::chord::Trigger,
+    screenshot: crate::chord::ModChord,
     lock: crate::lock::LockConfig,
     status: crate::status::StatusConfig,
     seed: &mut Option<RuntimeSeed>,
@@ -1702,6 +1719,22 @@ fn run_inner(
              CONSUMED in every realm, so an app that binds them loses them"
         );
     }
+    // The screenshot chord (WS-E.2.4), named in full at startup for the reason
+    // the two above are -- and with the one thing an operator most needs to
+    // have been told BEFORE they press it, which is what the file will not
+    // contain.
+    let screenshot_signal = Rc::new(RefCell::new(
+        crate::screenshot::ScreenshotSignal::new(screenshot)
+            .expect("the screenshot chord was validated at startup"),
+    ));
+    info!(
+        chord = screenshot_signal.borrow().spelling(),
+        "screenshot key armed: it is CONSUMED in every realm. What it writes is the REALM \
+         VIEW -- no trusted band, no consent prompt, no lock screen, no status strip, no \
+         agent cursor -- because the band's colour is this session's secret and the \
+         confined app can read any file this core writes. With no --screenshot-dir the \
+         chord is still consumed and writes nothing"
+    );
     // The lock screen (WS-E.2.2), named in full at startup for the reason the
     // attention and clipboard chords are: it is a key the core takes away from
     // every app in every realm, and it is the one whose consequence a human
@@ -1733,8 +1766,8 @@ fn run_inner(
         Rc::clone(&now),
         // `NestedHook`, built. The order is that alias's doc comment, which is
         // the single place this decision is written down: the lock outermost,
-        // then the consent grab, the dead-man watcher, the clipboard chords and
-        // the attention key.
+        // then the consent grab, the dead-man watcher, the clipboard chords,
+        // the screenshot key and the attention key.
         crate::lock::lock_gate(
             Rc::clone(&lock_screen),
             Rc::clone(&now),
@@ -1746,12 +1779,15 @@ fn run_inner(
                     Rc::clone(&now),
                     crate::clipboard::ClipboardHook::new(
                         Rc::clone(&clipboard_signal),
-                        crate::attention::AttentionHook::new(
-                            Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
-                                attention,
-                            ))),
-                            Rc::clone(&now),
-                            input::NoopHook,
+                        crate::screenshot::ScreenshotHook::new(
+                            Rc::clone(&screenshot_signal),
+                            crate::attention::AttentionHook::new(
+                                Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
+                                    attention,
+                                ))),
+                                Rc::clone(&now),
+                                input::NoopHook,
+                            ),
                         ),
                     ),
                 ),
@@ -3145,8 +3181,9 @@ mod tests {
     /// view. A regression that dropped the overlay from the upload — which
     /// previously passed the entire suite — fails here.
     /// **The nested hook stack is `ConsentGate` outside `DeadManHook` outside
-    /// `AttentionHook`** (WS-E.1.7 decision 11), pinned as a fact about the
-    /// type rather than as a comment beside the constructor.
+    /// `ClipboardHook` outside `ScreenshotHook` outside `AttentionHook`**
+    /// (WS-E.1.7 decision 11, extended by WS-E.2.1 and WS-E.2.4), pinned as a
+    /// fact about the type rather than as a comment beside the constructor.
     ///
     /// The order is the decision: a consent prompt and a dead-man chord press
     /// must each short-circuit *before* the attention key, whose worst failure
@@ -3160,26 +3197,29 @@ mod tests {
     /// Read off `type_name`, because nested generic arguments appear in
     /// left-to-right stacking order there and nowhere else this cheaply.
     #[test]
-    fn the_nested_stack_is_consent_then_dead_man_then_clipboard_then_attention() {
+    fn the_nested_stack_is_consent_then_dead_man_then_clipboard_then_screenshot_then_attention() {
         let name = std::any::type_name::<<NestedState as session::RuntimeHost>::Hook>();
         let at = |needle: &str| {
             name.find(needle)
                 .unwrap_or_else(|| panic!("the nested stack must carry {needle}: {name}"))
         };
-        let (consent, dead, clipboard, attention) = (
+        let (consent, dead, clipboard, screenshot, attention) = (
             at("ConsentGate"),
             at("DeadManHook"),
             at("ClipboardHook"),
+            at("ScreenshotHook"),
             at("AttentionHook"),
         );
         assert!(
-            consent < dead && dead < clipboard && clipboard < attention,
+            consent < dead && dead < clipboard && clipboard < screenshot && screenshot < attention,
             "the nested hook stack must be \
-             ConsentGate<DeadManHook<ClipboardHook<AttentionHook<..>>>>: a prompt and the \
-             human's off-switch each short-circuit before the clipboard chords and the \
-             attention key, never after; and the clipboard matcher must sit ABOVE the \
-             attention hook, which eats both Supers and would otherwise leave its `super` \
-             modifier bit permanently wrong. Got {name}"
+             ConsentGate<DeadManHook<ClipboardHook<ScreenshotHook<AttentionHook<..>>>>>: a \
+             prompt and the human's off-switch each short-circuit before the clipboard \
+             chords, the screenshot key and the attention key, never after; both chord \
+             matchers must sit ABOVE the attention hook, which eats both Supers and would \
+             otherwise leave their `super` modifier bit permanently wrong; and the \
+             screenshot key must sit BELOW the lock, so a locked session cannot be \
+             photographed by whoever is standing at it. Got {name}"
         );
     }
 

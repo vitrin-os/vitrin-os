@@ -944,6 +944,12 @@ impl<H: PreemptionHook> PreemptionHook for ConsentGate<H> {
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
         self.inner.clipboard()
     }
+
+    fn screenshot(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
+        self.inner.screenshot()
+    }
 }
 
 #[cfg(test)]
@@ -2078,6 +2084,12 @@ mod tests {
             fn clipboard(
                 &self,
             ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>>
+            {
+                None
+            }
+            fn screenshot(
+                &self,
+            ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>>
             {
                 None
             }

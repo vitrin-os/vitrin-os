@@ -80,6 +80,19 @@ PROPERTY_GATES=(
                                 # real shims, two real Wayland clients, and the
                                 # journal grepped for the literal string it must
                                 # not contain.
+  test_screenshot.py            # WS-E.2.4 (#216): the human's screenshot key
+                                # writes ONE file of the REALM VIEW into ONE
+                                # audited directory and touches no grant. A
+                                # `screenshot` line on the physical-input
+                                # channel presses the real chord, so this covers
+                                # detection as well as effect; the PNG is
+                                # decoded with stdlib zlib (no image codec, in
+                                # any dependency class) and compared against
+                                # `--capture-dump` byte for byte, and the
+                                # shipped binary's own startup refusals for a
+                                # missing/file/symlink/world-writable/relative
+                                # `--screenshot-dir` are asserted with a control
+                                # that a clean directory passes.
   test_launch.py                # a consented `realm_launch` grant makes the
                                 # TRUSTED CORE fork a process, and the journal
                                 # names who asked (#207). The one gate covering

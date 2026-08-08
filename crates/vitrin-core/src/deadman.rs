@@ -11,25 +11,29 @@
 //! event queue, a timer that never fires, a partially-consumed chord. Each
 //! of those is named below at the code that answers it.
 //!
-//! # The core owns three more physical gestures now, and this one's warrant is
+//! # The core owns four more physical gestures now, and this one's warrant is
 //! unchanged by every one of them
 //!
 //! Until WS-E.1.7 (issue #232) this module said the core owns **exactly one**
 //! physical chord, because the human's off-switch must not depend on a client.
-//! That sentence has now been false three times over, and each time it was
+//! That sentence has now been false four times over, and each time it was
 //! rewritten rather than quietly left, because a stale claim in the one module
 //! whose value is that nothing can defeat it is worse than none:
 //! [`crate::attention`] owns the attention key (WS-E.1.7), [`crate::clipboard`]
-//! owns the two clipboard chords (WS-E.2.1, D-024), and [`crate::lock`] owns
-//! the lock chord (WS-E.2.2, D-025).
+//! owns the two clipboard chords (WS-E.2.1, D-024), [`crate::lock`] owns the
+//! lock chord (WS-E.2.2, D-025), and [`crate::screenshot`] owns the screenshot
+//! key (WS-E.2.4, issue #216).
 //!
 //! **What has not changed is the argument.** The warrant this module claims is
 //! narrow and stays narrow: *an off-switch may not depend on a client, so the
 //! core owns the key that fires it.* It was never "the core may own chords in
 //! general", and admitting neighbours must not be read as generalising it.
-//! Each of the three made its own case from scratch against this module's own
+//! Each of the four made its own case from scratch against this module's own
 //! bar — D-023 for the attention key, D-024 for the clipboard pair, D-025 for
-//! the lock — and the presumption is still against the next one.
+//! the lock, D-027 for the screenshot key — and the presumption is still
+//! against the next one. The screenshot key is the weakest warrant of the four
+//! and says so in its own module docs: its worst failure is a picture that did
+//! not happen, which is why it is suppressible by everything above it.
 //!
 //! **The lock chord is the one that had to be answered directly**, because
 //! unlike the other two it consumes *every* physical event while it is raised
@@ -48,23 +52,32 @@
 //!   [`Chord::VOCABULARY`] excludes every modifier (below, and for its own
 //!   reason); the attention vocabulary is *nothing but* the two Super keys, so
 //!   those two cannot collide even before `main.rs`'s startup equality check.
-//!   The clipboard trigger and the lock chord's trigger **can**: both draw from
+//!   The clipboard trigger, the lock chord's trigger and the screenshot
+//!   chord's trigger **can**: all three draw from
 //!   [`crate::chord::Trigger`]'s vocabulary, which overlaps this one on every
-//!   editing and function key. `main.rs` refuses at startup, and the reason is
+//!   editing and function key. `main.rs` refuses at startup — over a list of
+//!   five chords since WS-E.2.4 — and the reason is
 //!   this module's own: detection here is in the unconditional `observe` tap,
 //!   so a neighbour sharing this chord's key would arm the human's off-switch
 //!   every time they used it, and **no hook ordering can prevent that** —
 //!   nothing is allowed to blind that tap. (Concretely: the default lock chord
-//!   is `ctrl+alt+delete`, so `--dead-man-chord delete` is refused.)
+//!   is `ctrl+alt+delete`, so `--dead-man-chord delete` is refused.) The
+//!   screenshot key's trigger, `print`, is the one row WS-E.2.4 added to
+//!   [`crate::input::invariant_keysym`], and it is **not** in
+//!   [`Chord::VOCABULARY`] — so that collision is unreachable from a default
+//!   command line, and refused anyway.
 //! - **Different halves of the hook.** This switch detects in
 //!   [`DeadManSwitch::observe_event`], reached from
 //!   [`PreemptionHook::observe`] — unconditional, unstoppable, owning all its
-//!   own state. The attention key, the clipboard chords and the lock all gate
-//!   only, so all three are suppressible by this hook, by a consent prompt, and
-//!   by anything above them. The lock is *outermost* and therefore suppresses
-//!   the other two — but it still cannot touch the tap this switch rides.
+//!   own state. The attention key, the clipboard chords, the screenshot key and
+//!   the lock all *decide* in `gate` only (the two chord matchers use `observe`
+//!   for modifier bookkeeping and nothing else), so all four are suppressible by
+//!   this hook, by a consent prompt, and by anything above them. The lock is
+//!   *outermost* and therefore suppresses the other three — but it still cannot
+//!   touch the tap this switch rides.
 //! - **Stacking order.** [`DeadManHook`] is stacked *outside*
-//!   `ClipboardHook` and `AttentionHook`, so a chord press wins: an attention
+//!   `ClipboardHook`, `ScreenshotHook` and `AttentionHook`, so a chord press
+//!   wins: an attention
 //!   press in the same dispatch round changes nothing this switch does, which is
 //!   asserted rather than argued
 //!   (`an_attention_press_in_the_same_round_changes_nothing_here`). It is stacked
@@ -1198,6 +1211,12 @@ impl<H: PreemptionHook> PreemptionHook for DeadManHook<H> {
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
         self.inner.clipboard()
+    }
+
+    fn screenshot(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
+        self.inner.screenshot()
     }
 }
 

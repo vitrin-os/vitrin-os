@@ -55,6 +55,21 @@
 //! tests): there is no legacy capture entry left to bypass enforcement
 //! through.
 //!
+//! # The human's screenshot is a sibling here, not a second caller (WS-E.2.4)
+//!
+//! [`render_screenshot`] (issue #216) turns the same realm view into a PNG on
+//! disk for a human who pressed a core-owned chord. It is deliberately a
+//! *sibling* of [`render_frame`] rather than a caller of it: the one-path
+//! property above is what makes "every capture an agent receives passed the
+//! check" grep-provable, and a second caller would have cost that to buy a
+//! convenience. A human holds no grant and has no principal, so there is
+//! nothing for the chokepoint to judge; what stops a screenshot becoming a
+//! bypass is that it produces a *file*, never a `frame_ready` and never a
+//! sealed memfd handed to a connection. Calling it at all requires a
+//! [`HumanGesture`](crate::screenshot::HumanGesture), a token only
+//! [`crate::screenshot`] can mint and only from a physical chord — so the
+//! chokepoint could not reach it even if someone tried.
+//!
 //! # The observation digest rides the copy path (P1.4.5, B1)
 //!
 //! [`render_frame`] returns the frame's [`ObservationDigest`] alongside the
@@ -178,6 +193,91 @@ pub(crate) fn render_frame(
         },
         digest,
     ))
+}
+
+/// Encode one **human screenshot** from the same realm view [`render_frame`]
+/// reads: convert the readback to 8-bit truecolor RGB, encode it as PNG, and
+/// digest the file's bytes (WS-E.2.4, issue #216).
+///
+/// # Why this is a sibling of [`render_frame`] rather than a second caller
+///
+/// [`crate::enforcement`]'s one-path property pins that `render_frame` has
+/// exactly **one** caller outside this module — the chokepoint, after
+/// admission — and that is what makes "every capture an agent receives passed
+/// the check" a grep rather than a habit. A human's screenshot passes no
+/// check, holds no grant and has no principal, so routing it through
+/// `render_frame` would either add a second caller (turning that scan red) or
+/// require inventing a human principal to satisfy a picture. It shares this
+/// module's validation and lives next to the code it must not diverge from,
+/// and the invariant's wording stays literally true.
+///
+/// # Only a human's chord can call it, and that is a type rather than a rule
+///
+/// The second parameter is a [`HumanGesture`](crate::screenshot::HumanGesture):
+/// a token with a private field, no `Copy`, no `Clone` and no constructor
+/// outside [`crate::screenshot`], where the only thing that mints one is a
+/// gesture drained from the chord matcher's queue — which only
+/// [`crate::input::PreemptionHook::gate`] fills, and only for a
+/// **physical-origin** chord ([`crate::chord`]'s rule 1). The chokepoint
+/// cannot call this function, no facet arm can call it, and no amount of
+/// `actuate_text` authority manufactures the argument. It is the shape
+/// [#207](https://github.com/vitrin-os/vitrin-os/issues/207)'s `SpawnRecord`
+/// and #213's `PendingPromotion` already take: a capability expressed as a
+/// value nobody else can build, rather than an `if` a refactor can route
+/// around.
+///
+/// (`pub(in crate::screenshot)` would have been simpler and is not legal
+/// Rust: `pub(in …)` accepts only an *ancestor* module of the item.)
+///
+/// # The returned digest is over the FILE, not over the pixels
+///
+/// [`render_frame`]'s digest is over the bytes the agent receives, because
+/// that is what "the observation an agent made" means. Here the artifact is a
+/// file on disk, so the digest is over the file's bytes — a journal entry
+/// whose digest did not identify the thing on disk would be unusable for the
+/// one job it has (`ScreenshotWritten`, [`crate::recorder`]). The cost is
+/// stated rather than hidden: a screenshot's digest and an agent's capture
+/// digest of the *same frame* are different values, so the journal cannot
+/// correlate them by digest alone.
+pub(crate) fn render_screenshot(
+    view: &RealmViewFrame<'_>,
+    _gesture: crate::screenshot::HumanGesture,
+) -> Result<(Vec<u8>, ObservationDigest), CaptureError> {
+    if view.width == 0 || view.height == 0 {
+        return Err(CaptureError::DegenerateView {
+            width: view.width,
+            height: view.height,
+        });
+    }
+    let expected = view.width as usize * view.height as usize * BYTES_PER_PIXEL;
+    if view.rgba.len() != expected {
+        return Err(CaptureError::MisSizedReadback {
+            got: view.rgba.len(),
+            expected,
+        });
+    }
+    let png = vitrin_png::encode_rgb(view.width, view.height, &rgba_to_rgb(view.rgba));
+    let digest = ObservationDigest::of(&png);
+    Ok((png, digest))
+}
+
+/// Drop the readback's alpha channel: tightly packed RGBA8888 in, tightly
+/// packed RGB in, rows unchanged.
+///
+/// The alpha byte is discarded rather than composited against anything.
+/// [`crate::scene::Scene::compose`] forces client content opaque and the wire
+/// format pins its padding byte `0xFF`, so a realm view has no meaningful
+/// alpha to preserve — and blending against an invented background would make
+/// the screenshot's bytes depend on a choice this module has no business
+/// making, which is the same argument [`rgba_to_xrgb8888`] makes for pinning
+/// `0xFF` instead of copying source alpha.
+fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    debug_assert!(rgba.len().is_multiple_of(BYTES_PER_PIXEL));
+    let mut out = Vec::with_capacity(rgba.len() / BYTES_PER_PIXEL * 3);
+    for px in rgba.chunks_exact(BYTES_PER_PIXEL) {
+        out.extend_from_slice(&px[..3]);
+    }
+    out
 }
 
 /// Convert tightly packed RGBA8888 (readback layout: bytes R,G,B,A) to the

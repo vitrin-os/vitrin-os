@@ -617,6 +617,12 @@ impl<H: PreemptionHook> PreemptionHook for AttentionHook<H> {
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
         self.inner.clipboard()
     }
+
+    fn screenshot(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
+        self.inner.screenshot()
+    }
 }
 
 /// The marker's height and width in pixels. Small, fixed, and at the origin:

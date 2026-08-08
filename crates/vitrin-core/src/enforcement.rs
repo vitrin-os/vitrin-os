@@ -33,7 +33,18 @@
 //!   and actuation alike (IDL `vitrin_grant`);
 //! - the capture mechanics entry [`crate::capture::render_frame`] and the
 //!   emulated-input constructor `SeatInput::emulated` each have exactly
-//!   one caller outside their home modules -- here, *after* admission;
+//!   one caller outside their home modules -- here, *after* admission.
+//!   Since WS-E.2.4 (issue #216) `capture.rs` also holds
+//!   [`crate::capture::render_screenshot`], the human screenshot key's
+//!   encoder, and the clause above stays literally true because that is a
+//!   **sibling** of `render_frame` rather than a caller of it. The scan says
+//!   so in both directions: `render_screenshot` has zero occurrences in this
+//!   file and exactly one outside its home module (`crate::screenshot`), and
+//!   `crate::screenshot` contains none of the chokepoint's own identifiers.
+//!   A human holds no grant and is no principal, so there was never a check
+//!   for that path to pass; what keeps it from being a bypass is that it
+//!   cannot produce a `frame_ready`, cannot reach a connection, and cannot be
+//!   called at all without a `HumanGesture` only a physical chord mints;
 //! - and [`GrantTable::holds_verb`] -- the attention event's **delivery
 //!   filter**, added by WS-E.1.7 -- is named by the scan **as an exclusion**:
 //!   zero occurrences in this file, exactly one outside the grant table. It
@@ -1628,6 +1639,89 @@ mod tests {
                 path.ends_with("grants.rs") || count(text, &admission_query) == 0,
                 "{}: the principal-keyed admission query must not back any path \
                  outside grants.rs",
+                path.display()
+            );
+        }
+
+        // (7) The human screenshot key's encoder (WS-E.2.4, issue #216),
+        // censused in **both** directions so the one-path property's wording
+        // above stays literally true.
+        //
+        // Forward: it is a sibling of `render_frame`, not a caller, so it must
+        // have exactly one non-test caller outside `capture.rs` -- the drain in
+        // `crate::screenshot` -- and zero occurrences here. A chokepoint that
+        // grew a call to it would be an enforcement path producing a file
+        // nobody judged; a second caller elsewhere would be a second way pixels
+        // leave this process.
+        //
+        // Backward: `screenshot.rs` must not name the chokepoint's entry point.
+        // "A human's screenshot never touches a grant" is the whole of issue
+        // #216's title, and the honest way to keep a negative claim true is to
+        // count the identifier rather than to re-read the file.
+        let screenshot_encoder = format!("render_{}", "screenshot");
+        let use_entry = format!("enforce_{}", "use");
+        let mut encoder_callers = 0;
+        for (path, text) in &sources {
+            let hits = count(text, &screenshot_encoder);
+            if path.ends_with("capture.rs") {
+                continue;
+            }
+            assert!(
+                !path.ends_with("enforcement.rs") || hits == 0,
+                "the screenshot encoder must never be reachable from the enforcement \
+                 chokepoint: a human holds no grant, and a picture is not a use"
+            );
+            encoder_callers += hits;
+        }
+        assert_eq!(
+            encoder_callers, 1,
+            "the screenshot encoder has exactly one non-test caller outside \
+             capture.rs, and it is the human screenshot drain"
+        );
+        // **Positive controls first, because this half of the census errs OPEN.**
+        // The loop below proves a negative over whichever files match a name,
+        // so a rename makes it prove the negative over nothing and pass. Two
+        // ways that happens and both are anticipated by the code it guards:
+        // `screenshot.rs` growing into `screenshot/mod.rs` (its own docs plan
+        // for a region and a window variant, and `Path::ends_with` matches
+        // whole components, so the directory form would NOT match), and the
+        // chokepoint's entry point being renamed out from under `use_entry`.
+        // The forward half of this test already establishes the pattern 140
+        // lines up; this half did not have it.
+        let screenshot_sources: Vec<_> = sources
+            .iter()
+            .filter(|(path, _)| {
+                path.ends_with("screenshot.rs")
+                    || path.ends_with("screenshot/mod.rs")
+                    || path
+                        .parent()
+                        .is_some_and(|parent| parent.ends_with("screenshot"))
+            })
+            .collect();
+        assert!(
+            !screenshot_sources.is_empty(),
+            "the screenshot census matched no file: it proves a negative over whatever it \
+             scans, so scanning nothing is a silent pass. Widen the match if the module was \
+             renamed or split."
+        );
+        assert!(
+            sources.iter().any(|(_, text)| count(text, &use_entry) > 0),
+            "the `{use_entry}` needle matched nowhere in the crate, so asserting it is ABSENT \
+             from the screenshot path proves nothing. The chokepoint's entry point was \
+             probably renamed."
+        );
+        for (path, text) in &screenshot_sources {
+            assert_eq!(
+                count(text, &use_entry),
+                0,
+                "the human screenshot path must not name the enforcement entry \
+                 point ({}): it holds no grant and has no principal to judge",
+                path.display()
+            );
+            assert_eq!(
+                count(text, &table_query),
+                0,
+                "the human screenshot path must not query the grant table ({})",
                 path.display()
             );
         }

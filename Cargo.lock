@@ -1852,6 +1852,7 @@ dependencies = [
  "vitrin-golden",
  "vitrin-ipc",
  "vitrin-mock-shim",
+ "vitrin-png",
  "vitrin-protocol",
  "wayland-egl",
 ]
@@ -1859,6 +1860,9 @@ dependencies = [
 [[package]]
 name = "vitrin-golden"
 version = "0.1.0"
+dependencies = [
+ "vitrin-png",
+]
 
 [[package]]
 name = "vitrin-ipc"
@@ -1879,6 +1883,10 @@ dependencies = [
  "vitrin-ipc",
  "vitrin-protocol",
 ]
+
+[[package]]
+name = "vitrin-png"
+version = "0.1.0"
 
 [[package]]
 name = "vitrin-protocol"

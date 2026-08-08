@@ -7,9 +7,15 @@ rust-version.workspace = true
 description = "Golden-frame comparison harness (P1.9.2): per-pixel tolerance + SSIM fallback, hand-rolled PNG actual/expected/diff artifacts. No image-processing dependencies (plan risk R7)."
 publish = false
 
-# Deliberately zero dependencies. The comparison, the SSIM score and the PNG
-# encoder are all hand-rolled here: this harness feeds pixel goldens, and the
-# whole point of plan risk R7 is that no image codec (`image`, `png`, ...)
-# enters the tree, not even as a test-only dependency. A stored-block DEFLATE
-# PNG is a few dozen lines (see `png.rs`); SSIM is textbook arithmetic.
+# Deliberately zero EXTERNAL dependencies. The comparison and the SSIM score
+# are hand-rolled here and the PNG encoder is hand-rolled in `vitrin-png`, an
+# in-tree crate with no dependencies of its own: this harness feeds pixel
+# goldens, and the whole point of plan risk R7 is that no image codec
+# (`image`, `png`, ...) enters the tree, not even as a test-only dependency. A
+# stored-block DEFLATE PNG is a few dozen lines; SSIM is textbook arithmetic.
+#
+# The encoder was `src/png.rs` here until WS-E.2.4 (issue #216), which needed
+# the identical bytes written from inside the trusted core. Two copies of an
+# encoder, one of them in the TCB, is the outcome that move avoids.
 [dependencies]
+vitrin-png = { path = "../vitrin-png" }

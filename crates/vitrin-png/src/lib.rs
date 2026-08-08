@@ -1,14 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
-//! A minimal, hand-rolled PNG encoder — just enough to write the harness's
-//! debugging artifacts (`actual.png`, `expected.png`, `diff.png`).
+//! A minimal, hand-rolled PNG **encoder** — and nothing else.
 //!
 //! Scope is deliberately tiny: 8-bit truecolor (RGB, no alpha), no filtering
 //! (every scanline uses filter type 0), and DEFLATE **stored** blocks only
 //! (BTYPE 00 — no Huffman, no LZ77). Stored blocks make a valid zlib stream
 //! that every PNG decoder accepts while keeping the encoder to arithmetic a
-//! reviewer can check by eye; the artifacts are for human eyes on a failing
-//! test, not for size. This is why the crate needs no `png`/`flate2`
+//! reviewer can check by eye. This is why nothing here needs a `png`/`flate2`
 //! dependency (plan risk R7).
+//!
+//! # Why this is a crate, and what "encode-only" is load-bearing for
+//!
+//! It was `vitrin-golden/src/png.rs`, written to dump the golden harness's
+//! debugging artifacts (`actual.png`, `expected.png`, `diff.png`). WS-E.2.4
+//! (issue #216) gave the trusted core a human screenshot key, which has to
+//! write an image — and *"no image codec in the core, in any dependency
+//! class"* is a rule `crates/vitrin-core/Cargo.toml` states twice.
+//!
+//! Promoting the file rather than copying it is what keeps that rule honest,
+//! and the argument is the one `Cargo.toml` already makes for `fontdue`'s
+//! `unsafe` blocks: **this code never parses attacker bytes.** There is no
+//! decoder here, in any form. Every entry point takes a buffer the caller
+//! already owns and returns bytes; nothing reads a PNG, nothing reads a file,
+//! nothing branches on input it did not itself produce. The only inputs are a
+//! width, a height, and `width * height * 3` bytes of pixels the core
+//! composited. A future decoder in this crate would silently move a parser
+//! into the TCB — so there must not be one, and its absence is the reviewable
+//! property.
+//!
+//! [`encode_rgb`] returns the bytes; [`write_rgb`] additionally writes them to
+//! a path. The trusted core uses **only** the former: it writes through a
+//! directory descriptor it validated at startup, so a path-taking helper is
+//! exactly the shape it must not reach for (see `vitrin-core`'s
+//! `screenshot` module).
 
 use std::fs;
 use std::io;
@@ -19,13 +42,26 @@ const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
 
 /// Encode `rgb` (tightly packed, `width * height * 3` bytes, rows top-down)
 /// as an 8-bit truecolor PNG and write it to `path`.
+///
+/// The golden harness's entry point. **The trusted core does not use this** —
+/// it calls [`encode_rgb`] and writes the bytes itself, relative to a
+/// directory descriptor it opened and audited at startup, because a path is
+/// exactly the argument it must not have.
 pub fn write_rgb(path: &Path, width: u32, height: u32, rgb: &[u8]) -> io::Result<()> {
     debug_assert_eq!(rgb.len(), width as usize * height as usize * 3);
     fs::write(path, encode_rgb(width, height, rgb))
 }
 
-/// Encode `rgb` as a complete PNG byte stream.
-fn encode_rgb(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+/// Encode `rgb` (tightly packed, `width * height * 3` bytes, rows top-down)
+/// as a complete 8-bit truecolor PNG byte stream.
+///
+/// **The pixel bytes appear literally in the output**, in order, once: filter
+/// type 0 and stored DEFLATE blocks mean nothing is transformed, only framed.
+/// That is a property callers may rely on — `vitrin-core`'s screenshot tests
+/// assert the encoded file against a re-encode of the expected pixels rather
+/// than decoding it, which is what lets a repository with no PNG decoder still
+/// check its own output byte for byte.
+pub fn encode_rgb(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&SIGNATURE);
 

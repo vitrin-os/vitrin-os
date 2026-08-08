@@ -23,11 +23,17 @@
 //! Goldens are only ever regenerated through the single documented
 //! entrypoint `cargo xtask bless` — see `tests/golden/README.md`.
 //!
-//! The crate has **no dependencies**: the SSIM arithmetic and the PNG
-//! encoder are hand-rolled (see [`png`]), keeping every image codec out of
-//! the tree exactly as plan risk R7 requires.
+//! The crate has **no external dependencies**: the SSIM arithmetic is
+//! hand-rolled here and the PNG encoder is hand-rolled in-tree
+//! ([`vitrin_png`]), keeping every image codec out of the tree exactly as plan
+//! risk R7 requires.
+//!
+//! The encoder used to live here as `src/png.rs`. WS-E.2.4 (issue #216) needed
+//! the same arithmetic inside the trusted core, which may not take an image
+//! codec in any dependency class — so the file moved to its own zero-dependency
+//! crate and both consumers share one reviewed copy rather than two that drift.
 
-mod png;
+use vitrin_png as png;
 
 use std::fs;
 use std::io;

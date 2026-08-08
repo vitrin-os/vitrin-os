@@ -128,6 +128,32 @@ gbm = { version = "0.18", default-features = false, optional = true }
 # The algorithm is tagged in every recorder entry (`frame.digest_alg`), so
 # swapping it is a schema-visible, non-breaking change.
 blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
+# The PNG **encoder** for the human's screenshot key (WS-E.2.4, issue #216).
+#
+# This is the one place the rule stated twice below -- "no image codec in the
+# core, in any dependency class" -- is met with a dependency rather than an
+# absence, so the argument has to carry its own weight. Three facts:
+#
+#  1. It is in-tree and has no dependencies of its own. `crates/vitrin-png` is
+#     ~130 lines of arithmetic (CRC-32, Adler-32, stored-block DEFLATE, four
+#     chunk headers) that has been in this repository since P1.9.2 as
+#     `vitrin-golden/src/png.rs`. It is a supply-chain edge to *ourselves*.
+#  2. It is an ENCODER, and there is no decoder in it. It consumes a buffer
+#     this core composited and returns bytes this core writes; it never parses
+#     input, so the class of bug an image codec is feared for -- a malformed
+#     file driving a parser -- has no way in. That is the same argument the
+#     fontdue block below makes for its `unsafe`: the input is not the
+#     attacker's.
+#  3. The alternative was worse in both directions: an external `png`/`image`
+#     crate (a real codec, with a decoder, in the TCB), or a copy of the
+#     encoder inside `vitrin-core` reviewed to a different bar than the copy
+#     the golden harness keeps.
+#
+# What it costs is stated rather than implied: this code was written for test
+# artifacts and is now TCB code, and it must be reviewed as such -- which
+# stays true only for as long as nothing else in the core feeds it bytes it
+# did not itself produce.
+vitrin-png = { path = "../vitrin-png" }
 # Glyph rasterization for the consent prompt (P1.7.1, `crate::consent`). The
 # core owns the screen, so there is no privileged system layer to delegate the
 # prompt to -- the TCB draws it itself -- and turning a TrueType outline into

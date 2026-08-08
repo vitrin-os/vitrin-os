@@ -26,6 +26,14 @@ APACHE-2.0 (LICENSE) — explicit patent grant
     — a third party writing a Go, TypeScript or C++ SDK forks these;
   - the conformance and robustness instruments: crates/vitrin-golden,
     crates/vitrin-mock-shim, fuzz/;
+  - crates/vitrin-png — a hand-rolled, zero-dependency, ENCODE-ONLY PNG
+    writer. It was vitrin-golden/src/png.rs and stays on this side of the
+    line although the MPL-2.0 core now links it (WS-E.2.4, issue #216): it
+    was written as an instrument, a third party writing a harness of their
+    own should be able to take it, and an MPL-2.0 crate linking an
+    Apache-2.0 one is the direction that works. What it must never grow is
+    a decoder; see the crate's own docs for why that absence is the
+    reviewable property;
   - the client SDKs: sdk/python/ and any future SDK;
   - the integration harness and the shipped examples: tests/integration/,
     examples/.

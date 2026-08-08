@@ -134,7 +134,11 @@ the config's intent]
      you come back to Hyprland, you have a working VT switch and a broken
      console — usable, but you will be flying blind on tty2 and you should fix
      it first.
-2. Log in on tty2. Leave the shell sitting there for the whole session.
+2. Log in on tty2. **Leave this shell alone for the whole session — it is your
+   escape shell and nothing else ever runs on it.** `vitrind` goes on tty3, in
+   step 4. An earlier draft of this page put both on tty2, which meant that from
+   step 6 onward there was no logged-in shell anywhere and every recovery step
+   below pointed at one that did not exist.
 3. Press `Ctrl+Alt+F1`. You should be back in Hyprland with your windows intact.
 4. Only now proceed.
 
@@ -208,14 +212,25 @@ reboot — it is not persisted. [verified: no `sysctl.d` file sets it]
 
 ## Steps at a glance
 
+> **Every "Expect" and every "failure" below is `[inferred]`.** Not one of them
+> has been observed, because the backend does not exist yet (#218) and the first
+> run of this page is the dangerous one. Individual `[verified]` marks appear
+> only on *machine facts* — what `/sys`, `lsmod` and `systemctl` said on
+> 2026-08-09 — never on what a running `vitrind` will do.
+>
+> An earlier draft marked four of the fifteen step tables and left the rest
+> unmarked, which read as though those eleven had been checked. They had not.
+> Read this page as a careful prediction, and correct it from the first real run
+> rather than trusting it over your own eyes.
+
 | # | Do | Expect | Worst credible failure |
 |---|---|---|---|
 | 0 | Prove the escape route | Login prompt on tty2, back to Hyprland on `Ctrl+Alt+F1` | VT switch is eaten — **stop** |
 | 1 | Record the baseline from `/sys` | kernel, mesa, `eDP-1 connected`, preferred mode | — (read-only) |
 | 2 | Build with `--features drm-backend` | clippy and build clean | Missing dev packages; a `cargo:warning` from smithay's gbm probe |
 | 3 | Check the configs | `realm.toml` + `principals.toml` resolve, `--consent=interactive` | Auto-approve accepted where it must be refused |
-| 4 | `Ctrl+Alt+F2`, log in | A shell on an active VT with a logind session | libseat cannot open the seat |
-| 5 | Confirm the VT is active and the card is the right one | `Active=yes` for your tty2 session | Backend selects `card2` (hazard H1) |
+| 4 | `Ctrl+Alt+F3`, log in | A shell on an active VT with a logind session | libseat cannot open the seat |
+| 5 | Confirm the VT is active and the card is the right one | `Active=yes` for your tty3 session | Backend selects `card2` (hazard H1) |
 | 6 | Start `vitrind --drm --consent=interactive` | Panel lights, trusted band on top | **Black screen, no console** — go to Recovery |
 | 7 | Connector + mode | Log names `eDP-1` and the mode it chose | Wrong connector; wrong refresh |
 | 8 | App maps and repaints | Terminal visible, cursor blinking | Mapped but frozen (frame pacing) |
@@ -289,12 +304,16 @@ will spend ten minutes debugging a working compositor.
 
 ## 4. Get onto a free VT and log in
 
-Press **`Ctrl+Alt+F2`**. Log in as `taha`.
+Press **`Ctrl+Alt+F3`**. Log in as `taha`.
+
+**tty3, not tty2.** tty2 is the escape shell from step 0.1 and must stay a
+shell — if `vitrind` runs there, killing it is the one thing you cannot do from
+the console you were told to keep.
 
 | Expected | Failure | What it means |
 |---|---|---|
 | A login prompt, then a shell | No prompt | See step 0.1 — you should already have proven this |
-| `loginctl session-status` shows your new session with `Active=yes`, `Seat=seat0`, `TTY=tty2` | `Active=no` | You are not on the active VT. libseat's logind backend will refuse the device (hazard H2) |
+| `loginctl session-status` shows your new session with `Active=yes`, `Seat=seat0`, `TTY=tty3` | `Active=no` | You are not on the active VT. libseat's logind backend will refuse the device (hazard H2) |
 | Hyprland's session (session 2, tty1) now shows `Active=no` | Hyprland still `Active=yes` | The VT did not actually switch; you are about to fight Hyprland for DRM master, which is the failure mode this whole page exists to avoid |
 
 Do not skip the `Active=yes` check. It is the one machine-readable statement of
@@ -309,7 +328,7 @@ ls -l /dev/dri/
 
 | Expected | Failure | What it means |
 |---|---|---|
-| Your tty2 session, `Active=yes` | as step 4 | — |
+| Your tty3 session, `Active=yes` | as step 4 | — |
 | You can `test -r /dev/dri/card1` | Permission denied | The logind ACL did not follow you to this session. You are in `video` [verified] so this should not happen; if it does, do not `chmod` anything — it means logind is not treating this as your active session |
 
 **If `--drm` accepts a card argument, pass `/dev/dri/card1` explicitly.** Hazard
@@ -392,14 +411,17 @@ Hold Escape for the configured hold time.
 
 ## 12. VT switch away and back (WS-E.3.3)
 
-Press `Ctrl+Alt+F2` (or F3 — anywhere but tty1 and the VT `vitrind` is on).
+Press **`Ctrl+Alt+F2`** — your escape shell, and deliberately *not* tty3, which
+is the VT `vitrind` occupies. Switching to `vitrind`'s own VT is a no-op, and an
+earlier draft told you to do exactly that, so this checklist item would have been
+recorded as a pass without a VT switch ever happening.
 Wait five seconds. Come back.
 
 | Expected [inferred — this is WS-E.3.3's answer and it is not written yet] | Failure | What it means |
 |---|---|---|
 | `vitrind` survives the switch, the panel comes back, and **the band is the same colour it was before** | A different band colour | The session secret was regenerated, i.e. the human's anchor moved under them. `TrustedIndicator` is generated once per process, so a changed colour means the process restarted — check whether `vitrind` is even the same PID |
 | | `vitrind` died on the switch | `SessionEvent::PauseSession` is unhandled. This is exactly the coupling #218 records: this backend cannot honestly close with that handler unwritten |
-| | Panel comes back black, `vitrind` alive | Master was not reacquired on resume. You still have VT switching — go back to your tty2 shell and kill it |
+| | Panel comes back black, `vitrind` alive | Master was not reacquired on resume. You still have VT switching — go back to your tty2 escape shell and kill it |
 | | **You cannot switch away at all** | Note that this is *expected* to be possible today: [`limits.md`](book/src/limits.md) records that nothing inhibits `Ctrl-Alt-F<n>` on any backend. If you cannot, something is grabbing the keyboard and you have just lost your first line — go to Recovery |
 
 ## 13. Type a letter (WS-E.3.1)
@@ -447,8 +469,20 @@ Work down this list. Do not skip to R4 because the first two feel slow.
 
 **`Ctrl+Alt+F1`.** You are back in Hyprland.
 
-If `vitrind` is still running and still holding master, it will fight you for
-the panel. Get to your tty2 shell (`Ctrl+Alt+F2`) and:
+**On whether it "still holds master" — H3 and this step used to disagree, and
+the resolution is worth knowing before you type.** logind revokes DRM master
+when a session's VT stops being active, so switching away *should* take it from
+`vitrind` and give it to Hyprland automatically, and `vitrind` should see a
+`PauseDevice` and stop drawing. That is the designed path (H3).
+
+It is also the path that WS-E.3.3 exists to test and that nobody has run. If
+`vitrind` ignores or mishandles the pause — a live possibility on a first
+bring-up — it keeps drawing to a card it no longer owns and the two fight over
+the panel. **You cannot tell which happened by looking**, because the symptom of
+both is a screen you do not trust.
+
+So do not reason about it: kill it. Get to your tty2 escape shell
+(`Ctrl+Alt+F2`) and:
 
 ```bash
 pkill -INT vitrind          # ask it to shut down cleanly first
@@ -487,13 +521,32 @@ Symptoms: Hyprland returns at a wrong resolution or refresh, or the panel is
 dark but the machine is clearly alive (you can type blind, log in, and
 `loginctl` responds).
 
+**`hyprctl` will not work from the console you are on.** It needs
+`HYPRLAND_INSTANCE_SIGNATURE`, which only exists inside the Hyprland session's
+own environment — and the state R3 is written for is exactly the one where you
+are on a fresh VT or a blind login and do *not* have it. An earlier draft of
+this section told you to run it anyway, which would have failed with an
+unhelpful error at the worst moment.
+
+Import it from the running Hyprland process first:
+
 ```bash
-# From a working VT or a blind login:
+# From your tty2 escape shell or a blind login.
+# 1. Find Hyprland and borrow its environment.
+HYPR_PID=$(pgrep -u "$USER" -x Hyprland | head -1)
+export HYPRLAND_INSTANCE_SIGNATURE=$(
+  tr '\0' '\n' < /proc/$HYPR_PID/environ | sed -n 's/^HYPRLAND_INSTANCE_SIGNATURE=//p')
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+
+# 2. Now hyprctl can reach it.
 hyprctl monitors                 # what Hyprland thinks it has
 hyprctl keyword monitor eDP-1,2560x1600@240,0x0,1
-# If Hyprland itself is gone:
-systemctl --user restart hyprland   # or however this session is started
 ```
+
+If `pgrep` finds no Hyprland, it is gone rather than confused — and on this
+machine it is **not** a systemd unit (it starts from a tty login shell via
+`/usr/bin/start-hyprland`), so `systemctl --user restart hyprland` will fail.
+Log in on tty1 and start it the way you normally do, or reboot.
 
 If nothing re-sets the mode, a **reboot** clears it: nothing about a DRM mode
 survives one. A wedged mode is annoying, not persistent — do not go to the

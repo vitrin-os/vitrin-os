@@ -80,18 +80,26 @@ than budgetary. Six of them, named rather than summarised:
 - **No seat in CI.** No `logind` session, no `seatd`, nothing for `libseat` to
   open a card through. The backend cannot even reach the point of failing
   usefully.
-- **Compile-check only.** The CI rung for this backend runs `cargo clippy -p
-  vitrin-core --all-targets --features drm-backend -- -D warnings` and stops
-  there — the same posture as the `gpu-tests` slice. It proves the code
-  type-checks against the smithay API. It proves nothing whatsoever about
-  behaviour, and its job name and step summary say so, because a green tick in
-  a repository whose readers are trained to trust green ticks is exactly how a
-  compile check gets cited as a functional one.
+- **Not even a compile-check, yet.** An earlier draft of this page said, in the
+  present tense, that a CI rung runs `cargo clippy … --features drm-backend`.
+  **No such rung exists and no such feature exists** — the backend itself is
+  unwritten (#218). The claim is corrected rather than deleted, because a limits
+  page that quietly acquires the right words teaches nothing about how it got
+  the wrong ones, and this is a page whose entire value is that it can be
+  believed. When #218 lands, a compile rung is the *floor* it must bring with
+  it, and even then it proves the code type-checks against the smithay API and
+  nothing whatsoever about behaviour — a green tick in a repository whose
+  readers are trained to trust green ticks is exactly how a compile check gets
+  cited as a functional one.
 - **`vkms-advisory` does not close this, and must never be read as if it did.**
   There is an advisory job that attempts `sudo modprobe vkms` and, when the
-  module is available, reports what it found. A virtual KMS device plausibly
-  exercises connector enumeration, mode setting, atomic commit and the
-  page-flip loop. Whether it exercises the **GBM + GLES scanout path at all** is
+  module is available, reports what it found. **What the job actually does is
+  narrower than the device's capabilities**, and the distinction matters: it
+  opens the node, reads mode-setting resources, and probes GBM/EGL/GLES up to
+  locking a front buffer. It deliberately never calls `drmSetMaster`, never sets
+  a mode and never flips a page — so it says nothing about mode setting, atomic
+  commit or the page-flip loop, whatever a vkms device is capable of in
+  principle. Whether it exercises the **GBM + GLES scanout path at all** is
   *unmeasured* — vkms exposes no render node, so the GLES half would need a
   software renderer and may not import into a vkms scanout buffer. The job
   measures and publishes that answer on each run; until it has run, this

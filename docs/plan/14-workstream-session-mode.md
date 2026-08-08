@@ -596,12 +596,88 @@ this workstream owns, not inherits:
   lock forces the CPU compositing path exactly as a consent card does — which
   on the WS-E laptop means the zero-copy dmabuf branch is off for as long as
   the screen is locked.
-- **Two indicators now compete for the top strip, and a third is scheduled**
-  (created by WS-E.1.7, owner: whoever lands WS-E.2.3/#215 second). The dead-man
-  hold bar, the attention marker, and #215's clock/battery/focused-realm strip
-  were each designed without the others. Nobody has designed that strip as a
-  whole, and each issue that adds to it is deciding the layout of a surface whose
-  whole purpose is being unambiguous.
+- **The top strip has now been designed as a whole** (created by WS-E.1.7,
+  resolved by WS-E.2.3/#215, which landed third and therefore owned the
+  collision). The dead-man hold bar, the attention marker and the status strip
+  were each designed without the others. The composite order is now stated once,
+  in `crates/vitrin-core/src/status/mod.rs`'s module docs and in
+  `backend::human_visible_from_view`, and it is:
+
+  ```text
+  realm view -> consent overlay -> lock cover -> STATUS STRIP -> trusted band
+             -> attention marker ... -> dead-man hold indicator (last of all)
+  ```
+
+  The decisions, each with its reason:
+  - The **band** keeps rows `[0, 8)` alone, exactly one colour, and nothing —
+    core-drawn or not — is composited into them. The strip's raster is the
+    strip's own height and is blitted at `y = TRUST_BAND_HEIGHT`, so no
+    coordinate expressible in the renderer lands in the band.
+  - The **strip is drawn over the lock cover**, not under it. #215 left this to
+    whoever landed second; #214 landed first, so #215 decided it. A clock is the
+    one thing a human wants on a lock screen, and "the strip is always there"
+    must have no exception. It leaks nothing the lock hides: every field is
+    core-owned, and the realm id it names is one the lock card already prints.
+  - The **attention marker keeps a lane**: the strip's content starts past
+    `attention::MARKER_W`, read from that constant and never restated, with a
+    `const` assertion that turns an overgrown marker into a compile error.
+  - The **dead-man hold indicator is still composited last of all**, so nothing
+    added here can hide a hold in progress.
+- **The status strip is opt-in, and the realm view is still NOT inset**
+  (created by WS-E.2.3). #215 asks for the app to be *configured* smaller by
+  `TRUST_BAND_HEIGHT + STATUS_STRIP_HEIGHT`; that is unmet, and the strip
+  therefore overdraws 20 rows of client content the way the band already
+  overdraws 8. A correct inset needs one usable-view value reaching
+  `scene::layout::place` from three paths (`Scene::compose`, the router's
+  `surface_local`, `dmabuf::human_visible_frame`) that share no carrier for a
+  second number, plus the `configure` size the shim is told — a `ViewGeometry`
+  refactor of its own, and a half-done version (one path reserving rows the
+  others do not) is strictly worse than none. `--status` is off by default so
+  no session pays the overdraw without asking; the cost is published in
+  `docs/book/src/limits.md`.
+- **A recurring filesystem read inside the TCB** (created by WS-E.2.3). Before
+  it, the core read `realm.toml` and `principals.toml` once at startup and
+  embedded its font at compile time; `crates/vitrin-core/src/status/battery.rs`
+  now reads `/sys/class/power_supply` on a 30 s cadence. Bounded to one fixed
+  root, at most 16 directory entries, and at most 16/32/32 bytes per attribute
+  through `Read::take` — with every failure collapsing to an empty slot rather
+  than a guess. **When E2.6/E2.7 put Landlock over the core's own process this
+  becomes a rule the core must grant itself**, which is a real widening of that
+  future sandbox and is recorded here so the ruleset's author does not have to
+  rediscover it.
+
+### Measurements taken for WS-E.2.3
+
+Numbers stated in `crates/vitrin-core/src/status/` come from here, so a later
+reader can re-run them rather than trust them.
+
+- **Battery read cost.** `read_battery` against the real
+  `/sys/class/power_supply` on the WS-E laptop (two devices: `ADP1` mains, `BAT1`
+  battery), 10 000 iterations, 2026-08-08:
+  **8.90 us/call in `--release`, 10.97 us/call in the debug profile.** At the
+  30 s `BATTERY_INTERVAL` that is 0.30 us of work per second of session.
+  Measured by timing a loop of `read_battery(Path::new(SYSFS_ROOT))` in a
+  temporary `#[test]` in `status/battery.rs`; the test is not kept, because a
+  timing assertion in CI is a flake generator.
+- **Type metrics.** `Text::line_metrics(12.0)` on the bundled face reports
+  `ascent = 11`, `height = 14`. `DEFAULT_HEIGHT = 20` is 14 + 3 + 3, and
+  `MIN_HEIGHT = 16` is the smallest strip that holds the line box plus the
+  bottom rule. Pinned by `the_height_flag_range_is_what_the_type_size_needs`,
+  so a font change moves the constant rather than clipping a digit.
+- **GPU-path cost.** One extra textured quad per presented frame, plus a
+  re-upload of one `view_width x 20` RGBA texture whenever the strip's
+  generation changes. At 2560x1600 that texture is `2560 * 20 * 4` =
+  **200 KiB**, and the generation changes **once a minute** at steady state
+  (the clock is `HH:MM` with no seconds; the battery is re-read every 30 s and
+  moves a percent far more slowly) — i.e. **~3.4 KiB/s** of bus traffic,
+  independent of the frame rate. At 240 Hz that is one re-upload per 14 400
+  presented frames. The alternative #215 rejects — forcing the CPU path — would
+  cost a full `2560*1600*4` = 16 MiB composite plus upload *per frame*, 3.9
+  GB/s at 240 Hz, which is why the strip is a texture and not a fallback.
+- **Wakeups.** A `--status` session arms one 1 s repeating timer
+  (`session::STATUS_TICK`) so an otherwise idle session's clock can move; the
+  repaint itself happens only on the minute that rolls over. A session without
+  `--status` arms no timer and makes no clock or filesystem read at all.
 
 ## 7. Safety rule, non-negotiable
 

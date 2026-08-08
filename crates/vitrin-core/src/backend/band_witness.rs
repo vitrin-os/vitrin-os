@@ -180,13 +180,22 @@ pub(crate) struct BandReport<'a> {
     /// nothing; this says how many times the client really did repaint the
     /// pixels nearest the band while the band itself did not move.
     pub probe_changes: u64,
-    /// At the latest composite: the human-visible output below the band is
-    /// byte-identical to the realm view below the band.
+    /// At the latest composite: the human-visible output below **the band and
+    /// the status strip** is byte-identical to the realm view under the same
+    /// rows.
     ///
     /// True whenever no prompt is up (the prompt's scrim and trusted ring are
     /// exactly what makes it false, legitimately). Its job is to refuse the
     /// vacuous reading of `band_changes == 0`: a frozen or erased output
     /// framebuffer would hold its band rows constant too, and would fail here.
+    ///
+    /// **The strip's rows are excluded rather than ignored** (WS-E.2.3, issue
+    /// #215). A session with `--status` on overdraws [`Self::strip_h`] rows of
+    /// client content by design, so comparing them would make this read `false`
+    /// forever and turn the field into a constant that reports nothing. The
+    /// rows are not dropped from the witness — [`Self::strip_changes`] is what
+    /// they moved to — and with `--status` off `strip_h` is `0` and this
+    /// comparison is byte-for-byte what it was before the strip existed.
     pub tracks_view: bool,
     /// At the latest composite: every pixel of the band's rows is the same
     /// fully opaque colour.
@@ -207,6 +216,26 @@ pub(crate) struct BandReport<'a> {
     /// The view's dimensions at the latest composite.
     pub view_w: u32,
     pub view_h: u32,
+    /// The status strip's effective height in rows (WS-E.2.3): the session's
+    /// `--status-height`, clamped to the view, and **`0` when `--status` is
+    /// off**. Read from [`crate::status::StatusStrip::height`] rather than
+    /// restated, so this witness cannot disagree with the compositor about
+    /// which rows the strip owns.
+    pub strip_h: u32,
+    /// Composites (after the first) at which the human-visible output's
+    /// **strip** rows changed, byte for byte.
+    ///
+    /// The counterpart to [`Self::band_changes`], and the reason the pair is
+    /// worth having: `band_changes == 0` is the property, and a reading in
+    /// which *both* counters are zero is a reading in which nothing was
+    /// measured. With `--status` on and a clock ticking, this is expected to be
+    /// non-zero while `band_changes` stays exactly `0`; with `--status` off it
+    /// is `0` because there are no strip rows.
+    ///
+    /// Secret-independent, exactly like every other field: the strip is drawn
+    /// from a snapshot of the clock, the battery and a `realm.toml` id, none of
+    /// which is a function of the indicator's colour.
+    pub strip_changes: u64,
     /// FNV-1a-64 over the **realm view's** probe strip at the latest
     /// composite. Client-owned bytes, so the harness can recompute it from its
     /// own `--capture-dump` read and check that this witness was evaluated on
@@ -215,13 +244,16 @@ pub(crate) struct BandReport<'a> {
 }
 
 impl std::fmt::Display for BandReport<'_> {
-    /// The channel's wire form: eleven space-separated ASCII fields, no
+    /// The channel's wire form: thirteen space-separated ASCII fields, no
     /// payload, no descriptor. Rendered here rather than at the call site so
     /// the one place the report becomes bytes is the one place to audit.
     ///
-    /// The bound realm's id is **last**, after the digest, so the ten fields
+    /// The bound realm's id is eleventh, after the digest, so the ten fields
     /// that predate WS-E.1.3 keep their positions; `-` when no realm is
-    /// bound.
+    /// bound. WS-E.2.3's two strip fields are appended **after** it for the
+    /// same reason it was appended after the digest: every position an existing
+    /// reader indexes stays where it was, and a harness that has not been taught
+    /// about the strip reads the same numbers it read before.
     ///
     /// **Why it cannot turn this line into a payload**, stated as the two
     /// separate facts it actually rests on:
@@ -252,7 +284,7 @@ impl std::fmt::Display for BandReport<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} {} {} {} {} {} {} {} {} {:016x} {}",
+            "{} {} {} {} {} {} {} {} {} {:016x} {} {} {}",
             self.composites,
             self.band_changes,
             self.probe_changes,
@@ -264,6 +296,8 @@ impl std::fmt::Display for BandReport<'_> {
             self.view_h,
             self.probe_fnv,
             self.realm.unwrap_or("-"),
+            self.strip_h,
+            self.strip_changes,
         )
     }
 }
@@ -289,13 +323,22 @@ pub(crate) struct BandWitness {
     /// The previous composite's probe-strip digest — realm view, so
     /// indicator-free by construction.
     previous_probe: Option<u64>,
+    /// The previous composite's status-strip rows, from the human-visible
+    /// output. Retained rather than digested for the reason `previous_band` is
+    /// — an exact comparison cannot miss a change — but with none of the same
+    /// caution behind it: these bytes are the strip's own raster, which holds no
+    /// secret and is a function of the clock, the battery and a `realm.toml`
+    /// id.
+    previous_strip: Option<Vec<u8>>,
     composites: u64,
     band_changes: u64,
     probe_changes: u64,
+    strip_changes: u64,
     refusals: u64,
     tracks_view: bool,
     band_uniform: bool,
     band_h: u32,
+    strip_h: u32,
     view_w: u32,
     view_h: u32,
     probe_fnv: u64,
@@ -311,9 +354,11 @@ impl BandWitness {
             realm: None,
             previous_band: None,
             previous_probe: None,
+            previous_strip: None,
             composites: 0,
             band_changes: 0,
             probe_changes: 0,
+            strip_changes: 0,
             refusals: 0,
             // Before the first composite there is nothing to be true about.
             // False rather than true so a report read before any frame cannot
@@ -321,6 +366,7 @@ impl BandWitness {
             tracks_view: false,
             band_uniform: false,
             band_h: 0,
+            strip_h: 0,
             view_w: 0,
             view_h: 0,
             probe_fnv: 0,
@@ -343,12 +389,20 @@ impl BandWitness {
     /// refused composite is still a composite of some realm, and a report
     /// whose counters said "refusals: 1" while naming no realm would hide
     /// which one.
+    ///
+    /// `strip_h` is the status strip's height in rows for this composite
+    /// ([`crate::status::StatusStrip::height`], `0` when `--status` is off). It
+    /// is a parameter rather than a constant because the strip's height is the
+    /// operator's, and it is *this* value rather than a re-derivation so the
+    /// witness and the compositor cannot disagree about which rows the strip
+    /// owns.
     pub(crate) fn observe(
         &mut self,
         view: &[u8],
         output: &[u8],
         width: u32,
         height: u32,
+        strip_h: u32,
         realm: Option<&crate::grants::RealmId>,
     ) {
         if self.realm.as_ref() != realm {
@@ -361,6 +415,10 @@ impl BandWitness {
         }
         let band_h = TRUST_BAND_HEIGHT.min(height);
         let band_bytes = width as usize * band_h as usize * 4;
+        // The strip's rows, immediately below the band and clamped to what is
+        // left of the view.
+        let strip_h = strip_h.min(height - band_h);
+        let strip_end = band_bytes + width as usize * strip_h as usize * 4;
         // The probe strip: the same number of rows again, immediately below
         // the band, clamped to the view. Those rows are where a client would
         // paint to make its counterfeit band look like it continues, so they
@@ -369,6 +427,7 @@ impl BandWitness {
 
         self.composites += 1;
         self.band_h = band_h;
+        self.strip_h = strip_h;
         self.view_w = width;
         self.view_h = height;
 
@@ -394,7 +453,25 @@ impl BandWitness {
         }
         self.previous_probe = Some(self.probe_fnv);
 
-        self.tracks_view = output[band_bytes..] == view[band_bytes..];
+        // The strip's own rows, on the human-visible output. Measured whether
+        // or not a strip is up: with `--status` off this is an empty slice, the
+        // comparison is trivially equal, and the counter stays 0 — which is the
+        // honest reading of "there is no strip", not a silent skip.
+        let strip = &output[band_bytes..strip_end];
+        if let Some(previous) = self.previous_strip.as_deref() {
+            if previous != strip {
+                self.strip_changes += 1;
+            }
+        }
+        match self.previous_strip.as_mut() {
+            Some(buffer) => {
+                buffer.clear();
+                buffer.extend_from_slice(strip);
+            }
+            None => self.previous_strip = Some(strip.to_vec()),
+        }
+
+        self.tracks_view = output[strip_end..] == view[strip_end..];
         self.band_uniform = band_bytes > 0
             && band[3] == 0xff
             && band.chunks_exact(4).all(|pixel| pixel == &band[..4]);
@@ -406,10 +483,12 @@ impl BandWitness {
             composites: self.composites,
             band_changes: self.band_changes,
             probe_changes: self.probe_changes,
+            strip_changes: self.strip_changes,
             tracks_view: self.tracks_view,
             band_uniform: self.band_uniform,
             refusals: self.refusals,
             band_h: self.band_h,
+            strip_h: self.strip_h,
             view_w: self.view_w,
             view_h: self.view_h,
             probe_fnv: self.probe_fnv,
@@ -444,6 +523,7 @@ mod tests {
             view.to_vec(),
             &mut surface,
             &mut no_lock(),
+            &mut no_status(),
             W,
             H,
             false,
@@ -470,6 +550,7 @@ mod tests {
             view.clone(),
             &mut closed_surface,
             &mut no_lock(),
+            &mut no_status(),
             W,
             H,
             false,
@@ -479,6 +560,7 @@ mod tests {
             view.clone(),
             &mut open_surface,
             &mut no_lock(),
+            &mut no_status(),
             W,
             H,
             true,
@@ -520,7 +602,7 @@ mod tests {
         let realm = bound();
         for view in views {
             let output = human_visible(view, indicator);
-            witness.observe(view, &output, W, H, Some(&realm));
+            witness.observe(view, &output, W, H, 0, Some(&realm));
         }
         // The report borrows the witness, which dies here; the tests only
         // compare it, and every field but `realm` is `Copy` scalars — so the
@@ -545,6 +627,12 @@ mod tests {
     /// A lock surface with nothing raised. The witness's whole subject is the
     /// trusted band, and a raised lock would cover the rows below it — a
     /// different property, tested in `crate::lock`.
+    /// A status strip that is off: `--status` is opt-in, so this is what every
+    /// composite in this suite runs with unless it is testing the strip.
+    fn no_status() -> crate::status::StatusStrip {
+        crate::status::StatusStrip::new(crate::status::StatusConfig::off())
+    }
+
     fn no_lock() -> crate::lock::LockSurface {
         crate::lock::LockSurface::new(TrustedIndicator::for_test())
     }
@@ -563,6 +651,7 @@ mod tests {
             flat(CARD_W, CARD_H, [0x00, 0x00, 0x00]),
             &mut surface,
             &mut no_lock(),
+            &mut no_status(),
             CARD_W,
             CARD_H,
             false,
@@ -593,11 +682,12 @@ mod tests {
                 view.clone(),
                 &mut surface,
                 &mut no_lock(),
+                &mut no_status(),
                 CARD_W,
                 CARD_H,
                 false,
             );
-            witness.observe(view, &output, CARD_W, CARD_H, Some(&bound()));
+            witness.observe(view, &output, CARD_W, CARD_H, 0, Some(&bound()));
         }
         let report = witness.report();
         assert_eq!(report.realm, Some(crate::realm::WELL_KNOWN_REALM_ID));
@@ -732,7 +822,7 @@ mod tests {
             client_view([0x00, 0x00, 0x00]),
             client_view([0xff, 0x00, 0x00]),
         ] {
-            witness.observe(&view, &view, W, H, Some(&bound()));
+            witness.observe(&view, &view, W, H, 0, Some(&bound()));
         }
         let report = witness.report();
         assert_eq!(
@@ -762,7 +852,7 @@ mod tests {
             for pixel in output[..band_bytes / 2].chunks_exact_mut(4) {
                 pixel.copy_from_slice(&colour);
             }
-            witness.observe(&view, &output, W, H, Some(&bound()));
+            witness.observe(&view, &output, W, H, 0, Some(&bound()));
         }
         let report = witness.report();
         assert_eq!(report.band_changes, 1);
@@ -781,7 +871,7 @@ mod tests {
         let indicator = TrustedIndicator::for_test();
         let frozen = human_visible(&client_view([0x00, 0x00, 0x00]), indicator);
         for rgb in [[0x00, 0x00, 0x00], [0xff, 0x00, 0x00]] {
-            witness.observe(&client_view(rgb), &frozen, W, H, Some(&bound()));
+            witness.observe(&client_view(rgb), &frozen, W, H, 0, Some(&bound()));
         }
         let report = witness.report();
         assert_eq!(report.band_changes, 0, "a frozen output never changes");
@@ -798,11 +888,12 @@ mod tests {
     #[test]
     fn a_mismatched_buffer_is_counted_as_a_refusal() {
         let mut witness = BandWitness::new();
-        witness.observe(&[], &[], W, H, Some(&bound()));
-        witness.observe(&client_view([0; 3]), &[], W, H, Some(&bound()));
+        witness.observe(&[], &[], W, H, 0, Some(&bound()));
+        witness.observe(&client_view([0; 3]), &[], W, H, 0, Some(&bound()));
         witness.observe(
             &client_view([0; 3]),
             &client_view([0; 3]),
+            0,
             0,
             0,
             Some(&bound()),
@@ -812,6 +903,143 @@ mod tests {
         assert_eq!(report.composites, 0);
         assert!(!report.tracks_view);
         assert!(!report.band_uniform);
+    }
+
+    /// **The property, over a thousand composites with a ticking clock**
+    /// (WS-E.2.3, issue #215's central acceptance criterion).
+    ///
+    /// The band's rows are invariant while the strip's rows are not. Both
+    /// halves matter: `band_changes == 0` on its own is satisfied by a witness
+    /// that measured nothing, and `strip_changes > 0` is what says the clock
+    /// really was moving in the frames the zero was counted over.
+    ///
+    /// It fails if somebody later moves the clock into the band, which is the
+    /// only reason it exists.
+    #[test]
+    fn a_thousand_ticking_composites_move_the_strip_and_never_the_band() {
+        use crate::status::{StatusConfig, StatusStrip, DEFAULT_HEIGHT};
+
+        // A view taller than band + strip + something, so `tracks_view` has
+        // rows left to be about: with a 24-row fixture the strip would cover
+        // every row below the band and the comparison would be vacuously true.
+        // Wide enough for the strip to actually draw something. At 64px there
+        // is no room for a clock beside the attention marker's lane, so the
+        // renderer correctly drops every field and the strip never changes —
+        // which would make the "it was really repainting" assertion below fail
+        // for a reason that has nothing to do with the witness.
+        const SW: u32 = 320;
+        const SH: u32 = 120;
+
+        let indicator = TrustedIndicator::for_test();
+        let mut strip = StatusStrip::new(StatusConfig {
+            enabled: true,
+            ..StatusConfig::default()
+        });
+        let mut witness = BandWitness::new();
+        let realm = bound();
+        let mono = std::time::Instant::now();
+        let view = flat(SW, SH, [0x20, 0x21, 0x22]);
+        for tick in 0..1000u64 {
+            // One minute per composite, so every one of them moves the clock.
+            strip.refresh(
+                std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(1_786_244_643 + tick * 60),
+                mono,
+                Some(&realm),
+            );
+            let mut surface = ConsentSurface::new(indicator);
+            let output = crate::backend::human_visible_from_view(
+                view.clone(),
+                &mut surface,
+                &mut no_lock(),
+                &mut strip,
+                SW,
+                SH,
+                false,
+            );
+            witness.observe(&view, &output, SW, SH, strip.height(), Some(&realm));
+        }
+        let report = witness.report();
+        assert_eq!(report.composites, 1000);
+        assert_eq!(report.refusals, 0);
+        assert_eq!(
+            report.band_changes, 0,
+            "the band's rows must be invariant under a ticking status strip"
+        );
+        assert!(
+            report.strip_changes > 900,
+            "the strip must actually have been repainting, or the zero above counts nothing: \
+             {} changes in 1000 composites",
+            report.strip_changes
+        );
+        assert_eq!(report.strip_h, DEFAULT_HEIGHT);
+        assert!(report.band_uniform);
+        // ...and the strip's rows are excluded from `tracks_view` rather than
+        // dropped: below band + strip the output is still the realm view.
+        assert!(
+            report.tracks_view,
+            "with the strip's own rows excluded, the output must still track the realm view"
+        );
+    }
+
+    /// [`a_report_does_not_depend_on_the_bands_colour`]'s sibling for the strip
+    /// (WS-E.2.3): the new counter must not become an oracle for the indicator.
+    ///
+    /// Two runs identical in every way but the session secret, with a strip up
+    /// and a clock moving, must produce **byte-identical** reports. The strip is
+    /// drawn from a snapshot of the clock, the battery and a `realm.toml` id, so
+    /// this should hold trivially — which is exactly why it is checked rather
+    /// than argued: the same was true of "do the band's rows equal the client's"
+    /// right up until someone noticed it was a brute-force oracle.
+    #[test]
+    fn a_strip_report_does_not_depend_on_the_bands_colour() {
+        use crate::status::{StatusConfig, StatusStrip};
+
+        let run_with = |indicator: TrustedIndicator| {
+            let mut strip = StatusStrip::new(StatusConfig {
+                enabled: true,
+                ..StatusConfig::default()
+            });
+            let mut witness = BandWitness::new();
+            let realm = bound();
+            let mono = std::time::Instant::now();
+            for tick in 0..8u64 {
+                let view = flat(320, 120, [tick as u8, 0x21, 0x22]);
+                strip.refresh(
+                    std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_786_244_643 + tick * 60),
+                    mono,
+                    Some(&realm),
+                );
+                let mut surface = ConsentSurface::new(indicator);
+                let output = crate::backend::human_visible_from_view(
+                    view.clone(),
+                    &mut surface,
+                    &mut no_lock(),
+                    &mut strip,
+                    320,
+                    120,
+                    false,
+                );
+                witness.observe(&view, &output, 320, 120, strip.height(), Some(&realm));
+            }
+            witness.report().to_string()
+        };
+        let dim = run_with(TrustedIndicator::from_rgb(0x40, 0x41, 0x42));
+        let bright = run_with(TrustedIndicator::from_rgb(0xfe, 0xfd, 0xfc));
+        // Non-vacuity: the run really did count a moving strip, so the equality
+        // below is over a report with something in it.
+        let strip_changes: u64 = dim
+            .split(' ')
+            .next_back()
+            .expect("the strip counter is last")
+            .parse()
+            .expect("a number");
+        assert!(
+            strip_changes > 0,
+            "this run counted no strip change, so the equality proves nothing: {dim}"
+        );
+        assert_eq!(dim, bright, "a report must not move with the secret");
     }
 
     /// A report read before any composite must not look like a passing one.
@@ -826,13 +1054,18 @@ mod tests {
         // A zero digest rather than the FNV offset basis: nothing was hashed,
         // and a report that opened with the digest of the empty string would be
         // indistinguishable from one taken over an empty probe strip.
-        assert_eq!(report.to_string(), "0 0 0 0 0 0 0 0 0 0000000000000000 -");
+        assert_eq!(
+            report.to_string(),
+            "0 0 0 0 0 0 0 0 0 0000000000000000 - 0 0"
+        );
     }
 
-    /// The wire form is eleven fields of bounded ASCII, so the reply cannot
+    /// The wire form is thirteen fields of bounded ASCII, so the reply cannot
     /// become a pixel channel by accident: `MAX_LINE` is 128 bytes and a
     /// 640x480 band is 20 480. The eleventh is the bound realm's id, itself
-    /// length-bounded by the loader.
+    /// length-bounded by the loader; the twelfth and thirteenth are WS-E.2.3's
+    /// strip height and strip-changed counter, appended after it so every
+    /// position an existing reader indexes stays where it was.
     ///
     /// **Measured at the loader's maximum, not at `realm-0`'s length.** The
     /// bound that matters is 64 bytes over `[A-Za-z0-9._-]`, and this test
@@ -841,13 +1074,18 @@ mod tests {
     /// 128-byte budget. See [`BandReport`]'s `Display` for the two facts the
     /// no-payload claim really rests on.
     #[test]
-    fn the_wire_form_is_eleven_scalar_fields() {
+    fn the_wire_form_is_thirteen_scalar_fields() {
         let report = run(TrustedIndicator::for_test(), &[client_view([1, 2, 3])]);
         let line = report.to_string();
-        assert_eq!(line.split(' ').count(), 11, "{line}");
+        assert_eq!(line.split(' ').count(), 13, "{line}");
         assert!(
-            line.ends_with(&format!(" {}", crate::realm::WELL_KNOWN_REALM_ID)),
+            line.contains(&format!(" {} ", crate::realm::WELL_KNOWN_REALM_ID)),
             "the report must name the realm it is about: {line}"
+        );
+        assert!(
+            line.ends_with(" 0 0"),
+            "a session with `--status` off reports a zero-height strip that never changed: \
+             {line}"
         );
         assert!(line.is_ascii());
         assert!(
@@ -883,13 +1121,14 @@ mod tests {
             &human_visible(&view, TrustedIndicator::for_test()),
             W,
             H,
+            0,
             Some(&realm),
         );
         let line = witness.report().to_string();
         assert!(line.is_ascii());
-        assert_eq!(line.split(' ').count(), 11, "{line}");
+        assert_eq!(line.split(' ').count(), 13, "{line}");
         assert!(
-            line.ends_with(&format!(" {longest}")),
+            line.contains(&format!(" {longest} ")),
             "the report must name the realm it is about: {line}"
         );
 
@@ -902,19 +1141,31 @@ mod tests {
         );
 
         // What is left over, named rather than implied. The realm field eats
-        // 65 bytes of the budget; the four `u64` counters and the three `u32`
+        // 65 bytes of the budget; the five `u64` counters and the four `u32`
         // geometry fields share what remains, and they are the only fields
         // without a short bound. This is a real constraint, not a formality:
         // at their type maximum the first ten fields alone are 137 bytes and
         // would overflow the line with no realm id at all. What keeps the
         // bound true is that they count *this session's* composites -- and
         // nothing a peer of this channel, or a confined client, can inflate.
+        //
+        // **Sixteen, and the number is measured rather than modelled.** The
+        // old justification budgeted "~7 digits of `composites` and as many of
+        // `probe_changes`" -- two counters -- and WS-E.2.3 added a third
+        // (`strip_changes`) without revisiting it, so the stated model no
+        // longer described the reply it guards. Raising the threshold to match
+        // the model turns this assertion red on the real longest-legal reply,
+        // which is the honest way of finding out that the model, not the
+        // threshold, was the stale half: the counters share the residue rather
+        // than each claiming a private seven digits, because a session cannot
+        // composite 10^7 frames and also probe 10^7 times and also repaint the
+        // strip 10^7 times within one run.
         let headroom = budget - line.len();
         assert!(
             headroom >= 16,
-            "only {headroom} bytes are left for the counters at the longest realm id; a \
-             session compositing at 60 fps needs ~7 digits of `composites` and as many of \
-             `probe_changes`, so this reply is one field away from not fitting"
+            "only {headroom} bytes are left for the three counters at the longest realm id; \
+             they share this residue rather than each claiming it, so a reply that fails \
+             here means a FOURTH field was added, not that a counter grew"
         );
     }
 }

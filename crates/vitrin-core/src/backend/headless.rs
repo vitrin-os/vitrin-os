@@ -369,6 +369,7 @@ fn readback_region(
 /// headless is the only backend CI can run, so it is the only place the
 /// capture-exclusion property can be *proved* on real composited pixels
 /// (`the_agent_cursor_reaches_human_visible_output_but_never_a_capture`).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     size: (u32, u32),
     dead_man: DeadManConfig,
@@ -377,6 +378,7 @@ pub fn run(
     #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
     clipboard: crate::chord::Trigger,
     agent_cursor: bool,
+    status: crate::status::StatusConfig,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
     #[cfg(feature = "physical-input-injector")] physical_input_fd: Option<std::os::fd::RawFd>,
     seed: RuntimeSeed,
@@ -394,6 +396,7 @@ pub fn run(
         attention,
         clipboard,
         agent_cursor,
+        status,
         #[cfg(feature = "consent-injector")]
         consent_injector_fd,
         #[cfg(feature = "physical-input-injector")]
@@ -407,6 +410,7 @@ pub fn run(
     (recorder, result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     size: (u32, u32),
     #[cfg_attr(not(feature = "dead-man-injector"), allow(unused_variables))]
@@ -416,6 +420,7 @@ fn run_inner(
     #[cfg_attr(not(feature = "physical-input-injector"), allow(unused_variables))]
     clipboard: crate::chord::Trigger,
     agent_cursor: bool,
+    status: crate::status::StatusConfig,
     #[cfg(feature = "consent-injector")] consent_injector_fd: Option<std::os::fd::RawFd>,
     #[cfg(feature = "physical-input-injector")] physical_input_fd: Option<std::os::fd::RawFd>,
     seed: &mut Option<RuntimeSeed>,
@@ -525,6 +530,7 @@ fn run_inner(
         event_loop.get_signal(),
         indicator,
         agent_cursor,
+        status,
     )?;
     let now_cell = std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now()));
     let mut state = HeadlessState {
@@ -636,6 +642,16 @@ fn run_inner(
     if let Err(err) = session::install(&loop_handle, &mut state.runtime) {
         *recovered = Some(state.runtime.into_recorder());
         return Err(err);
+    }
+
+    // The status strip's tick (WS-E.2.3, issue #215), armed only for a session
+    // that asked for one: the strip's clock has to move on a session where
+    // nothing else is happening, and the loop otherwise has no reason to wake.
+    if status.enabled {
+        if let Err(err) = session::arm_status_tick(&loop_handle) {
+            *recovered = Some(state.runtime.into_recorder());
+            return Err(err);
+        }
     }
 
     // The realm, only now. `install` has put the listener and the sweeps on
@@ -1208,6 +1224,22 @@ impl session::Presenter for HeadlessView {
         true
     }
 
+    /// The status strip (WS-E.2.3), on this backend too and for the reason the
+    /// attention marker needs no flag here: it is composited in
+    /// [`super::human_visible_from_view`], the *shared* output-stage fork, so a
+    /// backend that withheld it would make the two backends present different
+    /// human-visible output for the same session state. What is gated is
+    /// `--status` itself, in the [`crate::status::StatusStrip`] both backends
+    /// hold; a headless session without the flag samples nothing.
+    ///
+    /// The realm handed to the sampler is **the one bound to the output**, not
+    /// the router's: the strip names the realm in the picture the human is
+    /// looking at, and naming a hidden one would be a caption for a different
+    /// image.
+    fn refresh_status(&mut self, now: std::time::SystemTime, mono: std::time::Instant) -> bool {
+        self.output.status.refresh(now, mono, self.scenes.focused())
+    }
+
     /// All three, lent to `f`: the scene and retained image from the two
     /// fields the struct was split into for exactly this call (see
     /// [`HeadlessView::output`]); no importer, since this backend has no GPU
@@ -1326,6 +1358,17 @@ pub(crate) struct HeadlessOutput {
     /// stored, so "the flag is absent" is true of the composite and not only
     /// of the parser.
     agent_cursor: Option<(f64, f64)>,
+    /// The status strip (WS-E.2.3, issue #215). Always present and composited
+    /// through the shared output-stage fork, exactly like the lock surface; a
+    /// session without `--status` holds one that is off, samples nothing and
+    /// draws nothing.
+    ///
+    /// **Off by default here for the same measured reason `draw_agent_cursor`
+    /// is**: this backend's human-visible framebuffer is compared byte for byte
+    /// against the realm view by [`super::band_witness`] and by
+    /// `tests/integration/test_real_trust_band.py`, and a clock ticking in it
+    /// by default would make that gate a function of wall-clock time.
+    status: crate::status::StatusStrip,
 }
 
 impl HeadlessView {
@@ -1334,6 +1377,7 @@ impl HeadlessView {
         loop_signal: LoopSignal,
         indicator: TrustedIndicator,
         agent_cursor: bool,
+        status: crate::status::StatusConfig,
     ) -> Result<Self, Box<dyn Error>> {
         let mut renderer = PixmanRenderer::new()?;
         // `.max(0)` is defensive only: `run` always passes a positive size
@@ -1359,6 +1403,7 @@ impl HeadlessView {
                 draw_agent_cursor: agent_cursor,
                 agent_cursor: None,
                 attention: false,
+                status: crate::status::StatusStrip::new(status),
             },
             loop_signal,
         })
@@ -1592,6 +1637,7 @@ impl HeadlessOutput {
             view,
             &mut self.consent,
             &mut self.lock,
+            &mut self.status,
             w,
             h,
             self.attention,
@@ -1623,7 +1669,7 @@ impl HeadlessOutput {
         // composites, never miss one that reached the screen.
         #[cfg(feature = "consent-injector")]
         self.band_witness
-            .observe(&witnessed_view, &output, w, h, realm);
+            .observe(&witnessed_view, &output, w, h, self.status.height(), realm);
         composite(
             &mut self.renderer,
             &mut self.output_framebuffer,
@@ -1750,6 +1796,12 @@ mod tests {
     /// *other* overlays. A fresh one per call: [`crate::lock::LockSurface`]
     /// carries a generation counter and a raster cache, so a shared instance
     /// would let one caller's raise change what the next one measures.
+    /// A status strip that is off: `--status` is opt-in, so this is what every
+    /// composite in this suite runs with.
+    fn no_status() -> crate::status::StatusStrip {
+        crate::status::StatusStrip::new(crate::status::StatusConfig::off())
+    }
+
     fn no_lock() -> crate::lock::LockSurface {
         crate::lock::LockSurface::new(crate::consent::TrustedIndicator::for_test())
     }
@@ -1936,6 +1988,7 @@ mod tests {
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
             false,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
         state
@@ -1993,6 +2046,7 @@ mod tests {
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
             false,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
 
@@ -2081,6 +2135,7 @@ mod tests {
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
             false,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
         state
@@ -2173,6 +2228,7 @@ mod tests {
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
             false,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
 
@@ -2280,6 +2336,7 @@ mod tests {
             event_loop.get_signal(),
             TrustedIndicator::for_test(),
             false,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
         state
@@ -2311,6 +2368,7 @@ mod tests {
             state.bound_scene(),
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             VW,
             VH,
             false,
@@ -2397,6 +2455,7 @@ mod tests {
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
             false,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
 
@@ -2571,6 +2630,7 @@ mod tests {
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
             false,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
 
@@ -2736,6 +2796,7 @@ mod tests {
             crate::consent::TrustedIndicator::for_test(),
             // `--agent-cursor`, the operator's own switch.
             true,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
 
@@ -2867,6 +2928,190 @@ mod tests {
         );
     }
 
+    /// **The status strip reaches human-visible output and never a capture**
+    /// (WS-E.2.3, issue #215).
+    ///
+    /// Written positive-first on purpose. "Absent from the capture" is a
+    /// negative claim and negatives pass vacuously — a capture that was empty
+    /// for an unrelated reason would satisfy it while proving nothing. So the
+    /// **pattern is located in the human-visible output first**, by ground
+    /// colour and by exact row range, and only then looked for in the realm
+    /// view and in the bytes a `capture_frame` would actually seal into a
+    /// memfd.
+    ///
+    /// What is at stake is not cosmetic: the clock is a timing oracle and the
+    /// battery level is a session fact an agent has no other route to. Both are
+    /// low-bandwidth; neither is nothing.
+    #[test]
+    fn the_status_strip_reaches_human_visible_output_but_never_a_capture() {
+        use crate::capture::{render_frame, RealmViewFrame};
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+        use crate::session::Presenter;
+        use crate::status::{StatusConfig, DEFAULT_HEIGHT, STRIP_TOP};
+
+        let _fd = crate::capture::tests::fd_lock();
+        const VW: u32 = 400;
+        const VH: u32 = 300;
+        const BPP: usize = test_pattern::BYTES_PER_PIXEL;
+
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessView> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+            false,
+            // `--status`, the operator's own switch.
+            StatusConfig {
+                enabled: true,
+                ..StatusConfig::default()
+            },
+        )
+        .expect("headless state under pixman");
+
+        // A realm that has painted, so "the strip is absent from the capture"
+        // is distinguishable from "nothing was ever drawn".
+        state.scene_for_test().commit(
+            SurfaceContent::from_rgba(client_pixels(VW, VH), VW, VH).expect("well-formed content"),
+        );
+        state.redraw().expect("composite the committed surface");
+        let clean_view = state.latest_frame_rgba().expect("readback");
+        let clean_output = state.latest_output_rgba().expect("readback");
+
+        // Nothing has been sampled yet, so no strip is drawn: the flag alone
+        // paints nothing, which is what makes the difference below the strip's
+        // and not the flag's.
+        let band_bytes = crate::consent::TRUST_BAND_HEIGHT as usize * VW as usize * BPP;
+        assert_eq!(
+            clean_output[band_bytes..],
+            clean_view[band_bytes..],
+            "before the first sample the output differs from the view only by the band"
+        );
+
+        // One sample: this is the seam `session::post_dispatch` drives.
+        assert!(
+            state.refresh_status(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_786_244_643),
+                std::time::Instant::now(),
+            ),
+            "a first sample must dirty the frame"
+        );
+        state.redraw().expect("recomposite with the strip up");
+        let output = state.latest_output_rgba().expect("readback");
+        let view = state.latest_frame_rgba().expect("readback");
+
+        // --- Human-visible side: the strip is REALLY on the display. ---
+        let ground = |px: &[u8]| {
+            px.chunks_exact(BPP)
+                .filter(|pixel| *pixel == crate::status::render::tests::GROUND)
+                .count()
+        };
+        let strip_px = ground(&output);
+        assert!(
+            strip_px > 0,
+            "the status strip is not on the human-visible output at all"
+        );
+        // And in its own rows, exactly: every row of `[STRIP_TOP, STRIP_TOP +
+        // DEFAULT_HEIGHT)` differs from the clean composite, and no row outside
+        // that range does.
+        let row =
+            |px: &[u8], y: u32| px[y as usize * VW as usize * BPP..][..VW as usize * BPP].to_vec();
+        for y in 0..VH {
+            let inside = (STRIP_TOP..STRIP_TOP + DEFAULT_HEIGHT).contains(&y);
+            assert_eq!(
+                row(&output, y) != row(&clean_output, y),
+                inside,
+                "row {y} changed={} but inside-the-strip={inside}",
+                row(&output, y) != row(&clean_output, y)
+            );
+        }
+
+        // --- Agent side: the capture is the realm view, unchanged. ---
+        assert_eq!(
+            view, clean_view,
+            "a status strip being drawn must not move a single pixel of the realm view"
+        );
+        assert_eq!(
+            view,
+            state.bound_scene().compose(VW, VH),
+            "the capture source must be exactly Scene::compose -- the strip composites at the \
+             output stage, above this"
+        );
+        assert_eq!(
+            ground(&view),
+            0,
+            "a strip pixel reached the realm view an agent may capture"
+        );
+        assert_ne!(view, output, "...and the two really do differ now");
+
+        // The delivered artifact, not just the retained image. The wire frame
+        // is XRGB, so the ground colour is compared swizzled -- otherwise
+        // "absent" would be true of bytes nobody was looking for.
+        let (frame, _digest) = render_frame(&RealmViewFrame {
+            rgba: &view,
+            width: VW,
+            height: VH,
+        })
+        .expect("render the retained view");
+        let served = {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::File::from(frame.fd);
+            let mut buf = vec![0u8; (frame.stride * frame.height) as usize];
+            file.read_exact_at(&mut buf, 0).expect("read served frame");
+            buf
+        };
+        let g = crate::status::render::tests::GROUND;
+        let wire = [g[2], g[1], g[0], 0xff];
+        assert!(
+            !served.chunks_exact(4).any(|px| px == wire),
+            "a status-strip pixel reached a served capture: `vitrin_view.frame_ready` is \
+             delivering human-visible output, and with it a clock an agent must not have"
+        );
+    }
+
+    /// **Without `--status`, the headless composite is unchanged.** The default
+    /// this backend must keep, for the reason `--agent-cursor`'s default exists:
+    /// `tests/integration/test_real_trust_band.py` compares the human-visible
+    /// frame against the realm view byte for byte, and a ticking clock in that
+    /// comparison would make a mock-free milestone gate a function of the time
+    /// of day.
+    #[test]
+    fn without_the_flag_the_status_strip_changes_no_headless_pixel() {
+        use crate::scene::{tests::client_pixels, SurfaceContent};
+        use crate::session::Presenter;
+
+        const VW: u32 = 200;
+        const VH: u32 = 150;
+        let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
+        let event_loop: EventLoop<'static, HeadlessView> =
+            EventLoop::try_new().expect("calloop event loop");
+        let mut state = HeadlessView::new(
+            size,
+            event_loop.get_signal(),
+            crate::consent::TrustedIndicator::for_test(),
+            false,
+            crate::status::StatusConfig::off(),
+        )
+        .expect("headless state under pixman");
+        state.scene_for_test().commit(
+            SurfaceContent::from_rgba(client_pixels(VW, VH), VW, VH).expect("well-formed content"),
+        );
+        state.redraw().expect("composite");
+        let before = state.latest_output_rgba().expect("readback");
+
+        assert!(
+            !state.refresh_status(std::time::SystemTime::now(), std::time::Instant::now()),
+            "a strip that is off must never dirty a frame"
+        );
+        state.redraw().expect("recomposite");
+        assert_eq!(
+            state.latest_output_rgba().expect("readback"),
+            before,
+            "`--status` off must leave the human-visible composite byte-identical"
+        );
+    }
+
     /// **Without `--agent-cursor`, the headless composite is unchanged** — the
     /// default this backend must keep, because
     /// `tests/integration/test_real_trust_band.py` asserts the human-visible
@@ -2887,6 +3132,7 @@ mod tests {
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
             false,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
         state.scene_for_test().commit(
@@ -3031,6 +3277,7 @@ mod tests {
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
             false,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
         server
@@ -3204,6 +3451,7 @@ mod tests {
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
             false,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
         state
@@ -3226,6 +3474,7 @@ mod tests {
                     state.bound_scene(),
                     &mut expected,
                     &mut no_lock(),
+                    &mut no_status(),
                     VW,
                     VH,
                     false
@@ -3266,6 +3515,7 @@ mod tests {
             event_loop.get_signal(),
             crate::consent::TrustedIndicator::for_test(),
             false,
+            crate::status::StatusConfig::off(),
         )
         .expect("headless state under pixman");
 
@@ -3311,6 +3561,7 @@ mod tests {
                 &crate::scene::Scene::new(),
                 &mut expected,
                 &mut no_lock(),
+                &mut no_status(),
                 VW,
                 VH,
                 false
@@ -3400,6 +3651,7 @@ mod tests {
                 event_loop.get_signal(),
                 crate::consent::TrustedIndicator::for_test(),
                 false,
+                crate::status::StatusConfig::off(),
             )
             .expect("headless state under pixman"),
             server: Some(ShimServer::new(ShimConfig {

@@ -1211,6 +1211,7 @@ pub(crate) mod tests {
             &scene,
             &mut consent,
             &mut crate::lock::LockSurface::new(TrustedIndicator::for_test()),
+            &mut crate::status::StatusStrip::new(crate::status::StatusConfig::off()),
             W,
             H,
             false,
@@ -1249,6 +1250,111 @@ pub(crate) mod tests {
     /// band, in the order [`crate::backend::human_visible_from_view`] applies
     /// them — not on `composite_over` alone, so it covers the whole path an
     /// export would read.
+    /// **A status strip may never overdraw the consent card's trusted ring**
+    /// (WS-E.2.3 review).
+    ///
+    /// The ring is the human's only anti-forgery check on a prompt: a dialog
+    /// framed in any other colour is forged. The strip occupies rows
+    /// `[8, 8+H)` and the card is centred, so on a short enough output they
+    /// overlap — and the strip's first arrangement composited it LAST, over the
+    /// card. That reconciliation enumerated the lock cover, the attention
+    /// marker, the band and the dead-man indicator, and never mentioned the
+    /// card.
+    ///
+    /// Driven at a height chosen so the card genuinely reaches into the strip's
+    /// rows, and asserted twice: the ring survives, and the strip really was
+    /// drawn (or the first assertion would pass over a strip that painted
+    /// nothing).
+    #[test]
+    fn a_status_strip_never_overdraws_the_cards_trusted_ring() {
+        const W: u32 = 640;
+        // Short enough that a centred card reaches the strip's rows.
+        const H: u32 = 200;
+
+        let indicator = TrustedIndicator::for_test();
+        let ink = indicator.color();
+
+        let mut with_strip = ConsentSurface::new(indicator);
+        with_strip.show_for_test(prompt_fixture());
+        let mut strip = crate::status::StatusStrip::new(crate::status::tests::on());
+        strip.refresh(
+            std::time::SystemTime::UNIX_EPOCH,
+            std::time::Instant::now(),
+            Some(&crate::grants::RealmId::new("realm-0")),
+        );
+        let framed = crate::backend::human_visible_from_view(
+            flat_view(W, H, [40, 40, 40]),
+            &mut with_strip,
+            &mut crate::lock::LockSurface::new(TrustedIndicator::for_test()),
+            &mut strip,
+            W,
+            H,
+            false,
+        );
+
+        // The strip must actually be on this output, or the ring assertion
+        // below is a statement about nothing.
+        let mut plain_strip = crate::status::StatusStrip::new(crate::status::StatusConfig::off());
+        let mut no_prompt = ConsentSurface::new(TrustedIndicator::for_test());
+        let bare = crate::backend::human_visible_from_view(
+            flat_view(W, H, [40, 40, 40]),
+            &mut no_prompt,
+            &mut crate::lock::LockSurface::new(TrustedIndicator::for_test()),
+            &mut plain_strip,
+            W,
+            H,
+            false,
+        );
+        assert_ne!(
+            framed, bare,
+            "fixture check: this composite must differ from a bare one, or nothing is being \
+             drawn and the ring assertion below proves nothing"
+        );
+
+        // Every ring pixel the card's frame owns must still carry the session
+        // secret. Counting rather than sampling: a strip that clipped one row
+        // of the ring is exactly the defect, and one row is easy to miss.
+        let (x, y, cw, ch) = with_strip
+            .card_rect(W, H)
+            .expect("a prompt is up, so it has a footprint");
+        // **Count ring pixels ONLY in the strip's rows.** Counting them over
+        // the whole card was the first version of this test and it was
+        // vacuous: at this height the card is taller than the view (381 rows
+        // in 200), so its rect starts above the screen and its SIDE edges
+        // contribute ring pixels at every row. A `> 0` total therefore stayed
+        // true with the strip drawn straight over the ring, and the mutation
+        // run caught it. Rows [8, 8+H) are the only place the two surfaces can
+        // conflict, so they are the only rows that answer the question.
+        let strip_rows =
+            crate::status::STRIP_TOP..(crate::status::STRIP_TOP + crate::status::DEFAULT_HEIGHT);
+        let mut ring_in_strip_rows = 0usize;
+        for row in strip_rows.clone() {
+            if row >= H {
+                break;
+            }
+            for col in 0..W {
+                let inside_card = (col as i32) >= x
+                    && (col as i32) < x + cw as i32
+                    && (row as i32) >= y
+                    && (row as i32) < y + ch as i32;
+                if inside_card {
+                    continue;
+                }
+                let px = ((row * W + col) * 4) as usize;
+                if framed[px..px + 4] == ink {
+                    ring_in_strip_rows += 1;
+                }
+            }
+        }
+        assert!(
+            ring_in_strip_rows > 0,
+            "the trusted ring must survive the status strip in the strip's OWN rows \
+             ({strip_rows:?}): the ring is the human's only anti-forgery check on a prompt, \
+             and a strip drawn over it erases what distinguishes a real card from one an \
+             app painted"
+        );
+    }
+
     #[test]
     fn the_card_footprint_carries_no_indicator_pixel() {
         const W: u32 = 640;
@@ -1269,6 +1375,7 @@ pub(crate) mod tests {
             flat_view(W, H, [40, 40, 40]),
             &mut consent,
             &mut crate::lock::LockSurface::new(TrustedIndicator::for_test()),
+            &mut crate::status::StatusStrip::new(crate::status::StatusConfig::off()),
             W,
             H,
             false,

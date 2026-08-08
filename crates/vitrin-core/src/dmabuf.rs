@@ -631,6 +631,22 @@ pub(crate) enum Draw {
     /// ([`crate::cursor`]). Human-visible only, like everything else here,
     /// and already clipped below the trusted band by the geometry function.
     AgentCursor(Rectangle<i32, Physical>, [u8; 4]),
+    /// Blit the status strip's CPU raster into this rectangle
+    /// (WS-E.2.3, [`crate::status`]).
+    ///
+    /// **The rectangle only.** The texture is supplied by the executor
+    /// ([`present_human_visible`]) rather than carried here, so this enum stays
+    /// `Copy` and [`human_visible_frame`] stays a pure function of numbers —
+    /// which is what lets a display-free test assert the strip's geometry
+    /// against the view's own numbers. The pixels the executor uploads come
+    /// from [`crate::status::StatusStrip::raster`], the same cache the CPU path
+    /// blits, so the two paths cannot draw different strips.
+    ///
+    /// Present only when `--status` is on. This is the one slot of the draw
+    /// list that a *configuration* can empty, and the difference from the band
+    /// is the point: the band is not optional and no arm omits it, whereas a
+    /// session with no status strip has no strip to draw.
+    StatusStrip(Rectangle<i32, Physical>),
     /// Fill this rectangle with the session's trusted-indicator colour: the
     /// reserved strip along the top edge the human reads this session's
     /// secret colour from.
@@ -654,9 +670,33 @@ pub(crate) fn trust_band_rect(view: Size<i32, Physical>) -> Rectangle<i32, Physi
     Rectangle::new((0, 0).into(), (view.w.max(0), h).into())
 }
 
+/// The status strip's rectangle on a `view`-sized human-visible frame — the
+/// full width, `strip_h` tall, starting immediately below the band.
+///
+/// `strip_h` is [`crate::status::StatusStrip::height`], which is `0` when
+/// `--status` is off; an empty rectangle is the honest answer then, and
+/// [`human_visible_frame`] leaves the slot at [`Draw::Nothing`] rather than
+/// submitting a degenerate draw.
+///
+/// Derived from [`crate::status::STRIP_TOP`] — itself derived from
+/// [`TRUST_BAND_HEIGHT`] — and never restated, so the CPU blit and this
+/// rectangle cannot disagree about where the strip is. That is the same
+/// discipline [`trust_band_rect`] documents, applied to the surface that sits
+/// directly under the band; `the_gpu_strip_covers_exactly_what_the_cpu_strip_paints`
+/// pins the equality against the real CPU compositor.
+pub(crate) fn status_strip_rect(
+    view: Size<i32, Physical>,
+    strip_h: u32,
+) -> Rectangle<i32, Physical> {
+    let top = (crate::status::STRIP_TOP as i32).min(view.h.max(0));
+    let h = (strip_h as i32).min(view.h.max(0) - top);
+    Rectangle::new((0, top).into(), (view.w.max(0), h.max(0)).into())
+}
+
 /// How many draws one human-visible GPU frame is: the letterbox matte, the
-/// client's content, the agent cursor's slots, and the trusted band.
-pub(crate) const HUMAN_VISIBLE_DRAWS: usize = 3 + crate::cursor::AGENT_CURSOR_RECTS;
+/// client's content, the agent cursor's slots, the status strip, and the
+/// trusted band.
+pub(crate) const HUMAN_VISIBLE_DRAWS: usize = 4 + crate::cursor::AGENT_CURSOR_RECTS;
 
 /// Everything one human-visible GPU frame draws, in order: the letterbox
 /// matte, the client's content at its [`layout::place`] position, the agent
@@ -683,11 +723,19 @@ pub(crate) const HUMAN_VISIBLE_DRAWS: usize = 3 + crate::cursor::AGENT_CURSOR_RE
 /// [`crate::cursor::agent_cursor_rects`] and never restated here, so the CPU
 /// and GPU paths cannot draw different crosshairs — the drift
 /// [`trust_band_rect`] exists to prevent for the band.
+///
+/// `status_h` is the status strip's height in rows
+/// ([`crate::status::StatusStrip::height`]), `0` when the session has no strip.
+/// It rides in the draw list for the same reason the band and the cursor do —
+/// so a presentation path gets it by construction — but unlike the band it is
+/// legitimately absent, and `every_zero_copy_frame_ends_with_the_trusted_band`
+/// checks the band is still the *last* draw either way.
 pub(crate) fn human_visible_frame(
     view: Size<i32, Physical>,
     content: (u32, u32),
     indicator: TrustedIndicator,
     agent_cursor: Option<(f64, f64)>,
+    status_h: u32,
 ) -> [Draw; HUMAN_VISIBLE_DRAWS] {
     let placement = layout::place((view.w.max(0) as u32, view.h.max(0) as u32), content);
     let dst = Rectangle::new(
@@ -697,10 +745,23 @@ pub(crate) fn human_visible_frame(
     let mut draws = [Draw::Nothing; HUMAN_VISIBLE_DRAWS];
     draws[0] = Draw::Matte;
     draws[1] = Draw::Content(dst);
+    // **Strip BEFORE the cursor**, matching the CPU path, where
+    // `compose_human_visible` draws the strip and `composite_agent_cursor` runs
+    // after it. The two paths disagreed: on the GPU the strip sat in the slot
+    // after the cursor rects and covered the crosshair. The cursor wins because
+    // it is the signal that an AGENT IS POINTING somewhere -- a safety cue --
+    // while the strip is informational, and two backends that disagree about
+    // which of those a human sees is worse than either answer.
+    if status_h > 0 {
+        let rect = status_strip_rect(view, status_h);
+        if rect.size.w > 0 && rect.size.h > 0 {
+            draws[2] = Draw::StatusStrip(rect);
+        }
+    }
     if let Some(rects) = agent_cursor.and_then(|(x, y)| {
         crate::cursor::agent_cursor_rects(view.w.max(0) as u32, view.h.max(0) as u32, x, y)
     }) {
-        for (slot, rect) in draws[2..].iter_mut().zip(rects) {
+        for (slot, rect) in draws[3..HUMAN_VISIBLE_DRAWS - 1].iter_mut().zip(rects) {
             *slot = Draw::AgentCursor(
                 Rectangle::new(
                     (rect.x, rect.y).into(),
@@ -741,6 +802,18 @@ pub(crate) fn human_visible_frame(
 /// top-down and needs `Normal`. It was hardcoded to `Normal` when this
 /// function only ever ran against the offscreen harness; presenting into the
 /// window with that constant renders the frame upside down.
+///
+/// `status` is the status strip's already-uploaded texture and its height in
+/// rows, or `None` for a session with no strip. It is a *texture* rather than a
+/// forced fall-back to the CPU compositor because this path exists precisely
+/// because 2560x1600@240 cannot be CPU-composited: a re-upload of one
+/// 2560x20 RGBA texture is 200 KiB, and the snapshot changes once a minute
+/// (`HH:MM`, no seconds — [`crate::status::sample::ClockReading`]), so the
+/// amortised cost is 3.4 KiB/s of bus traffic and one extra textured quad per
+/// frame. Forcing the CPU path for a clock would cost the whole zero-copy win.
+/// The upload itself is the caller's ([`crate::backend::winit`]), keyed on the
+/// strip's generation, so this function stays a pure executor of a draw list.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn present_human_visible(
     renderer: &mut GlesRenderer,
     framebuffer: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
@@ -749,6 +822,7 @@ pub(crate) fn present_human_visible(
     content: &GpuContent,
     indicator: TrustedIndicator,
     agent_cursor: Option<(f64, f64)>,
+    status: Option<(&GlesTexture, u32)>,
 ) -> Result<(), GlesError> {
     let mut frame = renderer.render(framebuffer, view, transform)?;
     for draw in human_visible_frame(
@@ -756,6 +830,7 @@ pub(crate) fn present_human_visible(
         (content.width, content.height),
         indicator,
         agent_cursor,
+        status.map_or(0, |(_, height)| height),
     ) {
         match draw {
             // An empty cursor slot. Nothing to submit, and deliberately not
@@ -798,6 +873,28 @@ pub(crate) fn present_human_visible(
                         // Dst-local, exactly as above.
                         &[Rectangle::from_size(rect.size)],
                         color32f(rgba),
+                    )?;
+                }
+            }
+            // The strip's texture is 1:1 with its rectangle by construction —
+            // it was rasterized at this view's width and the configured height
+            // — so this is a blit, never a scale. A slot with no texture behind
+            // it is skipped rather than drawn black: `human_visible_frame`
+            // only emits this draw when `status_h > 0`, which only happens
+            // when the caller passed a texture, so the `else` is unreachable
+            // defence rather than a mode.
+            Draw::StatusStrip(rect) => {
+                if let Some((texture, _)) = status {
+                    Frame::render_texture_from_to(
+                        &mut frame,
+                        texture,
+                        Rectangle::from_size(texture.size().to_f64()),
+                        rect,
+                        // Dst-local, exactly as the content blit above.
+                        &[Rectangle::from_size(rect.size)],
+                        &[],
+                        Transform::Normal,
+                        1.0,
                     )?;
                 }
             }
@@ -948,7 +1045,7 @@ mod tests {
             // with a sprite parked wherever an agent liked. Neither may cost
             // the band its slot.
             for agent_cursor in [None, Some((10.0, 10.0)), Some((0.0, 0.0))] {
-                let draws = human_visible_frame(size, content, indicator, agent_cursor);
+                let draws = human_visible_frame(size, content, indicator, agent_cursor, 0);
                 assert_eq!(draws[0], Draw::Matte, "{view:?}/{content:?}");
                 assert!(
                     matches!(draws[1], Draw::Content(_)),
@@ -1021,7 +1118,7 @@ mod tests {
         let indicator = TrustedIndicator::from_rgb(0x11, 0x22, 0x33);
         let size: Size<i32, Physical> = (800, 600).into();
         let count = |cursor| {
-            human_visible_frame(size, (400, 300), indicator, cursor)
+            human_visible_frame(size, (400, 300), indicator, cursor, 0)
                 .iter()
                 .filter(|draw| matches!(draw, Draw::AgentCursor(..)))
                 .count()
@@ -1034,6 +1131,146 @@ mod tests {
         // A position that is not a number draws no sprite rather than a
         // sprite at an arbitrary place.
         assert_eq!(count(Some((f64::NAN, 100.0))), 0);
+    }
+
+    /// **The GPU strip and the CPU strip are the same strip** (WS-E.2.3,
+    /// issue #215).
+    ///
+    /// The band's own test's discipline, applied to the surface directly below
+    /// it: assert against what the CPU compositor **actually paints** — the
+    /// footprint [`crate::status::StatusStrip::composite_over`] changes on a
+    /// known buffer — rather than against the constants both paths happen to
+    /// read. Comparing the rectangle to [`status_strip_rect`]'s own return value
+    /// would be vacuous: a version of that function returning a zero-sized
+    /// rectangle would pass.
+    #[test]
+    fn the_gpu_strip_covers_exactly_what_the_cpu_strip_paints() {
+        use crate::status::{StatusConfig, StatusStrip};
+
+        const W: u32 = 64;
+        const H: u32 = 64;
+
+        let mut strip = StatusStrip::new(StatusConfig {
+            enabled: true,
+            ..StatusConfig::default()
+        });
+        strip.refresh(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_786_244_643),
+            std::time::Instant::now(),
+            None,
+        );
+
+        // A view of a colour the strip is not, so every changed pixel is the
+        // strip and only the strip.
+        let mut view = vec![0u8; W as usize * H as usize * BYTES_PER_PIXEL];
+        for px in view.chunks_exact_mut(BYTES_PER_PIXEL) {
+            px.copy_from_slice(&[0x00, 0x80, 0x00, 0xff]);
+        }
+        let before = view.clone();
+        strip.composite_over(&mut view, W, H);
+
+        let rect = status_strip_rect((W as i32, H as i32).into(), strip.height());
+        let mut painted_any = false;
+        for y in 0..H {
+            for x in 0..W {
+                let off = (y as usize * W as usize + x as usize) * BYTES_PER_PIXEL;
+                let painted =
+                    view[off..off + BYTES_PER_PIXEL] != before[off..off + BYTES_PER_PIXEL];
+                painted_any |= painted;
+                let inside = (x as i32) < rect.loc.x + rect.size.w
+                    && (x as i32) >= rect.loc.x
+                    && (y as i32) >= rect.loc.y
+                    && (y as i32) < rect.loc.y + rect.size.h;
+                assert_eq!(
+                    painted, inside,
+                    "({x},{y}): the GPU strip rectangle {rect:?} must be exactly the footprint \
+                     the CPU strip paints"
+                );
+            }
+        }
+        assert!(
+            painted_any,
+            "the CPU strip painted nothing, so the equality above compared two empty sets"
+        );
+        // Pinned against the VIEW's numbers and the band's constant, never
+        // against this function's own output.
+        assert_eq!(
+            rect.loc,
+            (0, crate::consent::TRUST_BAND_HEIGHT as i32).into()
+        );
+        assert_eq!(rect.size.w, W as i32);
+        assert_eq!(rect.size.h, crate::status::DEFAULT_HEIGHT as i32);
+        // It cannot overlap the band, whatever the height is asked for.
+        assert!(rect.loc.y >= trust_band_rect((W as i32, H as i32).into()).size.h);
+    }
+
+    /// A view too short to hold the whole strip clips it rather than reaching
+    /// past the buffer, and a view shorter than the band leaves no strip at
+    /// all.
+    #[test]
+    fn a_short_view_clips_the_strip_and_never_overruns_it() {
+        for h in 0..40i32 {
+            let rect = status_strip_rect((32, h).into(), crate::status::DEFAULT_HEIGHT);
+            assert!(rect.loc.y >= 0 && rect.size.h >= 0, "h={h}: {rect:?}");
+            assert!(
+                rect.loc.y + rect.size.h <= h.max(0),
+                "h={h}: the strip {rect:?} runs past the view"
+            );
+        }
+    }
+
+    /// **The band is still the last draw, with or without a strip**, and the
+    /// strip slot is empty exactly when `--status` is off.
+    #[test]
+    fn the_strip_joins_the_draw_list_without_displacing_the_band() {
+        let indicator = TrustedIndicator::from_rgb(0x7F, 0x10, 0xC0);
+        let size: Size<i32, Physical> = (640, 480).into();
+
+        let off = human_visible_frame(size, (400, 300), indicator, None, 0);
+        assert!(
+            matches!(off[HUMAN_VISIBLE_DRAWS - 1], Draw::TrustBand(..)),
+            "the band must be the last draw"
+        );
+        assert!(
+            !off.iter().any(|d| matches!(d, Draw::StatusStrip(_))),
+            "a session with no strip must emit no strip draw"
+        );
+
+        let on = human_visible_frame(size, (400, 300), indicator, None, 20);
+        assert_eq!(
+            off[HUMAN_VISIBLE_DRAWS - 1],
+            on[HUMAN_VISIBLE_DRAWS - 1],
+            "the strip must not change the band draw"
+        );
+        assert!(
+            matches!(on[HUMAN_VISIBLE_DRAWS - 1], Draw::TrustBand(..)),
+            "the band must still be last with a strip up"
+        );
+        // The strip sits at slot 2 -- after the matte and the client content,
+        // BEFORE the cursor rects. It moved there when the GPU path was
+        // corrected to match the CPU one, where `composite_agent_cursor` runs
+        // after the strip: the two backends had disagreed about whether the
+        // crosshair or the clock is on top, and the crosshair wins because it
+        // is the signal that an agent is pointing.
+        assert_eq!(
+            on[2],
+            Draw::StatusStrip(Rectangle::new(
+                (0, crate::consent::TRUST_BAND_HEIGHT as i32).into(),
+                (640, 20).into()
+            )),
+            "the strip is drawn after the content and before the cursor"
+        );
+        // ...and it is drawn AFTER the client content, so a client cannot
+        // cover it.
+        let strip_at = on
+            .iter()
+            .position(|d| matches!(d, Draw::StatusStrip(_)))
+            .expect("a strip draw");
+        let content_at = on
+            .iter()
+            .position(|d| matches!(d, Draw::Content(_)))
+            .expect("a content draw");
+        assert!(strip_at > content_at);
     }
 
     /// The GPU band and the CPU band are the same band.
@@ -1276,6 +1513,11 @@ mod gpu_tests {
             // pixels and the band above them. The sprite's own two-path
             // equality is pinned without a GPU, in `backend::winit`'s
             // `no_presentation_path_can_drop_the_agent_cursor`.
+            None,
+            // ...and no status strip, for the same reason: `--status` is
+            // opt-in, these expectations are about the client's pixels, and
+            // the strip's own two-path geometry is pinned without a GPU by
+            // `the_gpu_strip_covers_exactly_what_the_cpu_strip_paints`.
             None,
         )
         .expect("present retained content");

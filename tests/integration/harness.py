@@ -420,7 +420,7 @@ class ConsentInjector:
         return out, pixels
 
     def band(self, timeout: float = 30.0) -> dict[str, object]:
-        """The trusted-band witness (issue #139), as ten numbers plus the
+        """The trusted-band witness (issue #139), as twelve numbers plus the
         bound realm's id.
 
         Deliberately returns **no pixels and no descriptor**, and that is not
@@ -442,6 +442,14 @@ class ConsentInjector:
         core sends `-`). Configuration, not a secret, so it does not weaken
         the report's secret-independence rule.
 
+        `strip_h` and `strip_changes` (WS-E.2.3, issue #215) are the status
+        strip's height in rows and how many composites repainted it. Both are
+        `0` in every session that did not pass `--status`, which is the default
+        and what this suite runs with -- so `tracks_view` compares exactly the
+        rows it always did. They are appended AFTER the realm id rather than
+        inserted among the counters, so every field position an older reader
+        indexed is unchanged.
+
         Raises `InjectorFailed` if the core sent a descriptor with the reply:
         that would mean pixels travelled, which nothing about this request may
         ever cause.
@@ -460,8 +468,9 @@ class ConsentInjector:
             "view_w",
             "view_h",
         )
-        # verb + scalars + the hex digest + the bound realm's id
-        if len(fields) != len(keys) + 3:
+        # verb + scalars + the hex digest + the bound realm's id + the two
+        # WS-E.2.3 strip fields
+        if len(fields) != len(keys) + 5:
             raise InjectorFailed(f"malformed `band` reply: {fields!r}")
         if len(self._fds) != fds_before:
             raise InjectorFailed(
@@ -476,6 +485,8 @@ class ConsentInjector:
         out["probe_fnv"] = int(fields[1 + len(keys)], 16)
         realm = fields[2 + len(keys)]
         out["realm"] = None if realm == "-" else realm
+        out["strip_h"] = int(fields[3 + len(keys)])
+        out["strip_changes"] = int(fields[4 + len(keys)])
         return out
 
     def decide(self, token: str, choice: str, timeout: float = 30.0) -> str:

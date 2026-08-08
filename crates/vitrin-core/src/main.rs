@@ -331,6 +331,9 @@ mod shim;
 /// place: a shim spawned into a loop that is not yet servicing its
 /// socketpair blocks on `configure` forever, with no timeout on its side.
 mod spawn;
+/// The status strip (WS-E.2.3, issue #215): clock, battery and the focused
+/// realm's name, drawn beside the trusted band and never in it.
+mod status;
 mod test_pattern;
 /// The strict TOML subset every core configuration file is written in
 /// (P1.4.1's `principals.toml`, P1.5.1's `realm.toml`): one hand-rolled
@@ -502,6 +505,33 @@ USAGE:
                                   printf %s $PASS | vitrind --lock-hash \\
                                     > ~/.config/vitrin/lock.hash
                                   chmod 600 ~/.config/vitrin/lock.hash
+    vitrind --status            Draw the status strip: the focused realm's
+                                name, the battery and a clock, in a reserved
+                                band of rows immediately BELOW the trusted
+                                indicator band and never inside it. Off by
+                                default: it puts a ticking clock on the
+                                human-visible output, which every byte-for-byte
+                                comparison of that output (the trusted-band
+                                witness, the goldens) would otherwise become a
+                                function of. There is no client status bar and
+                                there cannot be one -- zwlr_layer_shell_v1 is
+                                not in the shim's global contract -- so this is
+                                the whole of the status UI: no tray, no
+                                notifications, no workspace switcher, no click
+                                targets. See docs/book/src/limits.md.
+    vitrind --status-height N   Rows the strip occupies, 16..=64 (default 20 --
+                                the 14-row line box the bundled face reports at
+                                12 px, plus 3 rows above and below). Needs
+                                `--status`.
+    vitrind --status-utc-offset O
+                                The clock's fixed offset from UTC: `UTC`, or a
+                                signed `+HH:MM` / `-HH:MM` between -12:00 and
+                                +14:00. Default UTC. The core carries NO
+                                timezone database -- a tz parser and a
+                                recurring read of /usr/share/zoneinfo is
+                                authority the TCB is not taking for a cosmetic
+                                field -- so there is no DST and the strip always
+                                labels the zone it is showing. Needs `--status`.
     vitrind --agent-cursor      `--headless` ONLY: also composite the agent
                                 cursor sprite into this run's human-visible
                                 output. Nested mode needs no flag -- a human
@@ -593,6 +623,15 @@ enum Action {
         /// the top of `backend::winit::run_inner`, before the listener accepts
         /// anyone, so a bad one is still a startup failure.
         lock: lock::LockConfig,
+        /// The status strip's policy (WS-E.2.3, issue #215): whether to draw
+        /// one, how tall, and which clock.
+        ///
+        /// Valid in **both** modes and carried on both variants, unlike
+        /// `lock` and `agent_cursor`: the strip needs no physical input device
+        /// to be useful and no display to be composited, so refusing it under
+        /// one backend would be a refusal with no reason behind it. Off by
+        /// default in both (`crate::status`'s module docs).
+        status: status::StatusConfig,
     },
     RunHeadless {
         size: (u32, u32),
@@ -673,6 +712,10 @@ enum Action {
         /// by `a_plain_build_cannot_name_the_physical_input_flag`.
         #[cfg(feature = "physical-input-injector")]
         physical_input_fd: Option<std::os::fd::RawFd>,
+        /// The status strip's policy (WS-E.2.3, issue #215). Accepted here as
+        /// well as on [`Action::RunNested`] -- see that variant's field for why
+        /// this one is not backend-gated.
+        status: status::StatusConfig,
     },
     Help,
     Version,
@@ -743,6 +786,9 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut lock_idle: Option<Duration> = None;
     let mut lock_passphrase: Option<PathBuf> = None;
     let mut agent_cursor = false;
+    let mut status_enabled = false;
+    let mut status_height: Option<u32> = None;
+    let mut status_offset: Option<status::UtcOffset> = None;
     #[cfg(feature = "consent-injector")]
     let mut consent_injector_fd: Option<std::os::fd::RawFd> = None;
     #[cfg(feature = "physical-input-injector")]
@@ -850,6 +896,24 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             // switch repeated says the same thing twice, unlike a valued flag
             // where the second value would have to win or lose silently.
             "--agent-cursor" => agent_cursor = true,
+            // Idempotent for the same reason `--agent-cursor` is.
+            "--status" => status_enabled = true,
+            "--status-height" => {
+                let value = args.next().ok_or(
+                    "`--status-height` requires a number of rows (e.g. `--status-height 20`)",
+                )?;
+                set_status_height(&mut status_height, value)?;
+            }
+            "--status-utc-offset" => {
+                let value = args.next().ok_or(
+                    "`--status-utc-offset` requires `UTC` or a signed offset \
+                     (e.g. `--status-utc-offset +09:00`)",
+                )?;
+                if status_offset.is_some() {
+                    return Err("`--status-utc-offset` given more than once".into());
+                }
+                status_offset = Some(status::UtcOffset::parse(value).map_err(str::to_string)?);
+            }
             #[cfg(feature = "consent-injector")]
             "--consent-injector-fd" => {
                 let value = args.next().ok_or(
@@ -1158,6 +1222,24 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         );
     }
 
+    // The two valued status flags are refused without `--status` rather than
+    // silently stored: a command line that set a height for a strip that will
+    // never be drawn is a command line whose author believed something false,
+    // and this is `--agent-cursor`'s posture (refuse, do not no-op) applied to
+    // a pair of values instead of a mode.
+    if !status_enabled && (status_height.is_some() || status_offset.is_some()) {
+        return Err(
+            "`--status-height` and `--status-utc-offset` need `--status`: without it no strip is \
+             drawn and the value would be stored and never used."
+                .into(),
+        );
+    }
+    let status = status::StatusConfig {
+        enabled: status_enabled,
+        height: status_height.unwrap_or(status::DEFAULT_HEIGHT),
+        utc_offset: status_offset.unwrap_or(status::UtcOffset::UTC),
+    };
+
     // `--help`/`--version` already returned above, so only the run modes
     // remain to resolve; `--size` is meaningless without `--headless`.
     match (mode, size) {
@@ -1176,6 +1258,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 idle: lock_idle,
                 passphrase: lock_passphrase,
             },
+            status,
         }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
         // A headless core has no display to draw the consent prompt on and no
@@ -1225,6 +1308,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             consent_injector_fd,
             #[cfg(feature = "physical-input-injector")]
             physical_input_fd,
+            status,
         }),
         (None, Some(_)) => Err("`--size` requires `--headless`".into()),
         (None, None) => Err("no mode given (expected `--nested` or `--headless`)".into()),
@@ -1398,6 +1482,27 @@ fn set_lock_idle(slot: &mut Option<Duration>, value: &str) -> Result<(), String>
     Ok(())
 }
 
+/// Record `--status-height` (WS-E.2.3), rejecting a repeat flag and anything
+/// outside the range the type size needs.
+///
+/// Clamped at parse time rather than at draw time, on `--lock-idle`'s
+/// precedent: a session that came up with a strip too short to hold a digit
+/// would be drawing a clipped number on a surface a human is trained to read as
+/// authoritative, and a clipped digit is a wrong digit.
+fn set_status_height(slot: &mut Option<u32>, value: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--status-height` given more than once".into());
+    }
+    let rows: u32 = value
+        .parse()
+        .map_err(|_| format!("`--status-height` `{value}` is not a whole number of rows"))?;
+    if !(status::MIN_HEIGHT..=status::MAX_HEIGHT).contains(&rows) {
+        return Err(status::HEIGHT_REFUSAL.into());
+    }
+    *slot = Some(rows);
+    Ok(())
+}
+
 /// Record the `--attention-chord` key (WS-E.1.7), rejecting a repeat flag and
 /// any key this build's input intake could not deliver.
 fn set_attention_chord(
@@ -1553,6 +1658,7 @@ fn main() -> ExitCode {
             attention,
             clipboard,
             lock,
+            status,
         } => {
             init_tracing();
             run_session(
@@ -1565,7 +1671,7 @@ fn main() -> ExitCode {
                 // `--consent-injector-fd` is refused with `--nested` at parse
                 // time (issue #138), so a nested run is never instrumented.
                 false,
-                move |seed| backend::winit::run(dead_man, attention, clipboard, lock, seed),
+                move |seed| backend::winit::run(dead_man, attention, clipboard, lock, status, seed),
             )
         }
         Action::RunHeadless {
@@ -1590,6 +1696,7 @@ fn main() -> ExitCode {
             consent_injector_fd,
             #[cfg(feature = "physical-input-injector")]
             physical_input_fd,
+            status,
         } => {
             init_tracing();
             #[cfg(feature = "consent-injector")]
@@ -1611,6 +1718,7 @@ fn main() -> ExitCode {
                         attention,
                         clipboard,
                         agent_cursor,
+                        status,
                         #[cfg(feature = "consent-injector")]
                         consent_injector_fd,
                         #[cfg(feature = "physical-input-injector")]
@@ -2599,7 +2707,8 @@ mod tests {
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
                 clipboard: default_clipboard(),
-                lock: default_lock()
+                lock: default_lock(),
+                status: status::StatusConfig::off(),
             })
         );
     }
@@ -2627,6 +2736,7 @@ mod tests {
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
                 physical_input_fd: None,
+                status: status::StatusConfig::off(),
             })
         );
     }
@@ -2654,6 +2764,7 @@ mod tests {
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
                 physical_input_fd: None,
+                status: status::StatusConfig::off(),
             })
         );
         assert_eq!(
@@ -2674,6 +2785,7 @@ mod tests {
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
                 physical_input_fd: None,
+                status: status::StatusConfig::off(),
             })
         );
     }
@@ -2704,6 +2816,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    status: status::StatusConfig::off(),
                 })
             );
         }
@@ -2719,7 +2832,8 @@ mod tests {
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
                 clipboard: default_clipboard(),
-                lock: default_lock()
+                lock: default_lock(),
+                status: status::StatusConfig::off(),
             })
         );
     }
@@ -3009,6 +3123,7 @@ mod tests {
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
                 physical_input_fd: None,
+                status: status::StatusConfig::off(),
             })
         );
         for args in [
@@ -3042,6 +3157,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    status: status::StatusConfig::off(),
                 })
             );
         }
@@ -3062,7 +3178,8 @@ mod tests {
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
                 clipboard: default_clipboard(),
-                lock: default_lock()
+                lock: default_lock(),
+                status: status::StatusConfig::off(),
             })
         );
     }
@@ -3103,6 +3220,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    status: status::StatusConfig::off(),
                 })
             );
         }
@@ -3124,7 +3242,8 @@ mod tests {
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
                 clipboard: default_clipboard(),
-                lock: default_lock()
+                lock: default_lock(),
+                status: status::StatusConfig::off(),
             })
         );
     }
@@ -3180,6 +3299,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    status: status::StatusConfig::off(),
                 })
             );
         }
@@ -3196,7 +3316,8 @@ mod tests {
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
                 clipboard: default_clipboard(),
-                lock: default_lock()
+                lock: default_lock(),
+                status: status::StatusConfig::off(),
             })
         );
     }
@@ -3250,6 +3371,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    status: status::StatusConfig::off(),
                 })
             );
         }
@@ -3266,7 +3388,8 @@ mod tests {
                 dead_man: DeadManConfig::default(),
                 attention: default_attention(),
                 clipboard: default_clipboard(),
-                lock: default_lock()
+                lock: default_lock(),
+                status: status::StatusConfig::off(),
             })
         );
     }
@@ -3756,6 +3879,7 @@ mod tests {
                     consent_injector_fd: None,
                     #[cfg(feature = "physical-input-injector")]
                     physical_input_fd: None,
+                    status: status::StatusConfig::off(),
                 })
             );
         }
@@ -3824,6 +3948,7 @@ mod tests {
                 consent_injector_fd: None,
                 #[cfg(feature = "physical-input-injector")]
                 physical_input_fd: None,
+                status: status::StatusConfig::off(),
             })
         );
     }
@@ -3872,6 +3997,107 @@ mod tests {
         assert!(parse_args(["--agent-cursor"]).is_err());
         // The flag is named in the help text, so an operator can find it.
         assert!(USAGE.contains("--agent-cursor"));
+    }
+
+    /// `--status` (WS-E.2.3, issue #215): off by default, accepted in **both**
+    /// modes, and its two valued companions refused without it.
+    ///
+    /// Both modes, unlike `--agent-cursor` and unlike the `--lock-*` family:
+    /// the strip needs neither a physical input device nor a host window, so a
+    /// per-backend refusal would be a refusal with no reason behind it. What is
+    /// asserted here is that the default really is off — the property
+    /// `tests/integration/test_real_trust_band.py` depends on.
+    #[test]
+    fn the_status_flag_is_off_by_default_in_both_modes() {
+        let headless = |args: Vec<&str>| match parse_args(args.clone()) {
+            Ok(Action::RunHeadless { status, .. }) => status,
+            other => panic!("{args:?} must parse as a headless run: {other:?}"),
+        };
+        let nested = |args: Vec<&str>| match parse_args(args.clone()) {
+            Ok(Action::RunNested { status, .. }) => status,
+            other => panic!("{args:?} must parse as a nested run: {other:?}"),
+        };
+
+        assert_eq!(
+            headless(vec!["--headless", "--consent=auto-approve"]),
+            status::StatusConfig::off()
+        );
+        assert_eq!(nested(vec!["--nested"]), status::StatusConfig::off());
+
+        let on = headless(vec!["--headless", "--consent=auto-approve", "--status"]);
+        assert!(on.enabled);
+        assert_eq!(on.height, status::DEFAULT_HEIGHT);
+        assert_eq!(on.utc_offset, status::UtcOffset::UTC);
+        assert!(nested(vec!["--nested", "--status"]).enabled);
+        // A boolean switch repeated says the same thing twice.
+        assert!(nested(vec!["--nested", "--status", "--status"]).enabled);
+
+        // The flags are named in the help text, so an operator can find them.
+        assert!(USAGE.contains("--status"));
+        assert!(USAGE.contains("--status-height"));
+        assert!(USAGE.contains("--status-utc-offset"));
+    }
+
+    #[test]
+    fn the_status_height_and_offset_are_validated_at_parse_time() {
+        let of = |args: Vec<&str>| match parse_args(args.clone()) {
+            Ok(Action::RunNested { status, .. }) => status,
+            other => panic!("{args:?} must parse as a nested run: {other:?}"),
+        };
+        assert_eq!(
+            of(vec!["--nested", "--status", "--status-height", "32"]).height,
+            32
+        );
+        assert_eq!(
+            of(vec![
+                "--nested",
+                "--status",
+                "--status-utc-offset",
+                "+09:00"
+            ])
+            .utc_offset,
+            status::UtcOffset::parse("+09:00").unwrap()
+        );
+
+        // Out of range, in both directions, with the reason named.
+        for bad in ["15", "65", "0", "nonsense"] {
+            let err = parse_args(["--nested", "--status", "--status-height", bad])
+                .expect_err("an out-of-range strip height must not start a session");
+            assert!(err.contains("--status-height"), "{err}");
+        }
+        assert!(parse_args(["--nested", "--status", "--status-height", "16"]).is_ok());
+        assert!(parse_args(["--nested", "--status", "--status-height", "64"]).is_ok());
+
+        let err = parse_args(["--nested", "--status", "--status-utc-offset", "+15:00"])
+            .expect_err("an offset outside the civil range must be refused");
+        assert_eq!(err, status::sample::OFFSET_REFUSAL);
+
+        // Repeats are refused rather than silently taking the last value.
+        assert!(parse_args([
+            "--nested",
+            "--status",
+            "--status-height",
+            "20",
+            "--status-height",
+            "24"
+        ])
+        .is_err());
+        assert!(parse_args([
+            "--nested",
+            "--status",
+            "--status-utc-offset",
+            "UTC",
+            "--status-utc-offset",
+            "Z"
+        ])
+        .is_err());
+
+        // A value with no `--status` is a command line whose author believed
+        // something false, so it is refused rather than stored and ignored.
+        let orphan = parse_args(["--nested", "--status-height", "20"])
+            .expect_err("a height without a strip must be refused");
+        assert!(orphan.contains("--status"), "{orphan}");
+        assert!(parse_args(["--nested", "--status-utc-offset", "+09:00"]).is_err());
     }
 
     #[test]

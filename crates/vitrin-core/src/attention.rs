@@ -163,6 +163,17 @@
 //! band that sometimes carries a marker is a band whose correct appearance is
 //! fuzzier. What the marker buys the human: a focus change that happened with
 //! no marker up was not theirs.
+//!
+//! Since WS-E.2.3 (issue #215) the marker is **not alone** in those rows: the
+//! status strip ([`crate::status`]) occupies the same row range whenever
+//! `--status` is on. The two do not fight. The strip is composited before the
+//! band and the marker after it, so the marker is on top wherever they meet —
+//! and, so the ordering never has to be the thing that saves it, the strip
+//! leaves the leftmost [`MARKER_W`] columns blank. It reads that width from
+//! here rather than restating it, and a `const` assertion in
+//! `status::render` turns a marker that outgrew the lane into a compile
+//! error. What is unchanged is the rule this module set: neither surface is
+//! ever drawn in the band.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -608,6 +619,21 @@ impl<H: PreemptionHook> PreemptionHook for AttentionHook<H> {
     }
 }
 
+/// The marker's height and width in pixels. Small, fixed, and at the origin:
+/// it says "a window is open" and nothing else, so it needs no size that
+/// scales with anything.
+///
+/// **`pub(crate)` because a second core-drawn surface now shares this row
+/// range.** [`crate::status`]'s strip (WS-E.2.3, issue #215) occupies the same
+/// rows immediately below the band, and it keeps the leftmost [`MARKER_W`]
+/// columns clear so the marker never lands on a glyph. It reads that width
+/// from *here* — never restates it — and a `const` assertion in that module
+/// turns a marker that outgrew the strip into a compile error rather than into
+/// a half-covered clock. The marker itself is unchanged and still drawn after
+/// the band, so it is on top of the strip wherever the two meet.
+pub(crate) const MARKER_H: u32 = 6;
+pub(crate) const MARKER_W: u32 = 96;
+
 /// Paint the open-window marker onto **human-visible** output.
 ///
 /// A short fixed-geometry tab at the top-left, immediately **below** the
@@ -625,17 +651,17 @@ impl<H: PreemptionHook> PreemptionHook for AttentionHook<H> {
 ///   consent overlay and the trust band rest on, not a checked flag.
 /// - **Below the dead-man indicator in draw order.** That bar is composited
 ///   last of all, so nothing here can hide a hold in progress.
+/// - **Above the status strip in draw order** (WS-E.2.3). The strip shares
+///   these rows and is composited before the band; the marker is composited
+///   after it, in a lane the strip leaves blank ([`MARKER_W`]), so the two
+///   core-drawn surfaces neither overlap nor depend on the order to look
+///   right.
 ///
 /// `view` must be `width * height * 4` RGBA8888. A dimension mismatch is
 /// refused rather than panicking, as elsewhere in the presentation path.
 pub(crate) fn composite_attention_marker(view: &mut [u8], width: u32, height: u32) {
     use crate::paint::canvas::{Canvas, Rect};
 
-    /// Marker height in pixels, and its width. Small, fixed, and at the
-    /// origin: it says "a window is open" and nothing else, so it needs no
-    /// size that scales with anything.
-    const MARKER_H: u32 = 6;
-    const MARKER_W: u32 = 96;
     /// A cool, unmistakably non-secret colour: it must not be confusable with
     /// the session's trusted band (a random colour in `[64, 255]` per channel)
     /// nor with the dead-man's amber. Fixed and public by design — this marker

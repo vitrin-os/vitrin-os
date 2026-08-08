@@ -105,7 +105,7 @@ use crate::capture::RealmViewFrame;
 use crate::consent::grab::ConsentGrab;
 use crate::consent::ConsentSurface;
 use crate::dmabuf::DmabufImporter;
-use crate::enforcement::{LayoutAct, LayoutMode};
+use crate::enforcement::{LaunchAsk, LaunchRefusal, LayoutAct, LayoutMode};
 use crate::grants::{GrantTable, RealmId};
 use crate::identity::StaticVerifier;
 use crate::input::{InputRouter, PhysicalPresenceMap, PreemptionHook, SeatInput};
@@ -1053,11 +1053,18 @@ pub(crate) fn start_realm_in<H: RuntimeHost>(
     // Collected before the loop: `spawn_realm` needs `&Realm` out of the
     // registry while the body below takes `host` mutably again, and the
     // registry itself is written by `mark_running` on the way out.
+    // **Templates are skipped** (WS-E.1.1, issue #207): a realm declared
+    // `autostart = false` exists to be launched *from*, so startup forking
+    // it would be the one thing the key says not to do. It stays in the
+    // registry, addressable and petitionable, in `RealmState::Template`.
+    // `RealmRegistry::from_specs` refuses a file where *every* realm is a
+    // template, so this filter cannot empty the list on a loaded config.
     let configured: Vec<RealmId> = host
         .runtime()
         .kernel
         .realms
         .iter()
+        .filter(|realm| realm.state() != crate::realm::RealmState::Template)
         .map(|realm| realm.id().clone())
         .collect();
     if configured.is_empty() {
@@ -1098,7 +1105,7 @@ fn start_one_realm_in<H: RuntimeHost>(
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn Error>> {
-    let mut spawned = {
+    let spawned = {
         let runtime = host.runtime();
         // Disjoint field borrows: `spawn_realm` reads the realm and writes
         // the log, and both live in `Kernel`.
@@ -1108,8 +1115,29 @@ fn start_one_realm_in<H: RuntimeHost>(
         let realm = realms
             .get(realm_id.as_str())
             .ok_or_else(|| format!("realm {realm_id} vanished from the registry mid-startup"))?;
-        spawn::spawn_realm(realm, paths, recorder)?
+        // The origin is a required argument, so "startup forked it" is
+        // stated rather than inferred from the absence of a principal
+        // (WS-E.1.1) — the journal's `spawned_by` field comes from here.
+        spawn::spawn_realm(realm, paths, recorder, spawn::SpawnOrigin::Startup)?
     };
+    attach_spawned_realm(host, spawned, width, height)
+}
+
+/// **Steps 2–5 of [`start_one_realm_in`]**: everything after the fork.
+///
+/// Split out for [`launch_realm`], the wire-reachable spawn path (WS-E.1.1,
+/// issue #207), which has to fork *inside* the enforcement chokepoint's
+/// launch sink — a `launched` event is a terminal, so a failure discovered
+/// after the reply could not be voiced — and then attach the child once the
+/// dispatch borrows have ended. Both callers run identical code from here
+/// on, which is the point: one attach sequence, one place the shim session,
+/// the loop registration and the registry transition are wired together.
+fn attach_spawned_realm<H: RuntimeHost>(
+    host: &mut H,
+    mut spawned: spawn::SpawnedRealm,
+    width: u32,
+    height: u32,
+) -> Result<(), Box<dyn Error>> {
     // Read back rather than assumed: this is the id the spawn actually
     // derived every path it owns from — the realm's runtime directory, its
     // `flock`, its private `wayland-0` — and the one `configure` carries to
@@ -1793,6 +1821,13 @@ fn dispatch_principal<H: RuntimeHost>(
             // kernel mutably. Applied by `apply_layout` once the borrows
             // end, in the order the chokepoint admitted them.
             let mut layout_acts: Vec<LayoutAct> = Vec::new();
+            // Chokepoint-admitted launches, forked already and waiting to be
+            // attached (WS-E.1.1). Collected for the same borrow reason the
+            // two sinks above are — attaching needs the loop handle and the
+            // whole runtime — but with one difference stated at
+            // [`PendingLaunch`]: the part that could *refuse* has already
+            // run, inside the sink, because `launched` is a terminal.
+            let mut launches: Vec<PendingLaunch> = Vec::new();
             let now = Instant::now();
             let outcome = {
                 let (runtime, view) = host.split();
@@ -1806,6 +1841,7 @@ fn dispatch_principal<H: RuntimeHost>(
                     conns,
                     view_cache,
                     realms,
+                    shim,
                     ..
                 } = runtime;
                 // **The single fact behind every `no_surface` refusal.**
@@ -1895,6 +1931,28 @@ fn dispatch_principal<H: RuntimeHost>(
                 let mut actuations =
                     |realm: &RealmId, input: SeatInput| seat.push((realm.clone(), input));
                 let mut layout = |act: LayoutAct| layout_acts.push(act);
+                // **The launch sink** (WS-E.1.1): the one closure in this
+                // core through which a wire request can make the trusted
+                // core fork. It borrows the realm registry *shared* — the
+                // same borrow `ServerCtx::realms` takes for petition
+                // admission — which is exactly why instance ids are minted
+                // through a `Cell` on the registry rather than from a
+                // counter someone else could keep: one naming authority,
+                // reachable from both.
+                let registry = &kernel.realms;
+                let shim_bin = shim.as_path();
+                let mut launch = |ask: LaunchAsk<'_>| {
+                    // Resolved per launch rather than per dispatch: this
+                    // reads `$XDG_RUNTIME_DIR` and can fail, and a launch is
+                    // rate-limited and rare while messages are not. A failure
+                    // is the IDL's `internal` -- a session whose runtime tree
+                    // cannot be named can create nothing.
+                    let paths = SpawnPaths::from_env(shim_bin.to_path_buf()).map_err(|err| {
+                        tracing::error!(%err, "launch could not name this session's runtime tree");
+                        LaunchRefusal::Internal
+                    })?;
+                    launch_realm(registry, &paths, &mut launches, ask)
+                };
                 // Borrowed for this one message's dispatch and dropped with
                 // `ctx` at the end of the block. Nothing between here and
                 // there routes input — the router's own `borrow_mut` runs in
@@ -1913,7 +1971,7 @@ fn dispatch_principal<H: RuntimeHost>(
                 let mut ctx = ServerCtx {
                     verifier: &kernel.verifier,
                     petitions: &mut kernel.petitions,
-                    realms: &kernel.realms,
+                    realms: registry,
                     grants: &mut kernel.grants,
                     now,
                     realm_view: &realm_view,
@@ -1923,6 +1981,7 @@ fn dispatch_principal<H: RuntimeHost>(
                     attention: &attention,
                     actuations: &mut actuations,
                     layout: &mut layout,
+                    launch: &mut launch,
                     recorder: &mut kernel.recorder,
                 };
                 let mut send =
@@ -1944,6 +2003,24 @@ fn dispatch_principal<H: RuntimeHost>(
                 }
             }
             if fatal {
+                // **Launches first, even here — especially here.** A launch
+                // that reached this point has already forked and exec'd a
+                // process; whatever happened to the socket afterwards, that
+                // process exists and the journal owes an entry naming who
+                // asked for it. Returning without this dropped the whole
+                // `Vec<PendingLaunch>` and every `SpawnRecord` in it, so a
+                // grant holder could defeat the one compensating control this
+                // verb offers — "the log can always answer who started this
+                // app" — by making its own connection fault in the same turn
+                // it launched. Issue #207's review found it; the `#[must_use]`
+                // that was supposed to prevent it says nothing about a value
+                // moved into a struct field inside a `Vec`.
+                //
+                // Attaching (rather than killing) the realm is the same answer
+                // the rest of this design gives: a launched realm outlives the
+                // connection that asked for it, exactly as one from
+                // `realm.toml` outlives the startup that read it.
+                apply_launches(host, launches);
                 // The goodbye is already on the wire and the violation is
                 // already logged; `handle_message` cannot run teardown
                 // because it holds no kernel state. This is the third close
@@ -1963,6 +2040,12 @@ fn dispatch_principal<H: RuntimeHost>(
             // the drain chasing a binding that had already moved.
             apply_layout(host, layout_acts);
             route_seat(host, seat);
+            // **Last**, and it does not compete with the two above: a
+            // launched realm is new, so no act in this turn can be about it
+            // and nothing here can move the output or the seat. Running it
+            // after keeps the ordering rule the two above encode — layout
+            // before deliveries — untouched by a third participant.
+            apply_launches(host, launches);
         }
         // Both terminal variants: the source has already removed itself, so
         // the core only forgets the connection and tears it down.
@@ -2194,6 +2277,186 @@ fn apply_layout<H: RuntimeHost>(host: &mut H, acts: Vec<LayoutAct>) {
         // the same pairing `rebind_output_after_death` documents.
         runtime.dirty = true;
         view.request_present();
+    }
+}
+
+/// **One forked-but-not-yet-attached realm**, carried out of the
+/// enforcement chokepoint's launch sink so [`apply_launches`] can finish it
+/// once the dispatch borrows have ended (WS-E.1.1, issue #207).
+///
+/// The split is not a convenience. `vitrin_launcher.launched` is a
+/// **terminal**, so everything that can refuse a launch has to happen
+/// before the reply — the realm cap, and the fork itself, which is why the
+/// fork is inside the sink rather than here. What is left over is the
+/// attach sequence, and none of it can turn a forked realm back into a
+/// refusal: it either serves, or the realm dies the way any realm dies.
+struct PendingLaunch {
+    /// The journal entry the spawn owes. The sink cannot write it — a
+    /// `ServerCtx` already holds the recorder mutably — so it travels here
+    /// and is `#[must_use]` the whole way (`spawn::SpawnRecord`).
+    record: spawn::SpawnRecord,
+    /// The realm the instance's configuration came from.
+    template: RealmId,
+    /// The core-minted instance id, already sent to the client. `None` when
+    /// the spawn failed, in which case the client already has its
+    /// `refused(realm_launch, internal)` and only the journal is left.
+    spawned: Option<(crate::realm::MintedRealmId, spawn::SpawnedRealm)>,
+}
+
+/// **The wire-reachable spawn path**: what the chokepoint's launch sink
+/// does once a `vitrin_launcher.launch` has passed the whole authority
+/// chain (WS-E.1.1, issue #207).
+///
+/// Everything refusable is here, synchronously, because the caller is about
+/// to send a terminal event:
+///
+/// 1. **The cap.** [`crate::realm::MAX_REALMS`] against
+///    `RealmRegistry::capacity_used` plus whatever this dispatch turn has
+///    already queued. Refused `capacity` — a policy answer, which is why
+///    the IDL gave it a code of its own rather than folding it into
+///    `internal`.
+/// 2. **The id.** Minted by the registry, never supplied: the return type
+///    is `MintedRealmId`, which nothing outside `crate::realm` constructs.
+/// 3. **The fork.** `spawn::spawn_realm_deferring_journal` runs the same
+///    PRD Doc 2 §4.1 sequence startup runs, including the spawn-time
+///    re-audit of the program — so a `command` that became writable since
+///    load is refused here rather than exec'd hours later. Any failure is
+///    the IDL's `internal`.
+///
+/// **The command is not a parameter and cannot be.** The only realm this
+/// function reads is `ask.template`, which the chokepoint resolved from the
+/// grant row; `launch` carries no arguments on the wire, so there is no
+/// path by which a principal names the program.
+fn launch_realm(
+    realms: &crate::realm::RealmRegistry,
+    paths: &SpawnPaths,
+    queued: &mut Vec<PendingLaunch>,
+    ask: LaunchAsk<'_>,
+) -> Result<crate::realm::MintedRealmId, LaunchRefusal> {
+    // The cap first: a refusal that creates nothing must not first create a
+    // runtime directory. `queued` is counted because the registry insert is
+    // deferred to `apply_launches` — one dispatch turn carries at most one
+    // launch today, and counting it anyway is what keeps that from being a
+    // load-bearing assumption.
+    if realms.capacity_used() + queued.len() >= crate::realm::MAX_REALMS {
+        tracing::info!(
+            template = %ask.template,
+            principal = %ask.principal,
+            cap = crate::realm::MAX_REALMS,
+            "refusing a launch: the session is at its realm capacity"
+        );
+        return Err(LaunchRefusal::Capacity);
+    }
+    let Some(minted) = realms.mint_instance(ask.template) else {
+        // Unreachable: the template came from a grant row, and rows are
+        // only minted over realms the registry resolved. Fail closed.
+        tracing::error!(
+            template = %ask.template,
+            "launch admitted over a realm the registry does not hold"
+        );
+        return Err(LaunchRefusal::Internal);
+    };
+    // The spawn reads the *template's* configuration and writes the
+    // *instance's* paths, so it is handed a realm value built from both.
+    // Deliberately built here rather than inserted into the registry first:
+    // a registry that gained a row for a fork that then failed would answer
+    // petitions about a realm that never existed.
+    let Some(instance) = realms.instance_of(ask.template, &minted) else {
+        tracing::error!(template = %ask.template, "template vanished between mint and spawn");
+        return Err(LaunchRefusal::Internal);
+    };
+    let (result, record) = spawn::spawn_realm_deferring_journal(
+        &instance,
+        paths,
+        spawn::SpawnOrigin::Launch {
+            principal: ask.principal,
+            grant: ask.grant,
+        },
+        |name| std::env::var(name).ok(),
+    );
+    match result {
+        Ok(spawned) => {
+            queued.push(PendingLaunch {
+                record,
+                template: ask.template.clone(),
+                spawned: Some((minted.clone(), spawned)),
+            });
+            Ok(minted)
+        }
+        Err(err) => {
+            tracing::warn!(
+                instance = %minted,
+                principal = %ask.principal,
+                %err,
+                "a launch could not fork; refusing internal"
+            );
+            queued.push(PendingLaunch {
+                record,
+                template: ask.template.clone(),
+                spawned: None,
+            });
+            Err(LaunchRefusal::Internal)
+        }
+    }
+}
+
+/// Finish every launch this dispatch turn forked: journal it, enter it in
+/// the registry, and attach its shim session to the loop.
+///
+/// Runs after the connection dispatch's borrows have ended, for exactly the
+/// reason [`apply_layout`] does — attaching needs the loop handle, the
+/// presenter and the whole runtime, and `ServerCtx` holds the kernel
+/// mutably. **Before the next message is dispatched**, which is what makes
+/// the deferral invisible on the wire: the client received `launched(id)`
+/// and the realm is in the registry before anything it sends next is read.
+///
+/// A failure here is a realm that died immediately, not a launch that
+/// should have been refused: the client already holds its terminal, and the
+/// answer it gets from then on is `unavailable` (the row is removed) or
+/// `no_surface` — the same answers any realm whose shim dies produces.
+fn apply_launches<H: RuntimeHost>(host: &mut H, launches: Vec<PendingLaunch>) {
+    if launches.is_empty() {
+        return;
+    }
+    let (width, height) = {
+        let (_, view) = host.split();
+        view.view_size()
+    };
+    for launch in launches {
+        // The journal first, always, and for both outcomes: what the
+        // trusted core executed — or tried to — is the most
+        // security-relevant act of a session, and a later failure must not
+        // be able to swallow the entry naming who asked.
+        launch.record.journal(&mut host.runtime().kernel.recorder);
+        let Some((minted, spawned)) = launch.spawned else {
+            continue;
+        };
+        if !host
+            .runtime()
+            .kernel
+            .realms
+            .insert_instance(&launch.template, minted.clone())
+        {
+            tracing::error!(
+                template = %launch.template,
+                instance = %minted,
+                "template vanished before its instance could be registered"
+            );
+            continue;
+        }
+        if let Err(err) = attach_spawned_realm(host, spawned, width, height) {
+            tracing::error!(
+                instance = %minted,
+                %err,
+                "a launched realm forked but could not be attached; dropping it"
+            );
+            // Removed rather than marked `Exited`: `Exited` carries the pid
+            // of a process that *served* the realm, and this one never did.
+            // The client sees `unavailable`, which is what an unknown name
+            // and a vacant realm both answer — deliberately indistinguishable
+            // (IDL `get_realm`).
+            host.runtime().kernel.realms.remove_instance(&minted);
+        }
     }
 }
 
@@ -3999,6 +4262,220 @@ mod tests {
                 entries.iter().map(|e| e.str("kind")).collect::<Vec<_>>()
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Realm launch (WS-E.1.1, issue #207)
+    // ------------------------------------------------------------------
+
+    /// **Startup forks the realms that autostart and no others**, and a
+    /// template is still addressable while not running.
+    ///
+    /// The failure this guards is silent in both directions: a startup that
+    /// forked templates would run apps the operator asked it to hold back,
+    /// and one that refused to *register* them would make `realm_launch`
+    /// unpetitionable over exactly the realms it exists for.
+    #[test]
+    fn startup_forks_autostarting_realms_and_leaves_templates_alone() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "templates",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let mock = crate::spawn::tests::mock_shim_bin();
+        rig.host.runtime.kernel.realms = crate::realm::tests::registry_of(vec![
+            crate::realm::tests::realm_with_spawn(
+                crate::realm::WELL_KNOWN_REALM_ID,
+                &mock,
+                &["--serve".to_string()],
+                &[],
+            ),
+            crate::realm::tests::template_with_spawn("kiosk", &mock, &["--serve".to_string()]),
+        ]);
+        rig.spawn_configured().expect("startup must succeed");
+
+        assert!(
+            rig.host
+                .runtime
+                .realms
+                .contains_key(&RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)),
+            "an autostarting realm must have a live shim session"
+        );
+        assert!(
+            !rig.host.runtime.realms.contains_key(&RealmId::new("kiosk")),
+            "a template must NOT be forked at startup: that is what the key says"
+        );
+        // ...and it is still a realm a petition can name, which is the half
+        // that makes the verb usable at all.
+        assert_eq!(
+            rig.host.runtime.kernel.realms.resolve_for_petition("kiosk"),
+            Some(&RealmId::new("kiosk"))
+        );
+        assert_eq!(
+            rig.entries()
+                .iter()
+                .filter(|e| e.str("kind") == "realm_spawned")
+                .count(),
+            1,
+            "exactly one realm may have been spawned"
+        );
+        shutdown_realm(&mut rig.host);
+    }
+
+    /// **An admitted launch really forks a shim, from the template's
+    /// configuration, under a core-minted id** — the production path
+    /// (`launch_realm` → `apply_launches` → `attach_spawned_realm`) driven
+    /// against the real mock-shim binary and the rig's own runtime tree.
+    ///
+    /// The wire half is `principal.rs`'s (`launched` is a terminal naming a
+    /// minted id) and the mock-free half is
+    /// `tests/integration/test_launch.py`'s. What is asserted here is the
+    /// middle: that the two ends are connected by an actual process.
+    #[test]
+    fn a_launch_forks_the_templates_program_into_a_new_realm() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "launch",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let mock = crate::spawn::tests::mock_shim_bin();
+        rig.host.runtime.kernel.realms = crate::realm::tests::registry_of(vec![
+            crate::realm::tests::realm_with_spawn(
+                crate::realm::WELL_KNOWN_REALM_ID,
+                &mock,
+                &["--serve".to_string()],
+                &[],
+            ),
+            crate::realm::tests::template_with_spawn("kiosk", &mock, &["--serve".to_string()]),
+        ]);
+        rig.spawn_configured().expect("startup must succeed");
+
+        let who = crate::identity::PrincipalIdentity::parse("vitrin://local/agent/demo")
+            .expect("fixture identity");
+        let grant = crate::grants::GrantId::from_u64_for_test(9);
+        let paths = SpawnPaths::under(&rig.dir, &mock);
+        let mut queued = Vec::new();
+        let minted = launch_realm(
+            &rig.host.runtime.kernel.realms,
+            &paths,
+            &mut queued,
+            LaunchAsk {
+                template: &RealmId::new("kiosk"),
+                principal: &who,
+                grant,
+            },
+        )
+        .expect("the launch must be served");
+        assert_eq!(
+            minted.to_string(),
+            "kiosk.1",
+            "the id is minted by the registry, not supplied"
+        );
+        apply_launches(&mut rig.host, queued);
+
+        // A live shim session under the minted id, registered and running --
+        // the three things that make it a realm rather than a name.
+        let pid = rig
+            .host
+            .runtime
+            .realms
+            .get(&RealmId::new("kiosk.1"))
+            .expect("the launched realm has a live shim session")
+            .life
+            .pid();
+        assert!(process_is_alive(pid), "the launch must have forked");
+        assert!(matches!(
+            rig.host
+                .runtime
+                .kernel
+                .realms
+                .get("kiosk.1")
+                .expect("the instance is registered")
+                .state(),
+            crate::realm::RealmState::Running { .. }
+        ));
+        // The instance runs the TEMPLATE's program -- the command never came
+        // off the wire, and there is no wire in this test at all.
+        assert_eq!(
+            rig.host
+                .runtime
+                .kernel
+                .realms
+                .get("kiosk.1")
+                .unwrap()
+                .spawn()
+                .command(),
+            mock.as_path()
+        );
+        // ...and the journal says who asked, which is the question the whole
+        // entry was extended for.
+        let entries = rig.entries();
+        let launched = entries
+            .iter()
+            .find(|e| e.str("kind") == "realm_spawned" && e.str("realm") == "kiosk.1")
+            .expect("the launch is journaled");
+        assert_eq!(launched.str("spawned_by"), "realm_launch");
+        assert_eq!(launched.str("principal"), "vitrin://local/agent/demo");
+        assert_eq!(launched.str("grant_id"), "grant-9");
+        shutdown_realm(&mut rig.host);
+    }
+
+    /// **A session at [`crate::realm::MAX_REALMS`] refuses `capacity`, and
+    /// creates nothing while doing it.**
+    ///
+    /// `capacity` rather than `internal` because it is a policy answer: the
+    /// deployment is full, retrying is legal once a realm exits, and the
+    /// IDL gave it its own code for exactly that reason.
+    #[test]
+    fn a_launch_past_the_realm_cap_refuses_capacity_and_forks_nothing() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "launch-cap",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let mock = crate::spawn::tests::mock_shim_bin();
+        // A registry already at the cap, with nothing forked: the cap is a
+        // question about rows, and this test is about the answer rather than
+        // about sixteen live shims.
+        let full: Vec<crate::realm::Realm> = (0..crate::realm::MAX_REALMS)
+            .map(|i| crate::realm::tests::template_with_spawn(&format!("r{i}"), &mock, &[]))
+            .collect();
+        rig.host.runtime.kernel.realms = crate::realm::tests::registry_of(full);
+
+        let who = crate::identity::PrincipalIdentity::parse("vitrin://local/agent/demo")
+            .expect("fixture identity");
+        let paths = SpawnPaths::under(&rig.dir, &mock);
+        let mut queued = Vec::new();
+        let refusal = launch_realm(
+            &rig.host.runtime.kernel.realms,
+            &paths,
+            &mut queued,
+            LaunchAsk {
+                template: &RealmId::new("r0"),
+                principal: &who,
+                grant: crate::grants::GrantId::from_u64_for_test(1),
+            },
+        )
+        .expect_err("a full session must refuse");
+        assert_eq!(refusal, LaunchRefusal::Capacity);
+        assert!(
+            queued.is_empty(),
+            "a refusal that creates nothing must not queue a spawn to attach"
+        );
+        assert_eq!(
+            rig.host.runtime.kernel.realms.len(),
+            crate::realm::MAX_REALMS,
+            "no row may be minted for a launch that was refused"
+        );
     }
 
     // ------------------------------------------------------------------

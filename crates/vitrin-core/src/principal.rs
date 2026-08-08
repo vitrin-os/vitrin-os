@@ -136,10 +136,10 @@
 //! mint **on the grant** -- the route every facet added after version 1
 //! must take. The mint is always legal (object-graph rules only: the
 //! live-object cap and the watermark rule, both fatal); the *use* is what
-//! refuses, and today it always does: `realm_launch` is unserved, so
-//! `launch` funnels through the same `serve_facet_use` as every other
-//! facet and comes back a recoverable `refused(realm_launch,
-//! not_granted)` with the connection intact. Answering the mint itself
+//! is judged, and it funnels through the same `serve_facet_use` as every
+//! other facet -- answering `launched(realm)` when the chokepoint admits
+//! it (WS-E.1.1, issue #207) and a recoverable `refused(realm_launch, …)`
+//! with the connection intact when it does not. Answering the mint itself
 //! with `invalid_opcode` -- the shape this dispatch had before the facet
 //! existed -- would kill a conformant client for sending a documented
 //! request, which is the razor's fatal-vs-recoverable line exactly. Every
@@ -886,6 +886,20 @@ pub(crate) struct ServerCtx<'a> {
     /// that nothing downstream may reinterpret. Collapsing them would put
     /// the two under one drop policy.
     pub layout: &'a mut dyn FnMut(crate::enforcement::LayoutAct),
+    /// **Where a chokepoint-admitted launch forks** (WS-E.1.1): given the
+    /// realm the grant names, `session::launch_realm` mints an instance id
+    /// and creates the process, or answers `capacity`/`internal`.
+    ///
+    /// A third sink rather than a widened `layout`, on exactly the grounds
+    /// that kept `layout` out of `actuations`: this one *returns a value the
+    /// client is told* (a realm id, on a reply-bearing request), where both
+    /// others are one-way. Folding it in would put a terminal event's
+    /// payload behind a sink that cannot fail.
+    pub launch:
+        &'a mut dyn FnMut(
+            crate::enforcement::LaunchAsk<'_>,
+        )
+            -> Result<crate::realm::MintedRealmId, crate::enforcement::LaunchRefusal>,
     /// The core's single flight-recorder handle (P1.4.5,
     /// [`crate::recorder`]): every handshake outcome, petition lifecycle
     /// transition, consent transition, and enforcement decision this
@@ -1381,14 +1395,14 @@ impl PrincipalServer {
         // on why the log must not become a keylogger).
         let detail = ActuationDetail::of(&kind);
         // Read before `kind` moves into the request below; see
-        // `grant_realm`, which is resolved owned only for these four.
-        let contends_for_attention = matches!(
-            kind,
-            UseKind::Pointer(_)
-                | UseKind::Text(_)
-                | UseKind::LayoutFocus
-                | UseKind::LayoutArrange(_)
-        );
+        // `grant_realm`, which is resolved owned only for the uses that
+        // need it. **Asked of the kind rather than re-derived here**
+        // (WS-E.1.1): this was a duplicate `matches!` listing the four
+        // attention-contending uses, and a launch -- which also needs the
+        // grant's realm, as its template -- would have been handed `None`
+        // and refused `internal` while the predicate a reader would check
+        // said otherwise.
+        let names_a_realm = kind.names_a_realm();
         let grant_row = self.grant_row_id(grant_wire_id);
         let request = UseRequest {
             facet_id,
@@ -1439,17 +1453,18 @@ impl PrincipalServer {
         // realm this grant names", is what keeps a second site from
         // disagreeing.
         //
-        // Owned, and **only for an attention-contending use**: the two actuators
-        // and the two layout requests, which are exactly the uses that either
-        // name a realm to the embedder or are judged against a realm's
-        // physical presence. The chokepoint takes `&mut GrantTable`, so a
-        // borrow of the row's realm cannot survive into the call. That is one
-        // realm-name clone -- a `String` the wire caps at 64 bytes
-        // (`vitrin_realm`) -- per such request, and it is the cost of the
-        // event carrying its own destination; a **capture** still allocates
-        // nothing here, which is the high-rate path this rule was written for.
-        // `contends_for_attention` is read before `kind` moves into the request.
-        let grant_realm = if contends_for_attention {
+        // Owned, and **only for a use that names a realm**
+        // ([`UseKind::names_a_realm`]): the two actuators and the two layout
+        // requests, which either name a realm to the embedder or are judged
+        // against a realm's physical presence, plus a **launch**, whose
+        // template is the realm the grant is over. The chokepoint takes
+        // `&mut GrantTable`, so a borrow of the row's realm cannot survive
+        // into the call. That is one realm-name clone -- a `String` the wire
+        // caps at 64 bytes (`vitrin_realm`) -- per such request, and it is
+        // the cost of the event carrying its own destination; a **capture**
+        // still allocates nothing here, which is the high-rate path this
+        // rule was written for. Read before `kind` moves into the request.
+        let grant_realm = if names_a_realm {
             grant_row.and_then(|row| ctx.grants.realm_of(row)).cloned()
         } else {
             None
@@ -1469,6 +1484,7 @@ impl PrincipalServer {
             actuations: &mut *ctx.actuations,
             grant_realm: grant_realm.as_ref(),
             layout: &mut *ctx.layout,
+            launch: &mut *ctx.launch,
         };
         let outcome = self
             .chokepoint
@@ -1663,10 +1679,9 @@ impl PrincipalServer {
     /// authority oracle -- it would tell the petitioner something about
     /// its own pending petition that only `resolved` may say. The facet
     /// is born inert and every `launch` is judged at the single
-    /// enforcement chokepoint, which today refuses `not_granted` on all
-    /// of them: `realm_launch` is not in
-    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no row
-    /// can carry the bit.
+    /// enforcement chokepoint, which refuses `not_granted` unless the
+    /// grant this facet was minted on resolved `granted` carrying
+    /// `realm_launch`.
     ///
     /// Only the object-graph rules can fail here: the live-object cap
     /// ([`MAX_LIVE_LAUNCHERS`]) and the watermark rule, both fatal.
@@ -2449,6 +2464,22 @@ pub(crate) mod tests {
         /// this to prove a `focus` or a `set_fullscreen` really reached the
         /// embedder rather than being swallowed on the way.
         layout: Vec<crate::enforcement::LayoutAct>,
+        /// Every **launch** the chokepoint admitted, in order: the template
+        /// it named, who asked, and the grant row it was judged against --
+        /// this rig's stand-in for `session::launch_realm`, minus the fork.
+        ///
+        /// The rig deliberately does *not* create a process: what these
+        /// tests are about is whether a launch reached the embedder at all,
+        /// with the right template and the right asker. That the fork then
+        /// happens is `tests/integration/test_launch.py`'s subject, against
+        /// the shipped binary.
+        launches: Vec<(RealmId, PrincipalIdentity, crate::grants::GrantId)>,
+        /// What the launch sink answers. `None` mints an id from
+        /// [`Shared::realms`], exactly as the runtime does; `Some(refusal)`
+        /// forces the post-admission refusal a test wants to see voiced
+        /// (`capacity`, or a spawn failure's `internal`) without needing a
+        /// session at its realm cap.
+        launch_answer: Option<crate::enforcement::LaunchRefusal>,
         /// The rig's single flight-recorder handle (P1.4.5): every test in
         /// this module drives the real recorder, so the emission wiring is
         /// exercised by the whole suite and not only by the tests that
@@ -2486,6 +2517,8 @@ pub(crate) mod tests {
                 attention: std::cell::RefCell::new(crate::attention::AttentionSignal::detached()),
                 actuations: Vec::new(),
                 layout: Vec::new(),
+                launches: Vec::new(),
+                launch_answer: None,
                 recorder,
                 log_path,
             }
@@ -2564,11 +2597,28 @@ pub(crate) mod tests {
             attention,
             actuations,
             layout,
+            launches,
+            launch_answer,
             recorder,
             ..
         } = shared;
         let mut sink = |realm: &RealmId, input: SeatInput| actuations.push((realm.clone(), input));
         let mut layout_sink = |act: crate::enforcement::LayoutAct| layout.push(act);
+        // The rig's launch sink: record the ask, then answer exactly as the
+        // runtime would -- a registry-minted instance id, or the forced
+        // post-admission refusal. Minting through `realms` rather than
+        // fabricating a string is what keeps these tests honest about where
+        // an instance id comes from; there is no other way to build one.
+        let launch_realms = &*realms;
+        let mut launch_sink = |ask: crate::enforcement::LaunchAsk<'_>| {
+            launches.push((ask.template.clone(), ask.principal.clone(), ask.grant));
+            match *launch_answer {
+                Some(refusal) => Err(refusal),
+                None => launch_realms
+                    .mint_instance(ask.template)
+                    .ok_or(crate::enforcement::LaunchRefusal::Internal),
+            }
+        };
         let realm_is_live = |realm: &RealmId| live_realms.contains(realm);
         for _ in 0..n {
             let msg = core
@@ -2607,6 +2657,7 @@ pub(crate) mod tests {
                 presence,
                 actuations: &mut sink,
                 layout: &mut layout_sink,
+                launch: &mut launch_sink,
                 recorder,
             };
             server.handle_message(msg, &mut ctx, &mut |frame, fd| core.send_message(frame, fd))?;
@@ -5259,6 +5310,17 @@ pub(crate) mod tests {
         launcher::requests::Launch {}.encode(launcher_id)
     }
 
+    /// Assert the next client-visible event is `vitrin_launcher.launched`
+    /// on the given facet, returning it for the realm-id assertion.
+    fn expect_launched(client: &mut Connection, facet_id: u32) -> launcher::events::Launched {
+        let msg = client.recv_message().unwrap().unwrap();
+        assert!(msg.fd.is_none(), "launched carries no fd");
+        let (object_id, ev) = launcher::events::Launched::decode(&msg.bytes, msg.fd)
+            .expect("the terminal of a launch is `launched`");
+        assert_eq!(object_id, facet_id, "launched arrives on the launch facet");
+        ev
+    }
+
     #[test]
     fn get_launcher_mints_an_inert_facet_and_never_kills_the_connection() {
         let _fd = crate::capture::tests::fd_lock();
@@ -5335,11 +5397,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn launching_an_unserved_verb_refuses_recoverably_and_leaves_the_socket_alive() {
+    fn launching_without_the_verb_refuses_not_granted_and_leaves_the_socket_alive() {
         let _fd = crate::capture::tests::fd_lock();
-        // The staging `realm_launch` ships in: the bit is absent from
-        // SERVED_VERB_BITS, so no row can carry it and the chokepoint
-        // refuses every launch `not_granted`. Note *which* code: there is
+        // A grant that does not carry `realm_launch` -- `granted_rig`
+        // petitions the three original facet verbs -- refuses every launch
+        // at step 4, whatever else is true. This used to hold for the whole
+        // deployment (the bit was absent from `SERVED_VERB_BITS`, so no row
+        // could carry it); since WS-E.1.1 the verb is served and the
+        // property is the narrower, permanent one: **authority you were not
+        // granted is refused**. Note *which* code: there is
         // no `refused(verb, unsupported)` on the wire -- `unsupported` is
         // a petition OUTCOME, and the refusal enum's `not_granted` entry
         // covers "the verb is outside its effective set" by name. The
@@ -5376,36 +5442,110 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn petitioning_for_realm_launch_resolves_unsupported_without_dying() {
-        let _fd = crate::capture::tests::fd_lock();
-        // The other half of the staging, and where `unsupported` actually
-        // appears: the verb bit is in range (so not fatal
-        // invalid_argument) but unserved, so the whole petition resolves
-        // `unsupported` -- never narrowed to the served remainder.
-        // No consent transitions: an admission refusal never begins the
-        // prompt lifecycle, so `resolved` is the first event.
-        let verifier = demo_verifier();
-        let (mut server, mut core, mut client, mut shared) = setup();
-        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+    /// A rig whose grant carries `realm_launch` beside the three original
+    /// facet verbs, on the auto-approve policy.
+    fn launch_granted_rig(
+        verifier: &dyn Verifier,
+    ) -> (PrincipalServer, Connection, Connection, Shared) {
+        let mut shared = Shared::new(ConsentPolicy::AutoApprove);
+        let (mut server, mut core, mut client) = connect(&mut shared);
+        bind_with_realm(&mut server, &mut core, &mut client, verifier, &mut shared);
         let mut req = petition_frame();
         req.verbs = all_verbs() | Verb::REALM_LAUNCH;
         client.send_message(&req.encode(3), None).unwrap();
-        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        process_n(&mut server, &mut core, verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Closed);
         let resolved = expect_resolved(&mut client, 4);
-        assert_eq!(resolved.outcome, Outcome::Unsupported);
-        assert_eq!(
-            resolved.verbs.bits(),
-            0,
-            "a non-granted outcome carries no authority"
+        assert_eq!(resolved.outcome, Outcome::Granted);
+        assert!(
+            resolved.verbs.contains(Verb::REALM_LAUNCH),
+            "a petition naming realm_launch is granted the bit since WS-E.1.1: \
+             it stopped resolving `unsupported` when the core gained a spawn path"
         );
+        (server, core, client, shared)
+    }
 
-        // A launcher minted on that grant is still legal to mint, and
-        // still refuses on use.
+    /// **`launched` names a realm the CORE minted, and the client cannot
+    /// influence which** (WS-E.1.1, issue #207).
+    ///
+    /// The two halves this pins are the two the issue calls out as easiest
+    /// to get wrong: the reply is a terminal (one per request, in order),
+    /// and its `realm` argument is `<template>.<n>` derived from the
+    /// **grant's** realm -- `launch` carries no arguments at all, so there
+    /// is nothing the client could have named.
+    #[test]
+    fn a_launch_answers_launched_with_a_core_minted_instance_id() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = launch_granted_rig(&verifier);
         client.send_message(&get_launcher(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+
+        // Two launches, pipelined: replies pair in order, and each is a
+        // NEW realm -- nothing is ever relaunched (IDL `launch`).
         client.send_message(&launch(9), None).unwrap();
-        process_n(&mut server, &mut core, &verifier, &mut shared, 2).unwrap();
-        expect_refused(&mut client, 4, Verb::REALM_LAUNCH, Refusal::NotGranted);
+        client.send_message(&launch(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 2).expect("launches admitted");
+        let first = expect_launched(&mut client, 9);
+        let second = expect_launched(&mut client, 9);
+        assert_eq!(
+            (first.realm.as_str(), second.realm.as_str()),
+            ("realm-0.1", "realm-0.2"),
+            "instance ids are <template>.<n>, minted by the registry and never reused"
+        );
+        // The embedder was asked about the realm the GRANT names, by the
+        // bound identity, against the row the chain judged -- the three
+        // facts `LaunchAsk` carries and the only three there are.
+        assert_eq!(shared.launches.len(), 2);
+        for (template, principal, _) in &shared.launches {
+            assert_eq!(template.as_str(), crate::realm::WELL_KNOWN_REALM_ID);
+            assert_eq!(principal.as_str(), DEMO_IDENTITY);
+        }
+        assert!(
+            shared.actuations.is_empty() && shared.layout.is_empty(),
+            "a launch is neither an actuation nor a layout act"
+        );
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            14,
+        );
+    }
+
+    /// **A post-admission failure is voiced, never swallowed**: the two
+    /// refusals only a launch can produce, each uncoalesced because
+    /// `launch` is reply-bearing and a coalesced terminal would leave the
+    /// client waiting forever.
+    #[test]
+    fn a_launch_the_embedder_could_not_serve_is_refused_capacity_or_internal() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = launch_granted_rig(&verifier);
+        client.send_message(&get_launcher(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+
+        for (answer, code) in [
+            (
+                crate::enforcement::LaunchRefusal::Capacity,
+                Refusal::Capacity,
+            ),
+            (
+                crate::enforcement::LaunchRefusal::Internal,
+                Refusal::Internal,
+            ),
+        ] {
+            shared.launch_answer = Some(answer);
+            // Twice, to prove neither is coalesced away: an actuation's
+            // second identical refusal is muted, a launch's is not.
+            client.send_message(&launch(9), None).unwrap();
+            client.send_message(&launch(9), None).unwrap();
+            process_n(&mut server, &mut core, &verifier, &mut shared, 2).unwrap();
+            expect_refused(&mut client, 4, Verb::REALM_LAUNCH, code);
+            expect_refused(&mut client, 4, Verb::REALM_LAUNCH, code);
+        }
         sync_fence(
             &mut server,
             &mut core,

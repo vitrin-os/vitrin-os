@@ -157,6 +157,11 @@ const SUBTITLE: &str = "Approving grants the authority listed below.";
 const LABEL_PRINCIPAL: &str = "Principal";
 const LABEL_REALM: &str = "Realm";
 const LABEL_REQUESTS: &str = "Requests";
+/// The `realm_launch` field's label. "Launches", not "Command": the human is
+/// deciding whether this principal may **start** that program, and a label
+/// reading like a field of the realm's description would invite them to skim
+/// it as configuration trivia rather than as the thing being approved.
+const LABEL_LAUNCHES: &str = "Launches";
 const LABEL_EXPIRES: &str = "Expires";
 /// What an unbounded (`expiry_ms == 0`) petition says. Honest about where the
 /// bound then comes from: the rung the human picks below.
@@ -206,7 +211,19 @@ const EXPIRY_UNBOUNDED: &str = "no time limit - bounded only by the choice below
 /// the grant is *told* when they press it, and it may *act* in that moment.
 /// It is deliberately not phrased as delegation ("you give it the key"),
 /// because the press delegates nothing — see [`crate::attention`].
-const VERB_CATALOGUE: [(Verb, &str, &str); 5] = [
+/// **`realm_launch`'s line says what the human loses, like the layout
+/// pair**, and what it costs is different in kind from every other verb
+/// here: approving it lets this principal make the trusted core **start a
+/// program**, repeatedly, for as long as the grant lives. The line names
+/// the act ("start"), its repeatability ("as often as its rate limit
+/// allows"), and defers the *identity* of the program to the `Launches`
+/// field above it — which is the one place the path is shown, so the two
+/// cannot disagree about which program is meant.
+///
+/// It deliberately does not say "and observe it": launching confers nothing
+/// over what was launched, and a line that implied otherwise would ask for
+/// consent to authority this grant does not carry.
+const VERB_CATALOGUE: [(Verb, &str, &str); 6] = [
     (Verb::OBSERVE, "observe", "capture frames of this realm"),
     (
         Verb::ACTUATE_POINTER,
@@ -228,6 +245,11 @@ const VERB_CATALOGUE: [(Verb, &str, &str); 5] = [
         "layout_focus",
         "show this realm and send your keyboard and mouse to it - and act on your attention \
          key",
+    ),
+    (
+        Verb::REALM_LAUNCH,
+        "realm_launch",
+        "start the program named above, as a new app, as often as its rate limit allows",
     ),
 ];
 
@@ -397,6 +419,19 @@ fn rows(prompt: &PromptContent, text: &mut Text) -> Vec<Row> {
         &[prompt.principal.to_string()],
     );
     field(&mut rows, text, LABEL_REALM, &[prompt.realm.to_string()]);
+    // **The program**, on a `realm_launch` petition and nowhere else
+    // (WS-E.1.1, issue #207). Placed under the realm and above the verb
+    // list because it *narrows* the realm: this card is about starting one
+    // named program, and a human reading top to bottom should know which
+    // one before they read what the principal may do with it.
+    if let Some(command) = &prompt.command {
+        field(
+            &mut rows,
+            text,
+            LABEL_LAUNCHES,
+            &[command.as_path().display().to_string()],
+        );
+    }
     field(&mut rows, text, LABEL_REQUESTS, &verb_lines(prompt.verbs));
     field(&mut rows, text, LABEL_EXPIRES, &[expiry_line(prompt)]);
 
@@ -665,6 +700,59 @@ mod tests {
         }
     }
 
+    /// **A `realm_launch` card names the program, and no other card does**
+    /// (WS-E.1.1, issue #207).
+    ///
+    /// Both halves are the assertion. Naming it is Q13's requirement — a
+    /// human approving "start apps in this realm" without being told *which*
+    /// app is being asked to consent to the one fact the verb's whole
+    /// security story rests on. Not naming it elsewhere is the card's own
+    /// rule: a prompt says what is being asked for and nothing else.
+    #[test]
+    fn a_launch_prompt_names_the_program_and_only_a_launch_prompt_does() {
+        let mut text = Text::new();
+        let program = "/usr/bin/kiosk-browser";
+
+        let mut launch = prompt_fixture();
+        launch.verbs = launch.verbs | Verb::REALM_LAUNCH;
+        launch.command = Some(crate::realm::AuditedCommand::for_test(program));
+        let lines = line_texts(&launch, &mut text);
+        assert!(
+            lines.iter().any(|l| l == LABEL_LAUNCHES),
+            "the launch field must be labelled: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains(program)),
+            "the program the human is approving must be on the card: {lines:?}"
+        );
+        // ...and it is drawn, not merely laid out: the card really got
+        // taller than the same petition without the field.
+        let mut without = launch.clone();
+        without.command = None;
+        assert!(
+            rasterize(&launch).height > rasterize(&without).height,
+            "the Launches field must occupy real rows on the card"
+        );
+
+        // The ordinary petition is unchanged -- no label, no path.
+        let plain = line_texts(&prompt_fixture(), &mut text);
+        assert!(
+            !plain.iter().any(|l| l == LABEL_LAUNCHES),
+            "a petition that does not ask to launch must not name a program: {plain:?}"
+        );
+    }
+
+    /// Every text line one card renders, in order — the lines a human reads.
+    fn line_texts(prompt: &PromptContent, text: &mut Text) -> Vec<String> {
+        rows(prompt, text)
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Line { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn the_verb_catalogue_covers_every_servable_verb() {
         // A verb this core can grant must gain a line here, or a consent
@@ -696,19 +784,23 @@ mod tests {
         // and admission refuses it `unsupported`; this only refuses to let
         // that happen silently.
         //
-        // Re-pinned by WS-E.1.4 (issue #210) with a human decision on each
-        // of the four bits that used to be here, not a mechanical subtraction
-        // of the two that moved: `layout_arrange` and `layout_focus` are
-        // served, so they left this pin and gained catalogue lines above;
-        // `observe_cursor` stays because per-principal cursor *delivery* is
-        // still M2's (D-017/D-019 both say so in as many words, and serving
-        // the verb without it would widen a capture with a cursor the core
-        // does not have); `realm_launch` stays because this core has no
-        // spawn path, which the chokepoint's `Launch` arm says at its own
-        // site.
+        // **Re-pinned by WS-E.1.1 (issue #207) with a decision on the bit
+        // that moved, not a mechanical subtraction.** `realm_launch` left
+        // this pin because the core gained the thing its refusal stood for:
+        // a chokepoint arm that forks, the realm cap, a core-minted instance
+        // id, and — the part this file owns — a catalogue line and a
+        // `Launches` field naming the program. That is Q13's rule applied
+        // exactly: the verb shipped admitted-but-refused `unsupported` until
+        // its copy existed, and its copy exists here.
+        //
+        // WS-E.1.4 (issue #210) moved `layout_arrange` and `layout_focus`
+        // out on the same terms. `observe_cursor` stays, and for a reason
+        // that has not moved: per-principal cursor *delivery* is still M2's
+        // (D-017/D-019 both say so in as many words), so serving the verb
+        // would widen a capture with a cursor the core does not have.
         assert_eq!(
             crate::grants::UNSERVED_VERB_BITS,
-            Verb::OBSERVE_CURSOR.bits() | Verb::REALM_LAUNCH.bits(),
+            Verb::OBSERVE_CURSOR.bits(),
             "the IDL defines a verb this module has not classified as served \
              or unserved (D-017/D-018)"
         );
@@ -756,7 +848,8 @@ mod tests {
                 "actuate_pointer",
                 "actuate_text",
                 "layout_arrange",
-                "layout_focus"
+                "layout_focus",
+                "realm_launch"
             ]
         );
     }

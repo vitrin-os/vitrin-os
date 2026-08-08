@@ -21,12 +21,22 @@
 //! - array-of-table headers `[[name]]`, `name` in `[A-Za-z0-9_]+`;
 //! - `key = "basic string"`, with only the `\\` and `\"` escapes;
 //! - `key = <non-negative decimal integer>` fitting `u32`;
+//! - `key = true` / `key = false` -- exactly those two spellings;
 //! - `key = ["a", "b"]` -- a single-line array of basic strings, trailing
 //!   comma allowed.
 //!
 //! Everything else -- single-bracket tables, dotted keys, inline tables,
 //! nested or multi-line arrays, multi-line and literal strings, other
-//! escapes, floats, booleans, datetimes -- is an error, never a guess.
+//! escapes, floats, datetimes -- is an error, never a guess.
+//!
+//! **Booleans were outside the subset until WS-E.1.1 (issue #207)**, which
+//! needed `realm.toml`'s `autostart` key. The widening is deliberate and
+//! minimal: [`boolean`] accepts the two TOML keywords by exact match and
+//! nothing else -- not `True`, not `yes`, not `1`, not `"true"` -- so the
+//! lexer gains one total function over a two-element vocabulary rather than
+//! a value class with a shape to get wrong. It stays inside the invariant
+//! this module exists for: every file the subset accepts is still valid
+//! TOML.
 //! Every file this subset accepts is valid TOML, so external tooling
 //! interoperates and a later swap to a full parser changes nothing an
 //! operator can see.
@@ -126,6 +136,30 @@ pub(crate) fn string_array(value: &str, line: usize) -> Result<Vec<String>, Subs
         out.push(element);
         rest = after.trim_start();
     }
+}
+
+/// Parse a TOML boolean: exactly `true` or `false`, lowercase, with only
+/// whitespace or a comment after it (WS-E.1.1, issue #207 --
+/// `realm.toml`'s `autostart`).
+///
+/// **Exact match, no near-misses accepted.** TOML defines two spellings and
+/// this accepts those two. `True`, `yes`, `on`, `1` and `"true"` are all
+/// refused, naming what was written, because each of them is a different
+/// file format's boolean and silently honoring one would be the fail-open
+/// tolerance this module's docs refuse: a realm the operator meant to hold
+/// back as a template but that autostarts anyway is a process nobody asked
+/// for.
+pub(crate) fn boolean(value: &str, line: usize) -> Result<bool, SubsetError> {
+    for (word, parsed) in [("true", true), ("false", false)] {
+        if let Some(rest) = value.strip_prefix(word) {
+            trailing_blank(rest, line, "boolean value")?;
+            return Ok(parsed);
+        }
+    }
+    Err(SubsetError::at(
+        line,
+        "expected `true` or `false` (TOML booleans are lowercase and unquoted)",
+    ))
 }
 
 /// Parse a bare non-negative decimal integer fitting `u32`; the remainder
@@ -289,6 +323,33 @@ mod tests {
             (r#""5""#, "quoted"),
         ] {
             assert!(integer(value, 5).is_err(), "must reject: {why}");
+        }
+    }
+
+    /// **The boolean vocabulary is two words, and nothing near them**
+    /// (WS-E.1.1, issue #207). Every near-miss below is another file
+    /// format's boolean; accepting one would be the fail-open tolerance
+    /// this module refuses, and for `realm.toml`'s `autostart` it would be
+    /// a realm the operator meant to hold back that starts anyway.
+    #[test]
+    fn booleans_are_exactly_true_and_false() {
+        assert_eq!(boolean("true", 1), Ok(true));
+        assert_eq!(boolean("false", 1), Ok(false));
+        // Comments and trailing whitespace are the subset's usual tolerance.
+        assert_eq!(boolean("true  # why", 1), Ok(true));
+        assert_eq!(boolean("false\t", 1), Ok(false));
+        for (value, why) in [
+            ("True", "capitalised"),
+            ("FALSE", "shouted"),
+            ("yes", "another format's spelling"),
+            ("on", "likewise"),
+            ("1", "an integer"),
+            ("\"true\"", "a string"),
+            ("truthy", "a prefix match must not be enough"),
+            ("", "empty"),
+            ("true false", "two values"),
+        ] {
+            assert!(boolean(value, 5).is_err(), "must reject ({why}): {value:?}");
         }
     }
 

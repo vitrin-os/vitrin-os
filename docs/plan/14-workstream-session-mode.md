@@ -106,11 +106,23 @@ None of these is DRM work. The backend is not the binding constraint.
    renders whether or not it is visible, and `MAX_REALMS` now has a measured
    memory bill rather than only a descriptor one — is published in
    `docs/book/src/limits.md` and re-derived in `realm.rs`.
-2. **No way to launch an app.** `vitrin_realm` has exactly **one** request
-   (`request_grant`). Realms exist only from `realm.toml` at startup, so
-   changing app means restarting `vitrind`. This is new protocol, and it is an
-   *authority* question: a principal that can spawn arbitrary realms holds a
-   large new capability.
+2. ~~**No way to launch an app.**~~ **Closed by WS-E.1.1 (#207)**, in both
+   halves: the protocol half (#225) put `realm_launch`, `vitrin_grant.get_launcher`
+   and `vitrin_launcher` on the wire at version 2, and the core half serves
+   them. A realm declared `autostart = false` in `realm.toml` is a
+   **template**; a principal holding `realm_launch` over one calls
+   `vitrin_launcher.launch` and the core forks an instance under an id it
+   mints itself (`<template>.<n>`).
+
+   The *authority* question this gap named is what the shape answers.
+   `launch` carries no arguments, so the command never crosses the wire: the
+   grant names a template, the template names the program, and the human sees
+   that program on the consent card. A launch grant is therefore authority
+   over operator-written configuration, never over an arbitrary command line
+   — and it is capped (`MAX_REALMS`, refused `capacity`), rate-limited,
+   revocable, expiring and journaled with the principal and grant that asked.
+   What it is *not* is bounded in what the launched app may then do: that is
+   Phase-2 confinement (E2.6/E2.7), and `docs/book/src/limits.md` says so.
 3. **No window management, by invariant.** [PRD](../PRD.md) §5.1 makes
    "window-management policy lives outside the core" permanent.
    [D-018](20-decision-log.md) allocated `layout_arrange` (0x10) and
@@ -133,7 +145,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 
 | Stage | Delivers | Est. |
 |---|---|---|
-| **1 — multi-app, nested** | Runtime app launch · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · ~~a core-owned attention key~~ (**landed**, WS-E.1.7/#232: a tapped, consumed Super lifts `preempted` for one layout use and delivers `vitrin_principal.attention`, so an in-realm shell can switch realms at all) · a shell client (switcher + launcher) | 7–9 w |
+| **1 — multi-app, nested** | ~~Runtime app launch~~ (**landed**, WS-E.1.1/#207: `autostart = false` templates, a served `realm_launch` verb, core-minted `<template>.<n>` instance ids, `capacity` at `MAX_REALMS`, and `realm_spawned` naming who asked) · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · ~~a core-owned attention key~~ (**landed**, WS-E.1.7/#232: a tapped, consumed Super lifts `preempted` for one layout use and delivers `vitrin_principal.attention`, so an in-realm shell can switch realms at all) · a shell client (switcher + launcher) | 7–9 w |
 | **2 — livable** | Cross-realm clipboard · core-drawn lock screen on the consent stack · status in the trusted band · human screenshot | 4–6 w |
 | **3 — bare metal** | The keymap decision · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
 | **4 — long tail** | X11 (defers to E3.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |

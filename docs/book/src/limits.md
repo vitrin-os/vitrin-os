@@ -206,12 +206,54 @@ it. `--headless` has a fixed virtual output and cannot reach this, which is
 also why no CI gate can see it — `shim/docs/nested-multi-realm.md` carries it
 as a manual step.
 
-**No realm enumeration on the wire, and no runtime launch.** A client
-cannot ask what realms exist; `realm-0` is the one name it can know without
-being told. `realm_launch` is defined on the wire and served by no
-deployment, so realms come only from the configuration file the core reads
-at startup. Multi-realm *fleet* mode — a 50-realm headless box — is
-Phase 3 and is a different thing again.
+**No realm enumeration on the wire — but do not read that as unguessable.**
+A client cannot ask what realms exist; `realm-0` is the one name it can know
+without being told, and `vitrin_launcher.launched` hands back the ids of realms
+it started itself. What that does *not* buy is secrecy of the others: instance
+ids are `<template>.<n>` with a small session-global counter, so a client that
+knows or guesses a template name can guess live instance ids cheaply, and
+petition admission answers differently for a realm that exists than for one
+that does not. So the id space is a **naming** scheme, not a capability — the
+grant is what confers authority, and knowing a name gets you a petition the
+human still has to approve. Treat any design that leans on an id being secret
+as broken. Multi-realm *fleet* mode — a 50-realm headless box — is Phase 3 and
+is a different thing again.
+
+**Runtime launch exists, and it is a real reduction in what the core
+guarantees.** `realm_launch` is served: a principal holding it over a realm
+template can make the trusted core fork a process, repeatedly, for as long as
+its grant lives. Until this landed, the *only* thing that could make `vitrind`
+fork was startup reading a file the operator had hardened. That property is
+gone. What replaces it is weaker than "impossible" and is stated as such: a
+human's approval on a card naming the template's program, an expiry,
+revocation, the grant's rate ceiling, a cap of 16 live realms (refused
+`capacity`), and a journal entry naming the principal and grant behind every
+spawn.
+
+**And nothing bounds what a launched app then does.** A launch grant is
+authority to start an *unconfined* process with the core's own uid and
+filesystem view — the confinement limits below apply to it unchanged, one
+authority level up. Phase-2 confinement (E2.6/E2.7) is what changes that.
+
+**A launched realm cannot be closed, by anybody, ever.** This is the sharper
+half of the point below and it is worth stating on its own: there is no wire
+request that ends a realm, and nothing in the core reclaims one. Revoking the
+launch grant does not close what it started; nor does closing the connection
+that asked; nor does the dead-man switch, which revokes every *grant* and
+leaves every *process* running. A realm ends when its own app exits, and not
+otherwise. So one approved `realm_launch` grant, exercised 15 times before the
+human revokes it, permanently commits every remaining slot of the 16-realm cap
+— and the core-side memory behind them — for the rest of the session. The only
+remedy is restarting `vitrind`. Revocation bounds *future* launches and nothing
+else; read it that way when deciding whether to approve one.
+
+**Launched realms accumulate for the life of a session.** An exited realm
+keeps its row so `unavailable` keeps meaning *not ever*, so a session that
+launches continuously grows a table of dead names it never frees. It costs no
+process, no descriptor and no pixels — a name and a spawn config — and it is
+bounded only by the grant's rate ceiling and expiry, not by a count. A
+long-lived session driven by an agent launching on a timer will grow that
+table without limit.
 
 **Identities are static tokens.** Listed in `principals.toml`. The IDL is
 shaped for SPIFFE/OIDC credentials; the machinery is not here yet.

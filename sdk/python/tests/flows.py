@@ -34,6 +34,9 @@ ALL_VERBS = 7  # observe | actuate_pointer | actuate_text
 # so they take 9 and 10 in the order the client first asks for them.
 LAYOUT_FOCUS_ID = 9
 LAYOUT_ARRANGE_ID = 10
+#: The launch facet, likewise minted on demand. Tests that mint only this
+#: one get 9, because ids are allocated in the order a client first asks.
+LAUNCHER_ID = 9
 
 
 def hello_frame(version: int = protocol.PROTOCOL_VERSION) -> bytes:
@@ -113,6 +116,21 @@ def frame_ready_frame(*, format: int = 0x34325258, width: int, height: int, stri
 
 def capture_frame_frame() -> bytes:
     return frame(VIEW_ID, 0)
+
+
+def get_launcher_frame(facet_id: int = LAUNCHER_ID) -> bytes:
+    """`vitrin_grant.get_launcher` — request opcode 0, since version 2."""
+    return frame(GRANT_ID, 0, u32(facet_id))
+
+
+def launch_frame(facet_id: int = LAUNCHER_ID) -> bytes:
+    """`vitrin_launcher.launch` — no arguments, and that is the point."""
+    return frame(facet_id, 0)
+
+
+def launched_frame(realm: str, *, facet_id: int = LAUNCHER_ID) -> bytes:
+    """`vitrin_launcher.launched` — the terminal of one launch."""
+    return frame(facet_id, 0, string(realm))
 
 
 def get_layout_focus_frame(facet_id: int = LAYOUT_FOCUS_ID) -> bytes:

@@ -652,7 +652,11 @@ jobs:
               missing=1
             fi
           done
-          for gate in test_real_trust_band.py test_input_switch.py; do
+          # Must match run.sh's PROPERTY_GATES exactly. This list had itself
+          # drifted -- it carried two of the five gates run.sh named, so the
+          # guard against gate drift had silently drifted, which is the same
+          # defect one level up. Edit both, and README.md's table, together.
+          for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_launch.py; do
             if [ ! -f "tests/integration/$gate" ]; then
               echo "::error::named property gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with that property's evidence contributing nothing. Restore it, or retire it from run.sh's PROPERTY_GATES, this list, and tests/integration/README.md's gate table together."
               missing=1

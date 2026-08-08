@@ -43,6 +43,7 @@ from .messages import (
     ErrorEvent,
     Event,
     FrameReadyEvent,
+    LaunchedEvent,
     RefusedEvent,
     ResolvedEvent,
 )
@@ -333,6 +334,27 @@ class Frame:
         )
 
 
+class _LauncherFacet(_Proxy):
+    """`vitrin_launcher` — start the app the granted realm's template names.
+
+    Reply-bearing, so this facet is the one that receives an event: exactly
+    one :class:`~vitrin_os.messages.LaunchedEvent` per successful ``launch``,
+    in request order. A refused launch arrives on the *grant* instead, as
+    ``refused(realm.launch, …)``.
+    """
+
+    _interface = "vitrin_launcher"
+
+    def __init__(self, conn: "Connection", oid: int, grant: "Grant") -> None:
+        super().__init__(conn, oid)
+        self._grant = grant
+        self._launched: deque[LaunchedEvent] = deque()
+
+    def _handle_event(self, event: Event) -> None:
+        if isinstance(event, LaunchedEvent):
+            self._launched.append(event)
+
+
 class _LayoutFocusFacet(_Proxy):
     """`vitrin_layout_focus` — bind the output to the granted realm.
 
@@ -380,6 +402,7 @@ class Grant(_Proxy):
         # a petition's id footprint at five for clients that never arrange.
         self._layout_focus: _LayoutFocusFacet | None = None
         self._layout_arrange: _LayoutArrangeFacet | None = None
+        self._launcher: _LauncherFacet | None = None
 
     def _handle_event(self, event: Event) -> None:
         if isinstance(event, ResolvedEvent):
@@ -477,6 +500,48 @@ class Grant(_Proxy):
             protocol.LayoutMode.FULLSCREEN if fullscreen else protocol.LayoutMode.WINDOWED
         )
         self._conn._send(messages.encode_set_fullscreen(facet.id, mode=mode))
+
+    # -- launch --------------------------------------------------------------
+
+    def launch(self) -> str:
+        """Start the granted realm's template, returning the new realm's id.
+
+        Reply-bearing (one request, one terminal), exactly like
+        :meth:`observe`: sends ``launch`` and blocks until ``launched``
+        (returned as the new realm's id) or ``refused(realm.launch, …)``
+        (raised as the typed exception — :class:`~vitrin_os.errors.AtCapacity`
+        when the deployment is at its realm limit).
+
+        **It takes no arguments, and cannot.** The realm this grant was
+        petitioned over names a template; the template names the program.
+        Choosing *which* program to run is done by petitioning over a
+        different realm, in front of the human, never by an argument here.
+
+        The returned id is minted by the server and is **opaque** — pass it
+        straight to :meth:`Connection.get_realm`, do not parse or predict it.
+        Launching confers nothing over what was launched: observing or
+        actuating the new realm is a separate petition.
+        """
+        facet = self._launcher_facet()
+        self._conn._send(messages.encode_launch(facet.id))
+        self._conn._run_until(
+            lambda: facet._launched or self._first_refusal(Verb.REALM_LAUNCH) is not None
+        )
+        refusal = self._first_refusal(Verb.REALM_LAUNCH)
+        if not facet._launched and refusal is not None:
+            self._refusals.remove(refusal)
+            raise refusal_error_by_code(
+                refusal.verb, refusal.code, refusal.retry_after_ms, grant_id=self.id
+            )
+        return facet._launched.popleft().realm
+
+    def _launcher_facet(self) -> _LauncherFacet:
+        if self._launcher is None:
+            oid = self._conn._allocate_ids(1)[0]
+            self._launcher = _LauncherFacet(self._conn, oid, self)
+            self._conn._register(self._launcher)
+            self._conn._send(messages.encode_get_launcher(self.id, facet_id=oid))
+        return self._launcher
 
     def _focus_facet(self) -> _LayoutFocusFacet:
         if self._layout_focus is None:

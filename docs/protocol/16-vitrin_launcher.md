@@ -73,14 +73,20 @@ discovered.
 
 ## Served status
 
-**No deployment serves `realm_launch` today.** The verb is defined,
-petitionable, and refused `unsupported` at admission — the same staging
-[`observe_cursor`](04-vitrin_grant.md#defined-but-unserved) still uses, and
-that `layout_arrange` and `layout_focus` used until the reference core began
-serving them. The structural reason is the same in every case: an
+**The reference core serves `realm_launch` as of WS-E.1.1.** A grant may carry
+the bit, an admitted `launch` forks a realm, and the human sees a consent card
+naming the principal, the template and the template's program.
+
+Serving it stays a **deployment** property, not a version property, and the
+staging remains available to a deployment that declines: the verb is
+petitionable everywhere and refused `unsupported` where it is not served —
+the same posture [`observe_cursor`](04-vitrin_grant.md#defined-but-unserved)
+is still in everywhere. The structural reason is the same in every case: an
 *out-of-range* bit is fatal `invalid_argument` and kills the connection, so a
 client asking for authority a deployment does not serve must get an answer
-rather than a dead socket.
+rather than a dead socket. A deployment that cannot afford
+[`capacity`](04-vitrin_grant.md#refusal)'s cross-principal side channel must
+not serve this verb, because no attenuation of a launch grant removes it.
 
 This interface's messages are `since="2"`, so they do not exist on a
 version-1 connection at all; sending one there is fatal `invalid_opcode`. The
@@ -232,15 +238,16 @@ gets a distinct prompt.
 The mint succeeds and the *use* refuses. Refusing at mint time would turn the
 mint into an oracle for what a grant holds.
 
-### 3. Today's answer, on every deployment
+### 3. A deployment that does not serve the verb
 
 ```
 1. A→C  vitrin_realm.request_grant(…, verbs=realm_launch, …)
 2. C→A  vitrin_grant.resolved(unsupported, 0, once, 0)
 ```
 
-No deployment serves the verb yet, and a petition mixing `realm_launch` with a
-served verb is refused **whole** — never narrowed to the served remainder.
+The reference core no longer answers this way, but a deployment that declines
+to host process creation does — and a petition mixing `realm_launch` with a
+served verb is refused **whole**, never narrowed to the served remainder.
 
 ## Growth
 

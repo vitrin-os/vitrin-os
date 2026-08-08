@@ -268,7 +268,9 @@ per-principal delivery stays deferred to M2 (D-017, D-019). Of the three verbs t
 are **servable** — each has a facet interface, and the reference core serves
 both — while `observe_cursor` is refused `unsupported` by every deployment,
 because the delivery it would widen a capture with does not exist.
-`realm_launch` takes the same staged posture for a different question. See
+`realm_launch` was in that same staged posture and no longer is: the reference
+core serves it as of WS-E.1.1, though a deployment that will not host process
+creation still refuses it. See
 [§ defined but unserved](04-vitrin_grant.md#defined-but-unserved) for why
 defining a verb before serving it is structural rather than cosmetic, and for
 why "unserved" is a statement about a deployment rather than about the wire.
@@ -790,11 +792,13 @@ recoverable).
 > accepts exactly its maximum version and refuses everything else, so today it
 > serves version 2 alone and answers a version-1 `hello` with fatal
 > `version_unsupported`. That is a gap between this document and the
-> implementation, not a second reading of the document — serving 1 and 2
-> concurrently is WS-E.1.1's core half and has not landed. Nothing outside the
-> repo speaks version 1, so the gap costs no deployed client; it is recorded
-> here so nobody reads "a server whose maximum is N implements every version
-> from 1 to N" as a description of what runs today.
+> implementation, not a second reading of the document. **Serving 1 and 2
+> concurrently is P2.1.2's version matrix**, not WS-E.1.1's: that issue landed
+> the `realm_launch` half of version 2 without touching version acceptance,
+> and half a version matrix would be worse than none. Nothing outside the repo
+> speaks version 1, so the gap costs no deployed client; it is recorded here so
+> nobody reads "a server whose maximum is N implements every version from 1 to
+> N" as a description of what runs today.
 
 ### 7.4 Growth rules (Wayland-style)
 
@@ -963,12 +967,14 @@ named here so their absence is understood as a decision, not an omission:
   undiscoverable on the wire and `realm-0` remains the one name a conformant
   client can know without being told. Realm *creation* is on the wire as the
   `realm_launch` verb and the [`vitrin_launcher`](16-vitrin_launcher.md)
-  facet, but **no deployment serves it yet**: the verb is admitted and refused
-  `unsupported`, exactly as `observe_cursor` is. (The layout verbs were in that
-  same position until version 2 served them — which is why "unserved" is a
-  statement about a deployment rather than about the wire.) What is
-  decided now, and would otherwise be unstateable, is the *shape* — launch is
-  an attenuable grant verb rather than a request on the realm handle, and the
+  facet, and **the reference core serves it** as of WS-E.1.1: a consented
+  launch forks a realm instance from an operator-written template, under an id
+  the core mints. A deployment that will not host process creation still
+  refuses the verb `unsupported`, exactly as every deployment does for
+  `observe_cursor` — which is why "unserved" is a statement about a deployment
+  rather than about the wire. What the wire decides, and would otherwise be
+  unstateable, is the *shape* — launch is an
+  attenuable grant verb rather than a request on the realm handle, and the
   program name is never on the wire. **Stopping** a realm is not expressible at
   all.
 - **Powerbox** — no system-mediated resource picker; petitions name resources

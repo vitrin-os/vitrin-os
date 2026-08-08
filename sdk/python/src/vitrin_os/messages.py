@@ -15,6 +15,7 @@ Request opcodes (document order):
     vitrin_view:             capture_frame=0
     vitrin_actuator_pointer: move=0, button=1, scroll=2
     vitrin_actuator_text:    type=0
+    vitrin_launcher:         launch=0               (since=2)
     vitrin_layout_focus:     focus=0                (since=2)
     vitrin_layout_arrange:   set_fullscreen=0       (since=2)
 
@@ -24,6 +25,7 @@ Event opcodes (document order):
     vitrin_grant:            resolved=0, refused=1
     vitrin_consent:          state=0
     vitrin_view:             frame_ready=0 (fd_count=1)
+    vitrin_launcher:         launched=0                  (since=2)
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ OP_TYPE = 0
 OP_GET_LAUNCHER = 0
 OP_GET_LAYOUT_FOCUS = 1
 OP_GET_LAYOUT_ARRANGE = 2
+OP_LAUNCH = 0
 OP_FOCUS = 0
 OP_SET_FULLSCREEN = 0
 
@@ -121,6 +124,30 @@ def encode_request_grant(
 def encode_capture_frame(view_oid: int) -> bytes:
     # The request deliberately carries no arguments.
     return MessageEncoder().finish(view_oid, OP_CAPTURE_FRAME)
+
+
+def encode_get_launcher(grant_oid: int, *, facet_id: int) -> bytes:
+    """`vitrin_grant.get_launcher` — a since=2 structural mint.
+
+    Neither reply-bearing nor refusable, like its two layout siblings: it
+    allocates the launch facet and nothing else. A grant that does not hold
+    `realm.launch` still mints fine and refuses on first use, because
+    refusing the mint would turn it into an oracle for what the grant holds.
+    """
+    return MessageEncoder().put_new_id(facet_id).finish(grant_oid, OP_GET_LAUNCHER)
+
+
+def encode_launch(facet_oid: int) -> bytes:
+    """`vitrin_launcher.launch` — no arguments, and that is the security
+    property rather than an economy.
+
+    The realm the grant was petitioned over names a **template**, and the
+    template names the program. A command string off the wire would hand the
+    choice of what the trusted core executes to any principal holding one
+    grant. Selecting *which* program to run is done by petitioning over a
+    different realm, at consent time, in front of the human.
+    """
+    return MessageEncoder().finish(facet_oid, OP_LAUNCH)
 
 
 def encode_get_layout_focus(grant_oid: int, *, facet_id: int) -> bytes:
@@ -270,6 +297,23 @@ class RefusedEvent:
 
 
 @dataclass(frozen=True)
+class LaunchedEvent:
+    """vitrin_launcher.launched — the realm one `launch` created.
+
+    ``realm`` is minted by the core, unique for the life of the session, and
+    usable as :meth:`Connection.get_realm`'s ``name``. **Treat it as
+    opaque**: its internal shape is the server's business, not something a
+    client may parse or predict.
+
+    Launching confers nothing over what was launched — observing or
+    actuating the new realm is a separate petition, seen by the human
+    separately.
+    """
+
+    realm: str
+
+
+@dataclass(frozen=True)
 class ConsentStateEvent:
     """vitrin_consent.state — prompt lifecycle transition."""
 
@@ -297,6 +341,7 @@ Event = (
     | RefusedEvent
     | ConsentStateEvent
     | FrameReadyEvent
+    | LaunchedEvent
 )
 
 
@@ -333,6 +378,10 @@ def _decode_refused(dec: MessageDecoder, fd: int | None) -> RefusedEvent:
     return RefusedEvent(verb=dec.uint(), code=dec.uint(), retry_after_ms=dec.uint())
 
 
+def _decode_launched(dec: MessageDecoder, fd: int | None) -> LaunchedEvent:
+    return LaunchedEvent(realm=dec.string(max_bytes=protocol.MAX_REALM_NAME_BYTES))
+
+
 def _decode_consent_state(dec: MessageDecoder, fd: int | None) -> ConsentStateEvent:
     return ConsentStateEvent(state=dec.uint())
 
@@ -361,11 +410,16 @@ _EVENT_DECODERS: dict[
     "vitrin_grant": {0: (False, _decode_resolved), 1: (False, _decode_refused)},
     "vitrin_consent": {0: (False, _decode_consent_state)},
     "vitrin_view": {0: (True, _decode_frame_ready)},
+    "vitrin_launcher": {0: (False, _decode_launched)},
     # vitrin_realm, vitrin_actuator_pointer, and vitrin_actuator_text carry
     # no events in version 1.
     "vitrin_realm": {},
     "vitrin_actuator_pointer": {},
     "vitrin_actuator_text": {},
+    # vitrin_layout_focus and vitrin_layout_arrange are deliberately
+    # event-free: neither reports what it did (protocol/vitrin-v0.xml).
+    "vitrin_layout_focus": {},
+    "vitrin_layout_arrange": {},
 }
 
 

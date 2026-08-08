@@ -4159,6 +4159,10 @@ pub(crate) mod tests {
                         actuations: &mut |realm, input| routed.push((realm.clone(), input)),
                         grant_realm: Some(&grant_realm),
                         layout: &mut |act| panic!("no layout act expected: {act:?}"),
+                        // Not a launch test; a launch reaching this sink
+                        // would be the bug, so it panics rather than
+                        // silently answering.
+                        launch: &mut |ask| panic!("no launch expected: {ask:?}"),
                     },
                     now,
                     &mut |_principal_frame, _fd| Ok(()),

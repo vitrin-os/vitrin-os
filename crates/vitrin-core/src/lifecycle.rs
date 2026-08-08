@@ -1357,7 +1357,7 @@ mod tests {
     use crate::scene::Scene;
     use crate::shim::ShimServer;
     use crate::spawn::tests::{children_of, mock_shim_bin, ppid_of, scratch, wait_for, DEADLINE};
-    use crate::spawn::{spawn_realm_with_env, SpawnPaths};
+    use crate::spawn::{spawn_realm_with_env, SpawnOrigin, SpawnPaths};
 
     /// The realm view every rig configures its shim at.
     const VIEW_W: u32 = 64;
@@ -1534,8 +1534,14 @@ mod tests {
             // the `command` app stand-in; the fixture flags in `args` ride the
             // app-argument tail, which the mock scans (issue #103).
             let paths = SpawnPaths::under(&self.base, &bin);
-            let mut spawned = spawn_realm_with_env(&realm, &paths, &mut self.recorder, |_| None)
-                .expect("spawn must succeed against a scratch runtime tree");
+            let mut spawned = spawn_realm_with_env(
+                &realm,
+                &paths,
+                &mut self.recorder,
+                SpawnOrigin::Startup,
+                |_| None,
+            )
+            .expect("spawn must succeed against a scratch runtime tree");
             assert!(self.realms.mark_running(spawned.realm_id(), spawned.pid()));
 
             // Bring-up, which is also the readiness gate: a `create_surface`
@@ -1601,8 +1607,14 @@ mod tests {
             let mut shim_argv: Vec<OsString> = vec![OsString::from(command)];
             shim_argv.extend(args.iter().map(OsString::from));
             let paths = SpawnPaths::under_with_shim_argv(&self.base, shim_argv);
-            let spawned = spawn_realm_with_env(&realm, &paths, &mut self.recorder, |_| None)
-                .expect("spawn must succeed against a scratch runtime tree");
+            let spawned = spawn_realm_with_env(
+                &realm,
+                &paths,
+                &mut self.recorder,
+                SpawnOrigin::Startup,
+                |_| None,
+            )
+            .expect("spawn must succeed against a scratch runtime tree");
             assert!(self.realms.mark_running(spawned.realm_id(), spawned.pid()));
             // These tests service the socketpair by hand rather than
             // through an event loop, so the lifecycle keeps the connection
@@ -2620,8 +2632,14 @@ mod tests {
                 OsString::from("exec sleep 300"),
             ],
         );
-        let spawned = spawn_realm_with_env(&realm, &paths, &mut rig.recorder, |_| None)
-            .expect("spawn must succeed against a scratch runtime tree");
+        let spawned = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut rig.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .expect("spawn must succeed against a scratch runtime tree");
         let pid = spawned.pid();
         assert!(proc_state(pid).is_some(), "the shim really started");
 

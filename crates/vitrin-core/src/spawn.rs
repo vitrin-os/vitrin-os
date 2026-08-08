@@ -381,7 +381,8 @@ use rustix::fs::{FileType, Mode, OFlags};
 use vitrin_ipc::paths;
 use vitrin_ipc::{Connection, TransportError};
 
-use crate::grants::RealmId;
+use crate::grants::{GrantId, RealmId};
+use crate::identity::PrincipalIdentity;
 use crate::realm::{untrusted_writer, Realm, SpawnConfig, RESERVED_ENV};
 use crate::recorder::{Event, Recorder};
 use crate::shim::{ShimConfig, ShimServer};
@@ -822,8 +823,37 @@ pub(crate) fn spawn_realm(
     realm: &Realm,
     paths: &SpawnPaths,
     recorder: &mut Recorder,
+    origin: SpawnOrigin<'_>,
 ) -> Result<SpawnedRealm, SpawnError> {
-    spawn_realm_with_env(realm, paths, recorder, |name| std::env::var(name).ok())
+    spawn_realm_with_env(realm, paths, recorder, origin, |name| {
+        std::env::var(name).ok()
+    })
+}
+
+/// **Why the trusted core is forking** -- a required argument of every
+/// spawn, and a required field of both of the flight recorder's spawn
+/// entries (WS-E.1.1, issue #207).
+///
+/// Until `realm_launch` was served there was one answer and it did not have
+/// to be written down: startup read a file the operator had hardened, and
+/// nothing reachable from the wire could make `vitrind` create a process.
+/// That property is gone. What replaces it is consent, a cap, a token
+/// bucket, revocation and this -- and "the journal names who asked" is only
+/// true if the asker cannot be omitted, so it is a parameter with no
+/// default rather than an `Option` a caller may leave `None`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SpawnOrigin<'a> {
+    /// Session startup, from `realm.toml`. No principal and no grant: the
+    /// authority was the operator's write access to the file, which the
+    /// loader audited.
+    Startup,
+    /// An admitted `vitrin_launcher.launch` -- the verifier-canonical
+    /// identity bound at `hello`, and the grant row the chokepoint judged
+    /// the use against.
+    Launch {
+        principal: &'a PrincipalIdentity,
+        grant: GrantId,
+    },
 }
 
 /// [`spawn_realm`] with the core's environment supplied explicitly, so the
@@ -840,27 +870,166 @@ pub(crate) fn spawn_realm_with_env<F>(
     realm: &Realm,
     paths: &SpawnPaths,
     recorder: &mut Recorder,
+    origin: SpawnOrigin<'_>,
     lookup: F,
 ) -> Result<SpawnedRealm, SpawnError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    let result = launch(realm, paths, lookup);
-    match &result {
-        Ok(spawned) => recorder.record(Event::RealmSpawned {
-            realm: realm.id(),
-            pid: spawned.pid(),
-            command: realm.spawn().command(),
-            runtime_dir: spawned.runtime_dir(),
-            env_allow: realm.spawn().env_allow(),
-        }),
-        Err(err) => recorder.record(Event::RealmSpawnFailed {
-            realm: realm.id(),
-            command: realm.spawn().command(),
-            cause_class: err.cause_class(),
-        }),
-    }
+    let (result, record) = spawn_realm_deferring_journal(realm, paths, origin, lookup);
+    record.journal(recorder);
     result
+}
+
+/// [`spawn_realm_with_env`] for the one caller that **cannot lend a
+/// `&mut Recorder` at the moment it forks**: the enforcement chokepoint's
+/// launch sink (WS-E.1.1, issue #207).
+///
+/// A principal-connection dispatch already holds the recorder mutably
+/// through its `ServerCtx`, so a sink that also took one would alias the
+/// same field. The alternative -- handing the chokepoint a recorder -- is
+/// the thing [`crate::enforcement`] is written not to do: the recorder
+/// observes the chokepoint through its return value and never appears
+/// inside it.
+///
+/// **The log is still inescapable**, which is the property the recorder
+/// parameter above exists for. The `Result` and the [`SpawnRecord`] come
+/// out together, the record is `#[must_use]`, and `journal` is the only
+/// thing that consumes it -- so a caller can drop the obligation only by
+/// writing a line the compiler warns about. A future error path added
+/// inside [`launch`] is still covered structurally, because the record is
+/// built from the result rather than at each return.
+pub(crate) fn spawn_realm_deferring_journal<F>(
+    realm: &Realm,
+    paths: &SpawnPaths,
+    origin: SpawnOrigin<'_>,
+    lookup: F,
+) -> (Result<SpawnedRealm, SpawnError>, SpawnRecord)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let result = launch(realm, paths, lookup);
+    let record = SpawnRecord {
+        realm: realm.id().clone(),
+        command: realm.spawn().command().to_path_buf(),
+        env_allow: realm.spawn().env_allow().to_vec(),
+        origin: match origin {
+            SpawnOrigin::Startup => OwnedSpawnOrigin::Startup,
+            SpawnOrigin::Launch { principal, grant } => OwnedSpawnOrigin::Launch {
+                principal: principal.clone(),
+                grant,
+            },
+        },
+        outcome: match &result {
+            Ok(spawned) => Ok((spawned.pid(), spawned.runtime_dir().to_path_buf())),
+            Err(err) => Err(err.cause_class()),
+        },
+        journaled: false,
+    };
+    (result, record)
+}
+
+/// [`SpawnOrigin`] owned, for the moment a [`SpawnRecord`] outlives the
+/// borrow its spawn was made under.
+#[derive(Debug, Clone)]
+enum OwnedSpawnOrigin {
+    Startup,
+    Launch {
+        principal: PrincipalIdentity,
+        grant: GrantId,
+    },
+}
+
+/// **The journal entry one spawn owes**, when the spawn happened somewhere
+/// the recorder could not be borrowed. See
+/// [`spawn_realm_deferring_journal`].
+/// # Why a `Drop` guard and not only `#[must_use]`
+///
+/// `#[must_use]` is kept, but it is the weaker half and it is why this hole
+/// existed: the attribute fires on an *expression* whose value is discarded,
+/// and says nothing at all once the value is moved into a struct field inside
+/// a `Vec`. That is exactly where this record lives (`session::PendingLaunch`),
+/// and a dispatch turn that ended on a transport fault returned before the
+/// launches were applied, dropping the whole vector -- forked processes,
+/// unjournaled, with the compiler perfectly happy. Issue #207's review found
+/// it; the doc on this type had claimed the log was "inescapable" and it was
+/// not.
+///
+/// [`Drop`] closes it for good, because a drop is the one thing every escape
+/// path has in common. Debug builds abort on the spot; release builds log at
+/// `error` and carry on, because losing a journal line is bad but killing a
+/// live session over it is worse.
+#[must_use = "a spawn that is never journaled is exactly the gap the recorder parameter on \
+              spawn_realm_with_env exists to close: what the trusted core executed is the \
+              most security-relevant act of a session"]
+pub(crate) struct SpawnRecord {
+    realm: RealmId,
+    command: PathBuf,
+    env_allow: Vec<String>,
+    origin: OwnedSpawnOrigin,
+    /// `Ok((pid, runtime_dir))` or `Err(cause_class)` -- exactly what the
+    /// two entries below need, and nothing that could be used to reconstruct
+    /// a spawn that did not happen.
+    outcome: Result<(u32, PathBuf), &'static str>,
+    /// Set by [`Self::journal`] just before the entry is written, and read
+    /// only by [`Drop`]. The obligation is discharged, not merely intended.
+    journaled: bool,
+}
+
+impl Drop for SpawnRecord {
+    fn drop(&mut self) {
+        if self.journaled {
+            return;
+        }
+        // A forked process with no journal entry is the one outcome the
+        // launch verb's whole accountability story rules out: "who started
+        // this app" must always have an answer.
+        tracing::error!(
+            realm = %self.realm,
+            command = %self.command.display(),
+            "a spawn record was dropped without being journaled -- the flight recorder \
+             cannot say who started this realm"
+        );
+        debug_assert!(
+            false,
+            "a spawn was dropped without being journaled ({}): every escape path from a \
+             fork must write its entry",
+            self.realm
+        );
+    }
+}
+
+impl SpawnRecord {
+    /// Write this spawn's entry. Consumes the record, so it cannot be
+    /// written twice and cannot be kept for later.
+    pub fn journal(mut self, recorder: &mut Recorder) {
+        // Before the write, so the `Drop` guard below cannot fire for a record
+        // that is in the middle of discharging its obligation.
+        self.journaled = true;
+        let origin = match &self.origin {
+            OwnedSpawnOrigin::Startup => SpawnOrigin::Startup,
+            OwnedSpawnOrigin::Launch { principal, grant } => SpawnOrigin::Launch {
+                principal,
+                grant: *grant,
+            },
+        };
+        match &self.outcome {
+            Ok((pid, runtime_dir)) => recorder.record(Event::RealmSpawned {
+                realm: &self.realm,
+                pid: *pid,
+                origin,
+                command: &self.command,
+                runtime_dir,
+                env_allow: &self.env_allow,
+            }),
+            Err(cause_class) => recorder.record(Event::RealmSpawnFailed {
+                realm: &self.realm,
+                origin,
+                command: &self.command,
+                cause_class,
+            }),
+        }
+    }
 }
 
 /// The spawn itself. Separated from the journaling wrapper above so no
@@ -1755,9 +1924,13 @@ pub(crate) mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             let paths = self.paths();
-            let mut spawned = spawn_realm_with_env(&realm, &paths, &mut self.recorder, |name| {
-                core_env.get(name).cloned()
-            })
+            let mut spawned = spawn_realm_with_env(
+                &realm,
+                &paths,
+                &mut self.recorder,
+                SpawnOrigin::Startup,
+                |name| core_env.get(name).cloned(),
+            )
             .expect("spawn must succeed against a scratch runtime tree");
             wait_for_exec(spawned.pid(), &bin);
 
@@ -1866,8 +2039,14 @@ pub(crate) mod tests {
         let app = PathBuf::from("/bin/true");
         let realm = realm_with_spawn("realm-0", &app, &["--serve".to_string()], &[]);
         let paths = SpawnPaths::under(&h.base, &shim);
-        let mut spawned = spawn_realm_with_env(&realm, &paths, &mut h.recorder, |_| None)
-            .expect("spawn must succeed against a scratch runtime tree");
+        let mut spawned = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut h.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .expect("spawn must succeed against a scratch runtime tree");
 
         // The direct child is the SHIM, not `/bin/true`: had the core exec'd
         // `command` directly, `/proc/<pid>/exe` would never flip to the shim
@@ -2054,7 +2233,8 @@ pub(crate) mod tests {
         // `spawn_realm` (not `spawn_realm_with_env`/`spawn_mock`) is kept on
         // purpose: this test exists to exercise the production
         // `std::env::var` ambient path that the *_with_env variants bypass.
-        let mut spawned = spawn_realm(&realm, &paths, &mut h.recorder).expect("spawn");
+        let mut spawned =
+            spawn_realm(&realm, &paths, &mut h.recorder, SpawnOrigin::Startup).expect("spawn");
         wait_for_exec(spawned.pid(), &bin);
 
         // Affirmative-liveness gate before any /proc read: only after the
@@ -2462,7 +2642,10 @@ pub(crate) mod tests {
     fn refused_spawn_with_shim(label: &str, realm: &Realm, shim: &Path) -> (SpawnError, Json) {
         let mut h = Harness::new(label);
         let paths = SpawnPaths::under(&h.base, shim);
-        let err = spawn_realm_with_env(realm, &paths, &mut h.recorder, |_| Some("hostile".into()))
+        let err =
+            spawn_realm_with_env(realm, &paths, &mut h.recorder, SpawnOrigin::Startup, |_| {
+                Some("hostile".into())
+            })
             .expect_err("this spawn must be refused");
         assert!(
             !h.base.join("vitrin-0/realm-0").exists(),
@@ -2548,8 +2731,14 @@ pub(crate) mod tests {
         // A read-only runtime base: the realm's directory cannot be made.
         fs::set_permissions(&h.base, fs::Permissions::from_mode(0o500)).unwrap();
         let paths = h.paths();
-        let err = spawn_realm_with_env(&realm, &paths, &mut h.recorder, |_| None)
-            .expect_err("an unwritable runtime tree must refuse the spawn");
+        let err = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut h.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .expect_err("an unwritable runtime tree must refuse the spawn");
         assert!(matches!(err, SpawnError::RuntimeDir { .. }), "{err}");
         assert_eq!(err.cause_class(), "runtime_dir");
         fs::set_permissions(&h.base, fs::Permissions::from_mode(0o700)).unwrap();
@@ -2619,6 +2808,52 @@ pub(crate) mod tests {
             paths.realm_dir("realm-0").unwrap(),
             paths.realm_lock("realm-0").unwrap(),
         )
+    }
+
+    /// **A spawn record that is dropped without being journaled is caught.**
+    ///
+    /// The structural half of issue #207's accountability claim, and the half
+    /// that was missing. `#[must_use]` is on this type and did nothing: it
+    /// fires when an *expression's* value is discarded and says nothing once
+    /// the value is moved into a struct field inside a `Vec` — which is
+    /// exactly where a pending launch keeps it. A dispatch turn ending on a
+    /// transport fault returned early, dropped the vector, and left a forked
+    /// process with no journal entry naming who asked for it.
+    ///
+    /// This pins the [`Drop`] guard rather than that one call path, because a
+    /// drop is what every escape path has in common: a future early return
+    /// nobody has written yet is caught by the same assertion.
+    ///
+    /// **Debug-only, and that is the guard's design rather than a gap in the
+    /// test.** `Drop` aborts under `debug_assert!` and merely logs at `error`
+    /// in release, because losing a journal line is bad and killing a live
+    /// desktop session over it is worse. So this test cannot run in release —
+    /// and `cargo test --release` is exactly where it first went red, because
+    /// a local `cargo test --workspace` is debug only while CI runs both.
+    /// Do not "fix" this by deleting the `cfg`; the release half of the guard
+    /// is a log line, and asserting on one would cost more machinery than it
+    /// is worth.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "dropped without being journaled")]
+    fn a_spawn_record_dropped_without_journaling_is_caught() {
+        let _fd = fd_lock();
+        let base = scratch();
+        // A command that cannot possibly spawn: the record's outcome is `Err`,
+        // which still owes a `realm_spawn_failed` entry. A failed spawn is
+        // exactly as accountable as a successful one — "the core tried to run
+        // this" is the fact, and it is the one an attacker would most like
+        // missing from the log.
+        let realm = crate::realm::tests::realm_with_spawn(
+            "realm-0",
+            Path::new("/nonexistent/vitrin-spawn-record-drop-test"),
+            &[],
+            &[],
+        );
+        let paths = SpawnPaths::under(&base, Path::new("/vitrin-shim-placeholder"));
+        let (_result, record) =
+            spawn_realm_deferring_journal(&realm, &paths, SpawnOrigin::Startup, |_| None);
+        drop(record);
     }
 
     #[test]
@@ -2836,8 +3071,14 @@ pub(crate) mod tests {
         let bin = mock_shim_bin();
         let realm = realm_with_spawn("realm-0", &bin, &["--serve".to_string()], &[]);
         let paths = h.paths();
-        let spawned = spawn_realm_with_env(&realm, &paths, &mut h.recorder, |_| None)
-            .expect("spawn must succeed against a scratch runtime tree");
+        let spawned = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut h.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .expect("spawn must succeed against a scratch runtime tree");
         let pid = spawned.pid();
         wait_for_exec(pid, &bin);
         assert!(

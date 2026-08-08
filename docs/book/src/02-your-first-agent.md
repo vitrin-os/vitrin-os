@@ -237,8 +237,9 @@ from vitrin_os import (NotGranted, GrantExpired, Revoked, RateLimited,
 | `OperationFailed` | The core tried and could not. | Maybe. |
 
 There is a ninth, `AtCapacity`, and it is missing from the list above on
-purpose: it is only ever produced by `realm_launch`, which no deployment
-serves, so an actuation can never see it.
+purpose: it is only ever produced by `realm.launch`, so an actuation can never
+see it. If you hold a launch grant, it means the session is already running as
+many realms as it will, and retrying is legal once one exits.
 
 `Revoked` and `Preempted` are the two that matter for behaving well. Both
 mean a human intervened, and an agent that hammers through them is exactly

@@ -69,6 +69,11 @@ PROPERTY_GATES=(
   test_attention.py             # the human's attention key lifts `preempted` for
                                 # exactly one layout use, and only for principals
                                 # holding layout authority (#232)
+  test_launch.py                # a consented `realm_launch` grant makes the
+                                # TRUSTED CORE fork a process, and the journal
+                                # names who asked (#207). The one gate covering
+                                # a wire-reachable path into `spawn.rs`, so its
+                                # silent absence is the costliest of any here.
 )
 missing=()
 for gate in "${MILESTONE_GATES[@]}" "${PROPERTY_GATES[@]}"; do

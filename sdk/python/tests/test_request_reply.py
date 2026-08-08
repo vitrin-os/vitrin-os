@@ -8,6 +8,7 @@ import pytest
 import flows
 import vectors
 from vitrin_os import (
+    AtCapacity,
     ConsentState,
     GrantDenied,
     LayoutHeld,
@@ -310,6 +311,75 @@ def test_layout_held_outcome_decodes_and_keeps_the_connection(server) -> None:
     assert excinfo.value.outcome == 6
     assert not isinstance(excinfo.value, ServerContractViolation)
     assert not conn.closed
+    conn.sync()
+    conn.close()
+
+
+def test_launch_is_reply_bearing_and_returns_the_servers_realm_id(server) -> None:
+    """`launch` carries no arguments and its terminal names the new realm.
+
+    Both halves are the point. The request is empty on the wire because the
+    grant's realm names a template and the template names the program — a
+    command string here would hand the choice of what the trusted core
+    executes to any principal holding one grant. And the reply is a
+    *terminal*: one `launched` per `launch`, in request order, whose `realm`
+    the client treats as opaque and passes straight back to `get_realm`.
+    """
+    launch_verbs = int(Verb.REALM_LAUNCH)
+    server.run(
+        [
+            *flows.handshake_steps(),
+            ("expect", flows.get_realm_frame()),
+            ("expect", flows.request_grant_frame(verbs=launch_verbs)),
+            ("send", flows.resolved_frame(outcome=0, verbs=launch_verbs)),
+            ("expect", flows.get_launcher_frame()),
+            ("expect", flows.launch_frame()),
+            ("send", flows.launched_frame("kiosk.1")),
+            # No second mint: the facet is remembered, exactly as the layout
+            # facets are.
+            ("expect", flows.launch_frame()),
+            ("send", flows.launched_frame("kiosk.2")),
+            ("expect", encode_sync(1)),
+            ("send", flows.done_frame(1)),
+        ]
+    )
+    conn = _connect(server)
+    grant = conn.request_grant(verbs=Verb.REALM_LAUNCH).await_consent()
+    assert grant.launch() == "kiosk.1"
+    assert grant.launch() == "kiosk.2"
+    conn.sync()
+    conn.close()
+
+
+def test_a_refused_launch_raises_the_typed_exception_and_keeps_the_socket(server) -> None:
+    """`capacity` is a launch's own refusal and reaches the caller typed.
+
+    It arrives on the **grant**, not on the launch facet, like every other
+    refusal — and it is recoverable, so the connection survives and a later
+    launch on the same grant is served.
+    """
+    launch_verbs = int(Verb.REALM_LAUNCH)
+    server.run(
+        [
+            *flows.handshake_steps(),
+            ("expect", flows.get_realm_frame()),
+            ("expect", flows.request_grant_frame(verbs=launch_verbs)),
+            ("send", flows.resolved_frame(outcome=0, verbs=launch_verbs)),
+            ("expect", flows.get_launcher_frame()),
+            ("expect", flows.launch_frame()),
+            ("send", flows.refused_frame(verb=int(Verb.REALM_LAUNCH), code=8)),
+            ("expect", flows.launch_frame()),
+            ("send", flows.launched_frame("kiosk.1")),
+            ("expect", encode_sync(1)),
+            ("send", flows.done_frame(1)),
+        ]
+    )
+    conn = _connect(server)
+    grant = conn.request_grant(verbs=Verb.REALM_LAUNCH).await_consent()
+    with pytest.raises(AtCapacity):
+        grant.launch()
+    assert not conn.closed
+    assert grant.launch() == "kiosk.1"
     conn.sync()
     conn.close()
 

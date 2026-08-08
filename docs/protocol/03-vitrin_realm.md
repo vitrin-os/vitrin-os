@@ -63,17 +63,16 @@ Launch is instead the grant verb
 [`realm_launch`](./04-vitrin_grant.md#verb), exercised through the
 [`vitrin_launcher`](./16-vitrin_launcher.md) facet that
 [`vitrin_grant.get_launcher`](./04-vitrin_grant.md#get_launcher) mints. Going
-through a grant is what would buy consent, expiry, revocation, journaling and
-the rate ceiling with no new machinery: a launch petition is the shape that
-puts a prompt naming the principal and the template in front of the human, and
-that ties the authority's death to the grant's.
+through a grant is what buys consent, expiry, revocation, journaling and the
+rate ceiling with no new machinery: a launch petition is the shape that puts a
+prompt naming the principal, the template and the template's program in front
+of the human, and that ties the authority's death to the grant's.
 
-**Served status.** No such prompt happens today, and none can: `realm_launch`
-is defined but **unserved by the reference core**, like `observe_cursor`, so a
-petition naming it is refused `unsupported` at admission — before a prompt
-exists to show. What is decided now is the *design*; what is served is
-nothing. (The layout verbs were in this same position and no longer are — the
-reference core serves both as of WS-E.1.4.) See [defined but
+**Served status.** The reference core serves `realm_launch` as of WS-E.1.1, so
+that prompt is a thing a human really sees. Whether any *particular*
+deployment serves it stays a deployment property: one that will not host
+process creation refuses the verb `unsupported` at admission, exactly as every
+deployment still does for `observe_cursor`. See [defined but
 unserved](./04-vitrin_grant.md#defined-but-unserved).
 
 A realm handle *is* still how such a petition is addressed — it names a realm

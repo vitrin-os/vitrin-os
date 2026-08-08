@@ -39,6 +39,34 @@
 //! | `command` | string | **yes** | absolute path of the program the realm launches (P1.5.2 execs it); audited at load, see below |
 //! | `args` | array of strings | no (default `[]`) | arguments **after** `argv[0]`; the core supplies `argv[0]` itself from `command` |
 //! | `env_allow` | array of strings | no (default `[]`) | names of environment variables passed through from the core's own environment; see below |
+//! | `autostart` | boolean | no (default `true`) | whether startup forks this realm's app. `false` makes the realm a **template**: addressable and petitionable, never itself running -- see below |
+//!
+//! ## `autostart = false`: a template (WS-E.1.1, issue #207)
+//!
+//! A realm declared `autostart = false` is loaded in
+//! [`RealmState::Template`] and [`crate::session::start_realm_in`] does not
+//! fork it. It exists to be the **subject of a `realm_launch` grant**: a
+//! principal petitions over the template, a human sees the template's
+//! `command` on the consent card, and each admitted
+//! `vitrin_launcher.launch` forks one *instance* of that command.
+//!
+//! Three consequences, all deliberate:
+//!
+//! - A template **admits petitions** ([`Realm::admits_petitions`]) -- it has
+//!   to, or the authority to launch it could never be petitioned for.
+//! - A template **never paints**. An `observe` grant over one refuses
+//!   `no_surface` forever, which is authority over nothing: inert rather
+//!   than dangerous, and the IDL says so at `vitrin_launcher.launch`.
+//! - **At least one realm must autostart** ([`RealmRegistry::from_specs`]).
+//!   A session of nothing but templates comes up with no app, no output
+//!   binding and nothing for a human to look at; refusing it at load is the
+//!   same posture as refusing an empty file.
+//!
+//! `autostart` is *not* what makes a realm launchable. Any realm in the
+//! registry names a program, so a `realm_launch` grant over a running realm
+//! launches a second instance of that realm's app. The key answers one
+//! question only -- does **startup** fork it -- which is why it is a
+//! boolean and not a `kind = "template"` enum: there is no second axis.
 //!
 //! ## `realm-0` is the IDL's name and stays mandatory (WS-E.1.2)
 //!
@@ -79,6 +107,31 @@
 //! uniqueness across a session a property of a text file, which is one
 //! authority too many for something that also names a private runtime
 //! directory.
+//!
+//! The split is enforced rather than described, in two places, and both are
+//! in [`validate_realm_id`] -- so a *declared* id that could collide with a
+//! *minted* one is refused at load and the collision is unrepresentable
+//! afterwards:
+//!
+//! 1. **A declared id may not look like an instance id.** The minted shape
+//!    is `<declared>.<decimal>`, and each realm claims both `<id>` and
+//!    `<id>.lock` in the flat runtime tree
+//!    ([`reject_runtime_name_collisions`]), so a declared `foo.1` would own
+//!    minted `foo.1`'s directory and a declared `foo.1.lock` would own its
+//!    lock. Both are refused: a declared id may not end in `.` followed by
+//!    digits, with or without a trailing `.lock`.
+//! 2. **A declared id must leave room for the suffix.** The wire caps a
+//!    realm id at 64 bytes and `launched` has to carry the minted id
+//!    *through* that cap, so a declared id is capped at
+//!    `64 - `[`MAX_INSTANCE_SUFFIX`] bytes. Without this, minting could
+//!    produce an id the wire cannot express and a launch would fail
+//!    `internal` for a reason the operator could have been told at load.
+//!
+//! Uniqueness among minted ids is then a counter, not a search:
+//! [`RealmRegistry::mint_instance`] never reissues a number for the life of
+//! the session, and the resulting id is a [`MintedRealmId`] -- a type
+//! nothing outside this module can construct, so "the id came off the wire"
+//! is a compile error rather than a review note.
 //!
 //! ## The environment allowlist: names, not pairs, and default-deny
 //!
@@ -357,6 +410,7 @@
 //! directory specification, to `$HOME/.config/vitrin/realm.toml`. That is
 //! the same directory `principals.toml` is conventionally read from.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -556,9 +610,20 @@ pub(crate) const CONFIG_FILE_NAME: &str = "realm.toml";
 /// deployment is at its realm capacity" -- which exists precisely because
 /// the answer is a policy, not a fault.
 ///
-/// It is a *startup* bound today: realms come only from `realm.toml`, so
-/// the cap is enforced by the loader ([`too_many_realms`]) rather than at
-/// launch time.
+/// **It is no longer only a startup bound** (WS-E.1.1, issue #207). It was,
+/// while realms came only from `realm.toml`; now [`too_many_realms`] is one
+/// of *two* enforcement sites, and the second is the one the paragraph
+/// above was written for. `vitrin_launcher.launch` refuses `capacity` when
+/// [`RealmRegistry::capacity_used`] has reached this number, so the
+/// fd/memory/process bill measured above is what a launch grant is bounded
+/// by rather than a bound only an operator's own file could hit.
+///
+/// The two sites count different things and must: the loader counts
+/// `[[realm]]` tables, because it is judging a file; the launch path counts
+/// realms that are **not** terminal, because an exited realm holds no shim,
+/// no descriptors and no pixels, and charging a session for the sixteen
+/// apps it has already closed would make the verb useless after one
+/// afternoon.
 pub(crate) const MAX_REALMS: usize = 16;
 
 /// Environment variable names `env_allow` may not carry, each paired with
@@ -650,6 +715,22 @@ impl SpawnConfig {
         &self.env_allow
     }
 
+    /// **The one program name a consent prompt may render** (WS-E.1.1).
+    ///
+    /// [`crate::consent::PromptContent`] holds no free-text field, so that
+    /// "an agent cannot put a glyph on screen" is a property of a type
+    /// rather than a rule someone keeps applying. A `realm_launch` prompt
+    /// has to name the program the human is approving the launching of, and
+    /// [`AuditedCommand`] is how that is done without reopening the door: it
+    /// wraps a `PathBuf` whose only source is a [`SpawnConfig`], and a
+    /// `SpawnConfig`'s only source is [`validate_realm`] reading an
+    /// operator-owned, not-group/other-writable `realm.toml` whose
+    /// `command` passed [`audit_spawn_target`]. There is no constructor
+    /// taking a wire string, in this module or any other.
+    pub fn audited_command(&self) -> AuditedCommand {
+        AuditedCommand(self.command.clone())
+    }
+
     /// The inherited half of the app's environment: each allow-listed name
     /// that `lookup` resolves, in allowlist order. Names the lookup does
     /// not resolve are skipped (module docs: an unset variable is a
@@ -671,6 +752,56 @@ impl SpawnConfig {
     }
 }
 
+/// A program path the core itself validated, carried where a bare
+/// `PathBuf` would be indistinguishable from client text.
+///
+/// The private field is the whole point: it is constructed at exactly one
+/// site, [`SpawnConfig::audited_command`], whose receiver can only have come
+/// out of `realm.toml`. See that method for the argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuditedCommand(PathBuf);
+
+impl AuditedCommand {
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// A command for tests that do not load a config file. Deliberately
+    /// `#[cfg(test)]`: a release build has exactly one constructor, and a
+    /// second one behind a feature flag would be a second way for a string
+    /// to reach a consent card.
+    #[cfg(test)]
+    pub fn for_test(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+}
+
+/// **A realm id the core minted for a launch instance** (WS-E.1.1, issue
+/// #207): the only thing [`crate::enforcement`] will put in a
+/// `vitrin_launcher.launched` event.
+///
+/// A newtype with a private field and exactly one constructor,
+/// [`RealmRegistry::mint_instance`], because "instance ids are minted by the
+/// core, never supplied" is otherwise a rule a reviewer has to keep
+/// re-checking against a `String` that looks like every other `String`. As a
+/// type it is a compile error: the launch arm of the chokepoint can only
+/// answer with a value that came out of the registry, and no wire decode
+/// produces one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MintedRealmId(RealmId);
+
+impl MintedRealmId {
+    pub fn as_realm_id(&self) -> &RealmId {
+        &self.0
+    }
+}
+
+impl fmt::Display for MintedRealmId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// A realm's lifecycle state. [`Realm::admits_petitions`] is where every
 /// variant decides vacancy (module docs), and it is the only place that has
 /// to change when a variant is added.
@@ -678,6 +809,17 @@ impl SpawnConfig {
 pub(crate) enum RealmState {
     /// Described by `realm.toml` and addressable; no app process yet.
     Configured,
+    /// **A template** (WS-E.1.1): declared `autostart = false`, so startup
+    /// never forks it and nothing ever will -- it is not a realm waiting to
+    /// run, it is the *configuration* a `vitrin_launcher.launch` forks
+    /// instances from.
+    ///
+    /// Distinct from [`RealmState::Configured`], which is a realm on its way
+    /// to [`RealmState::Running`] and reaches it within one startup. Folding
+    /// the two would make "this realm has no app yet" and "this realm will
+    /// never have an app" the same state, and the flight recorder could then
+    /// not say which of the two a `no_surface` refusal came from.
+    Template,
     /// The realm's shim has been forked and `exec`ed ([`crate::spawn`]):
     /// the core holds its end of the identity socketpair and this pid is
     /// the shim. Says nothing about whether the app has painted -- that
@@ -703,6 +845,15 @@ pub(crate) struct Realm {
     id: RealmId,
     spawn: SpawnConfig,
     state: RealmState,
+    /// The **declared** realm this one was minted from, or `None` for a
+    /// realm `realm.toml` declared itself (WS-E.1.1).
+    ///
+    /// Read by [`RealmRegistry::mint_instance`] so an instance launched from
+    /// an instance is still named after the *template*: `foo.1` launching
+    /// again yields `foo.9`, never `foo.1.9`. Without it, ids would nest and
+    /// the 64-byte wire bound would become a function of how many times an
+    /// agent had launched.
+    template: Option<RealmId>,
 }
 
 impl Realm {
@@ -721,6 +872,25 @@ impl Realm {
         self.state
     }
 
+    /// The **declared** realm whose configuration this realm runs: itself,
+    /// for a realm `realm.toml` declared, and its template for an instance
+    /// [`RealmRegistry::mint_instance`] created.
+    fn template_root(&self) -> &RealmId {
+        self.template.as_ref().unwrap_or(&self.id)
+    }
+
+    /// Whether this realm counts against [`MAX_REALMS`] right now: every
+    /// state but the terminal one.
+    ///
+    /// A template counts even though it holds no process: it is a row the
+    /// operator declared, and the loader's cap already counted it. An
+    /// `Exited` realm does not -- it holds no shim, no descriptors and no
+    /// pixels, and keeping it in the cap would mean a session that launched
+    /// and closed sixteen apps could never launch again.
+    fn occupies_capacity(&self) -> bool {
+        !matches!(self.state, RealmState::Exited { .. })
+    }
+
     /// **The vacancy predicate** (module docs): may a petition naming this
     /// realm be admitted, or is the realm vacant and its petitions bound to
     /// resolve `unavailable`? The single place realm state becomes a
@@ -733,6 +903,28 @@ impl Realm {
             // enforcement chokepoint (`no_surface`), never a lie about the
             // realm's existence.
             RealmState::Configured => true,
+            // **A template** (WS-E.1.1): `true`, and it is the one arm
+            // where that answer is not about painting at all.
+            //
+            // A template never runs, so on the `no_surface`/`unavailable`
+            // reading above it looks like the `Exited` case -- it will never
+            // paint either. It is not: `unavailable` is an *addressing*
+            // answer, and a template is exactly the thing a `realm_launch`
+            // petition has to be able to address. Answering `unavailable`
+            // here would make the launch verb unpetitionable over the only
+            // realms it is meant for, and the IDL states the shape this arm
+            // produces in as many words: a template "is addressable but
+            // never itself paints", and a grant to observe one "refuses
+            // no_surface forever, which is authority over nothing rather
+            // than authority over something dangerous".
+            //
+            // The difference from `Exited` is what an agent should do next.
+            // `unavailable` says stop asking; a template says ask, and if
+            // what you asked for was `observe` you will hold authority that
+            // never yields a frame. Fail-closed is untouched either way --
+            // the chokepoint still refuses every capture and every
+            // actuation over a realm with no live view.
+            RealmState::Template => true,
             // Running is the same answer for the same reason, one step
             // further along: an app that has started but not yet committed
             // a surface is still merely unpainted. The petition-time answer
@@ -779,6 +971,25 @@ pub(crate) struct RealmRegistry {
     /// Keyed by id, so lookup is by the name the wire carries and
     /// enumeration is deterministic.
     realms: BTreeMap<RealmId, Realm>,
+    /// The next instance number [`Self::mint_instance`] will issue --
+    /// **session-global, monotonic, never reset** (WS-E.1.1).
+    ///
+    /// Session-global rather than per template because uniqueness is the
+    /// only property it owes and one counter gives it across every
+    /// template at once; monotonic and never reused because an exited
+    /// realm keeps its id for the life of the session (an `unavailable`
+    /// that later became a live realm would make the answer a lie), so a
+    /// per-template counter that reset on exit would reissue a name.
+    ///
+    /// A [`Cell`] because minting happens where the registry is borrowed
+    /// **shared**: the chokepoint's launch sink is built beside a
+    /// `ServerCtx` that already holds `&RealmRegistry` for petition
+    /// admission, and the alternative is a second counter living outside
+    /// the registry -- which would put the session's naming authority in
+    /// two places, exactly the thing the module docs above say must not
+    /// happen. Nothing else in this type is interior-mutable, and the cell
+    /// is written by one method.
+    next_instance: Cell<u64>,
 }
 
 impl RealmRegistry {
@@ -829,7 +1040,16 @@ impl RealmRegistry {
             let realm = Realm {
                 id: spec.id.clone(),
                 spawn: spec.spawn,
-                state: RealmState::Configured,
+                // `autostart = false` is a template: never forked by
+                // startup, still addressable and petitionable (module docs).
+                state: if spec.autostart {
+                    RealmState::Configured
+                } else {
+                    RealmState::Template
+                },
+                // Declared, so it *is* a template root; only
+                // [`Self::mint_instance`] sets this.
+                template: None,
             };
             if realms.insert(spec.id.clone(), realm).is_some() {
                 return Err(ErrorKind::Invalid(format!(
@@ -837,6 +1057,22 @@ impl RealmRegistry {
                     spec.id.as_str()
                 )));
             }
+        }
+        // At least one realm has to actually come up (module docs,
+        // `autostart = false`). Checked on the assembled set for the same
+        // reason `realm-0`'s membership is: it is a property of the file,
+        // and pointing at one table would name an innocent one.
+        if !realms
+            .values()
+            .any(|realm| realm.state != RealmState::Template)
+        {
+            return Err(ErrorKind::Invalid(
+                "every [[realm]] sets `autostart = false`, so this session would come up with \
+                 no app running, no realm on the output and nothing for a human to look at. \
+                 At least one realm must autostart; a template is something to launch FROM, \
+                 not a session"
+                    .into(),
+            ));
         }
         // The membership rule that replaced the version-0 id pin (module
         // docs). Checked on the assembled set rather than per table,
@@ -858,7 +1094,10 @@ impl RealmRegistry {
             )));
         }
         reject_runtime_name_collisions(&realms)?;
-        Ok(Self { realms })
+        Ok(Self {
+            realms,
+            next_instance: Cell::new(1),
+        })
     }
 
     /// **The petition-time existence query** ([`crate::petitions`]'s
@@ -925,6 +1164,115 @@ impl RealmRegistry {
     pub fn len(&self) -> usize {
         self.realms.len()
     }
+
+    /// **How many realms this session currently holds against
+    /// [`MAX_REALMS`]** (WS-E.1.1): every realm but the terminal ones.
+    ///
+    /// This, not [`Self::len`], is what a launch is refused `capacity`
+    /// against. `len` counts rows, and rows outlive realms on purpose --
+    /// an exited realm keeps its id so `unavailable` keeps meaning *not
+    /// ever* -- so a session that started and closed sixteen apps would
+    /// otherwise be permanently at its cap while holding no processes at
+    /// all.
+    pub fn capacity_used(&self) -> usize {
+        self.realms
+            .values()
+            .filter(|realm| realm.occupies_capacity())
+            .count()
+    }
+
+    /// **Mint the id of a new instance of `template`** -- the core's half
+    /// of the two naming authorities (module docs), and the only
+    /// constructor of [`MintedRealmId`] there is.
+    ///
+    /// `None` when `template` is not a realm this registry holds, which is
+    /// unreachable from the launch path (the id comes from a grant row,
+    /// and rows are only ever minted over realms the registry resolved)
+    /// and is surfaced as the IDL's `internal` rather than guessed at.
+    ///
+    /// The id is `<template-root>.<n>`: the *declared* realm's id, so an
+    /// instance launched from an instance does not nest
+    /// ([`Realm::template_root`]), and a session-global counter that never
+    /// reissues a number. It cannot collide with a declared id, and it
+    /// cannot exceed the wire's 64-byte realm-id bound -- both because
+    /// [`validate_realm_id`] refused, at load, every declared id that
+    /// would have made either possible. The `debug_assert` below is the
+    /// tripwire for that reasoning, not the guard: the guard is at load.
+    pub fn mint_instance(&self, template: &RealmId) -> Option<MintedRealmId> {
+        let realm = self.realms.get(template)?;
+        let n = self.next_instance.get();
+        self.next_instance.set(n.saturating_add(1));
+        let id = format!("{}.{n}", realm.template_root());
+        debug_assert!(
+            validate_transport_realm_id(&id).is_ok()
+                && !self.realms.contains_key(&RealmId::new(&id)),
+            "minted realm id {id:?} is illegal or already taken; the load-time rules in \
+             validate_realm_id are supposed to make both unreachable"
+        );
+        Some(MintedRealmId(RealmId::new(id)))
+    }
+
+    /// Enter a minted instance of `template` into the registry, in
+    /// [`RealmState::Configured`] and ready for [`Self::mark_running`].
+    ///
+    /// Takes a [`MintedRealmId`] rather than a [`RealmId`], which is what
+    /// makes "a client cannot name the realm it creates" structural: there
+    /// is no other way to obtain the argument, and no wire decode produces
+    /// one.
+    ///
+    /// Returns `false` (and inserts nothing) when the template is gone --
+    /// unreachable, and fail-closed rather than fabricating a realm with
+    /// no configuration.
+    pub fn insert_instance(&mut self, template: &RealmId, id: MintedRealmId) -> bool {
+        let Some(realm) = self.instance_of(template, &id) else {
+            return false;
+        };
+        self.realms.insert(realm.id.clone(), realm);
+        true
+    }
+
+    /// **The [`Realm`] an instance of `template` would be, without entering
+    /// it in the registry.**
+    ///
+    /// The launch path forks *before* it registers, and deliberately: a
+    /// registry that gained a row for a fork that then failed would answer
+    /// petitions about a realm that never existed, and the client would
+    /// have been told `internal` about the same id. So the spawn is handed
+    /// this value -- the template's configuration under the instance's id,
+    /// which is exactly what the spawn needs (it reads `spawn()` and
+    /// derives every path from `id()`).
+    ///
+    /// `None` when the template is gone; unreachable from the launch path,
+    /// where the id came from a grant row.
+    pub fn instance_of(&self, template: &RealmId, id: &MintedRealmId) -> Option<Realm> {
+        let parent = self.realms.get(template)?;
+        Some(Realm {
+            id: id.as_realm_id().clone(),
+            spawn: parent.spawn.clone(),
+            state: RealmState::Configured,
+            // The *declared* root, never the realm launched from: see
+            // [`Realm::template`].
+            template: Some(parent.template_root().clone()),
+        })
+    }
+
+    /// Drop an instance whose spawn never got as far as serving.
+    ///
+    /// The narrow inverse of [`Self::insert_instance`], for the one window
+    /// the launch path has: the fork succeeded (so the client already holds
+    /// its `launched`), and the attach sequence after it did not. Removing
+    /// the row rather than marking it `Exited` keeps the flight recorder
+    /// honest -- `Exited` carries the pid of a process that served the
+    /// realm, and this one never did -- and costs the client nothing: an
+    /// unknown name and a vacant realm are one answer at petition time by
+    /// design.
+    ///
+    /// **Instances only.** It takes a [`MintedRealmId`], so no declared
+    /// realm can be removed through it and the registry stays what
+    /// `realm.toml` said for the life of the session.
+    pub fn remove_instance(&mut self, id: &MintedRealmId) {
+        self.realms.remove(id.as_realm_id());
+    }
 }
 
 /// One validated `[[realm]]` table, before it becomes a [`Realm`].
@@ -932,6 +1280,9 @@ impl RealmRegistry {
 pub(crate) struct RealmSpec {
     pub id: RealmId,
     pub spawn: SpawnConfig,
+    /// `autostart` (default `true`): whether startup forks this realm's
+    /// app, or it is a template to launch instances from (module docs).
+    pub autostart: bool,
 }
 
 /// `$XDG_CONFIG_HOME/vitrin/realm.toml`, falling back to
@@ -1170,6 +1521,7 @@ struct RawRealm {
     command: Option<(String, usize)>,
     args: Option<Vec<String>>,
     env_allow: Option<(Vec<String>, usize)>,
+    autostart: Option<bool>,
 }
 
 /// Parse the strict TOML subset into validated specs. Anything outside the
@@ -1237,11 +1589,18 @@ fn parse_config(text: &str) -> Result<Vec<RealmSpec>, ErrorKind> {
                 }
                 realm.env_allow = Some((toml_subset::string_array(value, line_no)?, line_no));
             }
+            "autostart" => {
+                if realm.autostart.is_some() {
+                    return Err(parse_err(line_no, "duplicate `autostart` key".into()));
+                }
+                realm.autostart = Some(toml_subset::boolean(value, line_no)?);
+            }
             other => {
                 return Err(parse_err(
                     line_no,
                     format!(
-                        "unknown key {other:?} (this schema defines id, command, args, env_allow)"
+                        "unknown key {other:?} (this schema defines id, command, args, \
+                         env_allow, autostart)"
                     ),
                 ));
             }
@@ -1412,6 +1771,11 @@ fn validate_realm(raw: RawRealm) -> Result<RealmSpec, ErrorKind> {
             args: raw.args.unwrap_or_default(),
             env_allow,
         },
+        // Default `true`: every configuration written before this key
+        // existed means exactly what it always meant, and the surprising
+        // reading -- a file whose realms silently do not start -- is the
+        // one an operator has to ask for.
+        autostart: raw.autostart.unwrap_or(true),
     })
 }
 
@@ -1423,6 +1787,44 @@ fn validate_realm(raw: RawRealm) -> Result<RealmSpec, ErrorKind> {
 /// and validates the id before joining, so id rules can never drift
 /// between the two crates.
 fn validate_realm_id(id: &str) -> Result<(), String> {
+    validate_transport_realm_id(id)?;
+    // The two rules that keep the operator's names and the core's apart
+    // (module docs, "Two naming authorities"). Both are load-time refusals
+    // precisely so the collision they prevent is unrepresentable at run
+    // time rather than checked for on every launch.
+    if looks_like_an_instance_id(id) {
+        return Err(format!(
+            "`id` {id:?} has the shape the core mints for LAUNCH INSTANCES \
+             (<template>.<number>, optionally with this session's .lock suffix beside it), so \
+             it could collide with a realm `vitrin_launcher.launch` creates -- either taking \
+             that realm's private runtime directory or its lock file. Configuration names \
+             templates and the core names instances; rename this one"
+        ));
+    }
+    if id.len() > MAX_DECLARED_ID_BYTES {
+        return Err(format!(
+            "`id` {id:?} is {} bytes; a realm declared in this file may be at most {} so that \
+             the core can append the instance suffix it mints (`.<number>`, up to {} bytes) \
+             and still produce a realm id the wire can carry (64 bytes, vitrin_realm)",
+            id.len(),
+            MAX_DECLARED_ID_BYTES,
+            MAX_INSTANCE_SUFFIX
+        ));
+    }
+    Ok(())
+}
+
+/// The **transport's** realm-id rule, and only that: at most 64 bytes over
+/// `[A-Za-z0-9._-]`, never `.` or `..`.
+///
+/// Split out from [`validate_realm_id`] because the two callers ask
+/// different questions. A *declared* id must additionally not look like,
+/// and must leave room for, an id the core mints; a *minted* id is
+/// instance-shaped by construction and only has to be legal on the wire and
+/// as a directory name. Applying the declared rules to a minted id would
+/// reject every id the core produces, which is exactly the assertion
+/// failure this split fixed.
+fn validate_transport_realm_id(id: &str) -> Result<(), String> {
     vitrin_ipc::paths::shim_runtime_dir_in(Path::new("/"), id)
         .map(|_| ())
         .map_err(|e| {
@@ -1432,6 +1834,35 @@ fn validate_realm_id(id: &str) -> Result<(), String> {
                  and the realm's private runtime directory"
             )
         })
+}
+
+/// The most bytes [`RealmRegistry::mint_instance`] can append: a `.` plus
+/// the 20 decimal digits of `u64::MAX`.
+///
+/// Stated as the counter's worst case rather than as a plausible one. A
+/// session cannot realistically reach `u64::MAX` launches, but the bound
+/// that keeps a minted id inside the wire's 64 bytes must not depend on
+/// anyone's estimate of how many times an agent will call `launch`.
+const MAX_INSTANCE_SUFFIX: usize = 1 + 20;
+
+/// The most bytes a realm id **declared in `realm.toml`** may have: the
+/// wire's 64-byte realm-id bound less the suffix the core may append.
+const MAX_DECLARED_ID_BYTES: usize = 64 - MAX_INSTANCE_SUFFIX;
+
+/// Whether `id` has the shape [`RealmRegistry::mint_instance`] produces, or
+/// the shape of such an id's runtime **lock** entry.
+///
+/// Both matter, and only the second is non-obvious: the runtime tree is
+/// flat and every realm claims `<id>` *and* `<id>.lock`
+/// ([`reject_runtime_name_collisions`]), so a declared realm named
+/// `foo.1.lock` would own minted realm `foo.1`'s lock file even though its
+/// own name ends in letters.
+fn looks_like_an_instance_id(id: &str) -> bool {
+    let stem = id.strip_suffix(".lock").unwrap_or(id);
+    let Some((prefix, tail)) = stem.rsplit_once('.') else {
+        return false;
+    };
+    !prefix.is_empty() && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// A POSIX portable environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
@@ -1471,28 +1902,16 @@ pub(crate) mod tests {
     pub(crate) fn registry_of(realms: Vec<Realm>) -> RealmRegistry {
         RealmRegistry {
             realms: realms.into_iter().map(|r| (r.id.clone(), r)).collect(),
+            next_instance: Cell::new(1),
         }
     }
 
     pub(crate) fn registry_with(ids: &[&str]) -> RealmRegistry {
-        RealmRegistry {
-            realms: ids
-                .iter()
-                .map(|id| {
-                    let id = RealmId::new(*id);
-                    let realm = Realm {
-                        id: id.clone(),
-                        spawn: SpawnConfig {
-                            command: PathBuf::from("/usr/bin/true"),
-                            args: Vec::new(),
-                            env_allow: Vec::new(),
-                        },
-                        state: RealmState::Configured,
-                    };
-                    (id, realm)
-                })
+        registry_of(
+            ids.iter()
+                .map(|id| realm_with_spawn(id, Path::new("/usr/bin/true"), &[], &[]))
                 .collect(),
-        }
+        )
     }
 
     /// A [`SpawnConfig`] with exactly these fields -- the constructor
@@ -1525,6 +1944,17 @@ pub(crate) mod tests {
             id: RealmId::new(id),
             spawn: spawn_config_with(command, args, env_allow),
             state: RealmState::Configured,
+            template: None,
+        }
+    }
+
+    /// The same realm declared `autostart = false` -- a [`RealmState::Template`]
+    /// (WS-E.1.1). Startup must not fork it; a `realm_launch` grant over it
+    /// must still be petitionable.
+    pub(crate) fn template_with_spawn(id: &str, command: &Path, args: &[String]) -> Realm {
+        Realm {
+            state: RealmState::Template,
+            ..realm_with_spawn(id, command, args, &[])
         }
     }
 
@@ -1695,7 +2125,7 @@ pub(crate) mod tests {
             "[[realm]]\ncommand = \"/usr/bin/true\"\n\
              [[realm]]\nid = \"editor\"\ncommand = \"/usr/bin/false\"\nargs = [\"-e\"]\n\
              [[realm]]\nid = \"browser\"\ncommand = \"/usr/bin/true\"\nenv_allow = [\"HOME\"]\n\
-             [[realm]]\nid = \"term.1\"\ncommand = \"/usr/bin/true\"\n",
+             [[realm]]\nid = \"term-1\"\ncommand = \"/usr/bin/true\"\n",
         )
         .unwrap();
         assert_eq!(registry.len(), 4);
@@ -1704,7 +2134,7 @@ pub(crate) mod tests {
         // makes the runtime's spawn order and this assertion stable.
         assert_eq!(
             registry.iter().map(|r| r.id().as_str()).collect::<Vec<_>>(),
-            ["browser", "editor", "realm-0", "term.1"]
+            ["browser", "editor", "realm-0", "term-1"]
         );
 
         // Each realm owns its own spawn configuration -- the per-realm
@@ -1718,12 +2148,12 @@ pub(crate) mod tests {
             registry.get("browser").unwrap().spawn().env_allow(),
             ["HOME"]
         );
-        assert!(registry.get("term.1").unwrap().spawn().args().is_empty());
+        assert!(registry.get("term-1").unwrap().spawn().args().is_empty());
 
         // And every one of them is independently addressable and
         // petitionable -- a real map lookup per name, not one realm wearing
         // four labels.
-        for id in ["realm-0", "editor", "browser", "term.1"] {
+        for id in ["realm-0", "editor", "browser", "term-1"] {
             assert_eq!(
                 registry.resolve_for_petition(id),
                 Some(&RealmId::new(id)),
@@ -1738,7 +2168,7 @@ pub(crate) mod tests {
         let mut registry = registry;
         assert!(registry.mark_exited(&RealmId::new("editor"), 4242));
         assert_eq!(registry.resolve_for_petition("editor"), None);
-        for id in ["realm-0", "browser", "term.1"] {
+        for id in ["realm-0", "browser", "term-1"] {
             assert_eq!(
                 registry.resolve_for_petition(id),
                 Some(&RealmId::new(id)),
@@ -2084,13 +2514,17 @@ pub(crate) mod tests {
         // all, provided `realm-0` is also present. The id pin used to fire
         // here; the shape check is what survives, and this is the pair that
         // shows the two were always distinct.
+        // (`realm.0` would have served here until WS-E.1.1 (issue #207)
+        // gave the core the `<template>.<number>` instance shape and
+        // refused declared ids that could collide with it; `realm.zero`
+        // makes the same point -- dotted, not well-known, accepted.)
         let registry = registry_from(
-            "[[realm]]\ncommand = \"/a\"\n[[realm]]\nid = \"realm.0\"\ncommand = \"/a\"\n",
+            "[[realm]]\ncommand = \"/a\"\n[[realm]]\nid = \"realm.zero\"\ncommand = \"/a\"\n",
         )
         .unwrap();
         assert_eq!(
-            registry.resolve_for_petition("realm.0"),
-            Some(&RealmId::new("realm.0"))
+            registry.resolve_for_petition("realm.zero"),
+            Some(&RealmId::new("realm.zero"))
         );
     }
 
@@ -2458,6 +2892,188 @@ pub(crate) mod tests {
             Err(ErrorKind::Insecure(_)) | Err(ErrorKind::Io(_))
         ));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    // -- templates and instance ids (WS-E.1.1, issue #207) ------------------
+
+    #[test]
+    fn autostart_false_loads_a_template_that_still_admits_petitions() {
+        let registry = registry_from(
+            "[[realm]]\ncommand = \"/a\"\n\
+             [[realm]]\nid = \"kiosk\"\ncommand = \"/b\"\nautostart = false\n",
+        )
+        .expect("a template beside an autostarting realm loads");
+        assert_eq!(registry.get("kiosk").unwrap().state(), RealmState::Template);
+        // Addressable: the whole point is that `realm_launch` can be
+        // petitioned over it. A template answering `unavailable` would make
+        // the verb unpetitionable over exactly the realms it is for.
+        assert_eq!(
+            registry.resolve_for_petition("kiosk"),
+            Some(&RealmId::new("kiosk"))
+        );
+        // ...and the realm that did not say so is unchanged.
+        assert_eq!(
+            registry.get(WELL_KNOWN_REALM_ID).unwrap().state(),
+            RealmState::Configured,
+            "autostart defaults to true: a file written before the key existed means \
+             exactly what it always meant"
+        );
+    }
+
+    #[test]
+    fn a_config_of_nothing_but_templates_is_refused() {
+        let err = registry_from(
+            "[[realm]]\ncommand = \"/a\"\nautostart = false\n\
+             [[realm]]\nid = \"kiosk\"\ncommand = \"/b\"\nautostart = false\n",
+        )
+        .expect_err("a session with no app to run must not come up");
+        assert!(
+            format!("{err}").contains("autostart"),
+            "the refusal has to name the key an operator would change: {err}"
+        );
+    }
+
+    #[test]
+    fn autostart_accepts_only_the_two_toml_spellings() {
+        for value in ["True", "yes", "1", "\"false\"", "on"] {
+            let err = registry_from(&format!(
+                "[[realm]]\ncommand = \"/a\"\nautostart = {value}\n"
+            ))
+            .expect_err("only `true` and `false` are TOML booleans");
+            assert!(
+                matches!(err, ErrorKind::Parse { .. }),
+                "{value} must be a parse refusal, not a silent reading: {err:?}"
+            );
+        }
+    }
+
+    /// **A declared id that could collide with a core-minted instance id is
+    /// refused at load**, which is what makes the collision unrepresentable
+    /// afterwards rather than checked for on every launch.
+    #[test]
+    fn declared_ids_shaped_like_instance_ids_are_refused() {
+        // `foo.1` would own minted realm `foo.1`'s private directory;
+        // `foo.1.lock` would own its lock file, which sits *beside* that
+        // directory in the flat runtime tree.
+        for id in ["foo.1", "foo.1.lock", "realm-0.10", "a.b.7"] {
+            let err = registry_from(&format!(
+                "[[realm]]\ncommand = \"/a\"\n[[realm]]\nid = \"{id}\"\ncommand = \"/b\"\n"
+            ))
+            .expect_err("an instance-shaped declared id must be refused");
+            assert!(
+                format!("{err}").contains("LAUNCH INSTANCES"),
+                "{id} must be refused as instance-shaped: {err}"
+            );
+        }
+        // ...and ids that merely *contain* digits or dots are untouched.
+        for id in ["term-1", "realm.zero", "a.b", "v2.x", "1.a"] {
+            registry_from(&format!(
+                "[[realm]]\ncommand = \"/a\"\n[[realm]]\nid = \"{id}\"\ncommand = \"/b\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("{id} is not instance-shaped and must load: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_declared_id_with_no_room_for_an_instance_suffix_is_refused() {
+        // Shape-legal on the wire (<= 64 bytes) but too long to carry the
+        // suffix the core appends, so minting could produce an id the wire
+        // cannot express. Told to the operator at load instead.
+        let id = "a".repeat(MAX_DECLARED_ID_BYTES + 1);
+        let err = registry_from(&format!(
+            "[[realm]]\ncommand = \"/a\"\n[[realm]]\nid = \"{id}\"\ncommand = \"/b\"\n"
+        ))
+        .expect_err("an id with no room for the instance suffix must be refused");
+        assert!(format!("{err}").contains("instance suffix"), "{err}");
+        // The longest id that *does* fit still loads, so the bound is the
+        // stated one rather than an off-by-one.
+        let id = "a".repeat(MAX_DECLARED_ID_BYTES);
+        registry_from(&format!(
+            "[[realm]]\ncommand = \"/a\"\n[[realm]]\nid = \"{id}\"\ncommand = \"/b\"\n"
+        ))
+        .expect("the stated maximum must load");
+    }
+
+    #[test]
+    fn minted_instance_ids_are_unique_and_named_for_the_declared_template() {
+        let mut registry = registry_with(&[WELL_KNOWN_REALM_ID, "kiosk"]);
+        let first = registry.mint_instance(&RealmId::new("kiosk")).unwrap();
+        let second = registry.mint_instance(&RealmId::new("kiosk")).unwrap();
+        assert_eq!(
+            (first.to_string(), second.to_string()),
+            ("kiosk.1".to_string(), "kiosk.2".to_string())
+        );
+        // The counter is session-global, so a different template continues
+        // it rather than restarting -- uniqueness is the only property it
+        // owes, and one counter gives it across every template at once.
+        let other = registry
+            .mint_instance(&RealmId::new(WELL_KNOWN_REALM_ID))
+            .unwrap();
+        assert_eq!(other.to_string(), "realm-0.3");
+
+        // **Instances do not nest.** Launching from an instance names the
+        // declared root, so ids cannot grow past the wire's bound however
+        // many times an agent launches.
+        assert!(registry.insert_instance(&RealmId::new("kiosk"), first.clone()));
+        let grandchild = registry.mint_instance(first.as_realm_id()).unwrap();
+        assert_eq!(grandchild.to_string(), "kiosk.4");
+
+        // An unknown template mints nothing rather than guessing one.
+        assert!(registry.mint_instance(&RealmId::new("absent")).is_none());
+    }
+
+    #[test]
+    fn capacity_counts_live_realms_and_forgets_exited_ones() {
+        let mut registry = registry_with(&[WELL_KNOWN_REALM_ID, "kiosk"]);
+        assert_eq!(registry.capacity_used(), 2);
+        // A template costs a row and counts: the loader already counted it.
+        let mut with_template = registry_of(vec![
+            realm_with_spawn(WELL_KNOWN_REALM_ID, Path::new("/usr/bin/true"), &[], &[]),
+            template_with_spawn("kiosk", Path::new("/usr/bin/true"), &[]),
+        ]);
+        assert_eq!(with_template.capacity_used(), 2);
+        assert!(with_template.mark_running(&RealmId::new("kiosk"), 42));
+        assert_eq!(with_template.capacity_used(), 2);
+        // An exited realm keeps its row -- `unavailable` must keep meaning
+        // *not ever* -- and stops costing capacity, or a session that
+        // launched and closed sixteen apps could never launch again.
+        assert!(registry.mark_exited(&RealmId::new("kiosk"), 7));
+        assert_eq!(registry.capacity_used(), 1);
+        assert_eq!(
+            registry.len(),
+            2,
+            "the row survives so the name stays taken"
+        );
+    }
+
+    #[test]
+    fn an_instance_runs_the_templates_program_under_its_own_id() {
+        let mut registry = registry_of(vec![
+            realm_with_spawn(WELL_KNOWN_REALM_ID, Path::new("/usr/bin/true"), &[], &[]),
+            template_with_spawn(
+                "kiosk",
+                Path::new("/usr/bin/kiosk"),
+                &["--fullscreen".to_string()],
+            ),
+        ]);
+        let minted = registry.mint_instance(&RealmId::new("kiosk")).unwrap();
+        let instance = registry
+            .instance_of(&RealmId::new("kiosk"), &minted)
+            .expect("the template exists");
+        assert_eq!(instance.id().as_str(), "kiosk.1");
+        assert_eq!(instance.spawn().command(), Path::new("/usr/bin/kiosk"));
+        assert_eq!(instance.spawn().args(), ["--fullscreen"]);
+        // An instance is never itself a template: it is `Configured`, on its
+        // way to `Running`, so a capture over it is judged by liveness
+        // rather than by "this realm never runs".
+        assert_eq!(instance.state(), RealmState::Configured);
+
+        // ...and a spawn that never served is removed rather than marked
+        // `Exited`, whose `pid` names a process that *did* serve.
+        assert!(registry.insert_instance(&RealmId::new("kiosk"), minted.clone()));
+        assert!(registry.get("kiosk.1").is_some());
+        registry.remove_instance(&minted);
+        assert!(registry.get("kiosk.1").is_none());
     }
 
     // -- the default config path --------------------------------------------

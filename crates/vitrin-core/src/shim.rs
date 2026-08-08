@@ -2721,14 +2721,19 @@ mod tests {
             &["300".to_string()],
             &env_allow,
         );
-        let mut spawned =
-            crate::spawn::spawn_realm_with_env(&realm, &paths, &mut recorder, |name| match name {
+        let mut spawned = crate::spawn::spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut recorder,
+            crate::spawn::SpawnOrigin::Startup,
+            |name| match name {
                 "WLR_BACKENDS" => Some("headless".into()),
                 "WLR_RENDERER" => Some("pixman".into()),
                 "WLR_RENDERER_ALLOW_SOFTWARE" => Some("1".into()),
                 _ => None,
-            })
-            .expect("the C shim must spawn");
+            },
+        )
+        .expect("the C shim must spawn");
 
         let mut server = ShimServer::new(ShimConfig {
             realm: "realm-0".into(),

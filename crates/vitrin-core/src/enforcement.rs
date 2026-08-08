@@ -5,14 +5,19 @@
 //! grant -> verbs -> constraints` in exactly that order (PRD Doc 2 §5) and
 //! voicing every refusal as `vitrin_grant.refused` from one emission site.
 //!
-//! `vitrin_launcher.launch` (since version 2) joins the funnel on the same
-//! terms as the rest, and joining it is what makes the verb's staging
-//! honest: `realm_launch` is not in
-//! [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no grant row
-//! can hold the bit and step 4 refuses every launch **`not_granted`** --
-//! recoverably, connection intact. The mint that produces the facet
-//! ([`vitrin_grant.get_launcher`](crate::principal)) is structural and
-//! always legal; the *use* is what refuses.
+//! `vitrin_launcher.launch` (since version 2) passes through the same
+//! funnel, and since WS-E.1.1 (issue #207) it can actually *succeed*:
+//! `realm_launch` is in
+//! [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so a grant row
+//! may carry the bit and an admitted launch forks a realm through
+//! [`UseEnv::launch`]. **This is the point at which a request on a socket
+//! can make the trusted core create a process**, and routing it here is
+//! what buys that a consent prompt, an expiry, revocation, the token
+//! bucket, a realm cap and a journal entry naming who asked -- rather than
+//! a second path beside the chain, which is what the one-path property
+//! below exists to forbid. The mint that produces the facet
+//! ([`vitrin_grant.get_launcher`](crate::principal)) stays structural and
+//! always legal; the *use* is what is judged.
 //!
 //! # The one-path property (grep-provable)
 //!
@@ -233,12 +238,14 @@ use std::time::{Duration, Instant};
 
 use vitrin_ipc::TransportError;
 use vitrin_protocol::generated::vitrin_grant::{self as grant, Refusal, Verb};
+use vitrin_protocol::generated::vitrin_launcher as launcher;
 
 use crate::capture::{self, RealmViewFrame};
 use crate::grants::{GrantId, GrantTable};
 use crate::identity::PrincipalIdentity;
 use crate::input::{PhysicalPresenceMap, SeatInput, SeatInputKind};
 use crate::petitions::PetitionRegistry;
+use crate::realm::MintedRealmId;
 use crate::recorder::ObservedFrame;
 
 /// Nanoseconds per second, for exact integer bucket arithmetic.
@@ -275,12 +282,11 @@ pub(crate) enum UseKind {
     Pointer(SeatInputKind),
     /// `vitrin_actuator_text.type` (fire-and-forget).
     Text(SeatInputKind),
-    /// `vitrin_launcher.launch` (reply-bearing, since version 2). The
-    /// facet is mintable on any grant, but `realm_launch` is not in
-    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no row
-    /// can carry the bit and every launch is refused `not_granted` at
-    /// step 4 -- recoverably, which is the entire point of admitting the
-    /// request rather than killing the connection.
+    /// `vitrin_launcher.launch` (reply-bearing, since version 2): fork a
+    /// new realm instance from the template **the grant names**. Carries
+    /// no payload, and that emptiness is the security property -- the
+    /// request has no arguments on the wire and this variant is where
+    /// that stays true in the core.
     Launch,
     /// `vitrin_layout_focus.focus` (fire-and-forget, since version 2):
     /// bind the output to this grant's realm and send the human's own
@@ -360,7 +366,7 @@ impl UseKind {
     /// different -- the human's own signal, which *lifts* a refusal this
     /// predicate selects for. A free rename then; a permanent reading hazard
     /// in the one function where misreading it is most expensive.
-    fn contends_for_attention(&self) -> bool {
+    pub(crate) fn contends_for_attention(&self) -> bool {
         matches!(
             self,
             UseKind::Pointer(_)
@@ -368,6 +374,21 @@ impl UseKind {
                 | UseKind::LayoutFocus
                 | UseKind::LayoutArrange(_)
         )
+    }
+
+    /// Whether the chokepoint needs [`UseEnv::grant_realm`] resolved for
+    /// this use: the two actuations and the two layout requests, which name
+    /// a realm to the embedder or are judged against one's physical
+    /// presence, **and a launch**, whose template is the grant's realm.
+    ///
+    /// Named and public so `PrincipalServer::serve_facet_use` asks the kind
+    /// rather than re-deriving the set with its own `matches!` — the
+    /// duplicate that existed until WS-E.1.1 and would have silently
+    /// handed the launch arm `None` (and therefore `internal`) the moment
+    /// the verb became servable. A **capture** is still excluded, which is
+    /// what keeps the high-rate path free of the realm-name clone.
+    pub(crate) fn names_a_realm(&self) -> bool {
+        self.contends_for_attention() || matches!(self, UseKind::Launch)
     }
 
     /// The two **layout** uses, and only those — the exact set the human's
@@ -489,6 +510,69 @@ pub(crate) struct UseEnv<'a> {
     /// and a layout act is a change to the session's presentation that
     /// nothing downstream may reinterpret.
     pub layout: &'a mut dyn FnMut(LayoutAct),
+    /// **Where an admitted launch forks** (WS-E.1.1, issue #207): given the
+    /// realm the *grant* names, mint an instance id and create the process,
+    /// or say why not.
+    ///
+    /// Three shapes here are load-bearing and none is an economy:
+    ///
+    /// - **It takes a realm and nothing else.** No command, no argument, no
+    ///   id. `launch` carries no arguments on the wire and this signature
+    ///   is where that stays true inside the core: the template comes from
+    ///   [`Self::grant_realm`], resolved from the grant row exactly as the
+    ///   layout arms' realm is, so a holder can only ever launch the
+    ///   template the human saw on its consent card.
+    /// - **It returns a [`MintedRealmId`]**, a type only
+    ///   `RealmRegistry::mint_instance` constructs. The chokepoint
+    ///   therefore *cannot* answer `launched` with anything a client
+    ///   supplied -- there is no value of that type reachable from a wire
+    ///   decode.
+    /// - **It is synchronous, and the fork is inside it.** `launched` is a
+    ///   terminal, so a deferred fork would mean replying success and
+    ///   discovering failure afterwards, with no way to voice the IDL's
+    ///   `internal`. What the runtime *does* defer is only the attach
+    ///   sequence after the child exists (`configure`, the loop
+    ///   registration, the registry insert), none of which can turn a
+    ///   forked realm back into a refusal.
+    pub launch: &'a mut dyn FnMut(LaunchAsk<'_>) -> Result<MintedRealmId, LaunchRefusal>,
+}
+
+/// Everything the embedder is told about an admitted launch — and the
+/// enumeration is the security claim, so read it as an exhaustive list.
+///
+/// Three fields. **None of them came off the wire**: the template is the
+/// realm the *grant row* names, the principal is the verifier-canonical
+/// identity bound at `hello`, and the grant is the row the chain judged.
+/// `vitrin_launcher.launch` carries no arguments at all, so there is
+/// nothing else it *could* carry — and adding a field here later would be
+/// a visible change at a site whose whole point is that it has none.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LaunchAsk<'a> {
+    /// The realm whose configuration names the program to fork: the realm
+    /// the human saw on this grant's consent card, never a client's choice.
+    pub template: &'a crate::grants::RealmId,
+    /// Who asked, for the flight recorder's `realm_spawned` entry.
+    pub principal: &'a PrincipalIdentity,
+    /// Which authority they exercised, likewise.
+    pub grant: GrantId,
+}
+
+/// Why an admitted launch could not create a realm -- the two refusal codes
+/// reachable *after* the authority chain has said yes.
+///
+/// Deliberately not [`Refusal`] itself: the sink answers about creating a
+/// realm, and letting it name any refusal code would let the embedder
+/// invent an authority answer (`not_granted` from a spawn path) that no
+/// authority check produced. Two variants, mapped at one site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaunchRefusal {
+    /// The deployment is at [`crate::realm::MAX_REALMS`]. A **policy**
+    /// answer, not a failure -- which is why the IDL gave it its own code
+    /// rather than folding it into `internal`.
+    Capacity,
+    /// The fork, the exec, or the spawn-time program audit failed. The
+    /// IDL's `internal`: "a spawn failure the core did not choose".
+    Internal,
 }
 
 /// How one use was decided -- the chokepoint's summary of its own
@@ -1010,30 +1094,76 @@ impl Chokepoint {
                 })
             }
             UseKind::Launch => {
-                // Unreachable in this build, and by construction rather
-                // than by luck: `realm_launch` is absent from
-                // `SERVED_VERB_BITS`, so petition admission resolves any
-                // petition naming it `unsupported` and no row can carry
-                // the bit -- step 4 above refused `not_granted` before
-                // anything reached here. Spawning a realm is the core
-                // half of WS-E.1.1 and does not exist yet, so this arm
-                // fails closed with the IDL's `internal` rather than
-                // fabricating a `launched` naming a realm nothing
-                // created. Typed, never a panic, exactly like the
-                // capture path's unreachable readback failure.
-                tracing::warn!("launch admitted with no spawn path; refusing internal");
-                let voiced = self.voice_refusal(
-                    req.grant_wire_id,
-                    verb,
-                    Refuse::code(Refusal::Internal),
-                    false,
-                    now,
-                    send,
-                )?;
-                Ok(UseOutcome::Refused {
-                    code: Refusal::Internal,
-                    voiced,
-                })
+                // **The template comes from the grant row**, exactly as the
+                // realm of an actuation and of a layout act does, and never
+                // from the wire: `launch` carries no arguments at all, so a
+                // holder can only ever start the template the human saw
+                // named on its consent card. `None` is unreachable past
+                // step 3 and is surfaced as `internal` rather than guessing
+                // a realm to fork.
+                let Some(realm) = env.grant_realm else {
+                    tracing::warn!("launch admitted with no grant realm; refusing internal");
+                    let voiced = self.voice_refusal(
+                        req.grant_wire_id,
+                        verb,
+                        Refuse::code(Refusal::Internal),
+                        false,
+                        now,
+                        send,
+                    )?;
+                    return Ok(UseOutcome::Refused {
+                        code: Refusal::Internal,
+                        voiced,
+                    });
+                };
+                match (env.launch)(LaunchAsk {
+                    template: realm,
+                    principal: req.principal,
+                    grant: allowed.grant_id,
+                }) {
+                    Ok(minted) => {
+                        // Exactly one terminal per launch, in request order,
+                        // never coalesced -- the reply-bearing pairing a
+                        // capture's `frame_ready` obeys. The id is a
+                        // `MintedRealmId`, so the *only* string that can
+                        // appear here came out of the realm registry.
+                        let event = launcher::events::Launched {
+                            realm: minted.as_realm_id().to_string(),
+                        };
+                        send(&event.encode(req.facet_id), None)?;
+                        Ok(UseOutcome::Admitted {
+                            grant: allowed.grant_id,
+                            // A launch delivers no observation to identify.
+                            // Deliberately not the new realm's first frame:
+                            // launching confers nothing over what was
+                            // launched (IDL `launched`).
+                            frame: None,
+                            spent_once,
+                            attention_claimed,
+                        })
+                    }
+                    // Post-admission, and both are the IDL's own codes for
+                    // this operation: `capacity` is a policy answer about
+                    // the deployment, `internal` a spawn failure the core
+                    // did not choose. Never coalesced -- a terminal that
+                    // coalesced away would leave the client waiting forever.
+                    Err(refusal) => {
+                        let code = match refusal {
+                            LaunchRefusal::Capacity => Refusal::Capacity,
+                            LaunchRefusal::Internal => Refusal::Internal,
+                        };
+                        tracing::warn!(?code, "launch admitted but no realm was created");
+                        let voiced = self.voice_refusal(
+                            req.grant_wire_id,
+                            verb,
+                            Refuse::code(code),
+                            false,
+                            now,
+                            send,
+                        )?;
+                        Ok(UseOutcome::Refused { code, voiced })
+                    }
+                }
             }
         }
     }

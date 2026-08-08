@@ -115,7 +115,7 @@ VitrinError
 │   └── InternalError ─ ResourceExhausted            (one per fatal code, §5.2)
 ├── GrantResolutionError        vitrin_grant.resolved with outcome != granted
 │   ├── GrantDenied ─ ConsentTimeout ─ RealmUnavailable ─
-│   └── GrantUnsupported ─ Busy                      (one per outcome, §5.3)
+│   └── GrantUnsupported ─ Busy ─ LayoutHeld         (one per outcome, §5.3)
 └── GrantRefused                vitrin_grant.refused (use-time, recoverable)
     ├── NotGranted ─ GrantExpired ─ Revoked ─ RateLimited ─
     ├── Preempted ─ ConsentHeld ─ NoSurface ─ OperationFailed ─
@@ -126,10 +126,50 @@ The mapping is exhaustive by construction (module-level assertions in
 `errors.py`, plus a test): every fatal code, every petition outcome, and
 every refusal code maps to exactly one distinct exception class. `AtCapacity`
 is the wire's `capacity` (8), added at version 2 and reachable only through
-`realm_launch` — which no deployment serves yet, so nothing raises it today.
-It is carried anyway, for the reason the whole hierarchy exists: an unmapped
-refusal code is a `ServerContractViolation`, so omitting it would turn a
-recoverable refusal into a fatal client-side error the day the verb is served.
+`realm_launch`, which the reference core serves since WS-E.1.1; `LayoutHeld`
+is the wire's `layout_held` outcome (6), raised at admission when another live
+grant already holds `layout.arrange` for the output (D-018(4)). Both are
+carried for the reason the whole hierarchy exists: an unmapped outcome or
+refusal code is a `ServerContractViolation`, which **closes the connection** —
+so omitting one turns a recoverable answer the protocol defines into a dead
+socket. That is not hypothetical: the SDK could not decode
+`layout_held` when WS-E.1.4 invented it, and would have done exactly that --
+caught in review before it reached `main` (`docs/plan/20-decision-log.md`), so
+the near-miss is the evidence, not an outage.
+
+## Layout and launching (wire version 2)
+
+Three facets are minted structurally on a resolved grant — lazily, because
+`request_grant`'s five `new_id` arguments are frozen forever and every facet
+added after version 1 arrives as a mint on the grant:
+
+```python
+grant.focus()                    # vitrin_layout_focus.focus — fire-and-forget
+grant.set_fullscreen(True)       # vitrin_layout_arrange.set_fullscreen — likewise
+realm_id = grant.launch()        # vitrin_launcher.launch — reply-bearing
+conn.sync(grant)                 # the barrier where a fire-and-forget refusal surfaces
+```
+
+Three things about these that a caller has to know rather than discover:
+
+- **`focus` and `set_fullscreen` are fire-and-forget.** Neither reports what it
+  did — `vitrin_layout_focus` deliberately offers no read of which realm holds
+  the output. A refusal arrives on the *grant* and surfaces at the next
+  `sync(grant)` or reply-bearing call.
+- **`launch()` takes no arguments and cannot.** Which program runs is fixed by
+  the realm template the grant addresses, in front of the human on the consent
+  card, never by an argument here. The returned id is **opaque**: pass it to
+  `get_realm`, do not parse or predict it.
+- **A launch confers nothing over what it launched.** Observing or actuating
+  the new realm is a separate petition, and a separate prompt.
+- **`conn.attention_count`** counts `vitrin_principal.attention` events — the
+  human tapped the core's attention key. It confers nothing and is deliberately
+  a count rather than a callback: send the request you had already staged and
+  show the `Preempted` refusal if you lost the race.
+
+[`examples/shell/`](../../examples/shell/README.md) is the worked example, and
+also the argument for why a client holding these verbs is still not a desktop
+shell.
 
 ## Test-vector sharing (decision)
 
@@ -144,6 +184,16 @@ established; a generated shared JSON corpus (via `vitrin-scanner`) remains
 an option once the vector set grows past hand-copy size, and would be a
 `track:protocol`/`ci-docs` change. When editing any golden frame, update
 all three files (each cross-references the others).
+
+One qualification, stated because "third copy" is a claim about the other two:
+the **version-2 layout and launcher vectors** added by WS-E.1.5 are Python-side
+only. The shim speaks the shim class and never those four principal-facing
+interfaces, and the Rust side's coverage of them is the fuzz decoder table plus
+the mock-free gates — so there is no third copy to keep in step, and
+`tests/vectors.py` says so where they are defined rather than leaving a reader
+to infer it from the file they appear in. They are still written down from the
+IDL and never copied out of `vitrin_os.messages`, which is the property that
+makes a golden vector worth having at all.
 
 The mocked-server flow tests (`tests/mock_server.py`) additionally build
 their scripted frames with a local, struct-level encoder in

@@ -204,7 +204,13 @@ this workstream owns, not inherits:
   replacements are core-owned surfaces.
 - **A shell crash loses window management**, because the shell is a client and
   there is no core-side fallback. §3(3)'s invariant is right and this is its
-  price.
+  price. **Measured since WS-E.1.5/#211**, and the shape is narrower than the
+  sentence suggests: killing the shell leaves both realms running and the realm
+  it last focused still receiving the human's physical input, because the
+  binding is core state. What is lost is the ability to *re-aim* — and the
+  wedge is that recovering means running the shell again from a terminal which,
+  in a real session, must already be the bound realm. Asserted by
+  `tests/integration/test_shell.py`; published in `docs/book/src/limits.md`.
 - **The DRM backend cannot be tested by CI** — no runner has a DRM device or a
   seat — so it arrives with structurally weaker evidence than anything else in
   the tree. That is an asymmetry against D12 and it is published, not
@@ -334,6 +340,31 @@ this workstream owns, not inherits:
   reconstruct why one `focus` landed and an identical one did not without
   correlating the core's attention entries, which it cannot see. The refusal used
   to mean one thing. Published in `docs/book/src/limits.md`.
+
+- **A principal cannot draw, and cannot receive physical input** (pre-existing,
+  *surfaced and priced* by WS-E.1.5/#211, no owner). Neither is new and neither
+  was written down as a user-facing limit until a switcher had to be built
+  against them. `vitrin_view` is capture-only and there is no principal-facing
+  surface interface in the IDL, so no client can put a pixel on the output —
+  which is why the shipped switcher is a line-oriented host-side program and
+  not a placeholder for a graphical one. There is no `observe_input` verb and
+  none is designed, so no client has a hotkey; the core owns two physical
+  chords and owns both because they must not depend on a client. The
+  consequence for a daily driver is blunt: **every layout change starts as a
+  line typed into a terminal that must be somewhere the human can reach.** The
+  eventual shape #211's decision 2 names — the shell running *as a realm*,
+  drawing through its own shim — needs no new protocol and does need that
+  realm to reach the core socket, which is a confinement question nobody has
+  answered. Published in `docs/book/src/limits.md`.
+
+- **The shell holds `layout.arrange` for the whole output** (created by
+  WS-E.1.5, and designed rather than accidental — D-018(4)). Arrangement is
+  single-holder per output, checked at admission, so while the switcher lives a
+  second tool that wants to arrange anything resolves `layout_held` before it
+  reaches a prompt. The shipped shell therefore petitions arrangement over
+  exactly one realm and names that realm on every `fullscreen`. It is the
+  correct behaviour and it is also a restriction people will hit before they
+  understand why.
 
 - **Two indicators now compete for the top strip, and a third is scheduled**
   (created by WS-E.1.7, owner: whoever lands WS-E.2.3/#215 second). The dead-man

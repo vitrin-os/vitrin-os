@@ -76,6 +76,51 @@ that refuse, but no requests at all, because a scene showing one unstacked
 realm cannot honour them and a verb that silently does less than its name is
 worse than one with no request. Do not plan a tiling shell against this yet.
 
+**A principal cannot draw, so nothing a client builds can be on screen.**
+`vitrin_view` is capture-only and there is **no principal-facing surface
+interface anywhere in the IDL** — a grant can read a realm's pixels and can put
+none back. So the switcher this project ships
+([`examples/shell/run_shell.py`](https://github.com/vitrin-os/vitrin-os/blob/main/examples/shell/run_shell.py))
+is a line-oriented program in a host terminal, and that is not a placeholder
+for a graphical one: no amount of client work reaches the output. The intended
+eventual shape is the shell running **as a realm**, drawing through its own
+shim like any other app while holding the layout verbs through the ordinary
+grant path — which needs no new protocol, but does need that realm to reach the
+core socket, and that is a confinement question nobody has answered. Until
+then, anything you would call a desktop shell — a bar, a launcher, an OSD, a
+window-switcher overlay — cannot exist on this display server, and the
+replacements are core-owned surfaces (the trusted band, the consent card, the
+attention marker) that no client can add to.
+
+**A principal cannot receive physical input either, so no client has a
+hotkey.** There is no `observe_input` verb and none is designed. The core owns
+exactly two physical chords — the dead-man switch and the attention key — and
+owns both *precisely because* the human's off-switch and the human's
+attention gesture must not depend on a client being alive and correct. A
+convenience hotkey is not in that class and must not borrow that warrant, so
+"Super+Tab switches windows" is not a missing feature: it would mean the core
+reserving a chord on behalf of whichever client asked first, which is
+window-management policy the core deliberately does not have. What follows for
+a user is concrete: **every layout change starts as a line you type into a
+terminal**, and the terminal has to be somewhere you can reach.
+
+**If the shell dies, you keep the session and lose the ability to re-aim it.**
+The switcher is a client (PRD §5.1, D-021(4)), so there is no core-side
+fallback — that is the price of the invariant, paid rather than argued away.
+Kill it and both realms keep running, their shims and apps being children of
+`vitrind` rather than of the shell, and the realm it last focused **keeps
+receiving your keyboard and pointer**, because the output binding is core state
+and nothing revokes it when the principal that set it disappears. What you
+cannot do is move it. Recovery is running the shell again, which re-petitions
+from zero and raises a fresh prompt per realm — **and in a real session the
+terminal you would restart it from must already be the bound realm.** If the
+shell died while the output was pointed at a realm with no terminal in it,
+nothing on screen can start it, and every remedy is outside Vitrin: an SSH
+session from another machine, a VT switch, or restarting `vitrind`. This is a
+genuine wedge; it is documented, asserted
+([`tests/integration/test_shell.py`](https://github.com/vitrin-os/vitrin-os/blob/main/tests/integration/test_shell.py)),
+and not solved.
+
 **`set_fullscreen` is a no-op whenever the output and the realm are the same
 size.** The two modes differ only in whether the realm's view size tracks the
 output's, so while they are equal — which is the ordinary case for a realm

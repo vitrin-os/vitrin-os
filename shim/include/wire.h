@@ -64,13 +64,22 @@
  * dynamic allocation in a path that runs per frame. */
 #define VITRIN_WIRE_MAX_FRAME 65535u
 
-/* The largest frame the SHIM ever sends. Every shim -> core request is
- * fixed-size: attach is 8 + 6*4 = 32 bytes (its fd rides out of band),
- * damage 24, commit 8, create_surface and get_seat 12. 64 rounds that up
- * with room for a future appended argument, and it is what lets a parked
- * frame live inline in the queue below instead of in a heap allocation --
- * the frame path must not call the allocator. A frame that does not fit is
- * caught as local misuse before it reaches the kernel. */
+/* The largest frame the SHIM ever sends **on the per-frame path**. Every
+ * shim -> core request on that path is fixed-size: attach is 8 + 6*4 = 32
+ * bytes (its fd rides out of band), damage 24, commit 8, create_surface and
+ * get_seat 12. 64 rounds that up with room for a future appended argument,
+ * and it is what lets a parked frame live inline in the queue below instead
+ * of in a heap allocation -- the frame path must not call the allocator. A
+ * frame that does not fit is caught as local misuse before it reaches the
+ * kernel.
+ *
+ * `vitrin_shim_session.selection` (WS-E.2.1) is the one exception and is why
+ * this constant is no longer the send-side ceiling: its `data` argument is
+ * bounded at 61440 bytes by the IDL, so the whole frame can approach the
+ * format's own 65535. It is NOT on the frame path -- it is answered once per
+ * human keypress -- so it gets the single dedicated slot below rather than
+ * 64 queue slots sized for it, which would cost 4 MiB of the shim's memory
+ * to carry a clipboard. */
 #define VITRIN_WIRE_SLOT_BYTES 64u
 
 /* Depth of the parked-frame queue. Backpressure toward the core is really
@@ -139,6 +148,21 @@ struct vitrin_wire {
 	size_t queue_head;
 	size_t queue_len;
 
+	/* The single OVERSIZED parked frame (WS-E.2.1): a `selection` answer the
+	 * kernel would not take whole. Drained BEFORE `queue`, and only ever
+	 * accepted when `queue` is empty, so "big first, then the queue" is the
+	 * wire order rather than a reordering -- anything parked afterwards was
+	 * handed to `vitrin_wire_send` afterwards.
+	 *
+	 * Exactly one, and a second while this is pending is fatal, for the same
+	 * reason a full `queue` is: it means the core stopped reading. Reachable
+	 * only from the clipboard path, which the core drives one question at a
+	 * time. No fd field: every oversized message in v0 has `fd_count` 0, and
+	 * `vitrin_wire_send` refuses the combination rather than trusting that. */
+	uint8_t big[VITRIN_WIRE_MAX_FRAME];
+	size_t big_len;
+	size_t big_offset;
+
 	struct wl_event_source *source;
 	vitrin_wire_handler_t handler;
 	vitrin_wire_drained_t on_drained;
@@ -158,6 +182,10 @@ bool vitrin_wire_adopt(struct vitrin_wire *w);
 
 /* True once a connection exists and has not failed or hung up. */
 bool vitrin_wire_alive(const struct vitrin_wire *w);
+
+/* The largest frame `vitrin_wire_send` accepts: the wire format's own
+ * ceiling, since `vitrin_shim_session.selection` can approach it. */
+#define VITRIN_WIRE_MAX_SEND VITRIN_WIRE_MAX_FRAME
 
 /* Send one complete frame, with `fd` (or -1) riding its first sendmsg as
  * SCM_RIGHTS ancillary data, so the core's positional fd matching holds by

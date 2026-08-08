@@ -384,6 +384,31 @@ pub(crate) struct ShimServer {
     /// Zero-copy instrumentation: every core-side CPU copy of client
     /// pixels (the shm copy-in — the only such site) is recorded here.
     copy_meter: CopyMeter,
+    /// The `selection` answer this shim sent and the runtime has not yet
+    /// drained (WS-E.2.1, issue #213).
+    ///
+    /// Parked here rather than acted on inside [`Self::handle_message`] for the
+    /// reason every other cross-cutting effect in this server is: this type
+    /// knows about one connection's object graph and nothing about the clipboard
+    /// slot, the realm registry or the recorder. The runtime drains it with
+    /// [`Self::take_selection_answer`] on the same turn, and a second answer
+    /// before that drain replaces the first — a shim that answers twice is
+    /// answering a question that was asked once.
+    selection_answer: Option<SelectionAnswer>,
+}
+
+/// One shim's answer to a `request_selection`, waiting for the runtime.
+///
+/// **No `Debug`, deliberately.** It carries an app's own bytes, and the whole
+/// point of [`crate::clipboard::ClipboardContent`]'s hand-written `Debug` is
+/// undone if the value on its way there prints itself into a panic message
+/// first. Nothing in the core formats this type; the runtime moves it into the
+/// slot, which is where the secrecy contract picks it up.
+pub(crate) struct SelectionAnswer {
+    pub serial: u32,
+    pub status: session::SelectionStatus,
+    pub mime: String,
+    pub data: String,
 }
 
 impl ShimServer {
@@ -396,7 +421,52 @@ impl ShimServer {
             owed_frame_dones: VecDeque::new(),
             retained_dmabuf: None,
             copy_meter: CopyMeter::default(),
+            selection_answer: None,
         }
+    }
+
+    /// Take this shim's pending `selection` answer, if it sent one.
+    pub fn take_selection_answer(&mut self) -> Option<SelectionAnswer> {
+        self.selection_answer.take()
+    }
+
+    /// Send `vitrin_shim_session.request_selection` — the first half of the
+    /// human's cross-realm copy gesture (WS-E.2.1, issue #213).
+    ///
+    /// **The core pulls.** This is sent only because a human at the physical
+    /// keyboard pressed the promote chord while the output was bound to this
+    /// realm; there is no message by which a shim can offer a selection unasked,
+    /// and the serial is what makes a superseded gesture's answer discardable.
+    pub fn send_request_selection<F>(&self, serial: u32, send: &mut F) -> Result<(), TransportError>
+    where
+        F: FnMut(&[u8]) -> Result<(), TransportError>,
+    {
+        send(&session::events::RequestSelection { serial }.encode(SHIM_SESSION_ID))
+    }
+
+    /// Send `vitrin_shim_session.offer_selection` — the second half, a separate
+    /// later physical act (WS-E.2.1, issue #213).
+    ///
+    /// The core never sends this with an empty slot, so a shim receiving it
+    /// always has something to install. It installs it as its app's ordinary
+    /// selection and does **not** paste: the human still presses their app's own
+    /// paste key.
+    pub fn send_offer_selection<F>(
+        &self,
+        mime: &str,
+        data: &str,
+        send: &mut F,
+    ) -> Result<(), TransportError>
+    where
+        F: FnMut(&[u8]) -> Result<(), TransportError>,
+    {
+        send(
+            &session::events::OfferSelection {
+                mime: mime.to_owned(),
+                data: data.to_owned(),
+            }
+            .encode(SHIM_SESSION_ID),
+        )
     }
 
     /// The client-pixel copy instrumentation (P1.3.5): tests assert the shm
@@ -532,6 +602,22 @@ impl ShimServer {
                         return Err(ShimViolation::AlreadyInitialized.into());
                     }
                     self.seat_id = Some(req.seat);
+                    Ok(false)
+                }
+                session::requests::Selection::OPCODE => {
+                    // Decoding enforces the IDL's `(max N bytes)` bound before
+                    // a byte of this reaches the core's own state: an oversized
+                    // `data` is fatal `invalid_argument` here, which is why the
+                    // IDL asks the shim to answer `too_large` itself rather than
+                    // letting a human's large copy kill their app's shim.
+                    let (_, req) = session::requests::Selection::decode(&msg.bytes, msg.fd)
+                        .map_err(ShimViolation::from)?;
+                    self.selection_answer = Some(SelectionAnswer {
+                        serial: req.serial,
+                        status: req.status,
+                        mime: req.mime,
+                        data: req.data,
+                    });
                     Ok(false)
                 }
                 _ => Err(ShimViolation::UnknownOpcode { object_id, opcode }.into()),

@@ -86,6 +86,9 @@ static int sink = 0;
     X(vitrin_shim_session_req_create_surface)                                \
     X(vitrin_shim_session_req_get_seat)                                      \
     X(vitrin_shim_session_evt_configure)                                     \
+    X(vitrin_shim_session_req_selection)                                     \
+    X(vitrin_shim_session_evt_request_selection)                             \
+    X(vitrin_shim_session_evt_offer_selection)                               \
     X(vitrin_shim_surface_req_attach)                                        \
     X(vitrin_shim_surface_req_damage)                                        \
     X(vitrin_shim_surface_req_commit)                                        \

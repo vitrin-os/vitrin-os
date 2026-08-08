@@ -30,6 +30,7 @@
 #include <wlr/util/log.h>
 
 #include "seat.h"
+#include "clipboard.h"
 #include "server.h"
 #include "upstream.h"
 #include "vitrin-protocol.h"
@@ -580,6 +581,49 @@ static void handle_configure(struct vitrin_shim *s, const uint8_t *frame, size_t
 /* One complete frame from the core. Routing is by object id, exactly as the
  * core routes ours: id 1 is the session, id 2 the surface we minted, id 3
  * the seat. */
+/* The cross-realm clipboard's two core-initiated events (WS-E.2.1, issue
+ * #213). Everything past the routing decision lives in clipboard.c; these are
+ * decode-and-forward, exactly as `handle_configure` is.
+ *
+ * A malformed frame is logged and dropped rather than fatal, the same posture
+ * every other event here takes: the core is the TCB, so this is version skew,
+ * not an attack. The cost is stated rather than hidden -- a dropped
+ * `request_selection` means the core waits out its own promotion with no
+ * answer, and the human's copy silently does nothing. */
+static void handle_request_selection(struct vitrin_shim *s, const uint8_t *frame, size_t len) {
+	uint32_t object_id = 0;
+	vitrin_shim_session_evt_request_selection_t ev;
+	vitrin_decode_status_t st =
+		vitrin_shim_session_evt_request_selection_decode(frame, len, -1, &object_id, &ev);
+	if (st != VITRIN_DECODE_OK) {
+		wlr_log(WLR_ERROR, "malformed request_selection: %s", vitrin_decode_status_string(st));
+		return;
+	}
+	vitrin_clipboard_handle_request(s, ev.serial);
+}
+
+static void handle_offer_selection(struct vitrin_shim *s, const uint8_t *frame, size_t len) {
+	uint32_t object_id = 0;
+	vitrin_shim_session_evt_offer_selection_t ev;
+	vitrin_decode_status_t st =
+		vitrin_shim_session_evt_offer_selection_decode(frame, len, -1, &object_id, &ev);
+	if (st != VITRIN_DECODE_OK) {
+		wlr_log(WLR_ERROR, "malformed offer_selection: %s", vitrin_decode_status_string(st));
+		return;
+	}
+	/* `mime` and `data` borrow `frame`, which outlives this call; clipboard.c
+	 * copies what it keeps. The MIME string is NUL-terminated here because the
+	 * wire's is not, and `strcmp` is what the allow-list check uses. */
+	char mime[64];
+	if (ev.mime.len >= sizeof(mime)) {
+		wlr_log(WLR_ERROR, "offer_selection carried an over-long MIME type; ignored");
+		return;
+	}
+	memcpy(mime, ev.mime.data, ev.mime.len);
+	mime[ev.mime.len] = '\0';
+	vitrin_clipboard_handle_offer(s, mime, ev.data.data, ev.data.len);
+}
+
 static bool upstream_message(void *data, const uint8_t *frame, size_t len) {
 	struct vitrin_shim *s = data;
 	vitrin_frame_header_t hdr;
@@ -591,6 +635,10 @@ static bool upstream_message(void *data, const uint8_t *frame, size_t len) {
 	case VITRIN_SESSION_ID:
 		if (hdr.opcode == VITRIN_SHIM_SESSION_EVT_CONFIGURE_OPCODE) {
 			handle_configure(s, frame, len);
+		} else if (hdr.opcode == VITRIN_SHIM_SESSION_EVT_REQUEST_SELECTION_OPCODE) {
+			handle_request_selection(s, frame, len);
+		} else if (hdr.opcode == VITRIN_SHIM_SESSION_EVT_OFFER_SELECTION_OPCODE) {
+			handle_offer_selection(s, frame, len);
 		} else {
 			wlr_log(WLR_ERROR, "unknown session event opcode %u", hdr.opcode);
 		}

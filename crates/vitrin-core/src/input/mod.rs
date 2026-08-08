@@ -617,6 +617,21 @@ pub(crate) trait PreemptionHook {
     fn attention(
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>>;
+
+    /// The clipboard chord signal this stack carries, if any (WS-E.2.1, issue
+    /// #213).
+    ///
+    /// The same wiring accessor [`Self::attention`] is, for the same reason and
+    /// with the same **deliberate absence of a default**: a wrapping hook that
+    /// forgot to forward its inner hook's answer would silently report "no
+    /// clipboard chords", `Runtime::new` would fall back to a detached signal,
+    /// and the human's Ctrl-Shift-Insert would queue gestures into a `RefCell`
+    /// the embedder never drains — the key simply stops working, with every test
+    /// still green. That is `PresenceHook`'s failure exactly, and a defaulted
+    /// method here would re-open it a third time.
+    fn clipboard(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>>;
 }
 
 /// The terminal hook: observes nothing, consumes nothing.
@@ -641,6 +656,14 @@ impl PreemptionHook for NoopHook {
     fn attention(
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>> {
+        None
+    }
+
+    /// The terminal hook owns no clipboard chords either, and says so out loud
+    /// for the reason above.
+    fn clipboard(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
         None
     }
 }
@@ -1168,6 +1191,16 @@ impl<H: PreemptionHook> InputRouter<H> {
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>> {
         self.hook.attention()
+    }
+
+    /// The clipboard chord signal this router's hook stack carries (WS-E.2.1),
+    /// on the same terms as [`Self::attention`]: `Runtime::new` takes it *out of
+    /// the router it is handed*, so the embedder that drains the gestures and
+    /// the hook that queues them cannot be two different signals.
+    pub fn clipboard(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
+        self.hook.clipboard()
     }
 
     /// Set the presence tap's clock to this dispatch turn's instant.
@@ -2891,6 +2924,12 @@ pub(crate) mod tests {
         ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>> {
             None
         }
+
+        fn clipboard(
+            &self,
+        ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
+            None
+        }
         fn gate(&mut self, input: &SeatInput) -> Gate {
             self.log.borrow_mut().push(("gate", input.origin()));
             if self.consume.get() {
@@ -3580,6 +3619,12 @@ pub(crate) mod tests {
         fn attention(
             &self,
         ) -> Option<std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>> {
+            None
+        }
+
+        fn clipboard(
+            &self,
+        ) -> Option<std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>> {
             None
         }
 

@@ -216,6 +216,24 @@ class PhysicalInputInjector:
         """
         self._expect_ack("attention", 2)
 
+    def clipboard(self, promote: bool) -> None:
+        """Chord the core's cross-realm clipboard gesture (WS-E.2.1, #213).
+
+        `promote=True` is ctrl+shift+KEY (ask the focused realm for its
+        selection); `promote=False` is shift+KEY (offer the core's slot to the
+        focused realm). One line is the whole chord -- modifiers down, trigger
+        down, trigger up, modifiers up -- because half a chord is not a gesture.
+
+        The ack count is the number of intake events, so it is exactly the
+        number of key transitions: 6 for the three-key chord, 4 for the
+        two-key one. Asserting it is what makes `ack` evidence rather than
+        decoration -- a core that stopped delivering a modifier would still
+        answer `ack`, but not with this number.
+        """
+        self._expect_ack(
+            f"clipboard {'promote' if promote else 'offer'}", 6 if promote else 4
+        )
+
     def click(self, x: float, y: float, code: int | None = None) -> None:
         """Move, press, release -- the human's version of `grant.pointer.click`."""
         code = self.BTN_LEFT if code is None else code

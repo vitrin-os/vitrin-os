@@ -94,15 +94,15 @@ def frame(object_id: int, opcode: int, payload: bytes, *, size_override: int | N
 
 
 # ---------------------------------------------------------------------------
-# protocol_decode: data[0] = decoder selector (mod 29), data[1] = fd flag
+# protocol_decode: data[0] = decoder selector (mod MESSAGE_COUNT), data[1] = fd flag
 # (bit 0), data[2:] = frame bytes handed to decode() verbatim. Selector
 # indices below MUST match fuzz_targets/protocol_decode.rs's DECODERS
 # table order exactly -- see that file's `decoder_table!` invocation.
 # ---------------------------------------------------------------------------
 
 SEL_HELLO = 0
-SEL_FRAME_READY = 11
-SEL_ATTACH = 19
+SEL_FRAME_READY = 15
+SEL_ATTACH = 26
 
 
 def protocol_decode_seeds() -> dict[str, bytes]:

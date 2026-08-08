@@ -70,6 +70,7 @@
 //!                     scroll <vertical|horizontal> <v120>
 //!                     key <evdev-scancode> <press|release>
 //!                     attention                      (one whole chord tap)
+//!                     clipboard <promote|offer>      (one whole modifier chord)
 //!
 //!   core -> harness   vitrin-physical-input 1        (banner, once)
 //!                     ack <injected-event-count>     (per accepted request)
@@ -85,6 +86,16 @@
 //! exists so a harness names the *gesture* rather than a scancode it had to
 //! guess, and so a run started with `--attention-chord rsuper` is exercised
 //! with `rsuper` without the harness knowing.
+//!
+//! `clipboard` is the same idea one gesture up (WS-E.2.1,
+//! [`crate::clipboard`]): one line is the *whole* chord — modifiers down,
+//! trigger down, trigger up, modifiers up — because half a chord is not a
+//! gesture and a harness that sent only the press would leave the core
+//! believing Shift is held. It is **not** a second path either: every event it
+//! produces comes out of the same [`super::physical_key`] a `key` line uses, on
+//! the modifiers' and the trigger's own scancodes, so `clipboard promote` and
+//! the five `key` lines that spell it are the identical five calls. Which key
+//! it chords is this run's `--clipboard-key`, not the peer's to choose.
 //!
 //! `ack` counts the [`super::SeatInput`]s the intake produced, not the
 //! deliveries: whether an event reaches an app is the router's and the shim's
@@ -135,6 +146,17 @@ pub(crate) enum Request {
     /// argument for the same reason the wire event does not: which key it is
     /// is the core's own configuration, not the peer's to choose.
     Attention,
+    /// One whole chord of **this run's configured clipboard gesture**
+    /// (WS-E.2.1): the modifiers down, the trigger down, the trigger up, the
+    /// modifiers up, through the same [`super::physical_key`] every other key
+    /// goes through.
+    ///
+    /// The direction is an argument where [`Request::Attention`]'s key is not,
+    /// and the asymmetry is the point: *which* key the attention chord uses is
+    /// the core's configuration, while *which of the two* clipboard gestures a
+    /// harness means is genuinely the harness's to say — they are two different
+    /// gestures, not two spellings of one.
+    Clipboard { promote: bool },
 }
 
 /// Parse one line into a [`Request`], or `None` for anything else.
@@ -170,6 +192,13 @@ pub(crate) fn parse_request(line: &str) -> Option<Request> {
             pressed: parse_press(fields.next()?)?,
         },
         "attention" => Request::Attention,
+        "clipboard" => Request::Clipboard {
+            promote: match fields.next()? {
+                "promote" => true,
+                "offer" => false,
+                _ => return None,
+            },
+        },
         _ => return None,
     };
     if fields.next().is_some() {
@@ -219,6 +248,7 @@ pub(crate) fn intake(
     request: Request,
     view: (i32, i32),
     attention: crate::attention::AttentionChord,
+    clipboard: crate::chord::Trigger,
 ) -> Vec<SeatInput> {
     match request {
         Request::Motion { x, y } => super::intake_physical::<SyntheticHost>(
@@ -287,6 +317,38 @@ pub(crate) fn intake(
                 None,
                 KeyState::Released,
             ));
+            out
+        }
+        // The whole chord, through the **same** `physical_key` every other key
+        // goes through, on the configured trigger's own scancode. Modifiers
+        // are released in reverse order, which is not cosmetic: the core's
+        // matcher tracks press and release per modifier, and a harness that
+        // released them in press order would still be correct here but would
+        // stop resembling a human, which is the only thing this channel is for.
+        Request::Clipboard { promote } => {
+            use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+            let mut mods = Vec::new();
+            if promote {
+                mods.push(crate::chord::Modifier::Ctrl.evdev());
+            }
+            mods.push(crate::chord::Modifier::Shift.evdev());
+            let mut out = Vec::new();
+            for evdev in &mods {
+                out.extend(super::physical_key(*evdev, None, KeyState::Pressed));
+            }
+            out.extend(super::physical_key(
+                clipboard.evdev(),
+                None,
+                KeyState::Pressed,
+            ));
+            out.extend(super::physical_key(
+                clipboard.evdev(),
+                None,
+                KeyState::Released,
+            ));
+            for evdev in mods.iter().rev() {
+                out.extend(super::physical_key(*evdev, None, KeyState::Released));
+            }
             out
         }
     }
@@ -594,12 +656,30 @@ mod tests {
             .expect("the default attention chord parses")
     }
 
+    fn trigger() -> crate::chord::Trigger {
+        crate::chord::Trigger::parse(crate::clipboard::DEFAULT_TRIGGER)
+            .expect("the default clipboard trigger parses")
+    }
+
     #[test]
-    fn the_vocabulary_is_exactly_five_verbs_and_nothing_decorated() {
+    fn the_vocabulary_is_exactly_six_verbs_and_nothing_decorated() {
         assert_eq!(parse_request("attention"), Some(Request::Attention));
         // Argument-free: which key it is is the core's configuration, not the
         // peer's to choose, so a decorated line is a different message.
         assert_eq!(parse_request("attention super"), None);
+        assert_eq!(
+            parse_request("clipboard promote"),
+            Some(Request::Clipboard { promote: true })
+        );
+        assert_eq!(
+            parse_request("clipboard offer"),
+            Some(Request::Clipboard { promote: false })
+        );
+        // The direction is required and closed: `clipboard` alone, or any other
+        // word, is a different message rather than a defaulted one.
+        assert_eq!(parse_request("clipboard"), None);
+        assert_eq!(parse_request("clipboard paste"), None);
+        assert_eq!(parse_request("clipboard promote extra"), None);
         assert_eq!(
             parse_request("motion 12.5 -3"),
             Some(Request::Motion { x: 12.5, y: -3.0 })
@@ -654,7 +734,7 @@ mod tests {
         // `intake_physical`/`physical_key` produce, tagged by the one
         // constructor that can tag it, and nothing here builds a `SeatInput`
         // of its own.
-        let motion = intake(Request::Motion { x: 4.0, y: 9.0 }, VIEW, chord());
+        let motion = intake(Request::Motion { x: 4.0, y: 9.0 }, VIEW, chord(), trigger());
         assert_eq!(motion.len(), 1);
         assert_eq!(motion[0].origin(), Origin::Physical);
         assert_eq!(motion[0].kind(), &SeatInputKind::Motion { x: 4.0, y: 9.0 });
@@ -666,6 +746,7 @@ mod tests {
             },
             VIEW,
             chord(),
+            trigger(),
         );
         assert_eq!(
             button[0].kind(),
@@ -682,6 +763,7 @@ mod tests {
             },
             VIEW,
             chord(),
+            trigger(),
         );
         assert_eq!(
             scroll[0].kind(),
@@ -700,6 +782,7 @@ mod tests {
             },
             VIEW,
             chord(),
+            trigger(),
         );
         assert_eq!(
             key[0].kind(),
@@ -718,7 +801,7 @@ mod tests {
         // chord's own scancode -- `attention` names a gesture, it is never a
         // second way into the core.
         let chord = chord();
-        let tap = intake(Request::Attention, VIEW, chord);
+        let tap = intake(Request::Attention, VIEW, chord, trigger());
         let by_hand: Vec<_> = intake(
             Request::Key {
                 evdev: chord.evdev(),
@@ -726,6 +809,7 @@ mod tests {
             },
             VIEW,
             chord,
+            trigger(),
         )
         .into_iter()
         .chain(intake(
@@ -735,6 +819,7 @@ mod tests {
             },
             VIEW,
             chord,
+            trigger(),
         ))
         .collect();
         assert_eq!(tap.len(), 2);
@@ -770,6 +855,7 @@ mod tests {
             },
             VIEW,
             chord(),
+            trigger(),
         )
         .is_empty());
         // A scroll that rounds to nothing is not a zero-valued event.
@@ -780,6 +866,7 @@ mod tests {
             },
             VIEW,
             chord(),
+            trigger(),
         )
         .is_empty());
     }

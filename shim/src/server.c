@@ -17,6 +17,7 @@
 #include <wlr/util/log.h>
 
 #include "ledger.h"
+#include "clipboard.h"
 #include "server.h"
 #include "upstream.h"
 
@@ -93,6 +94,7 @@ void vitrin_shim_finish(struct vitrin_shim *s) {
 	 * that `wlr_keyboard_finish` asserts is gone. seat.c owns the ordering;
 	 * calling it here is what guarantees it runs on every exit path,
 	 * including main()'s partial-bring-up one. */
+	vitrin_clipboard_finish(s);
 	vitrin_seat_finish(s);
 	/* Release the core connection and the frame pool BEFORE the display
 	 * goes: the wire's event source belongs to the display's event loop, so

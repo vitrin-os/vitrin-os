@@ -315,6 +315,24 @@ pub(crate) struct Kernel {
     /// signal that never opens, which is the honest answer for a build with no
     /// physical input device rather than a special case in the chokepoint.
     pub attention: std::rc::Rc<std::cell::RefCell<crate::attention::AttentionSignal>>,
+    /// **The human's clipboard chords** (WS-E.2.1, issue #213): the queue the
+    /// hook writes a gesture into and [`drain_clipboard_gestures`] drains.
+    ///
+    /// Taken out of the router on the same terms as `attention` above, and for
+    /// the same reason: a kernel draining a signal the hook does not write is a
+    /// clipboard whose chords silently do nothing, with every test green. A
+    /// backend whose stack carries no
+    /// [`ClipboardHook`](crate::clipboard::ClipboardHook) gets a detached
+    /// signal nothing ever queues into.
+    pub clipboard: std::rc::Rc<std::cell::RefCell<crate::clipboard::ClipboardSignal>>,
+    /// **The session's one clipboard slot** (WS-E.2.1, issue #213, D-024).
+    ///
+    /// Kernel state rather than router state, because it holds application
+    /// bytes and the router must never learn about authority or about realms.
+    /// It is the one piece of session state the dead-man switch's grant sweep
+    /// cannot reach, which is why [`crate::deadman::apply`] clears it
+    /// explicitly.
+    pub clipboard_slot: crate::clipboard::ClipboardSlot,
 }
 
 /// The realm's live shim session: the protocol server, the out-of-band send
@@ -742,6 +760,17 @@ impl<H: PreemptionHook> Runtime<H> {
                 crate::attention::AttentionSignal::detached(),
             ))
         });
+        // ...and the clipboard chord queue, the same way and for the same
+        // reason (WS-E.2.1). A detached signal is the honest answer for a
+        // backend with no physical input device: the slot still exists and the
+        // chokepoint-independent clipboard code is the same in every build,
+        // and "this backend has no clipboard chord" stays a fact about the hook
+        // stack.
+        let clipboard = router.clipboard().unwrap_or_else(|| {
+            std::rc::Rc::new(std::cell::RefCell::new(
+                crate::clipboard::ClipboardSignal::detached(),
+            ))
+        });
         let RuntimeSeed {
             listener,
             verifier,
@@ -765,6 +794,8 @@ impl<H: PreemptionHook> Runtime<H> {
                 recorder,
                 presence,
                 attention,
+                clipboard,
+                clipboard_slot: crate::clipboard::ClipboardSlot::new(),
             },
             listener: Some(listener),
             conns: BTreeMap::new(),
@@ -854,6 +885,7 @@ impl<H: PreemptionHook> Runtime<H> {
             &mut self.kernel.grants,
             &mut self.kernel.petitions,
             &self.kernel.attention,
+            &mut self.kernel.clipboard_slot,
             &mut self.kernel.recorder,
             now,
         );
@@ -1374,6 +1406,7 @@ fn with_realm_teardown<H: RuntimeHost, T>(
                 importer,
                 router,
                 retained,
+                clipboard: &mut kernel.clipboard_slot,
                 realms: &mut kernel.realms,
                 recorder: &mut kernel.recorder,
             };
@@ -1476,7 +1509,18 @@ fn rebind_output_after_death<H: RuntimeHost>(host: &mut H) {
 /// causal order — a petition dies, then rows die — matching what a
 /// reconstruction expects.
 fn sweep<H: RuntimeHost>(host: &mut H) {
-    let now = Instant::now();
+    sweep_at(host, Instant::now());
+}
+
+/// [`sweep`] with the instant injected, so its call sites are testable.
+///
+/// Split out because the clipboard's expiry lives here and "cleared after two
+/// minutes" cannot be asserted against a function that reads the wall clock
+/// itself. The split is the whole point: the bug this fixes was never in
+/// `ClipboardSlot::expire`, which had a passing unit test — it was in **where
+/// expire was called from**, and a test that cannot drive the call site cannot
+/// see that class of defect at all.
+fn sweep_at<H: RuntimeHost>(host: &mut H, now: Instant) {
     let runtime = host.runtime();
 
     for resolution in runtime.kernel.petitions.expire_due(now) {
@@ -1488,6 +1532,25 @@ fn sweep<H: RuntimeHost>(host: &mut H) {
     // heartbeat file.
     let expired = runtime.kernel.grants.expire_due(now);
     runtime.kernel.recorder.record_expiry_sweep(&expired);
+
+    // **The clipboard slot expires HERE, on the timer, not on input.**
+    //
+    // It was originally expired inside `drain_clipboard_gestures`, which made
+    // "cleared after two minutes" false in the one case that matters: a human
+    // copies a password and walks away. That function runs only on a physical
+    // input turn, and returns early unless that turn carried a clipboard
+    // chord -- so with nobody at the keyboard the plaintext stayed resident in
+    // `vitrind`'s heap for the life of the session, while `limits.md`, D-024(5)
+    // and the code's own comment all said it was gone. The timeout was a read
+    // filter wearing a clear's clothes.
+    //
+    // This sweep already exists, already runs every second whether or not
+    // anything happened, and is already the home of expiry. The cost of that
+    // granularity is stated rather than hidden: the slot is cleared within one
+    // second of its deadline, never before it.
+    if runtime.kernel.clipboard_slot.expire(now) {
+        tracing::debug!("clipboard slot expired on the sweep");
+    }
 }
 
 /// Route one deferred [`Resolution`] to the connection that petitioned.
@@ -2722,6 +2785,230 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
     // one of *this* turn's events, and the window it opens is measured from the
     // human's gesture rather than from the delivery round.
     open_attention_window(runtime, now);
+    // ...and the clipboard chords, on the same terms and for the same reason
+    // (WS-E.2.1, issue #213): the hook queued a gesture, and only here is the
+    // realm the output is bound to, the shim connection and the slot all in
+    // scope at once.
+    drain_clipboard_gestures(runtime, scenes, now);
+}
+
+/// Turn the human's queued clipboard chords into wire traffic (WS-E.2.1,
+/// issue #213).
+///
+/// **The hook could not do any of this and must never be able to.** It runs
+/// inside `InputRouter::route_physical`, which is never told a realm — the
+/// property that makes the consent grab and the dead-man switch session-wide by
+/// construction ([`crate::input::PreemptionHook`]'s trait docs). So the gate
+/// records *that a gesture happened* and this function, which owns the realm
+/// registry and the slot, decides *where*.
+///
+/// **Both gestures aim at the realm the output is bound to**, resolved through
+/// [`physical_seat_target`] — the same function that decides where the human's
+/// keystrokes go. That is not a convenience: a clipboard gesture that promoted
+/// from a realm the human was not looking at would be a channel out of a hidden
+/// realm, which is the one thing a human-driven mediator must not be.
+///
+/// **One gesture transfers nothing.** `Promote` writes the slot and sends
+/// nothing to any other realm; `Offer` reads it ([`ClipboardSlot::peek`] takes
+/// `&self`) and writes nothing. The chords cannot both fire from one press —
+/// [`crate::chord`] compares modifier sets for equality — so the property holds
+/// at the matcher, here, and in the types, independently.
+fn drain_clipboard_gestures<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    scenes: &crate::scene::realms::RealmScenes,
+    now: Instant,
+) {
+    let gestures = runtime.kernel.clipboard.borrow_mut().take_pending();
+    if gestures.is_empty() {
+        return;
+    }
+    // Expire before anything reads the slot, so a gesture arriving in the same
+    // turn as the deadline cannot read a stale slot. This is a SECOND line of
+    // defence, not the clear: `sweep` owns that and runs without input, which
+    // is what makes "cleared after two minutes" true for a human who copies
+    // and walks away.
+    if runtime.kernel.clipboard_slot.expire(now) {
+        tracing::debug!("clipboard slot expired at gesture time");
+    }
+    let target = physical_seat_target(&runtime.realms, scenes).map(|(id, _)| id.clone());
+    for gesture in gestures {
+        let Runtime { realms, kernel, .. } = runtime;
+        let Some(realm_id) = target.as_ref() else {
+            // No realm is bound, so there is nothing to ask and nothing to
+            // offer. Journalled rather than silent: the human has no other
+            // instrument for "why did my copy do nothing".
+            kernel
+                .recorder
+                .record(crate::recorder::Event::ClipboardRefused {
+                    realm: None,
+                    gesture: gesture.label(),
+                    reason: "no_bound_realm",
+                });
+            continue;
+        };
+        let refuse = |kernel: &mut Kernel, reason: &'static str| {
+            kernel
+                .recorder
+                .record(crate::recorder::Event::ClipboardRefused {
+                    realm: Some(realm_id),
+                    gesture: gesture.label(),
+                    reason,
+                });
+        };
+        let Some(realm) = realms.get(realm_id) else {
+            refuse(kernel, "no_realm");
+            continue;
+        };
+        let Some(server) = realm.server.as_ref() else {
+            refuse(kernel, "no_shim");
+            continue;
+        };
+        let mut send = |frame: &[u8]| realm.outbox.send(frame);
+        match gesture {
+            crate::clipboard::ClipboardGesture::Promote => {
+                // The serial is minted *before* the send and superseding is its
+                // whole job: a second press while the first answer is in flight
+                // makes that answer stale by the human's own account.
+                let serial = kernel.clipboard_slot.open_promotion(realm_id.clone());
+                if let Err(err) = server.send_request_selection(serial, &mut send) {
+                    tracing::warn!(realm = %realm_id, %err, "request_selection could not be sent");
+                    kernel.clipboard_slot.abandon_promotion();
+                    refuse(kernel, "send_failed");
+                }
+            }
+            crate::clipboard::ClipboardGesture::Offer => {
+                // Read, encode and send inside one borrow of the slot. That
+                // keeps the slot's OWN copy singular; it does **not** mean no
+                // other copy exists, and an earlier version of this comment
+                // claimed it did. `send_offer_selection` does `data.to_owned()`,
+                // `OfferSelection::encode` copies again into a `Vec<u8>`, and
+                // `Outbox::send` does `frame.to_vec()` a third time -- none of
+                // them zeroised on free, while the shim half `memset`s every
+                // buffer that held a selection. Closing that asymmetry means
+                // zeroising on the core's send path too, which is real work and
+                // is not done here; it is published rather than implied away.
+                // The journal fields are copied out first because they are the
+                // only things that outlive the borrow.
+                // `Err(reason)` rather than `None`, so the journal can tell an
+                // EMPTY slot from a FULL one whose send failed. Collapsing both
+                // to `empty_slot` made the flight recorder assert the slot was
+                // empty when it was full -- and the `Promote` branch above
+                // already had the right label (`send_failed`), so the
+                // vocabulary existed and simply was not reached.
+                let sent = match kernel.clipboard_slot.peek(now) {
+                    None => Err("empty_slot"),
+                    Some(offered) => {
+                        let record = (offered.bytes, offered.digest, offered.source.clone());
+                        match server.send_offer_selection(offered.mime, offered.data, &mut send) {
+                            Ok(()) => Ok(record),
+                            Err(err) => {
+                                tracing::warn!(
+                                    realm = %realm_id,
+                                    %err,
+                                    "offer_selection could not be sent"
+                                );
+                                Err("send_failed")
+                            }
+                        }
+                    }
+                };
+                match sent {
+                    Ok((bytes, digest, source)) => {
+                        kernel
+                            .recorder
+                            .record(crate::recorder::Event::ClipboardOffered {
+                                realm: realm_id,
+                                source: &source,
+                                mime: crate::clipboard::CLIPBOARD_MIME,
+                                bytes,
+                                digest: &digest,
+                            });
+                        tracing::info!(
+                            realm = %realm_id,
+                            bytes,
+                            "clipboard offered to the realm the human is looking at"
+                        );
+                    }
+                    Err(reason) => refuse(kernel, reason),
+                }
+            }
+        }
+    }
+}
+
+/// Fold a shim's `selection` answer into the slot (WS-E.2.1, issue #213).
+///
+/// **This is where "the core pulls" stops being a rule and becomes a type.**
+/// The answer can only reach [`ClipboardSlot::fill`] through
+/// [`ClipboardSlot::claim_answer`], which matches the serial *and* the realm of
+/// a promotion this core itself opened on a human's gesture, and hands back a
+/// [`PendingPromotion`](crate::clipboard::PendingPromotion) that `fill` consumes
+/// by value. An unsolicited `selection` — from a compromised shim, or from a
+/// well-meaning one racing a superseded gesture — finds no ticket and does
+/// nothing at all.
+///
+/// The core re-judges the MIME type and the length whatever the shim's `status`
+/// claimed, because a shim is untrusted and `ok` is a claim rather than a
+/// credential.
+fn apply_selection_answer<H: RuntimeHost>(host: &mut H, realm_id: &RealmId, now: Instant) {
+    let Runtime { realms, kernel, .. } = host.runtime();
+    let Some(answer) = realms
+        .get_mut(realm_id)
+        .and_then(|realm| realm.server.as_mut())
+        .and_then(|server| server.take_selection_answer())
+    else {
+        return;
+    };
+    let Some(ticket) = kernel.clipboard_slot.claim_answer(realm_id, answer.serial) else {
+        tracing::debug!(
+            realm = %realm_id,
+            "selection answer discarded: no promotion of this core's is waiting for it"
+        );
+        return;
+    };
+    use vitrin_protocol::generated::vitrin_shim_session::SelectionStatus;
+    // The shim's own refusing statuses, taken at face value only in the
+    // direction that refuses: they can never *cause* a fill.
+    let refused = match answer.status {
+        SelectionStatus::Ok => None,
+        SelectionStatus::Empty => Some("empty"),
+        SelectionStatus::WrongType => Some("wrong_type"),
+        SelectionStatus::TooLarge => Some("too_large"),
+    };
+    let outcome = match refused {
+        Some(reason) => Err(reason),
+        None => kernel
+            .clipboard_slot
+            .fill(ticket, &answer.mime, &answer.data, now)
+            .map_err(|refusal| refusal.label()),
+    };
+    match outcome {
+        Ok(promoted) => {
+            kernel
+                .recorder
+                .record(crate::recorder::Event::ClipboardPromoted {
+                    realm: realm_id,
+                    mime: promoted.mime,
+                    bytes: promoted.bytes,
+                    digest: &promoted.digest,
+                });
+            tracing::info!(
+                realm = %realm_id,
+                bytes = promoted.bytes,
+                "clipboard promoted from the realm the human is looking at"
+            );
+        }
+        Err(reason) => {
+            kernel
+                .recorder
+                .record(crate::recorder::Event::ClipboardRefused {
+                    realm: Some(realm_id),
+                    gesture: crate::clipboard::ClipboardGesture::Promote.label(),
+                    reason,
+                });
+            tracing::debug!(realm = %realm_id, reason, "clipboard promotion refused");
+        }
+    }
 }
 
 /// Turn a gated attention press into an open window (WS-E.1.7, issue #232):
@@ -2967,8 +3254,13 @@ fn dispatch_shim<H: RuntimeHost>(
                     // still registered, and the `Hangup` the lifecycle holds
                     // is what retires it.
                     close_realm(host, realm_id, DeathCause::of_shim_fault(fault));
+                    return;
                 }
             }
+            // Only on a live connection, and only after the message was
+            // accepted: a `selection` answer parked by a shim the core is about
+            // to bury must not fill the human's clipboard (WS-E.2.1).
+            apply_selection_answer(host, realm_id, Instant::now());
         }
         ConnectionEvent::Disconnected => {
             tracing::info!(realm = %realm_id, "shim connection closed");
@@ -3022,6 +3314,17 @@ fn close_realm<H: RuntimeHost>(host: &mut H, realm_id: &RealmId, cause: DeathCau
     // nested human's screen until an unrelated resize, focus change or
     // petition happened along.
     let (runtime, view) = host.split();
+    // The slot cannot outlive the realm that authored its bytes (WS-E.2.1,
+    // D-024(5)): keeping them would mean the core holding application content
+    // nothing left in the session can account for, and offering them onward
+    // would be a channel out of a realm that no longer exists. An outstanding
+    // promotion addressed here is abandoned on the same line.
+    if runtime.kernel.clipboard_slot.forget_realm(realm_id) {
+        tracing::info!(
+            realm = %realm_id,
+            "clipboard slot cleared: the realm its contents came from has died"
+        );
+    }
     runtime.dirty = true;
     view.request_present();
 }
@@ -6502,9 +6805,19 @@ mod tests {
         // allocates no verb bit -- so D-018(2) invariant 2 is untouched. What
         // it does do is make `preempted` CONDITIONAL for the two layout verbs;
         // that is D-023, not this invariant.
+        // Re-pinned 37 -> 40 by WS-E.2.1 (issue #213), with the same decision
+        // taken rather than skipped: the three added messages are
+        // `vitrin_shim_session.request_selection`, `.selection` and
+        // `.offer_selection` -- two events and one request, all on the SHIM
+        // bootstrap object, on the shim connection class, which no principal
+        // can address at all. None is a request on either layout interface,
+        // none adds an arrangement this scene cannot honour, and none allocates
+        // a verb bit (`Verb::VALID_MASK` is still 575). D-018(2) invariant 2 is
+        // untouched. What they do add is a cross-realm channel the human drives
+        // with two physical chords; that is D-024, not this invariant.
         assert_eq!(
             vitrin_protocol::generated::MESSAGE_COUNT,
-            37,
+            40,
             "a message was added to the IDL. If it is a request on \
              vitrin_layout_arrange or vitrin_layout_focus, D-018(2) invariant 2 is at \
              stake: this scene shows one realm, unstacked and unoverlapped, so it cannot \
@@ -7756,6 +8069,79 @@ mod tests {
     /// The human says no; the facet is still mintable (mint-freely-and-
     /// check-at-use) and its first use refuses `not_granted` without killing
     /// the connection.
+    /// **The clipboard clears on the TIMER, with nobody at the keyboard.**
+    ///
+    /// The defect this pins was not in `ClipboardSlot::expire` — that had a
+    /// passing unit test the whole time. It was in where expire was *called
+    /// from*: inside `drain_clipboard_gestures`, after an early return that
+    /// fires unless the turn carried a clipboard chord, in a function that only
+    /// runs on a physical-input turn at all. So the one case that matters —
+    /// a human copies a password and walks away — left the plaintext resident
+    /// in `vitrind`'s heap for the life of the session, while `limits.md`,
+    /// D-024(5) and the code's own comment all called it cleared.
+    ///
+    /// Driven through `sweep_at`, which is what the loop's one-second timer
+    /// calls, with **no input of any kind** in between. That absence is the
+    /// test: a version that expires on a gesture cannot pass it.
+    #[test]
+    fn the_clipboard_clears_on_the_sweep_with_nobody_at_the_keyboard() {
+        use crate::clipboard::{CLIPBOARD_LIFETIME, CLIPBOARD_MIME};
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "clipboard-sweep",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let realm = RealmId::new(crate::realm::WELL_KNOWN_REALM_ID);
+        let t0 = Instant::now();
+        {
+            let slot = &mut rig.host.runtime.kernel.clipboard_slot;
+            let serial = slot.open_promotion(realm.clone());
+            let ticket = slot
+                .claim_answer(&realm, serial)
+                .expect("the promotion just opened must be claimable");
+            slot.fill(ticket, CLIPBOARD_MIME, "hunter2", t0)
+                .expect("fixture text is in-policy");
+        }
+        assert!(
+            rig.host.runtime.kernel.clipboard_slot.peek(t0).is_some(),
+            "fixture check: the slot starts full"
+        );
+
+        // One sweep well inside the lifetime changes nothing...
+        sweep_at(&mut rig.host, t0 + CLIPBOARD_LIFETIME / 2);
+        assert!(
+            rig.host
+                .runtime
+                .kernel
+                .clipboard_slot
+                .peek(t0 + CLIPBOARD_LIFETIME / 2)
+                .is_some(),
+            "the slot must survive until its deadline: clearing early would lose a paste              the human is entitled to make twice"
+        );
+
+        // ...and one sweep past it clears, with no gesture anywhere.
+        sweep_at(&mut rig.host, t0 + CLIPBOARD_LIFETIME);
+        // **Peek at `t0`, not at the deadline.** `peek` filters on staleness
+        // itself, so peeking at `t0 + LIFETIME` answers `None` whether the
+        // bytes were cleared or are merely unreadable -- which is exactly the
+        // distinction under test. Asserted that way, this test passes with the
+        // sweep's expiry deleted; it was written that way first and the
+        // mutation run caught it. Ninth vacuous test in this workstream, same
+        // tell as the other eight. At `t0` a slot that still HELD the bytes
+        // answers `Some`, so this is the one instant that separates a clear
+        // from a filter.
+        assert!(
+            rig.host.runtime.kernel.clipboard_slot.peek(t0).is_none(),
+            "past the deadline the bytes must be GONE, not merely unreadable: peeked at \
+             the moment they were copied, a slot that only filtered on read would still \
+             hand them over"
+        );
+    }
+
     #[test]
     fn a_denied_layout_focus_grant_refuses_not_granted_on_use() {
         use vitrin_protocol::generated::vitrin_grant::{events::Refused, Refusal};

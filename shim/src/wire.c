@@ -171,6 +171,21 @@ static ssize_t wire_write(struct vitrin_wire *w, const uint8_t *bytes, size_t le
 /* Park an unsent frame tail. `fd` is duplicated only when the kernel has not
  * already taken it (i.e. when zero bytes of the frame went out). */
 static bool wire_park(struct vitrin_wire *w, const uint8_t *bytes, size_t len, int fd) {
+	if (len > VITRIN_WIRE_SLOT_BYTES) {
+		/* The oversized slot (WS-E.2.1). Accepted only when nothing else is
+		 * parked -- the caller has just flushed -- so "drain big, then the
+		 * queue" preserves wire order. A second while one is pending means
+		 * the core stopped reading, which is the conclusion a full queue
+		 * reaches too. */
+		if (w->big_len > w->big_offset || w->queue_len > 0) {
+			return wire_fail(w, "a second oversized frame while one is unsent: "
+			                    "the core has stopped reading");
+		}
+		memcpy(w->big, bytes, len);
+		w->big_len = len;
+		w->big_offset = 0;
+		return true;
+	}
 	if (w->queue_len >= VITRIN_WIRE_QUEUE_SLOTS) {
 		return wire_fail(w, "outgoing queue full: the core has stopped reading");
 	}
@@ -196,6 +211,21 @@ static bool wire_park(struct vitrin_wire *w, const uint8_t *bytes, size_t len, i
  * success ("wait for write readiness"), so returning true does not mean the
  * queue is now empty. */
 static bool wire_flush(struct vitrin_wire *w) {
+	/* The oversized slot first, always: it was accepted only when the queue
+	 * was empty, so anything in the queue was handed over after it and must
+	 * not overtake it (WS-E.2.1). */
+	while (w->big_len > w->big_offset) {
+		ssize_t n = wire_write(w, w->big + w->big_offset, w->big_len - w->big_offset, -1);
+		if (n < 0) {
+			return false;
+		}
+		w->big_offset += (size_t)n;
+		if (n == 0) {
+			return true; /* kernel is full; the rest waits for writability */
+		}
+	}
+	w->big_len = 0;
+	w->big_offset = 0;
 	while (w->queue_len > 0) {
 		struct vitrin_wire_slot *slot = &w->queue[w->queue_head];
 		ssize_t n = wire_write(w, slot->bytes + slot->offset, slot->len - slot->offset, slot->fd);
@@ -225,7 +255,7 @@ static void wire_update_mask(struct vitrin_wire *w) {
 		return;
 	}
 	uint32_t mask = WL_EVENT_READABLE;
-	if (w->queue_len > 0) {
+	if (w->queue_len > 0 || w->big_len > w->big_offset) {
 		mask |= WL_EVENT_WRITABLE;
 	}
 	wl_event_source_fd_update(w->source, mask);
@@ -238,8 +268,16 @@ bool vitrin_wire_send(struct vitrin_wire *w, const uint8_t *frame, size_t len, i
 	/* Local misuse, caught before any byte hits the wire -- the core answers
 	 * a malformed frame by closing without a word, so a bug here must be
 	 * loud on this side instead (vitrin-ipc's `validate_outgoing`). */
-	if (len < VITRIN_HEADER_LEN || len > VITRIN_WIRE_SLOT_BYTES) {
+	if (len < VITRIN_HEADER_LEN || len > VITRIN_WIRE_MAX_SEND) {
 		return wire_fail(w, "outgoing frame outside the shim's size envelope");
+	}
+	/* The oversized path carries no ancillary data, by construction: every
+	 * message in v0 that can exceed a queue slot has `fd_count` 0. Checked
+	 * rather than assumed, because the parking slot below has nowhere to put
+	 * an fd and a silent drop would be an fd leak plus a positional-matching
+	 * violation at the core. */
+	if (len > VITRIN_WIRE_SLOT_BYTES && fd >= 0) {
+		return wire_fail(w, "an oversized outgoing frame may not carry a descriptor");
 	}
 	vitrin_frame_header_t hdr;
 	if (vitrin_frame_header_decode(frame, len, &hdr) != VITRIN_DECODE_OK) {
@@ -254,11 +292,11 @@ bool vitrin_wire_send(struct vitrin_wire *w, const uint8_t *frame, size_t len, i
 
 	/* Anything already parked must go first: the stream is ordered, and a
 	 * frame that jumped the queue would interleave with a torn predecessor. */
-	if (w->queue_len > 0) {
+	if (w->big_len > w->big_offset || w->queue_len > 0) {
 		if (!wire_flush(w)) {
 			return false;
 		}
-		if (w->queue_len > 0) {
+		if (w->big_len > w->big_offset || w->queue_len > 0) {
 			bool ok = wire_park(w, frame, len, fd);
 			wire_update_mask(w);
 			return ok;

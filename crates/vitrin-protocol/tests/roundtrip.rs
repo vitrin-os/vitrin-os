@@ -79,6 +79,9 @@ type TypeText = gen::vitrin_actuator_text::requests::Type;
 type CreateSurface = gen::vitrin_shim_session::requests::CreateSurface;
 type GetSeat = gen::vitrin_shim_session::requests::GetSeat;
 type Configure = gen::vitrin_shim_session::events::Configure;
+type SessionSelection = gen::vitrin_shim_session::requests::Selection;
+type RequestSelection = gen::vitrin_shim_session::events::RequestSelection;
+type OfferSelection = gen::vitrin_shim_session::events::OfferSelection;
 
 type Attach = gen::vitrin_shim_surface::requests::Attach;
 type Damage = gen::vitrin_shim_surface::requests::Damage;
@@ -214,6 +217,9 @@ impl_message!(
     CreateSurface,
     GetSeat,
     Configure,
+    SessionSelection,
+    RequestSelection,
+    OfferSelection,
     Attach,
     Damage,
     Commit,
@@ -486,6 +492,35 @@ fn configure() -> impl Strategy<Value = Configure> {
     })
 }
 
+/// The cross-realm clipboard's three messages (WS-E.2.1, issue #213).
+///
+/// `mime` and `data` are exercised at their **declared** bounds rather than at
+/// the one value the core serves: the round trip is about the wire, and the
+/// wire's bound is what a hostile peer will push against.
+fn session_selection() -> impl Strategy<Value = SessionSelection> {
+    (
+        any_u32(),
+        plain_enum(gen::vitrin_shim_session::SelectionStatus::ALL),
+        bounded_string(32),
+        bounded_string(61440),
+    )
+        .prop_map(|(serial, status, mime, data)| SessionSelection {
+            serial,
+            status,
+            mime,
+            data,
+        })
+}
+
+fn request_selection() -> impl Strategy<Value = RequestSelection> {
+    any_u32().prop_map(|serial| RequestSelection { serial })
+}
+
+fn offer_selection() -> impl Strategy<Value = OfferSelection> {
+    (bounded_string(32), bounded_string(61440))
+        .prop_map(|(mime, data)| OfferSelection { mime, data })
+}
+
 /// Non-fd fields of `attach`, in field order; the fd itself is spliced in by
 /// the dedicated `proptest!` block below.
 type AttachFields = (
@@ -663,6 +698,15 @@ roundtrip_test!(
 );
 roundtrip_test!(roundtrip_vitrin_shim_session_get_seat, get_seat());
 roundtrip_test!(roundtrip_vitrin_shim_session_configure, configure());
+roundtrip_test!(roundtrip_vitrin_shim_session_selection, session_selection());
+roundtrip_test!(
+    roundtrip_vitrin_shim_session_request_selection,
+    request_selection()
+);
+roundtrip_test!(
+    roundtrip_vitrin_shim_session_offer_selection,
+    offer_selection()
+);
 
 // vitrin_shim_surface.attach: fd-bearing, see dedicated block below.
 roundtrip_test!(roundtrip_vitrin_shim_surface_damage, damage());

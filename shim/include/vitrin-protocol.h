@@ -315,7 +315,7 @@ static inline vitrin_decode_status_t vitrin_frame_header_decode(
 /* test_header_compiles.c) checks its own list length against this with */
 /* _Static_assert, so a message added to the IDL cannot ship without a */
 /* compile-time proof that its marshal functions type-check. */
-#define VITRIN_MESSAGE_COUNT 37
+#define VITRIN_MESSAGE_COUNT 40
 
 /* ==================================================================== */
 /* Section 1: per-interface metadata and enums.                          */
@@ -706,11 +706,41 @@ static inline bool vitrin_actuator_pointer_axis_is_valid(uint32_t v) {
 /* Every request on this interface exercises the grant verb `actuate_text`. */
 #define VITRIN_ACTUATOR_TEXT_VERB "actuate_text"
 
-/* ==== vitrin_shim_session (version 1) ==== */
+/* ==== vitrin_shim_session (version 2) ==== */
 /* shim connection bootstrap */
 
 #define VITRIN_SHIM_SESSION_INTERFACE_NAME "vitrin_shim_session"
-#define VITRIN_SHIM_SESSION_INTERFACE_VERSION 1u
+#define VITRIN_SHIM_SESSION_INTERFACE_VERSION 2u
+
+/* Enum `selection_status` on `vitrin_shim_session`.
+ *
+ * why a selection answer carries no data
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* mime and data carry the app's selection */
+    VITRIN_SHIM_SESSION_SELECTION_STATUS_OK = 0,
+    /* the app has no selection at all */
+    VITRIN_SHIM_SESSION_SELECTION_STATUS_EMPTY = 1,
+    /* the selection is not well-formed text/plain;charset=utf-8 */
+    VITRIN_SHIM_SESSION_SELECTION_STATUS_WRONG_TYPE = 2,
+    /* the selection exceeds data's byte bound */
+    VITRIN_SHIM_SESSION_SELECTION_STATUS_TOO_LARGE = 3,
+} vitrin_shim_session_selection_status_t;
+
+/* Whole-value membership check for `vitrin_shim_session_selection_status_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_shim_session_selection_status_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_SHIM_SESSION_SELECTION_STATUS_OK:
+        case VITRIN_SHIM_SESSION_SELECTION_STATUS_EMPTY:
+        case VITRIN_SHIM_SESSION_SELECTION_STATUS_WRONG_TYPE:
+        case VITRIN_SHIM_SESSION_SELECTION_STATUS_TOO_LARGE:
+            return true;
+        default:
+            return false;
+    }
+}
 
 /* ==== vitrin_shim_surface (version 1) ==== */
 /* shim-to-core buffer path */
@@ -3156,6 +3186,123 @@ static inline vitrin_decode_status_t vitrin_shim_session_req_get_seat_decode(
     return VITRIN_DECODE_OK;
 }
 
+/* Request `selection` (opcode 2) on `vitrin_shim_session`.
+ *
+ * answer request_selection with the app's current selection
+ */
+typedef struct {
+    /* the serial of the request_selection being answered */
+    uint32_t serial;
+    /* whether data follows, and why not */
+    vitrin_shim_session_selection_status_t status;
+    /* MIME type of data, empty unless status is ok (max 32 bytes) */
+    vitrin_string_t mime;
+    /* the selection as UTF-8, empty unless status is ok (max 61440 bytes) */
+    vitrin_string_t data;
+} vitrin_shim_session_req_selection_t;
+
+#define VITRIN_SHIM_SESSION_REQ_SELECTION_OPCODE ((uint8_t)2)
+#define VITRIN_SHIM_SESSION_REQ_SELECTION_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SESSION_REQ_SELECTION_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_session_req_selection_encode(const vitrin_shim_session_req_selection_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    if (msg->mime.len > 32u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    if (msg->data.len > 61440u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + vitrin_raw_string_wire_len(msg->mime.len) + vitrin_raw_string_wire_len(msg->data.len);
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SESSION_REQ_SELECTION_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SESSION_REQ_SELECTION_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, msg->serial);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->status);
+    pos += 4u;
+    pos += vitrin_raw_write_string(out + pos, msg->mime);
+    pos += vitrin_raw_write_string(out + pos, msg->data);
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_session_req_selection_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_session_req_selection_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SESSION_REQ_SELECTION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SESSION_REQ_SELECTION_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SESSION_REQ_SELECTION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_serial = vitrin_raw_read_u32(in, in_len, &pos, &out->serial);
+    if (st_serial != VITRIN_DECODE_OK) { return st_serial; }
+    uint32_t status_raw;
+    vitrin_decode_status_t st_status = vitrin_raw_read_u32(in, in_len, &pos, &status_raw);
+    if (st_status != VITRIN_DECODE_OK) { return st_status; }
+    if (!vitrin_shim_session_selection_status_is_valid(status_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->status = (vitrin_shim_session_selection_status_t)status_raw;
+    vitrin_decode_status_t st_mime = vitrin_raw_read_string(in, in_len, &pos, 32u, &out->mime);
+    if (st_mime != VITRIN_DECODE_OK) { return st_mime; }
+    vitrin_decode_status_t st_data = vitrin_raw_read_string(in, in_len, &pos, 61440u, &out->data);
+    if (st_data != VITRIN_DECODE_OK) { return st_data; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
 /* Event `configure` (opcode 0) on `vitrin_shim_session`.
  *
  * realm identity and view geometry
@@ -3255,6 +3402,200 @@ static inline vitrin_decode_status_t vitrin_shim_session_evt_configure_decode(
     if (st_width != VITRIN_DECODE_OK) { return st_width; }
     vitrin_decode_status_t st_height = vitrin_raw_read_u32(in, in_len, &pos, &out->height);
     if (st_height != VITRIN_DECODE_OK) { return st_height; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `request_selection` (opcode 1) on `vitrin_shim_session`.
+ *
+ * ask this realm for its current selection
+ */
+typedef struct {
+    /* names the answer this request expects */
+    uint32_t serial;
+} vitrin_shim_session_evt_request_selection_t;
+
+#define VITRIN_SHIM_SESSION_EVT_REQUEST_SELECTION_OPCODE ((uint8_t)1)
+#define VITRIN_SHIM_SESSION_EVT_REQUEST_SELECTION_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SESSION_EVT_REQUEST_SELECTION_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_session_evt_request_selection_encode(const vitrin_shim_session_evt_request_selection_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SESSION_EVT_REQUEST_SELECTION_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SESSION_EVT_REQUEST_SELECTION_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, msg->serial);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_session_evt_request_selection_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_session_evt_request_selection_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SESSION_EVT_REQUEST_SELECTION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SESSION_EVT_REQUEST_SELECTION_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SESSION_EVT_REQUEST_SELECTION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_serial = vitrin_raw_read_u32(in, in_len, &pos, &out->serial);
+    if (st_serial != VITRIN_DECODE_OK) { return st_serial; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `offer_selection` (opcode 2) on `vitrin_shim_session`.
+ *
+ * offer the core-held clipboard to this realm
+ */
+typedef struct {
+    /* MIME type of data (max 32 bytes) */
+    vitrin_string_t mime;
+    /* the clipboard contents as UTF-8 (max 61440 bytes) */
+    vitrin_string_t data;
+} vitrin_shim_session_evt_offer_selection_t;
+
+#define VITRIN_SHIM_SESSION_EVT_OFFER_SELECTION_OPCODE ((uint8_t)2)
+#define VITRIN_SHIM_SESSION_EVT_OFFER_SELECTION_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SESSION_EVT_OFFER_SELECTION_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_session_evt_offer_selection_encode(const vitrin_shim_session_evt_offer_selection_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    if (msg->mime.len > 32u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    if (msg->data.len > 61440u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->mime.len) + vitrin_raw_string_wire_len(msg->data.len);
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SESSION_EVT_OFFER_SELECTION_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SESSION_EVT_OFFER_SELECTION_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    pos += vitrin_raw_write_string(out + pos, msg->mime);
+    pos += vitrin_raw_write_string(out + pos, msg->data);
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_session_evt_offer_selection_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_session_evt_offer_selection_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SESSION_EVT_OFFER_SELECTION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SESSION_EVT_OFFER_SELECTION_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SESSION_EVT_OFFER_SELECTION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_mime = vitrin_raw_read_string(in, in_len, &pos, 32u, &out->mime);
+    if (st_mime != VITRIN_DECODE_OK) { return st_mime; }
+    vitrin_decode_status_t st_data = vitrin_raw_read_string(in, in_len, &pos, 61440u, &out->data);
+    if (st_data != VITRIN_DECODE_OK) { return st_data; }
     if (pos != in_len) {
         return VITRIN_DECODE_ERR_TRAILING_BYTES;
     }

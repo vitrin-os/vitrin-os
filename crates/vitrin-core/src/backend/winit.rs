@@ -1265,7 +1265,13 @@ pub(crate) struct NestedState {
     /// second one, so an agent's chokepoint-admitted actuations and a human's
     /// physical input share one implicit-grab and pointer state — which is
     /// what makes the preemption hook mean anything.
-    runtime: Runtime<ConsentGate<DeadManHook<crate::attention::AttentionHook<input::NoopHook>>>>,
+    runtime: Runtime<
+        ConsentGate<
+            DeadManHook<
+                crate::clipboard::ClipboardHook<crate::attention::AttentionHook<input::NoopHook>>,
+            >,
+        >,
+    >,
     /// The consent input grab (P1.7.2), shared with the router's gate:
     /// while a prompt is up it owns physical input, and a click on one of
     /// the card's buttons becomes a petition decision here.
@@ -1339,6 +1345,7 @@ pub(crate) struct NestedState {
 pub fn run(
     dead_man: DeadManConfig,
     attention: crate::attention::AttentionChord,
+    clipboard: crate::chord::Trigger,
     seed: RuntimeSeed,
 ) -> (Recorder, Result<(), Box<dyn Error>>) {
     // The seed is consumed the moment the state is built; until then it is
@@ -1348,7 +1355,7 @@ pub fn run(
     // four-line `match`.
     let mut seed = Some(seed);
     let mut recovered = None;
-    let result = run_inner(dead_man, attention, &mut seed, &mut recovered);
+    let result = run_inner(dead_man, attention, clipboard, &mut seed, &mut recovered);
     let recorder = recovered
         .or_else(|| seed.take().map(|seed| seed.recorder))
         .expect("the seed is either still unconsumed or its recorder was recovered");
@@ -1358,6 +1365,7 @@ pub fn run(
 fn run_inner(
     dead_man: DeadManConfig,
     attention: crate::attention::AttentionChord,
+    clipboard: crate::chord::Trigger,
     seed: &mut Option<RuntimeSeed>,
     recovered: &mut Option<Recorder>,
 ) -> Result<(), Box<dyn Error>> {
@@ -1481,27 +1489,56 @@ fn run_inner(
          of layout authority. It delegates nothing -- every authority exercised afterwards \
          came from a grant a human approved on a consent card"
     );
+    // The clipboard chords (WS-E.2.1), named in full at startup for the reason
+    // the attention chord is: both are keys the core takes away from every app
+    // in every realm, and an operator has to be able to see which.
+    let clipboard_signal = Rc::new(RefCell::new(
+        crate::clipboard::ClipboardSignal::new(clipboard)
+            .expect("the clipboard chord pair was validated at startup"),
+    ));
+    {
+        let signal = clipboard_signal.borrow();
+        let spellings: Vec<String> = signal.chords().map(|c| c.spelling()).collect();
+        info!(
+            key = signal.trigger(),
+            chords = spellings.join(", "),
+            max_bytes = crate::clipboard::MAX_CLIPBOARD_BYTES,
+            mime = crate::clipboard::CLIPBOARD_MIME,
+            "cross-realm clipboard armed: the first chord asks the focused realm for its \
+             selection, the second offers the core's slot to the focused realm. Both are \
+             CONSUMED in every realm, so an app that binds them loses them"
+        );
+    }
     let router = input::InputRouter::new(
         Rc::new(RefCell::new(input::PhysicalPresenceMap::new())),
         Rc::clone(&now),
         // The stacking WS-E.1.7 decision 11 fixes, outermost first: the
-        // consent grab, the dead-man watcher, then the attention key. Both
-        // hooks above short-circuit the one below, so a raised prompt or a
-        // dead-man chord press wins over -- and is never delayed by -- a
-        // mechanism whose worst failure is a focus change that does not
-        // happen.
+        // consent grab, the dead-man watcher, the clipboard chords, then the
+        // attention key. Every hook above short-circuits the ones below, so a
+        // raised prompt or a dead-man chord press wins over -- and is never
+        // delayed by -- a mechanism whose worst failure is a convenience that
+        // does not happen.
+        //
+        // **The clipboard sits OUTSIDE the attention hook, and that is not
+        // arbitrary** (WS-E.2.1): `AttentionHook` consumes both Super keys, so a
+        // modifier matcher stacked *inside* it would never see a Super press and
+        // its `super` bit would be permanently wrong. Harmless for this issue's
+        // two chords, and a trap laid for whichever of WS-E.2.2/2.4 wants one.
         ConsentGate::new(
             Rc::clone(&grab),
             Rc::clone(&now),
             DeadManHook::new(
                 Rc::clone(&deadman),
                 Rc::clone(&now),
-                crate::attention::AttentionHook::new(
-                    Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
-                        attention,
-                    ))),
-                    Rc::clone(&now),
-                    input::NoopHook,
+                crate::clipboard::ClipboardHook::new(
+                    Rc::clone(&clipboard_signal),
+                    crate::attention::AttentionHook::new(
+                        Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
+                            attention,
+                        ))),
+                        Rc::clone(&now),
+                        input::NoopHook,
+                    ),
                 ),
             ),
         ),
@@ -2424,7 +2461,11 @@ pub(crate) fn next_frame(hold: Option<f64>, elapsed: Duration) -> NextFrame {
 }
 
 impl session::RuntimeHost for NestedState {
-    type Hook = ConsentGate<DeadManHook<crate::attention::AttentionHook<input::NoopHook>>>;
+    type Hook = ConsentGate<
+        DeadManHook<
+            crate::clipboard::ClipboardHook<crate::attention::AttentionHook<input::NoopHook>>,
+        >,
+    >;
     type View = NestedView;
 
     fn split(&mut self) -> (&mut Runtime<Self::Hook>, &mut NestedView) {
@@ -2753,19 +2794,26 @@ mod tests {
     /// Read off `type_name`, because nested generic arguments appear in
     /// left-to-right stacking order there and nowhere else this cheaply.
     #[test]
-    fn the_nested_stack_is_consent_then_dead_man_then_attention() {
+    fn the_nested_stack_is_consent_then_dead_man_then_clipboard_then_attention() {
         let name = std::any::type_name::<<NestedState as session::RuntimeHost>::Hook>();
         let at = |needle: &str| {
             name.find(needle)
                 .unwrap_or_else(|| panic!("the nested stack must carry {needle}: {name}"))
         };
-        let (consent, dead, attention) =
-            (at("ConsentGate"), at("DeadManHook"), at("AttentionHook"));
+        let (consent, dead, clipboard, attention) = (
+            at("ConsentGate"),
+            at("DeadManHook"),
+            at("ClipboardHook"),
+            at("AttentionHook"),
+        );
         assert!(
-            consent < dead && dead < attention,
-            "the nested hook stack must be ConsentGate<DeadManHook<AttentionHook<..>>>: a \
-             prompt and the human's off-switch each short-circuit before the attention key, \
-             never after it. Got {name}"
+            consent < dead && dead < clipboard && clipboard < attention,
+            "the nested hook stack must be \
+             ConsentGate<DeadManHook<ClipboardHook<AttentionHook<..>>>>: a prompt and the \
+             human's off-switch each short-circuit before the clipboard chords and the \
+             attention key, never after; and the clipboard matcher must sit ABOVE the \
+             attention hook, which eats both Supers and would otherwise leave its `super` \
+             modifier bit permanently wrong. Got {name}"
         );
     }
 

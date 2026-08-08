@@ -87,6 +87,9 @@ type TypeText = gen::vitrin_actuator_text::requests::Type;
 type CreateSurface = gen::vitrin_shim_session::requests::CreateSurface;
 type GetSeat = gen::vitrin_shim_session::requests::GetSeat;
 type Configure = gen::vitrin_shim_session::events::Configure;
+type SessionSelection = gen::vitrin_shim_session::requests::Selection;
+type RequestSelection = gen::vitrin_shim_session::events::RequestSelection;
+type OfferSelection = gen::vitrin_shim_session::events::OfferSelection;
 type Attach = gen::vitrin_shim_surface::requests::Attach;
 type Damage = gen::vitrin_shim_surface::requests::Damage;
 type Commit = gen::vitrin_shim_surface::requests::Commit;
@@ -240,6 +243,9 @@ impl_decode_msg_no_fd!(
     GetLayoutArrange,
     LayoutFocus,
     LayoutSetFullscreen,
+    SessionSelection,
+    RequestSelection,
+    OfferSelection,
 );
 // The two fd-bearing messages in v0.xml (grep for an `fd`-typed arg),
 // matching tests/roundtrip.rs's dedicated-block split.
@@ -258,6 +264,23 @@ macro_rules! decoder_table {
     };
 }
 
+/// The decoder table, in **IDL declaration order, which is load-bearing** --
+/// interfaces top to bottom, each interface's requests before its events, which
+/// is also how the scanner assigns the implicit per-interface opcodes.
+/// `fuzz/seed_corpus.py` derives its selector indices from the IDL on exactly
+/// that assumption, so a table written in any other order silently points every
+/// checked-in seed at a decoder it does not claim.
+///
+/// It really had drifted. `vitrin_principal.attention` and the two layout mints
+/// were appended to the END of this table instead of inserted where the IDL puts
+/// them, which moved every later index and left the `attach_with_fd` seed
+/// feeding an fd to `get_seat` -- an immediate `FdCountMismatch`, so the one
+/// seed that exercises the fd path exercised nothing. Nothing caught it because
+/// `fuzz/` is its own cargo workspace and no CI job ran `cargo test` inside it.
+/// WS-E.2.1 reorders the table and adds that job step in the same commit.
+///
+/// Nothing may be written between the macro's parentheses but bare type names:
+/// `seed_corpus_reachability.rs` parses this invocation out of the source.
 static DECODERS: &[Decoder] = decoder_table!(
     Hello,
     HandshakeSync,
@@ -268,6 +291,8 @@ static DECODERS: &[Decoder] = decoder_table!(
     Attention,
     RequestGrant,
     GetLauncher,
+    GetLayoutFocus,
+    GetLayoutArrange,
     Resolved,
     Refused,
     ConsentStateEvent,
@@ -279,7 +304,10 @@ static DECODERS: &[Decoder] = decoder_table!(
     TypeText,
     CreateSurface,
     GetSeat,
+    SessionSelection,
     Configure,
+    RequestSelection,
+    OfferSelection,
     Attach,
     Damage,
     Commit,
@@ -292,8 +320,6 @@ static DECODERS: &[Decoder] = decoder_table!(
     SeatText,
     Launch,
     Launched,
-    GetLayoutFocus,
-    GetLayoutArrange,
     LayoutFocus,
     LayoutSetFullscreen,
 );

@@ -1017,6 +1017,64 @@ pub(crate) enum Event<'a> {
     /// Emitted **once** per realm death: [`crate::lifecycle`] latches the
     /// transition, so the EOF and the `SIGCHLD` for one death produce one
     /// of these no matter which arrives first, or whether both do.
+    /// The human's promote chord filled the core-held clipboard slot
+    /// (WS-E.2.1, issue #213).
+    ///
+    /// **Length and digest only, and there is no field content could go in.**
+    /// The secrecy contract this module inherits from [`crate::identity`] is
+    /// structural here for the same reason [`ActuationDetail::Text`] is: a
+    /// clipboard carries passwords, and a journal that recorded one would be a
+    /// credential store built by accident. `mime` is this core's own
+    /// [`crate::clipboard::CLIPBOARD_MIME`] constant, never the shim's bytes, so
+    /// not even the type field can carry attacker-chosen text.
+    ClipboardPromoted {
+        /// The realm the bytes came from.
+        realm: &'a RealmId,
+        /// The one served type, from a constant.
+        mime: &'static str,
+        /// Length only -- **never** the bytes.
+        bytes: usize,
+        /// BLAKE3 over the UTF-8, tagged like every other digest here: enough
+        /// to see that the same string crossed twice without the log holding
+        /// it.
+        digest: &'a blake3::Hash,
+    },
+    /// The human's offer chord handed the slot to a realm (WS-E.2.1).
+    ///
+    /// **Named `offered`, not `pasted`, and the distinction is the same one
+    /// `shim/README.md` makes about `sent` versus `delivered`.** The core hands
+    /// the bytes to the target realm's shim, which installs them as its app's
+    /// ordinary selection; whether the human then pastes is invisible to the
+    /// core, and an entry claiming a paste would be a record of something
+    /// nothing here observed. Issue #213 asked for `ClipboardPasted`; this is
+    /// that entry under an honest name.
+    ClipboardOffered {
+        /// The realm the slot was offered to.
+        realm: &'a RealmId,
+        /// The realm it was promoted from -- so one journal line answers "what
+        /// crossed which boundary" without correlating two.
+        source: &'a RealmId,
+        mime: &'static str,
+        /// Length only -- **never** the bytes.
+        bytes: usize,
+        digest: &'a blake3::Hash,
+    },
+    /// A clipboard gesture reached the core and moved nothing (WS-E.2.1).
+    ///
+    /// Written for every refusing outcome -- no realm bound, an empty slot, a
+    /// shim with no selection, a type outside the allow-list, a selection past
+    /// the cap -- because a human asking "why did my copy not work" has no
+    /// other instrument: the core has no surface on which to tell them, which
+    /// is a published cost of D-024 rather than something this entry fixes.
+    ClipboardRefused {
+        /// The realm the gesture was aimed at, or `null` when none was bound.
+        realm: Option<&'a RealmId>,
+        /// `promote` or `offer`, from
+        /// [`crate::clipboard::ClipboardGesture::label`].
+        gesture: &'static str,
+        /// A fixed label from a closed vocabulary -- never free-form text.
+        reason: &'static str,
+    },
     RealmDied {
         realm: &'a RealmId,
         /// The shim that was serving the realm. It may already be reaped.
@@ -1084,6 +1142,9 @@ impl Event<'_> {
             Event::GrantRemoved { .. } => "grant_removed",
             Event::RealmSpawned { .. } => "realm_spawned",
             Event::RealmSpawnFailed { .. } => "realm_spawn_failed",
+            Event::ClipboardPromoted { .. } => "clipboard_promoted",
+            Event::ClipboardOffered { .. } => "clipboard_offered",
+            Event::ClipboardRefused { .. } => "clipboard_refused",
             Event::RealmDied { .. } => "realm_died",
             Event::RealmExited { .. } => "realm_exited",
             Event::ConnectionTeardown { .. } => "connection_teardown",
@@ -1413,6 +1474,46 @@ impl Event<'_> {
                 field_display(out, "command", command.display());
                 field_str(out, "cause_class", cause_class);
                 field_null(out, "pid");
+            }
+            Event::ClipboardPromoted {
+                realm,
+                mime,
+                bytes,
+                digest,
+            } => {
+                field_display(out, "realm", realm);
+                field_str(out, "mime", mime);
+                // Shape and identity only -- there is deliberately no `text`
+                // member, in any configuration.
+                field_u64(out, "bytes", bytes as u64);
+                field_str(out, "digest_alg", DIGEST_ALG);
+                field_str(out, "digest", &digest.to_hex());
+            }
+            Event::ClipboardOffered {
+                realm,
+                source,
+                mime,
+                bytes,
+                digest,
+            } => {
+                field_display(out, "realm", realm);
+                field_display(out, "source", source);
+                field_str(out, "mime", mime);
+                field_u64(out, "bytes", bytes as u64);
+                field_str(out, "digest_alg", DIGEST_ALG);
+                field_str(out, "digest", &digest.to_hex());
+            }
+            Event::ClipboardRefused {
+                realm,
+                gesture,
+                reason,
+            } => {
+                match realm {
+                    Some(realm) => field_display(out, "realm", realm),
+                    None => field_null(out, "realm"),
+                }
+                field_str(out, "gesture", gesture);
+                field_str(out, "reason", reason);
             }
             Event::RealmDied { realm, pid, cause } => {
                 field_display(out, "realm", realm);

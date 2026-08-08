@@ -1,0 +1,574 @@
+# Bringing up the DRM backend by hand (WS-E.3.4, issue #220)
+
+**This is a manual procedure, not a CI test — not skipped in CI, not present in
+CI.** There is no DRM device and no seat on any GitHub runner, so the only
+evidence this backend works is a human executing this page on one machine and
+writing down what happened. That is structurally weaker than every other claim
+in this repository, and it is published as such in
+[`docs/book/src/limits.md`](book/src/limits.md) rather than discovered.
+
+> ## Read this before anything else
+>
+> **A DRM backend takes DRM master. Starting one from inside the live session
+> kills the session it is started from.** That is
+> [WS-E §7](plan/14-workstream-session-mode.md)'s non-negotiable safety rule,
+> and every step below is arranged around it.
+>
+> **On this machine there is no SSH escape route, by the owner's decision**
+> (2026-08-09, recorded as
+> [D-028](plan/20-decision-log.md#d-028--the-drm-bring-up-escape-route-is-vt-switching-and-an-installer-usb-not-ssh)).
+> Issue #220 required an SSH session from a second machine and called it
+> non-negotiable; it is not there. What replaces it is **step 0**, and the cost
+> is stated plainly: **a wedged DRM master with no live console is now a reboot,
+> where the design assumed it was a command.**
+
+## Status of this document
+
+| | |
+|---|---|
+| **The backend it describes** | **Does not exist yet.** `crates/vitrin-core/src/backend/drm.rs` is WS-E.3.2 / issue #218 and has not landed. `grep -rn drm crates/vitrin-core/src/main.rs` returns nothing today. |
+| **Why it is written first** | #220's decision 1: the honest limit and the escape route must never be the thing that slipped behind the code. The `limits.md` entry and this page land with or ahead of #218's PR. |
+| **Has it been executed?** | **No.** See [Record the run](#record-the-run) at the bottom, and the outstanding acceptance criterion recorded with it. |
+| **Who wrote it** | Not a human at the machine. Every fact below is marked verified or inferred — see the convention immediately below. |
+
+### Verified vs inferred — the convention, and why it is here
+
+An unverified runbook that reads as verified is worse than one that admits it,
+so every claim about this machine carries one of two marks:
+
+- **[verified]** — read from this machine on **2026-08-09**, read-only. No DRM
+  device was opened, no module was loaded, no VT was switched, and no `vitrind`
+  was started. `/sys`, `/proc`, `lsmod`, `pacman -Q` and `systemctl is-active`
+  were the whole of it.
+- **[inferred]** — from the source, from a manual page, or from a distribution
+  default that is in place. **Never executed here.** Treat an inferred expected
+  observation as a hypothesis you are testing, not a promise you are checking.
+
+The failure column is inferred throughout. That is the honest limit of a page
+written by someone who could not run it.
+
+## The machine this is written for
+
+Every path, node name and connector below is this laptop's, on purpose. A
+generic runbook is one you have to translate at the worst possible moment.
+
+| Fact | Value | |
+|---|---|---|
+| Kernel | `7.1.5-arch1-2` | [verified] |
+| Mesa | `1:26.1.6-1` | [verified] |
+| libinput / seatd | `1.31.3-1` / `0.9.3-1` | [verified] |
+| Scanout card | `/dev/dri/card1`, driver **i915** | [verified] |
+| Connected connector | **`eDP-1`** on `card1` — the only one in `connected` state anywhere | [verified] |
+| Other connectors on card1 | `DP-1`, `DP-2`, `HDMI-A-1`, `HDMI-A-2` — all `disconnected` | [verified] |
+| **Second card** | **`/dev/dri/card2`, driver `nvidia`, `nvidia_drm` loaded, all four of its connectors `disconnected`** | [verified] — see hazard H1 |
+| Panel | 2560x1600, scale 1, 240 Hz ([WS-E §5](plan/14-workstream-session-mode.md)) | from the plan doc |
+| Node permissions | `crw-rw----+ root video` on both cards; the operator is in `video` **and** carries the logind ACL | [verified] |
+| Current session | Hyprland, logind session 2, `seat0`, **`tty1`**, `Type=wayland`, `Active=yes` | [verified] |
+| Free VTs | `tty2`–`tty6`, no getty running on any of them | [verified] |
+| VT autospawn | `/etc/systemd/logind.conf` leaves `NAutoVTs=6` and `ReserveVT=6` commented, i.e. at their defaults | [verified] — the autospawn *behaviour* is [inferred] |
+| seatd | **installed, not running** | [verified] |
+| systemd-logind | **active** | [verified] |
+| Operator groups | `taha wheel input video plugdev docker` — **no `seat` group** | [verified] |
+| sshd | **inactive, by the owner's choice** | [verified] |
+| SysRq mask | **`16`** — sync only. Not `1`. See step 0.4. | [verified] |
+| wayvnc | running, `--output=eDP-1`, bound to `127.0.0.1:5900`, reached over Tailscale | [verified] — see step 0.2 |
+
+### Three hazards this machine has that a generic page would not warn about
+
+**H1 — there are two DRM cards, and only one of them can light the panel.**
+`card1` is i915 and owns `eDP-1`; `card2` is the NVIDIA GPU with `nvidia_drm`
+loaded and **nothing connected**. [verified] Note that
+[WS-E §5](plan/14-workstream-session-mode.md) states `nvidia_drm` is *not*
+loaded — that is stale, and the module is loaded today. A udev-enumerating
+backend that takes the first DRM device it finds can take `card2`, which has
+zero connected connectors. #218's own rule ("refuse to start with a named error
+on zero or more than one connected connector") then fires on the *wrong card* and
+the error will read like a hardware fault rather than a device-selection bug.
+**Expect to have to name the card explicitly.** If `--drm` grows no card
+argument, this is the first thing to add. [inferred]
+
+**H2 — `seatd` is not running, so libseat must use its logind backend.**
+`libseat.so.1` links `libsystemd` and carries both `seatd_impl` and
+`logind_impl`. [verified] With `seatd.service` inactive and the operator not in
+a `seat` group, the seatd backend cannot work; the logind backend can, and
+**only for a session logind considers active on its own VT**. This is why step 4
+is *log in on the VT*, not merely `chvt`. Setting `LIBSEAT_BACKEND=seatd` here
+will fail with a connection error to `/run/seatd.sock`, and that error is a
+configuration mistake, not a bring-up finding. [inferred]
+
+**H3 — Hyprland keeps its file descriptor on `card1` for the whole bring-up.**
+It is not going to close it, and you do not need it to. logind revokes **DRM
+master** from a session's devices when that session's VT stops being active, and
+grants it to whoever is active. So "verify Hyprland is not holding the card" is
+really "verify that your VT is the active one" — `fuser`/`lsof` showing Hyprland
+on `/dev/dri/card1` is expected and is not the problem. [inferred]
+
+---
+
+## Step 0 — the escape route, before you type anything else
+
+This is the step that will be tempted away, by the person most likely to skip
+it, on the machine that matters, at the end of a long session. It costs about
+ninety seconds.
+
+### 0.1 First line: VT switching. `Ctrl+Alt+F1` goes back to Hyprland.
+
+logind hands the display to whichever VT is active, so switching back is
+ordinary and reversible. Hyprland is on **tty1** [verified], and this
+configuration deliberately preserves `Ctrl+Alt+F<n>`: the keybind wrapper skips
+F1–F12 precisely so the recovery path survives. [verified, as a statement about
+the config's intent]
+
+**Before you start, prove the escape route works, in this order:**
+
+1. From Hyprland, press `Ctrl+Alt+F2`. A login prompt should appear.
+   - *Expected:* `agetty` spawns on tty2 and prints a login prompt. `NAutoVTs=6`
+     is at its default, so logind starts one on demand — no `systemctl enable
+     getty@tty2` needed. [inferred]
+   - *If instead* nothing happens and the screen stays on Hyprland: your VT
+     switching is being eaten (a keybind, or a compositor grabbing the chord).
+     **Stop here.** You have no first line and no second line, and the runbook
+     is now a one-way door. Fix this before continuing.
+   - *If instead* the screen goes black and stays black with no prompt: the
+     console is switching but nothing is drawing. Press `Ctrl+Alt+F1` blind. If
+     you come back to Hyprland, you have a working VT switch and a broken
+     console — usable, but you will be flying blind on tty2 and you should fix
+     it first.
+2. Log in on tty2. Leave the shell sitting there for the whole session.
+3. Press `Ctrl+Alt+F1`. You should be back in Hyprland with your windows intact.
+4. Only now proceed.
+
+The point of step 3 is that you have now *executed* the recovery path once,
+while nothing was wrong. A recovery path you have never used is a plan.
+
+### 0.2 Second line: your remote control is NOT an escape route. Read why.
+
+`wayvnc` is running on this machine, `--output=eDP-1`, bound to
+`127.0.0.1:5900` and reached over Tailscale. [verified]
+
+**It runs through the desktop.** It is a Wayland client of Hyprland using
+`wlr-screencopy` against a Hyprland output. The moment `vitrind` takes DRM
+master and Hyprland's session goes inactive — or the moment Hyprland dies —
+wayvnc has nothing to capture and no compositor to talk to. It cannot show you
+`vitrind`'s output, and it cannot give you a shell.
+
+Naming it as an escape route would be worse than omitting it, because you would
+count on it in the one situation where it is guaranteed to be gone. It is
+listed here **so that you do not reach for it.**
+
+### 0.3 Last line: the Arch installer USB and a chroot.
+
+Real, and slower by orders of magnitude. Physical access to the machine, a hard
+power cycle, boot the USB, `mount` the root (and `/boot`, and unlock LUKS if the
+disk is encrypted), `arch-chroot`, edit whatever wedged it, `exit`, reboot.
+**Minutes to tens of minutes**, against seconds for a console command.
+
+Have the USB physically present in the room before you start. If it is in a
+drawer in another room, you do not have a third line; you have an errand.
+
+### 0.4 Optional, and a real security trade: raise the SysRq mask.
+
+`/proc/sys/kernel/sysrq` is **`16`** on this machine, with no `sysctl.d`
+override. [verified] `16` is *sync only*. **REISUB does not work here** — no
+`b` (reboot), no `e`/`i` (signal processes), no `r` (take the keyboard out of
+raw mode). If you were counting on Alt+SysRq as a safety net, you do not have
+one.
+
+Making it one is a deliberate change, before the bring-up, not during:
+
+```bash
+# TEMPORARY, this boot only. Restores itself on reboot.
+sudo sysctl kernel.sysrq=1
+```
+
+What you are buying: `Alt+SysRq+r` (unraw — recovers a keyboard a wedged
+compositor left grabbed) and `Alt+SysRq+e,i,s,u,b` (the REISUB sequence — a
+clean-ish reboot without the power button). What you are paying: **anyone at
+this physical keyboard can now reboot the machine and kill any process**, with
+no authentication, until you reboot. On a laptop that never leaves your desk
+that is a small price for a bring-up session; it is still a price, and it is
+yours to decide.
+
+Set it back with `sudo sysctl kernel.sysrq=16` when you are done, or just
+reboot — it is not persisted. [verified: no `sysctl.d` file sets it]
+
+### 0.5 What you are explicitly NOT doing
+
+- **Not** `systemctl isolate multi-user.target`. It works, and it takes your
+  entire graphical session with it — every editor, browser tab and terminal you
+  had open. Step 4's VT login gets you the same isolation with Hyprland still
+  alive on tty1 to come back to. Reach for `isolate` only if a VT login turns
+  out not to be enough, and know that you are trading your session for it.
+- **Not** running `vitrind --drm` from a terminal inside Hyprland. That is the
+  exact thing WS-E §7 forbids. It will either fail to get master (best case,
+  and a confusing error) or take it (worst case, and your desktop is gone with
+  its logs on a VT you are not looking at).
+
+---
+
+## Steps at a glance
+
+| # | Do | Expect | Worst credible failure |
+|---|---|---|---|
+| 0 | Prove the escape route | Login prompt on tty2, back to Hyprland on `Ctrl+Alt+F1` | VT switch is eaten — **stop** |
+| 1 | Record the baseline from `/sys` | kernel, mesa, `eDP-1 connected`, preferred mode | — (read-only) |
+| 2 | Build with `--features drm-backend` | clippy and build clean | Missing dev packages; a `cargo:warning` from smithay's gbm probe |
+| 3 | Check the configs | `realm.toml` + `principals.toml` resolve, `--consent=interactive` | Auto-approve accepted where it must be refused |
+| 4 | `Ctrl+Alt+F2`, log in | A shell on an active VT with a logind session | libseat cannot open the seat |
+| 5 | Confirm the VT is active and the card is the right one | `Active=yes` for your tty2 session | Backend selects `card2` (hazard H1) |
+| 6 | Start `vitrind --drm --consent=interactive` | Panel lights, trusted band on top | **Black screen, no console** — go to Recovery |
+| 7 | Connector + mode | Log names `eDP-1` and the mode it chose | Wrong connector; wrong refresh |
+| 8 | App maps and repaints | Terminal visible, cursor blinking | Mapped but frozen (frame pacing) |
+| 9 | Trusted band | 8 rows of one colour along the top edge | Band absent — **stop and file it** |
+| 10 | Consent prompt + physical click | Card with a ring in the band's colour; click resolves it | Click does nothing (libinput not routed) |
+| 11 | Held-Esc revocation | Hold bar, then every grant revoked | The off-switch does not arm |
+| 12 | VT switch away and back | Same band colour after returning | Different colour, or a dead session |
+| 13 | Type a letter | The letter appears in the app | Only modifiers/arrows work (no keymap) |
+| 14 | Frame cadence | A number, measured, written down | — |
+| 15 | Shut down cleanly | Hyprland intact on tty1 | Panel left in a bad mode |
+
+---
+
+## 1. Record the baseline (read-only, safe from anywhere)
+
+Run this from your normal Hyprland terminal *before* you go anywhere near a VT.
+It opens no device.
+
+```bash
+uname -r
+pacman -Q mesa libinput seatd libdrm
+for c in /sys/class/drm/card*-*/status; do printf '%s %s\n' "$c" "$(cat "$c")"; done
+cat /sys/class/drm/card1-eDP-1/modes | head -5
+ls -l /dev/dri/
+```
+
+| Expected | Failure | What it means |
+|---|---|---|
+| `card1-eDP-1 connected`, everything else `disconnected`; `modes` lists the preferred mode first (widest × tallest at the highest refresh) | `eDP-1` shows `disconnected` | The panel is off or the lid state confused i915 — nothing below will work; do not proceed |
+| Two cards, `card1` and `card2` | Only one card | Something changed since 2026-08-09; re-read hazard H1 before assuming which one it is |
+
+**Write the kernel version, the mesa version, the connector and the preferred
+mode into the record block at the bottom now**, while you can still copy-paste.
+After step 6 you may be on a VT with no clipboard.
+
+## 2. Build the backend
+
+```bash
+cd ~/projects/vitrin
+cargo clippy -p vitrin-core --all-targets --features drm-backend -- -D warnings
+cargo build --release -p vitrin-core --bin vitrind --features drm-backend
+meson compile -C shim/build     # the shim must be current too
+```
+
+| Expected | Failure | What it means |
+|---|---|---|
+| Both clean | `pkg-config` panic from `drm-sys` or `libseat-sys` | The dev headers are missing. #218 decision 3: those build scripts `unwrap()` the probe, so a missing header is a build panic rather than a feature-off |
+| No warnings | `cargo:warning` about gbm from smithay's build script | **Do not ignore this.** #218 records that smithay's gbm feature probe *fails soft* — a missing gbm header silently selects an older buffer-allocation path with no build failure. A bring-up that misbehaves after a soft-failed probe will look like a driver bug |
+
+## 3. Check the configs, before you lose your comfortable terminal
+
+```bash
+cat ~/.config/vitrin/realm.toml
+cat ~/.config/vitrin/principals.toml
+```
+
+Those two paths are the wrapper's documented defaults. [verified: the wrapper at
+`~/.local/bin/vitrind` says so in its own header] The wrapper also sets
+`WLR_BACKENDS=headless WLR_RENDERER=pixman` for the shim and passes `--shim`
+explicitly, both of which you still need on DRM — the shim is internally
+headless regardless of what the core presents on.
+
+Make sure `realm.toml` declares **at least one `autostart = true` realm running
+something you can see and type into** — a terminal. If the only realms are
+templates, step 6 lights a panel showing the deterministic background and you
+will spend ten minutes debugging a working compositor.
+
+| Expected | Failure | What it means |
+|---|---|---|
+| Both files parse, one autostart realm with a terminal | `vitrind` refuses `--drm --consent=auto-approve` at parse time | Correct, per #218 decision 5. This backend *is* the human's display; auto-approving grants on it is the fail-open posture this repo refuses. Use `--consent=interactive` |
+
+## 4. Get onto a free VT and log in
+
+Press **`Ctrl+Alt+F2`**. Log in as `taha`.
+
+| Expected | Failure | What it means |
+|---|---|---|
+| A login prompt, then a shell | No prompt | See step 0.1 — you should already have proven this |
+| `loginctl session-status` shows your new session with `Active=yes`, `Seat=seat0`, `TTY=tty2` | `Active=no` | You are not on the active VT. libseat's logind backend will refuse the device (hazard H2) |
+| Hyprland's session (session 2, tty1) now shows `Active=no` | Hyprland still `Active=yes` | The VT did not actually switch; you are about to fight Hyprland for DRM master, which is the failure mode this whole page exists to avoid |
+
+Do not skip the `Active=yes` check. It is the one machine-readable statement of
+"it is safe to take master now".
+
+## 5. Confirm what you are about to open
+
+```bash
+loginctl session-status | head -12
+ls -l /dev/dri/
+```
+
+| Expected | Failure | What it means |
+|---|---|---|
+| Your tty2 session, `Active=yes` | as step 4 | — |
+| You can `test -r /dev/dri/card1` | Permission denied | The logind ACL did not follow you to this session. You are in `video` [verified] so this should not happen; if it does, do not `chmod` anything — it means logind is not treating this as your active session |
+
+**If `--drm` accepts a card argument, pass `/dev/dri/card1` explicitly.** Hazard
+H1: the NVIDIA card is present, has `nvidia_drm` loaded, and has nothing
+connected.
+
+## 6. Start it — this is the irreversible step
+
+```bash
+cd ~/projects/vitrin
+vitrind --drm --consent=interactive \
+  --realm ~/.config/vitrin/realm.toml \
+  --principals ~/.config/vitrin/principals.toml \
+  --recorder /tmp/vitrind-drm-$(date +%s).jsonl \
+  2>&1 | tee /tmp/vitrind-drm.log
+```
+
+`tee` is not optional. If the panel does something you cannot read, the log on
+disk is the only account of what happened.
+
+| Expected [inferred] | Failure | What it means / what to do |
+|---|---|---|
+| The panel blanks briefly, then shows the realm's app with a coloured band along the top | **The screen stays black and the keyboard still works** | The backend did not present. You still have a console — `Ctrl+C`, read `/tmp/vitrind-drm.log`. This is the *good* failure |
+| | **The screen goes black and the keyboard is dead** | Master was taken and something wedged before presenting, or libinput never opened. Go to [Recovery](#recovery), path R2. This is the failure the escape route exists for |
+| | **The screen shows garbage, tearing, or a wrong-size image** | Mode set succeeded, scanout is wrong. `Ctrl+C` if you have a keyboard; record what it looked like — a mode/format mismatch is a real finding, not a crash |
+| | It exits immediately naming a connector count | Hazard H1 — check which card it opened before believing the panel is at fault |
+| | It exits naming libseat | Hazard H2 — check `Active=yes`, and do not set `LIBSEAT_BACKEND=seatd` |
+
+---
+
+## The observation checklist
+
+Do these **in this order**. Each one assumes the last one passed. Record every
+one as pass or fail with what you actually saw — **a failed observation is a
+result, and recording it is the point.**
+
+## 7. Connector and mode selected
+
+| Expected [inferred] | Failure | What it means |
+|---|---|---|
+| The log names `eDP-1` and a mode; the mode matches the first line of `/sys/class/drm/card1-eDP-1/modes` from step 1 | A different connector | Device/connector selection bug (H1) |
+| | The right connector, a lower refresh | The preferred mode was not taken. Not fatal; record the number — the whole GLES+GBM argument in [WS-E §5](plan/14-workstream-session-mode.md) rests on 240 Hz |
+
+## 8. A real app maps and repaints
+
+Look at the terminal. Type nothing yet — just watch the cursor blink.
+
+| Expected | Failure | What it means |
+|---|---|---|
+| The app is visible and its cursor blinks | Visible but completely frozen | The frame-callback path. #218 is explicit: `redraw` must return `Presentation::Scheduled` and the **page-flip handler** must call `session::emit_presented`. Answering `Completed` without presenting hands a `frame_done`-paced shim a fresh permit every dispatch round and it stops throttling — the symptom is usually the opposite (a runaway), so a *frozen* app more likely means `emit_presented` is never called at all |
+| | Nothing but the deterministic background | No realm autostarted. Step 3 |
+
+## 9. The trusted band
+
+| Expected | Failure | What it means |
+|---|---|---|
+| 8 rows of one solid colour along the **top edge** of the panel, present in every frame | **No band** | **Stop the bring-up and file this.** `backend/mod.rs` is explicit that the band must live inside every presentation path's draw list precisely so a third path cannot drop it. A DRM backend presenting without a band is the most serious defect this page can find |
+| | Band present but a different colour each frame | The indicator is being regenerated per frame. Same severity |
+| | Band present, but client content overlaps it | Ordering violation (D-018). Record and file |
+
+## 10. A consent prompt, answered by a physical click
+
+Run an agent that petitions — the SDK demo agent will do — and let it ask for a
+grant.
+
+| Expected | Failure | What it means |
+|---|---|---|
+| A core-drawn card appears, framed in a ring **the same colour as the band**, and all input goes to it | Card appears, ring is a different colour | The two paths are drawing different secrets (issue #85's class). File it |
+| **Clicking Approve with the physical mouse resolves it** | The click does nothing | libinput pointer events are not reaching `input::intake_physical`. Keyboard may still work — check both before concluding |
+| The app behind the card receives nothing while it is up | The app reacts to your click | The consent grab is not exclusive. Security defect; stop |
+
+## 11. Held-Esc revocation (the dead-man switch)
+
+Hold Escape for the configured hold time.
+
+| Expected | Failure | What it means |
+|---|---|---|
+| A hold indicator appears, composited last of all; on completion every grant in the session is revoked and a `dead_man_triggered` entry lands in the recorder log | No hold bar | The unconditional observe tap is not being fed by the libinput intake. This should be *unconstructible* (`crate::input::ConsumingGate`) — treat it as a refactor bug, not a policy one |
+| | Bar appears, nothing is revoked | Worse than no bar: the human's off-switch is drawing a lie. Stop the session |
+
+## 12. VT switch away and back (WS-E.3.3)
+
+Press `Ctrl+Alt+F2` (or F3 — anywhere but tty1 and the VT `vitrind` is on).
+Wait five seconds. Come back.
+
+| Expected [inferred — this is WS-E.3.3's answer and it is not written yet] | Failure | What it means |
+|---|---|---|
+| `vitrind` survives the switch, the panel comes back, and **the band is the same colour it was before** | A different band colour | The session secret was regenerated, i.e. the human's anchor moved under them. `TrustedIndicator` is generated once per process, so a changed colour means the process restarted — check whether `vitrind` is even the same PID |
+| | `vitrind` died on the switch | `SessionEvent::PauseSession` is unhandled. This is exactly the coupling #218 records: this backend cannot honestly close with that handler unwritten |
+| | Panel comes back black, `vitrind` alive | Master was not reacquired on resume. You still have VT switching — go back to your tty2 shell and kill it |
+| | **You cannot switch away at all** | Note that this is *expected* to be possible today: [`limits.md`](book/src/limits.md) records that nothing inhibits `Ctrl-Alt-F<n>` on any backend. If you cannot, something is grabbing the keyboard and you have just lost your first line — go to Recovery |
+
+## 13. Type a letter (WS-E.3.1)
+
+Type `hello` into the terminal, on your real layout.
+
+| Expected [inferred — depends on WS-E.3.1's keymap decision] | Failure | What it means |
+|---|---|---|
+| `hello` appears | Nothing appears, but arrows and modifiers work | The keymap half is missing. `invariant_keysym` covers Escape, arrows and modifiers and **not a single letter** — this is the exact gap WS-E.3.1 exists to close, and seeing it is a confirmation, not a surprise |
+| | Wrong letters | The scancode→keysym resolution is wrong for this layout. Record which key produced which letter |
+| | Letters appear doubled or stick | Key pairing moved from the keysym to the scancode (`input/mod.rs`); a mismatched press/release pair is the classic symptom |
+
+## 14. Measure the frame cadence
+
+Do not eyeball it. Get a number.
+
+- From the recorder log: the interval between successive presentation entries.
+- Or run something with a known cadence and count.
+- Also worth measuring while you are here: **the CPU compose cost on the capture
+  path.** #218 flags it — `post_dispatch` refreshes `view_cache` from
+  `view_rgba` on every dirty round whether or not an agent is observing, and at
+  2560x1600 that is a 16 MB compose per latched batch. If it hurts, that is a
+  recorded decision, **not** a quiet gating of the refresh on grant state (which
+  would make capture freshness depend on whether a grant happened to exist).
+
+Write the number down. A cadence you did not measure is a cadence you did not
+observe.
+
+## 15. Shut down cleanly
+
+From the VT `vitrind` is on: `Ctrl+C`. Then `Ctrl+Alt+F1`.
+
+| Expected | Failure | What it means |
+|---|---|---|
+| `vitrind` exits, the VT returns to a text console, `Ctrl+Alt+F1` restores Hyprland with your windows intact | Hyprland comes back at the wrong resolution or refresh | The panel was left in a mode Hyprland did not re-set. See Recovery R3 |
+| The shim and its app exited too | Stray `vitrin-shim` processes | Realm shutdown ordering. `pkill vitrin-shim` from tty2, and file it |
+
+---
+
+## Recovery
+
+Work down this list. Do not skip to R4 because the first two feel slow.
+
+### R1 — the desktop is gone but the keyboard works
+
+**`Ctrl+Alt+F1`.** You are back in Hyprland.
+
+If `vitrind` is still running and still holding master, it will fight you for
+the panel. Get to your tty2 shell (`Ctrl+Alt+F2`) and:
+
+```bash
+pkill -INT vitrind          # ask it to shut down cleanly first
+sleep 2
+pgrep -a vitrind || echo "gone"
+pkill -KILL vitrind         # only if -INT did nothing
+pkill vitrin-shim           # shims are children of vitrind but check anyway
+```
+
+`-INT` before `-KILL` matters: a clean exit runs `shutdown_realm` and drops
+master in order. `-KILL` leaves the kernel to reclaim master, which usually
+works and occasionally leaves the panel in the state described in R3.
+
+### R2 — the screen is black **and** the keyboard is dead
+
+This is the case that has no good answer here, and the reason the cost of the
+escape-route substitution is stated at the top of this page.
+
+1. **Try `Ctrl+Alt+F1` anyway.** The keyboard may only *look* dead because
+   nothing is drawing. Give it a few seconds — a mode set is not instant.
+2. **Try `Alt+SysRq+r`** (unraw), then `Ctrl+Alt+F1` again — **only if you did
+   step 0.4.** With the default mask of `16` this does nothing at all.
+   [verified]
+3. **If you did step 0.4: `Alt+SysRq+e`, `i`, `s`, `u`, `b`**, a couple of
+   seconds apart. That is a sync-and-reboot without the power button, which is
+   strictly better for your filesystem than the next line.
+4. **Hold the power button.** With no SSH, this is where the substitution lands.
+   State it plainly: **this is a reboot, where #220's design assumed it was a
+   command.**
+5. If the machine does not come back up cleanly, that is what the installer USB
+   in step 0.3 is for: boot it, mount, `arch-chroot`, undo whatever wedged it.
+
+### R3 — the panel is left in a bad mode
+
+Symptoms: Hyprland returns at a wrong resolution or refresh, or the panel is
+dark but the machine is clearly alive (you can type blind, log in, and
+`loginctl` responds).
+
+```bash
+# From a working VT or a blind login:
+hyprctl monitors                 # what Hyprland thinks it has
+hyprctl keyword monitor eDP-1,2560x1600@240,0x0,1
+# If Hyprland itself is gone:
+systemctl --user restart hyprland   # or however this session is started
+```
+
+If nothing re-sets the mode, a **reboot** clears it: nothing about a DRM mode
+survives one. A wedged mode is annoying, not persistent — do not go to the
+installer USB for this.
+
+### R4 — `vitrind` is dead but nothing will take the panel back
+
+Usually a leaked master fd on a process that has not fully exited. Check for
+zombies and stray shims first (`pgrep -a vitrind; pgrep -a vitrin-shim`), then
+reboot. There is no way to force-release DRM master from userspace and there is
+no point pretending otherwise.
+
+### What none of this covers
+
+**A kernel-side wedge in i915.** If the GPU hangs, none of the above applies —
+you get a hard freeze, possibly with `i915` messages in the journal you can read
+after the reboot (`journalctl -b -1 -k -g i915`). That is a driver bug, not a
+`vitrind` bug, and the only response is to record the trace and the mode that
+produced it.
+
+---
+
+## Record the run
+
+Date it, and record the environment, exactly as
+[`shim/docs/nested-lock-screen.md`](../shim/docs/nested-lock-screen.md) and
+`shim/docs/firefox.md` do. The value of a manual runbook is entirely in whether
+anyone can tell when it was last actually executed.
+
+```text
+Last executed: (not yet — WS-E.3.4 landed this page; the backend it describes
+                (WS-E.3.2 / #218) has not landed, so there is nothing to execute
+                against yet. The first dated run belongs to whoever brings the
+                DRM backend up on the target laptop.)
+Kernel:
+Mesa:
+Connector:
+Selected mode:
+Measured frame cadence:
+Card opened (card1/card2):
+
+Observation checklist — pass/fail and what was seen:
+  7.  Connector and mode ..............
+  8.  App maps and repaints ...........
+  9.  Trusted band ....................
+  10. Consent prompt + physical click ..
+  11. Held-Esc revocation .............
+  12. VT switch away and back .........
+  13. Type a letter ...................
+  14. Frame cadence (number) ..........
+  15. Clean shutdown ..................
+
+Recovery paths actually used (if any):
+Notes:
+```
+
+> **This runbook is UNEXECUTED, and that means issue #220 has an unmet
+> acceptance criterion.** #220 asks that "the runbook has been executed end to
+> end on the target machine and the results recorded in this issue: date, kernel
+> version, mesa version, connector, selected mode, observed frame cadence, and
+> each checklist observation as pass/fail with what was seen." The document
+> exists; the execution does not. **#220 must not be closed as if that criterion
+> were met.**
+>
+> Why it was not run as part of this change: two independent reasons, either of
+> which alone is sufficient. First, **the backend does not exist** — WS-E.3.2 /
+> #218 is open, and `--drm` is not a flag `vitrind` accepts today. Second, the
+> first execution is by construction the dangerous one: it takes DRM master on
+> the maintainer's own laptop, from a physical keyboard, with a human present to
+> use the escape route. That is exactly the class of evidence CI cannot produce
+> and an agent must not fake — the same split #212, #214 and #232 already wrote
+> down for physical input.
+>
+> What the run would add that nothing else does: that this backend lights a real
+> panel, presents a real frame, and delivers a real input event. **No green
+> check in this repository will ever prove those three things**, and the
+> `vkms-advisory` job does not either — see
+> [`docs/book/src/limits.md`](book/src/limits.md).

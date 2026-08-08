@@ -399,6 +399,18 @@ struct PendingPetition {
     /// lands, tests today -- and implicitly cleared when the petition
     /// leaves the pending table.
     prompt_shown: bool,
+    /// The petitioned realm's program, kept **only** when the petition
+    /// names `realm_launch` (WS-E.1.1, issue #207): what the consent card
+    /// has to show, because approving that verb approves starting *this*
+    /// program.
+    ///
+    /// Resolved here, at admission, from the same [`RealmRegistry`] lookup
+    /// that decided the realm exists -- so [`Self::prompt_content`] stays a
+    /// pure function of pending state and the renderer never gains a second
+    /// route from configuration to the screen. `None` for every other
+    /// petition, so no card names a program the human is not being asked
+    /// about.
+    launch_command: Option<crate::realm::AuditedCommand>,
 }
 
 /// The effective authority a granted resolution carries -- what the
@@ -683,10 +695,11 @@ impl PetitionRegistry {
         if req.flags != 0 {
             return declined(Outcome::Unsupported);
         }
-        // A verb bit the IDL defines but this core does not enforce
-        // (`observe_cursor`, `layout_arrange`, `layout_focus` from D-017
-        // and D-018, plus `realm_launch` since version 2). Refused
-        // **whole**, never narrowed to the served
+        // A verb bit the IDL defines but this core does not enforce --
+        // today exactly `observe_cursor` (D-017). `layout_arrange` and
+        // `layout_focus` left that set at WS-E.1.4 and `realm_launch` at
+        // WS-E.1.1, each when the core gained the mechanism its refusal
+        // stood for. Refused **whole**, never narrowed to the served
         // remainder: narrowing is the human's move at consent time, and
         // silently dropping a requested verb would leave the agent
         // believing it holds authority nothing checks. The wire keeps
@@ -800,6 +813,19 @@ impl PetitionRegistry {
             ConsentPolicy::Interactive => {
                 let petition = PetitionId(self.next_petition_id);
                 self.next_petition_id += 1;
+                // The one configuration fact a card may name, resolved here
+                // and only for the verb it belongs to (WS-E.1.1). Asked of
+                // the same registry that already said this realm exists, so
+                // there is one lookup and one authority for what the realm
+                // runs. Unreachable `None` for a resolved realm; a card that
+                // could not name the program simply does not claim to.
+                let launch_command = if requested.verbs.contains(Verb::REALM_LAUNCH) {
+                    realms
+                        .get(realm.as_str())
+                        .map(|r| r.spawn().audited_command())
+                } else {
+                    None
+                };
                 // Fail-closed on an unrepresentable deadline (absurd
                 // configured timeout): collapse to immediate expiry, never
                 // to a never-expiring prompt.
@@ -817,6 +843,7 @@ impl PetitionRegistry {
                         // Born queued; the renderer (P1.7.2) flips this
                         // when the prompt actually reaches the screen.
                         prompt_shown: false,
+                        launch_command,
                     },
                 );
                 Admission::Pending { petition }
@@ -973,6 +1000,9 @@ impl PetitionRegistry {
             verbs: pending.requested.verbs,
             persistence: pending.requested.persistence,
             expiry_ms: pending.requested.expiry_ms,
+            // Resolved at admission, from the registry, for `realm_launch`
+            // petitions only -- see [`PendingPetition::launch_command`].
+            command: pending.launch_command.clone(),
         })
     }
 
@@ -1316,16 +1346,24 @@ mod tests {
         // the ones it does not implement. The failure this guards is the
         // silent one: accepting the bit and enforcing nothing.
         //
-        // Two bits, not three, since WS-E.1.4 (issue #210) served the
-        // layout pair. `observe_cursor` is here because per-principal
-        // cursor delivery is M2's; `realm_launch` because this core has no
-        // spawn path.
+        // **One bit now**, and each removal was a decision rather than a
+        // subtraction: WS-E.1.4 (issue #210) served the layout pair, and
+        // WS-E.1.1 (issue #207) served `realm_launch` once the core gained
+        // the spawn path, the realm cap and the consent copy its absence
+        // used to stand for. `observe_cursor` is what is left, because
+        // per-principal cursor delivery is still M2's.
         let t0 = t0();
         let mut reg = registry(ConsentPolicy::AutoApprove);
         let conn = reg.register_connection();
 
         let mut wire_id = 10;
-        for verb in [Verb::OBSERVE_CURSOR, Verb::REALM_LAUNCH] {
+        // A one-element list, deliberately: this is a SET that has shrunk
+        // three times (D-018's two verbs, then `realm_launch` at WS-E.1.1) and
+        // will shrink again when cursor delivery lands. Collapsing it to a
+        // straight-line assertion would hide that shape and make the next
+        // removal a rewrite rather than a deletion.
+        #[allow(clippy::single_element_loop)]
+        for verb in [Verb::OBSERVE_CURSOR] {
             // Alone.
             let mut req = request(DEMO, conn, wire_id);
             req.verbs = verb;
@@ -1562,6 +1600,57 @@ mod tests {
         reg.resolve_scripted(admitted[2], ScriptedDecision::Deny)
             .unwrap();
         assert_eq!(reg.front_pending(), None);
+    }
+
+    /// **The card names the program a `realm_launch` approval would start,
+    /// and only then** (WS-E.1.1, issue #207).
+    ///
+    /// Resolved here, at admission, from the same registry lookup that
+    /// decided the realm exists — so the renderer never gains a second route
+    /// from configuration to the screen, and a petition that does not ask to
+    /// launch carries no program at all.
+    #[test]
+    fn only_a_launch_petition_carries_its_templates_command_to_the_prompt() {
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::Interactive);
+        let conn = reg.register_connection();
+        let realms =
+            crate::realm::tests::registry_of(vec![crate::realm::tests::template_with_spawn(
+                "kiosk",
+                std::path::Path::new("/usr/bin/kiosk-browser"),
+                &[],
+            )]);
+
+        let mut req = request(DEMO, conn, 10);
+        req.realm_name = "kiosk".into();
+        req.verbs = Verb::OBSERVE | Verb::REALM_LAUNCH;
+        let Admission::Pending { petition } = reg.admit(req, t0, &realms, false) else {
+            panic!("interactive petition must pend");
+        };
+        let prompt = reg.prompt_content(petition).expect("pending");
+        assert_eq!(
+            prompt
+                .command
+                .as_ref()
+                .map(|c| c.as_path().display().to_string()),
+            Some("/usr/bin/kiosk-browser".to_string()),
+            "a launch prompt must name the program it would start"
+        );
+
+        // The same realm, without the verb: no program travels. A card that
+        // named one anyway would be showing the human a fact they are not
+        // being asked about.
+        let mut req = request(DEMO, conn, 20);
+        req.realm_name = "kiosk".into();
+        req.verbs = Verb::OBSERVE;
+        let Admission::Pending { petition } = reg.admit(req, t0, &realms, false) else {
+            panic!("interactive petition must pend");
+        };
+        assert!(reg
+            .prompt_content(petition)
+            .expect("pending")
+            .command
+            .is_none());
     }
 
     #[test]

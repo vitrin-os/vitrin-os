@@ -8,21 +8,31 @@
 # `crates/vitrin-core/src/toml_subset.rs` for the dialect and
 # `crates/vitrin-core/src/realm.rs` for the schema and every decision
 # below): comments, blank lines, [[realm]] headers, `key = "string"` and
-# `key = ["a", "b"]` -- nothing else. Every file this subset accepts is
-# valid TOML.
+# `key = ["a", "b"]`, `key = true` -- nothing else. Every file this subset
+# accepts is valid TOML.
 #
-# HOW MANY TABLES: at least one, at most MAX_REALMS (16), and one of them
-# must be "realm-0". The cap is a cardinality rule in the validator, not a
-# format limit -- the file has always been an array of tables. Sixteen is
-# argued rather than chosen by taste, and the argument is DESCRIPTORS, not
-# memory: every realm costs the trusted core two descriptors permanently
-# (the shim socketpair and the realm lock) plus up to sixteen staged buffer
-# fds, so sixteen realms claim at most ~288 of the customary 1024 soft
-# RLIMIT_NOFILE -- and running out is a whole-process failure that would
-# cost unrelated agents their connections. It also costs 32 processes (one
-# shim and one app each). Unbounded would make one launch grant an
-# fd-exhaustion primitive with no protocol violation anywhere in the trace.
-# The full accounting is at MAX_REALMS in realm.rs.
+# HOW MANY TABLES: at least one, at most MAX_REALMS (16), one of them must be
+# "realm-0", and at least one must autostart (see `autostart` below). The cap
+# is a cardinality rule in the validator, not a format limit -- the file has
+# always been an array of tables.
+#
+# Sixteen is argued rather than chosen by taste, and the argument has been
+# re-derived three times because it was wrong twice; the current one is
+# MEASURED, and it is MEMORY rather than descriptors. Each realm costs the
+# core three permanent descriptors (shim socketpair, realm lock, outbox
+# eventfd) plus up to sixteen staged buffer fds -- at most ~304 of the
+# customary 1024 soft RLIMIT_NOFILE at the cap -- and, since per-realm scenes
+# landed, TWO view-sized RGBA buffers: ~15.9 MiB per realm at 1920x1080 and
+# ~31.3 MiB at 2560x1600, measured, so ~586 MiB at the cap on a large panel.
+# It also costs 32 processes (one shim and one app each). The full accounting,
+# with the measurements and every correction, is at MAX_REALMS in realm.rs.
+#
+# THE CAP IS ENFORCED IN TWO PLACES, and since WS-E.1.1 the second one is the
+# reason it exists: this file is checked at load, and `vitrin_launcher.launch`
+# is refused `capacity` when the session already holds MAX_REALMS realms that
+# have not exited. Unbounded would make one launch grant an fd-exhaustion,
+# memory-exhaustion and process-exhaustion primitive with no protocol
+# violation anywhere in the trace.
 #
 # NOT bounded by this cap: the memory your apps and their shims use, which
 # is where nearly all of a realm's real cost is. The core neither measures
@@ -59,9 +69,10 @@
 # Wayland client throttles on frame callbacks, so a realm that stopped
 # being paced would stop repainting and its capture would go stale, which
 # the protocol forbids. Budget roughly 2 x width x height x 4 bytes of
-# core-side memory per realm (~32 MB each on a 2560x1600 panel) plus the
+# core-side memory per realm (~31 MiB each on a 2560x1600 panel) plus the
 # app's own, and expect sixteen realms to composite at the output's rate
-# with nobody looking at fifteen of them.
+# with nobody looking at fifteen of them. A realm a LAUNCH created costs
+# exactly the same as one this file declared.
 #
 # SECURITY -- this file names the program the trusted core will execute, so
 # whoever can write it chooses what vitrind spawns. It is refused unless it
@@ -115,6 +126,18 @@
 # the instance's id itself (`<template>.<n>`), because uniqueness across a
 # session must not be a property of a text file that also names a private
 # runtime directory.
+#
+# That split is ENFORCED here, not merely described, and it costs two further
+# refusals on the ids you may write:
+#
+#   - An id may not have the shape the core mints -- `<something>.<digits>`,
+#     with or without a trailing `.lock`. A realm named "foo.1" would own
+#     launched realm foo.1's directory, and "foo.1.lock" would own its lock.
+#   - An id may be at most 43 bytes, not the wire's 64: the core has to be
+#     able to append `.<number>` and still produce a realm id the wire can
+#     carry.
+#
+# Both are refused at startup, naming the id and the reason.
 #id = "realm-0"
 
 # REQUIRED. Absolute path of the APP this realm launches, which must exist
@@ -159,16 +182,46 @@ command = "/usr/bin/foot"
 #                    injects the realm's own runtime directory instead
 #env_allow = ["HOME", "LANG", "XDG_SESSION_TYPE"]
 
+# Optional (default true). Whether STARTUP forks this realm's app.
+#
+# `autostart = false` makes the realm a TEMPLATE: it is in the registry, it is
+# addressable, an agent may petition over it -- and nothing ever runs it until
+# a principal holding the `realm_launch` verb calls `vitrin_launcher.launch`,
+# which forks one INSTANCE of this table's `command` under a core-minted id.
+#
+# Two consequences worth knowing before you write it:
+#
+#   - A template NEVER PAINTS. An `observe` grant over one refuses
+#     `no_surface` forever. That is authority over nothing -- inert rather
+#     than dangerous -- but it is a shape a confused client can reach.
+#   - At least one realm in this file must autostart. A session of nothing but
+#     templates comes up with no app, nothing on the output and nothing for a
+#     human to look at; startup refuses it.
+#
+# The key does NOT decide what may be launched: any realm here names a
+# program, so a launch grant over a running realm starts a second instance of
+# that realm's app. It answers one question only -- does startup fork it.
+#autostart = true
+
 # A SECOND REALM is a second table, and nothing else. Every path this realm
 # owns is derived from its id, so it gets its own
 # $XDG_RUNTIME_DIR/vitrin-0/editor/ tree, its own lock and its own
 # wayland-0 -- no extra key, no extra section. Read the cardinality note at
-# the top of this file first: it runs, and until WS-E.1.3 lands it is not
-# separately observable.
+# the top of this file first: with WS-E.1.3 landed, each realm has its own
+# scene and its own capture, so a second realm is separately observable.
 #
 #[[realm]]
 #id = "editor"
 #command = "/usr/bin/gedit"
+
+# A TEMPLATE is the same table with one more key. Nothing runs this until a
+# consented launch grant asks it to, and each launch mints a NEW realm --
+# "kiosk.1", "kiosk.2", ... -- because nothing is ever relaunched.
+#
+#[[realm]]
+#id = "kiosk"
+#command = "/usr/bin/firefox"
+#autostart = false
 
 # ---------------------------------------------------------------------------
 # WHAT THIS FILE CANNOT PROMISE YOU (read before trusting the list above)
@@ -187,6 +240,15 @@ command = "/usr/bin/foot"
 # above grows linearly with the number of tables in this file and there is
 # no compensating control until E2.6/E2.7 land. The MAX_REALMS cap bounds
 # memory, not this.
+#
+# AND SINCE WS-E.1.1, N IS NO LONGER YOURS ALONE TO SET. A principal holding
+# `realm_launch` over a template can add processes at run time, up to the cap
+# and up to its grant's rate ceiling. Every word above applies unchanged to
+# what it starts: a launch grant is authority to start an UNCONFINED process
+# with the core's own uid and filesystem view. What bounds it is who holds the
+# grant (a human approved it, naming this template's program on the card), how
+# long (expiry, revocation), how often (max_event_rate) and how many
+# (MAX_REALMS) -- not what the launched program may then do.
 #
 # The sharpest instance is the SESSION D-BUS, and it is a deliberate,
 # documented hole:

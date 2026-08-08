@@ -298,12 +298,23 @@ A verb may be defined on the wire ahead of being served and **refused
 
 Four verbs were defined this way. `observe_cursor`, `layout_arrange` and
 `layout_focus` were defined from day one and `realm_launch` arrived with
-version 2; of those, **`layout_arrange` and `layout_focus` are now served** by
-the reference core (each has a facet interface, an enforcement arm and consent
-copy), while `observe_cursor` and `realm_launch` are not. `observe_cursor`
-stays unserved everywhere because the per-principal cursor *delivery* it would
-widen a capture with does not exist (D-017, D-019); `realm_launch` stays
-unserved by this core because it has no spawn path.
+version 2; of those, **three are now served** by the reference core — each has
+a facet interface, an enforcement arm and consent copy naming its consequence
+in plain language. `layout_arrange` and `layout_focus` joined at WS-E.1.4, and
+`realm_launch` at WS-E.1.1, when the core gained the spawn path, the realm cap
+and the prompt line its refusal had stood for.
+
+**`observe_cursor` is the one that remains**, and its reason has not moved: the
+per-principal cursor *delivery* it would widen a capture with does not exist
+(D-017, D-019), so serving the verb would promise something no capture
+carries.
+
+Serving a verb is a **deployment** property, not a version property. A
+deployment that will not host process creation must refuse `realm_launch`
+`unsupported` — nothing in this protocol obliges a server to serve every verb
+it can decode, and `capacity`'s [own note](#refusal) says in as many words
+that a deployment which cannot afford that refusal's side channel must not
+serve the verb at all.
 
 The staging is structural rather than cosmetic, for two reasons:
 
@@ -350,9 +361,10 @@ name only one of them, and the other's requests would reach the chokepoint
 with no verb to check them against. D-018(3) requires the two independently
 attenuable; two interfaces is how the dialect makes that structural.
 
-`realm_launch` is therefore defined-but-unserved *with its facet already on
-the wire*: the deployment refuses the verb, not the mint. Minting is always
-legal for every facet, and the use is what refuses.
+Where a deployment does not serve one of these verbs, the facet is still on
+the wire: the deployment refuses the **verb**, not the mint. Minting is always
+legal for every facet, and the use is what refuses — which is what keeps the
+mint from becoming an oracle for what a grant holds.
 
 #### Verb composition
 

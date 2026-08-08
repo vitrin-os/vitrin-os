@@ -2503,6 +2503,9 @@ mod tests {
                         // No layout use here; the sink must still exist,
                         // and a layout act reaching it would be the bug.
                         layout: &mut |act| panic!("no layout act expected: {act:?}"),
+                        // Likewise for launch: no test here exercises it,
+                        // and one reaching this sink is a defect.
+                        launch: &mut |ask| panic!("no launch expected: {ask:?}"),
                     },
                     now,
                     &mut |_frame, _fd| Ok(()),

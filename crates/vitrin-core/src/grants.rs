@@ -274,17 +274,27 @@ impl ResourceRef {
 /// The wire bitfield ([`Verb::VALID_MASK`]) is deliberately wider: D-017
 /// and D-018 define `observe_cursor`, `layout_arrange` and `layout_focus`
 /// from day one so the decided cursor and layout models are expressible
-/// before v0 freezes, and version 2 adds `realm_launch` on exactly the
+/// before v0 freezes, and version 2 added `realm_launch` on exactly the
 /// same terms -- so a petition for one is a *recoverable* `unsupported`
 /// rather than an out-of-range bit that kills the connection.
 ///
-/// **Two of those four are now served** (WS-E.1.4, issue #210):
-/// `layout_arrange` (16) and `layout_focus` (32) each have a facet
-/// interface, a chokepoint arm and consent-prompt copy, so this core
-/// enforces them and may therefore grant them. `observe_cursor` (8) and
-/// `realm_launch` (512) are still refused `unsupported` --
-/// per-principal cursor delivery is M2's and realm spawning is
-/// WS-E.1.1's core half, neither of which exists here.
+/// **Three of those four are now served.** `layout_arrange` (16) and
+/// `layout_focus` (32) joined at WS-E.1.4 (issue #210), and
+/// `realm_launch` (512) at WS-E.1.1 (issue #207): each has a facet
+/// interface, a chokepoint arm and consent-prompt copy naming the
+/// consequence in plain language, which is the whole of what "this core
+/// serves the verb" means. `observe_cursor` (8) is the one that stays
+/// out -- per-principal cursor *delivery* is M2's, and serving the verb
+/// would promise a capture widened with a cursor this core does not have.
+///
+/// **Moving `realm_launch` in is the single largest widening this
+/// constant has taken**, and it is worth naming here rather than only at
+/// the chokepoint: a bit in this set is a bit a grant row may carry, and
+/// this one makes a wire request able to fork a process in the trusted
+/// core. What bounds it is not this constant but everything the
+/// chokepoint route buys -- a human's approval, an expiry, revocation,
+/// the token bucket, [`crate::realm::MAX_REALMS`], and a journal entry
+/// naming who asked.
 ///
 /// Same posture as the durable persistence rungs, one rung up: those are
 /// **absent** from [`PersistenceRung`] so a row cannot hold one; these
@@ -294,7 +304,28 @@ impl ResourceRef {
 /// is the same -- a deployment never grants authority it does not
 /// enforce, and says so with `unsupported` rather than accepting
 /// silently.
-pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4 | 16 | 32;
+/// # A normative rule this constant does NOT implement (a landmine for P2.1.2)
+///
+/// `protocol/vitrin-v0.xml` states, normatively: *"A verb bit is NOT
+/// version-gated: the bitfield is one mask ... so a version-1 connection may
+/// name `realm_launch` and is answered `unsupported` rather than killed."* The
+/// SDK bakes that in (`VERBS_SERVED_IN_VERSION_1` excludes `realm_launch`,
+/// explaining it as a fact "about the VERSION"), and `00-conventions.md`
+/// restates it. Under CLAUDE.md the IDL's `<description>` text wins, so this is
+/// a normative rule with two readers and **no writer**.
+///
+/// This constant is version-independent and `PetitionRegistry::admit` takes no
+/// protocol version, so nothing here can answer a version-1 connection
+/// differently from a version-2 one. That is invisible today only because the
+/// core accepts version **2 only** — the disclosed divergence owned by P2.1.2 —
+/// so no version-1 connection exists to be answered wrongly.
+///
+/// It becomes live the moment P2.1.2 serves version 1. Whoever does that owns
+/// making `admit` version-aware, or amending the IDL sentence; discovering it
+/// then, from a client that is killed where the spec promises `unsupported`,
+/// is the expensive way. Flagged here rather than only in a plan document
+/// because this constant is where the fix has to land.
+pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4 | 16 | 32 | 512;
 
 /// The verb bits the IDL defines that this core does **not** serve. A
 /// petition naming any of these resolves `unsupported` -- whole, never
@@ -1267,23 +1298,24 @@ mod tests {
     // -- served vs. defined verbs ------------------------------------------
 
     #[test]
-    fn served_verb_bits_are_exactly_the_five_facet_verbs() {
+    fn served_verb_bits_are_exactly_the_six_facet_verbs() {
         // Pinned to the generated constants, not to a literal, so a verb
         // that ever changed value would fail here rather than silently
         // widening what this core claims to enforce.
         //
-        // Five since WS-E.1.4 (issue #210): the two layout verbs joined the
-        // three original facet verbs, each with an interface declaring it,
-        // a chokepoint arm exercising it and a consent-prompt line naming
-        // it. `observe_cursor` and `realm_launch` are the two defined verbs
-        // that stay out -- see the sibling test.
+        // Six since WS-E.1.1 (issue #207): `realm_launch` joined the two
+        // layout verbs WS-E.1.4 added and the three original facet verbs.
+        // Each has an interface declaring it, a chokepoint arm exercising
+        // it and a consent-prompt line naming it. `observe_cursor` is the
+        // one defined verb that stays out -- see the sibling test.
         assert_eq!(
             SERVED_VERB_BITS,
             (Verb::OBSERVE
                 | Verb::ACTUATE_POINTER
                 | Verb::ACTUATE_TEXT
                 | Verb::LAYOUT_ARRANGE
-                | Verb::LAYOUT_FOCUS)
+                | Verb::LAYOUT_FOCUS
+                | Verb::REALM_LAUNCH)
                 .bits()
         );
         // Every served bit is a defined wire bit.
@@ -1291,19 +1323,32 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_and_launch_verbs_are_defined_on_the_wire_but_unserved() {
-        // The two bits that are still staged: in-range (so naming one is
-        // never fatal) and unserved (so a petition for one resolves
-        // `unsupported`). Both halves matter -- either alone would be a
-        // lie about what this core does.
+    fn the_cursor_verb_is_defined_on_the_wire_but_unserved() {
+        // The one bit still staged: in-range (so naming it is never fatal)
+        // and unserved (so a petition for it resolves `unsupported`). Both
+        // halves matter -- either alone would be a lie about what this core
+        // does.
         //
-        // `observe_cursor` stays because per-principal cursor *delivery* is
-        // M2's (D-017, D-019): serving the verb would promise a capture
-        // widened with a cursor this core does not have. `realm_launch`
-        // stays because this core has no spawn path, which the chokepoint's
-        // `Launch` arm says at its own site. Neither is a placeholder for
-        // "not got to yet" -- each names a specific missing mechanism.
-        for verb in [Verb::OBSERVE_CURSOR, Verb::REALM_LAUNCH] {
+        // **`realm_launch` left this list at WS-E.1.1 (issue #207), and
+        // deliberately rather than mechanically.** It was here because this
+        // core had no spawn path reachable from a grant; it now has one, at
+        // the chokepoint's `Launch` arm, complete with the realm cap, the
+        // core-minted instance id and the consent copy Q13 requires. That
+        // is the specific missing mechanism this list is supposed to name,
+        // and it is no longer missing.
+        //
+        // `observe_cursor` stays, and for a reason that has not moved:
+        // per-principal cursor *delivery* is M2's (D-017, D-019), so
+        // serving the verb would promise a capture widened with a cursor
+        // this core does not have. It is not a placeholder for "not got to
+        // yet".
+        // A one-element list, deliberately: this is a SET that has shrunk
+        // three times (D-018's two verbs, then `realm_launch` at WS-E.1.1) and
+        // will shrink again when cursor delivery lands. Collapsing it to a
+        // straight-line assertion would hide that shape and make the next
+        // removal a rewrite rather than a deletion.
+        #[allow(clippy::single_element_loop)]
+        for verb in [Verb::OBSERVE_CURSOR] {
             assert!(
                 Verb::from_bits(verb.bits()).is_ok(),
                 "{verb:?} must decode: an out-of-range bit would be fatal, not `unsupported`"
@@ -1315,6 +1360,15 @@ mod tests {
             );
             assert_eq!(verb.bits() & UNSERVED_VERB_BITS, verb.bits());
         }
+        // ...and the verb that left is really served now, not merely absent
+        // from the list above. Asserted here rather than only in the
+        // sibling test so the two halves of "moved from unserved to served"
+        // are one failure when someone reverts half of it.
+        assert_eq!(
+            Verb::REALM_LAUNCH.bits() & SERVED_VERB_BITS,
+            Verb::REALM_LAUNCH.bits(),
+            "realm_launch must be served: WS-E.1.1 gave it a chokepoint arm and prompt copy"
+        );
         // The two classifications partition the wire bitfield: a verb
         // appended to the IDL lands in one of them, never in neither.
         assert_eq!(SERVED_VERB_BITS | UNSERVED_VERB_BITS, Verb::VALID_MASK);

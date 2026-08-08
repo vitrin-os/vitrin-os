@@ -108,7 +108,13 @@ VERB_MASK = int(
 # `layout_arrange` and `layout_focus` joined the set at WS-E.1.4: each gained a
 # facet interface (`vitrin_layout_focus`, `vitrin_layout_arrange`), an
 # enforcement arm and consent-prompt copy. Still out: `observe_cursor`
-# (per-principal cursor delivery is M2's) and `realm_launch` (no spawn path).
+# (per-principal cursor delivery is M2's) and `realm_launch` — the latter for a
+# reason that is about the VERSION rather than about any deployment, and that
+# is why it stays out even though the reference core serves the verb since
+# WS-E.1.1 (issue #207): a version-1 connection cannot mint `vitrin_launcher`
+# at all (`get_launcher` is `since="2"`), so there is nothing for a version-1
+# grant carrying the bit to be exercised through. The IDL says exactly that,
+# and this constant is derived from the IDL's own summaries.
 # Those are refused "unsupported", and a petition mixing served and unserved
 # verbs is refused whole — the core never silently narrows a verb set.
 VERBS_SERVED_IN_VERSION_1 = int(
@@ -165,8 +171,9 @@ class Refusal(enum.IntEnum):
     """vitrin_grant.refusal — use-time refusal codes.
 
     ``CAPACITY`` arrived with wire version 2 and is reachable only through
-    ``realm_launch``. It is here even though no deployment serves that verb
-    yet, for the same reason the unserved verb bits are: a code the SDK does
+    ``realm_launch``, which the reference core serves since WS-E.1.1. Whether
+    any *particular* deployment serves it is still a deployment property, and
+    every code the IDL defines is listed here regardless: a code the SDK does
     not know decodes to ``ServerContractViolation``, which is an accusation
     that the *server* broke the contract — the wrong answer for a refusal
     the IDL defines.

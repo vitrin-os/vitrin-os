@@ -515,6 +515,7 @@ class Core:
         seat: bool = False,
         runtime_dir: str | os.PathLike[str] | None = None,
         realms: tuple[str, ...] = (),
+        templates: tuple[str, ...] = (),
         wait: bool = True,
         write_config: bool = True,
         shim: str | os.PathLike[str] | None = None,
@@ -575,6 +576,14 @@ class Core:
                 # to exercise the seat path. Default off, so every existing
                 # caller's argv is unchanged.
                 #
+                # `templates` names realms declared `autostart = false`
+                # (WS-E.1.1, issue #207): present in the registry, addressable
+                # and petitionable, but never forked at startup. They exist to
+                # be the subject of a `realm.launch` grant, and the core
+                # refuses a file in which EVERY realm is one -- so `realm-0`
+                # (written unconditionally, and never a template) is also what
+                # keeps such a file loadable.
+                #
                 # `realms` names EXTRA realms beside `realm-0` (WS-E.1.2):
                 # each becomes another `[[realm]]` table running the same
                 # mock shim. Default empty, so every existing caller still
@@ -588,7 +597,8 @@ class Core:
                     f'id = "{rid}"\n'
                     f'command = "{MOCK_SHIM}"\n'
                     f'args = ["--serve"{seat_arg}, "--animate", "{animate}"]\n'
-                    for rid in ("realm-0", *realms)
+                    + ("autostart = false\n" if rid in templates else "")
+                    for rid in ("realm-0", *realms, *templates)
                 )
                 self.realm.write_text(tables)
             else:
@@ -624,7 +634,8 @@ class Core:
                         f"{_toml_string(os.fspath(per_command.get(rid, command)))}\n"
                         f"args = {_toml_string_array(per_args.get(rid, args or []))}\n"
                         f"env_allow = {_toml_string_array(list(env_allow))}\n"
-                        for rid in ("realm-0", *realms)
+                        + ("autostart = false\n" if rid in templates else "")
+                        for rid in ("realm-0", *realms, *templates)
                     )
                 )
 

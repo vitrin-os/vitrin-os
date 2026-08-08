@@ -61,11 +61,26 @@
 //! to a strict ASCII subset, and drawn from the operator's
 //! `principals.toml`), [`RealmId`] (from the operator's `realm.toml`, never
 //! the client's `get_realm` name — [`crate::petitions`] stores the registry's
-//! id, not the requested string), [`Verb`], [`PersistenceRung`], and a `u32`
-//! of milliseconds. Every character the card draws is either one of those
-//! typed values rendered by this module, or a `const` string in
-//! [`render`]. There is no free-text field to smuggle a glyph through,
-//! because there is no free-text field.
+//! id, not the requested string), [`Verb`], [`PersistenceRung`], a `u32`
+//! of milliseconds, and — since WS-E.1.1 — an optional
+//! [`AuditedCommand`](crate::realm::AuditedCommand). Every character the card
+//! draws is either one of those typed values rendered by this module, or a
+//! `const` string in [`render`]. There is no free-text field to smuggle a
+//! glyph through, because there is no free-text field.
+//!
+//! **`AuditedCommand` is the one member that is operator *text*, and it is
+//! still not a string field.** A `realm_launch` prompt has to name the
+//! program the human is approving the launching of, or the card would ask
+//! them to approve "start an app" with no way to tell which. The type is
+//! what keeps that from reopening the hole: its field is private and its
+//! only non-test constructor is
+//! [`SpawnConfig::audited_command`](crate::realm::SpawnConfig::audited_command),
+//! whose receiver can only have come from a `realm.toml` the loader found
+//! regular, core-owned and not group/other-writable, and whose `command`
+//! passed the transitive not-writable audit. So it is trusted in exactly the
+//! sense `principals.toml`'s identities are trusted — and, like them, it is
+//! still put through [`text`]'s ASCII-printable substitution below, because
+//! "trusted" is not "verified to be renderable".
 //!
 //! Where those values come from is **convention**, not structure, and the
 //! difference is worth stating precisely in a claim of this kind. The only
@@ -224,6 +239,23 @@ pub(crate) struct PromptContent {
     pub persistence: PersistenceRung,
     /// The requested lifetime in milliseconds; `0` = bounded by the rung.
     pub expiry_ms: u32,
+    /// **The program a `realm_launch` approval would let this principal
+    /// start** (WS-E.1.1, issue #207), or `None` when the petition does not
+    /// name that verb.
+    ///
+    /// `Some` exactly when `verbs` contains `realm_launch`, resolved once
+    /// at admission from the petitioned realm's configuration
+    /// ([`crate::petitions::PetitionRegistry::admit`]) rather than looked
+    /// up at render time -- the renderer holds no realm registry, and
+    /// giving it one would be a second path from configuration to the
+    /// screen.
+    ///
+    /// It is here because the alternative is a card that says "start apps
+    /// in this realm" and leaves the human to guess which app. The verb's
+    /// whole security story is that the *template* names the program, so a
+    /// prompt that did not show the program would be asking for consent to
+    /// the one fact it hid.
+    pub command: Option<crate::realm::AuditedCommand>,
 }
 
 impl PromptContent {
@@ -638,6 +670,10 @@ pub(crate) mod tests {
             verbs: Verb::OBSERVE | Verb::ACTUATE_POINTER | Verb::ACTUATE_TEXT,
             persistence: PersistenceRung::WhileRunning,
             expiry_ms: 60_000,
+            // No `realm_launch` in the fixture's verb set, so no program is
+            // named -- the golden card stays what it was, and the launch
+            // card is a separate fixture beside it.
+            command: None,
         }
     }
 

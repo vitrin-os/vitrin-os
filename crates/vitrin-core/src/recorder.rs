@@ -360,6 +360,7 @@ use crate::grants::{GrantId, Issuer, PersistenceRung, RealmId};
 use crate::identity::{PrincipalIdentity, RejectionCause};
 use crate::input::SeatInputKind;
 use crate::petitions::{ConnectionId, EffectiveAuthority, PetitionId};
+use crate::spawn::SpawnOrigin;
 
 /// The entry-schema version stamped on every line. Bump only when an
 /// existing field's *meaning* changes; adding a field is additive, and a
@@ -957,6 +958,22 @@ pub(crate) enum Event<'a> {
         /// The shim's pid: the process holding the other end of the
         /// identity socketpair.
         pid: u32,
+        /// **Who asked** (WS-E.1.1, issue #207): startup, or a named
+        /// principal exercising a named grant.
+        ///
+        /// The single most security-relevant act of a session used to be
+        /// journaled without an asker, because until `realm_launch` was
+        /// served there could only be one: the core forked what
+        /// `realm.toml` said and nothing on the wire could make it fork
+        /// anything. That is no longer true, and a log that could not
+        /// answer "who started this app" would be missing the fact the
+        /// whole verb exists to make attributable.
+        ///
+        /// Not an `Option`, and [`crate::spawn::spawn_realm`] takes the
+        /// same type: a spawn with no stated origin is unwritable rather
+        /// than merely discouraged. The identity is the *verifier-
+        /// canonical* one bound at `hello`, never client-claimed text.
+        origin: SpawnOrigin<'a>,
         command: &'a Path,
         /// The realm's private runtime directory (mode `0700`) -- where the
         /// app-facing socket the child's `WAYLAND_DISPLAY` names lives.
@@ -973,6 +990,11 @@ pub(crate) enum Event<'a> {
     /// the log would otherwise say the realm was ever meant to run.
     RealmSpawnFailed {
         realm: &'a RealmId,
+        /// Who asked, on exactly [`Event::RealmSpawned`]'s terms. A refused
+        /// launch is as attributable as an admitted one -- more so, since
+        /// a principal that repeatedly makes the core try and fail to fork
+        /// is the shape a reader is looking for.
+        origin: SpawnOrigin<'a>,
         command: &'a Path,
         /// A fixed label from [`crate::spawn::SpawnError::cause_class`] --
         /// never free-form `Display` text, per this log's convention.
@@ -1357,12 +1379,18 @@ impl Event<'_> {
             Event::RealmSpawned {
                 realm,
                 pid,
+                origin,
                 command,
                 runtime_dir,
                 env_allow,
             } => {
                 field_display(out, "realm", realm);
                 field_u64(out, "pid", u64::from(pid));
+                // **Who asked.** Three fields, always written -- an
+                // explicit `null` rather than an absent key, so a reader
+                // never has to tell "this core could not say" from "the
+                // writer forgot" (this method's rule).
+                write_spawn_origin(out, origin);
                 field_display(out, "command", command.display());
                 field_display(out, "runtime_dir", runtime_dir.display());
                 // Names only -- see the variant's docs. The core's two
@@ -1376,10 +1404,12 @@ impl Event<'_> {
             }
             Event::RealmSpawnFailed {
                 realm,
+                origin,
                 command,
                 cause_class,
             } => {
                 field_display(out, "realm", realm);
+                write_spawn_origin(out, origin);
                 field_display(out, "command", command.display());
                 field_str(out, "cause_class", cause_class);
                 field_null(out, "pid");
@@ -1467,6 +1497,28 @@ fn write_effective(out: &mut String, effective: Option<EffectiveAuthority>) {
             close_object(out);
         }
         None => field_null(out, "effective"),
+    }
+}
+
+/// **Who made the core fork**, as three always-present fields (WS-E.1.1).
+///
+/// One writer for both spawn entries, so a reader parses one shape and the
+/// success and failure lines cannot drift into disagreeing about what
+/// `principal` means. Absent information is an explicit `null`, per
+/// [`Event::write_body`]'s rule: a startup spawn genuinely has no principal
+/// and no grant, and saying so is different from omitting the keys.
+fn write_spawn_origin(out: &mut String, origin: SpawnOrigin<'_>) {
+    match origin {
+        SpawnOrigin::Startup => {
+            field_str(out, "spawned_by", "startup");
+            field_null(out, "principal");
+            field_null(out, "grant_id");
+        }
+        SpawnOrigin::Launch { principal, grant } => {
+            field_str(out, "spawned_by", "realm_launch");
+            field_str(out, "principal", principal.as_str());
+            field_display(out, "grant_id", grant);
+        }
     }
 }
 
@@ -2892,6 +2944,72 @@ pub(crate) mod tests {
                 "a seat-delivery entry must not carry payload; found {forbidden}"
             );
         }
+        cleanup(&path);
+    }
+
+    /// **The journal answers "who started this app"** (WS-E.1.1, issue
+    /// #207) — for both spawn outcomes, and for both origins.
+    ///
+    /// Until `realm_launch` was served there could only be one answer, so
+    /// the entry carried none. There are two now, and the attribution is a
+    /// required field of the entry rather than something a caller may pass
+    /// (`spawn::SpawnOrigin`), so a spawn with no stated origin is
+    /// unwritable rather than merely discouraged.
+    #[test]
+    fn a_spawn_entry_names_who_asked_for_it() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rec, path) = scratch_recorder("spawn-origin");
+        let realm = crate::grants::RealmId::new("kiosk.1");
+        let who = identity("vitrin://local/agent/demo");
+        let grant = crate::grants::GrantId::from_u64_for_test(7);
+        rec.record(Event::RealmSpawned {
+            realm: &realm,
+            pid: 4242,
+            origin: crate::spawn::SpawnOrigin::Launch {
+                principal: &who,
+                grant,
+            },
+            command: Path::new("/usr/bin/kiosk-browser"),
+            runtime_dir: Path::new("/run/user/1000/vitrin-0/kiosk.1"),
+            env_allow: &[],
+        });
+        rec.record(Event::RealmSpawned {
+            realm: &crate::grants::RealmId::new("realm-0"),
+            pid: 11,
+            origin: crate::spawn::SpawnOrigin::Startup,
+            command: Path::new("/usr/bin/foot"),
+            runtime_dir: Path::new("/run/user/1000/vitrin-0/realm-0"),
+            env_allow: &[],
+        });
+        rec.record(Event::RealmSpawnFailed {
+            realm: &realm,
+            origin: crate::spawn::SpawnOrigin::Launch {
+                principal: &who,
+                grant,
+            },
+            command: Path::new("/usr/bin/kiosk-browser"),
+            cause_class: "exec",
+        });
+
+        let entries = read_log(&path);
+        assert_eq!(entries.len(), 3);
+        // A wire launch: attributable to a principal AND to the row it
+        // exercised, so a reader can tie the process to the consent card
+        // that authorized it rather than to a timestamp.
+        assert_eq!(entries[0].str("kind"), "realm_spawned");
+        assert_eq!(entries[0].str("spawned_by"), "realm_launch");
+        assert_eq!(entries[0].str("principal"), "vitrin://local/agent/demo");
+        assert_eq!(entries[0].str("grant_id"), "grant-7");
+        // Startup: no principal and no grant, stated as explicit nulls
+        // rather than as absent keys.
+        assert_eq!(entries[1].str("spawned_by"), "startup");
+        assert!(entries[1].is_null("principal"));
+        assert!(entries[1].is_null("grant_id"));
+        // A *refused* launch is as attributable as an admitted one.
+        assert_eq!(entries[2].str("kind"), "realm_spawn_failed");
+        assert_eq!(entries[2].str("spawned_by"), "realm_launch");
+        assert_eq!(entries[2].str("principal"), "vitrin://local/agent/demo");
+        assert_eq!(entries[2].str("cause_class"), "exec");
         cleanup(&path);
     }
 

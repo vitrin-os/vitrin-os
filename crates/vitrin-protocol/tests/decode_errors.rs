@@ -65,10 +65,10 @@ fn invalid_bitfield_value_is_rejected() {
     // and is settled at petition admission (`unsupported`), deliberately not
     // a decode error, so the codec must accept every defined bit whatever
     // any core does with it. That is unchanged by WS-E.1.4 serving
-    // `layout_arrange` (16) and `layout_focus` (32) in the reference core:
-    // this file is the codec's, and the codec never knew which bits were
-    // served. Bits 8 and 512 (`observe_cursor`, `realm_launch`) remain
-    // defined-and-unserved there (D-017/D-018).
+    // `layout_arrange` (16) and `layout_focus` (32), and by WS-E.1.1 serving
+    // `realm_launch` (512), in the reference core: this file is the codec's,
+    // and the codec never knew which bits were served. Bit 8
+    // (`observe_cursor`) remains defined-and-unserved there (D-017).
     //
     // The 64/128/256 gap is not free space: those bits are allocated (to
     // `designate_file`, `egress`, `publish_tree`) but not yet defined in the

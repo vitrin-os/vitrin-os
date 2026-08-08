@@ -90,7 +90,46 @@ core socket, and that is a confinement question nobody has answered. Until
 then, anything you would call a desktop shell — a bar, a launcher, an OSD, a
 window-switcher overlay — cannot exist on this display server, and the
 replacements are core-owned surfaces (the trusted band, the consent card, the
-attention marker) that no client can add to.
+attention marker, the lock screen and the status strip) that no client can add
+to.
+
+**No client status bar is possible, and the core's `--status` strip is the
+whole of the replacement.** `zwlr_layer_shell_v1` is not in the shim's global
+contract, and that was measured rather than assumed: waybar connects, binds six
+globals, and never maps a surface; rofi and wofi are the same class. So
+`vitrind --status` draws the strip itself, in reserved rows immediately below
+the trusted band, and it shows **three facts**: the focused realm's name, the
+battery, and a clock. There is no tray, no notifications, no workspace
+switcher, and no click targets — it is not interactive at all, because a
+principal cannot receive physical input (above) and the core does not want a
+fourth core-owned gesture for a status bar. Four further limits belong with it:
+
+- **The strip is unspoofable in pixels but is not self-authenticating.** It
+  always wins the composite, so a confined app cannot cover it — but an app
+  *can* paint a convincing fake strip one row lower. The band above it is the
+  anchor, and the rule is **"trusted content is everything above the coloured
+  line"**. That is strictly weaker than the band's own guarantee: the band
+  proves itself, the strip only inherits position from it. This makes the
+  indicator story three rules where there was one, and a human who cannot state
+  the rule cannot apply it.
+- **Every app loses rows while the strip is on.** The realm view is *not* inset
+  — the app is not configured smaller, its top rows are overdrawn, exactly as
+  the band's 8 rows already are. Issue #215 asks for the inset and it is
+  unimplemented; `--status` is off by default so no session pays for a strip it
+  did not ask for.
+- **The clock is UTC unless you say otherwise, and there is no DST.** The core
+  carries no timezone database — a `tzfile` parser and a recurring read of
+  `/usr/share/zoneinfo` is authority the TCB is not taking for a cosmetic field
+  — so `--status-utc-offset +09:00` states a fixed offset and the strip always
+  labels the zone it is showing. A session running across a DST boundary shows
+  an hour that is wrong until the operator changes the flag.
+- **The strip is a recurring filesystem read inside the TCB.** The battery
+  comes from `/sys/class/power_supply`, re-read every 30 s, bounded to one fixed
+  root, 16 directory entries and 16–32 bytes per attribute, with every failure —
+  no battery, a desktop, a machine mid-suspend — collapsing to an **empty slot**
+  rather than a guess. When Landlock over the core's own process lands, this
+  becomes a rule the core must grant itself, i.e. this widens that future
+  sandbox.
 
 **A principal cannot receive physical input either, so no client has a
 hotkey.** There is no `observe_input` verb and none is designed. The core owns

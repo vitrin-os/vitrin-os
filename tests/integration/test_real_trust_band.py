@@ -612,6 +612,20 @@ class RealTrustBand(IntegrationTest):
         self.assertEqual(
             report["band_uniform"], 1, "the band's rows are not one opaque colour"
         )
+        # This session runs WITHOUT `--status` (WS-E.2.3, issue #215): the
+        # status strip is opt-in precisely so that this gate's byte-for-byte
+        # comparison of the human-visible frame against the realm view does not
+        # become a function of the time of day. A non-zero height here means a
+        # future default flipped, and `tracks_view` above would then be about
+        # fewer rows than this gate believes it is about.
+        self.assertEqual(
+            report["strip_h"],
+            0,
+            "this session did not pass `--status`, so no rows below the band may be "
+            "reserved for the status strip; `tracks_view` is otherwise about a smaller "
+            "region than this gate thinks",
+        )
+        self.assertEqual(report["strip_changes"], 0)
         probe = _rgba_rows(dump, REALM_WH[0], self.band_h, 2 * self.band_h)
         self.assertEqual(
             report["probe_fnv"],

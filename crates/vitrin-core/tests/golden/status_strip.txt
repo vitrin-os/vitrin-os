@@ -1,0 +1,10 @@
+# vitrind status strip -- WS-E.2.3 visual golden
+# Regenerate: VITRIN_REGEN_GOLDEN=1 cargo test -p vitrin-core status_strip_golden
+# One character per 4x4 block of the rasterized strip, by mean luminance.
+size 640x20
+blake3 9b046bb17d17c4336156a00d0cf347cbf051667078c9253ec9d4009d569de952
+                                                                                                                                                                
+                           .. .:.. .:                                                                                             .:.::.   .:::.:.: ..:::.:::   
+                           ---------:.                                                                                            ::.:::.   :.:::=- --::-::=:.  
+                           .::::....:                                                                                             .:. ...  .-::.:.: ..:::.:::   
+................................................................................................................................................................

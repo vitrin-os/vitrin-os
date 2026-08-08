@@ -696,6 +696,25 @@ pub(crate) trait Presenter {
     /// Backends that composite no marker answer `false` forever, which costs
     /// the dispatch round nothing.
     fn set_attention(&mut self, open: bool) -> bool;
+
+    /// Re-sample the **status strip** (WS-E.2.3, issue #215) and say whether
+    /// anything it draws changed.
+    ///
+    /// Unlike [`Self::set_attention`] this takes no value: what the strip shows
+    /// is the wall clock, the battery and the realm the *output* is bound to,
+    /// and the view is the thing that knows the last of those. So the round
+    /// asks the view to look, rather than computing a value the view already
+    /// holds half of.
+    ///
+    /// `now` and `mono` are passed in rather than read here so a test can
+    /// advance either independently — the same discipline
+    /// [`crate::status::sample::Sampler`] is written to.
+    ///
+    /// `true` means the caller should mark the frame dirty and present. A
+    /// session with `--status` off answers `false` forever **and reads no clock
+    /// and opens no file** — the strip's whole cost, syscalls included, is
+    /// behind the flag.
+    fn refresh_status(&mut self, now: std::time::SystemTime, mono: Instant) -> bool;
 }
 
 /// A backend state type that carries a [`Runtime`], split into provably
@@ -982,6 +1001,40 @@ where
     tracing::debug!(
         interval_ms = SWEEP_INTERVAL.as_millis(),
         "expiry sweeps armed (advisory: authority is re-checked at use time)"
+    );
+    Ok(())
+}
+
+/// How often a `--status` session wakes the loop so the strip's clock can move.
+///
+/// One second. The strip shows `HH:MM` with no seconds
+/// ([`crate::status::sample::ClockReading`]), so this is not a repaint cadence:
+/// it is the bound on how *stale* the displayed minute may be, and
+/// [`post_dispatch`] marks the frame dirty only on the minute that actually
+/// rolls over. The cost is one timerfd wakeup per second while the strip is on,
+/// and **nothing at all when it is off** — [`arm_status_tick`] is only called
+/// for a session that asked for a strip.
+const STATUS_TICK: Duration = Duration::from_secs(1);
+
+/// Arm the status strip's tick. Called by a backend's `run_inner` only when
+/// `--status` is on.
+///
+/// The callback is deliberately empty: every dispatch round ends in
+/// [`post_dispatch`], which is where the strip is re-sampled and where the
+/// decision to repaint is made. A timer that did the sampling itself would be a
+/// second place that decision lives, which is how the two backends' strips would
+/// come to disagree.
+pub(crate) fn arm_status_tick<H>(handle: &LoopHandle<'static, H>) -> Result<(), Box<dyn Error>>
+where
+    H: RuntimeHost,
+{
+    handle.insert_source(
+        Timer::from_duration(STATUS_TICK),
+        |_now, _, _host: &mut H| TimeoutAction::ToDuration(STATUS_TICK),
+    )?;
+    tracing::debug!(
+        interval_ms = STATUS_TICK.as_millis(),
+        "status strip armed: the loop wakes once a second so the clock can move"
     );
     Ok(())
 }
@@ -3582,6 +3635,24 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
             runtime.dirty = true;
             view.request_present();
         }
+        // ...and the status strip (WS-E.2.3), on the same terms and before the
+        // same gate. It answers `false` — and touches neither clock nor
+        // filesystem — unless `--status` is on, so a session without a strip
+        // pays no SAMPLING here: no sysfs read, no snapshot, no raster.
+        //
+        // It does not pay *nothing*, and an earlier version of this comment
+        // said it did. Both clocks below are arguments, so they are evaluated
+        // at this call site on every dispatch round whether or not a strip
+        // exists — two `clock_gettime` calls, which is why the claim is
+        // narrowed here rather than left to read as "a strip-less session
+        // never asks the time".
+        //
+        // The wall clock is read once, at this one site, so the strip's
+        // contents cannot depend on where in the round they were sampled.
+        if view.refresh_status(std::time::SystemTime::now(), Instant::now()) {
+            runtime.dirty = true;
+            view.request_present();
+        }
         if !runtime.dirty {
             return;
         }
@@ -3781,6 +3852,11 @@ mod tests {
     /// *other* overlays. A fresh one per call: [`crate::lock::LockSurface`]
     /// carries a generation counter and a raster cache, so a shared instance
     /// would let one caller's raise change what the next one measures.
+    /// A status strip that is off — `--status` is opt-in.
+    fn no_status() -> crate::status::StatusStrip {
+        crate::status::StatusStrip::new(crate::status::StatusConfig::off())
+    }
+
     fn no_lock() -> crate::lock::LockSurface {
         crate::lock::LockSurface::new(crate::consent::TrustedIndicator::for_test())
     }
@@ -3889,6 +3965,7 @@ mod tests {
                 self.scenes.bound(),
                 &mut self.consent,
                 &mut no_lock(),
+                &mut no_status(),
                 w,
                 h,
                 false,
@@ -3916,6 +3993,13 @@ mod tests {
             let changed = self.attention != open;
             self.attention = open;
             changed
+        }
+        /// The status strip is off in this rig, for the same reason it is off
+        /// by default in a real session: these tests compare human-visible
+        /// output against captures byte for byte, and a clock in that
+        /// comparison would make them a function of wall time.
+        fn refresh_status(&mut self, _now: std::time::SystemTime, _mono: Instant) -> bool {
+            false
         }
         fn scene_mut(&mut self, realm: &RealmId) -> &mut Scene {
             self.scenes.scene_mut(realm)

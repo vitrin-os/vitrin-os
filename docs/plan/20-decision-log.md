@@ -322,6 +322,36 @@ Entries D-001 through D-011 are seeded from decisions the [PRD](../PRD.md) alrea
 
 ---
 
+### D-026 — The top strip is designed as one surface: the band alone, then the status strip beside it, and the app's rows are still overdrawn
+
+**Status:** accepted (2026-08-08) — implements WS-E.2.3's status strip (issue [#215](https://github.com/vitrin-os/vitrin-os/issues/215)); workstream [WS-E](14-workstream-session-mode.md) §6
+
+**Why an entry at all:** three issues drew into the rows around the trusted band and each was designed without the others — the dead-man hold bar ([D-023](#d-023--the-core-owns-a-second-physical-chord-a-tapped-consumed-attention-key-that-lifts-preempted-for-the-two-layout-verbs-only-and-delegates-nothing)'s neighbour), WS-E.1.7's attention marker (#232), and this strip. WS-E §6 recorded that as an unowned collision and named the third to land as its owner. This is that decision, made once and written where the next person will find it.
+
+**Decision, in draw order:**
+
+```text
+realm view -> consent overlay -> lock cover -> STATUS STRIP -> trusted band
+           -> attention marker  ...  -> dead-man hold indicator (last of all)
+```
+
+1. **Nothing is ever composited into the band.** Rows `[0, TRUST_BAND_HEIGHT)` stay exactly one colour. This is not a review rule: the strip's raster is the *strip's* own height and is blitted at `y = TRUST_BAND_HEIGHT`, so no coordinate expressible in `status::render` lands in the band. It is also measured — `band_witness`'s `band_changes` stays `0` over composites its new sibling `strip_changes` proves were really repainting.
+2. **The strip is composited over the lock cover, not under it.** #215 left this open for whoever landed second; #214 landed first, so #215 decided it. A clock is the one thing a human wants on a lock screen, and "the strip is always there" must have no exception — a rule with an exception is a rule a human cannot apply. It leaks nothing the lock exists to hide: the lock's job is that *client* content stops being legible, and every field on the strip is core-owned, including a `realm.toml` id the lock card itself already prints.
+3. **The attention marker keeps a lane rather than relying on z-order.** The strip's content starts past `attention::MARKER_W`, read from that constant and never restated, under a `const` assertion that turns an overgrown marker into a compile error. Ordering alone would keep the marker *visible*; it would still leave a glyph half-covered whenever the window is open.
+4. **The dead-man hold indicator stays composited last of all.** Unchanged, and restated because every addition to this surface is a chance for it to stop being true.
+5. **The strip is opt-in (`--status`, off by default).** The `--agent-cursor` precedent, for the same measured reason: the headless human-visible framebuffer is compared byte-for-byte against the realm view by `band_witness` and by `tests/integration/test_real_trust_band.py`, and a clock on by default would make a mock-free gate a function of the time of day.
+6. **The clock is a fixed offset, not a timezone.** The core takes no tzdata parser and no recurring `/usr/share/zoneinfo` read into the TCB for a cosmetic field. `--status-utc-offset` states an offset; the strip always labels the zone it draws, so a wrong hour is a wrong flag rather than a wrong clock. No DST.
+
+**Costs, stated:**
+
+- **The realm view is NOT inset, and #215 asked for it.** The strip overdraws 20 rows of client content the way the band already overdraws 8; the app is not configured smaller and does not lay out for it. A correct inset needs one usable-view value reaching `scene::layout::place` from three paths that share no carrier for a second number (`Scene::compose`, the router's `surface_local`, `dmabuf::human_visible_frame`) plus the `configure` size the shim is told — a `ViewGeometry` refactor of its own — and a half-done version, one path reserving rows the others do not, is strictly worse than none. Deferred deliberately, published in `docs/book/src/limits.md`, and the reason `--status` is opt-in.
+- **The indicator story is three rules where it was one.** "Everything above the coloured line is trusted, the line itself is the proof, and the strip below it is trusted-but-not-self-proving." An app can paint a convincing fake strip one row lower; the band is the only anchor. `limits.md` already concedes the indicator is "unforgeable, not necessarily noticed", and this widens what a human has to notice.
+- **A recurring filesystem read inside the TCB.** The first one: `/sys/class/power_supply`, every 30 s, bounded to one fixed root, 16 entries and 16–32 bytes per attribute through `Read::take`, every failure an empty slot rather than a guess. When E2.6/E2.7 confine the core with Landlock this becomes a rule the core must grant itself — a real widening of that future sandbox, recorded here and in WS-E §6 rather than left to be rediscovered.
+- **The zero-copy draw list gained its first stateful member.** `dmabuf::human_visible_frame` was a pure function returning solid-colour draws, which is what made "no arm omits the band" structurally true. `Draw::StatusStrip` carries a rectangle only — the texture is the executor's — so the function stays pure, but the frame now depends on an upload that can fail. A failed upload drops the strip for that frame and logs; it never drops the band and never refuses to present, because the strip asserts nothing about authenticity and the band asserts everything.
+- **It is not a panel.** Three facts, no tray, no notifications, no workspace switcher, no click targets, and no interaction at all — a principal cannot receive physical input and the core is not taking a fifth gesture for a status bar.
+
+---
+
 
 ## Part B — Open questions (PRD §20), with owners and decide-by gates
 

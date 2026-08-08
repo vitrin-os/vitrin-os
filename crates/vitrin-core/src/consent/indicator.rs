@@ -47,6 +47,33 @@
 //! regardless. The human reads the band, then checks a prompt's frame against
 //! it: a dialog framed in any other colour, or none, is forged — whoever drew
 //! it.
+//!
+//! # What may sit near the band, and what may never sit in it
+//!
+//! Three core-drawn surfaces now occupy the rows immediately **below** the
+//! band, and none of them is ever composited into rows `[0,
+//! TRUST_BAND_HEIGHT)`: [`crate::attention`]'s marker (WS-E.1.7),
+//! [`crate::status`]'s clock/battery/realm strip (WS-E.2.3), and, transiently,
+//! [`crate::lock`]'s cover — which stops *below* the band for the same reason.
+//! The rule is one sentence and it has no exceptions: **the band has exactly
+//! one correct appearance, so nothing at all is drawn on it.** A band that
+//! sometimes carried a glyph would be a band whose correct appearance is a
+//! judgement call, and the human's check against a forged prompt is only as
+//! sharp as that appearance is unambiguous.
+//!
+//! It is enforced structurally rather than by review. The strip's raster is the
+//! strip's own height and is blitted at `y = TRUST_BAND_HEIGHT`, so no
+//! coordinate expressible in its renderer lands in the band; the marker's rect
+//! starts at the same row; the cover's fill is followed by
+//! [`super::ConsentSurface::composite_trust_band`], which overdraws it. And it
+//! is measured: [`crate::backend::band_witness`]'s `band_changes` is `0` in a
+//! correct session, over composites its sibling `strip_changes` proves were
+//! really repainting.
+//!
+//! The strip below is **not** covered by this argument, and the difference is
+//! published rather than blurred: an app can paint a convincing fake strip one
+//! row lower than the real one. The band is the anchor; the rule taught to the
+//! human is "trusted content is everything above the coloured line".
 
 /// A per-session secret colour. Opaque RGBA; `Copy` so it rides in the
 /// [`crate::session::RuntimeSeed`] and into both backends' consent surfaces

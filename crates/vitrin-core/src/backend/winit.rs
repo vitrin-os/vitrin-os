@@ -216,6 +216,14 @@ struct TextureKey {
     /// what the pixels depend on is open-or-not, and putting an `Instant` in a
     /// `PartialEq` cache key would re-upload every frame for a whole second.
     attention: bool,
+    /// [`crate::status::StatusStrip::generation`] at upload time (WS-E.2.3).
+    ///
+    /// In the key for exactly the reason `attention` is: without it the cache
+    /// short-circuits the one call that would redraw the strip, so on the CPU
+    /// path a session's clock would advance only when the app happened to
+    /// repaint — which for a static app is never. A generation rather than the
+    /// snapshot itself, because the snapshot is what the generation counts.
+    status_generation: u64,
 }
 
 /// How many distinct fill levels the hold indicator has. Twenty steps across
@@ -225,6 +233,7 @@ const HOLD_STEPS: f64 = 20.0;
 
 impl TextureKey {
     /// The key describing what a texture composed *right now* would contain.
+    #[allow(clippy::too_many_arguments)]
     fn current(
         size: Size<i32, Physical>,
         realm: Option<&RealmId>,
@@ -233,6 +242,7 @@ impl TextureKey {
         hold: Option<f64>,
         agent_cursor: Option<(f64, f64)>,
         attention: bool,
+        status: &crate::status::StatusStrip,
     ) -> Self {
         Self {
             size,
@@ -242,6 +252,7 @@ impl TextureKey {
             hold_bucket: hold.map(|p| (p.clamp(0.0, 1.0) * HOLD_STEPS) as u8),
             agent_cursor: agent_cursor.and_then(|(x, y)| crate::cursor::hotspot(x, y)),
             attention,
+            status_generation: status.generation(),
         }
     }
 }
@@ -299,17 +310,19 @@ struct SceneTexture {
 /// ([`crate::cursor`]), and the hold indicator last of all — so nothing an
 /// agent positions can cover the strip the human reads the session colour
 /// from, and nothing at all can hide a hold in progress.
+#[allow(clippy::too_many_arguments)]
 fn window_pixels(
     scene: &Scene,
     consent: &mut ConsentSurface,
     lock: &mut crate::lock::LockSurface,
+    status: &mut crate::status::StatusStrip,
     hold: Option<f64>,
     agent_cursor: Option<(f64, f64)>,
     attention: bool,
     size: Size<i32, Physical>,
 ) -> Vec<u8> {
     let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
-    let mut pixels = super::compose_human_visible(scene, consent, lock, w, h, attention);
+    let mut pixels = super::compose_human_visible(scene, consent, lock, status, w, h, attention);
     if let Some((x, y)) = agent_cursor {
         // Deliberately drawn even over a raised lock screen (WS-E.2.2). It
         // looks wrong for a moment and is the honest choice: a lock does not
@@ -326,6 +339,59 @@ fn window_pixels(
         crate::deadman::composite_hold_indicator(&mut pixels, w, h, progress);
     }
     pixels
+}
+
+/// Upload the status strip's raster as a GPU texture, re-using the cached one
+/// when nothing that would change it has changed (WS-E.2.3, issue #215).
+///
+/// The zero-copy path presents a *client* texture with no CPU composite, so the
+/// strip has to reach it as a texture of its own — forcing the CPU path for a
+/// clock would cost the whole zero-copy win, which at 2560x1600@240 is not a
+/// trade available to make. The key is `(generation, width)`: the snapshot
+/// changes once a minute (`HH:MM`, no seconds), so at steady state this uploads
+/// **one 2560x20 RGBA texture — 200 KiB — per minute**, i.e. ~3.4 KiB/s, plus
+/// one textured quad per presented frame.
+///
+/// The bytes come from [`crate::status::StatusStrip::raster`], the same cache
+/// [`window_pixels`] blits from on the CPU path, so the two paths cannot draw
+/// different strips.
+///
+/// A failed upload is a `None` and a warning, never an error: a frame without
+/// the strip is a cosmetic loss, and unlike the trusted band the strip asserts
+/// nothing about authenticity — so taking the session down, or refusing to
+/// present, would trade a real property for a cosmetic one.
+fn upload_status_texture<'t>(
+    renderer: &mut GlesRenderer,
+    strip: &mut crate::status::StatusStrip,
+    cache: &'t mut Option<(u64, u32, GlesTexture)>,
+    width: u32,
+) -> Option<(&'t GlesTexture, u32)> {
+    let height = strip.height();
+    if height == 0 || width == 0 {
+        // Dropped rather than kept: a session that never turns the strip back
+        // on must not hold a GPU texture for it.
+        *cache = None;
+        return None;
+    }
+    let generation = strip.generation();
+    let fresh = matches!(cache.as_ref(), Some((cached, cached_w, _))
+        if *cached == generation && *cached_w == width);
+    if !fresh {
+        let (bytes, raster_w, raster_h) = strip.raster(width)?;
+        let buffer_size: Size<i32, Buffer> = (raster_w as i32, raster_h as i32).into();
+        match renderer.import_memory(bytes, Fourcc::Abgr8888, buffer_size, false) {
+            Ok(texture) => *cache = Some((generation, width, texture)),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "the status strip could not be uploaded; this frame draws without it"
+                );
+                *cache = None;
+                return None;
+            }
+        }
+    }
+    cache.as_ref().map(|(_, _, texture)| (texture, height))
 }
 
 /// **Whose retained texture this frame presents zero-copy** — the *bound*
@@ -1299,6 +1365,25 @@ pub(crate) struct NestedView {
     /// so a frame missing it is a frame the human has to check by other means
     /// rather than a frame that can lie to them.
     attention: bool,
+    /// The status strip (WS-E.2.3, issue #215): the snapshot, its cached CPU
+    /// raster, and the generation both presentation paths key on.
+    ///
+    /// Read by the CPU path through [`window_pixels`] and — unlike the
+    /// attention marker above — by the **zero-copy path too**, as a texture
+    /// ([`Self::status_texture`]). That is not symmetry for its own sake: this
+    /// backend is the one that can actually reach 2560x1600@240, the strip is
+    /// on every frame rather than transiently, and a status bar that vanished
+    /// whenever the app took the fast path would be a status bar nobody could
+    /// rely on.
+    status: crate::status::StatusStrip,
+    /// The strip's GPU texture and the `(generation, width)` it was uploaded
+    /// for.
+    ///
+    /// Re-uploaded only when that key changes, which is once a minute at
+    /// steady state (`HH:MM`, no seconds) plus once per resize. The bytes come
+    /// from [`crate::status::StatusStrip::raster`] — the *same* cache the CPU
+    /// blit uses — so the two paths cannot draw different strips.
+    status_texture: Option<(u64, u32, GlesTexture)>,
 }
 
 /// Per-run state of the nested backend: its presentation half, the session
@@ -1432,6 +1517,7 @@ pub fn run(
     attention: crate::attention::AttentionChord,
     clipboard: crate::chord::Trigger,
     lock: crate::lock::LockConfig,
+    status: crate::status::StatusConfig,
     seed: RuntimeSeed,
 ) -> (Recorder, Result<(), Box<dyn Error>>) {
     // The seed is consumed the moment the state is built; until then it is
@@ -1446,6 +1532,7 @@ pub fn run(
         attention,
         clipboard,
         lock,
+        status,
         &mut seed,
         &mut recovered,
     );
@@ -1460,6 +1547,7 @@ fn run_inner(
     attention: crate::attention::AttentionChord,
     clipboard: crate::chord::Trigger,
     lock: crate::lock::LockConfig,
+    status: crate::status::StatusConfig,
     seed: &mut Option<RuntimeSeed>,
     recovered: &mut Option<Recorder>,
 ) -> Result<(), Box<dyn Error>> {
@@ -1696,6 +1784,8 @@ fn run_inner(
             // establishes it (`InputRouter::agent_pointer`).
             agent_cursor: None,
             attention: false,
+            status: crate::status::StatusStrip::new(status),
+            status_texture: None,
         },
         runtime: Runtime::new(
             seed.take().expect("the seed is consumed exactly once"),
@@ -1726,6 +1816,16 @@ fn run_inner(
     if let Err(err) = session::install(&loop_handle, &mut state.runtime) {
         *recovered = Some(state.runtime.into_recorder());
         return Err(err);
+    }
+
+    // The status strip's tick (WS-E.2.3, issue #215), armed only for a session
+    // that asked for one: the strip's clock has to move on a session where
+    // nothing else is happening, and the loop otherwise has no reason to wake.
+    if status.enabled {
+        if let Err(err) = session::arm_status_tick(&loop_handle) {
+            *recovered = Some(state.runtime.into_recorder());
+            return Err(err);
+        }
     }
 
     // The realm, only now: `install` has put the listener and the sweeps on
@@ -2326,6 +2426,17 @@ impl NestedState {
                 // being applied by this caller, so the zero-copy path cannot
                 // quietly present without it (`dmabuf::human_visible_frame`).
                 let agent_cursor = self.view.agent_cursor;
+                // The strip's texture, uploaded (or re-used) BEFORE `bind`
+                // takes the backend: `renderer()` and `bind()` both want
+                // `self.view.backend`, and the returned borrow is of
+                // `status_texture` alone, so the two never overlap.
+                let status_width = size.w.max(0) as u32;
+                let status = upload_status_texture(
+                    self.view.backend.renderer(),
+                    &mut self.view.status,
+                    &mut self.view.status_texture,
+                    status_width,
+                );
                 let (renderer, mut framebuffer) = self.view.backend.bind()?;
                 // Resolved a second time rather than held across `bind`: the
                 // selection is one map lookup, and re-asking the same function
@@ -2344,6 +2455,7 @@ impl NestedState {
                     content,
                     indicator,
                     agent_cursor,
+                    status,
                 )?;
             }
             self.view.backend.submit(None)?;
@@ -2381,6 +2493,7 @@ impl NestedState {
             hold,
             agent_cursor,
             self.view.attention,
+            &self.view.status,
         );
         // The scene's own pending damage (P1.3.9, issue #117), drained here
         // at most once per redraw whenever the scene changed — regardless of
@@ -2402,6 +2515,7 @@ impl NestedState {
                 self.view.scenes.bound(),
                 &mut self.view.consent,
                 &mut self.view.lock,
+                &mut self.view.status,
                 hold,
                 agent_cursor,
                 self.view.attention,
@@ -2834,6 +2948,15 @@ impl session::Presenter for NestedView {
         true
     }
 
+    /// The status strip (WS-E.2.3). Sampled against **the realm the output is
+    /// bound to**, not the router's: the strip names the realm in the picture
+    /// the human is looking at, and naming a hidden one would be a caption for
+    /// a different image. Answers `false` and touches nothing when `--status`
+    /// is off.
+    fn refresh_status(&mut self, now: std::time::SystemTime, mono: Instant) -> bool {
+        self.status.refresh(now, mono, self.scenes.focused())
+    }
+
     /// The scene, `None` for the retained half, and the dmabuf importer
     /// bound to this backend's live `GlesRenderer` (P1.3.5, issue #117).
     ///
@@ -3002,6 +3125,12 @@ mod tests {
     /// A fresh one per call rather than a shared fixture: [`LockSurface`]
     /// carries a generation counter and a raster cache, and a shared instance
     /// would let one test's raise change what the next test measures.
+    /// A status strip that is off: `--status` is opt-in, so this is what every
+    /// composite in this suite runs with unless it is testing the strip.
+    fn no_status() -> crate::status::StatusStrip {
+        crate::status::StatusStrip::new(crate::status::StatusConfig::off())
+    }
+
     fn no_lock() -> crate::lock::LockSurface {
         crate::lock::LockSurface::new(crate::consent::TrustedIndicator::for_test())
     }
@@ -3073,6 +3202,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             None,
             None,
             false,
@@ -3112,6 +3242,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             None,
             None,
             false,
@@ -3129,6 +3260,7 @@ mod tests {
                 &scene,
                 &mut expected,
                 &mut no_lock(),
+                &mut no_status(),
                 W as u32,
                 H as u32,
                 false
@@ -3204,6 +3336,7 @@ mod tests {
                     &scene,
                     &mut consent,
                     &mut no_lock(),
+                    &mut no_status(),
                     hold,
                     None,
                     false,
@@ -3219,6 +3352,7 @@ mod tests {
                 &scene,
                 &mut consent,
                 &mut no_lock(),
+                &mut no_status(),
                 None,
                 None,
                 false,
@@ -3238,6 +3372,7 @@ mod tests {
                     &scene,
                     &mut idle,
                     &mut no_lock(),
+                    &mut no_status(),
                     None,
                     Some(aim),
                     false,
@@ -3254,7 +3389,7 @@ mod tests {
         // against `trust_band_rect(size)` — asserting a function's output
         // equals that same function's output is vacuous, and this test used
         // to pass with the band collapsed to zero size.
-        let draws = crate::dmabuf::human_visible_frame(size, (300, 200), indicator, None);
+        let draws = crate::dmabuf::human_visible_frame(size, (300, 200), indicator, None, 0);
         let last = crate::dmabuf::HUMAN_VISIBLE_DRAWS - 1;
         let crate::dmabuf::Draw::TrustBand(band, band_rgba) = draws[last] else {
             panic!(
@@ -3326,6 +3461,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             None,
             None,
             false,
@@ -3335,6 +3471,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             None,
             Some(at),
             false,
@@ -3354,7 +3491,7 @@ mod tests {
         // same order, in the same colours — derived from one geometry function
         // (`crate::cursor::agent_cursor_rects`), which is why this can be an
         // equality rather than a family of hand-written expectations.
-        let draws = crate::dmabuf::human_visible_frame(size, (400, 300), indicator, Some(at));
+        let draws = crate::dmabuf::human_visible_frame(size, (400, 300), indicator, Some(at), 0);
         let gpu: Vec<_> = draws
             .iter()
             .filter_map(|draw| match draw {
@@ -3376,7 +3513,7 @@ mod tests {
         // ...and a frame with no cursor really has none, so the equality above
         // is not passing on an unconditional draw.
         assert!(
-            crate::dmabuf::human_visible_frame(size, (400, 300), indicator, None)
+            crate::dmabuf::human_visible_frame(size, (400, 300), indicator, None, 0)
                 .iter()
                 .all(|draw| !matches!(draw, crate::dmabuf::Draw::AgentCursor(..))),
             "the zero-copy path drew a cursor for a frame that has none"
@@ -3427,6 +3564,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             W as u32,
             H as u32,
             false,
@@ -3452,6 +3590,7 @@ mod tests {
             &scene,
             &mut idle,
             &mut no_lock(),
+            &mut no_status(),
             Some(0.5),
             None,
             false,
@@ -3469,6 +3608,7 @@ mod tests {
             &scene,
             &mut idle,
             &mut no_lock(),
+            &mut no_status(),
             None,
             Some((400.0, 300.0)),
             false,
@@ -3550,6 +3690,7 @@ mod tests {
             scenes.bound(),
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             None,
             None,
             false,
@@ -3561,6 +3702,7 @@ mod tests {
                 scenes.scene(&a).unwrap(),
                 &mut ConsentSurface::new(TrustedIndicator::for_test()),
                 &mut no_lock(),
+                &mut no_status(),
                 W as u32,
                 H as u32,
                 false
@@ -3575,6 +3717,7 @@ mod tests {
             None,
             None,
             false,
+            &no_status(),
         );
 
         // Bound to B: different pixels, and a different key even though every
@@ -3584,6 +3727,7 @@ mod tests {
             scenes.bound(),
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             None,
             None,
             false,
@@ -3601,6 +3745,7 @@ mod tests {
             None,
             None,
             false,
+            &no_status(),
         );
         assert_eq!(
             key_a.scene_generation, key_b.scene_generation,
@@ -3732,46 +3877,126 @@ mod tests {
         let mut scene = Scene::new();
         let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
 
-        let base = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
+        let base = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            None,
+            None,
+            false,
+            &no_status(),
+        );
         assert_eq!(
             base,
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false),
+            TextureKey::current(
+                size,
+                Some(&realm),
+                &scene,
+                &consent,
+                None,
+                None,
+                false,
+                &no_status()
+            ),
             "an unchanged output must not force a re-upload"
         );
 
         // A prompt going up, and coming back down, both re-upload.
         consent.show_for_test(prompt_fixture());
-        let shown = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
+        let shown = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            None,
+            None,
+            false,
+            &no_status(),
+        );
         assert_ne!(base, shown, "a prompt appearing must re-upload");
         consent.dismiss_for_test();
-        let dismissed =
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
+        let dismissed = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            None,
+            None,
+            false,
+            &no_status(),
+        );
         assert_ne!(shown, dismissed, "a prompt going away must re-upload");
 
         // The queue advancing to a different petition re-uploads too, so the
         // window cannot keep showing a decided petition's card.
         consent.show_for_test(prompt_fixture());
-        let first = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
+        let first = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            None,
+            None,
+            false,
+            &no_status(),
+        );
         let mut next = prompt_fixture();
         next.principal =
             crate::identity::PrincipalIdentity::parse("vitrin://local/agent/other").unwrap();
         consent.show_for_test(next);
         assert_ne!(
             first,
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false),
+            TextureKey::current(
+                size,
+                Some(&realm),
+                &scene,
+                &consent,
+                None,
+                None,
+                false,
+                &no_status()
+            ),
             "a different petition must re-upload"
         );
 
         // And the two pre-existing inputs still matter.
-        let held = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
+        let held = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            None,
+            None,
+            false,
+            &no_status(),
+        );
         scene.commit(SurfaceContent::from_rgba(client_pixels(64, 48), 64, 48).expect("content"));
         assert_ne!(
             held,
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false),
+            TextureKey::current(
+                size,
+                Some(&realm),
+                &scene,
+                &consent,
+                None,
+                None,
+                false,
+                &no_status()
+            ),
             "a scene commit must re-upload"
         );
         assert_ne!(
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false),
+            TextureKey::current(
+                size,
+                Some(&realm),
+                &scene,
+                &consent,
+                None,
+                None,
+                false,
+                &no_status()
+            ),
             TextureKey::current(
                 size_of(640, 480),
                 Some(&realm),
@@ -3779,7 +4004,8 @@ mod tests {
                 &consent,
                 None,
                 None,
-                false
+                false,
+                &no_status()
             ),
             "a resize must re-upload"
         );
@@ -3788,8 +4014,16 @@ mod tests {
         // sprite left out of the key would move only when something else
         // happened to change, which for an agent hovering over a static app
         // is never — the operator watches a frozen crosshair.
-        let no_cursor =
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
+        let no_cursor = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            None,
+            None,
+            false,
+            &no_status(),
+        );
         let at_100 = TextureKey::current(
             size,
             Some(&realm),
@@ -3798,6 +4032,7 @@ mod tests {
             None,
             Some((100.0, 100.0)),
             false,
+            &no_status(),
         );
         assert_ne!(
             no_cursor, at_100,
@@ -3812,7 +4047,8 @@ mod tests {
                 &consent,
                 None,
                 Some((140.0, 100.0)),
-                false
+                false,
+                &no_status()
             ),
             "an agent cursor MOVING must re-upload"
         );
@@ -3825,7 +4061,8 @@ mod tests {
                 &consent,
                 None,
                 Some((100.4, 99.8)),
-                false
+                false,
+                &no_status()
             ),
             "a sub-pixel move draws the same sprite and must not re-upload"
         );
@@ -3838,7 +4075,8 @@ mod tests {
                 &consent,
                 None,
                 Some((f64::NAN, 0.0)),
-                false
+                false,
+                &no_status()
             ),
             "a position that is not a number draws no sprite, so it is no transition"
         );
@@ -3855,8 +4093,26 @@ mod tests {
         // lapses matters as much as drawing it: a marker that stayed up would
         // tell the human a defence is lifted when it is not, which is worse
         // than never drawing one.
-        let closed = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false);
-        let open = TextureKey::current(size, Some(&realm), &scene, &consent, None, None, true);
+        let closed = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            None,
+            None,
+            false,
+            &no_status(),
+        );
+        let open = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            None,
+            None,
+            true,
+            &no_status(),
+        );
         assert_ne!(
             closed, open,
             "the attention window OPENING must re-upload: the marker is drawn by \
@@ -3895,6 +4151,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             None,
             None,
             false,
@@ -3906,6 +4163,7 @@ mod tests {
                 &scene,
                 &mut consent,
                 &mut no_lock(),
+                &mut no_status(),
                 W as u32,
                 H as u32,
                 false
@@ -3917,6 +4175,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             Some(0.5),
             None,
             false,
@@ -3937,6 +4196,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             None,
             None,
             false,
@@ -3946,6 +4206,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &mut no_status(),
             Some(0.9),
             None,
             false,
@@ -3964,6 +4225,7 @@ mod tests {
                 Some(f64::from(step) / 10.0),
                 None,
                 false,
+                &no_status(),
             ));
         }
         keys.dedup();
@@ -3973,8 +4235,26 @@ mod tests {
             keys.len()
         );
         assert_ne!(
-            TextureKey::current(size, Some(&realm), &scene, &consent, Some(1.0), None, false),
-            TextureKey::current(size, Some(&realm), &scene, &consent, None, None, false),
+            TextureKey::current(
+                size,
+                Some(&realm),
+                &scene,
+                &consent,
+                Some(1.0),
+                None,
+                false,
+                &no_status()
+            ),
+            TextureKey::current(
+                size,
+                Some(&realm),
+                &scene,
+                &consent,
+                None,
+                None,
+                false,
+                &no_status()
+            ),
             "the indicator disappearing must re-upload too"
         );
     }

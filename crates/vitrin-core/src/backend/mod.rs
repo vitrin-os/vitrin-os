@@ -90,6 +90,7 @@ pub mod winit;
 use crate::consent::ConsentSurface;
 use crate::lock::LockSurface;
 use crate::scene::Scene;
+use crate::status::StatusStrip;
 
 /// Apply the consent overlay to an **already-composed** realm view, yielding
 /// human-visible output.
@@ -125,15 +126,39 @@ use crate::scene::Scene;
 /// through this function rather than a backend's own composite is what makes
 /// "the marker can never reach a capture" the same structural fact the consent
 /// card's exclusion is.
+///
+/// `status` is the session's status strip (WS-E.2.3, [`crate::status`]), on the
+/// same terms and for the same reason: a clock is a timing oracle and a battery
+/// level is a session fact an agent does not otherwise have, so both are drawn
+/// on *this* side of the fork and can no more reach `frame_ready` than the
+/// consent card can. With `--status` off it is a single branch and this
+/// function's output is byte-identical to what it was before the strip existed.
 pub(crate) fn human_visible_from_view(
     mut view: Vec<u8>,
     consent: &mut ConsentSurface,
     lock: &mut LockSurface,
+    status: &mut StatusStrip,
     width: u32,
     height: u32,
     attention: bool,
 ) -> Vec<u8> {
-    // Prompt (scrim + frame + card) first; then the trusted band on top, so
+    // **The status strip goes first** (WS-E.2.3, issue #215), and its first
+    // arrangement had it last — over the consent card — which was wrong in the
+    // one way that matters. The card is centred and the strip occupies rows
+    // `[8, 8+H)`; on any output short enough for the card to reach those rows,
+    // a strip drawn afterwards overdraws the card's **trusted ring**, which is
+    // the human's only anti-forgery check on a prompt. That reconciliation
+    // enumerated the lock cover, the attention marker, the band and the
+    // dead-man indicator, and never mentioned the card at all.
+    //
+    // So the order is: strip, then everything whose integrity the human is
+    // asked to trust. The cost of putting it here rather than after the lock is
+    // real and is accepted: an opaque lock cover now hides the clock, so
+    // "the strip is always there" gains the exception "except behind a lock".
+    // A visible clock on a lock screen is a convenience; an unforgeable ring
+    // around a consent card is the thing this project is for.
+    status.composite_over(&mut view, width, height);
+    // Prompt (scrim + frame + card) next; then the trusted band on top, so
     // client content — and even the scrim — never sits over the one strip the
     // human reads the session colour from.
     consent.composite_over(&mut view, width, height);
@@ -177,6 +202,7 @@ pub(crate) fn compose_human_visible(
     scene: &Scene,
     consent: &mut ConsentSurface,
     lock: &mut LockSurface,
+    status: &mut StatusStrip,
     width: u32,
     height: u32,
     attention: bool,
@@ -185,6 +211,7 @@ pub(crate) fn compose_human_visible(
         scene.compose(width, height),
         consent,
         lock,
+        status,
         width,
         height,
         attention,

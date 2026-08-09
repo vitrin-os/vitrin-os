@@ -5827,6 +5827,7 @@ mod tests {
             vec![(
                 RealmId::new("browser"),
                 SeatInput::emulated(crate::input::SeatInputKind::Key {
+                    source: crate::input::KeySource::Keysym,
                     keysym: SHIFT_L,
                     state: vitrin_protocol::generated::vitrin_shim_seat::KeyState::Pressed,
                 }),
@@ -5889,6 +5890,7 @@ mod tests {
             vec![(
                 RealmId::new("browser"),
                 SeatInput::emulated(crate::input::SeatInputKind::Key {
+                    source: crate::input::KeySource::Keysym,
                     keysym: SHIFT_L,
                     state: vitrin_protocol::generated::vitrin_shim_seat::KeyState::Released,
                 }),

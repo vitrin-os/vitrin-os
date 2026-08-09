@@ -1635,14 +1635,23 @@
 
     <event name="key">
       <description summary="key press or release (keysym)">
-        A key event for the human path: physical typing in nested mode
-        flows core to shim to app, and humans press chords, arrows, and
-        function keys that a text string cannot carry. Keys travel as
-        xkbcommon keysyms, not keycodes: layout-independent, requiring no
-        keymap-relay message and no keymap interpretation inside the core
-        (nested host input already arrives interpreted), and the shim maps
-        keysyms into the same dynamically generated keymap machinery that
-        text delivery already requires.
+        A key event for the human path: physical typing flows core to shim
+        to app, and humans press chords, arrows, and function keys that a
+        text string cannot carry. Keys travel as xkbcommon keysyms, not
+        keycodes: layout-independent, requiring no keymap-relay message,
+        and the shim maps keysyms into the same dynamically generated
+        keymap machinery that text delivery already requires.
+
+        Where the keysym is resolved is a property of the core's backend
+        and not of this wire. A nested core receives keys the host
+        compositor has already interpreted and interprets nothing itself.
+        A core driving physical input devices directly receives evdev
+        scancodes and nothing else, so it resolves them against a keymap
+        of its own before sending this event. Both produce a
+        modifier-resolved keysym, both leave the wire and this interface
+        unchanged, and a shim cannot tell them apart - which is the point,
+        and is why the earlier claim that no keymap interpretation happens
+        inside the core was corrected rather than made normative.
 
         Normative modifier-suppression rule: keysyms arrive already
         modifier-resolved. The shim MUST bind each non-modifier keysym at

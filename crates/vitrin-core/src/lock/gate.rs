@@ -129,7 +129,14 @@ const KEYSYM_ESCAPE: u32 = 0xff1b;
 
 /// The `0x0100_0000 | codepoint` "Unicode keysym" range
 /// ([`crate::input::host_keysym`]'s convention).
-const UNICODE_KEYSYM_BASE: u32 = 0x0100_0000;
+///
+/// Re-exported from `crate::input` rather than spelled again here since
+/// WS-E.3.1 (D-028(1)): three places depend on this convention now —
+/// `host_keysym` encodes nested input into it, `crate::input::keymap`
+/// normalises a real keymap's legacy keysyms into it, and [`printable`]
+/// below decodes the passphrase out of it. A private copy is how the third
+/// one would quietly stop agreeing with the first two.
+use crate::input::UNICODE_KEYSYM_BASE;
 
 /// What the lock chord means. A unit-like payload rather than `()` so the
 /// matcher's type says what a match is, and so a second lock-related chord
@@ -394,6 +401,7 @@ impl LockScreen {
             SeatInputKind::Key {
                 keysym,
                 state: KeyState::Pressed,
+                ..
             } => {
                 self.type_key(*keysym);
                 Gate::Consume
@@ -554,7 +562,7 @@ pub(crate) fn lock_gate<H: PreemptionHook>(
 mod tests {
     use super::*;
     use crate::chord::Trigger;
-    use crate::input::{InputRouter, NoopHook, SeatInputKind};
+    use crate::input::{InputRouter, KeySource, NoopHook, SeatInputKind};
 
     fn chord() -> ModChord {
         ModChord::parse("ctrl+alt+delete").expect("the default lock chord parses")
@@ -571,7 +579,11 @@ mod tests {
     /// the shared way to get one without a physical-origin constructor leaking
     /// out of intake.
     fn key(keysym: u32, state: KeyState) -> SeatInput {
-        crate::input::tests::physical_for_test(SeatInputKind::Key { keysym, state })
+        crate::input::tests::physical_for_test(SeatInputKind::Key {
+            source: KeySource::Keysym,
+            keysym,
+            state,
+        })
     }
 
     fn press(keysym: u32) -> SeatInput {
@@ -612,6 +624,7 @@ mod tests {
         let t0 = Instant::now();
         let mut s = screen(Some(Duration::from_secs(60)), t0);
         let emulated = SeatInput::emulated(SeatInputKind::Key {
+            source: KeySource::Keysym,
             keysym: 0x61,
             state: KeyState::Pressed,
         });
@@ -682,6 +695,7 @@ mod tests {
         let mut s = screen(None, t0);
         for keysym in [0xffe3, 0xffe9, 0xffff] {
             let emulated = SeatInput::emulated(SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym,
                 state: KeyState::Pressed,
             });
@@ -870,6 +884,7 @@ mod tests {
         let _ = s.take_journal();
         for keysym in [0x61u32, KEYSYM_RETURN] {
             let emulated = SeatInput::emulated(SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym,
                 state: KeyState::Pressed,
             });
@@ -1080,6 +1095,7 @@ mod tests {
         // half below a real difference rather than a vacuous one.
         let insert = |state| {
             crate::input::tests::physical_for_test(SeatInputKind::Key {
+                source: KeySource::Keysym,
                 keysym: 0xff63,
                 state,
             })

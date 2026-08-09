@@ -671,7 +671,7 @@ mod live {
 
 #[cfg(test)]
 mod tests {
-    use super::super::SeatInputKind;
+    use super::super::{KeySource, SeatInputKind};
     use super::*;
     use vitrin_protocol::generated::vitrin_actuator_pointer::{Axis, ButtonState};
     use vitrin_protocol::generated::vitrin_shim_seat::{KeyState, Origin};
@@ -836,6 +836,7 @@ mod tests {
         assert_eq!(
             key[0].kind(),
             &SeatInputKind::Key {
+                source: KeySource::Device(1),
                 keysym: 0xff1b,
                 state: KeyState::Pressed
             }
@@ -885,6 +886,7 @@ mod tests {
         assert_eq!(
             tap[0].kind(),
             &SeatInputKind::Key {
+                source: KeySource::Device(125),
                 keysym: 0xffeb,
                 state: KeyState::Pressed
             }
@@ -928,6 +930,7 @@ mod tests {
         assert_eq!(
             whole[1].kind(),
             &SeatInputKind::Key {
+                source: KeySource::Device(99),
                 keysym: 0xff61,
                 state: KeyState::Pressed
             },
@@ -941,6 +944,7 @@ mod tests {
         assert_eq!(
             whole[1].kind(),
             &SeatInputKind::Key {
+                source: KeySource::Device(63),
                 keysym: 0xffc2,
                 state: KeyState::Pressed
             },
@@ -955,10 +959,12 @@ mod tests {
 
     #[test]
     fn intake_produces_nothing_where_the_real_intake_produces_nothing() {
-        // A layout-DEPENDENT key: the core has no keymap and refuses to
-        // invent one, so this is dropped at intake exactly as it would be from
-        // a winit event with no resolved `logical_key`. `ack 0` is the honest
-        // answer and the channel does not pretend otherwise.
+        // A layout-DEPENDENT key: this channel is the HEADLESS backend's,
+        // which has no host to have interpreted one and no keymap of its own
+        // (`session-keymap` is a bare-metal feature), so this is dropped at
+        // intake exactly as it would be from a winit event with no resolved
+        // `logical_key`. `ack 0` is the honest answer and the channel does
+        // not pretend otherwise.
         const KEY_A: u32 = 30;
         assert!(super::super::invariant_keysym(KEY_A).is_none());
         assert!(intake(

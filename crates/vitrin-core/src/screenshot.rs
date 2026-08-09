@@ -748,7 +748,11 @@ mod tests {
             (PRINT, KeyState::Released),
             (CTRL_L, KeyState::Released),
         ] {
-            let input = SeatInput::emulated(crate::input::SeatInputKind::Key { keysym, state });
+            let input = SeatInput::emulated(crate::input::SeatInputKind::Key {
+                source: crate::input::KeySource::Keysym,
+                keysym,
+                state,
+            });
             hook.observe(&input);
             assert_eq!(
                 hook.gate(&input),
@@ -771,6 +775,7 @@ mod tests {
         }
         for state in [KeyState::Pressed, KeyState::Released] {
             let input = SeatInput::emulated(crate::input::SeatInputKind::Key {
+                source: crate::input::KeySource::Keysym,
                 keysym: PRINT,
                 state,
             });

@@ -113,6 +113,56 @@ libc = "0.2"
 # production dmabuf import path (`crate::dmabuf`) needs no allocator — it
 # receives fds — and builds in every configuration.
 gbm = { version = "0.18", default-features = false, optional = true }
+
+# The xkb keymap state a bare-metal session needs to turn an evdev scancode
+# into a keysym (WS-E.3.1, issue #217, decision D-028). Optional, and the
+# `session-keymap` feature below is the only thing that turns it on: a nested
+# or headless session gets its keysyms from winit or has no keyboard at all,
+# so neither may pay for this.
+#
+# **"Zero new crates" is a true statement about `Cargo.lock` and a misleading
+# one about the TCB, so the cost is stated in the units that matter.**
+# `xkbcommon 0.8.0` is already in the lock file (smithay -> winit ->
+# smithay-client-toolkit), so enabling this resolves no new package. What it
+# does do, MEASURED on this tree at the commit that added it:
+#
+# * a plain `cargo build --release` links **no** libxkbcommon at all --
+#   `readelf -d target/release/vitrind` has zero `NEEDED` entries matching
+#   `xkb` and `nm -D --undefined-only` finds zero `xkb_*` symbols. The crate
+#   is in the graph and dropped by `--as-needed`, because nothing in a
+#   default build calls it. That is the byte-for-byte baseline this feature
+#   must not move, and CI's default `rust` job is what holds it.
+# * turning the feature on adds `libxkbcommon.so.0` -- **383 144 bytes** of
+#   C, on this machine's 1.13.2 -- to the runtime image of the entire TCB,
+#   reached through **87** `extern "C"` declarations in the crate's
+#   `src/xkb/ffi.rs` and **91** lines mentioning `unsafe` across its
+#   `xkb/{mod,compose,ffi}.rs`. Stated as a future cost rather than a
+#   present one, because at THIS commit it is not yet paid: nothing calls
+#   `CoreKeymap` outside tests, so even a `--features session-keymap`
+#   release build still shows zero `xkb` in `readelf -d` -- LLVM drops the
+#   unreachable code and `--as-needed` drops the library. Measured with a
+#   throwaway caller wired into `main` (built, measured, reverted, not
+#   committed): `NEEDED libxkbcommon.so.0` appears, `nm -D
+#   --undefined-only` reports 6 `xkb_*` symbols
+#   (`xkb_context_new/_unref`, `xkb_keymap_new_from_string/_unref`,
+#   `xkb_state_new/_unref`), and the binary grows 9 245 480 -> 9 267 160
+#   bytes. #218 is what makes that real.
+# * and it runs a **parser** inside `vitrind`, over a ~73 KB keymap file
+#   (`xkbcli compile-keymap --layout tr` emits 73 028 bytes). That is
+#   strictly more than the constant table it replaces, and it is the argument
+#   `fontdue` makes one class weaker: fontdue's bytes are a compile-time
+#   constant vendored in this repo, and these are a file an operator names.
+#
+# Two structural bounds keep that parser off every search path a confined app
+# could write to, and they are the whole reason D-028 chose a file over an
+# RMLVO name set. Both are in `crate::input::keymap` and neither is a
+# convention: the context is built with `CONTEXT_NO_DEFAULT_INCLUDES |
+# CONTEXT_NO_ENVIRONMENT_NAMES`, so libxkbcommon has no include path and no
+# `XKB_*` environment to honour, and the keymap is compiled with
+# `Keymap::new_from_string` over bytes the core itself read from the one path
+# the operator named -- `new_from_names` is never called, and a unit test that
+# runs with this feature OFF greps the crate's sources to keep it that way.
+xkbcommon = { version = "0.8", optional = true }
 # The observation-digest hash of the flight recorder (P1.4.5, backward
 # requirement B1: every capture entry identifies what was observed). The one
 # hash dependency the TCB takes, and deliberately not hand-rolled -- rolling
@@ -491,6 +541,49 @@ consent-injector = []
 # chord revokes across realms) are proved in-crate against the real
 # `ConsentGate`/`DeadManHook` instead, where a real stack exists to drive.
 physical-input-injector = []
+# Compile the core's xkb keymap state (WS-E.3.1, issue #217, decision D-028):
+# `crate::input::keymap::CoreKeymap` -- a `Context`, a `Keymap` compiled once
+# from a file the operator names, and a `State` fed `update_key` per event --
+# plus the `crate::input::keymap_key` intake arm that resolves an evdev
+# scancode through it.
+#
+# # Why it is a feature and not just code
+#
+# A bare-metal session is the ONLY configuration that needs it. Nested mode
+# gets an already-interpreted `logical_key` from winit (issue #118) and
+# headless has no keyboard, so both would pay `libxkbcommon.so.0` -- 383 144
+# bytes of C reached through 87 `extern "C"` declarations, measured, see the
+# `xkbcommon` dependency block above -- for a code path they never enter.
+# The gate is therefore a TCB-size control, and it is checkable rather than
+# claimed: with the feature off, `readelf -d target/release/vitrind` shows no
+# `NEEDED` entry matching `xkb` and `nm -D --undefined-only` no `xkb_*`
+# symbol. Same posture as `gpu-tests`, `dead-man-injector`,
+# `consent-injector` and `physical-input-injector` -- a build that does not
+# need a capability does not carry it -- with one difference stated plainly:
+# those four are TEST instruments never enabled in a deployment build, and
+# this one is the opposite. It is a *deployment* feature that WS-E.3.2's DRM
+# backend (issue #218) will require, and a shipped bare-metal `vitrind` is a
+# build with it ON. It is off by default because nested and headless are the
+# only backends that exist today.
+#
+# # What is NOT here, deliberately
+#
+# No startup wiring, no `--keymap` flag, no libinput arm: there is no DRM
+# backend yet, and #217's own text is "Stage 3's first task is a decision, not
+# code". What this feature compiles is the decided resolution path and its
+# tests; #218 adds the caller. `CoreKeymap` therefore carries an
+# `#[allow(dead_code)]` with that reason attached rather than a fake consumer.
+#
+# # What CI does with it
+#
+# The `rust` job runs a dedicated `session-keymap` slice (clippy + tests), in
+# the same shape as the `gpu-tests` slice beside it, because two of #217's
+# four required unit tests -- shift-resolves-to-A, and resolve-before-update
+# ordering -- cannot exist without a keymap. The other two (pairing survives
+# a press/release sym change; the dead-man chord is still intakeable) are
+# router and table properties and run with the feature OFF, which is where
+# they belong: they are what the DEFAULT build must keep true.
+session-keymap = ["dep:xkbcommon"]
 
 [dev-dependencies]
 # The permanent mock-shim fixture (issue #21): a compliant peer speaking the

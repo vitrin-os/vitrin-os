@@ -379,7 +379,18 @@ jobs:
         # no device, open no seat and present nothing. Running them here is
         # the only place they run at all, since the feature is off in every
         # other job.
-        run: cargo test -p vitrin-core --features drm-backend --bin vitrind
+        #
+        # FILTERED, and the filter is the point. An unfiltered run of this
+        # binary also drags in `spawn::`, `session::` and
+        # `shim::c_shim_conforms_to_the_real_core`, which fork real processes,
+        # need a writable XDG_RUNTIME_DIR and need the built C shim -- none of
+        # which this job sets up, because none of it has anything to do with a
+        # display controller. That is the `rust` and `conformance` jobs' work
+        # and they already do it. Unfiltered, 89 of them fail here for reasons
+        # that would read as "the DRM backend is broken".
+        run: |
+          cargo test -p vitrin-core --features drm-backend --bin vitrind \
+            -- backend::drm:: the_drm_refusal_table
 
   shim:
     name: shim (C header, golden frames, Meson; no Rust)

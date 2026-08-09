@@ -208,6 +208,14 @@ mod lock;
 /// with the consent surface's private tools. It confers nothing and holds no
 /// session state; the authority claims stay in `consent` and `lock`.
 mod paint;
+/// **A notice the human can read on the panel they are trying to leave**
+/// (WS-E.3.5): a bounded, expiring, human-visible-only band the core raises
+/// when something it cannot fix has happened to the session itself. Its only
+/// producer today is the bare-metal VT escape ([`vt`]) — a `change_vt` that is
+/// refused or never acknowledged leaves a human staring at a key that did
+/// nothing, which is exactly the defect first light found, and a `stderr` line
+/// is worth nothing to somebody who cannot leave the screen to read it.
+mod notice;
 /// The grant table v0 (P1.4.2): the in-memory PRD Doc 2 §5.2 grant store of
 /// the capability kernel — rows keyed by `identity`'s verifier-canonical
 /// principal, answering the enforcement chokepoint's grant-scoped use query
@@ -350,6 +358,13 @@ mod test_pattern;
 /// TOML crate out of the TCB; having a single lexer is what keeps that
 /// choice from multiplying parsers.
 mod toml_subset;
+/// **The VT escape** (WS-E.3.5, D-031): `Ctrl-Alt-F1`..`Ctrl-Alt-F12`, matched
+/// on physical input only, consumed in every realm, and turned into the one
+/// `Session::change_vt` call this workspace contains. Bare metal only, because
+/// only a process holding DRM master can implement the chord the kernel stops
+/// handling once it does.
+#[cfg(feature = "drm-backend")]
+mod vt;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1409,6 +1424,77 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             }
         }
     }
+    // **The VT escape reserves `f1`..`f12` from every other core chord, on
+    // bare metal only** (WS-E.3.5, D-031).
+    //
+    // Same rule and same reason as the four refusals above, one list longer:
+    // the dead-man watcher detects in the router's UNCONDITIONAL observe tap,
+    // so a chord sharing a key with `Ctrl-Alt-F<n>` would arm the human's
+    // off-switch every single time they left the VT, and no hook ordering can
+    // prevent it because nothing may blind that tap.
+    //
+    // **Scoped to `--drm`**, on the lock chord's `--headless` precedent: the
+    // VT escape does not exist on the other two backends -- only a process
+    // holding DRM master can implement the chord -- so `--dead-man-chord f5
+    // --headless` must keep working. `the_reservation_does_not_reach_the_other_backends`
+    // is the control that stops this passing as a blanket refusal.
+    //
+    // The cost is published: `deadman::Chord`'s usable vocabulary drops from
+    // 19 keys to 7 on bare metal. Nothing collides on a default command line
+    // -- the shipped defaults are `esc`, `super`, `insert`, `ctrl+print` and
+    // `ctrl+alt+delete`, with no F-key among them.
+    #[cfg(feature = "drm-backend")]
+    if matches!(mode, Some(Mode::Drm)) {
+        let reserved = vt::reserved_triggers();
+        for (keysym, flag, name) in [
+            (
+                dead_man.chord.keysym(),
+                "--dead-man-chord",
+                dead_man.chord.name().to_string(),
+            ),
+            // Unreachable today -- `AttentionChord`'s vocabulary is `super`
+            // and `rsuper` only -- and listed anyway, for the defence-in-depth
+            // reason the dead-man/attention pair above is: a vocabulary that
+            // grows must not silently disarm the escape.
+            (
+                attention.keysym(),
+                "--attention-chord",
+                attention.name().to_string(),
+            ),
+            (
+                clipboard.keysym(),
+                "--clipboard-key",
+                clipboard.name().to_string(),
+            ),
+            (
+                lock_chord.trigger_keysym(),
+                "--lock-chord",
+                lock_chord.spelling(),
+            ),
+            (
+                screenshot_chord.trigger_keysym(),
+                "--screenshot-chord",
+                screenshot_chord.spelling(),
+            ),
+        ] {
+            if let Some(taken) = reserved.iter().find(|t| t.keysym() == keysym) {
+                return Err(format!(
+                    "`{flag}` `{name}` uses `{}`, which `--drm` reserves for the VT escape \
+                     `Ctrl-Alt-{}`: on bare metal this core implements Ctrl-Alt-F1..F12 \
+                     itself, because once it holds the display the kernel stops handling \
+                     them and a session that did not implement them would be one you cannot \
+                     leave. The dead-man watcher detects in the router's UNCONDITIONAL \
+                     observe tap, so a chord sharing that key would arm the human's \
+                     off-switch every time they left the VT, and no hook ordering can \
+                     prevent it. Pick another key, or run this session `--nested` / \
+                     `--headless`, where there is no VT to escape from",
+                    taken.name(),
+                    taken.name().to_uppercase()
+                ));
+            }
+        }
+    }
+
     // **A configured gesture with nowhere to write is a key that silently does
     // nothing**, which is the fail-open configuration trap `Chord::parse`
     // refuses for an undeliverable key and `realm.rs`'s loader refuses for an
@@ -3233,6 +3319,37 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+    log_build_identity();
+}
+
+/// **Say which binary this is, in the first lines of every run** (WS-E.3.5).
+///
+/// Zero risk and it is first on the list for a measured reason. The bare-metal
+/// backend's first run on hardware pinned a core at 99% CPU and produced a
+/// preserved log, and the log could not answer the one question that decides
+/// what the measurement means: **was it a debug build?** The pixel loops on
+/// that session's frame path cost ~6 ms per frame compiled `-O` and ~283 ms
+/// compiled `-O0`, a factor of ~50, and the observed cadence was 383 ms per
+/// frame. Cargo overwrites fingerprint directories in place, so the answer was
+/// not recoverable from the filesystem afterwards either.
+///
+/// A performance report from a binary nobody can identify is not a measurement,
+/// so the binary identifies itself. `debug_assertions` rather than a build
+/// script constant, because it is the flag that actually governs whether the
+/// hot loops were optimised.
+fn log_build_identity() {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        profile,
+        exe = ?std::env::current_exe().ok(),
+        "vitrind starting. A `debug` profile runs this core's CPU composite roughly 50x \
+         slower than `release`; do not read a performance measurement from one"
+    );
 }
 
 #[cfg(test)]
@@ -3513,6 +3630,94 @@ mod tests {
             err.contains("--drm"),
             "the mode list must name every mode: {err}"
         );
+    }
+
+    /// **The VT escape reserves `f1`..`f12` from every other core chord, on
+    /// bare metal only** (WS-E.3.5, D-031).
+    ///
+    /// Five flags, one for each core-owned chord, because the consequence is
+    /// the same for all five and it is not "two keys do two things": the
+    /// dead-man watcher detects in the router's UNCONDITIONAL observe tap, so
+    /// a chord sharing a key with `Ctrl-Alt-F<n>` arms the human's off-switch
+    /// **every single time they leave the VT**, and no hook ordering can stop
+    /// it because nothing may blind that tap.
+    #[cfg(feature = "drm-backend")]
+    #[test]
+    fn the_vt_escape_reserves_the_function_keys_on_bare_metal() {
+        for (args, flag) in [
+            (vec!["--drm", "--dead-man-chord", "f5"], "--dead-man-chord"),
+            (vec!["--drm", "--lock-chord", "ctrl+alt+f5"], "--lock-chord"),
+            (vec!["--drm", "--clipboard-key", "f5"], "--clipboard-key"),
+            (
+                vec![
+                    "--drm",
+                    "--screenshot-chord",
+                    "ctrl+f5",
+                    "--screenshot-dir",
+                    "/tmp/shots",
+                ],
+                "--screenshot-chord",
+            ),
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err(&format!("{args:?} must be refused: f5 is the VT escape's"));
+            assert!(err.contains(flag), "the refusal must name the flag: {err}");
+            assert!(
+                err.contains("Ctrl-Alt-F5"),
+                "the refusal must name the chord the key is taken by: {err}"
+            );
+            assert!(
+                err.contains("observe tap"),
+                "the WHY must be named, not just the collision: {err}"
+            );
+        }
+
+        // Both ends of the range, so an off-by-one in the reservation is not
+        // hidden by the middle.
+        for key in ["f1", "f12"] {
+            assert!(
+                parse_args(["--drm", "--dead-man-chord", key]).is_err(),
+                "{key} must be reserved"
+            );
+        }
+        // ...and a key just outside it is still available, so this is a
+        // reservation rather than a blanket refusal of everything.
+        assert!(parse_args(["--drm", "--dead-man-chord", "insert"]).is_err()); // clipboard's
+        assert!(parse_args(["--drm", "--dead-man-chord", "home"]).is_ok());
+        // The shipped defaults collide with nothing: esc, super, insert,
+        // ctrl+print, ctrl+alt+delete -- no F-key among them.
+        assert!(parse_args(["--drm"]).is_ok());
+        // `--attention-chord` is in the reservation list and is deliberately
+        // NOT tested for a refusal: `AttentionChord`'s vocabulary is `super`
+        // and `rsuper` only, so the collision is unreachable today. It is
+        // listed in the check for the same defence-in-depth reason the
+        // dead-man/attention pair above it is -- a vocabulary that grows
+        // must not silently disarm the escape -- and saying so here is what
+        // keeps a reader from writing a test that can never go red.
+        assert!(parse_args(["--drm", "--attention-chord", "f5"]).is_err());
+    }
+
+    /// **The reservation does not reach the other two backends** — the control
+    /// that stops the test above passing against a blanket refusal.
+    ///
+    /// The `--headless` skip the lock chord's own check already sets, for the
+    /// same reason applied to a different fact: the VT escape does not exist
+    /// on nested or headless, because only a process holding DRM master can
+    /// implement a chord the kernel stops handling once it does. Refusing
+    /// `--dead-man-chord f5` there would be refusing a collision that cannot
+    /// happen.
+    #[test]
+    fn the_vt_reservation_does_not_reach_the_other_backends() {
+        assert!(parse_args(["--nested", "--dead-man-chord", "f5"]).is_ok());
+        assert!(parse_args([
+            "--headless",
+            "--consent=auto-approve",
+            "--dead-man-chord",
+            "f5"
+        ])
+        .is_ok());
+        assert!(parse_args(["--nested", "--lock-chord", "ctrl+alt+f5"]).is_ok());
+        assert!(parse_args(["--nested", "--clipboard-key", "f5"]).is_ok());
     }
 
     /// **A build without the backend cannot even name its flags**, the

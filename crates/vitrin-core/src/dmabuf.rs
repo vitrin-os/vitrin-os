@@ -823,6 +823,33 @@ pub(crate) fn human_visible_frame(
     draws
 }
 
+/// The output transform for any **memory-backed** render target.
+///
+/// Two kinds of target reach [`present_human_visible`] and they take opposite
+/// transforms, so the kinds are named here rather than the values guessed at
+/// each call site. A memory-backed target — an offscreen renderbuffer read
+/// back with `copy_framebuffer`, or the GBM buffer `GbmBufferedSurface` hands
+/// to a CRTC — is addressed from its **first row of storage**, and smithay's
+/// renderer already post-multiplies GL's own y-flip, so `Normal` puts the
+/// logical top row there. The other kind is an EGL **window surface**, whose
+/// default framebuffer origin is bottom-left; that one takes
+/// [`crate::backend::winit::WINDOW_TRANSFORM`].
+///
+/// This constant exists because the bare-metal backend took the *window's*
+/// value for a scanout buffer and presented the human's whole display
+/// vertically mirrored — found by running it on a panel, and by nothing else.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the production readers are `backend::drm`'s SCANOUT_TRANSFORM, which spells \
+                  the literal so a mutation of it is a real one, and the GPU harness. It is \
+                  named here so the two kinds of target are stated once rather than guessed \
+                  at each call site"
+    )
+)]
+pub(crate) const MEMORY_TARGET_TRANSFORM: Transform = Transform::Normal;
+
 /// Present retained zero-copy content into a bound framebuffer at the view
 /// size, as **human-visible** output: [`human_visible_frame`]'s draw list,
 /// executed against `renderer`.
@@ -843,13 +870,18 @@ pub(crate) fn human_visible_frame(
 /// the output of this function to an agent.
 ///
 /// `transform` is the **output** transform of the target being drawn into,
-/// and it is a parameter because the two targets disagree: the winit EGL
-/// window surface has its GL origin at the bottom-left and needs
-/// `backend::winit`'s `WINDOW_TRANSFORM` (`Flipped180`), while an
-/// offscreen renderbuffer read back with `copy_framebuffer` is already
-/// top-down and needs `Normal`. It was hardcoded to `Normal` when this
+/// and it is a parameter because the targets fall into two kinds that
+/// disagree. The winit EGL **window surface** has its GL origin at the
+/// bottom-left and needs `backend::winit`'s `WINDOW_TRANSFORM`
+/// (`Flipped180`); every **memory-backed** target — an offscreen renderbuffer
+/// read back with `copy_framebuffer`, and the GBM buffer the bare-metal
+/// backend hands to a CRTC — is addressed from its first row of storage and
+/// needs [`MEMORY_TARGET_TRANSFORM`]. It was hardcoded to `Normal` when this
 /// function only ever ran against the offscreen harness; presenting into the
-/// window with that constant renders the frame upside down.
+/// window with that constant renders the frame upside down, and passing the
+/// *window's* constant for a scanout buffer renders it upside down the other
+/// way — which is the defect first light found (`backend::drm`'s
+/// `SCANOUT_TRANSFORM`).
 ///
 /// `status` is the status strip's already-uploaded texture and its height in
 /// rows, or `None` for a session with no strip. It is a *texture* rather than a
@@ -995,6 +1027,25 @@ mod tests {
     use rustix::fs::MemfdFlags;
 
     use super::*;
+
+    /// **The two kinds of render target take opposite transforms**, and the
+    /// difference is the whole of the defect first light found.
+    ///
+    /// [`MEMORY_TARGET_TRANSFORM`] is what an offscreen renderbuffer and a
+    /// scanout buffer take; `backend::winit::WINDOW_TRANSFORM` is what an EGL
+    /// window surface takes. A change that made them equal would mean somebody
+    /// had decided the distinction does not exist — which is exactly the
+    /// belief that put the human's whole display upside down.
+    #[test]
+    fn a_memory_target_and_a_window_surface_are_opposite_kinds() {
+        assert_eq!(MEMORY_TARGET_TRANSFORM, Transform::Normal);
+        assert_ne!(
+            MEMORY_TARGET_TRANSFORM,
+            crate::backend::winit::WINDOW_TRANSFORM,
+            "a memory-backed target is addressed from its first row of storage and a window \
+             surface is not; if these two ever agree, one of them is presenting mirrored"
+        );
+    }
 
     #[test]
     fn fdinfo_parser_requires_both_dmabuf_keys() {
@@ -1605,9 +1656,12 @@ mod gpu_tests {
     /// not — it is the same function the nested backend's zero-copy branch
     /// calls, which is why these expectations include the trusted band.
     ///
-    /// `Transform::Normal` because an offscreen renderbuffer read back with
-    /// `copy_framebuffer` is already top-down; the window surface the nested
-    /// backend binds is not, and passes `WINDOW_TRANSFORM` instead.
+    /// [`MEMORY_TARGET_TRANSFORM`] because an offscreen renderbuffer read back
+    /// with `copy_framebuffer` is already top-down; the window surface the
+    /// nested backend binds is not, and passes `WINDOW_TRANSFORM` instead.
+    /// Read from the shared constant rather than spelled `Transform::Normal`
+    /// here, so this harness and the bare-metal scanout path cannot come to
+    /// disagree about which kind of target they are.
     fn composite_and_readback(renderer: &mut GlesRenderer, content: &GpuContent) -> Vec<u8> {
         let size: Size<i32, Physical> = (W as i32, H as i32).into();
         let mut target: GlesRenderbuffer = Offscreen::<GlesRenderbuffer>::create_buffer(
@@ -1625,7 +1679,7 @@ mod gpu_tests {
             renderer,
             &mut fb,
             size,
-            Transform::Normal,
+            MEMORY_TARGET_TRANSFORM,
             content,
             harness_indicator(),
             // No agent cursor: these expectations are about the client's own

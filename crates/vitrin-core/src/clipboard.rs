@@ -528,6 +528,16 @@ impl ClipboardSignal {
     pub fn take_pending(&mut self) -> Vec<ClipboardGesture> {
         std::mem::take(&mut self.pending)
     }
+
+    /// Forget the modifier bits and the consumed set across a seat pause —
+    /// [`ChordMatcher::forget_physical_state`], whose docs carry the reason.
+    ///
+    /// The clipboard's own instance of it: a human holding Shift when they
+    /// switch VT comes back to a matcher that believes Shift is still down, so
+    /// their next bare Insert offers the core's slot to the focused realm.
+    pub fn forget_physical_state(&mut self) {
+        self.matcher.forget_physical_state();
+    }
 }
 
 /// The clipboard chords attached at the router's preemption hook point.

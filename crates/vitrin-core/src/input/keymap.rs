@@ -374,6 +374,26 @@ impl CoreKeymap {
 
         (sym != xkb::Keysym::NoSymbol).then(|| unicode_keysym(sym))
     }
+
+    /// Forget every held modifier, because physical input has ended without
+    /// releases (D-031(4)).
+    ///
+    /// The other half of a latch the chord matchers already handle. On a seat
+    /// pause `ChordMatcher::forget_physical_state` clears *its* modifier bits,
+    /// but xkbcommon keeps its own — and at the instant of a VT switch the
+    /// human is holding Ctrl and Alt **by construction**, since that is the
+    /// gesture. libinput is suspended before either release can arrive, so
+    /// without this the state machine believes Ctrl+Alt are still down when
+    /// the seat comes back, and every subsequent key resolves at the wrong
+    /// level: `a` arrives as `XF86Switch_VT_...`-adjacent nonsense or as a
+    /// control character, for the rest of the session.
+    ///
+    /// Rebuilds the state rather than replaying releases: xkbcommon offers no
+    /// "clear all" and guessing which keys were held is exactly the bookkeeping
+    /// this is meant to discard.
+    pub fn forget_physical_state(&mut self) {
+        self.state = xkb::State::new(&self._keymap);
+    }
 }
 
 /// A keysym in the one convention this core puts on the wire: a codepoint
@@ -614,6 +634,39 @@ mod tests {
         assert_ne!(
             LEVEL3_SHIFT, LEVEL3_LATCH,
             "the fixture is only a test if the two levels differ"
+        );
+    }
+
+    /// **A seat pause must clear xkbcommon's modifier state too** (D-031(4)).
+    ///
+    /// The chord matchers clear their own bits on a pause; this is the same
+    /// latch one layer down and it was missed on the first pass. At the instant
+    /// of a VT switch the human holds the modifiers **by construction** — that
+    /// is the gesture — and libinput is suspended before either release can
+    /// arrive. Without this, the state machine believes they are still down
+    /// when the seat returns and every key resolves at the wrong level for the
+    /// rest of the session.
+    #[test]
+    fn a_seat_pause_clears_the_keymaps_own_modifier_state() {
+        let mut k = CoreKeymap::from_text(LATCH_KEYMAP).expect("the latch fixture compiles");
+
+        // Hold the level-shifting key and never release it -- the pause.
+        let held = press(&mut k, KEY_CAPSLOCK);
+        assert_eq!(held, Some(LEVEL3_SHIFT));
+        let shifted = press(&mut k, KEY_CAPSLOCK);
+        assert_eq!(
+            shifted,
+            Some(LEVEL3_LATCH),
+            "the fixture must actually be in a shifted state, or this test proves nothing"
+        );
+
+        k.forget_physical_state();
+
+        assert_eq!(
+            press(&mut k, KEY_CAPSLOCK),
+            Some(LEVEL3_SHIFT),
+            "after the seat comes back the keymap must resolve at the UNMODIFIED level again: \
+             a state machine still holding Ctrl+Alt mistypes every key the human presses"
         );
     }
 

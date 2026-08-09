@@ -1185,6 +1185,31 @@ impl ShimServer {
 /// xrgb8888's padding byte is never trusted (alpha forced opaque);
 /// argb8888's alpha is carried through (composition is opaque regardless —
 /// the P1.3.3 decision — so this only preserves the client's own bytes).
+///
+/// # Why the shape of this loop is worth a paragraph
+///
+/// This is the **hottest loop on the shm path**, and every shm client pays it
+/// once per commit. At the 2560x1600 the bare-metal backend's first run drove,
+/// that is 4.1 M pixels — and the first cut ran a per-pixel
+/// `extend_from_slice(&[b, g, r, a])` into a `Vec` sized only by
+/// `with_capacity`, i.e. 4.1 M four-byte appends with a length update apiece.
+/// A standalone replica of it measured 2.6 ms per frame compiled `-O` and
+/// 104 ms compiled `-O0`.
+///
+/// The rewrite is byte-for-byte identical by construction — same source
+/// bytes, same destination order, same alpha rule — and the existing frame
+/// goldens are the net under it. Two changes and nothing clever:
+///
+/// * the destination is **allocated once at its final size** and written
+///   through `chunks_exact_mut`, so the bounds check is per row rather than
+///   per pixel and there is no capacity check at all;
+/// * the swizzle writes each destination pixel in place instead of appending
+///   a temporary four-byte array.
+///
+/// **This is not the whole of the CPU cost of a frame**, and it is not
+/// presented as if it were: the same run also composed every live realm's
+/// capture view once per dirty round with no consumer, and was most likely a
+/// debug build (see `log_build_identity`). Those are separate questions.
 fn copy_in(
     file: &File,
     width: u32,
@@ -1193,16 +1218,21 @@ fn copy_in(
     format: Format,
 ) -> io::Result<Vec<u8>> {
     let row_bytes = width as usize * BYTES_PER_PIXEL;
-    let mut rgba = Vec::with_capacity(row_bytes * height as usize);
+    let mut rgba = vec![0u8; row_bytes * height as usize];
     let mut row = vec![0u8; row_bytes];
-    for y in 0..u64::from(height) {
-        file.read_exact_at(&mut row, y * u64::from(stride))?;
-        for px in row.chunks_exact(BYTES_PER_PIXEL) {
-            let alpha = match format {
+    for (y, dst_row) in rgba.chunks_exact_mut(row_bytes.max(1)).enumerate() {
+        file.read_exact_at(&mut row, y as u64 * u64::from(stride))?;
+        for (src, dst) in row
+            .chunks_exact(BYTES_PER_PIXEL)
+            .zip(dst_row.chunks_exact_mut(BYTES_PER_PIXEL))
+        {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = match format {
                 Format::Xrgb8888 => 0xff,
-                Format::Argb8888 => px[3],
+                Format::Argb8888 => src[3],
             };
-            rgba.extend_from_slice(&[px[2], px[1], px[0], alpha]);
         }
     }
     Ok(rgba)

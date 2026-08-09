@@ -524,13 +524,57 @@ screen lock is still the thing protecting the machine. Treat the nested lock as
 what it is — a privacy cover over the realms `vitrind` is showing — and not as
 an authentication boundary for the seat.
 
-**There is no protection against VT switching, on any backend, and that is now
-a decision rather than an open question.** Nothing inhibits `Ctrl-Alt-F<n>`. On
-the nested backend that is the host's business and outside this project's reach.
-On bare metal it is a real escape from the lock — and it stays open on purpose,
-because a display server that traps you on its own VT is one you cannot leave
-when it wedges, and the whole posture of the dead-man switch is that you always
-have an off-switch. So the answer is scope, not prevention.
+**`vitrind` never inhibits VT switching, and on bare metal it has to
+*implement* `Ctrl-Alt-F<n>` for it to work at all.** On the nested backend the
+chord is the host compositor's business and outside this project's reach. On
+bare metal it is `vitrind`'s, and there is no third option: **once a process
+holds the display, the kernel stops handling that chord**, so a display server
+that does not implement it is one you cannot leave.
+
+An earlier release of this page said the opposite — that the chord was left
+alone on purpose, because a display server that traps you on its own VT is one
+you cannot leave when it wedges. **The reasoning was right and the effect was
+its own opposite.** That code was run on a real panel for the first time on
+2026-08-09 and the human could not leave: `Ctrl-Alt-F1` and `Ctrl-Alt-F2` did
+nothing, and the session ended only because it was killed from another shell.
+The words are being changed, not quietly swapped: the decision that was written
+to keep the escape hatch open is what welded it shut.
+
+So, in this release:
+
+- **`Ctrl-Alt-F1` … `Ctrl-Alt-F12` switch virtual terminal**, exactly as they do
+  under every other Linux compositor. `vitrind` never switches your VT for any
+  other reason — not on a timer, not on an agent's request, not to bring you
+  back. Only your own hands can move it, and no principal on the wire can,
+  whatever it holds.
+- **They work while the screen is locked.** That is deliberate, and it is
+  argued rather than assumed: being trapped is worst in the state where you
+  cannot dismiss what is in front of you. It is **never a way past the lock** —
+  the lock stays up and still wants your passphrase when you come back. What
+  someone standing at your locked laptop gains by pressing it is a login prompt
+  on another terminal, which they could have reached before you started
+  `vitrind` or by power-cycling the machine. It is strictly less than what they
+  can already do: the dead-man chord revokes every grant in your session and
+  fires through the lock on purpose.
+- **Twelve keys are taken from every confined app on bare metal.** The chords
+  are consumed in every realm and never delivered. Same as every other Linux
+  compositor; stated because this project states what it takes. `f1`…`f12` are
+  also no longer available to `--dead-man-chord`, `--lock-chord`,
+  `--clipboard-key` or `--screenshot-chord` under `--drm`, and a command line
+  that asks for one is refused at startup rather than silently rearming your
+  off-switch every time you leave the terminal.
+- **Know your own VT number before you start.** The startup banner logs it.
+  A human who can leave and cannot come back is only half rescued.
+- **If a switch fails, you will see it on the panel**, in a red band that names
+  what happened and what you can still do. A log line is worth nothing to
+  somebody who cannot leave the screen to read it. If that band ever appears,
+  the session is trapped: record it and treat it as serious.
+
+**None of the five bullets above has been confirmed on hardware.** They are a
+design with unit tests behind it. No test in this project can take DRM master
+or a seat, so whether `Ctrl-Alt-F2` really puts a tty on your panel is knowable
+only by running the bring-up runbook, and that has not been done since this
+changed.
 
 **The trusted band covers this screen and this process, and nothing else.** The
 coloured strip means one thing: everything above the line on *this* display was

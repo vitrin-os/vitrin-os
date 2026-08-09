@@ -2276,4 +2276,72 @@ mod tests {
         assert_eq!(gate.gate(&input), Gate::Deliver);
         assert_eq!((observed.get(), gated.get()), (1, 1));
     }
+
+    /// **A raised consent prompt does not swallow the VT escape** (WS-E.3.5,
+    /// D-031(2)).
+    ///
+    /// A consent grab seizes the *whole* input stream — that is its point —
+    /// so a human who cannot answer a card, or does not want to, must still be
+    /// able to leave the terminal. `crate::vt::VtHook` therefore sits outside
+    /// this gate as well as outside the lock, and the resulting state is
+    /// already handled: `resume_physical_seat` restarts the guard and clears
+    /// `armed` on return (D-030(5)), so the card the human comes back to is
+    /// not one press from committing.
+    ///
+    /// It lives here rather than in `crate::vt` because arming a real grab
+    /// needs a real `PetitionRegistry` and `Recorder`, and those fixtures are
+    /// this module's. The control comes first, so the positive cannot pass
+    /// against a grab that is consuming nothing.
+    #[cfg(feature = "drm-backend")]
+    #[test]
+    fn a_raised_consent_prompt_does_not_swallow_the_vt_escape() {
+        use crate::input::{KeySource, NoopHook, SeatInputKind};
+        use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+
+        fn key(keysym: u32, state: KeyState) -> SeatInput {
+            crate::input::tests::physical_for_test(SeatInputKind::Key {
+                source: KeySource::Keysym,
+                keysym,
+                state,
+            })
+        }
+
+        let (grab, _surface, _registry, _petition, t0) = armed();
+        let now = Rc::new(Cell::new(awake(t0)));
+        let signal = Rc::new(RefCell::new(
+            crate::vt::VtSignal::new().expect("twelve bindings"),
+        ));
+        let mut hook = crate::vt::VtHook::new(
+            Rc::clone(&signal),
+            ConsentGate::new(Rc::new(RefCell::new(grab)), Rc::clone(&now), NoopHook),
+        );
+        let feed = |hook: &mut crate::vt::VtHook<ConsentGate<NoopHook>>, input: &SeatInput| {
+            hook.observe(input);
+            hook.gate(input)
+        };
+
+        // The control: with a card up, an ordinary key reaches no app.
+        assert_eq!(
+            feed(&mut hook, &key(0x61, KeyState::Pressed)),
+            Gate::Consume,
+            "a raised prompt must be consuming input, or the assertion below is vacuous"
+        );
+
+        // ...and the way out still works. `ctrl+alt+f2` -> VT 2.
+        feed(&mut hook, &key(0xffe3, KeyState::Pressed));
+        feed(&mut hook, &key(0xffe9, KeyState::Pressed));
+        assert_eq!(
+            feed(&mut hook, &key(0xffbf, KeyState::Pressed)),
+            Gate::Consume
+        );
+        assert_eq!(
+            signal
+                .borrow_mut()
+                .take_pending()
+                .expect("a human who cannot answer a card must still be able to leave")
+                .target()
+                .get(),
+            2
+        );
+    }
 }

@@ -479,6 +479,37 @@ impl<K: Copy> ChordMatcher<K> {
         };
     }
 
+    /// **Forget every held modifier and every consumed trigger**, because
+    /// physical input has ended without the releases that would clear them.
+    ///
+    /// There is exactly one such event: a **seat pause**. Rule 2 above says a
+    /// modifier bit cannot get stuck because `observe` is unconditional — that
+    /// holds while events keep arriving, and a pause is the state where they
+    /// stop. `suspend_physical_seat` pays the confined app its held presses by
+    /// handing `SeatDelivery`s straight to the delivery funnel; they are not
+    /// `SeatInput`s and they never re-enter the hook stack, so every matcher
+    /// keeps whatever it believed at the instant the devices went away.
+    ///
+    /// Both halves matter and the second is easy to miss:
+    ///
+    /// * a stale `down` set is a matcher that believes the human is holding
+    ///   modifiers they let go of on another VT — and at the instant of a VT
+    ///   switch the human is holding **Ctrl and Alt by construction**, so
+    ///   their next bare F5 becomes `ctrl+alt+f5`, their next bare Insert
+    ///   becomes `shift+insert`, and their next bare Delete becomes
+    ///   `ctrl+alt+delete`;
+    /// * a stale `consumed` entry makes the *next* press's release get
+    ///   consumed while its press was delivered — a press stranded app-side,
+    ///   which is the latched key the pairing contract exists to prevent.
+    ///
+    /// **The nested backend needs none of this and must not get it**: winit
+    /// keeps delivering, the real release arrives, and `observe` clears the
+    /// bit. The asymmetry is principled, exactly as D-030(8)'s button drain is.
+    pub fn forget_physical_state(&mut self) {
+        self.down = Modifiers::default();
+        self.consumed.clear();
+    }
+
     /// **The matching half**: decide whether this event is a chord.
     ///
     /// Returns the gate verdict and, on a matched press, the binding's value.
@@ -491,6 +522,7 @@ impl<K: Copy> ChordMatcher<K> {
         let SeatInputKind::Key { keysym, state, .. } = input.kind() else {
             return (Gate::Deliver, None);
         };
+
         if Modifier::of_keysym(*keysym).is_some() {
             return (Gate::Deliver, None);
         }

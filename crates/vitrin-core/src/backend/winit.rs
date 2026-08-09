@@ -133,7 +133,14 @@ const CLEAR_COLOR: Color32F = Color32F::new(0.06, 0.06, 0.08, 1.0);
 /// branch inherited `Transform::Normal` from the offscreen renderbuffer
 /// harness `render_content` was written against, and kept it when it started
 /// drawing into the window surface instead.
-const WINDOW_TRANSFORM: Transform = Transform::Flipped180;
+///
+/// `pub(crate)` since first light so [`super::drm`]'s
+/// `the_scanout_and_the_window_are_opposite_kinds_of_target` can assert
+/// against it: the bare-metal backend's scanout constant took *this* value,
+/// which mirrored the human's whole display vertically, and the durable fix is
+/// a test that names the relationship between the two kinds of target rather
+/// than a second magic literal. See [`crate::dmabuf::MEMORY_TARGET_TRANSFORM`].
+pub(crate) const WINDOW_TRANSFORM: Transform = Transform::Flipped180;
 
 /// Fallback frame budget (~60 Hz), scoped to whatever redraw chain is
 /// already running (P1.3.9, issue #117: the chain itself starts only from a
@@ -351,6 +358,7 @@ pub(crate) fn window_pixels(
     consent: &mut ConsentSurface,
     lock: &mut crate::lock::LockSurface,
     status: &mut crate::status::StatusStrip,
+    notice: Option<&mut crate::notice::CoreNotice>,
     hold: Option<f64>,
     agent_cursor: Option<(f64, f64)>,
     human_cursor: Option<(f64, f64)>,
@@ -359,6 +367,20 @@ pub(crate) fn window_pixels(
 ) -> Vec<u8> {
     let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
     let mut pixels = super::compose_human_visible(scene, consent, lock, status, w, h, attention);
+    // **After the lock cover, and before both cursors** (WS-E.3.5). After the
+    // cover because the cover is opaque and the VT escape works *while
+    // locked* (D-031(2)), so a notice drawn under it would be invisible in the
+    // state a trapped human is most likely to be in. Before the sprites
+    // because neither an agent's pointer nor the human's own may sit on top of
+    // a core alarm; and before the hold indicator, which stays last of all so
+    // nothing can hide a gesture on the off-switch in progress.
+    //
+    // `None` on nested and headless, and that is a fact about who owns the
+    // display rather than a policy difference: neither can switch a VT, so
+    // neither can fail to.
+    if let Some(notice) = notice {
+        notice.composite_over(&mut pixels, w, h);
+    }
     if let Some((x, y)) = agent_cursor {
         // Deliberately drawn even over a raised lock screen (WS-E.2.2). It
         // looks wrong for a moment and is the honest choice: a lock does not
@@ -490,8 +512,20 @@ pub(crate) fn overlay_needs_the_window(
     hold: Option<f64>,
     consent: &ConsentSurface,
     lock: &crate::lock::LockSurface,
+    notice: Option<&crate::notice::CoreNotice>,
 ) -> bool {
-    hold.is_some() || consent.prompt().is_some() || lock.is_raised()
+    hold.is_some()
+        || consent.prompt().is_some()
+        || lock.is_raised()
+        // A fourth cause, and the only one that is *conditional on the
+        // backend* (WS-E.3.5): the notice surface exists to tell a human on
+        // bare metal that their VT escape did not work, and nested passes
+        // `None` because it has no VT to escape from. A raised notice is
+        // CPU-composited like the cover and the card, so the zero-copy branch
+        // would present the client's texture with the one message the human
+        // needs nowhere on it -- which is the original defect with an extra
+        // step.
+        || notice.is_some_and(crate::notice::CoreNotice::is_up)
 }
 
 pub(crate) fn zero_copy_source<'a, C>(
@@ -2441,7 +2475,9 @@ impl NestedState {
         // the overlay check below feed the same instant so a hold that
         // completes mid-frame is judged consistently within it.
         let hold = self.deadman.borrow().hold_progress(Instant::now());
-        let overlay_up = overlay_needs_the_window(hold, &self.view.consent, &self.view.lock);
+        // `None` for the notice surface: nested has no VT to escape from, so
+        // it can never fail to (WS-E.3.5).
+        let overlay_up = overlay_needs_the_window(hold, &self.view.consent, &self.view.lock, None);
 
         // Zero-copy dmabuf presentation (P1.3.5, issue #117): **the bound
         // realm** has a retained GPU import and neither overlay needs the
@@ -2600,6 +2636,9 @@ impl NestedState {
                 &mut self.view.consent,
                 &mut self.view.lock,
                 &mut self.view.status,
+                // No notice surface here either, and for the same reason:
+                // only the backend that can switch a VT can fail to.
+                None,
                 hold,
                 agent_cursor,
                 // No human cursor here, ever: the host desktop is already
@@ -3196,23 +3235,29 @@ mod tests {
         // The control FIRST: with nothing up, the zero-copy branch is allowed.
         // Without this the three assertions below would pass against a function
         // that always answered `true`.
-        assert!(!overlay_needs_the_window(None, &idle_consent, &idle_lock));
+        assert!(!overlay_needs_the_window(
+            None,
+            &idle_consent,
+            &idle_lock,
+            None
+        ));
 
         // A hold.
         assert!(overlay_needs_the_window(
             Some(0.5),
             &idle_consent,
-            &idle_lock
+            &idle_lock,
+            None
         ));
         // A consent card.
         let mut prompt = ConsentSurface::new(indicator);
         prompt.show_for_test(prompt_fixture());
-        assert!(overlay_needs_the_window(None, &prompt, &idle_lock));
+        assert!(overlay_needs_the_window(None, &prompt, &idle_lock, None));
         // A lock screen.
         let mut locked = no_lock();
         locked.raise(crate::lock::tests::lock_fixture());
         assert!(
-            overlay_needs_the_window(None, &idle_consent, &locked),
+            overlay_needs_the_window(None, &idle_consent, &locked, None),
             "a raised lock MUST force the CPU path: the zero-copy branch presents the \
              client's own texture, so a locked session that took it would show the app \
              full-window with the lock nowhere on it"
@@ -3220,7 +3265,38 @@ mod tests {
         // ...and lowering it gives the branch back, so the test is measuring
         // the lock's state and not the surface's existence.
         locked.lower();
-        assert!(!overlay_needs_the_window(None, &idle_consent, &locked));
+        assert!(!overlay_needs_the_window(
+            None,
+            &idle_consent,
+            &locked,
+            None
+        ));
+
+        // **A raised core notice**, the fourth cause and the bare-metal-only
+        // one (WS-E.3.5). It is CPU-composited, so a session that took the
+        // zero-copy branch while one was up would present the client's texture
+        // with the one message a trapped human needs nowhere on it -- the
+        // original defect with an extra step. `None` first, so this measures
+        // the notice's state rather than the parameter's presence.
+        let mut notice = crate::notice::CoreNotice::new();
+        assert!(!overlay_needs_the_window(
+            None,
+            &idle_consent,
+            &locked,
+            Some(&notice)
+        ));
+        notice.raise(
+            crate::notice::NoticeContent::VtSwitchFailed {
+                target: 2,
+                own: Some(3),
+            },
+            std::time::Instant::now(),
+        );
+        assert!(
+            overlay_needs_the_window(None, &idle_consent, &locked, Some(&notice)),
+            "a raised notice MUST force the CPU path, or the message telling the human their \
+             session cannot leave this terminal is composited into a frame that is never drawn"
+        );
     }
 
     /// A lock surface with nothing raised, for the many composite tests that
@@ -3237,6 +3313,83 @@ mod tests {
 
     fn no_lock() -> crate::lock::LockSurface {
         crate::lock::LockSurface::new(crate::consent::TrustedIndicator::for_test())
+    }
+
+    /// **A raised notice really reaches the human-visible upload, and it is
+    /// drawn OVER a raised lock cover** (WS-E.3.5, D-031(3)).
+    ///
+    /// Both halves are load-bearing and neither is worth much alone. Deleting
+    /// the composite call from [`window_pixels`] left every other test in this
+    /// workspace green while the one surface a trapped human can read stopped
+    /// being drawn — so the positive is pinned. And the VT escape works
+    /// **while locked** by decision, so the state a human is most likely to be
+    /// trapped in is precisely the one where an opaque cover is on top of
+    /// everything composed before it; a notice under that cover would be a
+    /// message nobody can read, which is the defect it exists to close.
+    #[test]
+    fn a_raised_notice_reaches_the_upload_and_sits_over_the_lock_cover() {
+        const W: i32 = 800;
+        const H: i32 = 600;
+        let size = size_of(W, H);
+        let mut scene = Scene::new();
+        scene
+            .commit(SurfaceContent::from_rgba(client_pixels(400, 300), 400, 300).expect("content"));
+        let last_row = |px: &[u8]| {
+            let off = (H as usize - 1) * W as usize * crate::scene::BYTES_PER_PIXEL;
+            px[off..off + crate::scene::BYTES_PER_PIXEL].to_vec()
+        };
+
+        let mut notice = crate::notice::CoreNotice::new();
+        let mut consent = ConsentSurface::new(TrustedIndicator::for_test());
+        let without = window_pixels(
+            &scene,
+            &mut consent,
+            &mut raised_lock(),
+            &mut no_status(),
+            Some(&mut notice),
+            None,
+            None,
+            None,
+            false,
+            size,
+        );
+
+        notice.raise(
+            crate::notice::NoticeContent::VtSwitchFailed {
+                target: 2,
+                own: Some(3),
+            },
+            Instant::now(),
+        );
+        let with = window_pixels(
+            &scene,
+            &mut consent,
+            &mut raised_lock(),
+            &mut no_status(),
+            Some(&mut notice),
+            None,
+            None,
+            None,
+            false,
+            size,
+        );
+        assert_ne!(
+            with, without,
+            "a raised notice must change what is uploaded, or the human is told nothing"
+        );
+        assert_ne!(
+            last_row(&with),
+            last_row(&without),
+            "the notice is anchored to the bottom edge and must be ON the frame, not merely \
+             rasterized somewhere"
+        );
+        // ...and the trusted band is still exactly the session colour, so
+        // nothing the notice draws reached rows [0, TRUST_BAND_HEIGHT).
+        assert_eq!(
+            with[..crate::scene::BYTES_PER_PIXEL],
+            TrustedIndicator::for_test().color(),
+            "the notice must not touch the band"
+        );
     }
 
     /// A lock surface with the cover **up**, by the chord, passphrase-backed.
@@ -3332,6 +3485,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             size,
         );
@@ -3370,6 +3524,7 @@ mod tests {
             &mut consent,
             &mut no_lock(),
             &mut no_status(),
+            None,
             None,
             None,
             None,
@@ -3465,6 +3620,7 @@ mod tests {
                     &mut consent,
                     &mut no_lock(),
                     &mut no_status(),
+                    None,
                     hold,
                     None,
                     None,
@@ -3482,6 +3638,7 @@ mod tests {
                 &mut consent,
                 &mut no_lock(),
                 &mut no_status(),
+                None,
                 None,
                 None,
                 None,
@@ -3503,6 +3660,7 @@ mod tests {
                     &mut idle,
                     &mut no_lock(),
                     &mut no_status(),
+                    None,
                     None,
                     Some(aim),
                     None,
@@ -3596,6 +3754,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             size,
         );
@@ -3604,6 +3763,7 @@ mod tests {
             &mut consent,
             &mut no_lock(),
             &mut no_status(),
+            None,
             None,
             Some(at),
             None,
@@ -3725,6 +3885,7 @@ mod tests {
             &mut idle,
             &mut no_lock(),
             &mut no_status(),
+            None,
             Some(0.5),
             None,
             None,
@@ -3744,6 +3905,7 @@ mod tests {
             &mut idle,
             &mut no_lock(),
             &mut no_status(),
+            None,
             None,
             Some((400.0, 300.0)),
             None,
@@ -3830,6 +3992,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             size,
         );
@@ -3866,6 +4029,7 @@ mod tests {
             &mut consent,
             &mut no_lock(),
             &mut no_status(),
+            None,
             None,
             None,
             None,
@@ -4386,6 +4550,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             size,
         );
@@ -4408,6 +4573,7 @@ mod tests {
             &mut consent,
             &mut no_lock(),
             &mut no_status(),
+            None,
             Some(0.5),
             None,
             None,
@@ -4433,6 +4599,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             size,
         );
@@ -4441,6 +4608,7 @@ mod tests {
             &mut consent,
             &mut no_lock(),
             &mut no_status(),
+            None,
             Some(0.9),
             None,
             None,

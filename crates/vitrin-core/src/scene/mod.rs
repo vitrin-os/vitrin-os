@@ -391,9 +391,6 @@ impl Scene {
         let vw = width as usize;
         let vh = height as usize;
         let mut out = vec![0u8; vw * vh * BYTES_PER_PIXEL];
-        for px in out.chunks_exact_mut(BYTES_PER_PIXEL) {
-            px.copy_from_slice(&LETTERBOX_RGBA);
-        }
         if out.is_empty() {
             return out;
         }
@@ -410,6 +407,45 @@ impl Scene {
         let sh = surface.height as usize;
         let copy_w = (vw - dst_x).min(sw - src_x);
         let copy_h = (vh - dst_y).min(sh - src_y);
+
+        // **The matte is painted only where the client will not cover it.**
+        //
+        // Byte-for-byte what a full-view fill followed by the copy below
+        // produces — the destination rectangle is written unconditionally on
+        // the next loop — and in the maximized case, which is every session
+        // this core currently runs, it is the difference between touching
+        // every pixel twice and touching it once. That mattered enough to fix
+        // when the bare-metal backend's first run on hardware composed a
+        // 2560x1600 view twice per dirty round: at 4.1 M pixels a whole-view
+        // 4-byte-at-a-time fill is ~40% of this function and 100% of it is
+        // thrown away.
+        //
+        // `letterbox_rows` fills whole rows above and below the client;
+        // `letterbox_cols` fills the two side bars beside it. Kept as two
+        // named steps rather than one clever loop because the failure mode of
+        // getting it wrong is a strip of uninitialised black along an edge
+        // that no assertion about the client's own pixels would notice —
+        // `compose_matches_a_whole_view_fill` compares against the naive
+        // implementation over a matrix of geometries for exactly that reason.
+        let row_bytes = vw * BYTES_PER_PIXEL;
+        let fill_rows = |out: &mut [u8], from: usize, to: usize| {
+            for px in out[from * row_bytes..to * row_bytes].chunks_exact_mut(BYTES_PER_PIXEL) {
+                px.copy_from_slice(&LETTERBOX_RGBA);
+            }
+        };
+        fill_rows(&mut out, 0, dst_y);
+        fill_rows(&mut out, dst_y + copy_h, vh);
+        for row in dst_y..dst_y + copy_h {
+            let base = row * row_bytes;
+            for px in out[base..base + dst_x * BYTES_PER_PIXEL].chunks_exact_mut(BYTES_PER_PIXEL) {
+                px.copy_from_slice(&LETTERBOX_RGBA);
+            }
+            for px in out[base + (dst_x + copy_w) * BYTES_PER_PIXEL..base + row_bytes]
+                .chunks_exact_mut(BYTES_PER_PIXEL)
+            {
+                px.copy_from_slice(&LETTERBOX_RGBA);
+            }
+        }
 
         for row in 0..copy_h {
             let src_off = ((src_y + row) * sw + src_x) * BYTES_PER_PIXEL;
@@ -561,6 +597,91 @@ pub(crate) mod tests {
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(vec![0x10, 0x20, 0x30, 0x00], 1, 1).unwrap());
         assert_eq!(scene.compose(1, 1), [0x10, 0x20, 0x30, 0xff]);
+    }
+
+    /// **The matte painted only where the client will not cover it is
+    /// byte-for-byte the whole-view fill it replaced** (WS-E.3.5).
+    ///
+    /// The optimisation is worth having — the bare-metal backend composes a
+    /// 2560x1600 view twice per dirty round, and a whole-view 4-byte-at-a-time
+    /// fill is ~40% of this function and entirely thrown away in the maximized
+    /// case — and it is exactly the kind of change whose failure mode nothing
+    /// else would catch: a strip of uninitialised **black** along one edge,
+    /// which no assertion about the client's own pixels would notice and which
+    /// looks like a rendering artifact rather than a bug.
+    ///
+    /// So this compares against the naive implementation directly, over a
+    /// matrix of geometries chosen to hit every letterbox shape: client
+    /// smaller than the view in one axis, in both, exactly equal, larger
+    /// (clipped), and degenerate.
+    #[test]
+    fn compose_matches_a_whole_view_fill() {
+        /// The implementation this replaced: fill every pixel, then blit.
+        fn naive(scene: &Scene, width: u32, height: u32) -> Vec<u8> {
+            let composed = scene.compose(width, height);
+            let Some(surface) = &scene.surface else {
+                return composed;
+            };
+            let (vw, vh) = (width as usize, height as usize);
+            let mut out = vec![0u8; vw * vh * BYTES_PER_PIXEL];
+            for px in out.chunks_exact_mut(BYTES_PER_PIXEL) {
+                px.copy_from_slice(&LETTERBOX_RGBA);
+            }
+            if out.is_empty() {
+                return out;
+            }
+            let placement = layout::place((width, height), (surface.width, surface.height));
+            let dst_x = placement.x.max(0) as usize;
+            let dst_y = placement.y.max(0) as usize;
+            let src_x = (-placement.x).max(0) as usize;
+            let src_y = (-placement.y).max(0) as usize;
+            let sw = surface.width as usize;
+            let sh = surface.height as usize;
+            let copy_w = (vw - dst_x).min(sw - src_x);
+            let copy_h = (vh - dst_y).min(sh - src_y);
+            for row in 0..copy_h {
+                let src_off = ((src_y + row) * sw + src_x) * BYTES_PER_PIXEL;
+                let dst_off = ((dst_y + row) * vw + dst_x) * BYTES_PER_PIXEL;
+                let dst = &mut out[dst_off..dst_off + copy_w * BYTES_PER_PIXEL];
+                dst.copy_from_slice(&surface.rgba[src_off..src_off + copy_w * BYTES_PER_PIXEL]);
+                for px in dst.chunks_exact_mut(BYTES_PER_PIXEL) {
+                    px[3] = 0xff;
+                }
+            }
+            out
+        }
+
+        for (cw, ch) in [
+            (1u32, 1u32),
+            (33, 17),
+            (64, 8),
+            (8, 64),
+            (64, 64),
+            (200, 90),
+        ] {
+            for (vw, vh) in [(64u32, 64u32), (101, 59), (17, 33), (1, 1), (0, 0), (5, 0)] {
+                let mut scene = Scene::new();
+                scene.commit(SurfaceContent::from_rgba(client_pixels(cw, ch), cw, ch).unwrap());
+                assert_eq!(
+                    scene.compose(vw, vh),
+                    naive(&scene, vw, vh),
+                    "client {cw}x{ch} in view {vw}x{vh}: the matte must be painted everywhere \
+                     the client does not cover, or an edge of the view is left black"
+                );
+                // ...and the letterbox really is present in at least one of
+                // these, or the comparison above is between two identical
+                // no-ops.
+                if (vw > cw || vh > ch) && vw > 0 && vh > 0 {
+                    assert!(
+                        scene
+                            .compose(vw, vh)
+                            .chunks_exact(BYTES_PER_PIXEL)
+                            .any(|px| px == LETTERBOX_RGBA),
+                        "client {cw}x{ch} in view {vw}x{vh} must letterbox"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -628,6 +628,54 @@ Date it, and record the environment, exactly as
 `shim/docs/firefox.md` do. The value of a manual runbook is entirely in whether
 anyone can tell when it was last actually executed.
 
+### Second run — 2026-08-09, after the first run's three fixes
+
+```text
+Executed:      2026-08-09, by Taha, target laptop, RELEASE build.
+Purpose:       confirm the three fixes, and close checklist items 10 and 11,
+               which the first run left NOT TESTED.
+Connector:     EmbeddedDisplayPort (smithay logs it; vitrind's own line still
+               renders it empty -- first run's finding 4, still open)
+
+  9.  Trusted band ................... PASS -- band at the TOP. The mirror is
+                                       fixed (SCANOUT_TRANSFORM = Normal)
+  10. Consent prompt + physical click . PASS -- FIRST TIME EVER. Card drawn on
+                                       the panel, clicked with the mouse,
+                                       petition granted, 13 captures served
+  11. Held-Esc revocation ............ PASS -- FIRST TIME EVER against a LIVE
+                                       grant: dead_man_triggered held_ms=1005
+                                       revoked=1, grant_revoked in the SAME
+                                       millisecond, agent refused and voiced
+                                       128 ms later. The first run's revoked=0
+                                       proved only reachability
+  12. VT switch away and back ........ PASS -- 5 chorded switches honoured,
+                                       plus 4 `vt_switch_refused already_here`
+                                       when the human chorded the VT they were
+                                       already on. Two full pause->activate
+                                       cycles: master dropped and reclaimed
+  14. Frame cadence .................. 32.9% CPU (release) against 99.1%
+                                       (debug) for the same client and mode.
+                                       ~3x of the first run's number was the
+                                       build profile
+
+Not on the checklist, and confirmed by accident:
+      D-030(4) WORKS ON HARDWARE. The observer was launched from Hyprland, so
+      the petition arrived while the seat was elsewhere: consent_transition
+      went `queued` at 23:27:51 and only `shown` at 23:27:57, when the human
+      switched back. A prompt was NOT journalled as shown to a human who could
+      not see it -- which is the entire falsehood that decision exists to
+      prevent, exercised in a test aimed at something else.
+
+      The capture path is byte-correct: centre pixel read #55aa00ff for a realm
+      configured 00aa55, which is exactly xrgb8888 little-endian.
+
+Still open after this run:
+      - vitrind's own log line renders the connector name empty
+      - the shim never emits dmabuf, so the zero-copy scanout path is dead code
+        against every real app
+      - refresh_view_cache composes for absent consumers
+```
+
 ```text
 Last executed: 2026-08-09, by Taha, on the target laptop (Monster).
                FIRST EXECUTION. The backend had never been run by anyone.

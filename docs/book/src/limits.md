@@ -17,6 +17,33 @@ Environment hygiene confines the well-behaved; it does not contain the
 hostile. Do not run untrusted applications, or untrusted agents, against
 this. Real sandboxing is Phase 2 (E2.6/E2.7, P13).
 
+**On bare metal, a realm's app can plausibly open the real keyboard and read
+every key you type — including into other realms, and including a passphrase.**
+This is the sandbox gap above, pointed at the one device the whole architecture
+is built to mediate. `logind` ACLs `/dev/input/event*` to the user owning the
+active seat session; the confined app runs as the core's **own uid** with the
+core's full filesystem view and no namespace, no seccomp filter and no Landlock
+policy, so nothing stops it from opening those nodes directly. On this
+project's own target machine the maintainer is additionally a member of the
+`input` group, which grants that access independently of any seat — so this is
+concrete rather than theoretical.
+
+What that bypasses is not a feature but the premise: `vitrind`'s input router,
+the origin tag that distinguishes a human from an agent, the per-realm routing,
+the consent grab that makes a prompt unspoofable, and the lock screen are all
+*downstream* of a device the app reached around. An app doing this is not
+observed by the journal, is not refused `preempted`, and does not appear in any
+capture.
+
+Two bounds, and neither is a fix. **It is not reachable today**: there is no
+DRM/KMS backend, and under `--nested` the host compositor is the only reader of
+those devices. It becomes reachable the moment a bare-metal backend lands
+(WS-E.3.2), which is why it is published here **ahead of** the code rather than
+with it. And it is the same hole `crates/vitrin-core/src/spawn/isolation.rs`
+already probes for and enforces nothing about — Phase-2 confinement (E2.6/E2.7)
+is what closes it, by giving the realm a device namespace it cannot see those
+nodes from.
+
 ## Testing gaps
 
 **The 24-hour fuzz soak has never been run.** `fuzz/` ships two cargo-fuzz
@@ -42,6 +69,60 @@ implemented and wired on the nested backend. The zero-memcpy assertion needs
 a real GPU (EGL + a DRM render node) and runs only under
 `VITRIN_GPU_TESTS=1 cargo test -p vitrin-core --features gpu-tests --
 --ignored dmabuf`. CI is GPU-free and exercises the shm path exclusively.
+
+**The DRM/KMS backend will never have a green gate behind it, and that is the
+weakest evidence in this repository.** Every other claim on this page closes on
+a named, mock-free test. This one cannot, and the reasons are structural rather
+than budgetary. Six of them, named rather than summarised:
+
+- **No DRM device in CI.** A GitHub runner has no display controller. Nothing
+  there can set a mode, commit a frame or receive a page flip.
+- **No seat in CI.** No `logind` session, no `seatd`, nothing for `libseat` to
+  open a card through. The backend cannot even reach the point of failing
+  usefully.
+- **Not even a compile-check, yet.** An earlier draft of this page said, in the
+  present tense, that a CI rung runs `cargo clippy … --features drm-backend`.
+  **No such rung exists and no such feature exists** — the backend itself is
+  unwritten (#218). The claim is corrected rather than deleted, because a limits
+  page that quietly acquires the right words teaches nothing about how it got
+  the wrong ones, and this is a page whose entire value is that it can be
+  believed. When #218 lands, a compile rung is the *floor* it must bring with
+  it, and even then it proves the code type-checks against the smithay API and
+  nothing whatsoever about behaviour — a green tick in a repository whose
+  readers are trained to trust green ticks is exactly how a compile check gets
+  cited as a functional one.
+- **`vkms-advisory` does not close this, and must never be read as if it did.**
+  There is an advisory job that attempts `sudo modprobe vkms` and, when the
+  module is available, reports what it found. **What the job actually does is
+  narrower than the device's capabilities**, and the distinction matters: it
+  opens the node, reads mode-setting resources, and probes GBM/EGL/GLES up to
+  locking a front buffer. It deliberately never calls `drmSetMaster`, never sets
+  a mode and never flips a page — so it says nothing about mode setting, atomic
+  commit or the page-flip loop, whatever a vkms device is capable of in
+  principle. Whether it exercises the **GBM + GLES scanout path at all** is
+  *unmeasured* — vkms exposes no render node, so the GLES half would need a
+  software renderer and may not import into a vkms scanout buffer. The job
+  measures and publishes that answer on each run; until it has run, this
+  sentence is the honest state of it. It is advisory, it never gates a PR, and
+  it is never to be named without the word *advisory*.
+- **One machine, one GPU, one panel, one kernel.** The evidence that this
+  backend works is one person executing
+  [`docs/drm-bringup.md`](https://github.com/vitrin-os/vitrin-os/blob/main/docs/drm-bringup.md)
+  on one laptop: a single Intel-driven `eDP-1` at 2560x1600, scale 1, on one
+  Arch kernel and one mesa version. It says nothing about any other GPU, panel,
+  kernel or mesa. The PRD names "hardware matrix" as the first item of the
+  support treadmill that consumed prior alternative display servers; this closes
+  none of it and must not read as if it does.
+- **The runbook has been executed once**, on 2026-08-09, and it carries its own
+  dated record block. It was not a clean pass: three defects came out of it, one
+  of which was that the page's own first line of recovery did not exist. A runbook nobody has executed is a plan, and the wlcs
+  number above is this repository's standing example of how a manual result
+  ages once it is taken.
+
+This is a recorded decision with a scheduled closure in the sense that page's
+last section means: the closure is a dated human run, not a job. The alternative
+— a green check proving compilation, read as proving function — is strictly
+worse, and is precisely the honesty gap this page exists to prevent.
 
 ## Model gaps
 

@@ -100,7 +100,10 @@ EVERYTHING NOT NAMED ABOVE
   tooling that is not part of a shipped artifact (.github/workflows/,
   build manifests, .claude/ agent and skill definitions) is Apache-2.0
   with the rest of the tooling. Neither category is a shipped artifact,
-  and no tracked path is left unassigned by this map.
+  and no tracked path is left unassigned by this map. (.github/ as a whole
+  falls in that tooling category, not only .github/workflows/: .github/vkms/
+  holds the advisory VKMS rung's script and capability probe, which are CI
+  tooling and carry Apache-2.0 SPDX headers of their own.)
 
 THIRD-PARTY — not ours to license
 

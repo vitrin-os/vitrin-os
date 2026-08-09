@@ -204,6 +204,7 @@ is not a human at the keyboard, and its actuations must not postpone the lock.
 |---|---|
 | The card's frame colour does not match the top strip | You are looking at a client-painted forgery, or the trusted indicator is not reaching one of the two paths (issue #85). |
 | The realm is still visible behind the lock | The zero-copy dmabuf branch presented the client's texture. `LockSurface::is_raised` must be in `overlay_up` (`backend/winit.rs`). |
+| The realm is still visible, but only on the *second* lock of a session, or the cover appears late when something unrelated moves | The presentation cache key is not carrying `LockSurface::generation`, so the composed cover is uploaded only when some other keyed input changes. **Your session is genuinely locked and eating your input** — type the passphrase blind. This shipped once; see "What the first run found" below. |
 | Keys come out capitalised after step 5 | The gate consumed a release whose press was delivered — the pairing contract (`crate::input::PreemptionHook`) is broken for this gate. |
 | No hold bar, or no `dead_man_triggered`, in step 6 | The observe tap is not being forwarded. This should be *unconstructible* (`crate::input::ConsumingGate`), so treat it as a compiler or refactor bug, not a policy one. |
 | The agent's frames go black in step 7 | Somebody "fixed" D-025 by blanking the realm view, which is the lie-by-omission the decision explicitly rejects. |
@@ -214,6 +215,86 @@ is not a human at the keyboard, and its actuations must not postpone the lock.
 Date it and note the host compositor, exactly as `shim/docs/firefox.md` does.
 The value of a manual runbook is entirely in whether anyone can tell when it was
 last actually executed.
+
+**Last executed:** 2026-08-09
+**Host compositor:** Hyprland 0.56.2 (Arch Linux, 2560x1600, nested window
+2554x1558)
+**Core:** `f9f2b8a`, `--lock-idle 30`, `--consent interactive`
+**Result:** PASS on steps 1-7, with two gaps named below. **The first execution
+of this page found a shipped defect** — see below.
+
+### What the first run found
+
+Steps 1 and 8 passed. Then the *second* `ctrl+alt+delete` of the session
+consumed input behind a screen still showing the unlocked application.
+
+`TextureKey::current` in `backend/winit.rs` enumerated every input to
+`compose_human_visible` **except the lock**, so the composed cover was
+presented only when some unrelated keyed input next happened to move. Against
+an idle client that is never. The first raise had drawn only because the client
+was still producing startup frames and `scene_generation` moved with it.
+
+Nothing else was wrong: the recorder showed `session_locked` /
+`unlock_attempted accepted` / `session_unlocked` / `session_locked` in order,
+and `service_lock` marked the frame dirty and requested the redraw. The redraw
+ran, compared keys, and re-presented the stale texture. So the gate consumed
+input exactly as designed while the cover's confidentiality property was
+silently not delivered — **a locked session that looked unlocked**, which is
+the row this page's failure table did not have.
+
+Fixed in `f9f2b8a`. This is why the page exists: every automated surface listed
+in "What CI proves" was green throughout.
+
+### Evidence for this run
+
+Recorder wall times, one session unless noted:
+
+- **1 — the chord raises it.** Card up, `Locked by: the lock chord`, frame
+  colour matching the top strip. Confirmed by eye; nothing else can confirm it.
+- **2 — nothing reaches the app.** Stronger than the page asks. Across three
+  lock windows the recorder logs **zero** `seat_delivered` entries: not the
+  passphrase keystrokes, not the dead-man's `Escape` hold.
+- **3 — the passphrase.** Five rejections (the page asks four), each its own
+  entry a second apart, then one acceptance. Field set across all six is
+  `schema_version, run_id, seq, mono_us, wall_ms, kind, accepted` — no bytes,
+  no digest, and **no length**.
+- **4 — editing works.** Correct passphrase unlocked on every one of six
+  attempts across the sittings.
+- **5 — a held modifier is not latched.** Run with `input-echo-client`, which
+  resolves keys through xkbcommon as a real toolkit does. `Shift` pressed
+  04:07:00.992, held; idle lock raised 04:07:31.094 (**a held key did not
+  postpone it**); `Shift` **released 04:07:36.386, while locked**; unlocked
+  04:07:50.133; `a`/`b`/`c` resolved `keysym=0x61/0x62/0x63`, lowercase, with
+  `depressed=0x0`. The release reached the app through a raised gate, which is
+  the P1.7.2 pairing contract holding live.
+- **6 — the off-switch survives.** `dead_man_triggered chord=esc held_ms=1000
+  revoked_grants=1`, then `grant_revoked cause=dead_man_chord`, then the
+  agent's next capture `refused (revoked, refusal_voiced=true)`. Session stayed
+  locked a further **82 seconds**. The amber hold bar was seen over the cover.
+  An earlier sitting logged `revoked_grants:0` with no agent connected, which
+  proves only that the chord is *reachable* while locked — run this step with a
+  live grant or it is half a test.
+- **7 — the published surprise.** Agent holding `observe` on `realm-0` captured
+  once a second across a lock: 13 `use_decision → allowed` entries spanning
+  `session_locked`, near-black fraction flat at 0.50, no cover in the frames.
+  D-025 as decided.
+- **8 — the idle raise.** Confirmed three times, `cause:"idle"`.
+
+### Gaps this run did not close
+
+- **Step 7 is weaker than it reads.** `input-echo-client` is static, so every
+  frame carried the identical digest. "Kept capturing the live realm" and
+  "served a stale cached frame" are indistinguishable from outside. Re-run with
+  `damage-client` to settle it.
+- **Step 8's second half is untested.** The agent held `observe` only and was
+  revoked before the idle lock, so "an agent actuating must not postpone the
+  lock" has never been exercised. Needs a grant carrying `actuate.pointer`.
+- **Step 7 needs no goal-directed agent.** The page says "`sdk/python/`'s demo
+  agent will do", but `run_demo.py` needs a real app serving a form — far more
+  setup than this step. Roughly forty lines against `vitrin_os.connect` +
+  `request_grant(verbs=("observe",))` + `observe()` in a loop is enough, and
+  printing each frame's near-black fraction is what distinguishes the two
+  failures named above.
 
 ```text
 Last executed: (not yet — WS-E.2.2 landed the code; the first dated run belongs

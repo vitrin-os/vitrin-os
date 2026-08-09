@@ -560,7 +560,9 @@ The premise is true: `DrmView::view_rgba` CPU-composes the retained scene and ne
 > The ranking below is therefore inverted from how it was first written: item 1
 > was theory and failed; item 3 is unchanged; the Hyprland-side shell was never
 > listed at all, because nobody had needed it yet. Until the `change_vt` fix
-> lands, **treat a bare-metal VT as one-way.**
+> lands. **It has since landed** (WS-E.3.5, `crate::vt`) and is unconfirmed on
+> hardware; until a second run says otherwise, the Hyprland-side shell remains
+> the only escape route this machine has been *observed* to have.
 
 
 **Status:** accepted (2026-08-09) — amends the escape-route requirement in issue **#220** (WS-E.3.4) and the standing safety rule in workstream [WS-E](14-workstream-session-mode.md) §7; implemented by [`docs/drm-bringup.md`](../drm-bringup.md)

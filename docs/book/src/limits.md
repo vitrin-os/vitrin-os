@@ -113,9 +113,9 @@ than budgetary. Six of them, named rather than summarised:
   kernel or mesa. The PRD names "hardware matrix" as the first item of the
   support treadmill that consumed prior alternative display servers; this closes
   none of it and must not read as if it does.
-- **The runbook is unexecuted.** As of this writing nobody has run it, because
-  the backend it describes has not landed. It carries its own dated record block
-  and says so there. A runbook nobody has executed is a plan, and the wlcs
+- **The runbook has been executed once**, on 2026-08-09, and it carries its own
+  dated record block. It was not a clean pass: three defects came out of it, one
+  of which was that the page's own first line of recovery did not exist. A runbook nobody has executed is a plan, and the wlcs
   number above is this repository's standing example of how a manual result
   ages once it is taken.
 

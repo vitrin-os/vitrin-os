@@ -26,7 +26,7 @@ in this repository, and it is published as such in
 
 | | |
 |---|---|
-| **The backend it describes** | **Does not exist yet.** `crates/vitrin-core/src/backend/drm.rs` is WS-E.3.2 / issue #218 and has not landed. `grep -rn drm crates/vitrin-core/src/main.rs` returns nothing today. |
+| **The backend it describes** | **Exists and has been run once** (#218, merged; first light 2026-08-09). `crates/vitrin-core/src/backend/drm.rs` is WS-E.3.2 / issue #218 and has not landed. `grep -rn drm crates/vitrin-core/src/main.rs` returns nothing today. |
 | **Why it is written first** | #220's decision 1: the honest limit and the escape route must never be the thing that slipped behind the code. The `limits.md` entry and this page land with or ahead of #218's PR. |
 | **Has it been executed?** | **No.** See [Record the run](#record-the-run) at the bottom, and the outstanding acceptance criterion recorded with it. |
 | **Who wrote it** | Not a human at the machine. Every fact below is marked verified or inferred — see the convention immediately below. |
@@ -84,8 +84,11 @@ backend that takes the first DRM device it finds can take `card2`, which has
 zero connected connectors. #218's own rule ("refuse to start with a named error
 on zero or more than one connected connector") then fires on the *wrong card* and
 the error will read like a hardware fault rather than a device-selection bug.
-**Expect to have to name the card explicitly.** If `--drm` grows no card
-argument, this is the first thing to add. [inferred]
+**RESOLVED 2026-08-09 — there is no card argument, and none was needed.**
+`--drm` takes no card selector; the backend calls smithay's
+`udev::primary_gpu(&seat_name)` and picks the seat's primary GPU itself. On the
+first run it selected `/dev/dri/card1` — the iGPU, which is the one with the
+panel — unprompted and correctly. Hazard H1 below did not materialise.
 
 **H2 — `seatd` is not running, so libseat must use its logind backend.**
 `libseat.so.1` links `libsystemd` and carries both `seatd_impl` and
@@ -111,13 +114,50 @@ This is the step that will be tempted away, by the person most likely to skip
 it, on the machine that matters, at the end of a long session. It costs about
 ninety seconds.
 
-### 0.1 First line: VT switching. `Ctrl+Alt+F1` goes back to Hyprland.
+> ## ⚠ CORRECTED BY THE FIRST RUN, 2026-08-09
+>
+> **VT switching does not work, and it was this page's first line of defence.**
+> On the first bare-metal run `Ctrl+Alt+F1` and `Ctrl+Alt+F2` did nothing and
+> the maintainer was trapped on tty3 until `vitrind` was killed from elsewhere.
+>
+> The reason is not "something is grabbing the keyboard", which is what §12 of
+> this page guessed. Once `vitrind` holds the display **the kernel stops
+> handling `Ctrl+Alt+F<n>` at all** — the compositor must call
+> `Session::change_vt`, and D-030(1) refused to implement it. Nothing was
+> grabbing anything; the verb was never there.
+>
+> **The escape route that worked, and is now first:** a shell in the
+> still-running **Hyprland session on tty1**. A `vitrind` session on tty3 does
+> not disturb it, so a terminal there reaches the machine:
+>
+> ```
+> pkill -TERM -f "vitrind --drm"
+> ```
+>
+> Until `change_vt` has a production caller, **treat a bare-metal VT as
+> one-way**, and do not start a run without a live Hyprland-side shell.
 
-logind hands the display to whichever VT is active, so switching back is
+### 0.1 First line: a shell inside the running Hyprland session.
+
+Hyprland is on **tty1** and a `vitrind` session on tty3 does not touch it. That
+is the whole property this depends on, and it is the one that has actually been
+observed: the first run was recovered exactly this way. Leave a terminal open
+there — or an agent session running in one, which is what happened — before you
+start anything.
+
+### 0.1b Second line: VT switching, *if and only if* it has been fixed.
+
+Everything below was written before the first run and assumes `Ctrl+Alt+F<n>`
+works. It did not. Check that `change_vt` has a production caller
+(`grep -rn change_vt crates/vitrin-core/src`) before relying on a word of it.
+
+logind hands the display to whichever VT is active, so switching back *would* be
 ordinary and reversible. Hyprland is on **tty1** [verified], and this
 configuration deliberately preserves `Ctrl+Alt+F<n>`: the keybind wrapper skips
 F1–F12 precisely so the recovery path survives. [verified, as a statement about
-the config's intent]
+the config's intent — and note that preserving the keys in the *wrapper* does
+nothing if the *compositor* never acts on them, which is exactly what went
+wrong]
 
 **Before you start, prove the escape route works, in this order:**
 
@@ -213,8 +253,10 @@ reboot — it is not persisted. [verified: no `sysctl.d` file sets it]
 ## Steps at a glance
 
 > **Every "Expect" and every "failure" below is `[inferred]`.** Not one of them
-> has been observed, because the backend does not exist yet (#218) and the first
-> run of this page is the dangerous one. Individual `[verified]` marks appear
+> had been observed when this page was first written, because the backend did
+> not exist yet. **The 2026-08-09 run changed that**: the record block at the
+> bottom is observation, and where it contradicts an `[inferred]` mark above,
+> the record wins. Individual `[verified]` marks appear
 > only on *machine facts* — what `/sys`, `lsmod` and `systemctl` said on
 > 2026-08-09 — never on what a running `vitrind` will do.
 >
@@ -331,9 +373,13 @@ ls -l /dev/dri/
 | Your tty3 session, `Active=yes` | as step 4 | — |
 | You can `test -r /dev/dri/card1` | Permission denied | The logind ACL did not follow you to this session. You are in `video` [verified] so this should not happen; if it does, do not `chmod` anything — it means logind is not treating this as your active session |
 
-**If `--drm` accepts a card argument, pass `/dev/dri/card1` explicitly.** Hazard
-H1: the NVIDIA card is present, has `nvidia_drm` loaded, and has nothing
-connected.
+**No card argument exists, and the automatic choice was right.** The backend
+resolves the card through `udev::primary_gpu(&seat_name)`, and on 2026-08-09 it
+chose `/dev/dri/card1` — the iGPU driving the panel. Hazard H1 (the NVIDIA card
+present, `nvidia_drm` loaded, nothing connected) did **not** materialise: the
+run's log records `DRM device opened card=/dev/dri/card1`. Keep the hazard
+written down anyway — it is a property of this machine, not of the code, and a
+future `primary_gpu` or a docked external display could still land on card2.
 
 ## 6. Start it — this is the irreversible step
 
@@ -422,7 +468,7 @@ Wait five seconds. Come back.
 | `vitrind` survives the switch, the panel comes back, and **the band is the same colour it was before** | A different band colour | The session secret was regenerated, i.e. the human's anchor moved under them. `TrustedIndicator` is generated once per process, so a changed colour means the process restarted — check whether `vitrind` is even the same PID |
 | | `vitrind` died on the switch | `SessionEvent::PauseSession` is unhandled. This is exactly the coupling #218 records: this backend cannot honestly close with that handler unwritten |
 | | Panel comes back black, `vitrind` alive | Master was not reacquired on resume. You still have VT switching — go back to your tty2 escape shell and kill it |
-| | **You cannot switch away at all** | Note that this is *expected* to be possible today: [`limits.md`](book/src/limits.md) records that nothing inhibits `Ctrl-Alt-F<n>` on any backend. If you cannot, something is grabbing the keyboard and you have just lost your first line — go to Recovery |
+| | **You cannot switch away at all** | **THIS IS WHAT HAPPENED, 2026-08-09.** The guess this row used to carry — "something is grabbing the keyboard" — was wrong, and following it would have sent you hunting a phantom. Once `vitrind` holds the display the kernel stops handling `Ctrl+Alt+F<n>` entirely; the compositor must call `Session::change_vt`, and D-030(1) refused to implement it. There is nothing to un-grab. Recover with `pkill -TERM -f "vitrind --drm"` from the Hyprland-side shell in Step 0.1 |
 
 ## 13. Type a letter (WS-E.3.1)
 
@@ -577,51 +623,87 @@ Date it, and record the environment, exactly as
 anyone can tell when it was last actually executed.
 
 ```text
-Last executed: (not yet — WS-E.3.4 landed this page; the backend it describes
-                (WS-E.3.2 / #218) has not landed, so there is nothing to execute
-                against yet. The first dated run belongs to whoever brings the
-                DRM backend up on the target laptop.)
-Kernel:
-Mesa:
-Connector:
-Selected mode:
-Measured frame cadence:
-Card opened (card1/card2):
+Last executed: 2026-08-09, by Taha, on the target laptop (Monster).
+               FIRST EXECUTION. The backend had never been run by anyone.
+Kernel:        7.1.5-arch1-2
+Mesa:          1:26.1.6-1
+Connector:     (logged EMPTY -- see finding 4 below; the panel is the laptop's
+               internal eDP, and mode selection worked, but `connector_name`
+               rendered nothing into the log line)
+Selected mode: 2560x1600 @ 240 Hz
+Measured frame cadence: not measured in fps. What WAS measured: `vitrind` at
+               99.1% CPU (ps), with the shim forwarding continuous full-frame
+               2560x1600 stride=10240 buffers. Run lasted 471 s.
+Card opened:   card1 (the iGPU, chosen automatically by udev::primary_gpu --
+               hazard H1 did not materialise)
 
-Observation checklist — pass/fail and what was seen:
-  7.  Connector and mode ..............
-  8.  App maps and repaints ...........
-  9.  Trusted band ....................
-  10. Consent prompt + physical click ..
-  11. Held-Esc revocation .............
-  12. VT switch away and back .........
-  13. Type a letter ...................
-  14. Frame cadence (number) ..........
-  15. Clean shutdown ..................
+Observation checklist -- pass/fail and what was seen:
+  7.  Connector and mode ............. PASS (2560x1600@240 set on card1);
+                                       connector NAME logged empty
+  8.  App maps and repaints .......... PASS (solid-client's green square drew)
+  9.  Trusted band ................... PASS but MIRRORED -- band drawn along the
+                                       BOTTOM edge. The band's fixed position is
+                                       what made the flip legible; a uniform
+                                       green square alone would have hidden it
+  10. Consent prompt + physical click . NOT TESTED (no agent connected this run)
+  11. Held-Esc revocation ............ NOT TESTED
+  12. VT switch away and back ........ **FAIL -- IMPOSSIBLE.** Ctrl+Alt+F1 and
+                                       Ctrl+Alt+F2 did nothing. See finding 2
+  13. Type a letter .................. PASS -- the Turkish passphrase was typed
+                                       into the lock screen and accepted, so the
+                                       compiled keymap resolves letters
+                                       (recorder: unlock_attempted accepted=true)
+  14. Frame cadence (number) ......... not captured; 99.1% CPU instead
+  15. Clean shutdown ................. PASS (SIGTERM -> run_ended, no stray
+                                       vitrind/vitrin-shim/solid-client left)
 
-Recovery paths actually used (if any):
-Notes:
+  Also observed, not on the checklist:
+      88 seat_delivered events -- libinput routed real mouse and keyboard input
+      session_locked(chord) -> unlock_attempted(true) -> session_unlocked: the
+      lock screen works on bare metal, including the passphrase path
+
+Recovery paths actually used: `pkill -TERM -f "vitrind --drm"` from a shell in
+      the still-running Hyprland session on tty1. VT switching was attempted
+      first, as this page instructed, and did not work. Hyprland and three
+      other working sessions were completely undisturbed throughout.
+
+Notes: four findings, in severity order --
+  1. The image is VERTICALLY MIRRORED (SCANOUT_TRANSFORM = Flipped180).
+  2. The human COULD NOT LEAVE. D-030(1) refused to implement change_vt and
+     pinned the refusal with a test; once vitrind holds the display the kernel
+     stops handling Ctrl+Alt+F<n>. The decision written to keep the escape
+     hatch open is what welded it shut. This page's own first line of defence
+     did not exist.
+  3. 99.1% CPU, laggy cursor, audible fan. solid-client uses wl_shm, so
+     zero-copy scanout can never engage and every frame is a full 2560x1600 CPU
+     composite -- at 240 Hz that is ~3.9 GB/s, which is precisely the cost
+     #218's decision 1 calculated in advance and asked to be measured here.
+     How much is the test client and how much is real is being investigated.
+  4. `connector=` logs empty.
 ```
 
-> **This runbook is UNEXECUTED, and that means issue #220 has an unmet
-> acceptance criterion.** #220 asks that "the runbook has been executed end to
-> end on the target machine and the results recorded in this issue: date, kernel
-> version, mesa version, connector, selected mode, observed frame cadence, and
-> each checklist observation as pass/fail with what was seen." The document
-> exists; the execution does not. **#220 must not be closed as if that criterion
-> were met.**
+> **This runbook HAS been executed: 2026-08-09, on the target machine, results
+> recorded above.** #220's acceptance criterion — "executed end to end on the
+> target machine and the results recorded: date, kernel version, mesa version,
+> connector, selected mode, observed frame cadence, and each checklist
+> observation as pass/fail with what was seen" — is met on every field except
+> **frame cadence**, which was not captured in fps; 99.1% CPU was measured
+> instead, and finding 3 is why that is the more useful number.
 >
-> Why it was not run as part of this change: two independent reasons, either of
-> which alone is sufficient. First, **the backend does not exist** — WS-E.3.2 /
-> #218 is open, and `--drm` is not a flag `vitrind` accepts today. Second, the
-> first execution is by construction the dangerous one: it takes DRM master on
-> the maintainer's own laptop, from a physical keyboard, with a human present to
-> use the escape route. That is exactly the class of evidence CI cannot produce
-> and an agent must not fake — the same split #212, #214 and #232 already wrote
-> down for physical input.
+> **It was not a clean pass, and that is the point.** Three defects came out of
+> it, and every one was found by a human looking at a panel — not by 12 green CI
+> checks, not by 855 unit tests, not by two rounds of adversarial review. One of
+> them is that **this page's own first line of defence did not exist**, which no
+> amount of re-reading the page could have revealed.
 >
-> What the run would add that nothing else does: that this backend lights a real
-> panel, presents a real frame, and delivers a real input event. **No green
-> check in this repository will ever prove those three things**, and the
-> `vkms-advisory` job does not either — see
-> [`docs/book/src/limits.md`](book/src/limits.md).
+> The first execution is by construction the dangerous one: it takes DRM master
+> on the maintainer's own laptop, from a physical keyboard, with a human present
+> to use the escape route. That is exactly the class of evidence CI cannot
+> produce and an agent must not fake — the same split #212, #214 and #232 wrote
+> down for physical input. It was run that way, and the escape route it needed
+> turned out to be the one this page had not listed.
+>
+> **Checklist items 10 and 11 were not tested.** No agent was connected, so
+> neither the consent prompt on bare metal nor held-Esc revocation has ever run
+> against a display controller. Those are the content of the next run, together
+> with re-checking 9 and 12 once the fixes land.

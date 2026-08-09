@@ -3121,6 +3121,16 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
 ///    through the funnel an ordinary release takes. Keys first is
 ///    [`InputRouter::bind_to`]'s order: a keyboard latch is the state that
 ///    misbehaves worst.
+/// 3. **Every chord matcher forgets its physical state.** The drain above pays
+///    the *app* its held presses, but those deliveries are `SeatDelivery`s
+///    handed straight to the funnel — they are not `SeatInput`s and they never
+///    re-enter the hook stack, so each matcher keeps whatever it believed at
+///    the instant the devices went away. That is a live defect rather than a
+///    hypothetical, and the VT escape makes it fire on the very first use: a
+///    human leaving this VT is holding **Ctrl and Alt by construction**, so
+///    without this their next bare F5 switches VT, their next bare Insert
+///    fires a clipboard gesture, and their next bare Delete raises the lock.
+///    See [`crate::chord::ChordMatcher::forget_physical_state`].
 ///
 /// # Buttons too, unlike nested focus loss, and that asymmetry is the decision
 ///
@@ -3156,6 +3166,21 @@ pub(crate) fn suspend_physical_seat<H: crate::input::PreemptionHook>(
 ) -> usize {
     // Before the drain, deliberately (doc comment above).
     switch.borrow_mut().forget_hold();
+    // Step 3 (doc comment above): the two matchers the *kernel* holds. The
+    // lock's and the VT escape's are forgotten by the backend's pause arm,
+    // which is where those two live; these are here because this is the one
+    // function that already has the kernel in hand, and because a default
+    // build has a behavioural test for it and no seat.
+    runtime
+        .kernel
+        .clipboard
+        .borrow_mut()
+        .forget_physical_state();
+    runtime
+        .kernel
+        .screenshot
+        .borrow_mut()
+        .forget_physical_state();
 
     let Runtime {
         router,
@@ -6857,6 +6882,68 @@ mod tests {
             2,
             "the drained presses must reach the realm's shim through the ordinary delivery \
              funnel and be journalled there"
+        );
+
+        // ---------------------------------------------------------------
+        // ...and every chord matcher forgot what it believed (WS-E.3.5).
+        // ---------------------------------------------------------------
+        //
+        // The drain above pays the *app* its held presses, but those go
+        // straight to the delivery funnel as `SeatDelivery`s -- they are not
+        // `SeatInput`s and they never re-enter the hook stack -- so each
+        // matcher keeps whatever modifiers it believed were down at the
+        // instant the devices went away. **This was live on this branch**, and
+        // the VT escape makes it fire on the very first use: a human leaving
+        // this VT is holding ctrl+alt by construction, because that is how
+        // they left.
+        //
+        // Driven on the screenshot chord because this rig's hook stack is the
+        // screenshot/attention pair, so it is the matcher whose `observe` the
+        // production intake actually reaches here. The clipboard's and the
+        // lock's are the same mechanism with different keys; the VT escape's
+        // has its own test beside it.
+        let press = |keysym: u32| {
+            physical_for_test(SeatInputKind::Key {
+                source: crate::input::KeySource::Keysym,
+                keysym,
+                state: KeyState::Pressed,
+            })
+        };
+        const CTRL_L: u32 = 0xffe3;
+        const PRINT: u32 = 0xff61;
+
+        // The control: with Ctrl genuinely held, the default `ctrl+print`
+        // chord fires. Without this the assertion below would pass against a
+        // rig whose screenshot chord never worked at all.
+        // Counted off the journal rather than off `take_pending`, because
+        // `route_physical_turn` drains the queue inside the turn: this rig has
+        // no `--screenshot-dir`, so a fired gesture lands as exactly one
+        // `screenshot_failed{no_screenshot_dir}` entry.
+        let fired = |rig: &mut Rig| {
+            rig.entries()
+                .iter()
+                .filter(|e| e.str("kind") == "screenshot_failed")
+                .count()
+        };
+        turn(&mut rig, vec![press(CTRL_L)]);
+        turn(&mut rig, vec![press(PRINT)]);
+        assert_eq!(
+            fired(&mut rig),
+            1,
+            "the screenshot chord must fire while Ctrl is really held, or the assertion below \
+             is vacuous"
+        );
+
+        // The seat leaves again. No release for Ctrl will ever arrive.
+        suspend_physical_seat(&mut rig.host.runtime, &rig.host.view.scenes, &switch);
+
+        turn(&mut rig, vec![press(PRINT)]);
+        assert_eq!(
+            fired(&mut rig),
+            1,
+            "a stale modifier bit survived the pause: the human's next BARE key now fires a \
+             chord they did not make. On bare metal that means a bare F5 switches VT and a \
+             bare Delete raises the lock screen"
         );
     }
 

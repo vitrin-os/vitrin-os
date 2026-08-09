@@ -491,6 +491,12 @@ impl ScreenshotSignal {
     pub fn take_pending(&mut self) -> Vec<ScreenshotGesture> {
         std::mem::take(&mut self.pending)
     }
+
+    /// Forget the modifier bits and the consumed set across a seat pause —
+    /// [`ChordMatcher::forget_physical_state`], whose docs carry the reason.
+    pub fn forget_physical_state(&mut self) {
+        self.matcher.forget_physical_state();
+    }
 }
 
 /// The screenshot chord attached at the router's preemption hook point.

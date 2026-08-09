@@ -96,9 +96,10 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use calloop::signals::{Signal, Signals};
+use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, LoopHandle, LoopSignal};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
@@ -112,7 +113,9 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{Bind, Color32F, Frame, ImportDma, ImportMem, Renderer, Texture};
 use smithay::backend::session::libseat::LibSeatSession;
-use smithay::backend::session::{Event as SessionEvent, Session};
+// `AsErrno` for `as_errno()`: a failed `change_vt` is journalled with the
+// integer and never with the OS *message*, on `ClipboardRefused`'s rule.
+use smithay::backend::session::{AsErrno, Event as SessionEvent, Session};
 use smithay::reexports::drm::control::{
     connector, crtc, Device as ControlDevice, Mode as DrmMode, ModeTypeFlags,
 };
@@ -138,19 +141,46 @@ use crate::session::{self, Presenter, Runtime, RuntimeSeed};
 
 /// The output transform every draw into a **scanout** buffer takes.
 ///
-/// The same value the nested backend's window surface uses, and for the same
-/// reason: GL's framebuffer origin is bottom-left while every composition in
-/// this core is top-down (`Scene::compose`'s contract), and a DRM scanout
-/// reads the buffer top-down from offset zero — so the projection is flipped
-/// exactly as it is for the host window. (The offscreen renderbuffer in
-/// `dmabuf`'s GPU harness needs `Normal` because `copy_framebuffer` reads it
-/// back the other way up; that is a readback, not a display.)
+/// # This was `Flipped180`, and the panel showed the composition upside down
 ///
-/// **Unverified on hardware, and it cannot be verified here.** It is a
-/// reasoned default, not a measurement: nothing in this workspace can put a
-/// frame on a panel. A frame presented upside down is the symptom, and
-/// WS-E.3.4's bring-up runbook owns the check.
-const SCANOUT_TRANSFORM: Transform = Transform::Flipped180;
+/// On 2026-08-09 this backend ran on real hardware for the first time and the
+/// trusted band — drawn in rows `[0, 8)` by construction — appeared along the
+/// **bottom** edge of the panel. That is a pure vertical mirror, and it is
+/// exactly what `Flipped180` produces here. The old comment reasoned "a window
+/// surface needs a flip, so a scanout buffer needs the same flip". The two are
+/// opposite kinds of target and the reason is in smithay's own source:
+///
+/// * [`GlesRenderer::render`] always post-multiplies its own y-flip
+///   (`smithay-0.7.0/src/backend/renderer/gles/mod.rs`: `flip180 *
+///   transform.matrix() * renderer`, commented "we account for OpenGLs
+///   coordinate system here"). With [`Transform::Normal`] the logical top row
+///   therefore lands at framebuffer row 0. `Flipped180.matrix()` is exactly
+///   `diag(1, -1, 1)`, so it *cancels* that flip and the logical top row lands
+///   at the framebuffer's **last** row. `x` is untouched either way, which is
+///   why the symptom is a vertical mirror with no left-right component.
+/// * "Framebuffer row 0" then means opposite things. For an **EGL window
+///   surface** (the nested backend) GL's default framebuffer origin is
+///   bottom-left, so row 0 is the bottom of the displayed window — that path
+///   really does need `Flipped180`, and `backend::winit` records the
+///   regression that taught it so. For a **GBM/dmabuf target** (this path:
+///   `renderer.bind(&mut dmabuf)` over the buffer `GbmBufferedSurface`
+///   scans out) row 0 is the first row of the buffer's memory, and a CRTC
+///   scans that out as the **top** scanline. So this is `Normal`.
+///
+/// The offscreen renderbuffer in `dmabuf`'s GPU harness already passes
+/// `Normal` for precisely this reason — it is a memory-backed target read back
+/// top-down — and `with_trust_band` asserts the band in the *first* rows of
+/// that readback. A scanout buffer is a memory-backed target of the same kind;
+/// this constant took the window's value instead, which is the whole defect.
+///
+/// `the_scanout_and_the_window_are_opposite_kinds_of_target` pins the
+/// relationship rather than the literal, so the next reader is not handed a
+/// magic constant.
+///
+/// **Still unconfirmed on hardware, and nothing here can confirm it.** No test
+/// in this workspace can put a frame on a panel; the evidence is WS-E.3.4's
+/// runbook, re-run and dated.
+const SCANOUT_TRANSFORM: Transform = Transform::Normal;
 
 /// Background behind the composed view, visible only if the blit fails.
 /// The nested backend's constant, restated here rather than shared because it
@@ -165,16 +195,45 @@ const SCANOUT_FORMATS: &[Fourcc] = &[Fourcc::Xrgb8888, Fourcc::Argb8888];
 
 /// The hook stack this backend's router carries.
 ///
-/// **The nested backend's alias, reused rather than respelled.** The order —
-/// lock, consent grab, dead-man watcher, clipboard, screenshot, attention — is
-/// a decision, and `backend::winit`'s `NestedHook` is where it is written
-/// down, complete with the argument for why the lock gate must be outermost. A
-/// second spelling here would be a second place that decision could drift, and
-/// the drift would be silent: `Runtime::new` takes the presence map, the
-/// attention signal and both chord queues *out of the router*, so a stack
-/// missing one hands the kernel a signal nothing ever writes — the mechanism
-/// dies and every test stays green.
-pub(crate) type DrmHook = super::winit::NestedHook;
+/// **The nested backend's alias with exactly one hook wrapped around it.** The
+/// inner order — lock, consent grab, dead-man watcher, clipboard, screenshot,
+/// attention — is a decision, and `backend::winit`'s `NestedHook` is where it
+/// is written down, complete with the argument for why the lock gate is
+/// outermost *there*. A second spelling of that order here would be a second
+/// place it could drift, and the drift would be silent: `Runtime::new` takes
+/// the presence map, the attention signal and both chord queues *out of the
+/// router*, so a stack missing one hands the kernel a signal nothing ever
+/// writes — the mechanism dies and every test stays green.
+///
+/// **[`crate::vt::VtHook`] is the first hook this project has ever put outside
+/// the lock gate** (WS-E.3.5, D-031), and it is bare metal's alone because
+/// only a process holding DRM master can implement `Ctrl-Alt-F<n>` — the
+/// kernel stops handling it the moment one does. Outside the lock because the
+/// escape must work *while locked*: `LockGate::judge` consumes every physical
+/// press while the lock is up, so any inner position would make the chord dead
+/// exactly when a trapped human most needs it.
+///
+/// `crate::lock::gate`'s soundness argument survives rather than merely
+/// tolerating this: a `ChordMatcher` never consumes a modifier key, so
+/// `LockGate::judge` still sees every Ctrl/Alt/Shift/Super transition it saw
+/// before, and the only events it can now be denied are F-key presses that
+/// matched a `ctrl+alt` chord — which `main`'s startup refusal reserves against
+/// every other core chord on this backend.
+/// `the_vt_chord_is_the_only_hook_outside_the_lock_gate` pins the shape at
+/// compile time, so reordering it stops the crate building.
+pub(crate) type DrmHook = crate::vt::VtHook<super::winit::NestedHook>;
+
+/// How long the core waits for the seat's `PauseSession` after a `change_vt`
+/// it accepted.
+///
+/// `libseat_switch_session` is asynchronous — the request goes to
+/// seatd/logind and `SessionEvent::PauseSession` arrives later on this same
+/// loop — so `Ok(())` means *accepted*, not *switched*. An accepted request
+/// that produces no pause is exactly the shape of the defect this backend
+/// shipped: a chord that appears to work and does not. Two seconds is a
+/// judgement, not a measurement, and is long enough that a busy seatd is not
+/// mistaken for a broken one.
+const VT_SWITCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ============================================================================
 // Output selection: the one refusal this backend makes at startup
@@ -394,6 +453,14 @@ pub(crate) struct DrmView {
     lock: crate::lock::LockSurface,
     indicator: TrustedIndicator,
     status: crate::status::StatusStrip,
+    /// **The one surface that can tell a trapped human anything** (WS-E.3.5).
+    ///
+    /// Raised when a `Ctrl-Alt-F<n>` the human pressed does not move them. It
+    /// lives on the view rather than beside the runtime because it is
+    /// presentation state exactly as `consent`, `lock` and `status` are, and it
+    /// is on **this** backend alone because it is the only one whose failure
+    /// mode is a human who cannot leave the screen to read a log.
+    notice: crate::notice::CoreNotice,
     dmabuf_content: RealmGpuContent,
     agent_cursor: Option<(f64, f64)>,
     /// **The human's own pointer**, in view coordinates, accumulated from
@@ -472,7 +539,8 @@ impl DrmView {
         // the nested backend samples it: a hold that completes mid-frame is
         // judged consistently within it.
         let hold = self.deadman.borrow().hold_progress(Instant::now());
-        let overlay_up = overlay_needs_the_window(hold, &self.consent, &self.lock);
+        let overlay_up =
+            overlay_needs_the_window(hold, &self.consent, &self.lock, Some(&self.notice));
         let agent_cursor = self.agent_cursor;
         // Always `Some` on this backend, and that is the whole of decision 6:
         // there is no host desktop drawing this, so a `None` here is a session
@@ -530,6 +598,7 @@ impl DrmView {
             &mut self.consent,
             &mut self.lock,
             &mut self.status,
+            Some(&mut self.notice),
             hold,
             agent_cursor,
             human_cursor,
@@ -814,24 +883,32 @@ pub(crate) struct DrmState {
     /// `--lock-passphrase-file` in that configuration, because a passphrase
     /// nobody can type is a lock nobody can answer.
     keymap: Option<CoreKeymap>,
-    /// The seat handle, held for its lifetime and **not** for its verbs.
+    /// The seat handle, held for its **lifetime** and for exactly **one verb**.
     ///
     /// `LibSeatSession` owns the seat every device this session opened belongs
     /// to, so dropping it would close them underneath a live compositor. That
-    /// is the whole reason it is a field.
+    /// is the first reason it is a field.
     ///
-    /// It also carries `Session::change_vt`, and D-030(1) is the decision that
-    /// this core never calls it: it does not inhibit a switch, does not
-    /// initiate one, and does not switch *back*. A display server that can move
-    /// the human between VTs is one that can trap them on its own, which
-    /// contradicts the posture the dead-man switch is built on — the human
-    /// always has an off-switch, and on bare metal `Ctrl-Alt-F<n>` is it. The
-    /// band is scoped to this screen instead (`crate::consent::indicator`).
-    #[allow(
-        dead_code,
-        reason = "held for the seat's lifetime, not for its verbs: dropping it would close \
-                  the devices this session opened. D-030(1) refuses `change_vt` outright"
-    )]
+    /// The second is `Session::change_vt`, called from exactly one place
+    /// ([`DrmState::drain_vt_requests`]) and only ever with a
+    /// [`crate::vt::VtRequest`] no principal can construct. **D-031 replaces
+    /// D-030(1) here**: that entry refused the call, reasoning that a display
+    /// server which can move the human between VTs can trap them on its own —
+    /// correct, and inverted in effect, because once a compositor holds DRM
+    /// master the kernel stops handling `Ctrl-Alt-F<n>`, so *not* calling this
+    /// is what welds the escape hatch shut. It was observed that way on
+    /// hardware on 2026-08-09.
+    ///
+    /// The posture in one line: **the core moves the human's VT only when the
+    /// human's own hands ask it to, and never otherwise.** It never inhibits a
+    /// switch, never initiates one on its own account, and never switches
+    /// back — which is why the seat handler is still forbidden to name this
+    /// verb (`the_seat_handler_...`'s third forbidden token).
+    ///
+    /// The `#[allow(dead_code)]` this field used to carry, whose reason said
+    /// "D-030(1) refuses `change_vt` outright", is deleted: the field is used.
+    /// The compiler would not have flagged the stale attribute, which is
+    /// exactly why it had to go by hand.
     seat: LibSeatSession,
     /// The DRM device, held so the seat's pause/activate can reach it.
     ///
@@ -855,6 +932,37 @@ pub(crate) struct DrmState {
     /// nodes stay open across a switch away — the seat revokes the fds
     /// underneath, and libinput is left holding devices it can no longer read.
     libinput: Libinput,
+    /// **The VT escape's queue** (WS-E.3.5, D-031), shared with the router's
+    /// outermost hook.
+    ///
+    /// Held as a field rather than reached through
+    /// [`crate::input::PreemptionHook`]'s wiring accessors, unlike the
+    /// attention/clipboard/screenshot signals, and that is a security decision
+    /// rather than a convenience: a fourth accessor would put a handle on
+    /// "switch the human's VT" on a trait `crate::session` — backend-agnostic,
+    /// shared with nested and headless — can reach. Off the trait,
+    /// `change_vt` stays reachable from exactly one file.
+    vt: Rc<RefCell<crate::vt::VtSignal>>,
+    /// This session's own VT, if it could be resolved at startup, and `None`
+    /// when it could not.
+    ///
+    /// Two uses, both diagnostics and neither gating the chord: a request
+    /// naming this VT is dropped before the call (`Ok`, no pause, a false
+    /// alarm), and the startup banner tells the human the number they need to
+    /// come *back* to. With `None` the chord still works and
+    /// [`Self::vt_pending`]'s watchdog is disabled — a silent watchdog beats a
+    /// lying one, and the escape must never be gated on a diagnostic.
+    self_vt: Option<i32>,
+    /// A `change_vt` the seat accepted, and when. Cleared by `PauseSession` —
+    /// the pause **is** the acknowledgement — and by the watchdog timer.
+    vt_pending: Option<(crate::vt::TargetVt, Instant)>,
+    /// `arm_deadman_timer`'s discipline, for the same reason: requests must
+    /// not stack timers.
+    vt_timer_armed: bool,
+    /// The notice surface's expiry timer, on the same discipline: this
+    /// backend's frame clock is the panel's, so an idle session would never
+    /// wake to take an expired notice off the screen.
+    notice_timer_armed: bool,
     deadman_chord: &'static str,
     deadman_timer_armed: bool,
     loop_signal: LoopSignal,
@@ -1121,6 +1229,211 @@ impl DrmState {
         // Backstop 2 of 3 for the elapse check: a physical event is not a
         // frame, so an armed hold needs this to start animating.
         self.deadman_tick(TickSource::OffChain);
+        // **Last, and only here** (WS-E.3.5, D-031). Last because `change_vt`
+        // is the one effect that ends this turn's ability to do anything else;
+        // only here because this is the single `&mut self` scope where
+        // `self.seat` is reachable from a *physical* input turn, which is the
+        // only thing that can produce a `VtRequest` at all.
+        self.drain_vt_requests();
+    }
+
+    /// **Perform the VT switch the human's chord asked for** — the only place
+    /// in this workspace that names `Session::change_vt`.
+    ///
+    /// The gate cannot make this call: it runs inside
+    /// [`crate::input::InputRouter::route_physical`], which holds no seat and
+    /// must not grow one. Same division as `ClipboardSignal`,
+    /// `ScreenshotSignal` and `LockJournal` — the hook records *that the human
+    /// asked*, the embedder answers *what that costs*.
+    ///
+    /// Four rules, and each is here because its absence is silent:
+    ///
+    /// * **Never fatal, never a panic, never a `?` that ends the session.**
+    ///   The session is the only thing still drawing on the human's panel;
+    ///   killing it because they could not leave it is the worst available
+    ///   outcome. This is the activate arm's posture for `libinput.resume()`
+    ///   and `device.activate()`.
+    /// * **Journalled before the call**, so a request that never returns is
+    ///   still on record. The flight recorder for the run that produced this
+    ///   change is silent about the two chords the human pressed to escape.
+    /// * **A request naming our own VT is dropped**, because it would return
+    ///   `Ok` and produce no pause, firing the watchdog on a working session
+    ///   and teaching the human to ignore the one indicator that matters.
+    /// * **`Ok(())` is not proof.** `libseat_switch_session` is asynchronous;
+    ///   the acknowledgement is `SessionEvent::PauseSession`, so an accepted
+    ///   request arms [`VT_SWITCH_TIMEOUT`] and a timeout raises the same
+    ///   on-screen notice a hard refusal does.
+    fn drain_vt_requests(&mut self) {
+        // Taken into a local first: the `RefMut` must be dropped before
+        // anything below touches `&mut self`.
+        let request = self.vt.borrow_mut().take_pending();
+        let Some(request) = request else {
+            return;
+        };
+        let target = request.target();
+        let vt = target.get();
+
+        if self.self_vt == Some(vt) {
+            info!(vt, "already on this VT; not asking the seat to switch");
+            self.runtime
+                .kernel
+                .recorder
+                .record(crate::recorder::Event::VtSwitchRefused {
+                    vt,
+                    reason: "already_here",
+                    errno: None,
+                });
+            return;
+        }
+
+        self.runtime
+            .kernel
+            .recorder
+            .record(crate::recorder::Event::VtSwitchRequested { vt });
+        info!(vt, "the human chorded a VT switch; asking the seat");
+        match self.seat.change_vt(vt) {
+            Ok(()) => {
+                // Accepted, not switched. Arm the watchdog.
+                self.vt_pending = Some((target, Instant::now()));
+                self.arm_vt_timer();
+            }
+            Err(err) => {
+                let errno = err.as_errno();
+                // A fixed label from a closed vocabulary, never the OS
+                // message: a journal field an errno *message* can reach is a
+                // journal field an attacker's filename can reach
+                // (`ClipboardRefused`'s and `ScreenshotFailed`'s rule).
+                let reason = if errno.is_some() {
+                    "seat_refused"
+                } else {
+                    "session_lost"
+                };
+                error!(vt, ?errno, "the seat refused to switch this session's VT");
+                self.runtime
+                    .kernel
+                    .recorder
+                    .record(crate::recorder::Event::VtSwitchRefused { vt, reason, errno });
+                self.raise_trapped_notice(vt);
+            }
+        }
+    }
+
+    /// Put the failure on the **panel**, not only in the log.
+    ///
+    /// This is the part that must not be argued away. The human is looking at
+    /// the screen; if they could read the log they would not be trapped. A
+    /// failure that lives only in `stderr` and the journal reproduces the
+    /// original defect exactly — a key that does nothing and says nothing.
+    fn raise_trapped_notice(&mut self, vt: i32) {
+        self.view.notice.raise(
+            crate::notice::NoticeContent::VtSwitchFailed {
+                target: vt,
+                own: self.self_vt,
+            },
+            Instant::now(),
+        );
+        // A notice forces the CPU composite (`overlay_needs_the_window`), so
+        // the frame has to be asked for as well as owed.
+        self.view.request_present();
+        self.arm_notice_timer();
+    }
+
+    /// Arm the one-shot timer that takes an expired notice off the screen.
+    ///
+    /// Needed because this backend's frame clock is the panel's: after the
+    /// frame that *shows* the notice lands, an idle session has no reason to
+    /// wake again, and the notice would stay up for the rest of the session.
+    /// `arm_deadman_timer`'s shape, re-scheduling rather than dropping while
+    /// the notice is still up, so a second raise cannot be cleared early by
+    /// the first raise's timer.
+    fn arm_notice_timer(&mut self) {
+        if self.notice_timer_armed {
+            return;
+        }
+        let Some(until) = self.view.notice.until() else {
+            return;
+        };
+        let armed = self.loop_handle.insert_source(
+            Timer::from_deadline(until),
+            |_deadline, _, state: &mut DrmState| {
+                state.notice_tick();
+                match state.view.notice.until() {
+                    Some(next) => TimeoutAction::ToInstant(next),
+                    None => {
+                        state.notice_timer_armed = false;
+                        TimeoutAction::Drop
+                    }
+                }
+            },
+        );
+        match armed {
+            Ok(_token) => self.notice_timer_armed = true,
+            Err(err) => warn!(
+                %err,
+                "could not arm the notice timer; the message stays on screen until the next \
+                 frame"
+            ),
+        }
+    }
+
+    /// Expire a raised notice, and ask for the frame that erases it.
+    fn notice_tick(&mut self) {
+        if self.view.notice.tick(Instant::now()) {
+            self.view.request_present();
+        }
+    }
+
+    /// Arm the one-shot watchdog for an accepted-but-unacknowledged switch.
+    ///
+    /// `arm_deadman_timer`'s shape, including the `timer_armed` bool, so a
+    /// human hammering the chord cannot stack timers.
+    fn arm_vt_timer(&mut self) {
+        if self.vt_timer_armed {
+            return;
+        }
+        // With no resolved VT there is nothing to compare a pause against, so
+        // the watchdog is off rather than wrong (`self_vt`'s docs).
+        if self.self_vt.is_none() {
+            return;
+        }
+        let Some((_, asked_at)) = self.vt_pending else {
+            return;
+        };
+        let armed = self.loop_handle.insert_source(
+            Timer::from_deadline(asked_at + VT_SWITCH_TIMEOUT),
+            |_deadline, _, state: &mut DrmState| {
+                state.vt_timer_armed = false;
+                if let Some((target, asked_at)) = state.vt_pending.take() {
+                    let vt = target.get();
+                    let after_ms = asked_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    error!(
+                        vt,
+                        after_ms,
+                        "the seat accepted a VT switch and never paused this session; the human \
+                         is still here"
+                    );
+                    state
+                        .runtime
+                        .kernel
+                        .recorder
+                        .record(crate::recorder::Event::VtSwitchStalled { vt, after_ms });
+                    state.raise_trapped_notice(vt);
+                }
+                TimeoutAction::Drop
+            },
+        );
+        match armed {
+            Ok(_token) => self.vt_timer_armed = true,
+            Err(err) => {
+                // Not fatal and not silent: the switch may still happen, and
+                // what is lost is the ability to *tell the human* it did not.
+                error!(
+                    %err,
+                    "could not arm the VT-switch watchdog; a switch that silently fails will \
+                     now be invisible at the panel"
+                );
+            }
+        }
     }
 
     /// The seat took the devices away (a VT switch), or gave them back.
@@ -1129,12 +1442,18 @@ impl DrmState {
     /// decisions that are *not* taken here are named there rather than left as
     /// a `warn!` pointing at an unwritten entry:
     ///
-    /// * **The core does not prevent the switch.** It cannot — the kernel owns
-    ///   `VT_SETMODE` — and a display server that traps the human on its own VT
-    ///   contradicts the dead-man switch's whole posture. The answer is scope,
-    ///   not prevention: the trusted band asserts only about this screen and
-    ///   this process, and `docs/book/src/limits.md` says so in the human's own
-    ///   words.
+    /// * **Neither arm may change the VT** (D-030(1), narrowed by D-031). The
+    ///   core does not *prevent* a switch and does not *initiate* one on its
+    ///   own account: a `change_vt` on either arm below would be a core moving
+    ///   the human in response to a **seat event** rather than a human
+    ///   gesture — a core that switches back, or one that fights another
+    ///   compositor for the terminal. That is the trap D-030(1) correctly
+    ///   named and D-031 does not license. The core *does* now implement
+    ///   `Ctrl-Alt-F<n>` itself, because once it holds DRM master the kernel
+    ///   stops handling it — but only from a human's physical chord, in
+    ///   [`DrmState::drain_vt_requests`], and never from here. The trusted
+    ///   band is still scoped to this screen and this process, and
+    ///   `docs/book/src/limits.md` says so in the human's own words.
     /// * **A switch away does not raise the lock**, and `LockCause` gains no
     ///   third variant. A lock raised on a seat event would claim a protection
     ///   this core does not have (the other VT is not covered, and D-025 keeps
@@ -1196,6 +1515,38 @@ impl DrmState {
                 // passphrase prompt nobody asked for. A lock already up stays
                 // up -- this suppresses the raise, never a lower.
                 self.lock.borrow_mut().set_seat_absent(true, self.now.get());
+                // **The pause IS the acknowledgement** of a `change_vt` this
+                // core asked for (WS-E.3.5), so the watchdog is disarmed here
+                // and nowhere else. An outstanding timer fires against an
+                // empty `vt_pending` and does nothing.
+                self.vt_pending = None;
+                // **Every chord matcher forgets what it believed** — the two
+                // this backend owns; `suspend_physical_seat` below does the
+                // clipboard's and the screenshot's, because it is the one
+                // function that already holds the kernel.
+                //
+                // Not hygiene. The drain pays the *app* its held presses by
+                // handing `SeatDelivery`s straight to the delivery funnel;
+                // they never re-enter the hook stack, so each matcher keeps
+                // whatever it believed at the instant the devices went away.
+                // At the instant of a VT switch the human is holding **Ctrl
+                // and Alt by construction**, so without this their next bare
+                // F5 switches VT again and their next bare Delete raises the
+                // lock screen. `ChordMatcher::forget_physical_state` carries
+                // the full argument, including the stranded-press half.
+                self.vt.borrow_mut().forget_physical_state();
+                self.lock.borrow_mut().forget_physical_state();
+                // ...and xkbcommon's own copy, which is the same latch one
+                // layer down and was missed on the first pass. The matchers
+                // above track modifiers as bits they set and clear; the keymap
+                // tracks them as a state machine libxkbcommon owns, and
+                // clearing one without the other leaves the two disagreeing.
+                // Concretely: on return every key resolves at the Ctrl+Alt
+                // level, so the human's `a` is not an `a`, for the rest of the
+                // session.
+                if let Some(keymap) = self.keymap.as_mut() {
+                    keymap.forget_physical_state();
+                }
                 // The `Rc` is cloned so the `RefCell` borrow inside holds
                 // nothing of `self`, leaving `runtime` and `view.scenes` as two
                 // disjoint field borrows.
@@ -1571,30 +1922,60 @@ fn run_inner(
         );
     }
 
-    // The hook stack, in `DrmHook`'s order -- which is `NestedHook`'s order,
-    // because it is the same alias and the same decision.
+    // **The VT escape** (WS-E.3.5, D-031). Built before the router because the
+    // hook is the outermost member of it.
+    let vt_signal = Rc::new(RefCell::new(
+        crate::vt::VtSignal::new().expect("the twelve ctrl+alt+F<n> chords are distinct"),
+    ));
+    let self_vt = crate::vt::resolve_own_vt();
+    info!(
+        vt = ?self_vt,
+        count = crate::vt::VT_COUNT,
+        "VT escape armed: Ctrl-Alt-F1..F12 switch virtual terminal and are CONSUMED in every \
+         realm. Once this process holds DRM master the kernel stops handling that chord, so a \
+         session that did not implement it would be one you cannot leave. It works while the \
+         screen is locked and is never a way past the lock. Press Ctrl-Alt-F<the vt above> to \
+         come back -- write it down"
+    );
+    if self_vt.is_none() {
+        warn!(
+            "this session's own VT could not be resolved (no usable XDG_VTNR and \
+             /sys/class/tty/tty0/active unreadable). The escape chord still works; what is off \
+             is the watchdog that would tell you a switch silently failed, and the notice that \
+             would name the VT to come back to"
+        );
+    }
+
+    // The hook stack, in `DrmHook`'s order: `NestedHook`'s order with the VT
+    // escape wrapped around it. The VT hook is OUTSIDE the lock gate -- the
+    // first hook ever to be -- because `LockGate::judge` consumes every
+    // physical press while the lock is up, so any inner position makes the
+    // escape dead exactly when a trapped human most needs it (D-031(2)).
     let router = input::InputRouter::new(
         Rc::new(RefCell::new(input::PhysicalPresenceMap::new())),
         Rc::clone(&now),
-        crate::lock::lock_gate(
-            Rc::clone(&lock_screen),
-            Rc::clone(&now),
-            ConsentGate::new(
-                Rc::clone(&grab),
+        crate::vt::VtHook::new(
+            Rc::clone(&vt_signal),
+            crate::lock::lock_gate(
+                Rc::clone(&lock_screen),
                 Rc::clone(&now),
-                DeadManHook::new(
-                    Rc::clone(&deadman),
+                ConsentGate::new(
+                    Rc::clone(&grab),
                     Rc::clone(&now),
-                    crate::clipboard::ClipboardHook::new(
-                        Rc::clone(&clipboard_signal),
-                        crate::screenshot::ScreenshotHook::new(
-                            Rc::clone(&screenshot_signal),
-                            crate::attention::AttentionHook::new(
-                                Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
-                                    attention,
-                                ))),
-                                Rc::clone(&now),
-                                input::NoopHook,
+                    DeadManHook::new(
+                        Rc::clone(&deadman),
+                        Rc::clone(&now),
+                        crate::clipboard::ClipboardHook::new(
+                            Rc::clone(&clipboard_signal),
+                            crate::screenshot::ScreenshotHook::new(
+                                Rc::clone(&screenshot_signal),
+                                crate::attention::AttentionHook::new(
+                                    Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
+                                        attention,
+                                    ))),
+                                    Rc::clone(&now),
+                                    input::NoopHook,
+                                ),
                             ),
                         ),
                     ),
@@ -1630,6 +2011,7 @@ fn run_inner(
             lock: crate::lock::LockSurface::new(indicator),
             indicator,
             status: crate::status::StatusStrip::new(status),
+            notice: crate::notice::CoreNotice::new(),
             dmabuf_content: RealmGpuContent::new(),
             agent_cursor: None,
             // The middle of the output: a pointer that started in a corner
@@ -1651,6 +2033,11 @@ fn run_inner(
         seat,
         device,
         libinput: libinput_handle,
+        vt: vt_signal,
+        self_vt,
+        vt_pending: None,
+        vt_timer_armed: false,
+        notice_timer_armed: false,
         deadman_chord: dead_man.chord.name(),
         deadman_timer_armed: false,
         loop_signal: event_loop.get_signal(),
@@ -2132,9 +2519,19 @@ mod tests {
     ///   event would claim a protection this core does not have while charging
     ///   the human a passphrase for using the escape hatch D-030(1) leaves open
     ///   on purpose.
-    /// * **Neither arm may change the VT** (D-030(1)). `LibSeatSession` carries
-    ///   `change_vt`; a display server that can move the human between VTs is
-    ///   one that can trap them on its own.
+    /// * **Neither arm may change the VT** (D-030(1), narrowed by D-031). This
+    ///   assertion **survives** the decision that made the core implement
+    ///   `Ctrl-Alt-F<n>`, because it was always right about *this method*: a
+    ///   `change_vt` on the pause or activate arm would be a core that moves
+    ///   the human in response to a **seat event** rather than a human
+    ///   gesture — a core that switches back, or one that fights another
+    ///   compositor for the terminal. That is the trap D-030(1) correctly
+    ///   named and D-031 does not license. What was wrong was never the
+    ///   test's scope; it was the decision behind it.
+    /// * **The pause arm must forget every chord matcher's physical state**
+    ///   (WS-E.3.5). Added here rather than left to the behavioural test one
+    ///   module over because two of the four matchers — the VT escape's and
+    ///   the lock's — live on this backend and nothing else can reach them.
     #[test]
     fn the_seat_handler_drains_on_pause_restores_the_guard_on_resume_and_rotates_nothing() {
         let after = source()
@@ -2160,6 +2557,23 @@ mod tests {
             "the activate arm stopped restarting the consent guard: a card raised before the \
              switch spent its guard on somebody else's VT, and the first press on return \
              commits it"
+        );
+        // WS-E.3.5: the two matchers only this file can reach. The clipboard's
+        // and the screenshot's are forgotten inside `suspend_physical_seat`,
+        // which has its own behavioural test in the default build.
+        assert_eq!(
+            pause.matches("forget_physical_state()").count(),
+            3,
+            "the pause arm stopped forgetting one of the THREE modifier states -- the VT matcher, the lock matcher, or xkbcommon's own: the human was \
+             holding ctrl+alt when they left this VT -- by construction, since that is how they \
+             left -- and no release will ever arrive, so their next bare F5 switches VT again \
+             and their next bare Delete raises the lock screen"
+        );
+        assert!(
+            pause.contains("self.vt_pending = None"),
+            "the pause arm stopped disarming the VT watchdog: the pause IS the acknowledgement \
+             of a change_vt this core asked for, so leaving it set makes a working switch \
+             report itself as stalled on the panel"
         );
         // The gate that keeps `Shown` honest, read off the SAME field
         // `should_queue_flip` reads -- one notion of "is this screen ours",
@@ -2192,10 +2606,17 @@ mod tests {
                  does not have, and charge the human a passphrase for the escape hatch \
                  D-030(1) deliberately leaves open",
             ),
+            // Call syntax, not the bare word, on this file's own precedent for
+            // `copy_framebuffer(`: the pause arm's comment *names* the verb
+            // while explaining that the pause is its acknowledgement, and a
+            // test that failed on its own explanation would teach the next
+            // reader to delete the explanation.
             (
-                "change_vt",
-                "this core never moves the human between VTs; one that can is one that can \
-                 trap them on its own (D-030(1))",
+                "change_vt(",
+                "`change_vt` in the seat handler: this core switches VT only when the human's \
+                 own chord asks it to. A switch initiated from a seat event is a core that \
+                 moves the human without being asked, or one that switches back -- which is \
+                 the trap D-030(1) correctly named and D-031 does not license",
             ),
         ] {
             assert!(
@@ -2203,6 +2624,213 @@ mod tests {
                 "`{forbidden}` in the seat handler: {why}"
             );
         }
+    }
+
+    /// **A scanout buffer and a window surface are opposite kinds of render
+    /// target**, and this constant took the wrong one.
+    ///
+    /// The defect this pins was found by running the backend on a panel and
+    /// by nothing else: the trusted band, drawn in rows `[0, 8)` by
+    /// construction, appeared along the **bottom** edge. That is a pure
+    /// vertical mirror, which is exactly what `Flipped180` produces here —
+    /// smithay's `GlesRenderer::render` already post-multiplies GL's own
+    /// y-flip, so `Flipped180` cancels it and puts the logical top row at the
+    /// buffer's last row of memory, which the CRTC scans out last.
+    ///
+    /// The relationship is asserted rather than the literal, so the next
+    /// reader is not handed a magic constant: a **memory-backed** target (an
+    /// offscreen renderbuffer read back with `copy_framebuffer`, and the GBM
+    /// buffer a CRTC scans out) is addressed from its first row of storage; an
+    /// **EGL window surface** is not. The two must never take the same value.
+    ///
+    /// **This test cannot tell you the panel is the right way up.** Nothing in
+    /// this workspace can put a frame on one. What it holds is that the two
+    /// kinds have not been conflated again; the evidence is WS-E.3.4's
+    /// runbook, re-run and dated.
+    #[test]
+    fn the_scanout_and_the_window_are_opposite_kinds_of_target() {
+        assert_eq!(
+            SCANOUT_TRANSFORM,
+            crate::dmabuf::MEMORY_TARGET_TRANSFORM,
+            "a scanout buffer is a memory-backed target: row 0 is its first row of storage and \
+             a CRTC scans that out as the TOP scanline, exactly like the offscreen \
+             renderbuffer `dmabuf`'s GPU harness reads back top-down"
+        );
+        assert_ne!(
+            SCANOUT_TRANSFORM,
+            crate::backend::winit::WINDOW_TRANSFORM,
+            "the scanout path took the WINDOW's transform, and a human's whole display was \
+             presented vertically mirrored -- the trusted band along the bottom edge. An EGL \
+             window surface has its GL origin at the bottom-left; a scanout buffer does not"
+        );
+        // ...and both branches of the composite really read this constant,
+        // rather than one of them deriving its own -- the regression
+        // `WINDOW_TRANSFORM` was introduced to close, restated for the third
+        // presentation path.
+        let after = source()
+            .split("fn compose_and_queue(&mut self")
+            .nth(1)
+            .expect("this backend composes through compose_and_queue");
+        let body = after
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        assert_eq!(
+            body.matches("SCANOUT_TRANSFORM").count(),
+            2,
+            "both presentation branches must pass the same output transform, or one of them \
+             presents upside down while the other stays correct"
+        );
+        assert!(
+            !body.contains("WINDOW_TRANSFORM") && !body.contains("Transform::Flipped"),
+            "a scanout branch must not reach for the window surface's transform"
+        );
+    }
+
+    /// **The VT escape is the one hook outside the lock gate, and it is
+    /// outside it** (WS-E.3.5, D-031).
+    ///
+    /// A type-level assertion, the mirror image of `backend::winit`'s
+    /// `the_lock_gate_is_the_outermost_hook`, and non-vacuous in the hardest
+    /// available way: `assert_vt_outermost_over_lock` accepts only a
+    /// `PhantomData<VtHook<LockGate<_>>>`, so moving the VT hook inside the
+    /// lock — or reordering the stack at all — **stops the crate compiling**.
+    ///
+    /// The property it holds is the whole of D-031(2): `LockGate::judge`
+    /// consumes *every* physical press while the lock is up, so at any inner
+    /// position the escape would be dead exactly when a trapped human most
+    /// needs it. The lock's own soundness argument survives, because a
+    /// `ChordMatcher` never consumes a modifier — see [`DrmHook`].
+    #[test]
+    fn the_vt_chord_is_the_only_hook_outside_the_lock_gate() {
+        use std::marker::PhantomData;
+        fn assert_vt_outermost_over_lock<H: input::PreemptionHook>(
+            _: PhantomData<crate::vt::VtHook<crate::lock::LockGate<H>>>,
+        ) {
+        }
+        assert_vt_outermost_over_lock(PhantomData::<DrmHook>);
+    }
+
+    /// **`change_vt` is reached from exactly one place, and that place is the
+    /// physical input drain** (WS-E.3.5, D-031).
+    ///
+    /// `DrmState` cannot be constructed without a real `DrmDevice`,
+    /// `LibSeatSession`, `GbmDevice` and `GlesRenderer`, so no test in this
+    /// workspace can *call* `drain_vt_requests`. What a display-free test can
+    /// hold is where the call lives — and every mutation of that is a mutation
+    /// that compiles, which is the only reason a source assertion is worth
+    /// anything.
+    #[test]
+    fn the_vt_switch_is_reached_only_from_the_input_drain() {
+        assert_eq!(
+            source().matches("change_vt(").count(),
+            1,
+            "the seat's VT verb must have exactly one call site in this backend"
+        );
+        let drain = source()
+            .split("fn drain_vt_requests(&mut self)")
+            .nth(1)
+            .expect("the drain exists");
+        let drain_body = drain
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        assert!(
+            drain_body.contains("self.seat.change_vt("),
+            "the one `change_vt` must be the drain's"
+        );
+        // ...and the drain is reached from the physical input turn, AFTER the
+        // route. Last because `change_vt` is the one effect that ends this
+        // turn's ability to do anything else.
+        let route = source()
+            .split("fn route_physical_inputs(&mut self")
+            .nth(1)
+            .expect("this backend routes physical input");
+        let route_body = route
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        let turn = route_body
+            .find("session::route_physical_turn(")
+            .expect("the turn is routed through the shared function");
+        let drained = route_body.find("self.drain_vt_requests()").expect(
+            "a chorded VT switch that nothing drains is a key that does nothing -- \
+                    which is the defect this whole change exists for",
+        );
+        assert!(
+            drained > turn,
+            "the drain must come after the route, not before it"
+        );
+        assert_eq!(
+            source().matches("self.drain_vt_requests()").count(),
+            1,
+            "one drain site: a second would let a non-physical path reach the seat's VT verb"
+        );
+    }
+
+    /// **A failed VT switch reaches the human's eyes, not only the log**
+    /// (WS-E.3.5).
+    ///
+    /// The human is looking at the panel. If they could read `stderr` they
+    /// would not be trapped, so a failure that lives only in the log
+    /// reproduces the original defect exactly: a key that does nothing and
+    /// says nothing. Both failure paths — the seat's refusal and the accepted
+    /// request that never produces a pause — must raise the notice, and both
+    /// must journal, because the flight recorder for the trapped run is silent
+    /// about the two chords the human pressed.
+    #[test]
+    fn a_failed_vt_switch_is_journalled_and_put_on_the_panel() {
+        let drain = source()
+            .split("fn drain_vt_requests(&mut self)")
+            .nth(1)
+            .expect("the drain exists");
+        let body = drain
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        let (before, after) = body
+            .split_once("match self.seat.change_vt(")
+            .expect("the drain calls the seat");
+        assert!(
+            before.contains("Event::VtSwitchRequested"),
+            "the request must be journalled BEFORE the call, so a switch that never returns is \
+             still on record"
+        );
+        assert!(
+            after.contains("Event::VtSwitchRefused") && after.contains("raise_trapped_notice("),
+            "a refused switch must both journal and put something on the panel"
+        );
+        // The watchdog half: an accepted request is not a switch.
+        let timer = source()
+            .split("fn arm_vt_timer(&mut self)")
+            .nth(1)
+            .expect("the watchdog exists");
+        let timer_body = timer
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        assert!(
+            timer_body.contains("Event::VtSwitchStalled")
+                && timer_body.contains("raise_trapped_notice("),
+            "`libseat_switch_session` is asynchronous: Ok means accepted, not switched. An \
+             accepted request that produces no pause is exactly the shape of the defect this \
+             change exists for, and it must be as visible as a refusal"
+        );
+        // ...and the notice is a human-visible surface, never a capture. The
+        // negative is asserted where a capture is actually served.
+        let view_rgba = source()
+            .split("fn view_rgba(&mut self")
+            .nth(1)
+            .expect("this backend implements Presenter::view_rgba");
+        assert!(
+            !view_rgba
+                .split_once("\n    }\n")
+                .expect("the method body ends at its closing brace")
+                .0
+                .contains("notice"),
+            "`notice` inside `view_rgba`: \"this human's session is trapped\" is exactly the \
+             fact an adversarial agent would most like to learn"
+        );
     }
 
     /// **A frame that cannot be queued now is owed, not lost.**

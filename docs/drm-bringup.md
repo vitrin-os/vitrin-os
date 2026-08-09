@@ -116,7 +116,9 @@ ninety seconds.
 
 > ## ⚠ CORRECTED BY THE FIRST RUN, 2026-08-09
 >
-> **VT switching does not work, and it was this page's first line of defence.**
+> **VT switching did not work on the first run, and it was this page's first
+> line of defence. It is implemented now (`crate::vt`, WS-E.3.5) and has NOT
+> yet been confirmed on hardware — the second run is what settles it.**
 > On the first bare-metal run `Ctrl+Alt+F1` and `Ctrl+Alt+F2` did nothing and
 > the maintainer was trapped on tty3 until `vitrind` was killed from elsewhere.
 >
@@ -134,8 +136,10 @@ ninety seconds.
 > pkill -TERM -f "vitrind --drm"
 > ```
 >
-> Until `change_vt` has a production caller, **treat a bare-metal VT as
-> one-way**, and do not start a run without a live Hyprland-side shell.
+> **Do not start a run without a live Hyprland-side shell**, regardless. The
+> escape chord is new, unproven code; the shell is the route that has actually
+> recovered a session. Treat the chord as the thing under test, not as the
+> thing you are relying on.
 
 ### 0.1 First line: a shell inside the running Hyprland session.
 
@@ -145,11 +149,13 @@ observed: the first run was recovered exactly this way. Leave a terminal open
 there — or an agent session running in one, which is what happened — before you
 start anything.
 
-### 0.1b Second line: VT switching, *if and only if* it has been fixed.
+### 0.1b Second line: VT switching — implemented, unconfirmed.
 
-Everything below was written before the first run and assumes `Ctrl+Alt+F<n>`
-works. It did not. Check that `change_vt` has a production caller
-(`grep -rn change_vt crates/vitrin-core/src`) before relying on a word of it.
+Everything below was written before the first run and assumed `Ctrl+Alt+F<n>`
+works. It did not, and now it is implemented rather than absent. Note what the
+fix actually binds, because it is not what the first attempt bound: with a
+`--keymap` loaded the chord arrives as `XF86Switch_VT_n`, not as `F1..F12` with
+modifiers, and a matcher keyed on the F-row fires never.
 
 logind hands the display to whichever VT is active, so switching back *would* be
 ordinary and reversible. Hyprland is on **tty1** [verified], and this

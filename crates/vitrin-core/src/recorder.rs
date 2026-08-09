@@ -1167,6 +1167,50 @@ pub(crate) enum Event<'a> {
     /// The lock came down: the session's physical input reaches realms again
     /// (WS-E.2.2). Always preceded by an accepted [`Event::UnlockAttempted`].
     SessionUnlocked,
+    /// The human chorded `Ctrl-Alt-F<n>` and the core asked the seat to switch
+    /// (WS-E.3.5, D-031).
+    ///
+    /// Written **before** the call, so a request that never returns is still on
+    /// record. That is not defensive style: the flight recorder for the run
+    /// that produced this whole change contains 96 entries and **not one about
+    /// the two chords the human pressed to get out of a session he could not
+    /// leave**. The one artifact built to reconstruct a session afterwards was
+    /// silent on the single most consequential thing that happened in it.
+    ///
+    /// A session-level fact with no principal and no realm, exactly like
+    /// [`Event::SessionLocked`]: no wire message can move the human's VT, and
+    /// the only thing that can is the human's own physical chord
+    /// ([`crate::vt::VtRequest`] is unconstructible without one).
+    VtSwitchRequested {
+        /// The VT asked for: 1..=12, chosen by the core from the key pressed.
+        vt: i32,
+    },
+    /// The seat refused the switch, or the core declined to ask (WS-E.3.5).
+    VtSwitchRefused {
+        vt: i32,
+        /// A fixed label from a closed vocabulary -- `seat_refused`,
+        /// `session_lost` or `already_here`. **Never an OS error string**, on
+        /// [`Event::ClipboardRefused`]'s and [`Event::ScreenshotFailed`]'s
+        /// rule: a journal field an errno *message* can reach is a journal
+        /// field an attacker's filename can reach.
+        reason: &'static str,
+        /// `AsErrno::as_errno()`'s integer, or `null` for a failure that has
+        /// none (a lost session). An integer is safe where the message is not.
+        errno: Option<i32>,
+    },
+    /// The seat **accepted** the switch and no pause followed within the
+    /// watchdog window (WS-E.3.5).
+    ///
+    /// `libseat_switch_session` is asynchronous: `Ok(())` means *accepted*, not
+    /// *switched*. An `Ok` followed by nothing is exactly the shape of the
+    /// defect this whole change exists for — a chord that appears to work and
+    /// does not — so the two are distinguished in the journal rather than
+    /// collapsed into one success entry.
+    VtSwitchStalled {
+        vt: i32,
+        /// How long the core waited for the seat's `PauseSession`.
+        after_ms: u64,
+    },
     RealmDied {
         realm: &'a RealmId,
         /// The shim that was serving the realm. It may already be reaped.
@@ -1242,6 +1286,9 @@ impl Event<'_> {
             Event::SessionLocked { .. } => "session_locked",
             Event::UnlockAttempted { .. } => "unlock_attempted",
             Event::SessionUnlocked => "session_unlocked",
+            Event::VtSwitchRequested { .. } => "vt_switch_requested",
+            Event::VtSwitchRefused { .. } => "vt_switch_refused",
+            Event::VtSwitchStalled { .. } => "vt_switch_stalled",
             Event::RealmDied { .. } => "realm_died",
             Event::RealmExited { .. } => "realm_exited",
             Event::ConnectionTeardown { .. } => "connection_teardown",
@@ -1648,6 +1695,21 @@ impl Event<'_> {
             // No body: the entry IS the fact. Deliberately carrying nothing
             // about the attempt that succeeded (see the variant's docs).
             Event::SessionUnlocked => {}
+            Event::VtSwitchRequested { vt } => {
+                field_i64(out, "vt", i64::from(vt));
+            }
+            Event::VtSwitchRefused { vt, reason, errno } => {
+                field_i64(out, "vt", i64::from(vt));
+                field_str(out, "reason", reason);
+                match errno {
+                    Some(errno) => field_i64(out, "errno", i64::from(errno)),
+                    None => field_null(out, "errno"),
+                }
+            }
+            Event::VtSwitchStalled { vt, after_ms } => {
+                field_i64(out, "vt", i64::from(vt));
+                field_u64(out, "after_ms", after_ms);
+            }
             Event::RealmDied { realm, pid, cause } => {
                 field_display(out, "realm", realm);
                 field_u64(out, "pid", u64::from(pid));
@@ -3481,6 +3543,53 @@ pub(crate) mod tests {
         // A multi-bit value is not one facet's verb; it must not be
         // rendered as one of them.
         assert_eq!(verb_label(Verb::OBSERVE | Verb::ACTUATE_TEXT), "unknown");
+    }
+
+    /// **The three VT entries exist, and the failure ones carry an integer
+    /// rather than an OS string** (WS-E.3.5, D-031).
+    ///
+    /// The flight recorder for the run that produced this whole change
+    /// contains 96 entries and **not one about the two chords the human
+    /// pressed to escape a session he could not leave**. This is that hole
+    /// closed, and the `reason` field is a fixed label for
+    /// [`Event::ClipboardRefused`]'s reason: a journal field an errno
+    /// *message* can reach is a journal field an attacker's filename can
+    /// reach.
+    #[test]
+    fn a_vt_switch_is_journalled_before_the_call_and_after_a_failure() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rec, path) = scratch_recorder("vt-switch");
+        rec.record(Event::VtSwitchRequested { vt: 2 });
+        rec.record(Event::VtSwitchRefused {
+            vt: 2,
+            reason: "seat_refused",
+            errno: Some(13),
+        });
+        rec.record(Event::VtSwitchRefused {
+            vt: 2,
+            reason: "session_lost",
+            errno: None,
+        });
+        rec.record(Event::VtSwitchStalled {
+            vt: 2,
+            after_ms: 2000,
+        });
+
+        let entries = read_log(&path);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].str("kind"), "vt_switch_requested");
+        assert_eq!(entries[0].u64("vt"), 2);
+        assert_eq!(entries[1].str("kind"), "vt_switch_refused");
+        assert_eq!(entries[1].str("reason"), "seat_refused");
+        assert_eq!(entries[1].u64("errno"), 13);
+        // An absent errno is an explicit null, never a missing key: a reader
+        // must never have to tell "this version could not say" from "the
+        // writer forgot".
+        assert!(entries[2].is_null("errno"));
+        assert_eq!(entries[2].str("reason"), "session_lost");
+        assert_eq!(entries[3].str("kind"), "vt_switch_stalled");
+        assert_eq!(entries[3].u64("after_ms"), 2000);
+        cleanup(&path);
     }
 
     #[test]

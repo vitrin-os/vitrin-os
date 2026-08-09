@@ -305,6 +305,26 @@ impl LockScreen {
         self.seat_absent = absent;
     }
 
+    /// Forget the lock chord's modifier bits and consumed set across a seat
+    /// pause — [`ChordMatcher::forget_physical_state`], whose docs carry the
+    /// reason.
+    ///
+    /// The lock's own instance is the sharpest of the four, because the
+    /// default lock chord is `ctrl+alt+delete` and the VT escape is
+    /// `ctrl+alt+F<n>`: a human who left this VT was holding **exactly**
+    /// `ctrl+alt`, so without this their next bare Delete raises the lock
+    /// screen.
+    #[cfg_attr(
+        not(feature = "drm-backend"),
+        allow(
+            dead_code,
+            reason = "the only production caller is the bare-metal PauseSession arm -- a seat                       pause is the one event that ends physical input without releases, and                       only that backend has a seat. The behaviour is tested below in every                       build"
+        )
+    )]
+    pub(crate) fn forget_physical_state(&mut self) {
+        self.matcher.forget_physical_state();
+    }
+
     /// Whether a lock is up, and why.
     pub fn cause(&self) -> Option<LockCause> {
         self.locked.as_ref().map(|l| l.cause)
@@ -740,6 +760,46 @@ mod tests {
             s.is_locked(),
             "and coming back must still meet the lock the human left up"
         );
+    }
+
+    /// **A seat pause leaves no stale `ctrl+alt` behind, so the human's next
+    /// bare Delete does not lock their screen** (WS-E.3.5).
+    ///
+    /// This is the lock's instance of a defect that was live on every branch
+    /// before the VT escape landed, and the escape is what makes it fire on
+    /// the first use: the default lock chord is `ctrl+alt+delete` and the
+    /// escape is `ctrl+alt+F<n>`, so a human leaving this VT is holding
+    /// **exactly** the lock chord's modifiers. libinput is suspended before
+    /// either release can arrive, and the presses the app is paid are handed
+    /// straight to the delivery funnel rather than back through the hook
+    /// stack, so nothing else clears the bits.
+    ///
+    /// The control comes first, or the assertion would pass against a matcher
+    /// that never tracked a modifier at all.
+    #[test]
+    fn a_seat_pause_leaves_no_stale_modifier_in_the_lock_chord() {
+        let t0 = Instant::now();
+
+        // The control: with ctrl+alt genuinely held, Delete locks.
+        let mut s = screen(None, t0);
+        s.judge(&press(0xffe3), t0);
+        s.judge(&press(0xffe9), t0);
+        assert_eq!(s.judge(&press(0xffff), t0), Gate::Consume);
+        assert!(s.is_locked(), "the fixture must reach the chord at all");
+
+        // The real case: the human held ctrl+alt, left for another VT, came
+        // back, and pressed a bare Delete.
+        let mut s = screen(None, t0);
+        s.judge(&press(0xffe3), t0);
+        s.judge(&press(0xffe9), t0);
+        s.forget_physical_state();
+        assert_eq!(
+            s.judge(&press(0xffff), t0),
+            Gate::Deliver,
+            "a stale ctrl+alt turns the human's next bare Delete into a lock chord -- and \
+             takes the key away from the app on the way"
+        );
+        assert!(!s.is_locked());
     }
 
     #[test]

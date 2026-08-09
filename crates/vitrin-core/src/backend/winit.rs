@@ -183,6 +183,22 @@ struct TextureKey {
     /// rather than a merged one because the two changes have different
     /// consumers — see [`crate::consent`]'s redraw section.
     consent_generation: u64,
+    /// [`crate::lock::LockSurface::generation`] at upload time (WS-E.2.2,
+    /// issue #214).
+    ///
+    /// Omitting this shipped a real defect, found by the first human run of
+    /// `shim/docs/nested-lock-screen.md` and not by any test: the lock is an
+    /// input to [`super::compose_human_visible`], so raising it changes every
+    /// pixel, but with no counter here the composed cover was presented only
+    /// when some *unrelated* keyed input next moved. Against an idle client
+    /// that is never — so the second `ctrl+alt+delete` of a session consumed
+    /// the human's input behind a screen still showing the unlocked app.
+    ///
+    /// A separate counter rather than merging into
+    /// [`Self::consent_generation`] for that field's own stated reason: the
+    /// two changes have different consumers, and a lock raised over a live
+    /// prompt must re-upload for both.
+    lock_generation: u64,
     /// The dead-man hold indicator's fill, quantized to
     /// [`HOLD_STEPS`] buckets, or `None` when no indicator is shown
     /// (P1.7.3).
@@ -233,12 +249,22 @@ const HOLD_STEPS: f64 = 20.0;
 
 impl TextureKey {
     /// The key describing what a texture composed *right now* would contain.
+    ///
+    /// The `scene, consent, lock, status` run of parameters is deliberately
+    /// in [`super::compose_human_visible`]'s order, because the invariant
+    /// binding the two is that **every input to that function appears here**.
+    /// `lock` was missing for the whole of WS-E.2.2 and the divergence was
+    /// invisible precisely because the argument lists did not line up to be
+    /// compared. Keep them parallel, and when composition grows an input, add
+    /// it here in the same position and extend
+    /// [`the_texture_key_changes_on_every_visible_transition`].
     #[allow(clippy::too_many_arguments)]
     fn current(
         size: Size<i32, Physical>,
         realm: Option<&RealmId>,
         scene: &Scene,
         consent: &ConsentSurface,
+        lock: &crate::lock::LockSurface,
         hold: Option<f64>,
         agent_cursor: Option<(f64, f64)>,
         attention: bool,
@@ -249,6 +275,7 @@ impl TextureKey {
             realm: realm.cloned(),
             scene_generation: scene.generation(),
             consent_generation: consent.generation(),
+            lock_generation: lock.generation(),
             hold_bucket: hold.map(|p| (p.clamp(0.0, 1.0) * HOLD_STEPS) as u8),
             agent_cursor: agent_cursor.and_then(|(x, y)| crate::cursor::hotspot(x, y)),
             attention,
@@ -2526,6 +2553,7 @@ impl NestedState {
             self.view.scenes.focused(),
             self.view.scenes.bound(),
             &self.view.consent,
+            &self.view.lock,
             hold,
             agent_cursor,
             self.view.attention,
@@ -3171,6 +3199,24 @@ mod tests {
         crate::lock::LockSurface::new(crate::consent::TrustedIndicator::for_test())
     }
 
+    /// A lock surface with the cover **up**, by the chord, passphrase-backed.
+    ///
+    /// Exists because until WS-E.2.2's fix there was no way to write one: the
+    /// texture key took no lock, so "the screen is locked" was a state this
+    /// suite's key assertions could not express, and the omission read as
+    /// coverage. Any new input to [`super::compose_human_visible`] wants the
+    /// matching pair — an `off` fixture and an `on` one — for the same reason.
+    fn raised_lock() -> crate::lock::LockSurface {
+        let mut lock = no_lock();
+        lock.raise(crate::lock::LockContent {
+            cause: crate::lock::LockCause::Chord,
+            realms: vec![RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)],
+            unlock: crate::lock::UnlockMethod::Passphrase,
+            deadman_chord: "esc",
+        });
+        lock
+    }
+
     /// Nested mode must actually put the prompt in the host window.
     ///
     /// This is the acceptance criterion's nested half, held as far as a
@@ -3754,6 +3800,7 @@ mod tests {
             scenes.focused(),
             scenes.bound(),
             &consent,
+            &no_lock(),
             None,
             None,
             false,
@@ -3782,6 +3829,7 @@ mod tests {
             scenes.focused(),
             scenes.bound(),
             &consent,
+            &no_lock(),
             None,
             None,
             false,
@@ -3922,6 +3970,7 @@ mod tests {
             Some(&realm),
             &scene,
             &consent,
+            &no_lock(),
             None,
             None,
             false,
@@ -3934,6 +3983,7 @@ mod tests {
                 Some(&realm),
                 &scene,
                 &consent,
+                &no_lock(),
                 None,
                 None,
                 false,
@@ -3949,6 +3999,7 @@ mod tests {
             Some(&realm),
             &scene,
             &consent,
+            &no_lock(),
             None,
             None,
             false,
@@ -3961,6 +4012,7 @@ mod tests {
             Some(&realm),
             &scene,
             &consent,
+            &no_lock(),
             None,
             None,
             false,
@@ -3976,6 +4028,7 @@ mod tests {
             Some(&realm),
             &scene,
             &consent,
+            &no_lock(),
             None,
             None,
             false,
@@ -3992,6 +4045,7 @@ mod tests {
                 Some(&realm),
                 &scene,
                 &consent,
+                &no_lock(),
                 None,
                 None,
                 false,
@@ -4006,6 +4060,7 @@ mod tests {
             Some(&realm),
             &scene,
             &consent,
+            &no_lock(),
             None,
             None,
             false,
@@ -4019,6 +4074,7 @@ mod tests {
                 Some(&realm),
                 &scene,
                 &consent,
+                &no_lock(),
                 None,
                 None,
                 false,
@@ -4026,12 +4082,87 @@ mod tests {
             ),
             "a scene commit must re-upload"
         );
+
+        // The lock, which this test omitted for the whole of WS-E.2.2 and
+        // which the first human run of `shim/docs/nested-lock-screen.md`
+        // caught: raising the cover changes every pixel, so a key that
+        // compares equal across it presents the *unlocked* app to a human
+        // whose input is already being consumed by the gate. Asserted in both
+        // directions because `lower` is the direction that returns the human
+        // to their session, and a stale cover there is a session that looks
+        // locked forever.
+        let unlocked = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            &no_lock(),
+            None,
+            None,
+            false,
+            &no_status(),
+        );
+        let locked = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            &raised_lock(),
+            None,
+            None,
+            false,
+            &no_status(),
+        );
+        assert_ne!(unlocked, locked, "the lock screen going up must re-upload");
+
+        // And a *second* raise in the same session, which is the exact shape
+        // that failed on hardware: lock, unlock, lock again, with nothing else
+        // moving. The counter must not return to a value already presented.
+        let mut cycled = raised_lock();
+        cycled.lower();
+        let after_unlock = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            &cycled,
+            None,
+            None,
+            false,
+            &no_status(),
+        );
+        assert_ne!(
+            locked, after_unlock,
+            "the lock screen coming down must re-upload"
+        );
+        cycled.raise(crate::lock::LockContent {
+            cause: crate::lock::LockCause::Chord,
+            realms: vec![RealmId::new(crate::realm::WELL_KNOWN_REALM_ID)],
+            unlock: crate::lock::UnlockMethod::Passphrase,
+            deadman_chord: "esc",
+        });
+        let relocked = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            &cycled,
+            None,
+            None,
+            false,
+            &no_status(),
+        );
+        assert_ne!(
+            after_unlock, relocked,
+            "a SECOND lock over an idle client must re-upload -- the hardware bug"
+        );
         assert_ne!(
             TextureKey::current(
                 size,
                 Some(&realm),
                 &scene,
                 &consent,
+                &no_lock(),
                 None,
                 None,
                 false,
@@ -4042,6 +4173,7 @@ mod tests {
                 Some(&realm),
                 &scene,
                 &consent,
+                &no_lock(),
                 None,
                 None,
                 false,
@@ -4059,6 +4191,7 @@ mod tests {
             Some(&realm),
             &scene,
             &consent,
+            &no_lock(),
             None,
             None,
             false,
@@ -4069,6 +4202,7 @@ mod tests {
             Some(&realm),
             &scene,
             &consent,
+            &no_lock(),
             None,
             Some((100.0, 100.0)),
             false,
@@ -4085,6 +4219,7 @@ mod tests {
                 Some(&realm),
                 &scene,
                 &consent,
+                &no_lock(),
                 None,
                 Some((140.0, 100.0)),
                 false,
@@ -4099,6 +4234,7 @@ mod tests {
                 Some(&realm),
                 &scene,
                 &consent,
+                &no_lock(),
                 None,
                 Some((100.4, 99.8)),
                 false,
@@ -4113,6 +4249,7 @@ mod tests {
                 Some(&realm),
                 &scene,
                 &consent,
+                &no_lock(),
                 None,
                 Some((f64::NAN, 0.0)),
                 false,
@@ -4138,6 +4275,7 @@ mod tests {
             Some(&realm),
             &scene,
             &consent,
+            &no_lock(),
             None,
             None,
             false,
@@ -4148,6 +4286,7 @@ mod tests {
             Some(&realm),
             &scene,
             &consent,
+            &no_lock(),
             None,
             None,
             true,
@@ -4262,6 +4401,7 @@ mod tests {
                 Some(&realm),
                 &scene,
                 &consent,
+                &no_lock(),
                 Some(f64::from(step) / 10.0),
                 None,
                 false,
@@ -4280,6 +4420,7 @@ mod tests {
                 Some(&realm),
                 &scene,
                 &consent,
+                &no_lock(),
                 Some(1.0),
                 None,
                 false,
@@ -4290,6 +4431,7 @@ mod tests {
                 Some(&realm),
                 &scene,
                 &consent,
+                &no_lock(),
                 None,
                 None,
                 false,

@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
-//! The **agent cursor sprite**: the small crosshair the core paints at an
-//! agent's own pointer position, into **human-visible output only**.
+//! The **cursor sprites**: the small crosshairs the core paints at a pointer
+//! position, into **human-visible output only**.
+//!
+//! Two of them since WS-E.3.2 (issue #218), drawn by the same geometry and
+//! separated by colour and size: the **agent** cursor (D-019), at an agent
+//! principal's own pointer, and the **human** cursor, at the position the
+//! physical pointer device has accumulated to. The second one exists only
+//! because a bare-metal session has no host desktop to draw it — see
+//! [`human_cursor_rects`], which carries the whole argument and the IDL
+//! sentence it corrected.
 //!
 //! # Drawing is not delivery, and this module is only the drawing half
 //!
@@ -59,8 +67,14 @@
 use crate::consent::TRUST_BAND_HEIGHT;
 use crate::paint::canvas::{Canvas, Rect};
 
-/// Half-length of each crosshair arm, in view pixels.
+/// Half-length of an **agent** crosshair's arm, in view pixels.
 const ARM: u32 = 9;
+/// Half-length of the **human** crosshair's arm. Deliberately shorter than
+/// [`ARM`]: the two sprites are on screen at the same time, and a human
+/// glancing at the display has to be able to say which of them is theirs
+/// without reading the colour of a 3-pixel bar. Size and colour both differ,
+/// so either one alone suffices.
+const HUMAN_ARM: u32 = 5;
 /// Thickness of each bar. Odd, so the bars centre on the hotspot pixel
 /// rather than straddling it.
 const THICK: u32 = 3;
@@ -78,10 +92,25 @@ pub(crate) const AGENT_CURSOR_HALO: [u8; 4] = [0x08, 0x08, 0x0c, 0xff];
 /// so no glance confuses the two.
 pub(crate) const AGENT_CURSOR_CORE: [u8; 4] = [0x4c, 0xf0, 0xff, 0xff];
 
+/// The **human** cursor's core: plain white, which nothing else in the
+/// human-visible composition paints as a small solid shape (the matte is
+/// dark, the band is a full-width strip in this session's secret colour, the
+/// hold indicator is amber, the agent's sprite is cyan). White rather than a
+/// second saturated colour on purpose: the human's own pointer is the one
+/// thing on the display that asserts nothing about authority, so it should
+/// read as furniture rather than as a signal.
+pub(crate) const HUMAN_CURSOR_CORE: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+
 /// How many solid rectangles one sprite costs: halo bar ×2, core bar ×2.
 /// Public because the zero-copy draw list is a fixed-size array sized from
 /// it.
 pub(crate) const AGENT_CURSOR_RECTS: usize = 4;
+
+/// The same, for the human sprite — the same crosshair shape, so the same
+/// count. Named separately rather than reusing [`AGENT_CURSOR_RECTS`] at the
+/// draw list's slot arithmetic so that changing one sprite's shape cannot
+/// silently resize the other one's slots.
+pub(crate) const HUMAN_CURSOR_RECTS: usize = 4;
 
 /// One axis-aligned, solid-colour piece of the sprite, in **integer view
 /// pixels**.
@@ -139,13 +168,68 @@ pub(crate) fn agent_cursor_rects(
     x: f64,
     y: f64,
 ) -> Option<[CursorRect; AGENT_CURSOR_RECTS]> {
+    crosshair_rects(width, height, x, y, ARM, AGENT_CURSOR_CORE)
+}
+
+/// The **human** pointer's rectangles, on [`agent_cursor_rects`]'s terms and
+/// through the very same geometry — a shorter arm and a white core, and
+/// nothing else different.
+///
+/// # Why the core draws this at all, when the IDL said it never would
+///
+/// `protocol/vitrin-v0.xml` stated flatly that *no* human cursor is
+/// composited, "in nested operation the host desktop draws it outside the
+/// realm view entirely". That sentence was true of the only two backends that
+/// existed and is false of the third: on bare metal (WS-E.3.2, issue #218)
+/// there is no host desktop, so either the core paints the human's pointer or
+/// the human has none. The IDL sentence is now nested-conditional and this is
+/// the code it was made conditional for.
+///
+/// **It changes nothing about capture.** This is applied at the same output
+/// stage as the agent sprite, the consent card and the trusted band — past
+/// [`crate::backend::human_visible_from_view`] — so it is excluded from
+/// `vitrin_view.frame_ready` by the same structural argument, not by a check.
+/// D-018's ordering invariant 4 is about *agent* cursors in *other*
+/// principals' captures and is untouched: nothing an agent can observe
+/// contains either sprite.
+///
+/// **Clipped below the trusted band, exactly like the agent's.** The clip is
+/// in the shared geometry below, so this sprite inherits it rather than
+/// deciding again — one band policy, not two. The cost is real and is not a
+/// bug: a human whose pointer is inside the top [`TRUST_BAND_HEIGHT`] rows
+/// sees no sprite there. Keeping one rule was preferred to giving the band
+/// two correct appearances, since "the band always looks exactly like this"
+/// is the only check a human has against a forged prompt.
+pub(crate) fn human_cursor_rects(
+    width: u32,
+    height: u32,
+    x: f64,
+    y: f64,
+) -> Option<[CursorRect; HUMAN_CURSOR_RECTS]> {
+    crosshair_rects(width, height, x, y, HUMAN_ARM, HUMAN_CURSOR_CORE)
+}
+
+/// The one crosshair description both sprites are derived from: a halo cross
+/// and a bright core cross, clipped below the trusted band.
+///
+/// Parameterised over the arm length and the core colour and over nothing
+/// else, so the two sprites cannot drift in the property that matters — the
+/// band clip — while still being told apart at a glance.
+fn crosshair_rects(
+    width: u32,
+    height: u32,
+    x: f64,
+    y: f64,
+    arm: u32,
+    core: [u8; 4],
+) -> Option<[CursorRect; 4]> {
     if width == 0 || height <= TRUST_BAND_HEIGHT {
         return None;
     }
     let (px, py) = hotspot(x, y)?;
     let (px, py) = (i64::from(px), i64::from(py));
     // The full span of a bar: both arms plus the hotspot's own pixel.
-    let bar = 2 * ARM + 1;
+    let bar = 2 * arm + 1;
     let piece = |x: i64, y: i64, w: u32, h: u32, rgba: [u8; 4]| -> CursorRect {
         // THE band clip, applied once here so no presentation path can omit
         // it (module docs).
@@ -166,7 +250,7 @@ pub(crate) fn agent_cursor_rects(
     };
     Some([
         piece(
-            px - i64::from(ARM + EDGE),
+            px - i64::from(arm + EDGE),
             py - i64::from(HALF + EDGE),
             bar + 2 * EDGE,
             THICK + 2 * EDGE,
@@ -174,25 +258,13 @@ pub(crate) fn agent_cursor_rects(
         ),
         piece(
             px - i64::from(HALF + EDGE),
-            py - i64::from(ARM + EDGE),
+            py - i64::from(arm + EDGE),
             THICK + 2 * EDGE,
             bar + 2 * EDGE,
             AGENT_CURSOR_HALO,
         ),
-        piece(
-            px - i64::from(ARM),
-            py - i64::from(HALF),
-            bar,
-            THICK,
-            AGENT_CURSOR_CORE,
-        ),
-        piece(
-            px - i64::from(HALF),
-            py - i64::from(ARM),
-            THICK,
-            bar,
-            AGENT_CURSOR_CORE,
-        ),
+        piece(px - i64::from(arm), py - i64::from(HALF), bar, THICK, core),
+        piece(px - i64::from(HALF), py - i64::from(arm), THICK, bar, core),
     ])
 }
 
@@ -206,7 +278,28 @@ pub(crate) fn agent_cursor_rects(
 /// The GPU counterpart is [`crate::dmabuf::human_visible_frame`]'s cursor
 /// slots, which read the very same [`agent_cursor_rects`].
 pub(crate) fn composite_agent_cursor(view: &mut [u8], width: u32, height: u32, x: f64, y: f64) {
-    let Some(rects) = agent_cursor_rects(width, height, x, y) else {
+    fill(view, width, height, agent_cursor_rects(width, height, x, y));
+}
+
+/// Paint the **human** cursor onto human-visible output, CPU path — the
+/// counterpart of [`composite_agent_cursor`], on the same terms.
+///
+/// Reached only from a backend that owns the physical display outright (the
+/// bare-metal DRM backend). The nested backend deliberately never calls it:
+/// the host desktop is already drawing the human's pointer over the core's
+/// window, and a second one would be two cursors for one mouse.
+///
+/// The GPU counterpart is [`crate::dmabuf::human_visible_frame`]'s human
+/// cursor slots, which read the very same [`human_cursor_rects`].
+pub(crate) fn composite_human_cursor(view: &mut [u8], width: u32, height: u32, x: f64, y: f64) {
+    fill(view, width, height, human_cursor_rects(width, height, x, y));
+}
+
+/// Blit one sprite's rectangles onto a CPU canvas. Shared by both
+/// compositors so a buffer whose length does not match its dimensions is
+/// refused in one place rather than two.
+fn fill(view: &mut [u8], width: u32, height: u32, rects: Option<[CursorRect; 4]>) {
+    let Some(rects) = rects else {
         return;
     };
     let Some(mut canvas) = Canvas::new(view, width, height) else {
@@ -336,6 +429,45 @@ mod tests {
         let mut px = blank();
         composite_agent_cursor(&mut px, W, H, 1e300, 1e300);
         assert!(px.iter().all(|&b| b == 0));
+    }
+
+    /// **The human's sprite is drawn, is distinguishable from an agent's,
+    /// and obeys the same band clip** (WS-E.3.2, issue #218).
+    ///
+    /// Three properties in one test because they are one decision: a second
+    /// sprite that a human cannot tell from an agent's would make D-019's
+    /// signal worthless, and a second sprite that could paint into the
+    /// trusted band would give the band two correct appearances.
+    #[test]
+    fn the_human_cursor_is_drawn_distinctly_and_never_reaches_the_band() {
+        let mut px = blank();
+        composite_human_cursor(&mut px, W, H, 32.0, 24.0);
+        // Drawn at all, in its own colour, and NOT in the agent's.
+        assert!(count(&px, HUMAN_CURSOR_CORE) > 0);
+        assert_eq!(count(&px, AGENT_CURSOR_CORE), 0);
+        // Smaller than an agent's, so colour is not the only difference.
+        let mut agent = blank();
+        composite_agent_cursor(&mut agent, W, H, 32.0, 24.0);
+        assert!(count(&px, HUMAN_CURSOR_CORE) < count(&agent, AGENT_CURSOR_CORE));
+
+        // The band clip is the shared geometry's, so it applies here too --
+        // including at the position an unclipped sprite would use to sit on
+        // the strip the human reads this session's secret colour from.
+        let band_bytes = TRUST_BAND_HEIGHT as usize * W as usize * BYTES_PER_PIXEL;
+        for y in [-20.0, 0.0, 4.0, 7.0] {
+            let mut px = blank();
+            composite_human_cursor(&mut px, W, H, 32.0, y);
+            assert!(
+                px[..band_bytes].iter().all(|&b| b == 0),
+                "the human sprite reached the trusted band's rows at y={y}"
+            );
+        }
+
+        // Degenerate input is survivable on this path too.
+        composite_human_cursor(&mut [], 0, 0, 0.0, 0.0);
+        let mut wrong = vec![0u8; 7];
+        composite_human_cursor(&mut wrong, W, H, 32.0, 24.0);
+        assert_eq!(wrong, vec![0u8; 7]);
     }
 
     /// The hotspot is what the nested backend's cache key quantizes on, so

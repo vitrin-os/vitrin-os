@@ -173,8 +173,32 @@ xkbcommon = { version = "0.8", optional = true }
 # BLAKE3's SIMD floor is SSE2 and it measures ~4 GB/s here (~1 ms/frame).
 # `default-features = false` drops `std` (nothing here needs it) and
 # `features = ["pure"]` drops the vendored assembly, so the crate is pure
-# Rust with runtime-dispatched intrinsics and the build invokes NO C
-# toolchain (verified by building with CC pointing at a nonexistent binary).
+# Rust with runtime-dispatched intrinsics and **no C is compiled into the
+# artifact**.
+#
+# This block used to say the build "invokes NO C toolchain (verified by
+# building with CC pointing at a nonexistent binary)". That claim is FALSE
+# and the verification that produced it does not test what it appears to.
+# Re-measured on 2026-08-09 (issue #201) with a `CC` shim that logs each
+# invocation and then execs the real compiler: a plain
+# `cargo build -p vitrin-core` with the default feature set invokes the C
+# compiler **8 times**, all from blake3's build script -- three
+# `detect_compiler_family.c` preprocessor runs, three `cc -?` probes, and two
+# real `-c` compiles of a flag-check translation unit for `-mavx512f` and
+# `-mavx512vl`. The cause is ordering, not configuration:
+# `blake3-1.8.5/build.rs:345` calls `c_compiler_support()` BEFORE line 346
+# consults `is_pure()`, so the probe runs whatever the feature says and only
+# the compilation it guards is skipped.
+#
+# The old experiment passed because those probes **fail soft**: with `CC`
+# pointing at nothing, `c_compiler_support()` returns `NoCompiler`, blake3
+# takes the same pure path, and the build succeeds. So "it builds with a
+# nonexistent CC" proves that no C is compiled in and that the toolchain is
+# not REQUIRED. It cannot prove that none is invoked, and a soft-failing
+# probe is exactly the shape it cannot see. The `drm-backend` feature below
+# adds six more invocations of the same shape, with a worse failure mode --
+# see that feature's block.
+#
 # The algorithm is tagged in every recorder entry (`frame.digest_alg`), so
 # swapping it is a schema-visible, non-breaking change.
 blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
@@ -584,6 +608,218 @@ physical-input-injector = []
 # router and table properties and run with the feature OFF, which is where
 # they belong: they are what the DEFAULT build must keep true.
 session-keymap = ["dep:xkbcommon"]
+# Compile the bare-metal DRM/KMS presentation backend (WS-E.3.2, issue #218):
+# the five Smithay features a session on real hardware needs, and nothing
+# else.
+#
+#   backend_drm              mode setting and page flips on a DRM device
+#   backend_gbm              buffer allocation for scanout (implies
+#                            backend_drm upstream; named anyway, because a
+#                            reader should not have to open smithay's
+#                            Cargo.toml to learn what this feature turns on)
+#   backend_libinput         the real keyboard/pointer/touch event source
+#   backend_udev             device discovery and hotplug for both of the above
+#   backend_session_libseat  seat acquisition -- opening the card and the
+#                            input nodes without being root, and being told
+#                            when the session is paused
+#
+# `renderer_gl` is deliberately NOT listed: `backend_winit` already enables it
+# (`smithay-0.7.0/Cargo.toml:81-88`), so the GLES renderer this backend
+# composites with is already paid for. `wayland_frontend` is deliberately NOT
+# enabled either, which is what keeps `smithay::backend::drm::compositor` out
+# of reach and forces the hand-rolled swapchain -- see #218 decision 2: that
+# module is gated on a Wayland *server* implementation, and `vitrind` serves
+# no Wayland clients (every app is behind a per-app shim; that is the whole
+# architecture).
+#
+# # Why it is not in `default`, stated as the build fact it is
+#
+# Two of the crates it pulls `.unwrap()` a pkg-config probe in their build
+# script and therefore PANIC the build when the `.pc` file is absent:
+#
+#   libseat-sys-0.2.0/build.rs:30   pkg_config::probe_library("libseat").unwrap()
+#   libudev-sys-0.1.4/build.rs:38   pkg_config::find_library("libudev").unwrap()
+#
+# Every current CI job installs only `libxkbcommon-dev` and `libpixman-1-dev`
+# (`.github/workflows/ci.yml`), so a default-on feature would turn
+# `cargo test --workspace` red on all of them and on every contributor machine
+# without a graphics dev stack. (#218's decision 3 cites
+# `drm-sys-0.8.1/build.rs:36` for this. That line is inside `mod use_bindgen`,
+# which is `#[cfg(feature = "use_bindgen")]` and off; the conclusion is right
+# and the citation is not. `libudev-sys` is the third such crate and #218 does
+# not name it.)
+#
+# # What it costs: 14 crates, measured
+#
+#   cargo tree -p vitrin-core -e normal [--features drm-backend] --prefix none \
+#     | sed 's/ (\*)$//;s/ (proc-macro)$//' | sort -u
+#
+# 119 unique packages -> 133. The 14, with the licences `deny.toml` checks
+# them against (all satisfied by its base allow-list; none needs an
+# exception):
+#
+#   bytemuck_derive 1.11.0  Zlib OR Apache-2.0 OR MIT
+#   drm             0.14.1  MIT      gbm-sys       0.4.0   MIT
+#   drm-ffi         0.9.1   MIT      input         0.9.1   MIT
+#   drm-sys         0.8.1   MIT      input-sys     1.19.0  MIT
+#   gbm             0.18.0  MIT      libseat       0.2.4   MIT
+#   libseat-sys     0.2.0   MIT      libudev-sys   0.1.4   MIT
+#   udev            0.9.3   MIT
+#   io-lifetimes    1.0.11  Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+#   linux-raw-sys   0.9.4   Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+#
+# `Cargo.lock` grew 252 -> 274 packages: those 14 minus `gbm`/`gbm-sys` (the
+# `gpu-tests` feature had already locked them), plus **10 packages no build of
+# this project ever compiles** -- `hermit-abi 0.3.9` and nine `windows*`
+# crates, from `io-lifetimes`'s non-Linux target table. `deny.toml`'s
+# `[graph] targets` is what keeps them out of the budget's view, and
+# `io-lifetimes` is a `[bans] deny` tripwire there for exactly this reason: it
+# is a crate superseded by `std`'s I/O-safety types (stable since 1.63; this
+# workspace's MSRV is 1.87) that only `udev 0.9.3` still wants.
+#
+# Duplicate versions, measured rather than assumed: this feature adds **one**,
+# `linux-raw-sys 0.9.4`, and for an unusual reason -- `drm-sys 0.8.1` depends
+# on it DIRECTLY, with `features = ["general", "no_std"]`, as its source of
+# kernel uapi struct definitions rather than through rustix. All seven
+# duplicated crate names in the graph (calloop, cpufeatures, linux-raw-sys,
+# rand_core, rustix, thiserror, thiserror-impl) already exist at default
+# features and belong to smithay's winit stack. Each is itemised with an exit
+# condition in `deny.toml`'s `[bans] skip`; #218's "two rustix, three
+# linux-raw-sys" reads as a cost of this feature and is mostly a pre-existing
+# one.
+#
+# # Four system libraries, not five
+#
+# Nothing links `libdrm`. `drm-sys` ships prebuilt bindings, takes its structs
+# from `linux-raw-sys`, and its build script emits no `cargo:rustc-link-lib`
+# at all; `drm-ffi` issues the ioctls through `rustix`. Verified by reading
+# `target/debug/build/drm-sys-*/output`, which is empty. What is actually
+# required, and by whom:
+#
+#   libgbm    gbm-sys      #[link(name = "gbm")]        link time
+#   libinput  input-sys    #[link(name = "input")]      link time
+#   libseat   libseat-sys  pkg_config::probe_library    BUILD time (panics)
+#   libudev   libudev-sys  pkg_config::find_library     BUILD time (panics)
+#
+# (`libgbm` in practice pulls `libdrm` in as its own shared-library
+# dependency, and a distro's `libgbm-dev` pulls `libdrm-dev`. That is not the
+# same thing as this crate graph needing libdrm, and a CI job should install
+# what the graph needs.)
+#
+# **No crate here runs `bindgen`.** #218 lists `libseat-sys` as doing so;
+# `bindgen` is an optional build-dependency behind a `use_bindgen` feature in
+# all four of `drm-sys`, `gbm-sys`, `input-sys` and `libseat-sys`, and nothing
+# enables it. Measured: `cargo tree -e normal,build` shows the same 14-crate
+# delta, with zero build-tool crates added.
+#
+# # The build starts invoking a C toolchain, and the probe fails soft
+#
+# Measured on 2026-08-09 with a `CC` shim that logs each invocation and execs
+# the real compiler, after `cargo clean -p smithay -p blake3 -p vitrin-core`:
+#
+#   default features   ->  8 invocations, all blake3's (see its block above)
+#   --features drm-backend -> 14 invocations: blake3's 8, plus **6 from
+#                          smithay's own build.rs** -- two
+#                          `detect_compiler_family.c` runs, two `cc -?`
+#                          probes, and two real compiles of
+#                          `test_gbm_bo_get_fd_for_plane.c` and
+#                          `test_gbm_bo_create_with_modifiers2.c`
+#                          (`smithay-0.7.0/build.rs:86`, `:114`).
+#
+# The failure mode is the part that matters. Repeating the build with
+# `CC=/nonexistent/definitely-not-a-compiler`:
+#
+#   * it **succeeds**, exit 0;
+#   * `target/debug/build/smithay-*/output` loses BOTH
+#     `cargo:rustc-cfg=feature="backend_gbm_has_fd_for_plane"` and
+#     `..."backend_gbm_has_create_with_modifiers2"`, which a working compiler
+#     sets;
+#   * the only trace is two `cargo:warning=Compiler family detection failed`
+#     lines, which cargo prints and does not fail on.
+#
+# So a build host with a broken or absent C compiler silently selects an older
+# gbm buffer-allocation path in the TCB's scanout code. Nothing in the build
+# output distinguishes that from a correct build except two warnings in a log
+# nobody reads. Whoever wires the CI job for #218 should assert the cfgs are
+# set, not merely that the build is green.
+#
+# # Unsafe FFI surface, counted
+#
+# Five of the fourteen are `-sys` crates. Counted in the crates' own sources
+# (`grep -c` for `extern "C"` and for lines mentioning `unsafe`), with the two
+# figures that would otherwise mislead corrected in place:
+#
+#   input-sys    267 `extern "C"` in the ONE binding file that compiles
+#                (`src/bindings/gen_1_21.rs`, the default `libinput_1_21`
+#                feature). The crate ships twelve such files, one per libinput
+#                version, totalling 3287 -- eleven of them are dead.
+#   gbm-sys       40 `extern "C"`, 1 unsafe line
+#   libseat-sys   12 `extern "C"`, 2 unsafe lines
+#   libudev-sys    2 `extern "C"` blocks covering the libudev API
+#   drm-sys        0 `extern "C"` -- structs only, no functions; the ioctls
+#                are rustix's
+#   linux-raw-sys  compiled with `general` + `no_std` only; the crate-wide
+#                figure (5891 unsafe lines over 122 files) is almost entirely
+#                architecture tables this configuration does not build, so it
+#                is quoted here as an upper bound and not as a measurement of
+#                what is linked.
+#
+# The safe wrappers above them add roughly 480 more `unsafe` lines
+# (`drm` 51, `drm-ffi` 81, `gbm` 62, `input` 174, `udev` 93, `libseat` 20).
+# That is the honest shape of this draw: the wrappers are where the FFI
+# invariants actually live, and they are ordinary Rust that a reviewer can
+# read.
+#
+# # What this feature costs, with a caller
+#
+# `crates/vitrin-core/src/backend/drm.rs` exists and `Mode::Drm` calls it, so
+# these are the linked-and-real numbers, not the declared-in-advance ones.
+# Measured on release builds of `vitrind`, x86_64:
+#
+#   default                  8 291 168 bytes
+#   --features drm-backend   9 525 240 bytes   (+1 234 072)
+#
+# An earlier revision of this block recorded +39 800 and "the SAME four NEEDED
+# entries in both", measured when the backend did not yet exist and nothing
+# referenced a single symbol -- `--as-needed` drops a library nothing calls.
+# That measurement was honest and is now worthless, which is exactly why it is
+# replaced here rather than left standing: a dependency budget that reports the
+# cost of not using a dependency is not a budget. `readelf -d` now shows FOUR
+# added `NEEDED` entries:
+#
+#   libgbm.so.1   libseat.so.1   libudev.so.1   libinput.so.10
+#
+# # FOUR system libraries, not five
+#
+# Issue #218's decision 4 names five (libdrm, libgbm, libinput, libudev,
+# libseat). **Nothing links libdrm** -- confirmed by its absence from the
+# `NEEDED` list above. `drm-sys` 0.8.1 ships prebuilt bindings, takes the
+# kernel uapi structs from `linux-raw-sys` as an ordinary Rust dependency, and
+# `drm-ffi` issues its ioctls through `rustix`; the crate's build script emits
+# no `cargo:rustc-link-lib` at all. The `pkgconf.probe("libdrm").unwrap()` that
+# issue cites lives inside `mod use_bindgen`, gated on a feature nothing here
+# enables.
+#
+# The two build scripts that really do panic on a missing header are
+# `libseat-sys` and `libudev-sys` -- and #218 never names the second. The
+# conclusion it drew (this feature must not be in `default`) is unaffected and
+# correct; only the reasons were wrong.
+drm-backend = [
+    # The core's own keymap, and a hard edge rather than a documented pairing:
+    # `crate::input::keymap_key` is what turns libinput's evdev scancode into a
+    # letter (WS-E.3.1, D-028), and a bare-metal build without it is a session
+    # whose keyboard types nothing but Escape and the arrows. Making it a
+    # feature dependency means no build configuration can produce that session
+    # by accident. It resolves no new package (xkbcommon is already in the
+    # graph via smithay -> winit) -- measured: `session-keymap + drm-backend`
+    # is the same 133 unique packages as `drm-backend` alone.
+    "session-keymap",
+    "smithay/backend_drm",
+    "smithay/backend_udev",
+    "smithay/backend_libinput",
+    "smithay/backend_session_libseat",
+    "smithay/backend_gbm",
+]
 
 [dev-dependencies]
 # The permanent mock-shim fixture (issue #21): a compliant peer speaking the

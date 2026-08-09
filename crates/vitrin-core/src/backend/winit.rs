@@ -337,14 +337,23 @@ struct SceneTexture {
 /// ([`crate::cursor`]), and the hold indicator last of all — so nothing an
 /// agent positions can cover the strip the human reads the session colour
 /// from, and nothing at all can hide a hold in progress.
+/// **`human_cursor` is `None` on this backend and `Some` only on bare metal**
+/// (WS-E.3.2, issue #218). The host desktop draws the human's pointer over
+/// this window, so a sprite here would be a second cursor for one mouse; the
+/// DRM backend has no host desktop and must draw it itself, which is the
+/// change that made the IDL's "no human cursor is composited at all" sentence
+/// nested-conditional. The parameter is threaded through this one function
+/// rather than composited by each backend afterwards so that both CPU paths
+/// draw the same overlays in the same order.
 #[allow(clippy::too_many_arguments)]
-fn window_pixels(
+pub(crate) fn window_pixels(
     scene: &Scene,
     consent: &mut ConsentSurface,
     lock: &mut crate::lock::LockSurface,
     status: &mut crate::status::StatusStrip,
     hold: Option<f64>,
     agent_cursor: Option<(f64, f64)>,
+    human_cursor: Option<(f64, f64)>,
     attention: bool,
     size: Size<i32, Physical>,
 ) -> Vec<u8> {
@@ -359,6 +368,12 @@ fn window_pixels(
         // that says "agents keep working" the one surface on which they
         // invisibly do.
         crate::cursor::composite_agent_cursor(&mut pixels, w, h, x, y);
+    }
+    // After the agent's, so the human's own pointer is never the sprite that
+    // disappears under an overlapping one, and before the hold indicator for
+    // the reason that one is last.
+    if let Some((x, y)) = human_cursor {
+        crate::cursor::composite_human_cursor(&mut pixels, w, h, x, y);
     }
     if let Some(progress) = hold {
         // Last, so neither a consent card nor an agent's cursor can hide the
@@ -387,7 +402,7 @@ fn window_pixels(
 /// the strip is a cosmetic loss, and unlike the trusted band the strip asserts
 /// nothing about authenticity — so taking the session down, or refusing to
 /// present, would trade a real property for a cosmetic one.
-fn upload_status_texture<'t>(
+pub(crate) fn upload_status_texture<'t>(
     renderer: &mut GlesRenderer,
     strip: &mut crate::status::StatusStrip,
     cache: &'t mut Option<(u64, u32, GlesTexture)>,
@@ -471,7 +486,7 @@ fn upload_status_texture<'t>(
 /// presenting needs an EGL context and a host window, so CI cannot drive
 /// `try_redraw` at all (D-019(4)), and a decision written inline there is a
 /// decision nothing can pin. `every_overlay_forces_the_cpu_path` pins it.
-fn overlay_needs_the_window(
+pub(crate) fn overlay_needs_the_window(
     hold: Option<f64>,
     consent: &ConsentSurface,
     lock: &crate::lock::LockSurface,
@@ -479,7 +494,7 @@ fn overlay_needs_the_window(
     hold.is_some() || consent.prompt().is_some() || lock.is_raised()
 }
 
-fn zero_copy_source<'a, C>(
+pub(crate) fn zero_copy_source<'a, C>(
     scenes: &RealmScenes,
     content: &'a RealmGpuContent<C>,
     overlay_up: bool,
@@ -2508,7 +2523,10 @@ impl NestedState {
                 let content =
                     zero_copy_source(&self.view.scenes, &self.view.dmabuf_content, overlay_up)
                         .expect("checked above");
-                present_human_visible(
+                // The sync point is dropped here and used on bare metal:
+                // the EGL swapchain synchronizes this frame, while a scanout
+                // buffer needs the fence handed to `queue_buffer`.
+                let _sync = present_human_visible(
                     renderer,
                     &mut framebuffer,
                     size,
@@ -2518,6 +2536,8 @@ impl NestedState {
                     content,
                     indicator,
                     agent_cursor,
+                    // No human cursor on this backend -- see `window_pixels`.
+                    None,
                     status,
                 )?;
             }
@@ -2582,6 +2602,11 @@ impl NestedState {
                 &mut self.view.status,
                 hold,
                 agent_cursor,
+                // No human cursor here, ever: the host desktop is already
+                // drawing the human's pointer over this window, so a sprite
+                // would be a second cursor for one mouse. Only the bare-metal
+                // backend passes `Some` (WS-E.3.2, issue #218).
+                None,
                 self.view.attention,
                 size,
             );
@@ -3291,6 +3316,7 @@ mod tests {
             &mut no_status(),
             None,
             None,
+            None,
             false,
             size,
         );
@@ -3329,6 +3355,7 @@ mod tests {
             &mut consent,
             &mut no_lock(),
             &mut no_status(),
+            None,
             None,
             None,
             false,
@@ -3425,6 +3452,7 @@ mod tests {
                     &mut no_status(),
                     hold,
                     None,
+                    None,
                     false,
                     size
                 )),
@@ -3439,6 +3467,7 @@ mod tests {
                 &mut consent,
                 &mut no_lock(),
                 &mut no_status(),
+                None,
                 None,
                 None,
                 false,
@@ -3461,6 +3490,7 @@ mod tests {
                     &mut no_status(),
                     None,
                     Some(aim),
+                    None,
                     false,
                     size
                 )),
@@ -3475,7 +3505,7 @@ mod tests {
         // against `trust_band_rect(size)` — asserting a function's output
         // equals that same function's output is vacuous, and this test used
         // to pass with the band collapsed to zero size.
-        let draws = crate::dmabuf::human_visible_frame(size, (300, 200), indicator, None, 0);
+        let draws = crate::dmabuf::human_visible_frame(size, (300, 200), indicator, None, None, 0);
         let last = crate::dmabuf::HUMAN_VISIBLE_DRAWS - 1;
         let crate::dmabuf::Draw::TrustBand(band, band_rgba) = draws[last] else {
             panic!(
@@ -3550,6 +3580,7 @@ mod tests {
             &mut no_status(),
             None,
             None,
+            None,
             false,
             size,
         );
@@ -3560,6 +3591,7 @@ mod tests {
             &mut no_status(),
             None,
             Some(at),
+            None,
             false,
             size,
         );
@@ -3577,7 +3609,8 @@ mod tests {
         // same order, in the same colours — derived from one geometry function
         // (`crate::cursor::agent_cursor_rects`), which is why this can be an
         // equality rather than a family of hand-written expectations.
-        let draws = crate::dmabuf::human_visible_frame(size, (400, 300), indicator, Some(at), 0);
+        let draws =
+            crate::dmabuf::human_visible_frame(size, (400, 300), indicator, Some(at), None, 0);
         let gpu: Vec<_> = draws
             .iter()
             .filter_map(|draw| match draw {
@@ -3599,7 +3632,7 @@ mod tests {
         // ...and a frame with no cursor really has none, so the equality above
         // is not passing on an unconditional draw.
         assert!(
-            crate::dmabuf::human_visible_frame(size, (400, 300), indicator, None, 0)
+            crate::dmabuf::human_visible_frame(size, (400, 300), indicator, None, None, 0)
                 .iter()
                 .all(|draw| !matches!(draw, crate::dmabuf::Draw::AgentCursor(..))),
             "the zero-copy path drew a cursor for a frame that has none"
@@ -3679,6 +3712,7 @@ mod tests {
             &mut no_status(),
             Some(0.5),
             None,
+            None,
             false,
             size,
         );
@@ -3697,6 +3731,7 @@ mod tests {
             &mut no_status(),
             None,
             Some((400.0, 300.0)),
+            None,
             false,
             size,
         );
@@ -3779,6 +3814,7 @@ mod tests {
             &mut no_status(),
             None,
             None,
+            None,
             false,
             size,
         );
@@ -3815,6 +3851,7 @@ mod tests {
             &mut consent,
             &mut no_lock(),
             &mut no_status(),
+            None,
             None,
             None,
             false,
@@ -4333,6 +4370,7 @@ mod tests {
             &mut no_status(),
             None,
             None,
+            None,
             false,
             size,
         );
@@ -4357,6 +4395,7 @@ mod tests {
             &mut no_status(),
             Some(0.5),
             None,
+            None,
             false,
             size,
         );
@@ -4378,6 +4417,7 @@ mod tests {
             &mut no_status(),
             None,
             None,
+            None,
             false,
             size,
         );
@@ -4387,6 +4427,7 @@ mod tests {
             &mut no_lock(),
             &mut no_status(),
             Some(0.9),
+            None,
             None,
             false,
             size,

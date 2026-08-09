@@ -152,6 +152,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
 use smithay::backend::allocator::{Format as DrmFormat, Fourcc, Modifier};
 use smithay::backend::renderer::gles::{GlesError, GlesRenderbuffer, GlesRenderer, GlesTexture};
+use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Bind, ExportMem, Frame, ImportDma, Offscreen, Renderer, Texture};
 use smithay::utils::{Physical, Rectangle, Size, Transform};
 use vitrin_protocol::generated::vitrin_view::Format;
@@ -631,6 +632,18 @@ pub(crate) enum Draw {
     /// ([`crate::cursor`]). Human-visible only, like everything else here,
     /// and already clipped below the trusted band by the geometry function.
     AgentCursor(Rectangle<i32, Physical>, [u8; 4]),
+    /// Fill this rectangle with a piece of the **human's own** pointer
+    /// sprite (WS-E.3.2, [`crate::cursor::human_cursor_rects`]), on exactly
+    /// the terms above.
+    ///
+    /// A distinct variant rather than a second [`Draw::AgentCursor`] because
+    /// the two mean different things to whoever audits a frame: an agent's
+    /// crosshair is a safety signal saying *something other than the human is
+    /// pointing here*, and the human's is the pointing device itself. Only a
+    /// backend that owns the physical display emits it — nested leaves these
+    /// slots empty, because the host desktop draws the human's pointer over
+    /// the core's window already.
+    HumanCursor(Rectangle<i32, Physical>, [u8; 4]),
     /// Blit the status strip's CPU raster into this rectangle
     /// (WS-E.2.3, [`crate::status`]).
     ///
@@ -694,9 +707,20 @@ pub(crate) fn status_strip_rect(
 }
 
 /// How many draws one human-visible GPU frame is: the letterbox matte, the
-/// client's content, the agent cursor's slots, the status strip, and the
-/// trusted band.
-pub(crate) const HUMAN_VISIBLE_DRAWS: usize = 4 + crate::cursor::AGENT_CURSOR_RECTS;
+/// client's content, the status strip, the agent cursor's slots, the human
+/// cursor's slots, and the trusted band.
+pub(crate) const HUMAN_VISIBLE_DRAWS: usize =
+    4 + crate::cursor::AGENT_CURSOR_RECTS + crate::cursor::HUMAN_CURSOR_RECTS;
+
+/// Index of the first agent-cursor slot. The three fixed draws (matte,
+/// content, strip) come first.
+const AGENT_CURSOR_SLOT: usize = 3;
+/// Index of the first human-cursor slot: immediately after the agent's, so
+/// the human's pointer is drawn *over* an agent's crosshair when the two
+/// overlap. Deliberate — the human's own pointer must never be the thing
+/// that disappears — and harmless to D-019, whose signal is "a crosshair is
+/// somewhere on this screen", not "no pixel of it is covered".
+const HUMAN_CURSOR_SLOT: usize = AGENT_CURSOR_SLOT + crate::cursor::AGENT_CURSOR_RECTS;
 
 /// Everything one human-visible GPU frame draws, in order: the letterbox
 /// matte, the client's content at its [`layout::place`] position, the agent
@@ -735,6 +759,7 @@ pub(crate) fn human_visible_frame(
     content: (u32, u32),
     indicator: TrustedIndicator,
     agent_cursor: Option<(f64, f64)>,
+    human_cursor: Option<(f64, f64)>,
     status_h: u32,
 ) -> [Draw; HUMAN_VISIBLE_DRAWS] {
     let placement = layout::place((view.w.max(0) as u32, view.h.max(0) as u32), content);
@@ -761,8 +786,31 @@ pub(crate) fn human_visible_frame(
     if let Some(rects) = agent_cursor.and_then(|(x, y)| {
         crate::cursor::agent_cursor_rects(view.w.max(0) as u32, view.h.max(0) as u32, x, y)
     }) {
-        for (slot, rect) in draws[3..HUMAN_VISIBLE_DRAWS - 1].iter_mut().zip(rects) {
+        for (slot, rect) in draws[AGENT_CURSOR_SLOT..HUMAN_CURSOR_SLOT]
+            .iter_mut()
+            .zip(rects)
+        {
             *slot = Draw::AgentCursor(
+                Rectangle::new(
+                    (rect.x, rect.y).into(),
+                    (rect.w as i32, rect.h as i32).into(),
+                ),
+                rect.rgba,
+            );
+        }
+    }
+    // ...then the human's own pointer, in its own slots (WS-E.3.2). `None`
+    // for every backend but the bare-metal one, which is the only place the
+    // core owns the physical display and therefore the only place a human
+    // pointer exists that nobody else is drawing.
+    if let Some(rects) = human_cursor.and_then(|(x, y)| {
+        crate::cursor::human_cursor_rects(view.w.max(0) as u32, view.h.max(0) as u32, x, y)
+    }) {
+        for (slot, rect) in draws[HUMAN_CURSOR_SLOT..HUMAN_VISIBLE_DRAWS - 1]
+            .iter_mut()
+            .zip(rects)
+        {
+            *slot = Draw::HumanCursor(
                 Rectangle::new(
                     (rect.x, rect.y).into(),
                     (rect.w as i32, rect.h as i32).into(),
@@ -822,14 +870,16 @@ pub(crate) fn present_human_visible(
     content: &GpuContent,
     indicator: TrustedIndicator,
     agent_cursor: Option<(f64, f64)>,
+    human_cursor: Option<(f64, f64)>,
     status: Option<(&GlesTexture, u32)>,
-) -> Result<(), GlesError> {
+) -> Result<SyncPoint, GlesError> {
     let mut frame = renderer.render(framebuffer, view, transform)?;
     for draw in human_visible_frame(
         view,
         (content.width, content.height),
         indicator,
         agent_cursor,
+        human_cursor,
         status.map_or(0, |(_, height)| height),
     ) {
         match draw {
@@ -865,7 +915,7 @@ pub(crate) fn present_human_visible(
             // arrives with off-canvas coordinates the rasterizer clips —
             // but a zero-extent draw is skipped here rather than submitted,
             // so no GL call is made with a degenerate rectangle.
-            Draw::AgentCursor(rect, rgba) => {
+            Draw::AgentCursor(rect, rgba) | Draw::HumanCursor(rect, rgba) => {
                 if rect.size.w > 0 && rect.size.h > 0 {
                     Frame::draw_solid(
                         &mut frame,
@@ -907,8 +957,13 @@ pub(crate) fn present_human_visible(
             )?,
         }
     }
-    let _sync = frame.finish()?;
-    Ok(())
+    // **Handed back rather than dropped** (WS-E.3.2). The nested backend's
+    // EGL swapchain synchronises its own frame and ignores this, but a
+    // scanout buffer does not: `GbmBufferedSurface::queue_buffer` wants the
+    // fence so the display controller does not read a buffer the GPU has not
+    // finished writing. Returning it keeps that decision at the call site
+    // that knows which target it is drawing into.
+    frame.finish()
 }
 
 /// An opaque RGBA8888 core colour as the renderer's float colour. One
@@ -1041,11 +1096,13 @@ mod tests {
             ((800, 4), (800, 4)),
         ] {
             let size: Size<i32, Physical> = (view.0, view.1).into();
-            // Both cursor postures: a frame with no agent cursor, and one
+            // Both cursor postures: a frame with no cursor at all, and one
             // with a sprite parked wherever an agent liked. Neither may cost
-            // the band its slot.
-            for agent_cursor in [None, Some((10.0, 10.0)), Some((0.0, 0.0))] {
-                let draws = human_visible_frame(size, content, indicator, agent_cursor, 0);
+            // the band its slot. The **human** sprite (WS-E.3.2) is fed the
+            // same positions in the same loop, because a bare-metal frame
+            // carries both and the band's slot must survive either.
+            for cursor in [None, Some((10.0, 10.0)), Some((0.0, 0.0))] {
+                let draws = human_visible_frame(size, content, indicator, cursor, cursor, 0);
                 assert_eq!(draws[0], Draw::Matte, "{view:?}/{content:?}");
                 assert!(
                     matches!(draws[1], Draw::Content(_)),
@@ -1093,12 +1150,14 @@ mod tests {
                     "{view:?}/{content:?}: a zero-height band is no band at all"
                 );
                 // No cursor slot may overlap the band's rows, at any position
-                // an agent can ask for.
+                // an agent can ask for -- nor at any position the human's own
+                // pointer can reach, which is the same clip through the same
+                // geometry function.
                 for draw in draws {
-                    if let Draw::AgentCursor(cursor, _) = draw {
+                    if let Draw::AgentCursor(cursor, _) | Draw::HumanCursor(cursor, _) = draw {
                         assert!(
                             cursor.size.h == 0 || cursor.loc.y >= rect.size.h,
-                            "{view:?}/{content:?}: an agent's cursor reached the trusted \
+                            "{view:?}/{content:?}: a cursor reached the trusted \
                              band: {cursor:?} against {rect:?}"
                         );
                     }
@@ -1118,7 +1177,7 @@ mod tests {
         let indicator = TrustedIndicator::from_rgb(0x11, 0x22, 0x33);
         let size: Size<i32, Physical> = (800, 600).into();
         let count = |cursor| {
-            human_visible_frame(size, (400, 300), indicator, cursor, 0)
+            human_visible_frame(size, (400, 300), indicator, cursor, None, 0)
                 .iter()
                 .filter(|draw| matches!(draw, Draw::AgentCursor(..)))
                 .count()
@@ -1131,6 +1190,62 @@ mod tests {
         // A position that is not a number draws no sprite rather than a
         // sprite at an arbitrary place.
         assert_eq!(count(Some((f64::NAN, 100.0))), 0);
+    }
+
+    /// **The human's sprite has slots of its own, and filling them displaces
+    /// neither the agent's nor the band's** (WS-E.3.2, issue #218).
+    ///
+    /// The sibling of the test above, and it exists because the failure it
+    /// guards is silent: slot arithmetic that overlapped the two cursors
+    /// would make a bare-metal frame drop one sprite whenever both were on
+    /// screen, and every existing assertion here would still pass.
+    #[test]
+    fn the_human_cursor_has_its_own_slots_and_takes_nobody_elses() {
+        let indicator = TrustedIndicator::from_rgb(0x11, 0x22, 0x33);
+        let size: Size<i32, Physical> = (800, 600).into();
+        let at = Some((100.0, 100.0));
+
+        // Human only: the agent's slots stay empty.
+        let human_only = human_visible_frame(size, (400, 300), indicator, None, at, 0);
+        assert_eq!(
+            human_only
+                .iter()
+                .filter(|d| matches!(d, Draw::HumanCursor(..)))
+                .count(),
+            crate::cursor::HUMAN_CURSOR_RECTS
+        );
+        assert!(!human_only
+            .iter()
+            .any(|d| matches!(d, Draw::AgentCursor(..))));
+
+        // Both at once -- the bare-metal frame -- and every slot of both is
+        // filled, with the band still last.
+        let both = human_visible_frame(size, (400, 300), indicator, at, at, 0);
+        assert_eq!(
+            both.iter()
+                .filter(|d| matches!(d, Draw::AgentCursor(..)))
+                .count(),
+            crate::cursor::AGENT_CURSOR_RECTS
+        );
+        assert_eq!(
+            both.iter()
+                .filter(|d| matches!(d, Draw::HumanCursor(..)))
+                .count(),
+            crate::cursor::HUMAN_CURSOR_RECTS
+        );
+        assert!(matches!(both[HUMAN_VISIBLE_DRAWS - 1], Draw::TrustBand(..)));
+        // The human's slots come after the agent's, so an overlapping human
+        // pointer is drawn on top of an agent's crosshair rather than under
+        // it.
+        let first_human = both
+            .iter()
+            .position(|d| matches!(d, Draw::HumanCursor(..)))
+            .expect("filled above");
+        let last_agent = both
+            .iter()
+            .rposition(|d| matches!(d, Draw::AgentCursor(..)))
+            .expect("filled above");
+        assert!(last_agent < first_human);
     }
 
     /// **The GPU strip and the CPU strip are the same strip** (WS-E.2.3,
@@ -1226,7 +1341,7 @@ mod tests {
         let indicator = TrustedIndicator::from_rgb(0x7F, 0x10, 0xC0);
         let size: Size<i32, Physical> = (640, 480).into();
 
-        let off = human_visible_frame(size, (400, 300), indicator, None, 0);
+        let off = human_visible_frame(size, (400, 300), indicator, None, None, 0);
         assert!(
             matches!(off[HUMAN_VISIBLE_DRAWS - 1], Draw::TrustBand(..)),
             "the band must be the last draw"
@@ -1236,7 +1351,7 @@ mod tests {
             "a session with no strip must emit no strip draw"
         );
 
-        let on = human_visible_frame(size, (400, 300), indicator, None, 20);
+        let on = human_visible_frame(size, (400, 300), indicator, None, None, 20);
         assert_eq!(
             off[HUMAN_VISIBLE_DRAWS - 1],
             on[HUMAN_VISIBLE_DRAWS - 1],
@@ -1502,7 +1617,11 @@ mod gpu_tests {
         )
         .expect("offscreen target");
         let mut fb = renderer.bind(&mut target).expect("bind");
-        present_human_visible(
+        // The sync point is dropped: this harness reads the result back with
+        // `copy_framebuffer` on the same context, which orders itself. A
+        // scanout buffer does not, which is why the caller is handed the
+        // fence rather than the function swallowing it.
+        let _sync = present_human_visible(
             renderer,
             &mut fb,
             size,
@@ -1513,6 +1632,9 @@ mod gpu_tests {
             // pixels and the band above them. The sprite's own two-path
             // equality is pinned without a GPU, in `backend::winit`'s
             // `no_presentation_path_can_drop_the_agent_cursor`.
+            None,
+            // ...and no human cursor: this harness stands in for the nested
+            // backend, which never draws one (the host desktop does).
             None,
             // ...and no status strip, for the same reason: `--status` is
             // opt-in, these expectations are about the client's pixels, and

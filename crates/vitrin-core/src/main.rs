@@ -613,6 +613,57 @@ USAGE:
                                 it changes nothing and confines nothing.
 ";
 
+/// The `--drm` half of the help, appended by [`Action::Help`] only in a build
+/// that has the backend.
+///
+/// A second const rather than lines inside [`USAGE`] because a build without
+/// `drm-backend` has no `--drm` arm in `parse_args` at all: help that named a
+/// flag the parser answers ``unknown argument`` to would be worse than help
+/// that omits it.
+#[cfg(feature = "drm-backend")]
+const DRM_USAGE: &str = "
+BARE METAL (WS-E.3.2):
+    vitrind --drm               Run on the display controller itself: DRM/KMS
+                                mode setting, a GBM swapchain, libinput for
+                                the human's real devices, libseat for the
+                                seat. This process takes DRM MASTER -- run it
+                                from a free VT, never from inside a desktop
+                                session.
+                                It REQUIRES `--consent=interactive` (the
+                                default) and refuses `auto-approve`: this
+                                backend is the human's display and there is a
+                                human at the keyboard, so a petition can
+                                always be shown and answered.
+                                It refuses `--size` (the mode's size is the
+                                panel's), `--agent-cursor` (drawn with no
+                                opt-in where a human is watching), and both
+                                injector descriptors (headless-only).
+                                The `--lock-*` flags ARE valid here, unlike
+                                with `--headless`.
+                                No green check in this repository proves this
+                                backend lights a panel: CI has no DRM device
+                                and no seat. See WS-E.3.4.
+    vitrind [--keymap PATH]     The compiled xkb keymap this session resolves
+                                libinput scancodes through (`--drm` only;
+                                WS-E.3.1, D-028). Produce one with
+                                `xkbcli compile-keymap --layout LAYOUT > PATH`.
+                                PATH and every directory above it must be
+                                owned by root or this uid and not writable by
+                                group or other -- whoever can write the keymap
+                                chooses what the trusted core believes the
+                                human typed. Startup FAILS naming the reason
+                                otherwise, and also if the keymap does not put
+                                every core-owned chord trigger on its own key
+                                (a layout that moved Escape would leave the
+                                dead-man switch unfirable).
+                                WITHOUT it the session still runs and still
+                                fires every core chord, but resolves only the
+                                layout-invariant scancode table: NO letter, NO
+                                digit and NO punctuation reaches any app, and
+                                `--lock-passphrase-file` is refused because
+                                the passphrase could not be typed.
+";
+
 /// Base name of the default flight-recorder log inside the core's runtime
 /// directory; the pid keeps concurrent runs in separate files ("one log
 /// file per run") without a randomness dependency.
@@ -780,6 +831,50 @@ enum Action {
         /// this one is not backend-gated.
         status: status::StatusConfig,
     },
+    /// Run on bare metal: DRM/KMS mode setting, a GBM swapchain, libinput and
+    /// libseat (WS-E.3.2, issue #218). `#[cfg(feature = "drm-backend")]`, like
+    /// [`Mode::Drm`] itself.
+    ///
+    /// It carries the nested variant's fields and one more. There is no
+    /// `size` (the mode's size is the panel's and no flag may contradict it),
+    /// no `agent_cursor` (the sprite is unconditional where a human is
+    /// watching), and no injector descriptor (both channels are headless-only
+    /// and both are refused here) — each of those is a *refusal* at parse
+    /// time rather than a field this variant accepts and ignores.
+    #[cfg(feature = "drm-backend")]
+    RunDrm {
+        consent: ConsentPolicy,
+        principals: Option<PathBuf>,
+        recorder: Option<PathBuf>,
+        realm: Option<PathBuf>,
+        shim: Option<PathBuf>,
+        capture_dump: Option<PathBuf>,
+        dead_man: DeadManConfig,
+        attention: attention::AttentionChord,
+        clipboard: chord::Trigger,
+        /// The lock screen's policy, accepted here on the same terms as
+        /// `--nested` and for the same reason: a human is at a real keyboard,
+        /// so a lock this session raises can be answered. The passphrase half
+        /// additionally requires `--keymap` — see [`Action::RunDrm::keymap`].
+        lock: lock::LockConfig,
+        screenshot: screenshot::ScreenshotConfig,
+        status: status::StatusConfig,
+        /// `--keymap PATH`: the compiled xkb keymap this session resolves
+        /// libinput scancodes through (WS-E.3.1, D-028).
+        ///
+        /// A path rather than a compiled keymap because this enum is
+        /// `PartialEq` and printed in parse tests; the file is read, audited
+        /// and compiled at the top of `backend::drm::run_inner`, before the
+        /// listener accepts anyone, so a bad one is still a startup failure.
+        ///
+        /// `None` is a legal, degraded session: only the layout-invariant
+        /// scancode table resolves, so every core chord fires and no letter
+        /// reaches any app. It is refused in combination with
+        /// `--lock-passphrase-file`, because a passphrase nobody can type is a
+        /// lock nobody can answer — the same reason `--headless` refuses that
+        /// flag outright.
+        keymap: Option<PathBuf>,
+    },
     Help,
     Version,
     /// Read a passphrase from stdin and print one `--lock-passphrase-file`
@@ -815,6 +910,17 @@ enum Action {
 enum Mode {
     Nested,
     Headless,
+    /// Bare metal: this process owns the display controller (WS-E.3.2, issue
+    /// #218).
+    ///
+    /// `#[cfg(feature = "drm-backend")]`, so a build without that backend
+    /// cannot even **name** `--drm`: `parse_args` has no arm for it and exits
+    /// with ``unknown argument `--drm` ``. That is the
+    /// `--consent-injector-fd` precedent, applied to a deployment feature
+    /// rather than a test one, and it is why the refusal table below is
+    /// cfg'd alongside it.
+    #[cfg(feature = "drm-backend")]
+    Drm,
 }
 
 /// Hand-rolled argument parsing: the surface is a handful of flags, which does
@@ -851,6 +957,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut lock_idle: Option<Duration> = None;
     let mut lock_passphrase: Option<PathBuf> = None;
     let mut agent_cursor = false;
+    #[cfg(feature = "drm-backend")]
+    let mut keymap: Option<PathBuf> = None;
     let mut status_enabled = false;
     let mut status_height: Option<u32> = None;
     let mut status_offset: Option<status::UtcOffset> = None;
@@ -863,6 +971,16 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         match arg {
             "--nested" => set_mode(&mut mode, Mode::Nested)?,
             "--headless" => set_mode(&mut mode, Mode::Headless)?,
+            #[cfg(feature = "drm-backend")]
+            "--drm" => set_mode(&mut mode, Mode::Drm)?,
+            #[cfg(feature = "drm-backend")]
+            "--keymap" => {
+                let value = args.next().ok_or(
+                    "`--keymap` requires a path to a compiled xkb keymap \
+                     (e.g. `--keymap /etc/vitrin/keymap.xkb`)",
+                )?;
+                set_path(&mut keymap, "--keymap", "keymap path", value)?;
+            }
             "--size" => {
                 if size.is_some() {
                     return Err("`--size` given more than once".into());
@@ -1389,6 +1507,60 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         );
     }
 
+    // **The bare-metal refusal table** (WS-E.3.2, issue #218), at parse time
+    // like every other one here, and each entry for its own named reason
+    // rather than by analogy.
+    #[cfg(feature = "drm-backend")]
+    if matches!(mode, Some(Mode::Drm)) {
+        // `--agent-cursor`, on `--nested`'s reason exactly: this backend is a
+        // human's actual display, which is the situation D-019 exists for, so
+        // the sprite has no opt-in and the flag would silently do nothing.
+        if agent_cursor {
+            return Err(
+                "`--agent-cursor` is only valid with `--headless`: a bare-metal session is a \
+                 human's display and composites the agent cursor with no opt-in, so the flag \
+                 would do nothing there."
+                    .into(),
+            );
+        }
+        // The lock's passphrase, refused for `--headless`'s reason applied to
+        // a different cause. Headless is refused because it has no keymap at
+        // all; a `--drm` session has one only if `--keymap` gave it one, and
+        // without it the alphabet is `invariant_keysym`'s -- Escape, Enter,
+        // the arrows, the modifiers -- which contains no letter and no digit.
+        // A passphrase file nobody can type is a lock nobody can answer.
+        if lock_passphrase.is_some() && keymap.is_none() {
+            return Err(PASSPHRASE_NEEDS_A_DRM_KEYMAP.into());
+        }
+        // **Auto-approve is refused outright.** `--headless` refuses
+        // *interactive* because it can raise no prompt; this is the inverse
+        // and it is the sharper of the two. This backend IS the human's
+        // display and there is a human at a real keyboard, so a card can
+        // always be drawn and answered -- and auto-approving every petition
+        // on the machine that is somebody's actual desktop is the fail-open
+        // posture this repo refuses everywhere else. It is not a warning: a
+        // session that grants silently cannot be un-granted by noticing.
+        if !matches!(consent, ConsentPolicy::Interactive) {
+            return Err(DRM_NEEDS_INTERACTIVE_CONSENT.into());
+        }
+    }
+
+    // `--keymap` names the keymap the *libinput* path resolves through, and
+    // only the bare-metal backend has one. Nested gets its keysyms from the
+    // host's already-interpreted `logical_key` (issue #118) and headless has
+    // no keyboard at all, so in either mode the flag would be read, stored and
+    // never consulted -- `--agent-cursor`'s posture, and `--size`'s before it.
+    #[cfg(feature = "drm-backend")]
+    if keymap.is_some() && !matches!(mode, Some(Mode::Drm)) {
+        return Err(
+            "`--keymap` requires `--drm`: only the bare-metal backend resolves scancodes \
+             itself. A nested session takes its keysyms from the host compositor's own \
+             interpretation and a headless session has no keyboard, so the keymap would be \
+             compiled and never consulted."
+                .into(),
+        );
+    }
+
     // `--physical-input-fd` names a channel that exists on the headless
     // backend only (issue #212): a nested session has a real human at a real
     // keyboard, and the adoption, the calloop source and the routing turn all
@@ -1445,6 +1617,36 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             status,
         }),
         (Some(Mode::Nested), Some(_)) => Err("`--size` is only valid with `--headless`".into()),
+        // `--size` names a *virtual* output's dimensions. On bare metal the
+        // size is the CRTC's active mode, read once and handed to every
+        // realm's shim at `configure`; a flag that contradicted it would
+        // either be ignored or would configure every app at a geometry the
+        // panel is not showing.
+        #[cfg(feature = "drm-backend")]
+        (Some(Mode::Drm), Some(_)) => Err("`--size` is only valid with `--headless`: a \
+                                           bare-metal session composes at the display's own \
+                                           mode."
+            .into()),
+        #[cfg(feature = "drm-backend")]
+        (Some(Mode::Drm), None) => Ok(Action::RunDrm {
+            consent,
+            principals,
+            recorder,
+            realm,
+            shim,
+            capture_dump,
+            dead_man,
+            attention,
+            clipboard,
+            lock: lock::LockConfig {
+                chord: lock_chord,
+                idle: lock_idle,
+                passphrase: lock_passphrase,
+            },
+            screenshot,
+            status,
+            keymap,
+        }),
         // A headless core has no display to draw the consent prompt on and no
         // physical input device to answer it, so an interactive petition could
         // only pend until it timed out — no human could ever say yes. Refuse
@@ -1496,9 +1698,42 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             status,
         }),
         (None, Some(_)) => Err("`--size` requires `--headless`".into()),
-        (None, None) => Err("no mode given (expected `--nested` or `--headless`)".into()),
+        (None, None) => Err(format!("no mode given (expected one of {MODE_FLAGS})")),
     }
 }
+
+/// The `--lock-passphrase-file` refusal under `--drm` **without** a keymap
+/// (WS-E.3.2).
+///
+/// A third reason, beside [`crate::lock::PASSPHRASE_NEEDS_A_KEYMAP`]'s and
+/// [`LOCK_NEEDS_PHYSICAL_INPUT`]'s, and it is deliberately a separate constant
+/// because the fix is different: headless can never take this flag, and a
+/// bare-metal session can — by passing `--keymap`. A message telling the
+/// operator their backend is wrong, when what is missing is one more flag,
+/// would send them the wrong way.
+#[cfg(feature = "drm-backend")]
+const PASSPHRASE_NEEDS_A_DRM_KEYMAP: &str =
+    "`--lock-passphrase-file` needs `--keymap` under `--drm`: without a keymap this session \
+     resolves only the layout-invariant scancode table, which has no letters, no digits and no \
+     punctuation in it -- so the passphrase could never be typed and the lock could never be \
+     answered. Pass `--keymap PATH`, or drop the passphrase file for a privacy-screen lock any \
+     keypress dismisses.";
+
+/// The `--drm --consent=auto-approve` refusal (WS-E.3.2, issue #218 decision
+/// 5).
+///
+/// [`HEADLESS_INTERACTIVE_REFUSAL`]'s inverse, and stated separately because
+/// the reasoning runs the other way: that one refuses interactive consent on a
+/// backend that cannot raise a prompt, this one refuses *silent* consent on
+/// the one backend that always can.
+#[cfg(feature = "drm-backend")]
+const DRM_NEEDS_INTERACTIVE_CONSENT: &str =
+    "`--drm` cannot serve `--consent=auto-approve`: this backend IS the human's display and \
+     there is a human at a real keyboard, so every petition can be shown on a consent card and \
+     answered. Granting silently on the machine that is somebody's actual desktop is the \
+     fail-open posture `--headless`'s own refusal exists to prevent, taken in the other \
+     direction. Use `--consent=interactive` (the default), or `--headless` for an unattended \
+     run.";
 
 /// The `--headless --consent=interactive` refusal, in one place so the
 /// deployment build's message and the instrumented build's extended one
@@ -1761,15 +1996,23 @@ fn set_consent(slot: &mut Option<ConsentPolicy>, policy: ConsentPolicy) -> Resul
 }
 
 /// Record the selected [`Mode`], rejecting a second (or conflicting) mode flag.
+/// The mode flags this build accepts, named in one place so the
+/// "more than one mode" and "no mode given" messages cannot disagree with each
+/// other or with what `parse_args` actually has an arm for.
+#[cfg(not(feature = "drm-backend"))]
+const MODE_FLAGS: &str = "`--nested`, `--headless`";
+#[cfg(feature = "drm-backend")]
+const MODE_FLAGS: &str = "`--nested`, `--headless`, `--drm`";
+
 fn set_mode(slot: &mut Option<Mode>, mode: Mode) -> Result<(), String> {
     match slot {
         None => {
             *slot = Some(mode);
             Ok(())
         }
-        Some(_) => {
-            Err("more than one mode given (expected one of `--nested`, `--headless`)".into())
-        }
+        Some(_) => Err(format!(
+            "more than one mode given (expected one of {MODE_FLAGS})"
+        )),
     }
 }
 
@@ -1819,6 +2062,8 @@ fn main() -> ExitCode {
     match action {
         Action::Help => {
             print!("{USAGE}");
+            #[cfg(feature = "drm-backend")]
+            print!("{DRM_USAGE}");
             ExitCode::SUCCESS
         }
         Action::Version => {
@@ -1884,6 +2129,58 @@ fn main() -> ExitCode {
                         screenshot_chord,
                         lock,
                         status,
+                        seed,
+                    )
+                },
+            )
+        }
+        #[cfg(feature = "drm-backend")]
+        Action::RunDrm {
+            consent,
+            principals,
+            recorder,
+            realm,
+            shim,
+            capture_dump,
+            dead_man,
+            attention,
+            clipboard,
+            lock,
+            screenshot,
+            status,
+            keymap,
+        } => {
+            init_tracing();
+            let screenshot_chord = screenshot.chord;
+            tracing::warn!(
+                "starting on BARE METAL: this process takes DRM master and libinput's devices \
+                 for the whole seat. The realm's app runs as this uid with no namespace, no \
+                 seccomp filter and no Landlock ruleset (docs/book/src/limits.md), and on a \
+                 real seat logind ACLs /dev/input/event* to the logged-in user -- so a \
+                 confined app can open the keyboard directly and read everything typed, \
+                 bypassing this core entirely. That hole is not created here; it becomes \
+                 reachable here"
+            );
+            run_session(
+                consent,
+                principals,
+                recorder,
+                realm,
+                shim,
+                capture_dump,
+                screenshot.dir,
+                // Both injector channels are refused with `--drm` at parse
+                // time, so a bare-metal run is never instrumented.
+                false,
+                move |seed| {
+                    backend::drm::run(
+                        dead_man,
+                        attention,
+                        clipboard,
+                        screenshot_chord,
+                        lock,
+                        status,
+                        keymap,
                         seed,
                     )
                 },
@@ -3121,6 +3418,126 @@ mod tests {
         assert!(parse_args(["--headless", "--consent=auto-approve"]).is_ok());
         assert!(parse_args(["--headless", "--consent", "auto-approve"]).is_ok());
         assert!(parse_args(["--nested"]).is_ok());
+    }
+
+    /// **The bare-metal refusal table** (WS-E.3.2, issue #218), in the shape
+    /// every other entry in this table is tested in: parse the command line,
+    /// assert the refusal names both the flag and the way out.
+    ///
+    /// Each of these is a flag that would otherwise be *accepted and ignored*,
+    /// which is how an operator comes to believe a session is configured
+    /// differently than it is — the trap `--size` set the precedent for and
+    /// `--agent-cursor` followed.
+    #[cfg(feature = "drm-backend")]
+    #[test]
+    fn the_drm_refusal_table_refuses_at_parse_time_rather_than_ignoring() {
+        // A plain bare-metal run parses, with interactive consent by default.
+        assert!(parse_args(["--drm"]).is_ok());
+        assert!(parse_args(["--drm", "--consent=interactive"]).is_ok());
+
+        // `--size`: the mode's size is the panel's.
+        let err = parse_args(["--drm", "--size", "640x480"]).expect_err("--size is headless-only");
+        assert!(
+            err.contains("--size") && err.contains("--headless"),
+            "{err}"
+        );
+
+        // `--agent-cursor`: drawn with no opt-in where a human is watching.
+        let err =
+            parse_args(["--drm", "--agent-cursor"]).expect_err("--agent-cursor is headless-only");
+        assert!(
+            err.contains("--agent-cursor") && err.contains("--headless"),
+            "{err}"
+        );
+
+        // `--consent=auto-approve`: the inverse of the headless refusal, and
+        // the message must name the way out rather than only the conflict.
+        let err = parse_args(["--drm", "--consent=auto-approve"])
+            .expect_err("a bare-metal session must not grant silently");
+        assert!(err.contains("auto-approve"), "{err}");
+        assert!(err.contains("--consent=interactive"), "{err}");
+
+        // `--keymap` belongs to this backend and to no other.
+        for args in [
+            vec!["--nested", "--keymap", "/etc/vitrin/keymap.xkb"],
+            vec!["--headless", "--consent=auto-approve", "--keymap", "/k.xkb"],
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err(&format!("{args:?} must refuse a keymap it cannot use"));
+            assert!(err.contains("--keymap") && err.contains("--drm"), "{err}");
+        }
+        assert!(parse_args(["--drm", "--keymap", "/etc/vitrin/keymap.xkb"]).is_ok());
+
+        // The passphrase needs an alphabet. Refused without `--keymap`, and
+        // accepted with one -- so the refusal is about the keymap and not
+        // about the backend.
+        let err = parse_args(["--drm", "--lock-passphrase-file", "/etc/vitrin/pass"])
+            .expect_err("a passphrase nobody can type is a lock nobody can answer");
+        assert!(err.contains("--keymap"), "{err}");
+        assert!(err.contains("--lock-passphrase-file"), "{err}");
+        assert!(parse_args([
+            "--drm",
+            "--keymap",
+            "/etc/vitrin/keymap.xkb",
+            "--lock-passphrase-file",
+            "/etc/vitrin/pass",
+        ])
+        .is_ok());
+
+        // The other `--lock-*` flags are refused under `--headless` and
+        // ACCEPTED here: a human is at a real keyboard, so a lock this
+        // session raises can be dismissed.
+        assert!(parse_args(["--drm", "--lock-idle", "300"]).is_ok());
+        assert!(parse_args(["--drm", "--lock-chord", "ctrl+alt+delete"]).is_ok());
+
+        // ...and both injector channels stay headless-only, which the
+        // existing guards already enforce -- asserted here so that "the
+        // bare-metal table" is complete in one place.
+        #[cfg(feature = "consent-injector")]
+        {
+            let err = parse_args(["--drm", "--consent-injector-fd", "7"])
+                .expect_err("the consent channel is headless-only");
+            assert!(err.contains("--headless"), "{err}");
+        }
+        #[cfg(feature = "physical-input-injector")]
+        {
+            let err = parse_args(["--drm", "--physical-input-fd", "7"])
+                .expect_err("the physical-input channel is headless-only");
+            assert!(err.contains("--headless"), "{err}");
+        }
+
+        // Two modes is still one error, and the message lists what this build
+        // actually has an arm for.
+        let err = parse_args(["--drm", "--nested"]).expect_err("two modes");
+        assert!(
+            err.contains("--drm"),
+            "the mode list must name every mode: {err}"
+        );
+    }
+
+    /// **A build without the backend cannot even name its flags**, the
+    /// `--consent-injector-fd` precedent applied to a deployment feature.
+    ///
+    /// It matters for the same reason: a flag that is recognised-and-ignored
+    /// makes an operator believe something false about a running process, and
+    /// `/proc/<pid>/cmdline` is what tells them otherwise.
+    #[cfg(not(feature = "drm-backend"))]
+    #[test]
+    fn a_build_without_the_drm_backend_cannot_name_its_flags() {
+        for args in [
+            vec!["--drm"],
+            vec!["--nested", "--keymap", "/etc/vitrin/keymap.xkb"],
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err(&format!("{args:?} must not parse without the backend"));
+            assert!(
+                err.contains("unknown argument"),
+                "the flag must be an unknown argument, not a recognised-and-ignored one: {err}"
+            );
+        }
+        // ...and the mode list an error names must not advertise it either.
+        let err = parse_args::<[&str; 0]>([]).expect_err("no mode given");
+        assert!(!err.contains("--drm"), "{err}");
     }
 
     /// **A deployment build cannot even name the hook** (issue #138, the

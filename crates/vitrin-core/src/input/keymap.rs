@@ -147,12 +147,19 @@ impl std::error::Error for KeymapError {}
 /// IDL's normative modifier-suppression rule), which is exactly why
 /// interpreting here needs no shim edit and no wire change.
 ///
-/// Not wired to a backend yet, and that is the honest state of #217: there is
-/// no DRM backend to feed it (that is #218, WS-E.3.2). This is the decided
-/// resolution path plus its tests; the caller arrives with libinput.
-#[allow(
-    dead_code,
-    reason = "WS-E.3.2 (#218) adds the libinput arm that calls it"
+/// Wired since WS-E.3.2 (#218): the DRM backend compiles one at startup from
+/// `--keymap PATH` and resolves every libinput key through it
+/// (`crate::input::keymap_key`). A build without that backend still compiles
+/// this module under `session-keymap` and still runs its tests, which is what
+/// keeps the resolution path measured on CI runners that have no seat.
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        dead_code,
+        reason = "the one non-test caller is the DRM backend's libinput arm; a \
+                  `session-keymap`-only build compiles this path and runs its tests \
+                  without one"
+    )
 )]
 pub(crate) struct CoreKeymap {
     /// Held for its lifetime, not for its API: libxkbcommon refcounts these,
@@ -164,9 +171,14 @@ pub(crate) struct CoreKeymap {
     state: xkb::State,
 }
 
-#[allow(
-    dead_code,
-    reason = "WS-E.3.2 (#218) adds the libinput arm that calls it"
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        dead_code,
+        reason = "the one non-test caller is the DRM backend's libinput arm; a \
+                  `session-keymap`-only build compiles this path and runs its tests \
+                  without one"
+    )
 )]
 impl CoreKeymap {
     /// Compile the keymap the operator's path names.
@@ -241,6 +253,19 @@ impl CoreKeymap {
 
     /// Compile keymap text the caller already holds. The test entry point,
     /// and the shared body of [`Self::from_path`].
+    ///
+    /// Deliberately has no production caller and must not grow one: every
+    /// keymap `vitrind` compiles comes from a path it audited first
+    /// ([`Self::from_path`]), and a second constructor that skipped the audit
+    /// would be the hole D-028(2) closed, reopened one call site along.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the audit-free constructor is for tests; production compiles only \
+                      through `from_path`"
+        )
+    )]
     pub fn from_text(text: &str) -> Result<Self, KeymapError> {
         Self::compile(text, None)
     }
@@ -379,6 +404,10 @@ impl CoreKeymap {
 ///
 /// Idempotent by construction: a Unicode keysym's codepoint re-encodes to
 /// itself.
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(dead_code, reason = "reached only through `CoreKeymap`, above")
+)]
 fn unicode_keysym(sym: xkb::Keysym) -> u32 {
     let raw = sym.raw();
     // **The keypad is left alone**, and this exception is not cosmetic.

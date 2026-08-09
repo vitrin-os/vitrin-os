@@ -200,6 +200,26 @@ pub(crate) struct LockScreen {
     /// forever. The fail-closed reading is the one that is also the obvious
     /// one.
     last_activity: Instant,
+    /// Whether the seat has been taken away from this session — on bare metal,
+    /// the human switched to another VT (D-030(7)).
+    ///
+    /// While true the idle clock does not run. **This is an owner decision,
+    /// not a derivation** (Taha, 2026-08-09): switching away must not lock the
+    /// session. Without it the behaviour is one nobody chose — physical input
+    /// is suspended for the whole switch, so `last_activity` cannot advance,
+    /// so a session with `--lock-idle` locks *during* the absence, at a moment
+    /// no human could see, and the human returns to a passphrase prompt they
+    /// did not ask for.
+    ///
+    /// The accepted cost is stated rather than hidden: a session switched away
+    /// from for eight hours is unlocked when it is switched back to, because
+    /// vitrind saw no idle time pass. A configurable policy — lock on switch,
+    /// lock on idle, never — is filed as its own issue rather than guessed at
+    /// here.
+    ///
+    /// Deliberately NOT a lowering: a lock already up stays up across a
+    /// switch. This suppresses only the *raise*.
+    seat_absent: bool,
     /// The stored digest an attempt is checked against, or `None` for a
     /// privacy screen with no authentication ([`UnlockMethod`]).
     verifier: Option<PassphraseFile>,
@@ -261,9 +281,28 @@ impl LockScreen {
                 .expect("a single binding cannot collide with itself"),
             idle_after,
             last_activity: now,
+            seat_absent: false,
             verifier,
             journal: Vec::new(),
         }
+    }
+
+    /// Tell the gate whether this session still holds the seat (D-030(7)).
+    ///
+    /// Called from the bare-metal backend's `PauseSession` / `ActivateSession`
+    /// handler and nowhere else — nested has no equivalent, because a host
+    /// compositor's focus loss is not a seat loss and the human can still see
+    /// the window.
+    ///
+    /// Returning advances the activity clock, so the idle countdown restarts
+    /// from the moment the human comes back rather than resuming a count that
+    /// was frozen mid-way. A human who returns to their own screen has, by
+    /// returning, done the one thing the idle timer is asking about.
+    pub(crate) fn set_seat_absent(&mut self, absent: bool, now: Instant) {
+        if !absent && self.seat_absent {
+            self.last_activity = now;
+        }
+        self.seat_absent = absent;
     }
 
     /// Whether a lock is up, and why.
@@ -340,6 +379,12 @@ impl LockScreen {
     /// timer bounds that.
     pub fn tick(&mut self, now: Instant) -> bool {
         if self.locked.is_some() {
+            return false;
+        }
+        // The seat is somebody else's right now (D-030(7)). Time the human
+        // spends on another VT is not idle time, and counting it would lock
+        // the session at an instant nobody could observe.
+        if self.seat_absent {
             return false;
         }
         let Some(after) = self.idle_after else {
@@ -636,6 +681,65 @@ mod tests {
             );
         }
         assert!(s.tick(t0 + Duration::from_secs(60)));
+    }
+
+    /// **Switching to another VT does not lock the session** (D-030(7)).
+    ///
+    /// An owner decision, not a derivation (Taha, 2026-08-09), and the
+    /// behaviour it replaces is one nobody chose. Physical input is suspended
+    /// for the whole absence, so `last_activity` cannot advance — a session
+    /// with `--lock-idle` would therefore lock *during* the switch-away, at an
+    /// instant no human could observe, and the human would return to a
+    /// passphrase prompt they never asked for.
+    ///
+    /// The accepted cost is asserted here too, so it cannot be quietly
+    /// changed: an eight-hour absence returns to an unlocked screen.
+    #[test]
+    fn a_seat_taken_away_stops_the_idle_clock_and_returning_restarts_it() {
+        let t0 = Instant::now();
+        let mut s = screen(Some(Duration::from_secs(60)), t0);
+
+        s.set_seat_absent(true, t0 + Duration::from_secs(1));
+        // Well past the deadline, and past any plausible absence.
+        assert!(
+            !s.tick(t0 + Duration::from_secs(8 * 60 * 60)),
+            "a session must not lock itself while the human is on another VT: nobody could see \
+             it happen, and they would come back to a prompt they did not ask for"
+        );
+        assert!(!s.is_locked());
+
+        // Coming back restarts the countdown rather than resuming a frozen
+        // one -- returning to your own screen is what an idle timer asks about.
+        let back = t0 + Duration::from_secs(8 * 60 * 60);
+        s.set_seat_absent(false, back);
+        assert!(
+            !s.tick(back + Duration::from_secs(59)),
+            "the countdown must restart from the return, not resume mid-way"
+        );
+        assert!(s.tick(back + Duration::from_secs(60)));
+        assert_eq!(s.cause(), Some(LockCause::Idle));
+    }
+
+    /// A lock already up is **not** lowered by losing the seat. The absence
+    /// suppresses the raise; it is not an unlock, and a VT switch must never
+    /// be a way past a lock screen.
+    #[test]
+    fn losing_the_seat_never_lowers_a_lock_that_is_already_up() {
+        let t0 = Instant::now();
+        let mut s = screen(Some(Duration::from_secs(60)), t0);
+        assert!(s.tick(t0 + Duration::from_secs(60)));
+        assert!(s.is_locked());
+
+        s.set_seat_absent(true, t0 + Duration::from_secs(61));
+        assert!(
+            s.is_locked(),
+            "a VT switch must not unlock a locked session"
+        );
+        s.set_seat_absent(false, t0 + Duration::from_secs(999));
+        assert!(
+            s.is_locked(),
+            "and coming back must still meet the lock the human left up"
+        );
     }
 
     #[test]

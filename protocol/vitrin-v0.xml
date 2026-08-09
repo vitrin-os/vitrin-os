@@ -1038,9 +1038,17 @@
       agent principal's own cursor, at the same output stage as the
       consent overlay and the trust indicator, so the rule binds the
       compositor NOW rather than vacuously and is exercised by every
-      frame drawn while an agent is pointing. No human cursor is
-      composited at all: in nested operation the host desktop draws it
-      outside the realm view entirely.
+      frame drawn while an agent is pointing. Whether a HUMAN cursor is
+      composited depends on who owns the display, and the answer changes
+      nothing above: in nested operation the core composites none,
+      because the host desktop draws it outside the realm view entirely;
+      on bare metal, where there is no host desktop, the core draws the
+      human's pointer itself, or the human has none. Both answers sit on
+      the same side of the same fork - the human-visible output stage,
+      alongside the consent overlay and the trust indicator - so a human
+      cursor can no more appear in a captured frame than a consent card
+      can, and the observe_cursor rule above is unaffected by which
+      backend is running.
       Streaming capture is a deliberate
       deferral, not an omission: if a later version adds it, it arrives
       as since-gated sibling messages beside this poll pair, which stays

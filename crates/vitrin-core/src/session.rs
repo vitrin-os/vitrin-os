@@ -1707,6 +1707,60 @@ pub(crate) fn deliver<H: PreemptionHook>(
     }
 }
 
+/// Whether a card raised **this round** would reach the human's eyes
+/// (WS-E.3.3, D-030(4)).
+///
+/// [`ConsentGrab::raise`] does five things in one call so that "visible",
+/// "input grabbed", "`consent_held` holds" and "the log says so" cannot drift
+/// apart — and the first of those five is the one an embedder can be wrong
+/// about. `raise` writes `Event::ConsentTransition { state: Shown }`, which is
+/// the flight recorder's record that **a human was asked**. Raising against a
+/// screen this session no longer owns puts a falsehood in the one artifact that
+/// has to reconstruct the session afterwards, and it also sets `prompt_shown`,
+/// so the enforcement chokepoint starts refusing that principal `consent_held`
+/// citing a card nobody can see.
+///
+/// # Why this is a parameter and not a field of [`ConsentGrab`]
+///
+/// [`ConsentGrab::set_view`]'s docs make the argument: a fact fed in from
+/// "somewhere else" is a correctness hazard rather than a stale cache, and the
+/// view is only safe because it is co-fed with the routing call in the same
+/// step. A `lit`/`dark` field on the grab would have no such co-feed and would
+/// be exactly that drift-prone shadow state. So the embedder answers the
+/// question once per round, from the same fact it presents by.
+///
+/// # There is deliberately no third variant for a dark panel
+///
+/// The obvious sibling — "the output is powered down" — is **not** here, and
+/// its absence is a decision rather than an omission. This core has no DPMS: it
+/// never sets a display-power state, never reads one, and while it holds DRM
+/// master nothing else may set one either. A variant for a condition nothing in
+/// the process can produce would be an unreachable guard that reads as a live
+/// protection, which this codebase has already shipped once (the `preempted`
+/// hook no backend stacked, from P1.4.4 until issue #212's review, while the
+/// book described it as live). D-030(4) states that in full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptVisibility {
+    /// The embedder is presenting to a display it owns, so a card raised this
+    /// round reaches it. Every backend that can host a prompt at all answers
+    /// this in the ordinary case.
+    Reachable,
+    /// The seat has taken this session's devices away — a VT switch on the
+    /// bare-metal backend — so nothing composited this round reaches a panel
+    /// and no physical input can arrive to answer it. The petition stays
+    /// pending, unshown and unjournalled, and the ordinary advisory sweep
+    /// resolves it `timed_out`, which reaches the agent as a refusal.
+    #[cfg_attr(
+        not(feature = "drm-backend"),
+        allow(
+            dead_code,
+            reason = "only a seat can take a screen away, and only the bare-metal backend has \
+                      one; a default build compiles this path and tests it through the rig"
+        )
+    )]
+    ScreenNotOurs,
+}
+
 /// Service one turn of interactive consent: retire a prompt whose petition
 /// already left the table, apply every human decision the input grab produced,
 /// then raise the front-of-queue petition's prompt if none is up. Reports
@@ -1744,16 +1798,19 @@ pub(crate) fn deliver<H: PreemptionHook>(
 /// 3. `retire_stale` again: a just-decided petition has left the pending table,
 ///    so its card comes down *this* round and the queue advances immediately
 ///    rather than one turn late.
-/// 4. Raise the front prompt **only when none is up**. That makes
-///    one-prompt-at-a-time structural, and it is also what stops a busy-spin:
+/// 4. Raise the front prompt **only when none is up**, and **only onto a
+///    screen this session still owns** ([`PromptVisibility`]). The first makes
+///    one-prompt-at-a-time structural, and is also what stops a busy-spin:
 ///    re-raising an already-shown petition returns `Some(route)`, which would
 ///    otherwise set `changed = true` on every idle round and keep the frame
-///    perpetually dirty.
+///    perpetually dirty. The second is D-030(4), and it is deliberately the
+///    *only* step gated — see [`PromptVisibility`].
 pub(crate) fn service_consent_round<H: PreemptionHook>(
     grab: &mut ConsentGrab,
     runtime: &mut Runtime<H>,
     consent: &mut ConsentSurface,
     now: Instant,
+    visibility: PromptVisibility,
 ) -> bool {
     // Take down a prompt whose petition already left the table (timed out via
     // the sweep, withdrawn with its connection, or dead-man-denied), freeing
@@ -1789,7 +1846,12 @@ pub(crate) fn service_consent_round<H: PreemptionHook>(
     // One prompt at a time, made structural — and the guard that keeps this
     // from busy-spinning, since re-raising an already-armed petition would
     // return `Some(route)` and set `changed` every round.
-    if grab.armed_petition().is_none() {
+    //
+    // **And only onto a screen this session still owns** (D-030(4)). Step 4
+    // alone is gated: `retire_stale` and the decision drain above must keep
+    // running through a pause, or a dead petition's card stays composited and
+    // the queue never advances.
+    if visibility == PromptVisibility::Reachable && grab.armed_petition().is_none() {
         if let Some(front) = runtime.kernel.petitions.front_pending() {
             // `raise` borrows two disjoint fields of `runtime.kernel` (the
             // petition registry and the recorder) alongside the `consent`
@@ -3027,6 +3089,139 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
     drain_screenshot_gestures(runtime, scenes, view);
 }
 
+/// **The seat has taken this session's input devices away** — a VT switch on
+/// bare metal — so cancel the gesture in progress and pay every app the
+/// releases it will otherwise never hear (WS-E.3.3, D-030(8)).
+///
+/// Returns how many releases were delivered, which is what makes this
+/// assertable: the counterpart drains empty the router's tables, so a test that
+/// only read the tables afterwards could not tell "released" from "forgotten".
+///
+/// # A free function here rather than a method on the backend
+///
+/// The same split [`route_physical_turn`] and `crate::backend::winit::route_turn`
+/// were made for, and for the same reason: `DrmState` cannot be constructed
+/// without a real `DrmDevice`, a `LibSeatSession`, a `GbmDevice` and a
+/// `GlesRenderer`, so anything left inside its `handle_session_event` is
+/// unreachable by every test in this workspace. That is how D-018(2)'s fifth
+/// ordering rule came to have production wiring a reviewer could revert with
+/// the suite still green, and a pause handler is exactly the same shape of
+/// risk — nothing goes red when it stops draining.
+///
+/// # What it does, in this order, and why the order is load-bearing
+///
+/// 1. **The dead-man hold is forgotten first.** A chord held when the VT
+///    switches away produces no release here, so a hold left armed would either
+///    fire with no gesture behind it or wedge in a state only a release can
+///    leave. Forgetting it *before* the drain means a chord in progress is
+///    already cancelled when the releases go out —
+///    `crate::backend::winit::NestedState::handle_focus` states the identical
+///    rule for a lost host focus.
+/// 2. **Keys, then buttons**, to the realm the human's attention is bound to,
+///    through the funnel an ordinary release takes. Keys first is
+///    [`InputRouter::bind_to`]'s order: a keyboard latch is the state that
+///    misbehaves worst.
+///
+/// # Buttons too, unlike nested focus loss, and that asymmetry is the decision
+///
+/// `handle_focus` drains keys and deliberately **not** buttons, because winit
+/// reports pointer state separately and the host keeps sending motion, so a
+/// synthetic button release would end a drag the human is still making. On a
+/// seat pause there is no such drag to end: `libinput_suspend` has closed the
+/// devices, no further motion or release can arrive for the whole pause, and
+/// the human's next press after the switch back is a new gesture. A held button
+/// left behind therefore wedges the app's implicit pointer grab with nothing
+/// that can ever pay it down — the exact case
+/// [`InputRouter::release_physical_buttons`] was added for (issue #212,
+/// decision 3), and until this call site it had exactly one caller.
+///
+/// # Agents are untouched
+///
+/// Only the human's presses are drained, by the same rule
+/// [`InputRouter::release_physical_keys`] states: the seat leaving is not part
+/// of an agent's actuation path, and a release synthesised for an agent's key
+/// would reach the shim and the flight recorder tagged as the human's.
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        dead_code,
+        reason = "the caller is the bare-metal backend's PauseSession arm; a default build \
+                  compiles this and runs its behavioural test without a seat"
+    )
+)]
+pub(crate) fn suspend_physical_seat<H: crate::input::PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    scenes: &crate::scene::realms::RealmScenes,
+    switch: &std::cell::RefCell<crate::deadman::DeadManSwitch>,
+) -> usize {
+    // Before the drain, deliberately (doc comment above).
+    switch.borrow_mut().forget_hold();
+
+    let Runtime {
+        router,
+        realms,
+        kernel,
+        ..
+    } = runtime;
+    let Some(bound) = router.bound_realm().cloned() else {
+        return 0;
+    };
+    let mut owed = router.release_physical_keys(&bound);
+    owed.extend(router.release_physical_buttons(&bound));
+    let count = owed.len();
+    for delivery in owed {
+        tracing::debug!(
+            realm = %bound,
+            "releasing a press held across a session switch so it cannot latch in the app"
+        );
+        deliver_physical(realms, scenes, &mut kernel.recorder, delivery);
+    }
+    count
+}
+
+/// **The seat has given the devices back**: restart the consent guard, because
+/// a card that was up across the pause has only now become visible again
+/// (WS-E.3.3, D-030(5)).
+///
+/// Returns whether there was a prompt to restart. The production caller
+/// discards it — the logging this function owes is done here, via `debug!`,
+/// precisely so a backend cannot forget it. The return value exists for the
+/// test, which has no other way to observe that the guard was restarted.
+///
+/// [`ConsentGrab::restart_guard`]'s docs enumerate one way "raised" and
+/// "visible" come apart — WS-E.2.2's opaque lock cover. A seat pause is the
+/// second, and it is worse in two ways. It is produced entirely outside this
+/// core, so nothing in the loop can decline it; and unlike the lock, which
+/// keeps a covered prompt *unanswerable* because `LockGate` is outermost, a
+/// paused session's grab is untouched — the press a human armed on Allow before
+/// switching away survives the switch, because `commit` re-checks only the last
+/// **physical** pointer position and a pause does not reset one. So the first
+/// release after the switch back would commit a decision armed on a card that
+/// spent its guard on somebody else's VT. `restart_guard` closes both halves:
+/// it moves `raised_at` and it clears `armed`.
+///
+/// **Only the guard restarts.** The petition's own deadline is deliberately
+/// untouched, exactly as the unlock path leaves it: it bounds how long the human
+/// has to decide, and a VT switch does not buy them more of it. Refreshing it
+/// would also let an agent extend its own petition's life by inducing VT churn,
+/// and would break the invariant `a_grab_never_outlives_its_petitions_deadline`
+/// pins.
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        dead_code,
+        reason = "the caller is the bare-metal backend's ActivateSession arm; a default build \
+                  compiles this and runs its behavioural test without a seat"
+    )
+)]
+pub(crate) fn resume_physical_seat(grab: &std::cell::RefCell<ConsentGrab>, now: Instant) -> bool {
+    let restarted = grab.borrow_mut().restart_guard(now);
+    if restarted {
+        tracing::debug!("consent guard restarted: a prompt became visible when the seat returned");
+    }
+    restarted
+}
+
 /// Turn the human's queued screenshot chords into files on disk (WS-E.2.4,
 /// issue #216).
 ///
@@ -4237,6 +4432,11 @@ mod tests {
         /// drives [`service_consent_round`] each dispatch round, exactly as
         /// the nested backend does.
         grab: Option<Rc<RefCell<ConsentGrab>>>,
+        /// What this rig's `service_consent` answers for
+        /// [`PromptVisibility`] — the bare-metal backend's `DrmOutput::active`
+        /// in miniature. `Reachable` by default, so every existing consent test
+        /// is unaffected; a pause test flips it.
+        screen: PromptVisibility,
     }
 
     impl RuntimeHost for TestHost {
@@ -4264,7 +4464,13 @@ mod tests {
                 return;
             };
             let mut grab = grab.borrow_mut();
-            if service_consent_round(&mut grab, &mut self.runtime, &mut self.view.consent, now) {
+            if service_consent_round(
+                &mut grab,
+                &mut self.runtime,
+                &mut self.view.consent,
+                now,
+                self.screen,
+            ) {
                 self.runtime.dirty = true;
             }
         }
@@ -4389,6 +4595,7 @@ mod tests {
                 signal: event_loop.get_signal(),
                 fatal: None,
                 grab: None,
+                screen: PromptVisibility::Reachable,
             };
             install(&handle, &mut host.runtime).expect("install runtime sources");
             Rig {
@@ -6413,6 +6620,300 @@ mod tests {
                 .any(|e| e.str("kind") == "consent_transition" && e.str("state") == "shown"),
             "the run must journal a consent_transition{{shown}}; got {:?}",
             entries.iter().map(|e| e.str("kind")).collect::<Vec<_>>()
+        );
+    }
+
+    /// **No prompt is raised onto a screen this session no longer owns, and
+    /// the flight recorder does not say one was** (WS-E.3.3, D-030(4)).
+    ///
+    /// The falsehood this closes was live on this branch before it landed.
+    /// `post_dispatch` calls `service_consent` unconditionally and the calloop
+    /// loop keeps dispatching through a seat pause, so an agent petitioning
+    /// while the human was on another VT got a card composited into a frame
+    /// `should_queue_flip` would never flip — while `raise` wrote
+    /// `consent_transition{shown}`, set `prompt_shown` so the chokepoint
+    /// refused that principal `consent_held`, and told the petitioner `shown`
+    /// over the wire. Authority still failed closed (the sweep times the
+    /// petition out); the **record** was the lie, and the record is the one
+    /// artifact that has to reconstruct the session afterwards.
+    ///
+    /// Both directions in one test, deliberately. The negative half alone
+    /// passes in a run where the consent machinery is simply broken, so it is
+    /// paired with the same petition being raised the moment the seat returns
+    /// — no new petition, no reconnect, only the visibility answer changing.
+    #[test]
+    fn no_prompt_is_raised_while_the_screen_is_not_ours() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "consent-paused",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let grab = rig.attach_grab();
+        // The seat took the devices away before the petition arrived.
+        rig.host.screen = PromptVisibility::ScreenNotOurs;
+
+        let mut client = agent(&rig.socket);
+        send_preamble(&mut client);
+        send_petition(&mut client);
+        rig.pump(Duration::from_millis(400));
+
+        // The petition really did arrive and really is pending — otherwise
+        // everything below is vacuous.
+        let front = rig
+            .host
+            .runtime
+            .kernel
+            .petitions
+            .front_pending()
+            .expect("the petition must be queued and awaiting a human");
+        assert!(
+            grab.borrow().armed_petition().is_none(),
+            "a card was raised while the seat held this session's devices: nothing composited \
+             this round reaches a panel, so no human could have seen it"
+        );
+        assert!(
+            rig.host.view.consent.card_origin(VIEW.0, VIEW.1).is_none(),
+            "the consent surface must have nothing on it while the screen is not ours"
+        );
+        let petitioner =
+            PrincipalIdentity::parse(DEMO_IDENTITY).expect("the rig's demo identity parses");
+        assert!(
+            !rig.host.runtime.kernel.petitions.prompt_up_for(&petitioner),
+            "`prompt_shown` was set for a card that reached no panel, so the enforcement \
+             chokepoint would refuse this principal `consent_held` citing it"
+        );
+        let entries = rig.entries();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.str("kind") == "consent_transition" && e.str("state") == "shown"),
+            "the flight recorder journalled `shown` for a prompt that never reached a display; \
+             got {:?}",
+            entries.iter().map(|e| e.str("kind")).collect::<Vec<_>>()
+        );
+
+        // The seat gives the devices back. Same petition, same connection —
+        // only the visibility answer changed.
+        rig.host.screen = PromptVisibility::Reachable;
+        let petition = pump_until_armed(&mut rig, &grab);
+        assert_eq!(
+            petition, front,
+            "the petition that waited is the one raised"
+        );
+        assert!(
+            rig.host.view.consent.card_origin(VIEW.0, VIEW.1).is_some(),
+            "the card must go up the moment the screen is ours again"
+        );
+        let entries = rig.entries();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.str("kind") == "consent_transition" && e.str("state") == "shown"),
+            "and only then may the run journal consent_transition{{shown}}; got {:?}",
+            entries.iter().map(|e| e.str("kind")).collect::<Vec<_>>()
+        );
+    }
+
+    /// **A seat pause pays the app every press the human is holding — keys
+    /// and buttons — and cancels the dead-man gesture in progress**
+    /// (WS-E.3.3, D-030(8); criteria (a) and (b) of issue #219).
+    ///
+    /// Driven through [`suspend_physical_seat`], which is the production body
+    /// of the bare-metal `PauseSession` arm. It is a free function for exactly
+    /// this reason: `DrmState` needs a real `DrmDevice`, `LibSeatSession`,
+    /// `GbmDevice` and `GlesRenderer`, so anything left inside its
+    /// `handle_session_event` is unreachable by every test in this workspace
+    /// — and a pause handler that silently stopped draining would take nothing
+    /// red with it.
+    ///
+    /// The presses are made by real physical events through
+    /// [`route_physical_turn`], so the router's tables are populated by the
+    /// production intake rather than by the test: a test that pushed its own
+    /// entries into the pairing table would be asserting about a fixture.
+    ///
+    /// **Buttons are the half the nested precedent does not pay.**
+    /// `handle_focus` drains keys only, because winit keeps sending pointer
+    /// events and a synthetic release would end a live drag. A seat pause has
+    /// closed the devices, so there is no drag left to end and a held button
+    /// wedges the app's implicit pointer grab with nothing that can ever pay
+    /// it down.
+    #[test]
+    fn a_paused_seat_pays_out_held_presses_and_forgets_the_dead_man_hold() {
+        use crate::input::tests::physical_for_test;
+        use crate::input::SeatInputKind;
+        use vitrin_protocol::generated::vitrin_actuator_pointer::ButtonState;
+        use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "seat-pause-drain",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        rig.start_realm(&["--serve", "--seat"]);
+        rig.pump(Duration::from_millis(400));
+        let realm = RealmId::new(crate::realm::WELL_KNOWN_REALM_ID);
+        // A committed surface, or a button press is a matte hit and never
+        // reaches the pairing table at all.
+        commit_into(&mut rig, &realm, VIEW.0, VIEW.1, 0x33);
+
+        let switch = std::cell::RefCell::new(crate::deadman::DeadManSwitch::new(
+            crate::deadman::DeadManConfig::default(),
+        ));
+        let turn = |rig: &mut Rig, inputs: Vec<crate::input::SeatInput>| {
+            route_physical_turn(
+                &mut rig.host.runtime,
+                &rig.host.view.scenes,
+                Some(&switch),
+                inputs,
+                VIEW,
+                Instant::now(),
+            );
+        };
+
+        // A key the human is holding, a pointer inside the surface, a button
+        // held on top of it — the mid-drag, mid-chord state a VT switch
+        // routinely lands in.
+        turn(
+            &mut rig,
+            crate::input::physical_key(28, None, KeyState::Pressed),
+        );
+        turn(
+            &mut rig,
+            vec![physical_for_test(SeatInputKind::Motion { x: 8.0, y: 8.0 })],
+        );
+        turn(
+            &mut rig,
+            vec![physical_for_test(SeatInputKind::Button {
+                button: 0x110,
+                state: ButtonState::Pressed,
+            })],
+        );
+        // ...and the dead-man chord going down. Fed to the switch's own
+        // detection entry point, which is exactly what
+        // `DeadManWatcher::observe` calls in production: this rig's hook stack
+        // is the screenshot/attention pair (it has no display, so it carries
+        // no watcher), and a hold armed any other way would be a fixture
+        // rather than the switch's own state.
+        switch
+            .borrow_mut()
+            .observe_event(&crate::input::tests::chord_press(), Instant::now());
+
+        assert_eq!(
+            rig.host.runtime.router.held_keys(&realm).len(),
+            1,
+            "the ordinary key must be in the pairing table"
+        );
+        assert_eq!(
+            rig.host.runtime.router.held_buttons(&realm).len(),
+            1,
+            "the button must be in the implicit-grab table"
+        );
+        assert!(
+            switch.borrow().deadline().is_some(),
+            "the chord press must have armed a hold, or half this test is about nothing"
+        );
+        let delivered_before = rig
+            .entries()
+            .iter()
+            .filter(|e| e.str("kind") == "seat_delivered")
+            .count();
+
+        // The seat takes the devices away.
+        let released = suspend_physical_seat(&mut rig.host.runtime, &rig.host.view.scenes, &switch);
+
+        assert_eq!(
+            released, 2,
+            "one key and one button are owed a release; the count is read off the deliveries \
+             rather than off the tables, so `forgotten` cannot pass as `released`"
+        );
+        assert!(
+            rig.host.runtime.router.held_keys(&realm).is_empty(),
+            "a key left in the pairing table across a VT switch stays latched down in the \
+             confined app indefinitely"
+        );
+        assert!(
+            rig.host.runtime.router.held_buttons(&realm).is_empty(),
+            "a button left held across a VT switch wedges the app's implicit pointer grab"
+        );
+        assert!(
+            switch.borrow().deadline().is_none(),
+            "an armed hold that survives the switch either fires with no gesture behind it or \
+             wedges in a state only a release can leave"
+        );
+        // The releases really went to the app, not merely out of the tables.
+        let delivered_after = rig
+            .entries()
+            .iter()
+            .filter(|e| e.str("kind") == "seat_delivered")
+            .count();
+        assert_eq!(
+            delivered_after - delivered_before,
+            2,
+            "the drained presses must reach the realm's shim through the ordinary delivery \
+             funnel and be journalled there"
+        );
+    }
+
+    /// **An answer given just before a VT switch is still honoured.**
+    ///
+    /// D-030(4) argues that **only step 4** of [`service_consent_round`] — the
+    /// raise — is gated on visibility, and that gating the whole round would be
+    /// an over-reach. Nothing held that. Inserting an early return at the top
+    /// of the round left the entire workspace green, and the consequence is
+    /// concrete: step 2 is the decision drain, so a human who pressed Allow and
+    /// switched VT a moment later would have their answer sit undrained for the
+    /// whole absence while the independent timeout sweep ran underneath it —
+    /// the agent refused `timed_out` for a petition the human had *granted*.
+    ///
+    /// The press happens while the screen is ours; the seat leaves immediately
+    /// after, exactly as a `Ctrl-Alt-F2` a beat after a click would.
+    #[test]
+    fn a_decision_taken_before_the_seat_left_is_still_drained() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "consent-answered-then-paused",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let grab = rig.attach_grab();
+        let mut client = agent(&rig.socket);
+        send_preamble(&mut client);
+        send_petition(&mut client);
+        let petition = pump_until_armed(&mut rig, &grab);
+
+        // The human answers...
+        grab.borrow_mut().queue_decision(Decision {
+            petition,
+            choice: Choice::Allow(PersistenceRung::Once),
+        });
+        // ...and switches VT before the next dispatch round drains it.
+        rig.host.screen = PromptVisibility::ScreenNotOurs;
+        rig.pump(Duration::from_millis(400));
+
+        // The core's own state FIRST, deliberately. `await_resolution` blocks
+        // on the wire, so a round that never drains the decision hangs it
+        // rather than failing it -- which in CI burns the job's timeout
+        // instead of reporting a defect. Asserting the grant table first turns
+        // the same break into an immediate, legible failure.
+        assert_eq!(
+            rig.host.runtime.kernel.grants.rows(Instant::now()).count(),
+            1,
+            "an Allow the human gave while the screen WAS theirs must still be drained after \
+             the seat leaves: gating the whole consent round on visibility, rather than the \
+             raise alone, silently converts a granted petition into a timed_out refusal"
+        );
+        assert_eq!(
+            await_resolution(&mut client),
+            Outcome::Granted,
+            "...and the agent must be told, so it stops waiting on a petition already decided"
         );
     }
 

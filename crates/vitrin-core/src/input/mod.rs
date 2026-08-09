@@ -294,7 +294,7 @@ use crate::scene::layout;
 /// xkb keycodes are evdev scancodes offset by 8 (the historical X11
 /// convention); Smithay's `KeyboardKeyEvent::key_code` is in the xkb
 /// domain, the kernel's `KEY_*` constants are not.
-const XKB_KEYCODE_OFFSET: u32 = 8;
+pub(crate) const XKB_KEYCODE_OFFSET: u32 = 8;
 
 /// The `keysymdef.h` convention for a keysym that is not its own codepoint:
 /// codepoints below `0x100` are their own keysym, everything else is
@@ -2276,11 +2276,16 @@ pub(crate) fn physical_key(
 ///
 /// Feature-gated with `CoreKeymap` itself: see `Cargo.toml`'s
 /// `session-keymap` block for why nested and headless must not pay for it.
-/// #218 (WS-E.3.2) is the caller.
+/// `crate::backend::drm`'s libinput `Keyboard` arm is the caller (WS-E.3.2,
+/// issue #218).
 #[cfg(feature = "session-keymap")]
-#[allow(
-    dead_code,
-    reason = "WS-E.3.2 (#218) adds the libinput arm that calls it"
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        dead_code,
+        reason = "the caller is the DRM backend's libinput arm; a `session-keymap`-only \
+                  build compiles this path and runs its tests without one"
+    )
 )]
 pub(crate) fn keymap_key(
     keymap: &mut keymap::CoreKeymap,
@@ -2301,6 +2306,29 @@ pub(crate) fn keymap_key(
             Vec::new()
         }
     }
+}
+
+/// Mint the physical [`SeatInput`] for one **absolute pointer position a
+/// bare-metal backend has already resolved** (WS-E.3.2, issue #218).
+///
+/// The pointer twin of [`keymap_key`], and it exists for a reason of the same
+/// shape. [`intake_physical`] serves `PointerMotionAbsolute` and **drops**
+/// `PointerMotion` — its doc names relative motion among the classes it does
+/// not translate — but an ordinary USB mouse on libinput emits nothing else.
+/// `SeatInputKind::Motion` is an *absolute* view coordinate, so somebody has
+/// to hold the accumulated position and clamp it to the output, and that
+/// somebody is the backend that owns the output ([`crate::backend::drm`]'s
+/// `accumulate_pointer`) — the position it accumulates is also the one it
+/// draws the human's cursor sprite at, so the two cannot disagree about where
+/// the pointer is.
+///
+/// What stays here is the *minting*: `Origin::Physical` is bound by the same
+/// private [`SeatInput::physical`] constructor every other intake path uses
+/// (B2), so a backend cannot forge a physical origin and nothing downstream
+/// can tell which backend a motion came from.
+#[cfg(feature = "drm-backend")]
+pub(crate) fn physical_motion(x: f64, y: f64) -> Vec<SeatInput> {
+    vec![SeatInput::physical(SeatInputKind::Motion { x, y })]
 }
 
 /// Resolve one keyboard event to its wire [`SeatInputKind`], preferring the

@@ -8,6 +8,22 @@ name: CI
 #                 session-keymap (clippy + tests, WS-E.3.1/D-028)
 #   codegen-diff  IDL schema validation + regeneration honesty (the P1.1.2
 #                 contract: checked-in generated code matches vitrin-v0.xml)
+#   deny          the TCB dependency budget (plan risk R7, issue #201):
+#                 `cargo deny check` against the checked-in deny.toml --
+#                 advisories, bans (an itemised multiple-versions decision,
+#                 not a blanket allow), licences derived from the NOTICE
+#                 path map, and sources. Blocking, like codegen-diff.
+#   drm-compile-check
+#                 COMPILE ONLY: the bare-metal DRM/KMS backend (WS-E.3.2,
+#                 issue #218) type-checked with `--features drm-backend`
+#                 after installing the graphics dev packages, plus its
+#                 device-free unit tests. A runner has no display
+#                 controller and no seat, so nothing here says this
+#                 backend lights a panel -- that evidence is WS-E.3.4's
+#                 runbook on real hardware. Its own job, not a slice of
+#                 `rust`, so the other jobs keep installing only
+#                 libxkbcommon-dev + libpixman-1-dev and a feature leak
+#                 into `default` still fails them loudly.
 #   shim          the C side, in a container with NO Rust toolchain -- the
 #                 checked-in generated header must suffice on its own. The
 #                 Meson build activates automatically once shim/meson.build
@@ -203,6 +219,178 @@ jobs:
         # crates/vitrin-protocol/src/generated + shim/include/vitrin-protocol.h.
         # Fails when generated code drifts from protocol/vitrin-v0.xml.
         run: cargo xtask codegen --check
+
+  deny:
+    name: deny (TCB dependency budget - plan risk R7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Blocking, in the same posture as codegen-diff above, because that is
+    # what plan risk R7's mitigation claims and what issue #201 asks for. The
+    # accepted cost is stated rather than discovered later: the advisories
+    # check reads the RustSec database live, so a newly published advisory
+    # against a crate already in the graph can turn `main` red with no PR
+    # having touched anything. That is the intended behaviour of a dependency
+    # budget -- the alternative is a check that only notices supply-chain
+    # problems the day someone happens to edit Cargo.toml -- and the response
+    # is an `[advisories] ignore` entry in deny.toml carrying a reachability
+    # argument and an exit condition, which is a reviewable decision, or a
+    # dependency change, which is a fix.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (pinned toolchain + components from rust-toolchain.toml)
+        # Installed from rust-toolchain.toml for the reasons documented on
+        # the rust job's install step (single source of truth for version
+        # and components).
+        run: rustup toolchain install && rustup show active-toolchain
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny (pinned)
+        # Built from source with `--locked` rather than pulled from a
+        # binary-installer action. Two reasons, both about what this job is:
+        # it is the job that guards the trusted core's supply chain, so
+        # introducing a new third-party action (and a new binary-download
+        # path) to run it would be self-defeating; and `--locked` means the
+        # tool's own dependency resolution is the one its authors tested.
+        # Swatinem/rust-cache caches ~/.cargo/bin, so the compile is paid on
+        # a cache miss, not on every run.
+        #
+        # The VERSION is pinned on the same reasoning as rust-toolchain.toml
+        # and the smithay pin: a cargo-deny minor release can add checks or
+        # change config schema, and the resulting red build would have
+        # nothing to do with the PR that hit it. What is deliberately NOT
+        # pinned is the advisory database -- it is fetched fresh every run,
+        # which is the whole point of the advisories check.
+        env:
+          # The workflow-wide `RUSTFLAGS: -D warnings` is this workspace's
+          # standard for OUR code and must not be applied to a third-party
+          # tool we merely install: a warning in cargo-deny or in any of its
+          # ~200 dependencies would fail this job for a reason that has
+          # nothing to do with the dependency budget. Cleared for this step
+          # only.
+          RUSTFLAGS: ""
+        run: cargo install cargo-deny --locked --version 0.20.2
+
+      - name: cargo deny check
+        # Runs all four checks (advisories, bans, licenses, sources) against
+        # the configuration in deny.toml, which resolves the graph with
+        # `all-features = true` for the two Linux targets this project
+        # supports. No apt packages are needed and none are installed: this
+        # step resolves cargo metadata and never compiles vitrin-core, so the
+        # feature-gated system libraries (libgbm/libinput/libudev/libseat
+        # under `drm-backend`) are irrelevant here -- unlike the compile-check
+        # slices in the `rust` job.
+        run: cargo deny check
+
+  drm-compile-check:
+    name: drm-compile-check (COMPILE ONLY - no display controller is touched)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # **This job compiles the bare-metal backend and runs its device-free unit
+    # tests. It does not, and cannot, exercise it.** A GitHub runner has no DRM
+    # device, no seat and no panel, so nothing here says the backend sets a
+    # mode, presents a frame, or delivers a key. WS-E.3.2's acceptance is
+    # explicit that no green check in this repository will ever prove that; the
+    # mock-free evidence is WS-E.3.4's runbook, executed on the target machine
+    # and recorded.
+    #
+    # A separate job rather than a slice of `rust`, and the reason is load
+    # bearing: the four system libraries below would otherwise be installed for
+    # every step of that job, and the thing that currently makes a `drm-backend`
+    # leak into `default` fail LOUDLY is that the other jobs install only
+    # libxkbcommon-dev and libpixman-1-dev. Keeping the graphics dev stack in
+    # its own job keeps that machine-enforced.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (pinned toolchain + components from rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install the bare-metal dev packages
+        # What each is for, because "install five -dev packages" hides that
+        # they are needed at three different times:
+        #
+        #   libseat-dev   libseat-sys/build.rs:30 -- pkg_config().unwrap(),
+        #                 so a MISSING .pc file PANICS the build script. Needed
+        #                 even for `cargo clippy`, which runs build scripts.
+        #   libudev-dev   libudev-sys/build.rs:38 -- the same, and #218's own
+        #                 text never names this crate.
+        #   libgbm-dev    #[link(name = "gbm")] in gbm-sys (link time), AND the
+        #                 header smithay's own build.rs feature-probes with a
+        #                 `cc` compile -- see the next step.
+        #   libinput-dev  #[link(name = "input")] in input-sys (link time).
+        #   libdrm-dev    NOT required by the crate graph: drm-sys ships
+        #                 prebuilt bindings and drm-ffi issues its ioctls
+        #                 through rustix, so nothing links libdrm. It is here
+        #                 because libgbm-dev depends on it, and naming it makes
+        #                 that visible rather than surprising.
+        #
+        # libxkbcommon-dev and libpixman-1-dev come along because `drm-backend`
+        # implies `session-keymap` and the crate still contains the headless
+        # backend's pixman path.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libdrm-dev libgbm-dev libinput-dev libseat-dev libudev-dev \
+            libxkbcommon-dev libpixman-1-dev
+
+      - name: vitrin-core drm-backend slice (compile-check only)
+        # Exactly the invocation issue #218's acceptance criterion names. It
+        # type-checks every lib/bin/test target with the feature on, which is
+        # the whole of what a machine with no display controller can say about
+        # this backend.
+        run: cargo clippy -p vitrin-core --all-targets --features drm-backend -- -D warnings
+
+      - name: Assert smithay's gbm probe actually ran (it fails SOFT)
+        # `smithay/build.rs` feature-probes gbm by COMPILING two C files
+        # (`test_gbm_bo_get_fd_for_plane.c`, `test_gbm_bo_create_with_modifiers2.c`)
+        # and treats a failure as a `cargo:warning`, not an error. Measured on
+        # 2026-08-09 with CC pointing at a nonexistent binary: the build stays
+        # GREEN and silently loses both cfgs, selecting an older buffer-
+        # allocation path inside the TCB's scanout code. "The build passed" is
+        # therefore not evidence that the probe worked, which is why this step
+        # exists -- it is the check `crates/vitrin-core/Cargo.toml`'s
+        # `drm-backend` block asks #218's CI job to add.
+        run: |
+          set -euo pipefail
+          for cfg in backend_gbm_has_fd_for_plane backend_gbm_has_create_with_modifiers2; do
+            if ! grep -qs "cargo:rustc-cfg=feature=\"${cfg}\"" target/debug/build/smithay-*/output; then
+              echo "::error::smithay's gbm probe did not set ${cfg}. The build is green anyway"
+              echo "::error::because the probe fails soft, but the scanout path just silently"
+              echo "::error::selected an older gbm buffer-allocation API. Check that a C"
+              echo "::error::compiler and gbm.h are both present on this runner."
+              exit 1
+            fi
+          done
+          echo "both gbm probe cfgs are set: the C probe ran and found the modern API"
+
+      - name: vitrin-core drm-backend device-free unit tests
+        # The unit tests the backend carries are pure functions and source
+        # assertions -- the one-output refusal, the pointer accumulator, the
+        # flip-coalescing gate, and two greps that hold `redraw` to
+        # `Scheduled` and the capture path off the scanout buffer. They touch
+        # no device, open no seat and present nothing. Running them here is
+        # the only place they run at all, since the feature is off in every
+        # other job.
+        #
+        # FILTERED, and the filter is the point. An unfiltered run of this
+        # binary also drags in `spawn::`, `session::` and
+        # `shim::c_shim_conforms_to_the_real_core`, which fork real processes,
+        # need a writable XDG_RUNTIME_DIR and need the built C shim -- none of
+        # which this job sets up, because none of it has anything to do with a
+        # display controller. That is the `rust` and `conformance` jobs' work
+        # and they already do it. Unfiltered, 89 of them fail here for reasons
+        # that would read as "the DRM backend is broken".
+        run: |
+          cargo test -p vitrin-core --features drm-backend --bin vitrind \
+            -- backend::drm:: the_drm_refusal_table
 
   shim:
     name: shim (C header, golden frames, Meson; no Rust)

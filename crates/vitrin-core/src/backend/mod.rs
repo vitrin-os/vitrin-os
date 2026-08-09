@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 //! Presentation backends for the trusted core.
 //!
-//! Two backends exist. The nested [`winit`] backend runs the core as a client
-//! of the host compositor, presenting one host window (P1.3.1). The
+//! Three backends exist. The nested [`winit`] backend runs the core as a
+//! client of the host compositor, presenting one host window (P1.3.1). The
 //! [`headless`] backend drives a fixed-size virtual output composited in
-//! software, its framebuffer retained in memory for capture (P1.3.2). `main`
-//! selects between them with `--nested` / `--headless`. Both backends present
+//! software, its framebuffer retained in memory for capture (P1.3.2). The
+//! [`drm`] backend owns the display controller outright — mode setting, a GBM
+//! swapchain, libinput and libseat — and is compiled only under the
+//! non-default `drm-backend` feature (WS-E.3.2, issue #218). `main` selects
+//! between them with `--nested` / `--headless` / `--drm`. All three present
 //! the same realm views; nothing outside this module may depend on which one
 //! is running.
 //!
@@ -42,14 +45,25 @@
 //! unchanged — it is downstream of [`Scene::compose`], full stop.
 //!
 //!
-//! Both backends reach that one function on the **CPU compositing path**:
+//! Every backend reaches that one function on the **CPU compositing path**:
 //! the nested backend through [`compose_human_visible`] (compose + overlay in
-//! one step) and the headless backend by calling it directly with the view it
-//! already composed for its capture image. Stated because the previous
-//! arrangement had headless open-coding the same two steps, which meant "both
-//! backends present the same output" rested on an equality assertion in a
-//! single test rather than on there being one implementation — and a doc
-//! comment claiming the latter.
+//! one step), the headless backend by calling it directly with the view it
+//! already composed for its capture image, and the bare-metal backend through
+//! the *same* `winit::window_pixels` the nested one uses, so the two paths
+//! that face a human cannot disagree about what he is shown. Stated because
+//! the previous arrangement had headless open-coding the same two steps, which
+//! meant "both backends present the same output" rested on an equality
+//! assertion in a single test rather than on there being one implementation —
+//! and a doc comment claiming the latter.
+//!
+//! The **human's own cursor** is the one thing drawn on this side that is not
+//! drawn by every backend, and the asymmetry is a fact about who owns the
+//! display rather than a difference in policy: nested draws none because the
+//! host desktop already does, headless has no pointer device at all, and
+//! [`drm`] draws it because otherwise nobody would (D-029; the IDL sentence
+//! that said no human cursor is ever composited was made nested-conditional
+//! for this). It joins at the same output stage as the agent sprite, so it
+//! reaches a capture exactly as often: never.
 //!
 //! # There is a second human-visible path, and it does not come through here
 //!
@@ -71,6 +85,15 @@
 //! `no_presentation_path_can_drop_the_trusted_band` (in [`winit`]'s tests)
 //! holds the two paths against each other, including that they paint the one
 //! session secret and not two.
+//!
+//! **That third path arrived, and the arrangement held.** The bare-metal
+//! backend (WS-E.3.2) composites into a scanout buffer through both of the
+//! same two entry points — `winit::window_pixels` on the CPU and
+//! [`crate::dmabuf::present_human_visible`] zero-copy — so it inherits the
+//! band from the existing draw lists rather than painting a third. The one
+//! thing it explicitly does *not* do is a **hardware cursor plane**: that is
+//! composited by the display controller, outside any draw list this core
+//! owns, and there would be no way to put the band into it.
 
 /// The trusted-band witness (issue #139): the *negative* half of issue #85,
 /// measured on the headless backend's own composites.
@@ -84,6 +107,17 @@
 /// reply), so a plain build computes nothing and answers nothing.
 #[cfg(any(test, feature = "consent-injector"))]
 pub(crate) mod band_witness;
+/// The bare-metal DRM/KMS backend (WS-E.3.2, issue #218) — **the third
+/// presentation path**, and the one this module's docs below warned would
+/// arrive: it presents through [`compose_human_visible`] on the CPU and
+/// through [`crate::dmabuf::present_human_visible`] zero-copy, so it inherits
+/// the trusted band from the same two draw lists rather than painting a third.
+///
+/// Behind a non-default cargo feature because two of the `-sys` crates it
+/// pulls panic the build when their pkg-config file is absent; see the
+/// `drm-backend` block in `crates/vitrin-core/Cargo.toml`.
+#[cfg(feature = "drm-backend")]
+pub mod drm;
 pub mod headless;
 pub mod winit;
 
@@ -170,6 +204,18 @@ pub(crate) fn human_visible_from_view(
     // an answerable decision; it resolves `timed_out`, which is refusal. Before
     // the band, because the band's whole value is having exactly one correct
     // appearance and nothing may sit on it, core-drawn or not.
+    //
+    // **That argument is about INPUT, and the record is a separate question the
+    // sentence above used to be silent on.** `service_consent_round` has no lock
+    // awareness at any line, so a petition arriving while the session is locked
+    // *is* raised: it writes `consent_transition{shown}`, sets `prompt_shown`
+    // (so the chokepoint refuses that principal `consent_held`) and composites a
+    // card under this cover. That is deliberate and it is not the same defect
+    // D-030(4) closes for a seat pause: a locked session still owns its panel,
+    // so the card really is on the human's screen the moment they unlock, the
+    // guard is restarted for them (`ConsentGrab::restart_guard`), and they can
+    // answer it. A paused session's card reaches no panel at all and never will
+    // — which is why that one is refused a raise and this one is not.
     lock.composite_over(&mut view, width, height);
     consent.composite_trust_band(&mut view, width, height);
     // ...and, while the human's attention window is open, a marker **beside**

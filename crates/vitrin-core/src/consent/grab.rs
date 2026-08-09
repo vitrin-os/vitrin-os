@@ -125,6 +125,20 @@
 //!   the queue at all recovers the pixels too, and a dead prompt can never
 //!   block the next one.
 //!
+//! **Neither backstop is disarmed by a seat pause** (a VT switch on the
+//! bare-metal backend), and that is what makes D-030(4)'s answer cost almost
+//! no new mechanism. The calloop loop keeps dispatching while the seat holds
+//! the devices — the principal sockets and the sweep timer are unaffected — so
+//! `crate::session`'s sweep still runs, `PetitionRegistry::expire_due` still
+//! resolves `timed_out`, and `service_consent_round`'s `retire_stale` still
+//! takes the pixels down. A petition raised or pending across a VT switch
+//! therefore **already** fails closed with no new timer, which is why "hold it
+//! pending and let the existing sweep resolve it" is a description of the
+//! machinery rather than an aspiration. The one thing that had to change is
+//! that no *new* prompt is raised while the screen is not ours
+//! ([`crate::session::PromptVisibility`]), because raising one would journal
+//! `Shown` for a card that reached no panel.
+//!
 //! # Press arms, release commits
 //!
 //! A decision is taken on the *release*, and only if the pointer is still
@@ -222,7 +236,12 @@
 //! 3. **Refusal is already reachable without a key.** A human who will not
 //!    or cannot use the pointer simply does not answer, and the petition
 //!    resolves `timed_out` at [`crate::petitions::PetitionConfig::consent_timeout`].
-//!    The keyboard's absence therefore fails closed, never open.
+//!    The keyboard's absence therefore fails closed, never open. **The same
+//!    is true of a human who is not there to answer at all** — behind a lock,
+//!    or on another VT while the seat holds this session's devices. Absence
+//!    fails closed by the same route, through the same sweep, which is why
+//!    holding a petition pending across a pause needs no new refusal code and
+//!    no wire change (D-030(4)).
 //!
 //! The cost is real and is not hidden: a keyboard-only human cannot approve
 //! a petition. The honest fix is a focus ring with an activation key that is
@@ -252,7 +271,9 @@
 //! but issue #85 has since landed the trusted indicator that lets a human tell
 //! the two apart — a per-session secret colour, minted at startup and painted
 //! as a reserved band plus the genuine card's frame on a display path the app
-//! cannot observe (see [`crate::consent::indicator`]). This module contributes
+//! cannot observe, which on bare metal means **the VT this core holds DRM
+//! master on and no other** (that scope is [`crate::consent::indicator`]'s to
+//! state; this page restates it and does not own it). This module contributes
 //! a *second*, independent line of defence, worth stating because it holds
 //! even if a human misses the frame: **a replica gets no input grab.** Clicking
 //! a real prompt's buttons produces no app-visible input at all, while clicking
@@ -262,20 +283,45 @@
 //! prevents; the indicator is what lets the human refuse before clicking at
 //! all.
 //!
+//! **One conditional worth naming, because bare metal introduces it.** The
+//! grab's guarantee assumes the seat has actually given the input devices
+//! back. `crate::backend::drm`'s activate arm handles a failed
+//! `libinput_resume` non-fatally — "this session has the panel but no physical
+//! input" — and in that state a real prompt is on screen and receives nothing.
+//! The second line of defence is then **vacuous rather than violated**: no
+//! input reaches the grab, and none reaches the app either. The core logs it
+//! loudly, and the petition fails closed to `timed_out` exactly as D-030(4)
+//! prescribes.
+//!
 //! # Wired at runtime (issue #90)
 //!
-//! This gate is now driven end to end. The nested backend carries it in its
-//! router (so the grab is live the instant a prompt is raised) and feeds it the
-//! view size on every input event, and once per dispatch round
-//! [`crate::session::service_consent_round`] calls [`ConsentGrab::raise`] for
-//! the front pending petition, drains the decisions this gate produced into
+//! This gate is now driven end to end, by **both** backends that have a human
+//! in front of them. The nested backend carries it in its router (so the grab
+//! is live the instant a prompt is raised) and feeds it the view size on every
+//! input event; the bare-metal backend does the same through the same
+//! `NestedHook` and the same `set_view` call, off libinput. Once per dispatch
+//! round [`crate::session::service_consent_round`] calls [`ConsentGrab::raise`]
+//! for the front pending petition, drains the decisions this gate produced into
 //! [`PetitionRegistry::resolve_human`], and lowers a card whose petition has
 //! left the table. So under `--consent=interactive` a running `vitrind` really
-//! does show the prompt and grab physical input while it is up. (`--headless`
-//! has no display and no physical input device, so it is refused with
-//! `--consent=interactive` at startup.) The mechanism below is additionally
-//! exercised in isolation by this module's tests, through the real router and
-//! the real wire to a mock shim.
+//! does show the prompt and grab physical input while it is up.
+//!
+//! **The two configuration refusals are a pair, and they point in opposite
+//! directions.** `--headless` has no display and no physical input device, so
+//! it is refused *with* `--consent=interactive` at startup — there would be
+//! nothing to draw the card on and nothing to answer it with. `--drm` is
+//! refused *without* it (D-029(3)): that backend **is** the display and the
+//! keyboard, so every petition can be shown and answered, and auto-approving on
+//! the machine that is somebody's actual desktop is the fail-open posture
+//! refused everywhere else configuration is read.
+//!
+//! Bare metal adds one thing neither other backend has: a screen that can be
+//! taken away mid-run. `raise` is therefore gated on
+//! [`crate::session::PromptVisibility`], so a petition arriving while the seat
+//! holds this session's devices is never journalled as shown (D-030(4)).
+//!
+//! The mechanism below is additionally exercised in isolation by this module's
+//! tests, through the real router and the real wire to a mock shim.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -618,28 +664,46 @@ impl ConsentGrab {
         true
     }
 
-    /// The petition whose prompt currently holds the grab, if any.
     /// **Restart the guard interval, because the card just became visible.**
     ///
     /// [`GUARD_INTERVAL`] exists so a press already travelling toward the
     /// screen when a prompt appears cannot commit a grant the human never read.
     /// It runs from `raised_at` — which is correct exactly while "raised" and
-    /// "visible" mean the same thing, and they stopped meaning the same thing
-    /// when WS-E.2.2 added a lock screen that composites an OPAQUE cover over
-    /// the card.
+    /// "visible" mean the same thing. **Two things now make them come apart,
+    /// and the embedder must call this for both.**
     ///
-    /// A prompt raised while the session is locked spends its whole guard
-    /// behind that cover. The human comes back, unlocks, sees a card for the
-    /// first time — and the first pointer press commits it, with a guard that
-    /// expired minutes ago in a frame nobody could see. `LockGate` being
-    /// outermost keeps the prompt *unanswerable* while locked, which is why
-    /// this is not a live clickjack; it does not make the card *visible*, which
-    /// is what the guard is actually about.
+    /// 1. **The lock screen** (WS-E.2.2), which composites an OPAQUE cover over
+    ///    the card. A prompt raised while the session is locked spends its whole
+    ///    guard behind that cover. The human comes back, unlocks, sees a card
+    ///    for the first time — and the first pointer press commits it, with a
+    ///    guard that expired minutes ago in a frame nobody could see.
+    ///    `LockGate` being outermost keeps the prompt *unanswerable* while
+    ///    locked, which is why this one was never a live clickjack; it does not
+    ///    make the card *visible*, which is what the guard is actually about.
+    /// 2. **A seat pause** — a VT switch on the bare-metal backend (WS-E.3.3,
+    ///    D-030(5)). This one is produced entirely outside the core, so nothing
+    ///    in the loop can decline it, and it is **worse than the lock in the
+    ///    half the lock covers**: a paused session's grab is untouched, so a
+    ///    press armed on Allow before the switch survives it, and `commit`
+    ///    re-checks only the last *physical* pointer position, which a pause
+    ///    does not reset. Without this call the release after the
+    ///    switch back commits a decision armed on a card that spent its guard on
+    ///    somebody else's VT. That *is* a live clickjack, and it is why this
+    ///    method has a second call site.
     ///
-    /// So the embedder calls this when the lock lowers with a prompt still up.
-    /// Only the guard restarts: the petition's own `deadline` is deliberately
-    /// untouched, since that bounds how long the human has to decide and a lock
-    /// does not buy them more of it.
+    /// So the embedder calls this on **every** transition from not-visible to
+    /// visible: the lock lowering with a prompt still up
+    /// ([`crate::session::service_lock_round`]), and the seat giving the
+    /// devices back ([`crate::session::resume_physical_seat`]).
+    ///
+    /// **Only the guard restarts**, on both paths: the petition's own
+    /// `deadline` is deliberately untouched, since that bounds how long the
+    /// human has to decide and neither a lock nor a VT switch buys them more of
+    /// it. Refreshing it would also let a petitioner extend its own petition's
+    /// life by inducing churn, and would break the invariant
+    /// `a_grab_never_outlives_its_petitions_deadline` pins. (Issue #219's
+    /// drafted decision 5 said "re-raise with a fresh deadline"; D-030(5)
+    /// records why that was not taken.)
     pub fn restart_guard(&mut self, now: Instant) -> bool {
         match self.prompt.as_mut() {
             Some(prompt) => {
@@ -654,6 +718,12 @@ impl ConsentGrab {
         }
     }
 
+    /// The petition whose prompt currently holds the grab, if any.
+    ///
+    /// (This sentence was orphaned onto [`Self::restart_guard`]'s doc block
+    /// when that method was inserted above it in WS-E.2.2, leaving this
+    /// accessor undocumented. Moved back in the same pass that gave
+    /// `restart_guard` its second call site.)
     pub fn armed_petition(&self) -> Option<PetitionId> {
         self.prompt.as_ref().map(|p| p.petition)
     }
@@ -1335,6 +1405,91 @@ mod tests {
             !idle.restart_guard(uncovered),
             "no prompt, no guard to move"
         );
+    }
+
+    /// **A prompt that spanned a VT switch gets its guard back, and a press
+    /// armed before the switch does not survive it** (WS-E.3.3, D-030(5)).
+    ///
+    /// Driven through [`crate::session::resume_physical_seat`], the production
+    /// body of the bare-metal `ActivateSession` arm, rather than through
+    /// [`ConsentGrab::restart_guard`] directly — because what was missing was
+    /// never the method, it was a **second call site**. Until this landed
+    /// `restart_guard` had exactly one caller (`service_lock_round`'s
+    /// `Unlocked` arm), so a card raised before a switch away spent its whole
+    /// guard on somebody else's VT and the first click on return committed it.
+    ///
+    /// A seat pause is strictly worse than the lock cover this method was
+    /// written for, in the half the lock does not have. `LockGate` is
+    /// outermost, so a covered prompt is *unanswerable* while it is up; a
+    /// paused session's grab is untouched, and `commit` re-checks only the last
+    /// **physical** pointer position, which a pause does not reset. So a press
+    /// armed on Allow and held across the switch would be committed by its
+    /// release afterwards. Both halves are asserted here.
+    ///
+    /// **What is deliberately NOT asserted: a refreshed deadline.** Issue
+    /// #219's drafted decision 5 said "re-raise with a fresh deadline", which
+    /// contradicts [`ConsentGrab::restart_guard`]'s own contract and would let
+    /// a petitioner extend its own petition's life by inducing VT churn. Only
+    /// the guard moves. D-030(5) records the correction.
+    #[test]
+    fn a_prompt_that_spanned_a_seat_pause_gets_a_fresh_guard_and_loses_its_armed_press() {
+        let (grab, _surface, _registry, petition, t0) = armed();
+        let target = center_of(&grab, Choice::Allow(PersistenceRung::WhileRunning));
+        let grab = std::cell::RefCell::new(grab);
+
+        // The human presses Allow, then the VT switches away with the button
+        // still down. `libinput_suspend` closes the devices, so no release can
+        // arrive for the duration -- the press is simply still armed.
+        let before_pause = awake(t0);
+        grab.borrow_mut()
+            .judge_parts(Origin::Physical, &motion(target.0, target.1), before_pause);
+        grab.borrow_mut()
+            .judge_parts(Origin::Physical, &press(BTN_LEFT), before_pause);
+
+        // Thirty seconds on another VT -- sixty times the guard, and still
+        // inside the petition's own consent deadline, so this test is about
+        // visibility rather than about expiry.
+        let back = before_pause + Duration::from_secs(30);
+        assert!(
+            crate::session::resume_physical_seat(&grab, back),
+            "there is a prompt up, so the seat's return must actually restart its guard"
+        );
+
+        // 1. The armed press did not survive the switch: its release decides
+        //    nothing, even though the pointer never moved.
+        grab.borrow_mut()
+            .judge_parts(Origin::Physical, &release(BTN_LEFT), back);
+        assert!(
+            grab.borrow_mut().take_decision().is_none(),
+            "a press armed before the switch away committed after it: the human let go on a \
+             card they had not looked at since another VT was on the panel"
+        );
+
+        // 2. ...and a fresh click still has to wait out the guard, measured
+        //    from the moment the screen became this session's again.
+        click(&mut grab.borrow_mut(), target, back);
+        assert!(
+            grab.borrow_mut().take_decision().is_none(),
+            "the first press after the seat returns must decide nothing: whatever the clock \
+             says about `raised_at`, the human has only just been shown this card again"
+        );
+
+        // 3. The guard delays; it never disables.
+        let readable = back + GUARD_INTERVAL + Duration::from_millis(1);
+        click(&mut grab.borrow_mut(), target, readable);
+        assert_eq!(
+            grab.borrow_mut().take_decision(),
+            Some(Decision {
+                petition,
+                choice: Choice::Allow(PersistenceRung::WhileRunning)
+            }),
+            "the restarted guard must still expire, or a VT switch would wedge the prompt"
+        );
+
+        // With no prompt up the seat's return has nothing to restart, and the
+        // embedder is told so rather than silently no-opping.
+        let idle = std::cell::RefCell::new(ConsentGrab::new());
+        assert!(!crate::session::resume_physical_seat(&idle, back));
     }
 
     #[test]

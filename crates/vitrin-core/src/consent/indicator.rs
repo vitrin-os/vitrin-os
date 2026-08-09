@@ -17,6 +17,29 @@
 //! - **Established before any client can connect** (`run_session`, at the same
 //!   startup point the listener binds), so no client — not even one holding an
 //!   observe grant — was ever running when the secret was minted.
+//!   **And minted exactly once, for the life of the process.** That is the
+//!   property, not an omission: the indicator defends against a replica by
+//!   being *stable*, and a colour that changed whenever the session was
+//!   interrupted would leave the human unable to tell a legitimate change from
+//!   a forgery — the check would collapse into "the colour is different now,
+//!   which is either normal or an attack". So the secret is **never rotated**,
+//!   on any event: not on a VT switch, not on a resume, not on revocation
+//!   (WS-E.3.3, D-030(3); `the_session_colour_is_minted_once_and_nothing_re_mints_it`
+//!   holds it to one call site).
+//!
+//!   **The cost of that, stated rather than implied.** One compromise of the
+//!   colour lasts the whole session, and there is no rotation path to reach
+//!   for. On bare metal that stops being theoretical: the panel is physically
+//!   in the room, so a camera pointed at it reads the band, and the
+//!   photographer can then paint a byte-identical band and a byte-identical
+//!   frame. What survives is the *second* line of defence — a replica gets no
+//!   input grab ([`super::grab`]) — so a forged card still cannot mint a
+//!   grant; the harm is deception, not direct authority. And the mitigation is
+//!   ending the session, which on bare metal means leaving vitrind's VT and
+//!   killing the process: **the dead-man chord is not it.** That chord revokes
+//!   every grant and denies every petition, which is the right instrument for
+//!   "stop everything" and does nothing at all for a compromised trust colour,
+//!   because the process — and its colour — keep running.
 //! - **Drawn only on the human-visible output path**
 //!   ([`crate::backend::human_visible_from_view`]) — the per-prompt frame in
 //!   [`super::ConsentSurface::composite_over`] and the always-present band in
@@ -51,12 +74,37 @@
 //! frame — prompt or not — composited after the client's surface, so client
 //! content in that strip is always overdrawn by the genuine colour (issue
 //! #85's "reserved strip ... the scene compositor refuses to let client
-//! content reach"). In nested mode the app is a client of *this* core, not of
-//! the host, so it cannot read back the host window; in headless mode there is
-//! no human to teach, and the overlay is absent from the agent's capture
-//! regardless. The human reads the band, then checks a prompt's frame against
-//! it: a dialog framed in any other colour, or none, is forged — whoever drew
-//! it.
+//! content reach"). The human reads the band, then checks a prompt's frame
+//! against it: a dialog framed in any other colour, or none, is forged —
+//! whoever drew it.
+//!
+//! **"The display vitrind owns" means three different things now, and the
+//! third one can be taken away.**
+//!
+//! - **Nested**: the app is a client of *this* core, not of the host, so it
+//!   cannot read back the host window. The host compositor above us can, and
+//!   always could; `docs/book/src/limits.md` publishes that the nested lock
+//!   covers a window rather than a session, and the band inherits the same
+//!   boundary.
+//! - **Headless**: there is no human to teach, and the overlay is absent from
+//!   the agent's capture regardless.
+//! - **Bare metal (WS-E.3.2/#218)**: the phrase becomes literally true and
+//!   stronger — this core holds DRM master on the connector, and the pixels
+//!   live in its own GBM buffers, which no other DRM client may read. But for
+//!   the first time the display can be **taken away**: `Ctrl-Alt-F<n>` hands
+//!   the panel to another VT, and nothing in this project inhibits it
+//!   (D-030(1) — a display server that traps the human on its own VT is one
+//!   they cannot escape when it wedges, which contradicts the dead-man
+//!   switch's whole posture).
+//!
+//! So the band asserts exactly this and no more: **everything above the line
+//! on *this* screen was drawn by the `vitrind` process you started.** It
+//! asserts nothing about any other VT, and while the seat holds the devices
+//! this core cannot see that screen, cannot draw on it, and cannot tell the
+//! human afterwards what was on it. What *is* checkable on return is the
+//! colour's continuity, which is why (1)'s mint-once rule is load-bearing
+//! rather than incidental: **the same colour means the same core; a different
+//! colour means the core you left is not the core you came back to.**
 //!
 //! # What may sit near the band, and what may never sit in it
 //!
@@ -84,6 +132,16 @@
 //! published rather than blurred: an app can paint a convincing fake strip one
 //! row lower than the real one. The band is the anchor; the rule taught to the
 //! human is "trusted content is everything above the coloured line".
+//!
+//! **On bare metal that rule needs a second clause, because a second forgery
+//! surface appears that has no row coordinate at all**: another VT, running
+//! another compositor, painting an entire fake session — band included, for
+//! anyone who has photographed the real one. A spatial rule cannot exclude it.
+//! So the rule taught to the human becomes *"trusted content is everything
+//! above the coloured line, on the VT this core is driving"* — and this core
+//! cannot tell the human which VT they are on, which is exactly what makes
+//! honest scoping (D-030(1)) the only available answer rather than the
+//! comfortable one.
 
 /// A per-session secret colour. Opaque RGBA; `Copy` so it rides in the
 /// [`crate::session::RuntimeSeed`] and into both backends' consent surfaces
@@ -224,6 +282,75 @@ mod tests {
                 "the value leaked through Debug: {shown}"
             );
         }
+    }
+
+    /// **The session colour is minted exactly once per process, and nothing —
+    /// least of all a VT switch — re-mints it** (WS-E.3.3, D-030(3)).
+    ///
+    /// Issue #219's acceptance criterion (c) asked for "`TrustedIndicator`
+    /// compares equal across pause→resume". That assertion is **vacuous** and
+    /// is deliberately not what this test is: the value is `Copy`, both
+    /// surfaces hold their own copy, and nothing on either seat-event arm
+    /// touches it — so an equality check passes against an empty handler, and
+    /// would go on passing against a handler that did the wrong thing
+    /// everywhere else. D-030(3) records the substitution.
+    ///
+    /// What actually holds the property is structural and is checked here: one
+    /// call site in the whole crate, in `run_session`, before the backend
+    /// begins accepting anyone. Add `self.view.indicator =
+    /// TrustedIndicator::generate()?` to the bare-metal `ActivateSession` arm —
+    /// which is exactly the "refresh the secret when the session is
+    /// interrupted" hygiene reflex D-030(3) exists to refuse — and this goes
+    /// red. Nothing else in the workspace would.
+    ///
+    /// Why rotation is the wrong instinct, in one line: the indicator defends
+    /// against a replica by being *stable*, so a colour that changed after
+    /// every VT switch would leave the human unable to tell a legitimate change
+    /// from a forgery, and the check collapses.
+    #[test]
+    fn the_session_colour_is_minted_once_and_nothing_re_mints_it() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sites: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("the crate's src/ is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("a readable source file");
+                checked += 1;
+                // Production source only: every file's trailing test module is
+                // cut off, or this test's own siblings (and every fixture that
+                // mints a throwaway colour) would count as call sites.
+                let production = text
+                    .split("\n#[cfg(test)]\nmod tests {")
+                    .next()
+                    .and_then(|t| t.split("\n#[cfg(test)]\npub(crate) mod tests {").next())
+                    .unwrap_or(&text);
+                // The trailing paren is what separates a call from the doc
+                // links this module and `band_witness` legitimately carry.
+                for _ in 0..production.matches("TrustedIndicator::generate(").count() {
+                    sites.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(checked > 20, "the scan must have read the crate: {checked}");
+        assert_eq!(
+            sites.len(),
+            1,
+            "the session colour must be minted in exactly one place; found {sites:?}"
+        );
+        assert!(
+            sites[0].ends_with("main.rs"),
+            "the mint must stay in `run_session`, before any client can connect; found {}",
+            sites[0]
+        );
     }
 
     #[test]

@@ -1,0 +1,475 @@
+# cargo-deny configuration -- the checked-in TCB dependency budget.
+#
+# This file is plan risk **R7**'s stated mitigation, finally built (issue #201).
+# `docs/plan/01-phase-1-mvp.md` has named "a checked-in cargo-deny budget for
+# `vitrin-core`, reviewed each milestone" as R7's control since Phase 1, and
+# until this commit no such file existed anywhere in the tree -- so every
+# milestone review that claimed to have applied it could not have. It is landed
+# now, BEFORE the DRM backend (issue #218) draws on it, precisely so the budget
+# is not a document written to fit what already shipped.
+#
+# Run it exactly as CI does:
+#
+#     cargo deny check
+#
+# The rule this file exists to enforce, in one line: **nothing enters the
+# trusted core's dependency graph without a written reason in this file or in
+# `crates/vitrin-core/Cargo.toml`.** Those two files are the budget. This one
+# is the machine-checkable half; that one carries the per-dependency argument.
+#
+# WHAT THIS FILE DOES NOT COVER, said here so nobody infers otherwise from a
+# green check: `fuzz/` is a separate cargo workspace with its own
+# `Cargo.lock`, so `cargo deny check` at the repo root never sees it. It is an
+# Apache-2.0 conformance instrument that ships in no artifact and is not in
+# the TCB, which is why that is tolerable rather than urgent -- but it is a
+# gap, not a decision. Closing it means a second invocation
+# (`cargo deny --manifest-path fuzz/Cargo.toml check`) in the CI job plus one
+# licence exception: measured, that workspace passes advisories, bans and
+# sources under this exact config and fails licences on a single crate --
+# `libfuzzer-sys 0.4.13`, whose expression is `(MIT OR Apache-2.0) AND NCSA`,
+# an AND on the University of Illinois/NCSA licence that LLVM's libFuzzer
+# carries. Permissive, and a deliberate decision rather than a line to add
+# quietly, which is why it is named here and not taken. The
+# `shim/` C build and its Meson subprojects are outside cargo entirely and
+# always will be; `NOTICE`'s THIRD-PARTY section is where their provenance
+# lives.
+#
+#
+# ============================================================================
+# THE NUMBER, so "reviewed each milestone" has something to compare against
+# ============================================================================
+#
+# Measured on 2026-08-09, host `x86_64-unknown-linux-gnu`, with
+#
+#     cargo tree -p vitrin-core -e normal --prefix none \
+#       | sed 's/ (\*)$//;s/ (proc-macro)$//' | sort -u | wc -l
+#
+# (unique packages, normal edges only, INCLUDING `vitrin-core` itself, so
+# subtract one for "dependencies"):
+#
+#     default features .......................... 119
+#     + session-keymap .......................... 119   (+0 -- xkbcommon is
+#                                                        already in the graph
+#                                                        via winit; see that
+#                                                        feature's own comment)
+#     + drm-backend ............................. 133   (+14)
+#     + session-keymap + drm-backend ............ 133   (+14)
+#
+# `Cargo.lock` went 252 -> 274 packages (+22) when `drm-backend` was declared:
+# the 14 above minus `gbm`/`gbm-sys`, which the `gpu-tests` feature had already
+# put in the lock, plus **10 packages this project never builds** --
+# `hermit-abi 0.3.9` and nine `windows*` crates, dragged in by
+# `io-lifetimes 1.0.11`'s non-Linux target table. They are in the lock, they
+# are not in any Linux graph, and `[graph] targets` below is what keeps them
+# out of every check here.
+#
+# Of the 119 default-feature packages, 6 are proc-macro crates -- `paste`,
+# `profiling-procmacros`, `thiserror-impl` (both versions), `tracing-attributes`
+# and `wayland-scanner` -- and they execute inside rustc rather than being
+# linked into `vitrind`. `drm-backend` adds a seventh, `bytemuck_derive`. That
+# distinction carries three of the five advisory decisions below, so it is
+# measured here rather than assumed there.
+#
+#
+# ============================================================================
+# WHAT `drm-backend` ADDS -- the 14, measured, not estimated
+# ============================================================================
+#
+# Issue #218's decision 4 claimed exactly 14 crates. Re-measured here against
+# smithay `=0.7.0` on this tree, and it is right -- the set matches name for
+# name:
+#
+#     bytemuck_derive 1.11.0   Zlib OR Apache-2.0 OR MIT
+#     drm             0.14.1   MIT
+#     drm-ffi         0.9.1    MIT
+#     drm-sys         0.8.1    MIT
+#     gbm             0.18.0   MIT
+#     gbm-sys         0.4.0    MIT
+#     input           0.9.1    MIT
+#     input-sys       1.19.0   MIT
+#     io-lifetimes    1.0.11   Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+#     libseat         0.2.4    MIT
+#     libseat-sys     0.2.0    MIT
+#     libudev-sys     0.1.4    MIT
+#     linux-raw-sys   0.9.4    Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+#     udev            0.9.3    MIT
+#
+# Every one of them is satisfied by the `allow` list below without an
+# exception entry, so the largest single TCB draw in this project's history
+# costs the licence policy nothing. That is worth recording as the one piece
+# of good news in the measurement.
+#
+# Two further things the measurement found that #218's text gets wrong, both
+# in the direction of overstating the cost, and both corrected here so the
+# next reader measures rather than quotes:
+#
+#  1. **The system-library count is four, not five.** Nothing links `libdrm`.
+#     `drm-sys 0.8.1` ships prebuilt bindings and takes its kernel uapi struct
+#     definitions from `linux-raw-sys 0.9.4` as an ordinary Rust dependency;
+#     `drm-ffi` issues the ioctls through `rustix`. Its `build.rs` emits no
+#     `cargo:rustc-link-lib` at all (verified in
+#     `target/debug/build/drm-sys-*/output`, which is empty). The four real
+#     ones, with who asks for them:
+#
+#       libgbm    `gbm-sys`      `#[link(name = "gbm")]`      -- link-time
+#       libinput  `input-sys`    `#[link(name = "input")]`    -- link-time
+#       libseat   `libseat-sys`  `pkg_config::probe_library`  -- BUILD-time
+#       libudev   `libudev-sys`  `pkg_config::find_library`   -- BUILD-time
+#
+#     The two build-time ones `.unwrap()` and therefore panic the build when
+#     the `.pc` file is missing. That -- not `drm-sys` -- is what makes
+#     `drm-backend` unfit for `default`, and `libudev-sys` is a third such
+#     crate #218 does not name. (#218 cites `drm-sys-0.8.1/build.rs:36` for
+#     this; that line is inside `mod use_bindgen`, which is `#[cfg(feature =
+#     "use_bindgen")]` and off. The conclusion holds, the citation does not.)
+#
+#  2. **No crate here runs `bindgen`.** #218 lists `libseat-sys` as "additionally
+#     runs bindgen at build time". `bindgen` is an OPTIONAL build-dependency
+#     behind a `use_bindgen` feature in all four of `drm-sys`, `gbm-sys`,
+#     `input-sys` and `libseat-sys`, and nothing enables it. Measured: the
+#     build-dependency delta (`cargo tree -e normal,build`) is the same 14
+#     crates, with zero build-tool crates added.
+#
+# What the measurement CONFIRMS, and #218 is right about: five of the fourteen
+# are `-sys` crates doing unsafe FFI, and the feature makes the core's build
+# invoke a C toolchain. See `crates/vitrin-core/Cargo.toml`'s `drm-backend`
+# block for that experiment and its result -- including that the probe fails
+# SOFT, so a missing gbm header silently downgrades the buffer-allocation path
+# rather than failing the build.
+
+
+[graph]
+# Linux only, and both architectures this project claims. `vitrind` is a Linux
+# display server: it speaks epoll, memfd, `SCM_RIGHTS`, signalfd, DRM/KMS and
+# libseat, and there is no configuration in which it targets Windows, macOS,
+# wasm or Redox. Checking those targets would put ~40 crates in front of every
+# reviewer that no build of this project ever compiles -- including all ten
+# packages `io-lifetimes 1.0.11` added to `Cargo.lock` -- and a budget padded
+# with unreachable crates is a budget nobody reads.
+#
+# aarch64 is here rather than assumed: `crates/vitrin-core/Cargo.toml`'s
+# fontdue block turns on the consent golden being byte-stable "across x86-64
+# and aarch64", so aarch64 is a supported target of record and its graph must
+# be checked, not inferred from x86-64's.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+# Check the MAXIMAL surface, not the shipped one. A budget that only sees
+# `default` cannot see the largest draw against it -- `drm-backend` -- and the
+# whole point of landing this before #218 is that the draw is visible when it
+# happens. This also covers the three test injectors and `gpu-tests`, whose
+# dependencies are real supply chain even though no deployment build carries
+# them.
+#
+# The cost, stated: a crate that enters only under `gpu-tests` is checked with
+# the same severity as one in `vitrind` itself. That is the conservative
+# direction and it is deliberate.
+all-features = true
+
+
+# ============================================================================
+[advisories]
+# ============================================================================
+#
+# Five advisories are open against this graph today. None is ignored silently:
+# each entry below says what reaches it, why it is not reachable as a defect in
+# `vitrind`, and what would have to change for the entry to be deleted. An
+# entry with no exit condition is a bug in this file.
+#
+# Two of the four affected crates are runtime code inside the TCB. Those are
+# not "fine"; they are *carried*, with the reason written down, because the
+# alternative is unpinning smithay (issue #17 forbids it: the pixel goldens are
+# a function of that exact version) or replacing a rasterizer whose output the
+# consent golden is pinned to. Both are real work, neither is this issue.
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = """
+quick-xml < 0.41: quadratic run time checking a start tag for duplicate
+attribute names. NOT IN THE BINARY. `quick-xml` is reached only through
+`wayland-scanner 0.31.10`, which is a **proc-macro** crate: it runs inside
+rustc during compilation and is never linked into `vitrind`. The only XML it
+ever parses is the Wayland protocol XML vendored inside the
+`wayland-protocols*` crates -- compile-time constants of this build, not input
+any agent, app or peer can supply. `wayland-scanner 0.31` requires
+`quick-xml = "0.39"`, so `cargo update` cannot resolve this; the fix is an
+upstream wayland-rs release, reachable here only through a smithay bump.
+EXIT: delete this entry when the `smithay = "=0.7.0"` pin moves.""" },
+
+    { id = "RUSTSEC-2026-0195", reason = """
+quick-xml < 0.41: unbounded namespace-declaration allocation in `NsReader`
+(memory-exhaustion DoS). Same crate, same path, same argument, same exit
+condition as RUSTSEC-2026-0194 above -- compile-time proc-macro, vendored
+input, blocked behind the smithay pin.""" },
+
+    { id = "RUSTSEC-2024-0436", reason = """
+`paste` is unmaintained. NOT IN THE BINARY: it is a proc-macro reached through
+`pixman 0.2.1`, i.e. smithay's `renderer_pixman`, and expands at compile time.
+An unmaintained proc-macro is a build-reproducibility risk, not a runtime
+attack surface. EXIT: `pixman` dropping the macro, or the smithay pin moving
+to a release that does.""" },
+
+    { id = "RUSTSEC-2026-0196", reason = """
+`cgmath` is unmaintained. THIS ONE IS RUNTIME CODE IN THE TCB: smithay 0.7.0
+depends on it directly for its geometry types, so it is linked into `vitrind`.
+It is carried, not excused. Mitigating facts, such as they are: it is pure
+arithmetic with no I/O and no parser, and nothing in `crate::scene` or
+`crate::consent::render` routes through it -- both are documented as integer
+byte assembly. There is no action available while smithay is pinned `=0.7.0`
+(issue #17: the pixel goldens are a function of that exact version). EXIT:
+re-evaluate at the next smithay bump; if upstream has not moved off cgmath by
+then, that is a finding for the R7 review, not a renewal of this entry.""" },
+
+    { id = "RUSTSEC-2026-0192", reason = """
+`ttf-parser` is unmaintained. RUNTIME CODE IN THE TCB, and it weakens an
+argument this repository has already written down: the fontdue justification in
+`crates/vitrin-core/Cargo.toml` leans on ttf-parser being the
+`#![forbid(unsafe_code)]` font parser "the wider Rust graphics ecosystem
+standardized on". The `forbid(unsafe_code)` half is still true and is what
+bounds the damage; "standardized on" is now past tense, and no future CVE in it
+will be fixed upstream. What keeps this from being urgent is narrow and is
+stated in that same block: the only bytes this parser ever sees are
+`FONT_BYTES`, a compile-time constant pinned by a `const` length assert and by
+the SHA-256 in `assets/fonts/README.md`. Nothing an agent or app sends reaches
+it. EXIT: the moment the consent prompt is given a second face, an
+operator-selectable face, or any font byte it did not itself vendor, this entry
+is invalid and the dependency must be re-argued -- the same trigger that block
+already names for re-auditing fontdue's four `unsafe` blocks.""" },
+]
+
+
+# ============================================================================
+[licenses]
+# ============================================================================
+#
+# The allow list is derived from the root `NOTICE` -- the normative path ->
+# licence map (D-005, executed per D-016) -- and not invented here:
+#
+#   * `MPL-2.0` is what this repository's own trusted core is under
+#     (`crates/vitrin-core`, `crates/vitrin-ipc`). `[licenses.private]` below
+#     deliberately does NOT ignore workspace crates, so our own licence fields
+#     are checked by the same rule as everyone else's; that is the point of
+#     naming MPL-2.0 here rather than exempting ourselves.
+#   * `Apache-2.0` is the other half of the split (`crates/vitrin-protocol`,
+#     `vitrin-scanner`, `xtask`, `vitrin-golden`, `vitrin-png`,
+#     `vitrin-mock-shim`) and is also what most of the Rust ecosystem dual
+#     licenses under.
+#   * `MIT` is the Rust ecosystem's other half, and specifically the licence of
+#     smithay, wlroots-adjacent bindings, and all twelve MIT crates
+#     `drm-backend` adds.
+#
+# Three licences in `NOTICE` are deliberately ABSENT and must stay absent:
+#
+#   * `CC-BY-4.0` covers spec prose (`docs/PRD.md`, `docs/protocol/`,
+#     `docs/plan/`). Prose is not a crate. A CC-BY-4.0 Cargo dependency would
+#     be a categorical mistake and this file should reject it.
+#   * `GPL-3.0-only` covers `shim/wlcs/` alone -- an advisory test module,
+#     outside the Cargo workspace, never built by default, never installed,
+#     never linked into `vitrin-shim`. A GPL-3.0 crate entering the Rust graph
+#     is exactly the event that would silently relicense the TCB, so it must
+#     fail loudly here.
+#   * `OFL-1.1` covers the vendored font under
+#     `crates/vitrin-core/assets/fonts/`. Vendored data, not a crate.
+#
+# Anything not on the list fails. The four crates that need something else get
+# a per-crate exception below rather than widening the list for everybody --
+# which is the difference between a budget and a permission slip.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+#
+# (`exceptions` entries take no `reason` field, so the reason is the comment
+# above each one. Each of these four was found by running the check with the
+# bare three-licence `allow` list and reading what it rejected -- not by
+# guessing -- and each is the ONLY crate in the graph forcing its licence.)
+exceptions = [
+    # BSD-2-Clause, no dual option. Reached through blake3 (the flight
+    # recorder's observation digest). A permissive 2-clause notice licence,
+    # compatible with every half of the NOTICE split.
+    { allow = ["BSD-2-Clause"], crate = "arrayref" },
+    # ISC, no dual option. Reached through smithay's `backend_egl`, which
+    # dynamically loads libEGL/libGL. ISC is the OpenBSD-style equivalent of
+    # 2-clause BSD; permissive, notice-only.
+    { allow = ["ISC"], crate = "libloading" },
+    # BSD-3-Clause, no dual option. A DIRECT dependency of vitrin-core
+    # (constant-time comparison for the lock screen's KDF, WS-E.2.2), so it is
+    # named here on purpose rather than inherited: the added no-endorsement
+    # clause is the only difference from the 2-clause form and constrains
+    # nothing this project does.
+    { allow = ["BSD-3-Clause"], crate = "subtle" },
+    # Expression is `(MIT OR Apache-2.0) AND Unicode-3.0` -- an AND, so no
+    # choice of the first term satisfies it. Unicode-3.0 is the Unicode
+    # data-file licence covering the character tables the crate embeds;
+    # permissive, obligations are notice-only. Reached through syn, i.e.
+    # through every proc macro in the graph.
+    { allow = ["Unicode-3.0"], crate = "unicode-ident" },
+]
+
+[licenses.private]
+# Do NOT skip our own crates. Every workspace crate here is `publish = false`,
+# so turning this on would silently exempt `vitrin-core` and `vitrin-ipc` --
+# the two crates whose licence the NOTICE map is most concerned with -- from
+# the only mechanical check that reads their `license` field. CLAUDE.md's rule
+# "a new crate must state its own `license`" gets its enforcement from here.
+ignore = false
+
+
+# ============================================================================
+[bans]
+# ============================================================================
+#
+# ## The multiple-versions decision, which is the reason this section exists
+#
+# `multiple-versions = "deny"` with an itemised skip list, NOT `"allow"`.
+#
+# Setting it to `"allow"` would make the check quiet and mean nothing, and
+# issue #218's decision 4 names the duplicate-version count as "exactly what
+# `[bans] multiple-versions` exists to turn into a decision". So it is turned
+# into one: every duplicate in the graph today is listed below, individually,
+# with the crate that holds the old version and the condition under which the
+# entry can be deleted. A NEW duplicate -- one not on this list -- fails the
+# build, which is the property worth having.
+#
+# ## What the measurement changes about #218's framing
+#
+# #218 names "two `rustix`, three `linux-raw-sys`, and `io-lifetimes 1.0.11`"
+# as the duplicate cost of the DRM feature. Measured, the picture is different
+# and the difference matters for who owns the problem:
+#
+#   * ALL SEVEN duplicated crate names already exist at default features:
+#     calloop, cpufeatures, linux-raw-sys, rand_core, rustix, thiserror,
+#     thiserror-impl. `drm-backend` introduces **no new duplicated crate
+#     name**.
+#   * Both `rustix` versions and `linux-raw-sys 0.4.15` are pre-existing, from
+#     the winit/smithay-client-toolkit stack inside smithay. `drm 0.14.1` adds
+#     another *edge* onto the already-present `rustix 0.38.44`; it does not add
+#     the version.
+#   * The one genuinely new duplicate is `linux-raw-sys 0.9.4`, and it arrives
+#     for an unusual reason: `drm-sys 0.8.1` depends on it DIRECTLY, as the
+#     source of kernel uapi struct definitions, not transitively through
+#     rustix. That is the same reason nothing links `libdrm`.
+#   * `io-lifetimes 1.0.11` is not a duplicate at all -- there is one version
+#     of it. It is a *superseded* crate (std's I/O-safety types landed in
+#     1.63), which is a different problem with a different control: see the
+#     `deny` list below, where it is a tripwire rather than a skip.
+#
+# So the honest statement is: `drm-backend` adds one duplicate version to a
+# graph that already had six, and the pre-existing six are smithay's, held in
+# place by the `=0.7.0` pin that issue #17 put there for the pixel goldens.
+multiple-versions = "deny"
+highlight = "all"
+
+# Path dependencies inside this workspace are declared as `{ path = "..." }`
+# with no version requirement, which cargo-deny reads as a wildcard. That is
+# the correct spelling for an unpublished workspace crate (`publish = false`
+# on all of them), so wildcards are denied for registry crates and allowed for
+# path crates -- the narrow form, so a real `foo = "*"` on a crates.io
+# dependency still fails.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+skip = [
+    { crate = "linux-raw-sys@0.9.4", reason = """
+THE ONE `drm-backend` ADDS. A direct dependency of `drm-sys 0.8.1`, used as the
+kernel uapi struct source rather than through rustix -- which is also why
+nothing in the DRM stack links `libdrm`. Not resolvable by us: drm-rs chose it
+deliberately, and unifying it with 0.12.1 would need a drm-rs release.
+EXIT: a drm-rs release that moves to linux-raw-sys 0.12.""" },
+    { crate = "linux-raw-sys@0.4.15", reason = "Transitive of `rustix 0.38.44` below; goes away with it, not before. Pre-existing at default features." },
+    { crate = "rustix@0.38.44", reason = """
+Pre-existing. Held by `calloop 0.13.0` (winit's), `smithay-client-toolkit
+0.19.2` and `winit 0.30.13`, and now also used by `drm 0.14.1`. `vitrind`'s own
+syscalls go through `rustix 1.1.4` (declared in vitrin-core and vitrin-ipc);
+this is the other one, inside smithay's window-system stack.
+EXIT: a smithay release whose winit/SCTK stack is on rustix 1.""" },
+    { crate = "calloop@0.13.0", reason = """
+Pre-existing. winit 0.30's smithay-client-toolkit stack pins it; the compositor
+loop `vitrind` actually runs is `calloop 0.14.4`, which is what vitrin-core,
+vitrin-ipc and smithay itself use. Two event loops in the graph, one in the
+process. EXIT: an SCTK release on calloop 0.14.""" },
+    { crate = "thiserror@1.0.69", reason = "Pre-existing. Held by `calloop 0.13.0`, `pixman 0.2.1` and `smithay-client-toolkit 0.19.2`; smithay itself is on thiserror 2. Derive-macro crate, no runtime surface. EXIT: those three moving to thiserror 2." },
+    { crate = "thiserror-impl@1.0.69", reason = "The proc-macro half of thiserror 1.0.69 above; not separately resolvable." },
+    { crate = "cpufeatures@0.2.17", reason = "Pre-existing. `argon2 0.5.3` and `sha2 0.10.9` are on 0.2; `blake3 1.8.5` is on 0.3. Compile-time-generated runtime CPU feature detection, a few hundred lines each. EXIT: RustCrypto bumping argon2/sha2 to cpufeatures 0.3." },
+    { crate = "rand_core@0.6.4", reason = """
+Pre-existing, and already on the record: `crates/vitrin-core/Cargo.toml`'s
+argon2 block documents that `argon2/alloc` pulls `password-hash`, which pulls
+`rand_core 0.6.4`, and that this is "surface the TCB carries without calling"
+-- the salt is drawn from the same `getrandom` the trusted indicator uses. The
+other version, `rand_core 0.9.5`, arrives through smithay's `rand`. That block
+also records the way out (drop `alloc`, hand argon2 a caller-owned block) and
+that it is a real trade, not an oversight.
+EXIT: taking that trade, or password-hash bumping to rand_core 0.9.""" },
+]
+
+# `skip-tree` is deliberately EMPTY. It suppresses an entire subtree, which
+# would hide future duplicates that have nothing to do with the crate named --
+# the exact failure mode this file is written against. If a subtree ever needs
+# it, the entry belongs here with a depth and a reason, not as a convenience.
+skip-tree = []
+
+# ## Tripwires
+#
+# These crates are not in the graph (except `io-lifetimes`, noted below). Each
+# entry exists because this repository has ALREADY written down, in prose, that
+# it must not be -- so the rule is moved here from a comment nobody's build
+# checks into a check that fails.
+deny = [
+    { crate = "io-lifetimes", wrappers = ["udev"], reason = """
+The one entry that IS in the graph. `io-lifetimes 1.0.11` is superseded by
+std's own I/O-safety types (`OwnedFd`/`BorrowedFd`, stable since 1.63) and this
+workspace's MSRV is 1.87, so nothing here has a reason to use it. It arrives
+through exactly one crate -- `udev 0.9.3`, itself reached from smithay and
+`input 0.9.1` -- and `wrappers` narrows the ban to precisely that edge. So this
+is not a ban that changes today's graph; it is a tripwire. If any second crate,
+or any of our own, starts depending on io-lifetimes, this check goes red and
+somebody has to justify it. It is also the entry that made the ten unbuilt
+`windows*`/`hermit-abi` lock entries appear, which is the visible cost of one
+superseded crate. EXIT: a udev-rs release using std's I/O-safety types.""" },
+
+    # --- No image codec in the TCB, in any dependency class ---
+    #
+    # `crates/vitrin-core/Cargo.toml` states this rule three separate times
+    # (against plan risk R7) and `crates/vitrin-png`'s justification turns on
+    # it: the one PNG dependency the core takes is an in-tree, dependency-free
+    # ENCODER with no decoder, "so the class of bug an image codec is feared
+    # for -- a malformed file driving a parser -- has no way in". A decoder
+    # entering the graph, even as a dev-dependency, invalidates that argument.
+    # It has been enforced by comment until now.
+    { crate = "image", reason = "Image codec (decoders included) in the TCB -- refused by R7; see crates/vitrin-png's own docs for why the absence of a decoder is the reviewable property." },
+    { crate = "png", reason = "PNG decoder in the TCB -- refused by R7. The core's PNG support is `crates/vitrin-png`, encode-only, in-tree, zero-dependency." },
+    { crate = "jpeg-decoder", reason = "Image decoder in the TCB -- refused by R7." },
+    { crate = "zune-jpeg", reason = "Image decoder in the TCB -- refused by R7." },
+    { crate = "gif", reason = "Image decoder in the TCB -- refused by R7." },
+    { crate = "tiff", reason = "Image decoder in the TCB -- refused by R7." },
+    { crate = "webp", reason = "Image decoder in the TCB -- refused by R7." },
+
+    # --- No text-shaping or vector-rasterization stack in the TCB ---
+    #
+    # Named as rejected alternatives, by crate, in the fontdue block of
+    # `crates/vitrin-core/Cargo.toml`: the consent prompt renders
+    # core-validated ASCII from a vendored font, "it needs no shaping engine,
+    # and buying one would put tens of thousands of lines of text-layout code
+    # inside the TCB to draw the string \"Deny\"".
+    { crate = "cosmic-text", reason = "Full text-shaping/layout stack -- explicitly rejected in vitrin-core's fontdue justification." },
+    { crate = "rustybuzz", reason = "HarfBuzz-derived shaping engine -- explicitly rejected in vitrin-core's fontdue justification." },
+    { crate = "swash", reason = "Shaping/scaling stack -- explicitly rejected in vitrin-core's fontdue justification." },
+    { crate = "fontdb", reason = "System font discovery -- the consent prompt must never read a user-writable font path; see vitrin-core's fontdue justification, point 3." },
+    { crate = "tiny-skia", reason = "Vector rasterizer -- explicitly rejected in vitrin-core's fontdue justification (7 crates, for shapes that are integer byte assembly in crate::consent::render)." },
+]
+
+
+# ============================================================================
+[sources]
+# ============================================================================
+#
+# Everything comes from crates.io or from a path inside this workspace. There
+# is no git dependency anywhere in the tree and there must not be one that
+# arrives unnoticed: a git dependency is an unversioned, unauditable,
+# force-pushable edge into the trusted core. If one is ever genuinely needed it
+# gets a `[sources.allow-org]` entry and a decision-log entry, in that order.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

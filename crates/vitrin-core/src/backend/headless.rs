@@ -1113,6 +1113,12 @@ impl session::RuntimeHost for HeadlessState {
             &mut self.runtime,
             &mut self.view.output.consent,
             now,
+            // This build has no panel and no seat at all, so there is nothing
+            // that could take a screen away mid-run: the injector *is* the
+            // human here, and it is reachable for as long as the process runs.
+            // `--headless` with `--consent=interactive` is refused at startup
+            // for the un-instrumented case (`HEADLESS_INTERACTIVE_REFUSAL`).
+            session::PromptVisibility::Reachable,
         ) {
             // A card went up or came down: the human-visible framebuffer
             // changed, so the round must recomposite. Headless owns its frame

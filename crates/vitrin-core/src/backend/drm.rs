@@ -273,8 +273,16 @@ impl Error for OutputRefusal {}
 /// and unplugging the only panel leaves the session compositing into a surface
 /// nobody sees. That is a deliberate omission with a stated shape rather than
 /// an oversight — handling it means answering what a session *does* when its
-/// only display disappears, which is WS-E.3.3's territory (it already owns the
-/// session-pause question) and is named in WS-E.3.4's runbook.
+/// only display disappears.
+///
+/// **D-030 does not answer it, and this sentence used to imply WS-E.3.3
+/// would.** A seat pause and an unplug look alike from here and are not the
+/// same fact: a paused session still has its panel and is told when it gets it
+/// back, so the answer is "hold everything, and resume" — while an unplugged
+/// session's panel is gone with no event promising its return, and holding a
+/// consent card and a lock for a screen that no longer exists is a different
+/// decision with a different failure mode. It stays unowned rather than being
+/// absorbed by D-030, and it is a numbered item in WS-E.3.4's runbook.
 ///
 /// Takes names rather than `connector::Info` so the decision is testable with
 /// no device — the shape `backend::winit::next_frame` established.
@@ -806,14 +814,23 @@ pub(crate) struct DrmState {
     /// `--lock-passphrase-file` in that configuration, because a passphrase
     /// nobody can type is a lock nobody can answer.
     keymap: Option<CoreKeymap>,
-    /// The seat handle. Held because it is the only way back to the VT
-    /// (`Session::change_vt`) and because dropping it would drop the last
-    /// strong reference to the seat while the devices it opened are still in
-    /// use.
+    /// The seat handle, held for its lifetime and **not** for its verbs.
+    ///
+    /// `LibSeatSession` owns the seat every device this session opened belongs
+    /// to, so dropping it would close them underneath a live compositor. That
+    /// is the whole reason it is a field.
+    ///
+    /// It also carries `Session::change_vt`, and D-030(1) is the decision that
+    /// this core never calls it: it does not inhibit a switch, does not
+    /// initiate one, and does not switch *back*. A display server that can move
+    /// the human between VTs is one that can trap them on its own, which
+    /// contradicts the posture the dead-man switch is built on — the human
+    /// always has an off-switch, and on bare metal `Ctrl-Alt-F<n>` is it. The
+    /// band is scoped to this screen instead (`crate::consent::indicator`).
     #[allow(
         dead_code,
-        reason = "WS-E.3.3 (#219) owns the VT-switch verb this handle exists for; \
-                  dropping it now would close the seat the open devices belong to"
+        reason = "held for the seat's lifetime, not for its verbs: dropping it would close \
+                  the devices this session opened. D-030(1) refuses `change_vt` outright"
     )]
     seat: LibSeatSession,
     /// The DRM device, held so the seat's pause/activate can reach it.
@@ -876,11 +893,30 @@ impl session::RuntimeHost for DrmState {
     /// The `Rc` is cloned first so the `RefMut` borrows nothing of `self`,
     /// leaving `&mut self.runtime` and `&mut self.view.consent` as the two
     /// disjoint field borrows [`session::service_consent_round`] needs.
+    ///
+    /// **This is the one backend that can answer
+    /// [`session::PromptVisibility`] with anything but `Reachable`** (D-030(4)),
+    /// and it answers it off `DrmOutput::active` — the *same* field
+    /// [`should_queue_flip`] reads, deliberately, so this core has exactly one
+    /// notion of "is this screen ours" and a second flag cannot disagree with
+    /// it. While the seat holds the devices, nothing composited here reaches a
+    /// panel, so a card raised now would be journalled `shown` to a human who
+    /// could not see it.
     fn service_consent(&mut self, now: Instant) {
+        let visibility = if self.view.output.active {
+            session::PromptVisibility::Reachable
+        } else {
+            session::PromptVisibility::ScreenNotOurs
+        };
         let grab = Rc::clone(&self.grab);
         let mut grab = grab.borrow_mut();
-        if session::service_consent_round(&mut grab, &mut self.runtime, &mut self.view.consent, now)
-        {
+        if session::service_consent_round(
+            &mut grab,
+            &mut self.runtime,
+            &mut self.view.consent,
+            now,
+            visibility,
+        ) {
             self.runtime.dirty = true;
             self.view.request_present();
         }
@@ -1089,34 +1125,55 @@ impl DrmState {
 
     /// The seat took the devices away (a VT switch), or gave them back.
     ///
-    /// **What is handled here is what cannot wait**, and the rest is named
-    /// rather than guessed at. WS-E.3.3 (#219) owns the session-switch
-    /// question in full — whether a switch away should raise the lock, what
-    /// happens to a consent card mid-prompt, and how the mode is restored if
-    /// another compositor changed it. This backend must not close claiming
-    /// that answer; what it does do is the subset whose absence would be a
-    /// *defect* rather than a missing feature:
+    /// **The policy this implements is D-030** (WS-E.3.3, issue #219), and the
+    /// decisions that are *not* taken here are named there rather than left as
+    /// a `warn!` pointing at an unwritten entry:
     ///
-    /// * **The dead-man hold is forgotten.** A key held while the VT switches
-    ///   away produces no release here, so a hold left armed would either fire
-    ///   with no gesture behind it or wedge in a state only a release can
-    ///   leave. The nested backend's `handle_focus` makes the identical
-    ///   argument for a lost host focus.
-    /// * **Every key the human is holding is released to the app**, through
-    ///   the same funnel an ordinary release takes, or it stays latched down
-    ///   in the confined app indefinitely. Keys an *agent* holds are untouched
-    ///   — the seat leaving is not part of an agent's actuation path.
+    /// * **The core does not prevent the switch.** It cannot — the kernel owns
+    ///   `VT_SETMODE` — and a display server that traps the human on its own VT
+    ///   contradicts the dead-man switch's whole posture. The answer is scope,
+    ///   not prevention: the trusted band asserts only about this screen and
+    ///   this process, and `docs/book/src/limits.md` says so in the human's own
+    ///   words.
+    /// * **A switch away does not raise the lock**, and `LockCause` gains no
+    ///   third variant. A lock raised on a seat event would claim a protection
+    ///   this core does not have (the other VT is not covered, and D-025 keeps
+    ///   every grant live regardless) while charging the human a passphrase for
+    ///   using the escape hatch the point above deliberately leaves open. The
+    ///   idle timer already covers the case that matters, identically whichever
+    ///   way the human left — see D-030(2).
+    /// * **The session colour is not re-minted.** Nothing on either arm touches
+    ///   [`TrustedIndicator`]: rotation would destroy the stability the whole
+    ///   check rests on. D-030(3).
+    ///
+    /// What the two arms do:
+    ///
+    /// * **The gesture in progress is cancelled and every press the human is
+    ///   holding is paid out** — keys and buttons both — through
+    ///   [`session::suspend_physical_seat`], or a hold fires with no gesture
+    ///   behind it and a key stays latched down in the confined app
+    ///   indefinitely. An *agent's* presses are untouched: the seat leaving is
+    ///   not part of an agent's actuation path.
+    /// * **No consent prompt is raised while the screen is not ours**, gated in
+    ///   [`Self::service_consent`] off the same `active` flag this sets, so the
+    ///   flight recorder never says a human was shown a card that reached no
+    ///   panel. A petition that arrives during the pause stays pending and the
+    ///   ordinary sweep resolves it `timed_out`, which is refusal.
+    /// * **A prompt that spanned the pause gets its guard back** on the way in,
+    ///   through [`session::resume_physical_seat`] — the same treatment an
+    ///   unlock gives a card that was behind the lock cover, and for the same
+    ///   reason.
     /// * **The output stops queueing flips** while paused; a frame owed at the
     ///   moment of the switch stays owed and is presented on activation.
     /// * **DRM master is dropped and re-acquired, and the CRTC state is
     ///   reset.** [`DrmDevice::pause`] / [`DrmDevice::activate`] and
     ///   [`DrmSurface::reset_state`] are the devices' own named handlers for
-    ///   exactly this, and skipping them is not a missing feature but the
-    ///   defect above in its purest form: the kernel discards this session's
-    ///   atomic state while another VT holds master, so the first post-resume
-    ///   commit is rejected, no vblank follows a flip that never landed, and
-    ///   the retry chain has no link left. The panel stays dark for the rest
-    ///   of the session with nothing but a `warn!` to say why.
+    ///   exactly this, and skipping them is not a missing feature but a defect
+    ///   in its purest form: the kernel discards this session's atomic state
+    ///   while another VT holds master, so the first post-resume commit is
+    ///   rejected, no vblank follows a flip that never landed, and the retry
+    ///   chain has no link left. The panel stays dark for the rest of the
+    ///   session with nothing but a `warn!` to say why.
     /// * **libinput is suspended and resumed.** The seat revokes the input
     ///   fds underneath a paused session; a context left running holds devices
     ///   it can no longer read.
@@ -1131,14 +1188,29 @@ impl DrmState {
                 // holding master over a panel another VT is now driving.
                 self.device.pause();
                 self.libinput.suspend();
-                self.deadman.borrow_mut().forget_hold();
+                // Stop the idle clock (D-030(7), Taha's call on 2026-08-09).
+                // Physical input is suspended for the whole absence, so
+                // `last_activity` cannot advance; without this a session with
+                // `--lock-idle` locks itself *during* the switch-away, at an
+                // instant no human could observe, and the human returns to a
+                // passphrase prompt nobody asked for. A lock already up stays
+                // up -- this suppresses the raise, never a lower.
+                self.lock.borrow_mut().set_seat_absent(true, self.now.get());
+                // The `Rc` is cloned so the `RefCell` borrow inside holds
+                // nothing of `self`, leaving `runtime` and `view.scenes` as two
+                // disjoint field borrows.
+                let deadman = Rc::clone(&self.deadman);
+                let released =
+                    session::suspend_physical_seat(&mut self.runtime, &self.view.scenes, &deadman);
+                // After the drain rather than before it: `forget_hold` inside
+                // the call above has already cancelled the gesture, and this
+                // is what takes the hold indicator off the (owed) frame.
                 self.deadman_tick(TickSource::OffChain);
-                self.release_held_keys();
-                warn!(
-                    "session pause is handled minimally here (master dropped, input suspended, \
-                     hold forgotten, keys released, presentation suspended). Whether a VT switch \
-                     should also raise the lock screen is WS-E.3.3's decision and is not made by \
-                     this backend"
+                info!(
+                    released,
+                    "session paused: master dropped, input suspended, dead-man hold forgotten, \
+                     held presses paid out, presentation suspended, and no consent prompt will \
+                     be raised until the seat returns (D-030)"
                 );
             }
             SessionEvent::ActivateSession => {
@@ -1167,6 +1239,14 @@ impl DrmState {
                 if let Err(err) = self.view.output.surface.surface().reset_state() {
                     error!(%err, "could not reset the CRTC state after the VT switch back");
                 }
+                // The idle countdown restarts from the moment the human comes
+                // back, rather than resuming a count frozen mid-way: returning
+                // to your own screen is the one thing an idle timer is asking
+                // about. Before `active = true`, so no `tick` between the two
+                // can see a running clock against a stale `last_activity`.
+                self.lock
+                    .borrow_mut()
+                    .set_seat_absent(false, self.now.get());
                 self.view.output.active = true;
                 // The flip we had in flight died with DRM master, and its
                 // completion event will never arrive: without clearing this
@@ -1175,27 +1255,17 @@ impl DrmState {
                 self.view.output.flip_pending = false;
                 self.view.output.surface.reset_buffers();
                 self.view.request_present();
+                // Last, once the screen really is ours again: a card that was
+                // up across the pause spent its guard on somebody else's VT,
+                // and a press armed on Allow before the switch survives it.
+                // Only the guard moves; the petition's deadline does not.
+                // `Instant::now()` rather than `self.now`: that cell is the
+                // *input turn's* sample and no input turn has run since before
+                // the pause, so reusing it would restart the guard to a moment
+                // that has already expired -- which is the bug this call exists
+                // to close, with an extra step.
+                session::resume_physical_seat(&self.grab, Instant::now());
             }
-        }
-    }
-
-    /// Release every key the human is holding to the realm they were
-    /// delivered to. The nested backend's focus-loss drain, verbatim in
-    /// structure and for the identical reason.
-    fn release_held_keys(&mut self) {
-        let scenes = &self.view.scenes;
-        let session::Runtime {
-            router,
-            realms,
-            kernel,
-            ..
-        } = &mut self.runtime;
-        let Some(bound) = router.bound_realm().cloned() else {
-            return;
-        };
-        for delivery in router.release_physical_keys(&bound) {
-            debug!("releasing a key held across a session switch so it cannot latch in the app");
-            session::deliver_physical(realms, scenes, &mut kernel.recorder, delivery);
         }
     }
 }
@@ -2035,6 +2105,104 @@ mod tests {
              whenever the zero-copy path is unavailable -- an overlay up, or an unimportable \
              client buffer"
         );
+    }
+
+    /// **The seat handler carries D-030's policy, on both arms** (WS-E.3.3).
+    ///
+    /// `handle_session_event` is a `&mut DrmState` method and `DrmState` cannot
+    /// be constructed without a real `DrmDevice`, `LibSeatSession`, `GbmDevice`
+    /// and `GlesRenderer`, so no test in this workspace can call it. The
+    /// *behaviour* therefore lives in two free functions with their own
+    /// behavioural tests one crate module over
+    /// (`session::tests::a_paused_seat_pays_out_held_presses_and_forgets_the_dead_man_hold`,
+    /// `consent::grab::tests::a_prompt_that_spanned_a_seat_pause_gets_a_fresh_guard_and_loses_its_armed_press`),
+    /// and what is left for this file is the **wiring** — which arm calls
+    /// which, and what neither arm may do. Deleting either call compiles
+    /// cleanly and takes nothing else red, which is precisely why it is pinned
+    /// here.
+    ///
+    /// The three negatives are decisions, not hygiene:
+    ///
+    /// * **Neither arm may touch the trusted indicator** (D-030(3)). Rotating
+    ///   the session colour on resume reads as hygiene and destroys the
+    ///   stability the whole check rests on. The crate-wide guard is
+    ///   `consent::indicator`'s `the_session_colour_is_minted_once_and_nothing_re_mints_it`;
+    ///   this is the same rule at the one site most likely to break it.
+    /// * **Neither arm may raise the lock** (D-030(2)). A lock raised on a seat
+    ///   event would claim a protection this core does not have while charging
+    ///   the human a passphrase for using the escape hatch D-030(1) leaves open
+    ///   on purpose.
+    /// * **Neither arm may change the VT** (D-030(1)). `LibSeatSession` carries
+    ///   `change_vt`; a display server that can move the human between VTs is
+    ///   one that can trap them on its own.
+    #[test]
+    fn the_seat_handler_drains_on_pause_restores_the_guard_on_resume_and_rotates_nothing() {
+        let after = source()
+            .split("fn handle_session_event(&mut self, event: SessionEvent)")
+            .nth(1)
+            .expect("this backend handles the seat's pause/activate events");
+        let body = after
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        let (pause, activate) = body
+            .split_once("SessionEvent::ActivateSession")
+            .expect("the handler has both arms");
+
+        assert!(
+            pause.contains("session::suspend_physical_seat("),
+            "the pause arm stopped draining the seat: a dead-man hold survives with no gesture \
+             behind it, a key stays latched down in the confined app, and a held button wedges \
+             its implicit pointer grab -- for the whole time the human is on another VT"
+        );
+        assert!(
+            activate.contains("session::resume_physical_seat("),
+            "the activate arm stopped restarting the consent guard: a card raised before the \
+             switch spent its guard on somebody else's VT, and the first press on return \
+             commits it"
+        );
+        // The gate that keeps `Shown` honest, read off the SAME field
+        // `should_queue_flip` reads -- one notion of "is this screen ours",
+        // never two that can disagree.
+        let consent = source()
+            .split("fn service_consent(&mut self, now: Instant)")
+            .nth(1)
+            .expect("this backend overrides the consent round");
+        let consent_body = consent
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        assert!(
+            consent_body.contains("self.view.output.active")
+                && consent_body.contains("PromptVisibility::ScreenNotOurs"),
+            "the consent round stopped asking whether this screen is ours: a petition arriving \
+             during a VT switch would be journalled `consent_transition{{shown}}` and told to \
+             the petitioner as `shown`, for a card that reaches no panel"
+        );
+
+        for (forbidden, why) in [
+            (
+                "TrustedIndicator",
+                "rotating the session colour on a seat event destroys the stability the \
+                 human's whole check rests on (D-030(3))",
+            ),
+            (
+                "LockCause",
+                "a VT switch does not raise the lock: it would claim a protection this core \
+                 does not have, and charge the human a passphrase for the escape hatch \
+                 D-030(1) deliberately leaves open",
+            ),
+            (
+                "change_vt",
+                "this core never moves the human between VTs; one that can is one that can \
+                 trap them on its own (D-030(1))",
+            ),
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "`{forbidden}` in the seat handler: {why}"
+            );
+        }
     }
 
     /// **A frame that cannot be queued now is owed, not lost.**

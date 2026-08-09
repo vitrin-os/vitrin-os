@@ -45,12 +45,14 @@ a real GPU (EGL + a DRM render node) and runs only under
 
 ## Model gaps
 
-**The trusted indicator is unforgeable, not necessarily noticed.** There is
-a rigorous gate proving a client cannot counterfeit the band. There is no
-evidence that a human *notices* when it is wrong — that needs user research
-nobody has done. The plan explicitly adjudicated unspoofability out of
-M1.4's criteria for exactly this reason. Do not cite the milestone as
-evidence for the human half.
+**The trusted indicator is unforgeable within one VT, and not necessarily
+noticed.** There is a rigorous gate proving a client cannot counterfeit the
+band. There is no evidence that a human *notices* when it is wrong — that needs
+user research nobody has done. The plan explicitly adjudicated unspoofability
+out of M1.4's criteria for exactly this reason. Do not cite the milestone as
+evidence for the human half. The second qualifier is the VT: the band says
+nothing about any screen other than the one this core is driving, which is
+spelled out with the VT-switch entry below.
 
 **Several realms run; only one is visible.** A `realm.toml` may now declare
 up to 16 realms, and each gets its own shim process, its own private runtime
@@ -404,6 +406,36 @@ every pending petition and clears the clipboard slot. The lock card says all of
 this on the card itself, in the same words, because a human who locks a screen
 and walks away should not learn it from a documentation page.
 
+**On bare metal, that same continued observation holds across a VT switch too —
+with one difference that is worse and is not softened here.** The subject here
+is the agent's access, *not* the paragraph immediately above: your dead-man
+chord is a **physical** gesture, and physical input is suspended for the whole
+time you are on another VT, so the emergency stop that still works while locked
+does **not** work while you are switched away. From another VT your only stop is
+a shell and a signal. An agent holding `observe` keeps being served
+its realm's capture while you are on another VT — the capture is composed from
+the realm's scene, which a VT switch does not touch, so the request keeps
+succeeding — and one holding `actuate_pointer` or `actuate_text` keeps acting on
+the app. Keeping both is right for the reason above: the grant is the authority,
+not your gaze. **But the pixels stop changing.** While the seat holds the
+devices no page flip lands, so no `frame_done` is issued, so every app that
+paces on it stops painting; the agent is served the same frame it had when you
+switched away, with no staleness signal and no refusal. That is *not* what
+happens across a lock, where the frame clock keeps running — so read the
+sentence above as true of a lock and this one as true of a VT switch. The net
+effect is the uncomfortable one: **across a VT switch an agent can still act and
+cannot see the consequences, and neither can you.** Giving realms a software
+frame cadence while the seat is away would fix the observation half; it is not
+scheduled, and the human's half needs a mission-control shell (E3), which is
+also not in this workstream.
+
+One more thing that gets quietly wider while you are away: `preempted` — the
+refusal that stops an agent acting where your hands are — is judged against
+recent *physical* input, and physical input is suspended for the whole switch.
+So the moment you leave is the moment agent actuation stops being refused
+`preempted`. That is correct (you really are absent) and it means agent
+authority is at its widest exactly when your view of it is at its narrowest.
+
 **In nested mode the lock screen locks a window, not a session.** `vitrind`
 runs as a client of your real compositor, which is above it and owns the actual
 session: anyone can alt-tab away from the locked window, and the host's own
@@ -411,12 +443,81 @@ screen lock is still the thing protecting the machine. Treat the nested lock as
 what it is — a privacy cover over the realms `vitrind` is showing — and not as
 an authentication boundary for the seat.
 
-**There is no protection against VT switching, on any backend.** Nothing
-inhibits `Ctrl-Alt-F<n>`. On the nested backend that is the host's business and
-outside this project's reach; on a future DRM backend it would be a real escape
-from the lock, and inhibiting it means a session you cannot leave when the
-compositor wedges. That trade is not decided, and it will be decided by whoever
-lands the DRM backend rather than pre-empted here.
+**There is no protection against VT switching, on any backend, and that is now
+a decision rather than an open question.** Nothing inhibits `Ctrl-Alt-F<n>`. On
+the nested backend that is the host's business and outside this project's reach.
+On bare metal it is a real escape from the lock — and it stays open on purpose,
+because a display server that traps you on its own VT is one you cannot leave
+when it wedges, and the whole posture of the dead-man switch is that you always
+have an off-switch. So the answer is scope, not prevention.
+
+**The trusted band covers this screen and this process, and nothing else.** The
+coloured strip means one thing: everything above the line on *this* display was
+drawn by the `vitrind` you started, not by an app running inside it. It makes no
+claim about any other virtual terminal. While you are away, `vitrind` cannot see
+that screen, cannot draw on it, and cannot tell you afterwards what was on it.
+
+What *is* checkable when you come back is the colour. It is minted once per
+`vitrind` process and **never rotated** — not on a VT switch, not on resume, not
+for any reason — so **the same colour means the same core, and a different
+colour means the core you left is not the core you came back to.** Treat
+everything on screen as untrusted until you know why it restarted.
+**Photograph the band before you switch and compare side by side on return**,
+rather than trusting your memory of an arbitrary colour: this page already says
+nobody has evidence a human reliably notices a wrong band, and a memory test is
+not a check.
+
+**A dark panel is not something `vitrind` can see.** It never turns your screen
+off and it has no way to tell that something else did. Your monitor's own power
+button, and the backlight controls your laptop exposes outside the display
+server, are both beyond it. So a consent card can in principle be raised — and
+recorded as shown to you — while you are looking at a dark screen. `vitrind`
+does hold this back when the *seat* is taken away from it, which is what happens
+when you switch to another VT and is the common case by a wide margin. It cannot
+do the same for a panel that went dark on its own, and no protection against
+that is claimed here.
+
+**That check runs in one direction only, and you should know which.** A
+*different* colour on return is a sound alarm: the core you left is not the core
+you came back to. A *matching* colour is **not** proof that it is. Anyone who
+photographed your band — the very exposure the next paragraph describes — can
+reproduce it exactly, so photograph-and-compare catches a restarted or
+substituted core and does not catch a patient one. It is worth doing because the
+first case is the common one, not because it closes the second.
+
+The cost of never rotating is real and is the price of the property. A colour
+observed once — a camera pointed at the panel, which is newly plausible when the
+panel is physically in the room — is observed for the whole session, and there
+is no rotation path to reach for. Rotation was refused because it would destroy
+what it appears to protect: a human who cannot tell a legitimate change from a
+forgery has no check left. What still holds is that **a forged card gets no
+input grab**, so a replica cannot mint a grant; the harm is deception, not
+authority. And the fix for a compromised colour is ending the session — which
+means leaving `vitrind`'s VT and killing the process. **The dead-man chord is
+not that fix**: it revokes every grant and denies every petition, which is the
+right instrument for "stop everything" and does nothing for the trust colour,
+because the process and its colour keep running. Note too that the chord is a
+*physical* gesture and physical input is suspended for the whole time you are on
+another VT, so from there your only stop is a shell and a signal.
+
+**A VT switch does not raise the lock screen, and a consent prompt raised while
+you are away is not recorded as shown.** Switching away is not treated as
+walking away: it costs no passphrase, because making the escape hatch expensive
+to come back from would erode the reason it is open. **The idle timer is also
+stopped while you are away**, and the countdown restarts when you come back —
+so with `--lock-idle` a switch away does not lock the session either, however
+long it lasts. **The cost of that is plain: a session you switched away from
+eight hours ago is unlocked when you switch back to it.** That is a deliberate
+choice rather than a default, and it is currently the only behaviour available;
+whether leaving should lock immediately, lock on idle, or never lock is a policy
+this release does not let you configure. A lock already up is untouched — a VT
+switch is never a way past a lock screen. What
+`vitrind` will not do is put a consent prompt on a screen it does not own: a
+petition that arrives while you are on another VT stays pending, is never
+journalled as shown, and times out on the ordinary sweep, which reaches the
+agent as a refusal. You will experience that as the system being obstructive.
+It is the fail-closed answer, and the flight recorder carries the reason
+(`petition_resolved{timed_out}` with no `consent_transition{shown}` before it).
 
 **Without `--lock-passphrase-file` the lock is a privacy screen, and it says
 so.** Enter dismisses it, with no authentication of any kind. The passphrase

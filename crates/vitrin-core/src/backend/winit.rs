@@ -2826,8 +2826,23 @@ impl session::RuntimeHost for NestedState {
     fn service_consent(&mut self, now: Instant) {
         let grab = Rc::clone(&self.grab);
         let mut grab = grab.borrow_mut();
-        if session::service_consent_round(&mut grab, &mut self.runtime, &mut self.view.consent, now)
-        {
+        if session::service_consent_round(
+            &mut grab,
+            &mut self.runtime,
+            &mut self.view.consent,
+            now,
+            // **Always reachable, on purpose** (D-030(4)). The gate this passes
+            // is a bare-metal fact — "the seat took our devices away" — and
+            // nested has no honest analogue. The nearest candidate is winit's
+            // `Occluded`, which is not delivered on every platform, is not the
+            // same fact (a minimized window is still answerable the moment the
+            // human raises it), and would make a *host* compositor's bookkeeping
+            // decide whether this core journals a prompt as shown. `limits.md`
+            // already publishes that the nested lock covers a window rather than
+            // a session; this is the same boundary, and it is scoped here rather
+            // than half-implemented.
+            session::PromptVisibility::Reachable,
+        ) {
             self.runtime.dirty = true;
             self.view.backend.window().request_redraw();
         }

@@ -575,11 +575,16 @@ this workstream owns, not inherits:
   Stages 1–2 therefore ship a privacy cover, not an authentication boundary
   for the seat. Published.
 - **No protection against VT switching, and the fix is a worse trade**
-  (created by WS-E.2.2, owner: whoever lands the DRM backend). On bare DRM
+  (created by WS-E.2.2, **decided by WS-E.3.3 / D-030**). On bare DRM
   `Ctrl-Alt-F<n>` walks past the lock unless the core inhibits it, and
   inhibiting it means a session a human cannot leave when the compositor
-  wedges. §7's safety rule and this item point at the same Stage-3 decision.
-  Published.
+  wedges. §7's safety rule and this item pointed at the same Stage-3 decision,
+  and D-030 took it: **no inhibition, and the trusted band is scoped to the
+  screen this core is driving instead** — plus the answer to the question this
+  bullet did not ask, which is that a switch away does *not* raise the lock
+  (it would claim a protection the core does not have and charge the human a
+  passphrase for using the escape hatch). Published, in the human's words, in
+  `docs/book/src/limits.md`.
 - **A passphrase is nested-only, because a headless backend has no keyboard** (created
   by WS-E.2.2, closed only by Stage 3 answering the keymap question). `--lock-passphrase-file`
   is refused at startup with `--headless`, naming the reason. Without it the

@@ -204,6 +204,18 @@ pub(crate) fn human_visible_from_view(
     // an answerable decision; it resolves `timed_out`, which is refusal. Before
     // the band, because the band's whole value is having exactly one correct
     // appearance and nothing may sit on it, core-drawn or not.
+    //
+    // **That argument is about INPUT, and the record is a separate question the
+    // sentence above used to be silent on.** `service_consent_round` has no lock
+    // awareness at any line, so a petition arriving while the session is locked
+    // *is* raised: it writes `consent_transition{shown}`, sets `prompt_shown`
+    // (so the chokepoint refuses that principal `consent_held`) and composites a
+    // card under this cover. That is deliberate and it is not the same defect
+    // D-030(4) closes for a seat pause: a locked session still owns its panel,
+    // so the card really is on the human's screen the moment they unlock, the
+    // guard is restarted for them (`ConsentGrab::restart_guard`), and they can
+    // answer it. A paused session's card reaches no panel at all and never will
+    // — which is why that one is refused a raise and this one is not.
     lock.composite_over(&mut view, width, height);
     consent.composite_trust_band(&mut view, width, height);
     // ...and, while the human's attention window is open, a marker **beside**

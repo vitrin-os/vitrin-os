@@ -118,6 +118,14 @@ than budgetary. Six of them, named rather than summarised:
   of which was that the page's own first line of recovery did not exist. A runbook nobody has executed is a plan, and the wlcs
   number above is this repository's standing example of how a manual result
   ages once it is taken.
+- **The session-lifecycle checklist has never been executed at all.** Blanking,
+  suspend, lid handling and deliberate-wedge recovery are rungs `L1`–`L6` in
+  [Getting out of a wedged session](recovery.md#the-hardware-checklist), and
+  every one of them is empty. Suspend and lid have never been exercised on this
+  backend by anyone, in any form — the bring-up runbook's own checklist has no
+  suspend, lid or blank step and never did, so those steps had to be *written*
+  before they could be run. Everything this release says about idle blanking is
+  therefore a claim about code, not a report about a laptop.
 
 This is a recorded decision with a scheduled closure in the sense that page's
 last section means: the closure is a dated human run, not a job. The alternative
@@ -592,15 +600,85 @@ rather than trusting your memory of an arbitrary colour: this page already says
 nobody has evidence a human reliably notices a wrong band, and a memory test is
 not a check.
 
-**A dark panel is not something `vitrind` can see.** It never turns your screen
-off and it has no way to tell that something else did. Your monitor's own power
-button, and the backlight controls your laptop exposes outside the display
-server, are both beyond it. So a consent card can in principle be raised — and
-recorded as shown to you — while you are looking at a dark screen. `vitrind`
-does hold this back when the *seat* is taken away from it, which is what happens
-when you switch to another VT and is the common case by a wide margin. It cannot
-do the same for a panel that went dark on its own, and no protection against
-that is claimed here.
+**Your screen now goes dark on its own — and a dark screen is not a locked
+session.** With `--blank-idle SECS` on bare metal, `vitrind` turns the panel off
+after that long with no physical input from you. **The session behind it stays
+unlocked.** Any physical input brings it back, and what comes back is your
+session exactly as you left it — not a passphrase prompt.
+
+Say the consequence rather than the feature: **anyone who walks up to your dark
+laptop and touches a key is inside your session.** That is worse than what most
+desktops do, where the screen blanking and the screen locking are the same
+timer. Here they are deliberately not coupled — locking is `Ctrl-Alt-Delete`, or
+`--lock-idle SECS`, and it is a separate thing you have to ask for. If you want
+a dark screen to mean a locked screen, set `--lock-idle` to a value you are
+comfortable with; nothing in the blank will do it for you, and the two timers do
+not know about each other beyond sharing the answer to *"when did a human last
+touch this?"*.
+
+Two smaller things that come with it. **Idle inhibition is not yet served**, so
+full-screen video will blank the screen — the client-side protocol for saying
+"don't blank, I'm playing a film" (`zwp_idle_inhibit_manager_v1`) needs both a
+new shim global and a new wire verb, and neither exists. That is a *not yet*
+with a named condition for changing, not a refusal. And **`--blank-idle` is
+refused on `--nested`**: a `vitrind` running inside your real compositor's
+window would be painting a black rectangle and calling it a dark screen, which
+asserts something about a display it does not own.
+
+**A dark screen is not evidence that nothing is watching, either — and this is
+the same decision as the lock screen, not a second accident.** An agent holding
+`observe` **keeps capturing the realm while your panel is off**, exactly as it
+does across a lock. Read the lock-screen entry above and read this as the same
+sentence: a lock, and now a blank, takes away **your** input and **your** view;
+neither touches an agent's authority, because the grant is what confers it and
+your gaze never did. The instrument for "stop everything" is unchanged and still
+works in the dark: **hold the dead-man chord**. It fires through a blank for a
+structural reason rather than a lucky one — the switch watches an input tap no
+gate can suppress, so the very press that wakes your screen is also the first
+press of the hold.
+
+**But it is worse than that, and the honest version is uncomfortable: a blank
+stops every realm's frame clock.** With the display powered off there are no
+vertical blanks, so nothing tells the compositor a frame landed, so no
+application is given permission to draw the next one. Every app in the session
+stops painting for as long as the screen is dark. An agent holding `observe`
+therefore does not "keep seeing" — **it is served the frame from just before the
+blank, over and over, indefinitely, with no signal that the picture is stale and
+no refusal to tell it something is wrong.** This is the same effect this page
+already describes for a VT switch, where the project's own notes call it *"worse
+than a stall"*; the difference is that a VT switch is something you do
+deliberately and a blank happens on a timer. So on a `--blank-idle` session,
+**an agent can still act and cannot see the consequences, on a schedule, without
+anybody choosing it.** The fix — giving realms a software frame cadence while
+the display is off — is named and is not scheduled. If you are running agents
+unattended, this is the entry to read twice, and the shortest honest advice is
+that a blank timeout and unattended agent work do not currently mix.
+
+**And `vitrind` still cannot see a panel that went dark for any other reason.**
+It knows about the darkness it caused itself, and that is all: your monitor's own
+power button, and the backlight controls your laptop exposes outside the display
+server, remain beyond it. So a consent card can still in principle be raised —
+and recorded as shown to you — while you are looking at a screen something *else*
+turned off. What `vitrind` does hold back is a prompt while its own blank is up,
+and a prompt while the *seat* is taken away from it, which is what happens when
+you switch to another VT and is the common case by a wide margin. **An earlier
+release of this page said `vitrind` "never turns your screen off and has no way
+to tell that something else did".** The first half stopped being true with this
+release and the second half never covered the case it is now narrowed to; the
+sentence is corrected here rather than quietly replaced, because a limits page
+that acquires the right words without saying how it had the wrong ones is a page
+you cannot check.
+
+**None of the blanking behaviour above has been confirmed on hardware.** It is a
+design with unit tests behind it. No test in this project can take DRM master, a
+seat, an ACPI event or a backlight, so whether the panel actually goes dark,
+whether it actually comes back, and whether a suspend or a lid close leaves you
+with a working screen are all knowable only by a human running
+[the recovery runbook's checklist](recovery.md#the-hardware-checklist) on the one
+machine that has the hardware. **Suspend and lid handling have never been
+exercised on this backend by anyone, in any form.** Until those numbers exist and
+are dated, treat every sentence in this section as a prediction about code rather
+than a report about a laptop.
 
 **That check runs in one direction only, and you should know which.** A
 *different* colour on return is a sound alarm: the core you left is not the core

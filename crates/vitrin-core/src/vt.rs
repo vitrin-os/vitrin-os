@@ -928,7 +928,14 @@ mod tests {
         let t0 = Instant::now();
         let now = Rc::new(Cell::new(t0));
         let lock_chord = ModChord::parse("ctrl+alt+delete").expect("the default lock chord");
-        let screen = Rc::new(RefCell::new(LockScreen::new(lock_chord, None, None, t0)));
+        let screen = Rc::new(RefCell::new(LockScreen::new(
+            lock_chord,
+            None,
+            None,
+            Rc::new(RefCell::new(crate::backend::blank::SessionActivity::new(
+                None, t0,
+            ))),
+        )));
         let signal = Rc::new(RefCell::new(VtSignal::new().expect("twelve bindings")));
 
         let mut router = InputRouter::detached(VtHook::new(

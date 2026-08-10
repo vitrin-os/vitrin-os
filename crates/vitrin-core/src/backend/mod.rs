@@ -107,6 +107,30 @@
 /// reply), so a plain build computes nothing and answers nothing.
 #[cfg(any(test, feature = "consent-injector"))]
 pub(crate) mod band_witness;
+/// The idle blank (WS-E.4.3, issue #223): the session's activity clock, the
+/// state machine that turns idleness into a dark panel, and the opaque cover
+/// that rides the output stage below while it happens.
+///
+/// Here rather than beside [`crate::lock`] because a blank is **output** state:
+/// the cover is composited by [`human_visible_from_view`] and the display power
+/// state is set by the one backend that owns a display controller. Living under
+/// `crate::backend` is also what lets [`blank::BlankSurface`]'s constructor and
+/// composite be `pub(in crate::backend)`, so no module outside this one can mint
+/// a cover, hold a cover, or draw a cover.
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        dead_code,
+        reason = "the only production driver of the blank is the bare-metal backend's \
+                  `service_screen`: it is the only backend that owns a display controller, and \
+                  the only one whose hook stack carries the lock gate that writes the activity \
+                  clock. A default build compiles the whole state machine, the cover and the \
+                  resume detector, and exercises every one of them from this crate's own \
+                  tests -- which is where CI's coverage of this lives, since no runner has a \
+                  DRM device"
+    )
+)]
+pub(crate) mod blank;
 /// The bare-metal DRM/KMS backend (WS-E.3.2, issue #218) — **the third
 /// presentation path**, and the one this module's docs below warned would
 /// arrive: it presents through [`compose_human_visible`] on the CPU and
@@ -125,6 +149,7 @@ use crate::consent::ConsentSurface;
 use crate::lock::LockSurface;
 use crate::scene::Scene;
 use crate::status::StatusStrip;
+use blank::BlankSurface;
 
 /// Apply the consent overlay to an **already-composed** realm view, yielding
 /// human-visible output.
@@ -167,10 +192,27 @@ use crate::status::StatusStrip;
 /// on *this* side of the fork and can no more reach `frame_ready` than the
 /// consent card can. With `--status` off it is a single branch and this
 /// function's output is byte-identical to what it was before the strip existed.
+///
+/// `blank` is the **idle cover** (WS-E.4.3, [`blank`]). It joins between the
+/// lock cover and the trusted band, and the position is argued in
+/// [`blank::BlankSurface::composite_over`]: it is the outermost *opaque* cover
+/// and must hide a lock card as well as an app, but nothing may sit on the band,
+/// so a blanked frame is black with this session's secret colour still lit along
+/// its top edge. It is a required parameter rather than an `Option` so a fourth
+/// backend cannot forget it — the only way to have no cover is to hand over a
+/// surface that is deliberately down.
+// **Eight parameters, and the allow is a decision.** Every one of them is a
+// surface the human-visible output stage composites, in the order it composites
+// them, and that parallel is load-bearing: `backend::winit::TextureKey::current`
+// takes the same run in the same order precisely so "every input to this
+// function appears in the cache key" can be checked by lining the two argument
+// lists up. Bundling them into a struct would hide exactly that.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn human_visible_from_view(
     mut view: Vec<u8>,
     consent: &mut ConsentSurface,
     lock: &mut LockSurface,
+    blank: &BlankSurface,
     status: &mut StatusStrip,
     width: u32,
     height: u32,
@@ -217,6 +259,23 @@ pub(crate) fn human_visible_from_view(
     // answer it. A paused session's card reaches no panel at all and never will
     // — which is why that one is refused a raise and this one is not.
     lock.composite_over(&mut view, width, height);
+    // ...then the IDLE BLANK (WS-E.4.3, issue #223), the outermost opaque cover
+    // and the last thing before the band. After the lock because a screen going
+    // dark must hide the lock card too -- a lock screen legible on a panel the
+    // human believes is off would be the same disclosure the cover exists to
+    // prevent, one surface up. **Before `composite_trust_band`, deliberately**:
+    // the band's whole value is having exactly one correct appearance and
+    // nothing may sit on it, core-drawn or not, so a blank that overdrew it
+    // would be the first exception ever granted.
+    //
+    // The consequence is a feature rather than a compromise. In the success case
+    // the panel is powered down and nobody sees the frame at all; in the failure
+    // case -- a display controller that refuses `clear()` -- the human is looking
+    // at a black screen carrying this session's secret colour, which is exactly
+    // the signal that distinguishes "vitrind blanked" from "a confined app
+    // painted itself black". `the_blank_cover_has_exactly_one_chokepoint` holds
+    // this call in this position.
+    blank.composite_over(&mut view, width, height);
     consent.composite_trust_band(&mut view, width, height);
     // ...and, while the human's attention window is open, a marker **beside**
     // the band and never inside it (WS-E.1.7, issue #232). After the band so
@@ -244,10 +303,12 @@ pub(crate) fn human_visible_from_view(
 /// realm view, never this. The headless backend keeps the two in separate
 /// retained images to make that impossible to confuse; see
 /// [`headless::HeadlessState`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compose_human_visible(
     scene: &Scene,
     consent: &mut ConsentSurface,
     lock: &mut LockSurface,
+    blank: &BlankSurface,
     status: &mut StatusStrip,
     width: u32,
     height: u32,
@@ -257,9 +318,142 @@ pub(crate) fn compose_human_visible(
         scene.compose(width, height),
         consent,
         lock,
+        blank,
         status,
         width,
         height,
         attention,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    /// **The blank cover has exactly one chokepoint**, and it is the shared
+    /// output stage — the `the_sprite_has_exactly_one_chokepoint` discipline
+    /// (WS-E.4.2) applied to WS-E.4.3's cover.
+    ///
+    /// The compiler already holds the half it can:
+    /// [`super::blank::BlankSurface::new`] and
+    /// [`super::blank::BlankSurface::composite_over`] are `pub(in
+    /// crate::backend)`, so no module outside `crate::backend` can mint, hold or
+    /// draw a cover. What the compiler cannot hold is the half this test is
+    /// for — that the *one* call inside `crate::backend` is
+    /// [`super::human_visible_from_view`]'s, in the one position where the
+    /// trusted band is still painted afterwards.
+    ///
+    /// Three assertions, and each names a different way the property dies:
+    ///
+    /// * a **second** call site is a second decision about whether the human's
+    ///   picture is covered, and the N+1st presentation path is the one that
+    ///   forgets;
+    /// * the one call being **outside** `human_visible_from_view` puts the cover
+    ///   on a path some backend does not take, which is the "third presentation
+    ///   path" `backend/mod.rs`'s own docs were written about;
+    /// * the one call landing **after** `composite_trust_band` overdraws the
+    ///   band, which is the one thing nothing in this core may ever do.
+    #[test]
+    fn the_blank_cover_has_exactly_one_chokepoint() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).expect("the crate source tree is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("a readable source file");
+                    // Truncated at the test module, exactly as the sprite's scan
+                    // is: otherwise the tests that exercise the cover would
+                    // count as production call sites.
+                    let production = text
+                        .split_once("\n#[cfg(test)]\nmod tests {")
+                        .map(|(before, _)| before.to_string())
+                        .unwrap_or(text);
+                    out.push((path, production));
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        rust_sources(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut sources,
+        );
+        assert!(
+            sources.iter().any(|(p, _)| p.ends_with("backend/mod.rs")),
+            "the scan must cover this file, or it proves nothing"
+        );
+
+        // **Scan for the METHOD, never for the receiver's name.** An earlier
+        // version of this test counted the literal `blank.composite_over(`, and
+        // a review walked straight through it by binding the same surface to a
+        // differently-named local — which would have been a second, untested
+        // decision about whether the human's screen is covered, in a test whose
+        // whole purpose is to forbid one. The assertion is over the exact
+        // expected set of `.composite_over(` receivers under `backend/`, so a
+        // new call site fails here whatever it calls its variable.
+        let mut calls: Vec<(String, String)> = Vec::new();
+        for (path, text) in &sources {
+            if !path.components().any(|c| c.as_os_str() == "backend") {
+                continue;
+            }
+            for (at, _) in text.match_indices(".composite_over(") {
+                let recv: String = text[..at]
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect::<Vec<char>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                let file = path
+                    .file_name()
+                    .expect("a source file has a name")
+                    .to_string_lossy()
+                    .into_owned();
+                calls.push((file, recv));
+            }
+        }
+        calls.sort();
+        let mut expected = vec![
+            ("mod.rs".to_string(), "blank".to_string()),
+            ("mod.rs".to_string(), "lock".to_string()),
+        ];
+        expected.sort();
+        let covers: Vec<(String, String)> = calls
+            .iter()
+            .filter(|(_, recv)| recv == "blank" || recv == "lock")
+            .cloned()
+            .collect();
+        assert_eq!(
+            covers, expected,
+            "every full-screen cover must be composited from exactly ONE place -- the shared \
+             human-visible output stage in backend/mod.rs. A second call is a second decision \
+             about whether the human's screen is covered, and the path that forgets is the one \
+             nobody tested. This scan matches the METHOD, so renaming the receiver does not \
+             evade it. All `.composite_over(` calls under backend/: {calls:?}"
+        );
+
+        let source = include_str!("mod.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file ends with its own test module")
+            .0;
+        let stage = source
+            .split("pub(crate) fn human_visible_from_view(")
+            .nth(1)
+            .expect("the shared output stage exists");
+        let cover = stage
+            .find("blank.composite_over(")
+            .expect("the one call must be inside `human_visible_from_view`");
+        let lock = stage
+            .find("lock.composite_over(")
+            .expect("the lock cover is composited at this stage");
+        let band = stage
+            .find("consent.composite_trust_band(")
+            .expect("the trusted band is painted at this stage");
+        assert!(
+            lock < cover && cover < band,
+            "the blank cover must sit AFTER the lock cover and BEFORE the trusted band: after \
+             the lock because a dark screen must hide the lock card too, and before the band \
+             because nothing -- core-drawn or not -- may sit on the one strip the human reads \
+             this session's colour from"
+        );
+    }
 }

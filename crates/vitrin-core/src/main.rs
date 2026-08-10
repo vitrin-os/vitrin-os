@@ -481,7 +481,7 @@ USAGE:
                                 is a security parameter, not an ergonomics
                                 one.
     vitrind [--lock-chord CHORD]
-                                `--nested` ONLY: the chord that raises the lock
+                                NOT with `--headless`: the chord that raises the lock
                                 screen (WS-E.2.2). MOD[+MOD...]+KEY; modifiers
                                 ctrl, shift, alt, super; the key must be
                                 layout-invariant and non-modifier -- a chord
@@ -493,14 +493,14 @@ USAGE:
                                 confined app sees it. Startup FAILS if its key
                                 is also --dead-man-chord's, --attention-chord's
                                 or --clipboard-key's.
-    vitrind [--lock-idle SECS]  `--nested` ONLY: raise the lock screen after
+    vitrind [--lock-idle SECS]  NOT with `--headless`: raise the lock screen after
                                 SECS with no PHYSICAL input. An agent's
                                 actuations never postpone it -- a session an
                                 agent is working in is still a session the human
                                 left. Off by default; 0 is REFUSED rather than
                                 read as off (it would relock every round).
     vitrind [--lock-passphrase-file PATH]
-                                `--nested` ONLY: unlock requires the passphrase
+                                NOT with `--headless`: unlock requires the passphrase
                                 whose Argon2id digest PATH holds. Absolute path,
                                 regular file, owned by this uid, mode 600 --
                                 stricter than realm.toml's rule, because whoever
@@ -531,6 +531,40 @@ USAGE:
                                   printf %s $PASS | vitrind --lock-hash \\
                                     > ~/.config/vitrin/lock.hash
                                   chmod 600 ~/.config/vitrin/lock.hash
+    vitrind [--blank-idle SECS] `--drm` ONLY (WS-E.4.3): after SECS with no
+                                PHYSICAL input, power the panel down. Any
+                                physical event brings it back, and that event
+                                is CONSUMED -- a key aimed at a dark screen
+                                neither commits a consent card nor reaches an
+                                app. An agent's actuations neither postpone the
+                                blank nor wake the screen: there is no verb in
+                                the protocol for `power the human's display`,
+                                and one that could be triggered remotely under
+                                no grant is not one this core is adding. Off by
+                                default; 0 is REFUSED rather than read as off.
+
+                                *** IT DOES NOT LOCK. ***
+                                The session stays UNLOCKED behind the dark
+                                screen. Locking is --lock-idle and the lock
+                                chord, and the two are coupled by nothing but a
+                                shared activity clock. Anyone who walks up and
+                                presses a key is inside the session. Two more
+                                consequences, stated rather than softened: a
+                                dark screen is not evidence that nothing is
+                                being OBSERVED (a lock does not suspend agents
+                                either -- D-025), and it is not evidence that
+                                anything is being observed LIVE, because a
+                                disabled CRTC produces no vblank, so no realm's
+                                frame_done is discharged and every paced app
+                                stops painting until the human comes back. See
+                                docs/book/src/limits.md.
+
+                                REFUSED with --nested (a client of another
+                                compositor cannot power a panel it does not own)
+                                and with --headless (no output, and no lock gate
+                                in its hook stack, so nothing would ever write
+                                the activity clock a wake reads -- the session
+                                would go dark and stay dark).
     vitrind --status            Draw the status strip: the focused realm's
                                 name, the battery and a clock, in a reserved
                                 band of rows immediately BELOW the trusted
@@ -874,6 +908,22 @@ enum Action {
         lock: lock::LockConfig,
         screenshot: screenshot::ScreenshotConfig,
         status: status::StatusConfig,
+        /// `--blank-idle SECS` (WS-E.4.3, issue #223): power the panel down
+        /// after SECS with no physical input, `None` for never.
+        ///
+        /// **Bare metal only, and there is no field for it on the other two
+        /// variants** -- the flag is refused with `--nested` and `--headless`
+        /// at parse time, naming the reason
+        /// ([`crate::backend::blank::BLANK_NEEDS_THE_OUTPUT`]), rather than
+        /// accepted as a silent no-op. That is `--agent-cursor`'s posture with
+        /// a sharper edge: on headless the flag would not be inert, it would
+        /// wedge the session dark, because that backend's hook stack has no
+        /// lock gate and so nothing writes the activity clock a wake reads.
+        ///
+        /// **It does not lock.** On idle the screen goes dark and the session
+        /// stays unlocked (Taha, 2026-08-10); locking is `--lock-idle` and the
+        /// lock chord, and the two are coupled by nothing but a shared clock.
+        blank_idle: Option<Duration>,
         /// `--keymap PATH`: the compiled xkb keymap this session resolves
         /// libinput scancodes through (WS-E.3.1, D-028).
         ///
@@ -970,6 +1020,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut screenshot_dir: Option<PathBuf> = None;
     let mut screenshot_chord: Option<chord::ModChord> = None;
     let mut lock_idle: Option<Duration> = None;
+    let mut blank_idle: Option<Duration> = None;
     let mut lock_passphrase: Option<PathBuf> = None;
     let mut agent_cursor = false;
     #[cfg(feature = "drm-backend")]
@@ -1101,6 +1152,12 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 )?;
                 set_lock_idle(&mut lock_idle, value)?;
             }
+            "--blank-idle" => {
+                let value = args.next().ok_or(
+                    "`--blank-idle` requires a whole number of seconds (e.g. `--blank-idle 300`)",
+                )?;
+                set_blank_idle(&mut blank_idle, value)?;
+            }
             "--lock-passphrase-file" => {
                 let value = args.next().ok_or(
                     "`--lock-passphrase-file` requires a path (e.g. \
@@ -1212,6 +1269,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_lock_chord(&mut lock_chord, value)?;
                 } else if let Some(value) = other.strip_prefix("--lock-idle=") {
                     set_lock_idle(&mut lock_idle, value)?;
+                } else if let Some(value) = other.strip_prefix("--blank-idle=") {
+                    set_blank_idle(&mut blank_idle, value)?;
                 } else if let Some(value) = other.strip_prefix("--lock-passphrase-file=") {
                     set_path(
                         &mut lock_passphrase,
@@ -1545,6 +1604,23 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         }
     }
 
+    // **`--blank-idle` is `--drm` only** (WS-E.4.3, issue #223), refused on
+    // BOTH other backends at parse time rather than accepted as a silent no-op
+    // -- the `--agent-cursor` and `--size` posture, taken here for a reason
+    // that is sharper on headless than on either of those: a headless session
+    // would not merely ignore the flag, it would go dark after the timeout and
+    // never come back, because that backend's hook stack carries no lock gate
+    // and so nothing at all writes the activity clock a blank is woken by.
+    #[cfg(feature = "drm-backend")]
+    let blank_has_an_output = matches!(mode, Some(Mode::Drm));
+    // A build without the backend has no `--drm` arm at all, so there is no
+    // mode this flag could be valid in.
+    #[cfg(not(feature = "drm-backend"))]
+    let blank_has_an_output = false;
+    if !blank_has_an_output && blank_idle.is_some() {
+        return Err(crate::backend::blank::BLANK_NEEDS_THE_OUTPUT.into());
+    }
+
     // The injector channel's two companion refusals (issue #138), taken at
     // PARSE time rather than at first use, which is this parser's rule
     // everywhere else too:
@@ -1731,6 +1807,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             },
             screenshot,
             status,
+            blank_idle,
             keymap,
         }),
         // A headless core has no display to draw the consent prompt on and no
@@ -2005,6 +2082,33 @@ fn set_lock_idle(slot: &mut Option<Duration>, value: &str) -> Result<(), String>
     Ok(())
 }
 
+/// Record the `--blank-idle` timeout in whole seconds (WS-E.4.3, issue #223),
+/// rejecting a repeat flag and a zero.
+///
+/// [`set_lock_idle`]'s shape and its zero refusal, for the same fail-closed
+/// reason one step worse: `--blank-idle 0` would power the panel down on the
+/// first dispatch round and again on the round after every wake, which is a
+/// session whose display flickers off faster than a human can read it. Omitting
+/// the flag is how an operator says "never blank", and there is exactly one
+/// spelling of it.
+fn set_blank_idle(slot: &mut Option<Duration>, value: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--blank-idle` given more than once".into());
+    }
+    let secs: u64 = value
+        .parse()
+        .map_err(|_| format!("`--blank-idle` `{value}` is not a whole number of seconds"))?;
+    if secs == 0 {
+        return Err(
+            "`--blank-idle 0` would power the panel down on the first dispatch round and again \
+             after every wake. Omit the flag to run with no idle blank."
+                .into(),
+        );
+    }
+    *slot = Some(Duration::from_secs(secs));
+    Ok(())
+}
+
 /// Record `--status-height` (WS-E.2.3), rejecting a repeat flag and anything
 /// outside the range the type size needs.
 ///
@@ -2234,6 +2338,7 @@ fn main() -> ExitCode {
             lock,
             screenshot,
             status,
+            blank_idle,
             keymap,
         } => {
             init_tracing();
@@ -2266,6 +2371,7 @@ fn main() -> ExitCode {
                         screenshot_chord,
                         lock,
                         status,
+                        blank_idle,
                         keymap,
                         seed,
                     )
@@ -3606,6 +3712,31 @@ mod tests {
         // session raises can be dismissed.
         assert!(parse_args(["--drm", "--lock-idle", "300"]).is_ok());
         assert!(parse_args(["--drm", "--lock-chord", "ctrl+alt+delete"]).is_ok());
+
+        // **`--blank-idle` is `--drm` only** (WS-E.4.3, issue #223), both
+        // spellings, and refused everywhere else naming the reason.
+        assert!(parse_args(["--drm", "--blank-idle", "300"]).is_ok());
+        assert!(parse_args(["--drm", "--blank-idle=300"]).is_ok());
+        assert_eq!(
+            blank_of(&parse_args(["--drm", "--blank-idle", "300"]).unwrap()),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            blank_of(&parse_args(["--drm"]).unwrap()),
+            None,
+            "off by default: a core that guessed an idle timeout is a core that blanked \
+             somebody's demo"
+        );
+        // Zero is refused rather than read as off, on `--lock-idle 0`'s
+        // precedent and for a worse consequence: it would power the panel down
+        // on the first dispatch round and again after every wake.
+        let err = parse_args(["--drm", "--blank-idle", "0"]).expect_err("zero is a wedge");
+        assert!(err.contains("--blank-idle 0"), "{err}");
+        assert!(
+            parse_args(["--drm", "--blank-idle", "300", "--blank-idle", "600"]).is_err(),
+            "a repeat flag is an error, like every other one-shot flag here"
+        );
+        assert!(parse_args(["--drm", "--blank-idle", "abc"]).is_err());
 
         // ...and both injector channels stay headless-only, which the
         // existing guards already enforce -- asserted here so that "the
@@ -5212,6 +5343,63 @@ mod tests {
         assert!(
             parse_args(["--nested", "--attention-chord"]).is_err(),
             "a bare flag takes the next argument; there is none"
+        );
+    }
+
+    /// The `--blank-idle` a bare-metal run resolved (WS-E.4.3).
+    #[cfg(feature = "drm-backend")]
+    fn blank_of(action: &Action) -> Option<Duration> {
+        match action {
+            Action::RunDrm { blank_idle, .. } => *blank_idle,
+            other => panic!("not a bare-metal run action: {other:?}"),
+        }
+    }
+
+    /// **`--blank-idle` is refused on every backend that does not own a display
+    /// controller** (WS-E.4.3, issue #223), and refused rather than accepted as
+    /// a silent no-op.
+    ///
+    /// The `--agent-cursor` and `--size` posture, taken here for a reason that
+    /// is sharper on headless than on either of those: the flag would not merely
+    /// be inert, it would **wedge the session dark**, because that backend's
+    /// hook stack carries no lock gate and therefore nothing at all writes the
+    /// activity clock a wake reads.
+    ///
+    /// Asserted in a build **without** `drm-backend` too, where there is no
+    /// mode the flag could be valid in at all -- that arm has its own `cfg`, and
+    /// a `cfg` nothing exercises is a refusal that can rot.
+    #[test]
+    fn blank_idle_is_refused_on_every_backend_without_an_output() {
+        for args in [
+            vec!["--nested", "--blank-idle", "300"],
+            vec!["--nested", "--blank-idle=300"],
+            vec!["--headless", "--blank-idle", "300"],
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err("a backend with no display controller cannot blank one");
+            assert!(
+                err.contains("--blank-idle") && err.contains("--drm"),
+                "the refusal must name the flag and the one backend it is valid on: {err}"
+            );
+        }
+        // Named in the help text, so an operator can find it -- and in `USAGE`
+        // rather than `DRM_USAGE`, because the parser has an arm for the flag in
+        // every build and answers a *reason* rather than `unknown argument`.
+        assert!(USAGE.contains("--blank-idle"));
+        assert!(
+            USAGE.contains("IT DOES NOT LOCK"),
+            "the help must say, where an operator will actually read it, that an idle blank \
+             leaves the session unlocked. That consequence is published rather than softened"
+        );
+
+        // The headless message must say WHY, because "no output" is only half
+        // of it and the other half is the one that wedges.
+        let err = parse_args(["--headless", "--blank-idle", "300"]).unwrap_err();
+        assert!(
+            err.contains("lock gate") || err.contains("activity clock"),
+            "the headless refusal must name the missing activity clock, not only the missing \
+             display: a reader who fixes the display half would still ship a session that \
+             goes dark and never comes back. Got: {err}"
         );
     }
 

@@ -185,7 +185,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 | **1 — multi-app, nested** | ~~Runtime app launch~~ (**landed**, WS-E.1.1/#207: `autostart = false` templates, a served `realm_launch` verb, core-minted `<template>.<n>` instance ids, `capacity` at `MAX_REALMS`, and `realm_spawned` naming who asked) · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · ~~a core-owned attention key~~ (**landed**, WS-E.1.7/#232: a tapped, consumed Super lifts `preempted` for one layout use and delivers `vitrin_principal.attention`, so an in-realm shell can switch realms at all) · a shell client (switcher + launcher) | 7–9 w |
 | **2 — livable** | ~~Cross-realm clipboard~~ (**landed**, WS-E.2.1/#213: a core-held single slot the core *pulls* into on Ctrl-Shift-Insert and offers on Shift-Insert, `text/plain;charset=utf-8` at 60 KiB, plus the modifier-aware chord matcher 2.2 and 2.4 consume — §4.1, [D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing)) · ~~core-drawn lock screen on the consent stack~~ (**landed**, WS-E.2.2/#214) · ~~status in the trusted band~~ (**landed**, WS-E.2.3/#215) · ~~human screenshot~~ (**landed**, WS-E.2.4/#216: `ctrl+print` writes one PNG of the REALM VIEW into one audited `--screenshot-dir`, touching no grant — §6) | 4–6 w |
 | **3 — bare metal** | ~~The keymap decision~~ (**landed**, WS-E.3.1/#217: xkbcommon in the core behind the off-by-default `session-keymap` feature, fed a pre-compiled keymap **file** and never a layout name, keysyms normalised to one Unicode convention, and key pairing moved to the scancode — §4, [D-028](20-decision-log.md#d-028--a-bare-metal-session-interprets-the-keyboard-inside-the-core-from-a-pre-compiled-keymap-file-and-key-pairing-moves-to-the-scancode)) · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
-| **4 — long tail** | X11 (defers to E3.2 — **scoped, not built**, WS-E.4.1/#221: six requirements handed to E3.2, the X11-only software measured on this machine, and the interim, all in §4.2) · ~~seat vocabulary~~ (**landed in the tree, unproven on hardware**, WS-E.4.2/#222: `relative_motion` and four gesture events on `vitrin_shim_seat`, a `pointer_constraint` ask-and-verdict pair on `vitrin_shim_session`, three new shim globals, touch and tablet deferred against named reopening evidence, the lid handed to WS-E.4.3 — §4.3, [D-032](20-decision-log.md#d-032--relative-motion-and-pointer-gestures-grow-the-seat-vocabulary-pointer-constraints-grow-the-shim-session-instead-and-touch-and-tablet-are-deferred-against-named-evidence)) · session lifecycle · the honesty sweep | open |
+| **4 — long tail** | X11 (defers to E3.2 — **scoped, not built**, WS-E.4.1/#221: six requirements handed to E3.2, the X11-only software measured on this machine, and the interim, all in §4.2) · ~~seat vocabulary~~ (**landed in the tree, unproven on hardware**, WS-E.4.2/#222: `relative_motion` and four gesture events on `vitrin_shim_seat`, a `pointer_constraint` ask-and-verdict pair on `vitrin_shim_session`, three new shim globals, touch and tablet deferred against named reopening evidence, the lid handed to WS-E.4.3 — §4.3, [D-032](20-decision-log.md#d-032--relative-motion-and-pointer-gestures-grow-the-seat-vocabulary-pointer-constraints-grow-the-shim-session-instead-and-touch-and-tablet-are-deferred-against-named-evidence)) · ~~session lifecycle~~ (**landed in the tree, unproven on hardware**, WS-E.4.3/#223: idle **blanks and does not lock**, one shared activity clock, suspend detected after the fact from the monotonic/wall clock pair rather than from D-Bus, lid and power delegated to logind, the XF86 media/brightness rows, and a recovery runbook whose SysRq path is `sudo`-only with the kernel mask untouched — §4.4, [D-033](20-decision-log.md#d-033--idle-blanks-the-screen-and-does-not-lock-it-suspend-is-detected-after-the-fact-or-not-at-all-and-the-recovery-path-is-sudo-only)) · the honesty sweep | open |
 
 **Stage 1 is the one that is genuinely dual-use.** Layout verbs are allocated
 and unserved, and multi-realm is Phase-3 fleet work; both get built here
@@ -1244,6 +1244,10 @@ capabilities share a noun in a document that cannot rename either.
 ### Handoff
 
 - **WS-E.4.3 (#223)** takes the lid switch, unchanged from #222's reading.
+  **Taken** — [§4.4](#44-session-lifecycle-build-what-the-hardware-forces-delegate-the-rest)
+  delegates it to logind rather than growing a wire event, and confirms on the
+  machine that the lid is `SW_LID` on `event0`, that `vitrind` sees it, and that
+  `intake_physical` drops it.
 - **WS-E.4.4 (#224)** publishes the deferrals. The register is dictated here
   for §4.2's reason: every surface states touch and tablet as **not yet
   served** and names the evidence that reopens each. §6's bullet is rewritten
@@ -1262,6 +1266,379 @@ capabilities share a noun in a document that cannot rename either.
 - **Owed, and named rather than smoothed over:** cancelling an in-flight
   gesture when a consent card or the lock screen raises (above); and the
   hardware rung itself.
+
+## 4.4 Session lifecycle: build what the hardware forces, delegate the rest
+
+Stage 4's third deliverable (WS-E.4.3, issue #223), written out here for §4.1's
+reason: the issue closes and this does not. Landed as
+**[D-033](20-decision-log.md#d-033--idle-blanks-the-screen-and-does-not-lock-it-suspend-is-detected-after-the-fact-or-not-at-all-and-the-recovery-path-is-sudo-only)**.
+
+On the nested and headless backends none of this exists to decide: `winit.rs` is
+a client of a compositor that owns suspend, blanking and VT switching entirely,
+and `headless.rs` has no output at all. On bare DRM the core becomes the thing
+that owns the display and the devices, so a subset of session management is
+**forced** on it. This section draws that line: build what the hardware forces,
+delegate policy to systemd-logind, and defer the rest against named evidence.
+
+### What #223 asserted about today's code that was no longer true
+
+#223 was filed **2026-08-06T08:35Z**, before Stage 2 (2026-08-08), Stage 3
+(2026-08-09) and WS-E.4.1/4.2 (2026-08-10). Five of its claims were checked
+against the tree on 2026-08-10 by opening the file, and did not survive. They
+are recorded because a stale issue acted on faithfully builds the wrong thing:
+
+| #223 said | The tree said, 2026-08-10 |
+|---|---|
+| *"There is no lock screen and none is built here … Published as a limit"* | **False.** A full core-drawn lock screen landed in WS-E.2.2/#214 (`crates/vitrin-core/src/lock/`: `LockScreen`, `LockPolicy`, Argon2id passphrase, golden render) and was exercised end to end on bare metal — `session_locked(chord)` → `unlock_attempted(true)` → `session_unlocked`, first-run record in [`docs/drm-bringup.md`](../drm-bringup.md). Publishing *"no lock screen"* would have been a false limit in the pessimistic direction, which is still false. |
+| Task 1, *"Activation transitions … drop DRM master and stop presenting on deactivate; on activate re-acquire"* | **Already built**, and more thoroughly than the task describes: `DrmState::handle_session_event` handles both arms, including the libinput suspend/resume, the held-press drain, the chord matchers forgetting physical state, the consent-guard restart and the idle-clock freeze. Confirmed on hardware — two full pause→activate cycles, master dropped and reclaimed (second-run record). |
+| Task 1's *"and its `PauseDevice`/`ResumeDevice` passthrough"* | **Nothing to wire.** libseat's listener has exactly two callbacks, `enable_seat` and `disable_seat` (`/usr/include/libseat.h`), and smithay 0.7 collapses them into `SessionEvent::{PauseSession, ActivateSession}` and exposes nothing else. |
+| Task 2, *"Route post-suspend recovery through the same reactivation path as VT switch, so there is one code path and not two"* | **The premise has no producer.** libseat does not handle `PrepareForSleep` at all; `disable_seat` fires on the logind session going inactive or on a `PauseDevice` signal, and a system suspend emits neither. A suspend/resume delivers **no session event**, so there is nothing to route and the sentence is vacuous as written. What replaces it is below. |
+| *"An idle timer on the existing `calloop` loop"* | An idle timer **already exists** and is deliberately not a `calloop` timer: `--lock-idle` drives `LockScreen::tick`, evaluated once per dispatch round from `post_dispatch`, whose own docs give the rule — *"a second clock would be a second thing to keep in step"*. The blank inherits that mechanism rather than adding a second one. |
+
+Two of #223's References were also line-drifted rather than wrong
+(`session.rs:327,472` for `Presenter`/`RuntimeHost`; `input/mod.rs:1239-1271`
+for `invariant_keysym`), and one — `lifecycle.rs:130-170`, cited as *"the
+`calloop` signal source a timer joins"* — points at module prose describing the
+realm shutdown ladder, which is not a signal source and which no timer joins.
+**Citations in this section name symbols wherever a symbol exists**, for the
+reason [§4.3](#43-the-five-input-classes-the-seat-vocabulary-drops-a-verdict-each)
+gives: a line number in a document describing a change is invalidated by that
+change; a symbol name is not.
+
+### Decision 1, the owner's: idle blanks the screen, and does not lock it
+
+**Taken by the owner on 2026-08-10 and not re-litigated here.** On idle the
+panel goes dark; the session stays **unlocked**. Locking remains the human's
+manual chord (`Ctrl-Alt-Delete`), which already exists. There is no idle-lock
+timer added here and the two are **not coupled**.
+
+The consequence is real and is published unsoftened rather than argued down: **an
+unlocked session behind a dark screen.** Anyone who walks up and touches a key
+gets the session, not a passphrase prompt. That is worse than what the machine
+does today under Hyprland, and it is the owner's trade to make.
+
+The two clocks share exactly one thing — the activity timestamp — and nothing
+else. In particular the blank must **not** suppress the idle lock: a session run
+with a blank timeout shorter than a lock timeout must still lock, or the blank
+would have silently disabled a security feature, which is precisely the class of
+unchosen behaviour [D-030(2)](20-decision-log.md#d-030--the-trusted-band-asserts-only-about-the-screen-this-core-is-driving-and-the-session-colour-is-never-re-minted-a-paused-seat-raises-no-prompt-it-could-record-as-shown)
+was written to catch. Blanking while unlocked and then locking behind the dark
+screen is the correct sequence: the human touches a key, the wake is consumed,
+and the screen returns showing the lock card.
+
+### The activity rules, as a stated policy
+
+One writer, one clock. The timestamp is written at exactly **one** site — the
+line already in `LockScreen::judge` — and read by two independent ticks. Two
+clocks meaning *"when did the human last touch this session"* would drift, and
+the drift would be invisible.
+
+- **Postpones the blank:** any seat input whose origin is **physical** — key,
+  button, motion, scroll, relative motion, gesture begin/update/end, text;
+  presses *and* releases. Nothing else. So a human who only moves the mouse
+  postpones the blank.
+- **Wakes the screen:** the same predicate, at the same site. Any physical
+  event.
+- **An agent's actuation does neither**, and the postpone half was already
+  decided by landed code rather than being restated here: `LockScreen::judge`
+  returns early for non-physical origin *above* the stamp, commented *"an
+  agent's actuations must not hold the idle lock open for a human who left"* and
+  pinned by `an_agents_actuation_never_holds_the_idle_lock_open`. Sharing the
+  clock makes the blank inherit it structurally.
+- **The independent argument for the wake half** is the stronger one: **there is
+  no verb in the IDL for "power the human's display".** An agent that could wake
+  the screen would be making an unrequested change to the human's physical
+  environment, remotely triggerable, under no grant — the same shape
+  [D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing)
+  refuses for the clipboard, and the inverse of what D-019 buys (an agent's
+  action must be *visible when a human is there*, not *summoning*). An agent
+  that could merely keep the screen awake is milder and still spends the human's
+  battery and lights an empty room under no authority.
+- **The counter-argument, stated and rejected:** *"an agent doing visible work
+  should keep the screen on so the human can watch."* A human who wants to watch
+  is present and touching things; a human who is not present is not watching.
+  D-030(6) already publishes that agents keep working while the human's screen is
+  not showing them.
+- **The core's own drawing does neither**, and it is enumerated rather than
+  implied, because *"the core drew something"* is exactly how a wake rule leaks:
+  a **consent card raising** must not wake (a core that woke the screen because
+  an agent petitioned would hand every principal a remote wake primitive, and
+  petitioning needs no grant at all); the **status strip's minute rollover** must
+  not wake (a session that woke itself once a minute would never blank); a
+  **realm's commit, a realm launch, an SDK client's layout verb** must not wake
+  (an app painting is not the human). The **dead-man chord** and the **VT chord**
+  need no rule of their own — both are held physical keys, so the first press
+  wakes by the ordinary predicate.
+- **The wake event is consumed**, so a press aimed at a dark screen neither
+  commits a consent card nor acts inside a confined app — and it is consumed
+  from the moment the blank begins until the first frame after the wake lands,
+  not for one event, because a modeset is long enough for a human to type several
+  characters into an app they cannot see. **Bounded**, so that a dark screen that
+  also swallows input can never become indistinguishable from a wedged session:
+  after the bound, input is delivered regardless and the fault is logged. *Fail
+  open on input, fail closed on authority* — the consent guard restart is what
+  holds the security property, so the consume is defence in depth and may be lost
+  to the bound without opening a clickjack.
+
+### Suspend: what the core can actually observe, which is less than #223 assumed
+
+**No D-Bus client goes into the core.** logind's `PrepareForSleep` is the
+textbook way to prepare for suspend and taking it means a message bus and its
+dependency tree inside the TCB, while
+[D-020](20-decision-log.md#d-020--the-realm-boundary-is-a-namespace-boundary-intra-user-by-default-in-namespace-uidgid-and-a-residue-that-lives-outside-every-realm)
+and #160 exist to *remove* ambient bus access from realms. That decision stands
+and is not re-argued.
+
+What #223 did not know is that **libseat delivers nothing on suspend either**
+(above), so *"one code path and not two"* had no second path to unify. The only
+fact the core already samples that a suspend perturbs is the **clock pair** it
+takes once per round: `Instant` is `CLOCK_MONOTONIC` and does not advance across
+a suspend, while `SystemTime` does. A round in which wall time advanced by
+seconds and monotonic time did not is a suspend that just ended, detectable with
+no D-Bus client, no new syscall and no new clock. Routing that detection into the
+same reactivation path the blank's wake uses is what makes #223's *"one code
+path"* sentence true rather than vacuous.
+
+**The residual is stated rather than hidden, and it is the same one #223's own
+key-decisions block names:** this detects a resume **after** the fact, never
+before. A frame may still be submitted into a suspending device, and the first
+post-resume frame may be late.
+
+### Suspend, lid and power policy is logind's
+
+`HandleLidSwitch`, `HandlePowerKey` and `HandleSuspendKey` already exist and are
+configured per machine. Reimplementing them would be session policy inside the
+TCB, and it is why the switch device class stays dropped at intake and why
+WS-E.4.2 grew no switch event
+([D-032(5)](20-decision-log.md#d-032--relative-motion-and-pointer-gestures-grow-the-seat-vocabulary-pointer-constraints-grow-the-shim-session-instead-and-touch-and-tablet-are-deferred-against-named-evidence)).
+Verified on this machine 2026-08-10: the lid is `SW_LID` on `event0`, `vitrind`
+sees it and drops it, and `crate::input::intake_physical`'s doc comment says so
+in as many words — *"Switch events (a lid closing) and hold gestures have no wire
+event either."*
+
+The cost is that **behaviour now depends on files this repository does not own**,
+so *"suspend works"* is not reproducible from this checkout. The values are
+therefore published with the runbook,
+[read from the running logind rather than from a config file](../book/src/recovery.md#the-settings-this-depends-on-which-this-repository-does-not-own),
+with the note that `/etc/systemd/logind.conf` is empty here so every one of them
+is a systemd default that can move without any change to this repo.
+
+### The biggest technical consequence, which #223 does not mention
+
+**A DPMS blank stops every realm's frame clock, so it silently halts every agent
+in the session.** CRTC disabled → no vblank → `DrmState::on_vblank` never runs →
+`session::emit_presented` is never called → no `frame_done` is discharged →
+every `frame_done`-paced client stops painting, and an agent holding `observe` is
+served the pre-blank frame indefinitely with no staleness signal and no refusal.
+
+That chain is verified rather than reasoned about: `emit_presented` has exactly
+one bare-metal call site and it is inside `on_vblank`, pinned by a
+source-inspecting test (`crates/vitrin-core/src/backend/drm.rs`), because
+`redraw` returns `Scheduled` unconditionally.
+
+D-030(6) already published this exact effect for a **VT switch** and called it
+*"worse than a stall"*. What is new is that blanking makes it a **routine,
+timer-driven** occurrence on an agent-first display server, rather than something
+that happens when a human deliberately leaves. It is published in
+`docs/book/src/limits.md` in the same register D-030 used, and the named fix —
+*a software frame cadence for paused realms* — is D-030's existing unscheduled
+deferral, inherited here rather than re-filed.
+
+**The backlight alternative was examined and is not taken.** Writing
+`/sys/class/backlight` keeps the CRTC active, so vblanks continue, the frame
+clock never stops, and unblank is one sysfs write with no modeset risk. It is
+refused because it puts a second display-power interface inside the TCB, has no
+effect on external displays, and saves almost no power — and because D-030
+already names it as an interface DRM master does not gate. The trade is recorded
+so that a later reader does not have to rediscover it.
+
+### The recovery runbook
+
+#223's last task. It landed as a new book page —
+[`docs/book/src/recovery.md`](../book/src/recovery.md) — wired into the book's
+summary, rather than as another section of the bring-up page, because the two
+answer different questions: the bring-up page is *how do I start this safely*
+and the recovery page is *how do I get out*. It cross-references bring-up step 0
+rather than restating it.
+
+Three things about it are decisions rather than prose:
+
+- **The route order is by symptom, and route 2 is first among the ones that have
+  ever worked.** `Ctrl-Alt-F<n>` (D-031, second entry) is route 1 because it is
+  the cheapest; a shell on another VT or in the Hyprland session on tty1 plus
+  `pkill -TERM -f "vitrind --drm"` is route 2 and is **the only route that has
+  ever actually recovered a session** — it is what freed the first bare-metal
+  run. The page says so rather than ranking by elegance.
+- **The SysRq path is `sudo`-only and the kernel mask is not touched.** Settled
+  by the owner on 2026-08-10. `/proc/sys/kernel/sysrq` is `16` here — sync only —
+  so the physical `Alt+SysRq` sequence is inert by configuration, and **raising
+  it is not proposed in any form.** The bring-up page's §0.4 carried a standing
+  recommendation to do exactly that; it is **deleted**, not merely
+  un-repeated, and its R2 rungs 2–3 that depended on it are rewritten.
+- **The correct trigger-file sequence is not REISUB, and working that out was the
+  substance of the task.** Three findings, each verified against the kernel's own
+  documentation and source on 2026-08-10 and written up on the page:
+  1. The mask claim holds — *"the value of `/proc/sys/kernel/sysrq` influences
+     only the invocation via a keyboard. Invocation of any operation via
+     `/proc/sysrq-trigger` is always allowed"* — and the mechanism is
+     `write_sysrq_trigger` calling `__handle_sysrq(c, /* check_mask */ false)`.
+  2. A naive `echo reisub > /proc/sysrq-trigger` performs `r` and **silently
+     nothing else**: only the first character is processed unless the string is
+     prefixed with `_`.
+  3. **And the kernel's own bulk-mode example, `_reisub`, is a hard reboot with
+     two no-ops in front of it.** `s` and `u` call `emergency_sync()` and
+     `emergency_remount()`, both of which are `schedule_work(...)` and **return
+     immediately**, while `b` calls `emergency_restart()`, which does not return
+     at all — and bulk mode runs the whole string inside one `write()` with no
+     pause between letters. So the sync and the remount are queued and the
+     machine reboots before either can run. The kernel documentation says the
+     same thing about the sync in its own words (*"the sync hasn't taken place
+     until you see the "OK" and "Done" appear on the screen"*), and bulk mode is
+     exactly the form that denies you the chance to see them.
+
+     The page therefore prescribes **three separate writes with a wait between
+     them** — `s`, wait; `u`, wait; `b` — and drops `e` and `i` entirely, on the
+     ground that the trigger path needs a reachable shell by construction, so
+     `pkill` is the aimed version of what `e` does bluntly, and `e` on this
+     machine would destroy the Hyprland session that *is* the escape route.
+- **The caveat is stated plainly:** the trigger file needs a **reachable shell**.
+  It covers *"vitrind wedged the display"* once a VT or the tty1 shell is
+  reachable; it does **not** cover *"input is completely dead"*, which is the
+  only case the physical combo would have covered, and which the owner has
+  declined knowingly. No new mitigation is invented — the page documents the
+  routes that exist.
+
+One machine-specific finding worth carrying: `kernel.dmesg_restrict` is `1` and
+the console log level is `1` here [verified 2026-08-10], so the kernel's
+completion messages reach **neither** an unprivileged `dmesg` **nor** the
+console. `sudo dmesg -w` in a second shell is the observable, which is a third
+independent reason this route needs a shell rather than a keyboard.
+
+### What is built, what is not, and what cannot be known here
+
+Same device as
+[D-032's table](20-decision-log.md#what-is-built-what-is-not-and-what-cannot-be-known-here),
+for the same reason: a build status compressed into a status line is the sentence
+nobody re-reads, and this workstream has already had five sentences claim
+something was unbuilt while sitting in the change that built it.
+
+| Task | State |
+|---|---|
+| Activation transitions (VT switch) | **Already on `main` before #223**, WS-E.3.3/D-030 and D-031. Hardware-confirmed: two pause→activate cycles, second run. #223 adds nothing here. |
+| Resume | **Redefined, not routed.** No session event exists to route; post-hoc detection from the monotonic/wall clock pair is what replaces it. |
+| Blank/unblank | **New.** The state machine, the cover surface and the activity clock; DPMS itself is `DrmSurface::clear()`, which is DRM-only. **Unproven on hardware.** |
+| Consent and dead-man interaction | **New for the dark case** — a third `PromptVisibility` variant, discharging D-030's explicit *"a dark-output gate — to whichever change implements DPMS, as that change's own acceptance criterion"* deferral. The dead-man switch needs **nothing new**, and that is a finding rather than a shrug: it detects in the router's unconditional `observe` tap, which no gate can suppress, so a held Escape starts its hold on the very press that wakes the screen. |
+| `RuntimeHost` surface | **Answered by landed code, and by neither option #223 offered.** Reactivation is a host-state method delegating to free `session::*` functions with explicit disjoint parameters; `RuntimeHost::split()` was never touched. A `Presenter` method would need both halves of `split()` at once, which is the borrow `split()` exists to avoid. |
+| Media and brightness keys | **New rows in the invariant table**, and #223's list was incomplete — it named volume-**up** and mute but not volume-**down**. |
+| Recovery runbook | **New page**, `docs/book/src/recovery.md`, wired into `SUMMARY.md`; bring-up §0.4 deleted and R2 rewritten. |
+
+**What no amount of work in this branch can establish.** CI has no DRM device,
+no seat, no ACPI and no backlight, and `DrmState` cannot be constructed without a
+real `DrmDevice`, `LibSeatSession`, `GbmDevice` and `GlesRenderer` — so
+`DrmSurface::clear()` is unreachable from every test in this workspace, exactly
+as D-030 recorded for `handle_session_event`. **Not one hardware criterion of
+#223 is claimed as met by this change.** The 10 VT switches, 5 suspend/resume
+cycles, 5 lid cycles, the blank/unblank and the deliberate wedge are the owner's
+to produce on the target machine, they are written as rungs `L1`–`L6` on the
+recovery page with a record block to paste numbers into, and **#223 stays open
+until he pastes them in.** Note also that **suspend and lid have never been
+exercised on this backend by anyone, in any form** — the bring-up page's existing
+checklist runs 7–15 and contains no suspend, lid or blank rung at all, which is
+why those rungs had to be written before they could be executed.
+
+**The VKMS rung was not attempted by this change, and that is recorded rather
+than left to be noticed.** #223's acceptance criteria ask that it be "attempted
+and its result recorded either way … it never silently disappears", and a
+criterion that quietly produces no text is the failure it was written against.
+`modprobe vkms` loads a kernel module on the owner's machine and was out of
+bounds for the session that wrote this. VKMS is nevertheless the only place in CI
+where `DrmSurface::clear()` could plausibly execute at all: it proves nothing
+about suspend, seat handover or backlight — there is no ACPI and no panel behind
+a virtual connector — but it would prove that the power-down and the unblank
+modeset are accepted by a real DRM device rather than only by this workspace's
+reasoning. It is therefore a named, unclaimed rung, **reopened by** anyone
+running the existing `vkms-advisory` job against a `--blank-idle` session and
+pasting the result either way.
+
+### Deferred, each with the evidence that would reopen it
+
+#223's body uses *"refused"* in several places. That wording **predates the
+owner's correction on #222** — a capability this issue does not build is
+**deferred**, and each deferral names the evidence that would reopen it. The
+correction is followed here and not the issue.
+
+- **Idle inhibition** (`zwp_idle_inhibit_manager_v1`). Needs a new shim global
+  *and* a shim→core wire verb, i.e. paired IDL + prose work on `track:protocol`.
+  **Reopened by:** that paired edit. Until then, publish plainly — **full-screen
+  video will blank the screen.**
+- **A software frame cadence for blanked or paused realms.** Inherits D-030's
+  existing unscheduled deferral. **Reopened by:** the first agent-visible stall an
+  operator reports, or an owner decision that a blank halting agents is
+  unacceptable.
+- **Backlight actuation for the brightness keys.** The new rows convert *"key
+  dropped at intake"* into *"key delivered to an app that cannot act on it"* — no
+  confined app can write `/sys/class/backlight`, so the human still presses
+  brightness and nothing happens. **Reopened by:** a shell client holding a named
+  verb (Stage 2's design), or an explicit owner decision to let the core write
+  `/sys/class/backlight`.
+- **Preparing for suspend** (logind `PrepareForSleep`). Stands on the no-D-Bus-in-
+  the-TCB decision. **Reopened by:** evidence that post-hoc resume detection is
+  insufficient — specifically, a reproducible corrupted or lost frame across a
+  real suspend on the target machine.
+- **A configurable lock-on-blank / lock-on-switch policy.** D-030(2) already
+  filed it; Decision 1 forbids coupling idle-blank to idle-lock here.
+  **Reopened by:** the owner asking for it.
+- **`--blank-idle` on `--nested`.** Refused at startup with a named reason: a
+  nested `vitrind` painting its window black would be asserting something about a
+  screen the host owns. **Reopened by:** someone naming a host fact that means
+  *"the human cannot see this"*, which winit's `Occluded` is not — D-030's own
+  wording.
+
+### Handoff to WS-E.4.4 (#224)
+
+#223 publishes to `docs/plan/`, to `docs/book/src/limits.md` and to the new
+`docs/book/src/recovery.md`, and stops there. **`README.md` and
+`site/index.html` were not edited by this issue** — they are #224's, so that the
+project's public claims are enumerated in one place rather than drifting surface
+by surface. This is the same split [§4.2](#the-interim-and-what-it-costs) used
+for #221, and the exact text each surface must carry is dictated here rather than
+summarised, for the same reason.
+
+| Surface | The claim, as it must read |
+|---|---|
+| `README.md` | **Idle blanks the screen; it does not lock it.** With `--blank-idle` the panel goes dark after a period of no physical input and the session stays **unlocked** — anyone who touches a key gets the session, not a passphrase prompt. Locking is a separate, manual chord. **And a dark screen is not evidence that nothing is watching:** an agent holding an `observe` grant keeps capturing while the panel is off, exactly as it does across a lock. Idle inhibition is **not yet served**, so full-screen video will blank the screen; it reopens on a paired IDL and shim change. None of the session-lifecycle behaviour has been confirmed on hardware. |
+| `site/index.html` | **Idle blanks, it does not lock.** A dark screen is not a locked session and is not evidence that nothing is being observed — an agent with an observe grant keeps capturing. Full-screen video will blank the screen; idle inhibition is not yet served. Unconfirmed on hardware. |
+| `docs/book/src/limits.md` | Landed by this issue, in the blank/idle entries. Reproduced in this table only so #224 can check that three surfaces say the same thing. |
+
+Four constraints on that text, which are why it is dictated rather than left to
+be re-worded:
+
+1. **It must not say "refused"** for idle inhibition, or for anything else #223's
+   body calls refused. The owner corrected that register on #222: these are
+   **deferrals**, and each names the evidence that reopens it. A surface that
+   says *"refused"* has published a permanence nobody decided.
+2. **It must not soften "unlocked".** The point of Decision 1 is that the cost is
+   real; a surface that says *"the screen turns off after a while"* and omits
+   *"and the session stays unlocked"* has published the half a reader does not
+   need.
+3. **The observe-across-a-blank claim must cite the lock-screen one**, not stand
+   alone. They are one policy — the grant is the authority, not the human's gaze
+   — decided by the owner on 2026-08-08 for the lock
+   ([D-025](20-decision-log.md#d-025--a-locked-screen-does-not-suspend-agent-observation-the-gap-is-published-not-papered-over))
+   and inherited here. Two surfaces stating them as unrelated accidents would
+   misrepresent a deliberate posture as a pair of oversights.
+4. **No hardware claim may be made.** Every lifecycle behaviour here is
+   *unproven on hardware* until #223's L1–L6 numbers exist. #224 must not tidy
+   that qualifier away, and if the numbers have landed by then it must cite the
+   dated run rather than dropping the sentence.
+
+Also handed to #224, because #223 cannot close them: the two `docs/plan/` and one
+`crates/` prose surfaces that this change falsifies and that live outside the
+docs half — `crates/vitrin-core/src/session.rs`'s *"This core has no DPMS"*
+paragraph and its *"there is deliberately no third variant for a dark panel"*
+claim, which the `rust-core` half of #223 rewrites in the same change that makes
+them false. If #224 finds either still standing, that is a defect in #223's
+landing rather than a change of decision.
 
 ## 5. The target machine, and why no number here generalizes
 
@@ -1367,10 +1744,99 @@ this workstream owns, not inherits:
     neither device, which is a measurement of one laptop and not a property of
     the protocol. Published in that register, with the reopening evidence
     named, by WS-E.4.4/#224.
-  - **NOT A SEAT QUESTION: the lid switch**, handed to WS-E.4.3/#223. Wayland
-    clients do not receive switch events at all — the compositor consumes them,
-    and on this machine logind does — so a wire message for one would sit under
-    something no application could use.
+  - **NOT A SEAT QUESTION: the lid switch**, handed to WS-E.4.3/#223 and
+    **decided there** ([§4.4](#44-session-lifecycle-build-what-the-hardware-forces-delegate-the-rest),
+    [D-033](20-decision-log.md#d-033--idle-blanks-the-screen-and-does-not-lock-it-suspend-is-detected-after-the-fact-or-not-at-all-and-the-recovery-path-is-sudo-only)):
+    delegated to logind, no wire event, and the `logind.conf` values it depends
+    on published with the recovery runbook because this repository does not own
+    them. Wayland clients do not receive switch events at all — the compositor
+    consumes them, and on this machine logind does — so a wire message for one
+    would sit under something no application could use.
+
+- **Idle blanks the screen and does not lock it, so a dark panel is an
+  *unlocked* session** (created by WS-E.4.3/#223, and **the owner's decision of
+  2026-08-10** — [D-033](20-decision-log.md#d-033--idle-blanks-the-screen-and-does-not-lock-it-suspend-is-detected-after-the-fact-or-not-at-all-and-the-recovery-path-is-sudo-only)).
+  `--blank-idle` turns the panel off after a period with no physical input; the
+  session behind it stays unlocked, and any physical input restores it.
+  Locking remains the human's manual `Ctrl-Alt-Delete`, and the two are
+  deliberately **not coupled** — coupling them would have made a comfort feature
+  into a security control nobody chose. **Anyone who walks up and touches a key
+  gets the session, not a passphrase prompt**, which is worse than what this
+  machine does under Hyprland today. Published unsoftened in
+  `docs/book/src/limits.md`; the owner's trade, stated as one.
+
+- **A dark screen is not evidence that nothing is watching** (created by
+  WS-E.4.3, and **the same policy as the lock**, not a second accident). An
+  agent holding `observe` keeps capturing the realm while the panel is off,
+  frame for frame — exactly as
+  [D-025](20-decision-log.md#d-025--a-locked-screen-does-not-suspend-agent-observation-the-gap-is-published-not-papered-over)
+  decided for a lock on 2026-08-08, on the same ground: the grant is the
+  authority, not the human's gaze. It is published *citing* the lock entry
+  rather than beside it, so the two read as one posture. The instrument for
+  "stop everything" is unchanged and works in the dark for a structural reason:
+  the dead-man switch detects in the router's unconditional `observe` tap, which
+  no gate can suppress, so the very press that wakes the screen also starts the
+  hold. Published in `docs/book/src/limits.md`.
+
+- **A blank stops every realm's frame clock, so it halts every agent in the
+  session** (created by WS-E.4.3, and the sharpest thing in this section).
+  CRTC disabled → no vblank → `DrmState::on_vblank` never runs →
+  `session::emit_presented` is never called → no `frame_done` is discharged →
+  every paced client stops painting. So the sentence above is true and
+  incomplete: the agent does not *keep seeing*, it is served **the pre-blank
+  frame indefinitely, with no staleness signal and no refusal**.
+  [D-030(6)](20-decision-log.md#d-030--the-trusted-band-asserts-only-about-the-screen-this-core-is-driving-and-the-session-colour-is-never-re-minted-a-paused-seat-raises-no-prompt-it-could-record-as-shown)
+  already published this for a VT switch and called it *"worse than a stall"*;
+  blanking makes it **routine and timer-driven** on an agent-first display
+  server rather than something a human causes by leaving. The named fix — a
+  software frame cadence for paused realms — is D-030's existing unscheduled
+  deferral, inherited rather than re-filed. Published in
+  `docs/book/src/limits.md`.
+
+- **Idle inhibition is not yet served, so full-screen video blanks the screen**
+  (created by WS-E.4.3, deferred with named reopening evidence).
+  `zwp_idle_inhibit_manager_v1` needs a new shim global *and* a shim→core wire
+  verb — paired IDL and prose work on `track:protocol` — for a comfort feature.
+  **What reopens it:** that paired edit. Stated as a *not yet* and never as a
+  refusal, on the register the owner corrected on #222. Published in
+  `docs/book/src/limits.md`.
+
+- **The media and brightness keys now reach an app that cannot act on them**
+  (created by WS-E.4.3, and an honest half-fix rather than a fix). The XF86 rows
+  stop those keys being dropped at intake with a trace line — but a delivered
+  `XF86MonBrightnessUp` reaches the focused realm's shim seat, and no confined
+  app can write `/sys/class/backlight`. So the human still presses brightness and
+  nothing happens; what changed is *where* it stops. **Backlight actuation is
+  deferred**, reopened by a shell client holding a named verb or by an explicit
+  owner decision to let the core write `/sys/class/backlight` — which D-030
+  already names as a display-power interface DRM master does not gate.
+
+- **Behaviour now depends on files this repository does not own** (created by
+  WS-E.4.3, and unavoidable given the delegation above). Lid, power-key and
+  suspend-key policy is logind's, so *"suspend works"* is not reproducible from
+  this checkout. The mitigation is publication, not ownership: the values are
+  read from the running logind and printed in
+  [the recovery runbook](../book/src/recovery.md#the-settings-this-depends-on-which-this-repository-does-not-own),
+  with the note that `/etc/systemd/logind.conf` is empty on this machine so every
+  one of them is a systemd default that can move without any change here. A run
+  recorded under different values is a run of a different system.
+
+- **TCB growth for zero differentiator, exactly as #223 predicted** (created by
+  WS-E.4.3). An idle state machine, a cover surface, a fourth flip-gating term, a
+  third `PromptVisibility` variant, an activity clock lifted out of the lock, and
+  a wider invariant keysym table — all inside the trusted core, none of it
+  anything a user would choose this project for. [PRD](../PRD.md) §5.3's warning
+  about the support treadmill, paid in full and recorded as paid.
+
+- **Suspend and lid have never been exercised on this backend by anyone**
+  (created by WS-E.4.3, and open until the owner closes it). Not once, in any
+  form: the bring-up page's checklist runs 7–15 and contains no suspend, lid or
+  blank rung at all, so those rungs had to be *written* before they could be
+  executed. They are `L1`–`L6` on
+  [the recovery runbook](../book/src/recovery.md#the-hardware-checklist) with a
+  record block to paste numbers into, and **#223 stays open until they are
+  filled in.** Nothing in this workstream may cite a hardware criterion of #223
+  as met.
 - ~~**Several realms run, one is visible, and a capture cannot tell them
   apart**~~ (created by WS-E.1.2, **closed by WS-E.1.3**). Raising the cap
   landed before the scene bound an output to a realm, so for one workstream

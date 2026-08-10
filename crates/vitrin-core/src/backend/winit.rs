@@ -247,6 +247,17 @@ struct TextureKey {
     /// repaint — which for a static app is never. A generation rather than the
     /// snapshot itself, because the snapshot is what the generation counts.
     status_generation: u64,
+    /// [`super::blank::BlankSurface::generation`] at upload time (WS-E.4.3,
+    /// issue #223).
+    ///
+    /// In the key because the invariant this struct carries is that **every
+    /// input to [`super::compose_human_visible`] appears here**, and the blank
+    /// cover became one. It is a constant on this backend (`--blank-idle` is
+    /// refused with `--nested`), and that is precisely why it would have been
+    /// left out: `lock_generation` was missing for the whole of WS-E.2.2 for the
+    /// same reason -- an input that is inert *today* on the backend you are
+    /// looking at.
+    blank_generation: u64,
 }
 
 /// How many distinct fill levels the hold indicator has. Twenty steps across
@@ -272,6 +283,7 @@ impl TextureKey {
         scene: &Scene,
         consent: &ConsentSurface,
         lock: &crate::lock::LockSurface,
+        blank: &super::blank::BlankSurface,
         hold: Option<f64>,
         agent_cursor: Option<(f64, f64)>,
         attention: bool,
@@ -283,6 +295,7 @@ impl TextureKey {
             scene_generation: scene.generation(),
             consent_generation: consent.generation(),
             lock_generation: lock.generation(),
+            blank_generation: blank.generation(),
             hold_bucket: hold.map(|p| (p.clamp(0.0, 1.0) * HOLD_STEPS) as u8),
             agent_cursor: agent_cursor.and_then(|(x, y)| crate::cursor::hotspot(x, y)),
             attention,
@@ -357,6 +370,7 @@ pub(crate) fn window_pixels(
     scene: &Scene,
     consent: &mut ConsentSurface,
     lock: &mut crate::lock::LockSurface,
+    blank: &super::blank::BlankSurface,
     status: &mut crate::status::StatusStrip,
     notice: Option<&mut crate::notice::CoreNotice>,
     hold: Option<f64>,
@@ -366,7 +380,8 @@ pub(crate) fn window_pixels(
     size: Size<i32, Physical>,
 ) -> Vec<u8> {
     let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
-    let mut pixels = super::compose_human_visible(scene, consent, lock, status, w, h, attention);
+    let mut pixels =
+        super::compose_human_visible(scene, consent, lock, blank, status, w, h, attention);
     // **After the lock cover, and before both cursors** (WS-E.3.5). After the
     // cover because the cover is opaque and the VT escape works *while
     // locked* (D-031(2)), so a notice drawn under it would be invisible in the
@@ -512,11 +527,21 @@ pub(crate) fn overlay_needs_the_window(
     hold: Option<f64>,
     consent: &ConsentSurface,
     lock: &crate::lock::LockSurface,
+    blank: &super::blank::BlankSurface,
     notice: Option<&crate::notice::CoreNotice>,
 ) -> bool {
     hold.is_some()
         || consent.prompt().is_some()
         || lock.is_raised()
+        // A fifth cause, and the same *security* shape as the lock (WS-E.4.3,
+        // issue #223): the zero-copy branch presents the confined client's own
+        // texture with no core composite at all, so a session that raised the
+        // idle cover and then took that branch would put the app on screen,
+        // full-window, on the frame it is about to power the panel down on --
+        // and leave that frame in the scanout buffer for whatever the unblank
+        // reveals. Nested and headless hold a surface that is never raised, so
+        // this term is a constant `false` there.
+        || blank.is_covering()
         // A fourth cause, and the only one that is *conditional on the
         // backend* (WS-E.3.5): the notice surface exists to tell a human on
         // bare metal that their VT escape did not work, and nested passes
@@ -1385,6 +1410,19 @@ pub(crate) struct NestedView {
     /// so "the pixels are up" and "physical input is being consumed" are one
     /// state rather than two that can drift.
     lock: crate::lock::LockSurface,
+    /// The idle blank's cover (WS-E.4.3, issue #223), **permanently lowered on
+    /// this backend**.
+    ///
+    /// `--blank-idle` is refused with `--nested` at startup
+    /// ([`crate::backend::blank::BLANK_NEEDS_THE_OUTPUT`]), because a nested
+    /// `vitrind` painting its own window black would be asserting something
+    /// about a screen the host compositor owns -- the same reason
+    /// [`session::PromptVisibility`] refuses to read winit's `Occluded`. The
+    /// surface is still held and still composited through, on
+    /// [`Self::lock`]'s terms: a backend that simply had no cover would be a
+    /// backend the shared output stage has to have a branch for, and the branch
+    /// is where the next presentation path forgets.
+    blank: super::blank::BlankSurface,
     /// This session's trusted indicator (issue #85), the same value
     /// [`Self::consent`] frames its prompts and paints its band in.
     ///
@@ -1826,11 +1864,21 @@ fn run_inner(
     // attention and clipboard chords are: it is a key the core takes away from
     // every app in every realm, and it is the one whose consequence a human
     // most needs to have been told about before it happens to them.
+    // The session's activity clock. Minted here, handed to the lock's gate and
+    // to nothing else on this backend: `--blank-idle` is refused with
+    // `--nested` (`crate::backend::blank::BLANK_NEEDS_THE_OUTPUT`), so nothing
+    // here ticks the blank and `NestedView::blank` stays down for the whole
+    // session. The clock is still shared-shaped rather than owned, so the two
+    // backends construct the lock identically.
+    let activity = Rc::new(RefCell::new(super::blank::SessionActivity::new(
+        None,
+        Instant::now(),
+    )));
     let lock_screen = Rc::new(RefCell::new(crate::lock::LockScreen::new(
         lock.chord,
         lock.idle,
         verifier,
-        Instant::now(),
+        Rc::clone(&activity),
     )));
     {
         let screen = lock_screen.borrow();
@@ -1900,6 +1948,7 @@ fn run_inner(
             scenes: RealmScenes::new((backend_size.w.max(0) as u32, backend_size.h.max(0) as u32)),
             consent: ConsentSurface::new(indicator),
             lock: crate::lock::LockSurface::new(indicator),
+            blank: super::blank::BlankSurface::new(),
             indicator,
             texture: None,
             dmabuf_content: RealmGpuContent::new(),
@@ -2501,7 +2550,13 @@ impl NestedState {
         let hold = self.deadman.borrow().hold_progress(Instant::now());
         // `None` for the notice surface: nested has no VT to escape from, so
         // it can never fail to (WS-E.3.5).
-        let overlay_up = overlay_needs_the_window(hold, &self.view.consent, &self.view.lock, None);
+        let overlay_up = overlay_needs_the_window(
+            hold,
+            &self.view.consent,
+            &self.view.lock,
+            &self.view.blank,
+            None,
+        );
 
         // Zero-copy dmabuf presentation (P1.3.5, issue #117): **the bound
         // realm** has a retained GPU import and neither overlay needs the
@@ -2634,6 +2689,7 @@ impl NestedState {
             self.view.scenes.bound(),
             &self.view.consent,
             &self.view.lock,
+            &self.view.blank,
             hold,
             agent_cursor,
             self.view.attention,
@@ -2659,6 +2715,7 @@ impl NestedState {
                 self.view.scenes.bound(),
                 &mut self.view.consent,
                 &mut self.view.lock,
+                &self.view.blank,
                 &mut self.view.status,
                 // No notice surface here either, and for the same reason:
                 // only the backend that can switch a VT can fail to.
@@ -3142,8 +3199,19 @@ impl session::Presenter for NestedView {
         crate::input::OutputGates {
             // `None` for the notice: nested has no VT to escape from, which is
             // the same argument `try_redraw` already makes at its own call.
-            overlay_up: overlay_needs_the_window(hold, &self.consent, &self.lock, None),
+            overlay_up: overlay_needs_the_window(
+                hold,
+                &self.consent,
+                &self.lock,
+                &self.blank,
+                None,
+            ),
             active: true,
+            // `false` unconditionally: `--blank-idle` is refused on this
+            // backend, so `self.blank` is never raised and there is no panel
+            // here to power down in the first place -- the host compositor owns
+            // the display this window sits on.
+            dark: false,
         }
     }
 
@@ -3339,12 +3407,14 @@ mod tests {
         let idle_lock = no_lock();
 
         // The control FIRST: with nothing up, the zero-copy branch is allowed.
-        // Without this the three assertions below would pass against a function
+        // Without this the assertions below would pass against a function
         // that always answered `true`.
+        let unblanked = crate::backend::blank::BlankSurface::for_test();
         assert!(!overlay_needs_the_window(
             None,
             &idle_consent,
             &idle_lock,
+            &unblanked,
             None
         ));
 
@@ -3353,17 +3423,20 @@ mod tests {
             Some(0.5),
             &idle_consent,
             &idle_lock,
+            &unblanked,
             None
         ));
         // A consent card.
         let mut prompt = ConsentSurface::new(indicator);
         prompt.show_for_test(prompt_fixture());
-        assert!(overlay_needs_the_window(None, &prompt, &idle_lock, None));
+        assert!(overlay_needs_the_window(
+            None, &prompt, &idle_lock, &unblanked, None
+        ));
         // A lock screen.
         let mut locked = no_lock();
         locked.raise(crate::lock::tests::lock_fixture());
         assert!(
-            overlay_needs_the_window(None, &idle_consent, &locked, None),
+            overlay_needs_the_window(None, &idle_consent, &locked, &unblanked, None),
             "a raised lock MUST force the CPU path: the zero-copy branch presents the \
              client's own texture, so a locked session that took it would show the app \
              full-window with the lock nowhere on it"
@@ -3375,6 +3448,7 @@ mod tests {
             None,
             &idle_consent,
             &locked,
+            &unblanked,
             None
         ));
 
@@ -3389,6 +3463,7 @@ mod tests {
             None,
             &idle_consent,
             &locked,
+            &unblanked,
             Some(&notice)
         ));
         notice.raise(
@@ -3399,9 +3474,26 @@ mod tests {
             std::time::Instant::now(),
         );
         assert!(
-            overlay_needs_the_window(None, &idle_consent, &locked, Some(&notice)),
+            overlay_needs_the_window(None, &idle_consent, &locked, &unblanked, Some(&notice)),
             "a raised notice MUST force the CPU path, or the message telling the human their \
              session cannot leave this terminal is composited into a frame that is never drawn"
+        );
+
+        // **A raised idle cover**, the fifth cause and the second *security*
+        // one (WS-E.4.3, issue #223). The zero-copy branch presents the
+        // confined client's own texture with no core composite at all, so a
+        // session that raised the cover and then took it would put the app on
+        // screen full-window on the very frame it is about to power the panel
+        // down on -- and leave that frame in the scanout buffer for the next
+        // unblank to reveal. The control is `unblanked` above, used by every
+        // assertion in this test, so this measures the cover's state.
+        let mut covering = crate::backend::blank::BlankSurface::for_test();
+        covering.set_covering(true);
+        let idle_notice = crate::notice::CoreNotice::new();
+        assert!(
+            overlay_needs_the_window(None, &idle_consent, &locked, &covering, Some(&idle_notice)),
+            "a raised blank cover MUST force the CPU path, or the frame the panel goes dark on \
+             is made entirely of pixels the confined client owns"
         );
     }
 
@@ -3419,6 +3511,12 @@ mod tests {
 
     fn no_lock() -> crate::lock::LockSurface {
         crate::lock::LockSurface::new(crate::consent::TrustedIndicator::for_test())
+    }
+
+    /// A blank cover with nothing raised -- what every composite in this suite
+    /// runs with, since `--blank-idle` is refused on this backend outright.
+    fn no_blank() -> crate::backend::blank::BlankSurface {
+        crate::backend::blank::BlankSurface::for_test()
     }
 
     /// **A raised notice really reaches the human-visible upload, and it is
@@ -3451,6 +3549,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut raised_lock(),
+            &no_blank(),
             &mut no_status(),
             Some(&mut notice),
             None,
@@ -3471,6 +3570,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut raised_lock(),
+            &no_blank(),
             &mut no_status(),
             Some(&mut notice),
             None,
@@ -3587,6 +3687,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             None,
@@ -3629,6 +3730,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             None,
@@ -3649,6 +3751,7 @@ mod tests {
                 &scene,
                 &mut expected,
                 &mut no_lock(),
+                &no_blank(),
                 &mut no_status(),
                 W as u32,
                 H as u32,
@@ -3725,6 +3828,7 @@ mod tests {
                     &scene,
                     &mut consent,
                     &mut no_lock(),
+                    &no_blank(),
                     &mut no_status(),
                     None,
                     hold,
@@ -3743,6 +3847,7 @@ mod tests {
                 &scene,
                 &mut consent,
                 &mut no_lock(),
+                &no_blank(),
                 &mut no_status(),
                 None,
                 None,
@@ -3765,6 +3870,7 @@ mod tests {
                     &scene,
                     &mut idle,
                     &mut no_lock(),
+                    &no_blank(),
                     &mut no_status(),
                     None,
                     None,
@@ -3856,6 +3962,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             None,
@@ -3868,6 +3975,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             None,
@@ -3964,6 +4072,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             W as u32,
             H as u32,
@@ -3990,6 +4099,7 @@ mod tests {
             &scene,
             &mut idle,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             Some(0.5),
@@ -4010,6 +4120,7 @@ mod tests {
             &scene,
             &mut idle,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             None,
@@ -4094,6 +4205,7 @@ mod tests {
             scenes.bound(),
             &mut consent,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             None,
@@ -4108,6 +4220,7 @@ mod tests {
                 scenes.scene(&a).unwrap(),
                 &mut ConsentSurface::new(TrustedIndicator::for_test()),
                 &mut no_lock(),
+                &no_blank(),
                 &mut no_status(),
                 W as u32,
                 H as u32,
@@ -4121,6 +4234,7 @@ mod tests {
             scenes.bound(),
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             None,
             false,
@@ -4134,6 +4248,7 @@ mod tests {
             scenes.bound(),
             &mut consent,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             None,
@@ -4152,6 +4267,7 @@ mod tests {
             scenes.bound(),
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             None,
             false,
@@ -4293,6 +4409,7 @@ mod tests {
             &scene,
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             None,
             false,
@@ -4306,6 +4423,7 @@ mod tests {
                 &scene,
                 &consent,
                 &no_lock(),
+                &no_blank(),
                 None,
                 None,
                 false,
@@ -4322,6 +4440,7 @@ mod tests {
             &scene,
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             None,
             false,
@@ -4335,6 +4454,7 @@ mod tests {
             &scene,
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             None,
             false,
@@ -4351,6 +4471,7 @@ mod tests {
             &scene,
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             None,
             false,
@@ -4368,12 +4489,52 @@ mod tests {
                 &scene,
                 &consent,
                 &no_lock(),
+                &no_blank(),
                 None,
                 None,
                 false,
                 &no_status()
             ),
             "a different petition must re-upload"
+        );
+
+        // **The blank cover** (WS-E.4.3, issue #223), the newest input to the
+        // composition and therefore the newest way to be left out of this key.
+        // It is inert on this backend -- `--blank-idle` is refused with
+        // `--nested` -- which is exactly the property `lock_generation` had when
+        // it was missing for the whole of WS-E.2.2: an input nobody notices
+        // because the backend they are looking at never moves it.
+        let mut blank = crate::backend::blank::BlankSurface::for_test();
+        let unblanked = TextureKey::current(
+            size,
+            Some(&realm),
+            &scene,
+            &consent,
+            &no_lock(),
+            &blank,
+            None,
+            None,
+            false,
+            &no_status(),
+        );
+        blank.set_covering(true);
+        assert_ne!(
+            unblanked,
+            TextureKey::current(
+                size,
+                Some(&realm),
+                &scene,
+                &consent,
+                &no_lock(),
+                &blank,
+                None,
+                None,
+                false,
+                &no_status()
+            ),
+            "the idle cover going up must re-upload: a cache that short-circuited it would \
+             leave the confined app's own pixels in the window on the frame the panel is \
+             about to go dark on"
         );
 
         // And the two pre-existing inputs still matter.
@@ -4383,6 +4544,7 @@ mod tests {
             &scene,
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             None,
             false,
@@ -4397,6 +4559,7 @@ mod tests {
                 &scene,
                 &consent,
                 &no_lock(),
+                &no_blank(),
                 None,
                 None,
                 false,
@@ -4419,6 +4582,7 @@ mod tests {
             &scene,
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             None,
             false,
@@ -4430,6 +4594,7 @@ mod tests {
             &scene,
             &consent,
             &raised_lock(),
+            &no_blank(),
             None,
             None,
             false,
@@ -4448,6 +4613,7 @@ mod tests {
             &scene,
             &consent,
             &cycled,
+            &no_blank(),
             None,
             None,
             false,
@@ -4469,6 +4635,7 @@ mod tests {
             &scene,
             &consent,
             &cycled,
+            &no_blank(),
             None,
             None,
             false,
@@ -4485,6 +4652,7 @@ mod tests {
                 &scene,
                 &consent,
                 &no_lock(),
+                &no_blank(),
                 None,
                 None,
                 false,
@@ -4496,6 +4664,7 @@ mod tests {
                 &scene,
                 &consent,
                 &no_lock(),
+                &no_blank(),
                 None,
                 None,
                 false,
@@ -4514,6 +4683,7 @@ mod tests {
             &scene,
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             None,
             false,
@@ -4525,6 +4695,7 @@ mod tests {
             &scene,
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             Some((100.0, 100.0)),
             false,
@@ -4542,6 +4713,7 @@ mod tests {
                 &scene,
                 &consent,
                 &no_lock(),
+                &no_blank(),
                 None,
                 Some((140.0, 100.0)),
                 false,
@@ -4557,6 +4729,7 @@ mod tests {
                 &scene,
                 &consent,
                 &no_lock(),
+                &no_blank(),
                 None,
                 Some((100.4, 99.8)),
                 false,
@@ -4572,6 +4745,7 @@ mod tests {
                 &scene,
                 &consent,
                 &no_lock(),
+                &no_blank(),
                 None,
                 Some((f64::NAN, 0.0)),
                 false,
@@ -4598,6 +4772,7 @@ mod tests {
             &scene,
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             None,
             false,
@@ -4609,6 +4784,7 @@ mod tests {
             &scene,
             &consent,
             &no_lock(),
+            &no_blank(),
             None,
             None,
             true,
@@ -4652,6 +4828,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             None,
@@ -4666,6 +4843,7 @@ mod tests {
                 &scene,
                 &mut consent,
                 &mut no_lock(),
+                &no_blank(),
                 &mut no_status(),
                 W as u32,
                 H as u32,
@@ -4678,6 +4856,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             Some(0.5),
@@ -4701,6 +4880,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             None,
@@ -4713,6 +4893,7 @@ mod tests {
             &scene,
             &mut consent,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             None,
             Some(0.9),
@@ -4732,6 +4913,7 @@ mod tests {
                 &scene,
                 &consent,
                 &no_lock(),
+                &no_blank(),
                 Some(f64::from(step) / 10.0),
                 None,
                 false,
@@ -4751,6 +4933,7 @@ mod tests {
                 &scene,
                 &consent,
                 &no_lock(),
+                &no_blank(),
                 Some(1.0),
                 None,
                 false,
@@ -4762,6 +4945,7 @@ mod tests {
                 &scene,
                 &consent,
                 &no_lock(),
+                &no_blank(),
                 None,
                 None,
                 false,

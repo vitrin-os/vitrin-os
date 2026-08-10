@@ -464,6 +464,27 @@ pub(crate) struct DrmView {
     scenes: RealmScenes,
     consent: ConsentSurface,
     lock: crate::lock::LockSurface,
+    /// **The idle blank's cover** (WS-E.4.3, issue #223): the opaque fill that
+    /// goes on the human-visible output while the panel is being powered down,
+    /// and the only backend where it is ever raised.
+    ///
+    /// Beside `lock` rather than inside it because the two are deliberately
+    /// uncoupled: on idle the screen goes dark and the session stays *unlocked*
+    /// (Taha, 2026-08-10). They share the activity clock in
+    /// [`Self::activity`] and nothing else.
+    blank: super::blank::BlankSurface,
+    /// **The session's activity clock and blank state machine**, shared with the
+    /// lock's gate by an `Rc` clone -- `deadman`'s and `constraints`' precedent,
+    /// and for the identical reason: the presentation half has to *read* whether
+    /// the cover is up and whether the panel is dark, and here the composite is
+    /// driven by the panel's own clock through
+    /// [`session::Presenter::request_present`] and [`DrmState::on_vblank`],
+    /// where only the view is reachable.
+    ///
+    /// An `Rc` clone of the very cell `LockScreen` writes, never a second one. A
+    /// second clock would be a second answer to "when did the human last touch
+    /// this session", and the drift would be invisible.
+    activity: Rc<RefCell<super::blank::SessionActivity>>,
     indicator: TrustedIndicator,
     status: crate::status::StatusStrip,
     /// **The one surface that can tell a trapped human anything** (WS-E.3.5).
@@ -532,6 +553,14 @@ impl DrmView {
         crate::input::OutputGates {
             overlay_up,
             active: self.output.active,
+            // **The same field `should_queue_flip` and the composite read**
+            // (WS-E.4.3, issue #223), so this core keeps exactly one notion of
+            // "can the human see this" rather than two that can disagree --
+            // D-030(4)'s argument for `active`, applied to the blank. A pointer
+            // constraint must deactivate on a dark output on the same footing
+            // it does on a paused one, or an app's lock survives a blank the
+            // human can neither see nor free.
+            dark: self.activity.borrow().is_dark(),
         }
     }
 
@@ -551,6 +580,7 @@ impl DrmView {
             self.output.wanted,
             self.output.flip_pending,
             self.output.active,
+            self.activity.borrow().is_dark(),
         ) {
             return;
         }
@@ -558,6 +588,13 @@ impl DrmView {
             Ok(()) => {
                 self.output.wanted = false;
                 self.output.flip_pending = true;
+                // **The cover is on its way to the panel** (WS-E.4.3). Recorded
+                // here, at the one place the swapchain actually accepts a flip,
+                // rather than where the cover was raised: the display power
+                // state may only be set off once the human's last screenful has
+                // been overdrawn, and a frame the hardware refused overdrew
+                // nothing.
+                self.activity.borrow_mut().note_frame_queued();
             }
             Err(err) => {
                 // Logged and kept owed rather than returned: a hiccup on the
@@ -580,8 +617,13 @@ impl DrmView {
         // the nested backend samples it: a hold that completes mid-frame is
         // judged consistently within it.
         let hold = self.deadman.borrow().hold_progress(Instant::now());
-        let overlay_up =
-            overlay_needs_the_window(hold, &self.consent, &self.lock, Some(&self.notice));
+        let overlay_up = overlay_needs_the_window(
+            hold,
+            &self.consent,
+            &self.lock,
+            &self.blank,
+            Some(&self.notice),
+        );
         let agent_cursor = self.agent_cursor;
         // **THE SPRITE CHOKEPOINT.** `Some` on this backend unless a pointer
         // constraint is in force -- there is no host desktop drawing this, so a
@@ -666,6 +708,7 @@ impl DrmView {
             self.scenes.bound(),
             &mut self.consent,
             &mut self.lock,
+            &self.blank,
             &mut self.status,
             Some(&mut self.notice),
             hold,
@@ -883,6 +926,7 @@ impl Presenter for DrmView {
             hold,
             &self.consent,
             &self.lock,
+            &self.blank,
             Some(&self.notice),
         ))
     }
@@ -963,6 +1007,15 @@ pub(crate) struct DrmState {
     now: Rc<Cell<Instant>>,
     deadman: Rc<RefCell<DeadManSwitch>>,
     lock: Rc<RefCell<crate::lock::LockScreen>>,
+    /// **Post-hoc suspend detection** (WS-E.4.3), from the two clocks
+    /// `post_dispatch` already samples.
+    ///
+    /// There is no session event to route: libseat has no `PrepareForSleep`
+    /// handler and smithay's listener carries exactly `PauseSession` and
+    /// `ActivateSession`, so a system suspend delivers this core **nothing**.
+    /// See [`super::blank::ResumeWatch`] for the whole argument and for what
+    /// this cannot do.
+    resume: super::blank::ResumeWatch,
     /// The session's compiled keymap (WS-E.3.1, D-028), or `None` for a
     /// session started with no `--keymap`.
     ///
@@ -1103,10 +1156,30 @@ impl session::RuntimeHost for DrmState {
     /// panel, so a card raised now would be journalled `shown` to a human who
     /// could not see it.
     fn service_consent(&mut self, now: Instant) {
-        let visibility = if self.view.output.active {
-            session::PromptVisibility::Reachable
-        } else {
+        let visibility = if !self.view.output.active {
             session::PromptVisibility::ScreenNotOurs
+        } else if self.view.blank.is_covering() {
+            // WS-E.4.3, and D-030(4)'s own deferral discharged: it filed "a
+            // dark-output gate -- to whichever change implements DPMS, as that
+            // change's own acceptance criterion", and this is that change. A
+            // separate variant rather than reusing `ScreenNotOurs` because the
+            // facts differ and the journal must say which: a paused session's
+            // card can never reach a panel, while a dark session's reaches it
+            // the instant the human touches anything.
+            //
+            // **THE COVER, NOT THE POWER STATE, AND THE DIFFERENCE IS A REAL
+            // BUG THIS ONCE HAD.** `is_dark()` is `Phase::Dark` alone, but the
+            // opaque cover is already composited over everything during
+            // `Phase::Covering` -- so gating on power let a card be raised,
+            // journalled `shown`, and marked `prompt_shown` onto a panel the
+            // human was already seeing as black. The test rig gated on the
+            // cover and was therefore STRICTER than the code it stood in for,
+            // which is how the acceptance criterion passed while the shipped
+            // backend failed it. `the_seat_handler_...` now pins both to this
+            // same predicate by source inspection.
+            session::PromptVisibility::ScreenIsDark
+        } else {
+            session::PromptVisibility::Reachable
         };
         let grab = Rc::clone(&self.grab);
         let mut grab = grab.borrow_mut();
@@ -1118,6 +1191,76 @@ impl session::RuntimeHost for DrmState {
             visibility,
         ) {
             self.runtime.dirty = true;
+            self.view.request_present();
+        }
+    }
+
+    /// Drive the **idle blank and the resume detector** for this round
+    /// (WS-E.4.3, issue #223) — the one backend that owns a display controller
+    /// and therefore the only one that can override this.
+    ///
+    /// Two facts in one method because they are one question ("is the human's
+    /// screen showing this session right now") answered from the two clocks the
+    /// round already samples, and because both of their reactions are the same
+    /// call: [`session::screen_became_visible`].
+    ///
+    /// The `Rc`s are cloned first so the `RefMut`s borrow nothing of `self`,
+    /// leaving the runtime and the view as disjoint field borrows -- the shape
+    /// [`Self::service_consent`] and [`Self::service_lock`] already use.
+    fn service_screen(&mut self, wall: std::time::SystemTime, now: Instant) {
+        // **The resume first.** A suspend that just ended froze this session
+        // mid-round, and a consent card that was up spent its whole guard
+        // interval on a powered-down machine -- so the guard is restarted
+        // before anything else this round can act on it. The petition's own
+        // deadline is deliberately untouched: a suspend does not buy the human
+        // more time to decide, exactly as an unlock and a VT return do not.
+        if let Some(gap) = self.resume.sample(wall, now) {
+            warn!(
+                suspended_s = gap.as_secs(),
+                "this session was suspended and has just resumed. The core can only REACT to a \
+                 suspend, never prepare for one -- it speaks no D-Bus and libseat delivers no \
+                 event for it -- so a frame may have been submitted into a suspending device \
+                 and the first frame back may be late"
+            );
+            session::screen_became_visible(&self.grab, now);
+            self.runtime.dirty = true;
+            self.view.request_present();
+        }
+
+        // **The `RefMut` is scoped to the round and released before anything
+        // asks for a frame**, and the block is load-bearing rather than tidy.
+        // [`Self::service_lock`] holds its own guard across
+        // `request_present()` safely, because that guard is on a *different*
+        // cell — but this one is on the very cell `DrmView::service_present`
+        // reads to decide whether the panel is dark, so holding it across the
+        // call is an `already mutably borrowed` panic in the compositor.
+        //
+        // It is written down because nothing can catch it: `DrmState` needs a
+        // real `DrmDevice`, `LibSeatSession`, `GbmDevice` and `GlesRenderer`,
+        // so no test in this workspace reaches this method, and the panic
+        // happens on the owner's own display the first time the idle timer
+        // fires.
+        let (changed, owes_the_panel) = {
+            let activity = Rc::clone(&self.view.activity);
+            let mut activity = activity.borrow_mut();
+            let changed = session::service_blank_round(&mut activity, &mut self.view.blank, now);
+            // **A wake owes a frame every round until one actually lands.**
+            // Edge-triggering this on `changed` alone was a real defect: the
+            // CRTC is off while waking, so `on_vblank` -- the only other thing
+            // that would retry -- cannot fire, and a `queue_buffer` that failed
+            // on the transition would leave the panel dark with nothing left to
+            // ask again. That includes the `wake_expired` fail-open path, which
+            // stops swallowing input but would otherwise never ask for the
+            // frame that lights the screen. Level-triggered, so a failure is
+            // retried next round instead of stranding the human in the dark.
+            (changed, activity.phase() == super::blank::Phase::Waking)
+        };
+        if changed || owes_the_panel {
+            self.runtime.dirty = true;
+            // Owed even while dark: `should_queue_flip` answers "not now",
+            // never "not ever", so the frame that raises the cover is queued
+            // and the frame a wake asks for is queued the instant the panel is
+            // ours to draw on again.
             self.view.request_present();
         }
     }
@@ -1189,6 +1332,13 @@ impl DrmState {
         }
         self.view.output.flip_pending = false;
         session::emit_presented(&mut self.runtime);
+        // **The display power state, and it is set from here and nowhere
+        // else** (WS-E.4.3, issue #223): a flip has just landed, so if that
+        // flip was the idle cover's the human's last screenful is now
+        // overdrawn and the panel may be powered down. Cover first, power
+        // second -- reversing them means a failed `clear()` leaves the
+        // human's own screen frozen on a panel nobody is at.
+        self.service_screen_power();
 
         // Backstop for the dead-man elapse check, at the panel's cadence, and
         // the continuation of the hold indicator's animation: an armed hold
@@ -1201,6 +1351,88 @@ impl DrmState {
             self.view.output.wanted = true;
         }
         self.view.service_present();
+    }
+
+    /// Set or clear the panel's display power state, from the one place a flip
+    /// is known to have landed (WS-E.4.3, issue #223).
+    ///
+    /// # Why `DrmSurface::clear`, and not the connector's DPMS property
+    ///
+    /// smithay exposes exactly one display-power operation and this is it:
+    /// under atomic it resets every used plane, detaches the connectors,
+    /// disables the CRTC and commits with `ALLOW_MODESET`; under legacy it
+    /// writes the connector's `DPMS` property. The two alternatives -- writing
+    /// that property through the `drm` crate directly, or hand-rolling an
+    /// atomic commit that sets `ACTIVE=0` -- both **bypass smithay's cached
+    /// `AtomicDrmSurface::state`**, which is what the next commit diffs
+    /// against. After either, smithay believes the CRTC is active while the
+    /// kernel has disabled it, and the first unblank is computed from a false
+    /// baseline: the exact failure class D-030 already documents for stale CRTC
+    /// state after a VT switch. `clear()` is the only operation that updates
+    /// that cache, so it is the only one that leaves smithay and the kernel
+    /// agreeing. Under atomic KMS the two are the same kernel operation anyway
+    /// (the legacy DPMS property is implemented by
+    /// `drm_atomic_helper_connector_dpms`, which commits `crtc active=false`),
+    /// so nothing cheaper is being given up.
+    ///
+    /// # The two costs, stated
+    ///
+    /// Unblank is a **full modeset**, because the connectors were detached --
+    /// tens to low hundreds of milliseconds on an internal panel, not a cheap
+    /// re-enable. And `clear_state` answers `DeviceInactive` while the seat is
+    /// paused, which is why [`super::blank::SessionActivity::set_seat_absent`]
+    /// forces the phase back to lit rather than leaving a blank a paused
+    /// session could not undo.
+    ///
+    /// # A failure is not fatal, and degrades to black rather than to the
+    /// human's screen
+    ///
+    /// The cover has already landed by the time this runs, so a `clear()` the
+    /// display controller refuses leaves the human looking at an opaque black
+    /// frame with this session's trusted band still lit along its top -- which
+    /// is the honest degradation, and is exactly the signal that distinguishes
+    /// "vitrind blanked" from "a confined app painted itself black". The phase
+    /// still advances to dark, so the wake path is identical either way.
+    fn service_screen_power(&mut self) {
+        // **Both `RefCell` reads are bound to locals before anything acts on
+        // them**, and that is not style. `Ref`/`RefMut` are guards with drop
+        // glue, so a `self.view.activity.borrow()` left inside an `if`
+        // condition is one language rule away from still being live when the
+        // body takes a `borrow_mut()` -- which panics at runtime, on a path no
+        // test in this workspace can execute (`DrmState` needs a real
+        // `DrmDevice`, `LibSeatSession`, `GbmDevice` and `GlesRenderer`). A
+        // panic reachable only on the owner's own display, only after an idle
+        // timeout, is precisely the failure this file must not ship.
+        let owed = self.view.activity.borrow().dpms_owed();
+        if owed {
+            match self.view.output.surface.surface().clear() {
+                Ok(()) => info!(
+                    "the session went idle: the cover is on the panel and the display is \
+                     powered down. THE SESSION IS NOT LOCKED -- idle blanks, it does not lock \
+                     (Taha, 2026-08-10) -- and every agent's grants are still live, so a dark \
+                     screen is not evidence that nothing is being observed. It is also not \
+                     evidence that anything is being observed LIVE: a disabled CRTC produces no \
+                     vblank, so no realm's frame_done is discharged until the human comes back"
+                ),
+                Err(err) => warn!(
+                    %err,
+                    "the display controller refused to power the panel down; the human is left \
+                     looking at the opaque cover instead. The session still counts as blanked, \
+                     so the wake path is unchanged"
+                ),
+            }
+            self.view.activity.borrow_mut().went_dark();
+            return;
+        }
+        // The other half: this flip is the one that ended a wake, so the human
+        // can see this session again as of now. `screen_became_visible` is the
+        // same call the seat's activate arm and the lock's unlock arm make --
+        // one helper, one meaning, so "the human can see this card again" is
+        // asserted from one place rather than four.
+        let woke = self.view.activity.borrow_mut().note_flip_completed();
+        if woke {
+            session::screen_became_visible(&self.grab, Instant::now());
+        }
     }
 
     /// One turn of physical input from libinput.
@@ -1759,12 +1991,22 @@ impl DrmState {
 ///   drops the frame;
 /// * queueing while the session is paused (a VT switch) fails against devices
 ///   that are not ours;
+/// * queueing while the **panel is powered down** (WS-E.4.3, issue #223) is a
+///   commit against a disabled CRTC, and it would also re-enable the display
+///   `clear()` just turned off -- smithay's own docs say the surface "will be
+///   re-enabled on the next page_flip or commit", so a stray flip is the whole
+///   blank undone;
 /// * **clearing the debt in either case** loses the frame permanently — the
 ///   change is on nobody's screen and nothing will ask again. So this answers
 ///   "not now", never "not ever": `wanted` is cleared by the caller only after
 ///   a flip is actually queued.
-pub(crate) fn should_queue_flip(wanted: bool, flip_pending: bool, active: bool) -> bool {
-    wanted && !flip_pending && active
+pub(crate) fn should_queue_flip(
+    wanted: bool,
+    flip_pending: bool,
+    active: bool,
+    dark: bool,
+) -> bool {
+    wanted && !flip_pending && active && !dark
 }
 
 /// Fold a pointer delta into an absolute view position, clamped to the output.
@@ -1823,6 +2065,9 @@ pub fn run(
     screenshot: crate::chord::ModChord,
     lock: crate::lock::LockConfig,
     status: crate::status::StatusConfig,
+    // `--blank-idle`: how long without physical input before the panel is
+    // powered down, or `None` for a session that never blanks (WS-E.4.3).
+    blank_idle: Option<Duration>,
     keymap: Option<PathBuf>,
     seed: RuntimeSeed,
 ) -> (Recorder, Result<(), Box<dyn Error>>) {
@@ -1835,6 +2080,7 @@ pub fn run(
         screenshot,
         lock,
         status,
+        blank_idle,
         keymap.as_deref(),
         &mut seed,
         &mut recovered,
@@ -1857,6 +2103,7 @@ fn run_inner(
     screenshot: crate::chord::ModChord,
     lock: crate::lock::LockConfig,
     status: crate::status::StatusConfig,
+    blank_idle: Option<Duration>,
     keymap: Option<&Path>,
     seed: &mut Option<RuntimeSeed>,
     recovered: &mut Option<Recorder>,
@@ -2028,11 +2275,33 @@ fn run_inner(
          VIEW -- no trusted band, no consent prompt, no lock screen, no status strip, no \
          agent cursor. With no --screenshot-dir the chord is still consumed and writes nothing"
     );
+    // **The session's one activity clock and its blank state machine**
+    // (WS-E.4.3, issue #223). Minted here, before the lock, and handed to
+    // three places by `Rc` clone: the lock's gate (which is the only thing that
+    // ever writes it), this state (which ticks it) and the view (which
+    // composites and gates flips off it). Never two.
+    let activity = Rc::new(RefCell::new(super::blank::SessionActivity::new(
+        blank_idle,
+        Instant::now(),
+    )));
+    if let Some(after) = blank_idle {
+        info!(
+            idle_s = after.as_secs(),
+            wake_deadline_ms = super::blank::WAKE_DEADLINE.as_millis(),
+            "idle blank armed: after this long with no PHYSICAL input the panel is powered \
+             down, and any physical event brings it back. *** IT DOES NOT LOCK. *** The \
+             session stays unlocked behind the dark screen -- locking is --lock-idle and the \
+             lock chord, and the two are deliberately uncoupled. An agent's actuations neither \
+             postpone the blank nor wake the screen. While the panel is dark no vblank arrives, \
+             so no realm's frame_done is discharged and every frame_done-paced app stops \
+             painting until the human comes back"
+        );
+    }
     let lock_screen = Rc::new(RefCell::new(crate::lock::LockScreen::new(
         lock.chord,
         lock.idle,
         verifier,
-        Instant::now(),
+        Rc::clone(&activity),
     )));
     {
         let screen = lock_screen.borrow();
@@ -2138,6 +2407,8 @@ fn run_inner(
             scenes: RealmScenes::new(view_size),
             consent: ConsentSurface::new(indicator),
             lock: crate::lock::LockSurface::new(indicator),
+            blank: super::blank::BlankSurface::new(),
+            activity: Rc::clone(&activity),
             indicator,
             status: crate::status::StatusStrip::new(status),
             notice: crate::notice::CoreNotice::new(),
@@ -2164,6 +2435,7 @@ fn run_inner(
         now,
         deadman,
         lock: lock_screen,
+        resume: super::blank::ResumeWatch::new(),
         keymap,
         seat,
         device,
@@ -2789,6 +3061,22 @@ mod tests {
             "a paused output must deactivate a pointer constraint, so the sprite is back on \
              the first frame after a VT switch regardless of what the record says"
         );
+        // ...and the dark half (WS-E.4.3, issue #223), read off the SAME record
+        // the composite and `should_queue_flip` read. Two answers to "can the
+        // human see this" is the failure D-030(4) named for `active`, and a
+        // third field is a third chance at it.
+        assert!(
+            of.contains("dark:") && of.contains("is_dark()"),
+            "a dark output must deactivate a pointer constraint too: a lock that survived a \
+             blank is a pointer the human can neither SEE -- no sprite is on screen -- nor \
+             free, because the app that took it is not on screen either"
+        );
+        assert!(
+            body.contains("&self.blank"),
+            "the blank cover must be one of the overlays the constraint gates read: a cover \
+             going up is exactly a frame in which the human cannot answer a consent card, and \
+             `overlay_needs_the_window` is the one place that judgement is made"
+        );
     }
 
     /// **A locked pointer does not move this backend's own accumulated
@@ -2942,6 +3230,32 @@ mod tests {
              during a VT switch would be journalled `consent_transition{{shown}}` and told to \
              the petitioner as `shown`, for a card that reaches no panel"
         );
+        // ...and the same question for a panel this session powered down itself
+        // (WS-E.4.3, issue #223 -- D-030(4)'s deferred dark-output gate). Read
+        // off the SAME record the composite and `should_queue_flip` read.
+        assert!(
+            consent_body.contains("blank.is_covering()")
+                && consent_body.contains("PromptVisibility::ScreenIsDark"),
+            "the consent round stopped asking whether the panel is lit: a petition arriving \
+             during an idle blank would be journalled `shown` and told to the petitioner as \
+             `shown`, for a card on a display that is off -- and unlike a VT switch that is a \
+             TIMER-driven occurrence, so it happens unattended and routinely. The predicate is \
+             pinned to `blank.is_covering()` and NOT to `is_dark()`: the cover is composited \
+             from `Phase::Covering`, one phase before the CRTC goes down, and gating on the \
+             power state let a card be raised onto a panel the human already saw as black. \
+             The test rig used the stricter predicate, so this criterion once passed in the \
+             rig while the shipped backend failed it"
+        );
+        // The pause arm must still hand the seat's absence to the shared
+        // activity record, which is what forces a blank back to lit: a paused
+        // session cannot undo one, since `DrmSurface::clear` answers
+        // `DeviceInactive` while the devices are somebody else's.
+        assert!(
+            pause.contains("set_seat_absent(true"),
+            "the pause arm stopped telling the session's activity record that the seat is \
+             gone: the idle clock would keep running on a VT nobody is looking at, and a \
+             blank raised during the switch could never be lifted"
+        );
 
         for (forbidden, why) in [
             (
@@ -2973,6 +3287,167 @@ mod tests {
                 "`{forbidden}` in the seat handler: {why}"
             );
         }
+    }
+
+    /// **The display power state is set from exactly one place, and only after
+    /// the cover's own flip has landed** (WS-E.4.3, issue #223).
+    ///
+    /// `DrmState` cannot be constructed without a real `DrmDevice`,
+    /// `LibSeatSession`, `GbmDevice` and `GlesRenderer`, so no test in this
+    /// workspace can drive `clear()` at all — the same bound D-030 records for
+    /// three of its own gates. What is left is the **shape**, and each of the
+    /// four assertions below is a different way the blank goes wrong silently:
+    ///
+    /// * **A second `clear()` call site** is a second decision about whether
+    ///   the human's panel is on, and the N+1st is the one that powers it down
+    ///   with no cover composited first.
+    /// * **`clear()` outside `service_screen_power`** — in the idle tick, say —
+    ///   powers the panel down at the moment the *deadline* passes rather than
+    ///   at the moment the cover reaches the panel, so a `clear()` the display
+    ///   controller refuses leaves the human's last screenful frozen on a
+    ///   display nobody is at. Cover first, power second.
+    /// * **`service_screen_power` reached from anywhere but `on_vblank`** is
+    ///   the same defect with an extra step: only a completed flip is evidence
+    ///   that the cover is actually on the panel.
+    /// * **The gate is `dpms_owed`**, which is `Covering && cover_queued`
+    ///   rather than `Covering` alone, so a flip queued *before* the cover went
+    ///   up cannot be mistaken for the cover's.
+    ///
+    /// And the negative that is a decision rather than hygiene: this backend
+    /// must not reach for the connector's legacy `DPMS` property or hand-roll an
+    /// atomic `ACTIVE=0` commit. Both bypass smithay's cached
+    /// `AtomicDrmSurface::state`, which is what the next commit diffs against,
+    /// so the first unblank would be computed from a false baseline — the exact
+    /// stale-CRTC failure class D-030 already documents for a VT switch.
+    #[test]
+    fn the_display_power_state_has_exactly_one_chokepoint() {
+        assert_eq!(
+            source().matches(".clear()").count(),
+            1,
+            "`clear()` must have exactly ONE call site in this backend: a second is a second \\
+             decision about whether the human's display is powered, and the one that forgets \\
+             to composite a cover first leaves their last screenful on a dark panel"
+        );
+        let power = source()
+            .split("fn service_screen_power(&mut self)")
+            .nth(1)
+            .expect("this backend sets the display power state");
+        let body = power
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        assert!(
+            body.contains(".clear()"),
+            "the one `clear()` must be `service_screen_power`'s"
+        );
+        assert!(
+            body.contains("dpms_owed()"),
+            "the power-down must be gated on `dpms_owed`, which is `Covering && cover_queued` \\
+             -- gating on the phase alone would let a flip queued BEFORE the cover went up \\
+             count as the cover's, and the human's own screen would be what the panel goes \\
+             dark on"
+        );
+        assert!(
+            body.contains("went_dark()") && body.contains("note_flip_completed()"),
+            "the same handler owns both ends of the cycle: the flip that darkens and the flip \\
+             that ends a wake. Splitting them is how one of the two comes to be reached from a \\
+             path the other is not"
+        );
+        assert!(
+            body.contains("session::screen_became_visible("),
+            "the flip that ends a wake must restart the consent guard: a press armed on Allow \\
+             before the panel went dark, released after the human comes back with the pointer \\
+             unmoved, would otherwise commit a grant decided against a card that spent its \\
+             whole guard interval on a screen that was off"
+        );
+
+        // ...and it is reached from the vblank handler and nowhere else.
+        assert_eq!(
+            source().matches("self.service_screen_power()").count(),
+            1,
+            "one call site: a second would let something other than a completed flip decide \\
+             the panel is dark"
+        );
+        let vblank = source()
+            .split("fn on_vblank(&mut self)")
+            .nth(1)
+            .expect("the vblank handler exists");
+        assert!(
+            vblank
+                .split_once("\n    }\n")
+                .expect("the method body ends at its closing brace")
+                .0
+                .contains("self.service_screen_power()"),
+            "the one call must be the vblank handler's: a completed flip is the only evidence \\
+             this core has that the cover actually reached the panel"
+        );
+
+        // The two alternatives that bypass smithay's cached CRTC state.
+        for forbidden in ["set_connector_state(", "\"DPMS\"", "AtomicCommitFlags"] {
+            assert!(
+                !source().contains(forbidden),
+                "`{forbidden}` in the bare-metal backend: writing the connector's DPMS \\
+                 property directly, or hand-rolling an atomic commit, bypasses \\
+                 `AtomicDrmSurface`'s cached state -- so smithay believes the CRTC is active \\
+                 while the kernel has disabled it, and the first unblank is computed from a \\
+                 false baseline. `DrmSurface::clear` is the only operation that updates that \\
+                 cache"
+            );
+        }
+    }
+
+    /// **The blank's round is driven from the loop, and the resume detector
+    /// with it** (WS-E.4.3, issue #223).
+    ///
+    /// `service_screen` is a `RuntimeHost` method with a no-op default, which
+    /// is precisely the shape that fails silently: deleting this backend's
+    /// override compiles cleanly, leaves every unit test in `backend::blank`
+    /// green, and ships a `--blank-idle` that never fires and a resume nothing
+    /// notices.
+    ///
+    /// The resume half has to be pinned separately because it has **no session
+    /// event behind it**: libseat's logind backend has no `PrepareForSleep`
+    /// handler and smithay's listener carries exactly `PauseSession` and
+    /// `ActivateSession`, so a suspend delivers this core nothing at all. The
+    /// only evidence available is the clock pair, and if this call goes the
+    /// residual is not "a late frame" but "a consent card that spent its guard
+    /// on a powered-down machine and commits on the first click back".
+    #[test]
+    fn the_blank_and_the_resume_are_driven_from_the_dispatch_round() {
+        let screen = source()
+            .split("fn service_screen(&mut self, wall: std::time::SystemTime, now: Instant)")
+            .nth(1)
+            .expect("this backend overrides the screen's lifecycle round");
+        let body = screen
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        assert!(
+            body.contains("session::service_blank_round("),
+            "the idle blank stopped being ticked from the dispatch round: `--blank-idle` \\
+             would be a flag that parses, logs a banner and never fires"
+        );
+        assert!(
+            body.contains("self.resume.sample("),
+            "the resume detector stopped being sampled: a suspend delivers this core NO \\
+             session event at all -- libseat has no PrepareForSleep handler -- so the clock \\
+             pair is the only evidence there is that one happened"
+        );
+        assert!(
+            body.contains("session::screen_became_visible("),
+            "a resume must restart the consent guard: the machine was off for the whole guard \\
+             interval, and the press the human armed before it suspended must not commit \\
+             afterwards"
+        );
+        let resume_at = body.find("self.resume.sample(").expect("checked above");
+        let blank_at = body
+            .find("session::service_blank_round(")
+            .expect("checked above");
+        assert!(
+            resume_at < blank_at,
+            "the resume is handled BEFORE the blank's round: a card that spanned a suspend \\
+             must have its guard back before anything else this round can act on it"
+        );
     }
 
     /// **A scanout buffer and a window surface are opposite kinds of render
@@ -3190,18 +3665,31 @@ mod tests {
     #[test]
     fn a_frame_that_cannot_be_flipped_now_stays_owed() {
         // The ordinary case.
-        assert!(should_queue_flip(true, false, true));
+        assert!(should_queue_flip(true, false, true, false));
         // Nothing asked for a frame: an idle session queues nothing at all,
         // which is the whole reason `redraw` and `request_present` set the
         // flag rather than compositing unconditionally.
-        assert!(!should_queue_flip(false, false, true));
+        assert!(!should_queue_flip(false, false, true, false));
         // A flip is already in flight -- a second `drmModePageFlip` before the
         // first completes returns EBUSY -- and a paused session's devices are
         // not ours. In both cases the answer is "not now": the caller leaves
         // `wanted` set, and the vblank handler or the activation retries.
-        assert!(!should_queue_flip(true, true, true));
-        assert!(!should_queue_flip(true, false, false));
-        assert!(!should_queue_flip(true, true, false));
+        assert!(!should_queue_flip(true, true, true, false));
+        assert!(!should_queue_flip(true, false, false, false));
+        assert!(!should_queue_flip(true, true, false, false));
+        // **The panel is powered down** (WS-E.4.3, issue #223), and this term
+        // is load-bearing in two directions. A commit against a disabled CRTC
+        // is not a frame; and smithay's own docs say a cleared surface "will be
+        // re-enabled on the next page_flip or commit", so a stray flip while
+        // dark is the whole blank silently undone -- the panel lights back up
+        // with nobody in front of it and the state machine still believing it
+        // is off.
+        assert!(!should_queue_flip(true, false, true, true));
+        assert!(!should_queue_flip(false, false, true, true));
+        // ...and the frame stays OWED through all of it: this function answers
+        // "not now", never "not ever", so a status tick or an app's commit
+        // during a blank is presented on the wake rather than lost.
+        assert!(should_queue_flip(true, false, true, false));
     }
 
     /// **The one-output refusal, both directions.**

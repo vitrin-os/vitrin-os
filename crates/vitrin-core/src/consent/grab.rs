@@ -1540,6 +1540,90 @@ mod tests {
         assert!(!crate::session::resume_physical_seat(&idle, back));
     }
 
+    /// **A prompt that spanned an idle blank gets its guard back, and a press
+    /// armed before the panel went dark does not survive it** (WS-E.4.3, issue
+    /// #223).
+    ///
+    /// The sibling of the VT-switch test above, and the reason it is a separate
+    /// test rather than a parameter is that the *frequency* is the whole
+    /// difference: a VT switch is a gesture a human deliberately makes, while a
+    /// blank is a **timer**. This makes "a card spent its guard on a screen
+    /// nobody was looking at" a routine, unattended occurrence on an
+    /// agent-first display server whose whole premise is that work continues
+    /// while the human is away.
+    ///
+    /// It is worse than the lock cover `restart_guard` was originally written
+    /// for, in exactly the way a seat pause is: `LockGate` is outermost, so a
+    /// covered prompt is *unanswerable* while the lock is up — but a blank
+    /// leaves the grab untouched, and `commit` re-checks only the last
+    /// **physical** pointer position, which going dark does not reset. So the
+    /// human's held press survives the dark and its release afterwards would
+    /// grant.
+    ///
+    /// Driven through [`crate::session::screen_became_visible`] — the shared
+    /// helper the blank's wake, the seat's activate arm and the lock's unlock
+    /// arm all call — because what was missing was never the method, it was a
+    /// **third** call site.
+    #[test]
+    fn a_prompt_that_spanned_an_idle_blank_gets_a_fresh_guard_and_loses_its_armed_press() {
+        let (grab, _surface, _registry, petition, t0) = armed();
+        let target = center_of(&grab, Choice::Allow(PersistenceRung::WhileRunning));
+        let grab = std::cell::RefCell::new(grab);
+
+        // The human presses Allow and walks away with the button still down.
+        // The idle timer fires, the cover goes up, the panel is powered off.
+        let before_blank = awake(t0);
+        grab.borrow_mut()
+            .judge_parts(Origin::Physical, &motion(target.0, target.1), before_blank);
+        grab.borrow_mut()
+            .judge_parts(Origin::Physical, &press(BTN_LEFT), before_blank);
+
+        // Thirty seconds dark -- sixty times the guard, and still inside the
+        // petition's own consent deadline, so this test is about visibility
+        // rather than about expiry.
+        let woke = before_blank + Duration::from_secs(30);
+        assert!(
+            crate::session::screen_became_visible(&grab, woke),
+            "there is a prompt up, so the wake must actually restart its guard"
+        );
+
+        // 1. The armed press did not survive the blank: its release decides
+        //    nothing, even though the pointer never moved.
+        grab.borrow_mut()
+            .judge_parts(Origin::Physical, &release(BTN_LEFT), woke);
+        assert!(
+            grab.borrow_mut().take_decision().is_none(),
+            "a press armed before the panel went dark committed after it: the human let go on \
+             a card they had not been able to see since the screen powered down"
+        );
+
+        // 2. ...and a fresh click still has to wait out the guard, measured
+        //    from the moment the panel came back.
+        click(&mut grab.borrow_mut(), target, woke);
+        assert!(
+            grab.borrow_mut().take_decision().is_none(),
+            "the first press after the screen wakes must decide nothing: the human has only \
+             just been shown this card again"
+        );
+
+        // 3. The guard delays; it never disables.
+        let readable = woke + GUARD_INTERVAL + Duration::from_millis(1);
+        click(&mut grab.borrow_mut(), target, readable);
+        assert_eq!(
+            grab.borrow_mut().take_decision(),
+            Some(Decision {
+                petition,
+                choice: Choice::Allow(PersistenceRung::WhileRunning)
+            }),
+            "the restarted guard must still expire, or a blank would wedge the prompt"
+        );
+
+        // With no prompt up a wake has nothing to restart, and the embedder is
+        // told so rather than silently no-opping.
+        let idle = std::cell::RefCell::new(ConsentGrab::new());
+        assert!(!crate::session::screen_became_visible(&idle, woke));
+    }
+
     #[test]
     fn the_guard_interval_is_measured_from_the_press_not_the_release() {
         // A press inside the guard arms nothing, so its release -- however

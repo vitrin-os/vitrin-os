@@ -1357,6 +1357,21 @@ pub(crate) struct HeadlessOutput {
     /// human-visible output and never a capture" a home on the one backend CI
     /// can run (D-019(4)).
     lock: crate::lock::LockSurface,
+    /// The idle blank's cover (WS-E.4.3, issue #223), **permanently lowered on
+    /// this backend**.
+    ///
+    /// `--blank-idle` is refused with `--headless`
+    /// ([`super::blank::BLANK_NEEDS_THE_OUTPUT`]) for a reason this backend
+    /// makes obvious: there is no display to power down, and -- decisively --
+    /// no lock gate in this backend's hook stack, so nothing would ever write
+    /// the activity clock a blank is postponed and woken by. A headless session
+    /// that accepted the flag would go dark after the timeout and never come
+    /// back.
+    ///
+    /// The surface is still held and still composited through, on
+    /// [`Self::lock`]'s terms: the shared output stage takes the cover as a
+    /// required parameter precisely so a backend cannot answer "I have none".
+    blank: super::blank::BlankSurface,
     /// The composed **realm view**, retained across the process lifetime
     /// (PRD Doc 2 §9) so an internal capture reads composited pixels, not a
     /// freshly cleared buffer. Overlay-free by construction — this is what
@@ -1433,6 +1448,7 @@ impl HeadlessView {
                 renderer,
                 consent: ConsentSurface::new(indicator),
                 lock: crate::lock::LockSurface::new(indicator),
+                blank: super::blank::BlankSurface::new(),
                 view_framebuffer,
                 output_framebuffer,
                 size,
@@ -1675,6 +1691,7 @@ impl HeadlessOutput {
             view,
             &mut self.consent,
             &mut self.lock,
+            &self.blank,
             &mut self.status,
             w,
             h,
@@ -2406,6 +2423,7 @@ mod tests {
             state.bound_scene(),
             &mut consent,
             &mut no_lock(),
+            &super::super::blank::BlankSurface::for_test(),
             &mut no_status(),
             VW,
             VH,
@@ -3626,6 +3644,7 @@ mod tests {
                     state.bound_scene(),
                     &mut expected,
                     &mut no_lock(),
+                    &super::super::blank::BlankSurface::for_test(),
                     &mut no_status(),
                     VW,
                     VH,
@@ -3713,6 +3732,7 @@ mod tests {
                 &crate::scene::Scene::new(),
                 &mut expected,
                 &mut no_lock(),
+                &super::super::blank::BlankSurface::for_test(),
                 &mut no_status(),
                 VW,
                 VH,

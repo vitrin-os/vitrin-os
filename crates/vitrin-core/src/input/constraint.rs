@@ -226,6 +226,21 @@ pub(crate) struct OutputGates {
     /// switch, a suspend), which is independently a record removal — see
     /// `session::suspend_physical_seat`.
     pub active: bool,
+    /// The session powered its own panel down after `--blank-idle` seconds idle
+    /// (WS-E.4.3, issue #223, `crate::backend::blank`).
+    ///
+    /// **A third field rather than a fold into `active`**, because the two are
+    /// different facts with different consequences and only one of them is this
+    /// core's own doing: a paused output is somebody else's VT, a dark output is
+    /// this session's own decision that it can undo the instant the human
+    /// touches anything.
+    ///
+    /// It deactivates a pointer constraint on exactly the same footing `!active`
+    /// does, and for a sharper reason: a locked pointer that survived a blank is
+    /// a constraint the human can neither *see* nor free — the sprite is not on
+    /// screen to show them where it is stuck, and the app that took the lock is
+    /// not on screen either.
+    pub dark: bool,
 }
 
 impl Default for OutputGates {
@@ -233,6 +248,7 @@ impl Default for OutputGates {
         Self {
             overlay_up: false,
             active: true,
+            dark: false,
         }
     }
 }
@@ -253,6 +269,14 @@ impl PresentationGates<'_> {
         // removal, deliberately: the devices are closed for the whole pause,
         // so nothing could ever end the constraint from the input side.
         if !self.output.active {
+            return inactive;
+        }
+        // Path 9b (WS-E.4.3, issue #223): the panel is powered down. Not a
+        // record removal -- unlike a seat pause, this ends the moment the human
+        // touches anything, and the wake is a physical event the input side can
+        // and does see -- but a constraint that stayed active across it would be
+        // a pointer the human can neither see nor free.
+        if self.output.dark {
             return inactive;
         }
         // Paths 6, 7, 12, 13: a consent prompt, the lock screen, the core
@@ -752,6 +776,7 @@ mod tests {
                 OutputGates {
                     overlay_up: true,
                     active: true,
+                    dark: false,
                 },
             ),
             (
@@ -760,6 +785,7 @@ mod tests {
                 OutputGates {
                     overlay_up: true,
                     active: true,
+                    dark: false,
                 },
             ),
             (
@@ -767,6 +793,7 @@ mod tests {
                 OutputGates {
                     overlay_up: true,
                     active: true,
+                    dark: false,
                 },
             ),
             (
@@ -775,6 +802,7 @@ mod tests {
                 OutputGates {
                     overlay_up: true,
                     active: true,
+                    dark: false,
                 },
             ),
             (
@@ -782,6 +810,17 @@ mod tests {
                 OutputGates {
                     overlay_up: false,
                     active: false,
+                    dark: false,
+                },
+            ),
+            (
+                "path 9b (WS-E.4.3): the panel is powered down after --blank-idle \
+                 -- a constraint that survived a blank is a pointer the human can \
+                 neither see nor free",
+                OutputGates {
+                    overlay_up: false,
+                    active: true,
+                    dark: true,
                 },
             ),
         ] {
@@ -1036,7 +1075,11 @@ mod tests {
                             let _ = table.ask(&r, lock_ask(1));
                             let gates = PresentationGates {
                                 focused,
-                                output: OutputGates { overlay_up, active },
+                                output: OutputGates {
+                                    overlay_up,
+                                    active,
+                                    dark: false,
+                                },
                                 surface,
                                 view: (200, 200),
                                 pointer,

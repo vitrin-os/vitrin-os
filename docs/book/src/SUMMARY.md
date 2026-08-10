@@ -19,5 +19,6 @@
 
 ---
 
+[Getting out of a wedged session](recovery.md)
 [Which applications have actually been run](session-app-matrix.md)
 [Where this is honest about its limits](limits.md)

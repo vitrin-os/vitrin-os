@@ -523,6 +523,7 @@ mod tests {
             view.to_vec(),
             &mut surface,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             W,
             H,
@@ -550,6 +551,7 @@ mod tests {
             view.clone(),
             &mut closed_surface,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             W,
             H,
@@ -560,6 +562,7 @@ mod tests {
             view.clone(),
             &mut open_surface,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             W,
             H,
@@ -637,6 +640,10 @@ mod tests {
         crate::lock::LockSurface::new(TrustedIndicator::for_test())
     }
 
+    fn no_blank() -> crate::backend::blank::BlankSurface {
+        crate::backend::blank::BlankSurface::for_test()
+    }
+
     fn flat(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
         [rgb[0], rgb[1], rgb[2], 0xff].repeat(width as usize * height as usize)
     }
@@ -651,6 +658,7 @@ mod tests {
             flat(CARD_W, CARD_H, [0x00, 0x00, 0x00]),
             &mut surface,
             &mut no_lock(),
+            &no_blank(),
             &mut no_status(),
             CARD_W,
             CARD_H,
@@ -682,6 +690,7 @@ mod tests {
                 view.clone(),
                 &mut surface,
                 &mut no_lock(),
+                &no_blank(),
                 &mut no_status(),
                 CARD_W,
                 CARD_H,
@@ -695,6 +704,114 @@ mod tests {
             realm: Some(crate::realm::WELL_KNOWN_REALM_ID),
             ..report
         }
+    }
+
+    /// **The blank cover rides the SAME output stage the band witness measures,
+    /// and the band survives it** (WS-E.4.3, issue #223).
+    ///
+    /// This is the acceptance criterion #223 states in as many words, and it is
+    /// written to fail if a blank is ever routed around
+    /// [`crate::backend::human_visible_from_view`]: every byte asserted below
+    /// comes out of that one call, so a cover applied in a backend's own
+    /// composite instead — the "third presentation path" this module's
+    /// neighbours were written about — leaves this test looking at an
+    /// uncovered frame.
+    ///
+    /// Three things are checked, and each is a different failure:
+    ///
+    /// * **Not one pixel of the realm view survives.** The witness's
+    ///   `tracks_view` reads `true` on the lit frame (the control, without which
+    ///   the second reading proves nothing) and `false` on the covered one, and
+    ///   the raw comparison below says why: the rows below the band are the
+    ///   cover's colour and not the client's.
+    /// * **The band is untouched**, byte for byte, across the transition —
+    ///   `band_changes == 0`, which is the property, and the cover is the first
+    ///   opaque full-view fill ever composited *under* it. A cover drawn after
+    ///   `composite_trust_band` would black the band out and turn this red.
+    /// * **The band still carries this session's own colour.** Not merely
+    ///   "unchanged": a frame that is black everywhere including the band would
+    ///   satisfy `band_changes == 0` on its own if the previous frame were black
+    ///   too, and it is the *lit* band on a blanked frame that distinguishes
+    ///   "vitrind blanked" from "a confined app painted itself black".
+    #[test]
+    fn the_blank_cover_rides_the_output_stage_and_leaves_the_band_lit() {
+        let indicator = TrustedIndicator::from_rgb(0x40, 0x41, 0x42);
+        let view = client_view([0x11, 0x22, 0x33]);
+        let mut surface = ConsentSurface::new(indicator);
+        let mut blank = no_blank();
+        let mut witness = BandWitness::new();
+
+        // The control: lit. Without it "no realm pixel survives" is a claim
+        // about a witness that might never have seen one.
+        let lit = crate::backend::human_visible_from_view(
+            view.clone(),
+            &mut surface,
+            &mut no_lock(),
+            &blank,
+            &mut no_status(),
+            W,
+            H,
+            false,
+        );
+        witness.observe(&view, &lit, W, H, 0, Some(&bound()));
+        assert!(
+            witness.report().tracks_view,
+            "the lit frame must track the realm view, or the covered reading below is \
+             measuring nothing"
+        );
+
+        // ...and now the cover.
+        blank.set_covering(true);
+        let covered = crate::backend::human_visible_from_view(
+            view.clone(),
+            &mut surface,
+            &mut no_lock(),
+            &blank,
+            &mut no_status(),
+            W,
+            H,
+            false,
+        );
+        witness.observe(&view, &covered, W, H, 0, Some(&bound()));
+        let report = witness.report();
+
+        assert!(
+            !report.tracks_view,
+            "a covered frame must NOT track the realm view: the whole point of the cover is \
+             that the human's last screenful is not what is sitting in the scanout buffer \
+             when the panel goes dark"
+        );
+        assert_eq!(
+            report.band_changes, 0,
+            "the trusted band must be byte-identical across a blank. The cover is the first \
+             opaque full-view fill ever composited UNDER it, and a cover drawn after \
+             `composite_trust_band` instead would black out the one strip the human reads \
+             this session's colour from"
+        );
+        assert!(report.band_uniform, "and it must still be one flat colour");
+
+        let band_bytes = (W as usize) * (crate::consent::TRUST_BAND_HEIGHT.min(H) as usize) * 4;
+        assert!(
+            covered[..band_bytes]
+                .chunks_exact(4)
+                .all(|px| px == indicator.color()),
+            "the band on a blanked frame must still carry THIS SESSION'S colour -- that is \
+             what tells a human looking at a black screen that vitrind blanked it rather than \
+             a confined app painting itself black"
+        );
+        assert!(
+            covered[band_bytes..]
+                .chunks_exact(4)
+                .all(|px| px == [0x00, 0x00, 0x00, 0xff]),
+            "and every row below the band must be the cover, with no client pixel left: \
+             {:?}",
+            &covered[band_bytes..band_bytes + 16]
+        );
+        assert_ne!(
+            &covered[band_bytes..band_bytes + 4],
+            &view[band_bytes..band_bytes + 4],
+            "...which the control makes meaningful: the client's own colour really was there"
+        );
     }
 
     /// **The leak argument, mechanically.** Two sessions identical in every way
@@ -952,6 +1069,7 @@ mod tests {
                 view.clone(),
                 &mut surface,
                 &mut no_lock(),
+                &no_blank(),
                 &mut strip,
                 SW,
                 SH,
@@ -1016,6 +1134,7 @@ mod tests {
                     view.clone(),
                     &mut surface,
                     &mut no_lock(),
+                    &no_blank(),
                     &mut strip,
                     320,
                     120,

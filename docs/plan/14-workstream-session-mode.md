@@ -185,7 +185,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 | **1 — multi-app, nested** | ~~Runtime app launch~~ (**landed**, WS-E.1.1/#207: `autostart = false` templates, a served `realm_launch` verb, core-minted `<template>.<n>` instance ids, `capacity` at `MAX_REALMS`, and `realm_spawned` naming who asked) · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · ~~a core-owned attention key~~ (**landed**, WS-E.1.7/#232: a tapped, consumed Super lifts `preempted` for one layout use and delivers `vitrin_principal.attention`, so an in-realm shell can switch realms at all) · a shell client (switcher + launcher) | 7–9 w |
 | **2 — livable** | ~~Cross-realm clipboard~~ (**landed**, WS-E.2.1/#213: a core-held single slot the core *pulls* into on Ctrl-Shift-Insert and offers on Shift-Insert, `text/plain;charset=utf-8` at 60 KiB, plus the modifier-aware chord matcher 2.2 and 2.4 consume — §4.1, [D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing)) · ~~core-drawn lock screen on the consent stack~~ (**landed**, WS-E.2.2/#214) · ~~status in the trusted band~~ (**landed**, WS-E.2.3/#215) · ~~human screenshot~~ (**landed**, WS-E.2.4/#216: `ctrl+print` writes one PNG of the REALM VIEW into one audited `--screenshot-dir`, touching no grant — §6) | 4–6 w |
 | **3 — bare metal** | ~~The keymap decision~~ (**landed**, WS-E.3.1/#217: xkbcommon in the core behind the off-by-default `session-keymap` feature, fed a pre-compiled keymap **file** and never a layout name, keysyms normalised to one Unicode convention, and key pairing moved to the scancode — §4, [D-028](20-decision-log.md#d-028--a-bare-metal-session-interprets-the-keyboard-inside-the-core-from-a-pre-compiled-keymap-file-and-key-pairing-moves-to-the-scancode)) · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
-| **4 — long tail** | X11 (defers to E3.2 — **scoped, not built**, WS-E.4.1/#221: six requirements handed to E3.2, the X11-only software measured on this machine, and the interim, all in §4.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |
+| **4 — long tail** | X11 (defers to E3.2 — **scoped, not built**, WS-E.4.1/#221: six requirements handed to E3.2, the X11-only software measured on this machine, and the interim, all in §4.2) · ~~seat vocabulary~~ (**landed in the tree, unproven on hardware**, WS-E.4.2/#222: `relative_motion` and four gesture events on `vitrin_shim_seat`, a `pointer_constraint` ask-and-verdict pair on `vitrin_shim_session`, three new shim globals, touch and tablet deferred against named reopening evidence, the lid handed to WS-E.4.3 — §4.3, [D-032](20-decision-log.md#d-032--relative-motion-and-pointer-gestures-grow-the-seat-vocabulary-pointer-constraints-grow-the-shim-session-instead-and-touch-and-tablet-are-deferred-against-named-evidence)) · session lifecycle · the honesty sweep | open |
 
 **Stage 1 is the one that is genuinely dual-use.** Layout verbs are allocated
 and unserved, and multi-realm is Phase-3 fleet work; both get built here
@@ -596,9 +596,19 @@ prior art, for a reason that has nothing to do with running a game here.
 
 **E3.2's exit criteria say nothing about games, and nothing in this list asks
 them to.** A game additionally needs relative pointer motion, pointer
-constraints, gamepads and GPU features far past anything E3.2 names — and v0's
-seat vocabulary is pointer + keyboard only, with **no relative motion at all**
-(§6). Recording Steam here is a statement about what one laptop has installed.
+constraints, gamepads and GPU features far past anything E3.2 names. **The
+first two are now on the wire and the third is not** (WS-E.4.2): version 2
+carries `relative_motion` and a `pointer_constraint` ask-and-verdict pair, so
+the two protocol pieces a game most obviously needs exist, while **gamepads
+remain absent and nothing in WS-E.4.2 changes that** — no evdev gamepad node
+exists on this machine, and no wire event carries one. (This paragraph read
+*"no relative motion at all"* and then *"none of the first three is on the
+wire today"*; the first was already false of the **core**, which has consumed
+relative motion since #218, and the second stopped being true in the change
+that landed WS-E.4.2. Both are corrected here rather than left standing.)
+None of that makes a game runnable: the wire pieces are a necessary condition
+and X11, GPU features and a gamepad path are all still missing.
+Recording Steam here is a statement about what one laptop has installed.
 It is not a statement that this project intends to run games, and it must not be
 read or republished as a roadmap item.
 
@@ -651,6 +661,607 @@ Steam client's windowing path came out *unknown*, not X11-only. **And it must
 not call the second session a mitigation**; every surface says *workaround*, and
 says whose. A surface that says "no X11 yet" and stops has published half of
 this, and the half it dropped is the one a reader needs.
+
+## 4.3 The five input classes the seat vocabulary drops: a verdict each
+
+Stage 4's second deliverable (WS-E.4.2, issue #222), written out here for
+§4.1's reason: the issue closes and this does not. Landed as
+**[D-032](20-decision-log.md#d-032--relative-motion-and-pointer-gestures-grow-the-seat-vocabulary-pointer-constraints-grow-the-shim-session-instead-and-touch-and-tablet-are-deferred-against-named-evidence)**.
+
+`crates/vitrin-core::input::intake_physical`'s doc comment named five classes
+it dropped at intake — *"touch, gestures, tablet, switches, relative motion"* —
+and its `_ => Vec::new()` arm is what dropped them. **That sentence no longer
+exists**: this section's change rewrote it, and the comment now names only two
+classes as still dropped, each as a *not yet*. It is quoted in the past tense
+because it is what these verdicts were taken against, not what the tree says.
+
+Two of the five — **gestures** and **relative motion** — are **served** here,
+and with them a sixth thing that comment does not name because it is not a
+device class at all: **pointer constraints**. Two — **touch** and **tablet** —
+are **deferred**, and a deferral here is not a polite spelling of a rejection:
+each one names the evidence that would reopen it, because a permanent wire
+protocol may not foreclose a device class on the ground that one laptop does
+not have one. The fifth, **switches**, is not a seat-vocabulary question and
+goes to WS-E.4.3.
+
+**Citations in this section name symbols wherever a symbol exists.** Every
+`file:line` in its first draft was checked at review and most resolved to
+unrelated code. **The cause is not what it looks like:** checked against the
+parent commit on 2026-08-10, nearly all of them were *correct when written*,
+and **this change moved them** — it inserted well over a thousand lines into
+the files it cites. A line number in a document describing a change is
+invalidated by that change. A symbol name is not.
+
+### How the device set was measured, and the one thing #222 asked for that does not exist
+
+#222's first task is *"Measure first: `libinput list-devices` on the target
+machine"*. **That command is not on this machine.** `libinput 1.31.3-1` is
+installed and owns 75 files; `pacman -Ql libinput` resolves three udev helpers
+under `/usr/lib/udev/` and **no `/usr/bin/libinput`** — Arch does not ship the
+debug tools in this package, so the instrument the issue names cannot be run
+here at all.
+
+The measurement is therefore taken one layer below it, which is strictly more
+than the CLI would have printed: **`/proc/bus/input/devices`, read on
+2026-08-10**, with every `PROP=`, `KEY=`, `ABS=`, `REL=` and `SW=` bitmap
+decoded to `input-event-codes.h` names rather than eyeballed. **Nothing was
+launched** — no `vitrind`, no realm, no shim, no application under test — and
+no input-injection tool of any kind was used, which on an input issue is the
+rule that most wants restating (§7's hazard class; the one shared cursor is
+the maintainer's).
+
+**Twenty-eight evdev nodes, `event0`–`event27`.** What decides the verdicts:
+
+| Finding | Evidence |
+|---|---|
+| **No touchscreen.** | **Not one node carries `INPUT_PROP_DIRECT`.** The only two nodes with any `PROP` bits at all are the two touchpads, both `POINTER \| BUTTONPAD` (`PROP=5`). A touchscreen is `INPUT_PROP_DIRECT` by definition, and nothing here has it. |
+| **No tablet, no stylus.** | No node carries `BTN_TOOL_PEN`, `BTN_STYLUS`, `BTN_STYLUS2`, `BTN_TOOL_RUBBER`, `BTN_TOOL_BRUSH` or `BTN_TOOL_AIRBRUSH`, and no node carries `ABS_PRESSURE` together with a pen tool (the one `ABS_PRESSURE` on the machine is a touchpad's finger pressure). |
+| **Two multi-finger touchpads, not one.** | `ELAN0305:00 04F3:31FD Touchpad` (`event15`, I²C-HID): `ABS_MT_SLOT`, `ABS_MT_POSITION_X/Y`, `ABS_MT_TRACKING_ID`, and `BTN_TOOL_DOUBLETAP`/`TRIPLETAP`/`QUADTAP`/**`QUINTTAP`** — five-finger detection. `ETPS/2 Elantech Touchpad` (`event25`, PS/2 serio): the same MT slots plus `ABS_MT_PRESSURE`, up to `QUADTAP`. #222's brief named only the first. |
+| **Every pointing device on this machine is relative-only.** | `Logitech MX Ergo` (`event4`), `Logitech MX Keys` (`event6`) and `ELAN0305:00 ... Mouse` (`event14`) all report `REL_X`/`REL_Y` and **no `ABS_X`/`ABS_Y`**. There is not one absolute pointing device in the set. |
+| **The lid switch is one of eleven `SW` devices.** | `Lid Switch` (`event0`, `SW` bit 0 = `SW_LID`). The other ten are audio-jack and HDMI presence detection on the ALSA nodes. |
+| No gamepad, no joystick, no accelerometer. | No `INPUT_PROP_ACCELEROMETER`, no `BTN_GAMEPAD` block. |
+
+Also present and not in #222's brief: two SteelSeries HID consumer-control
+nodes (`event10`, `event11`), two Bluetooth AVRCP media-key nodes
+(`Galaxy S22`, `Redmi Buds 6 Lite`), and `PC Speaker`. None of them changes a
+verdict; they are recorded because the brief's device list was a subset and a
+subset presented as the set is how a measurement stops being one.
+
+**What this method cannot say**, stated in §4.2's register: capability bits are
+what a device *advertises*, not what libinput will *emit*. That the ELAN
+touchpad advertises five-finger MT slots is a necessary condition for
+`GesturePinch*`/`GestureSwipe*` reaching the core and not a proof that they
+will; only a run under `--drm` proves that, and no such run exists yet.
+
+### The verdicts
+
+| Class | Verdict | Turns on |
+|---|---|---|
+| **Relative motion** | **SERVED** | Every pointing device on this machine emits nothing else, and the DRM backend already consumes it |
+| **Pointer constraints** | **SERVED — but not by a seat event** | A real `globals-demand` line, and a structural reason the verdict cannot ride this interface |
+| **Gestures** (pinch, multi-finger swipe) | **SERVED** | Two five-finger touchpads present, and a real `globals-demand` line |
+| **Touch** | **DEFERRED** — reopened by a touchscreen in the device set *and* an app that needs it | No `INPUT_PROP_DIRECT` device exists here |
+| **Tablet** | **DEFERRED** — reopened by a tablet or stylus in the device set | No pen tool exists here, though the app-side demand already does |
+
+Plus the sixth thing in that comment, which is not a seat-vocabulary question
+at all: **the lid switch is handed to WS-E.4.3 (#223)**. Wayland clients never
+receive switch events — the compositor consumes them, and on this machine
+logind does — so growing a switch event would put a wire message under
+something no app can use. #222 got this right and it is restated rather than
+re-decided.
+
+#### Relative motion — served, and the claim it corrects
+
+**§4.2's line that v0 has *"no relative motion at all"* was already false when
+it was written, and is corrected here rather than left standing.** Since
+WS-E.3.2 (#218, `cf653eb`) the DRM backend's `handle_libinput` has had a
+`PointerMotion` arm, which accumulates libinput's relative delta into an
+absolute view position through `accumulate_pointer` and mints
+`input::physical_motion`. What was true was narrower and was the actual gap:
+**the core consumed relative motion and the wire could not carry it**, so an
+app that wanted deltas — a 3D viewport, a drawing tool, anything that locks the
+pointer — saw only the accumulated absolute position, and at the view edge saw
+nothing at all.
+
+That was the only one of the five classes whose *core* half was already
+half-built, which is why it went first. **It is now whole.** The same
+`PointerMotion` arm mints **two** wire events from one host event: the delta,
+translated by `intake_physical` into `SeatInputKind::RelativeMotion`, and the
+accumulated absolute position, which stays this backend's own novelty because
+only the side that owns the output can hold and clamp a position. The IDL says
+`relative_motion` *accompanies* `motion` rather than replacing it, so an app
+binds whichever of the two it understands and never has to guess which one the
+core sends. The order is delta first, then destination — what
+`zwp_relative_pointer_v1` asks of a compositor.
+
+#### Pointer constraints — served, and the surprise is where
+
+The evidence the shim's own rule demands **already exists in this tree, from a
+real run**: `shim/docs/globals-touched-firefox-140.12.0esr.log` carries
+`globals-demand` lines for `zwp_pointer_constraints_v1` (`seq=80`) and
+`zwp_relative_pointer_manager_v1` (`seq=81`), each summarised in the same file
+as `class=probe advertised=1 binds=1 version_min=1 version_max=1 status=bound`
+— Firefox 140.12.0esr bound both probes. `shim/src/globals.c`'s header comment
+asks every addition to cite exactly such a line, and these two can.
+
+`shim/docs/firefox.md`'s `zwp_pointer_constraints_v1` row records why they were
+not served: *"a client that can warp or confine the pointer can invalidate what
+the agent observed between observation and actuation."* **That objection is
+answered rather than overruled, and the answer is one rule: a constraint binds
+physical motion only.** An agent's actuation is minted absolute by the
+chokepoint and routed by `InputRouter::route_emulated` to the realm its grant
+names; it is never re-expressed as a delta and never clipped to a confinement
+region. `route_physical` and `route_emulated` are two separately named entry
+points precisely so a call site has to say which rule it is following, and the
+constraint check is written on the physical arm only, gated on
+`Origin::Physical`. So what an agent observed and where it then actuates stay
+in one coordinate space, whatever the app has locked. The corollary is the
+sharper half: **an app that locks the pointer must not thereby confine an
+agent**, or a confined app would have acquired a way to trap a principal's
+actuation.
+
+**The structural finding, and it is the one that changed the shape of the
+work: a pointer-constraint verdict cannot be a `vitrin_shim_seat` event.**
+Backward requirement B2 makes `origin` the mandatory final argument of every
+event on that interface — the RNG's `seat-event` define ends with a reference
+to `origin-arg`, which pins the argument's name, type and enum — and `origin`
+has exactly two values: `physical`, meaning a human device produced this, and
+`emulated`, meaning a principal's actuator did. A constraint activation is
+caused by **the confined app**, which is neither. Any tag it carried would be
+false, and it would be false on the one interface whose entire design idea is
+that the tag never drifts. The schema forecloses the obvious alternative too:
+the `seat-interface` define admits only `seat-event` and `enum` children, so a
+*request* on that interface is not merely unwise, it is inexpressible. So:
+
+- the **ask** is a shim→core request on
+  [`vitrin_shim_session`](../protocol/09-vitrin_shim_session.md) — the
+  interface that already carries shim→core requests, and the only one that can;
+- the **verdict** is a core→shim event on the same interface, beside
+  `configure`, `request_selection` and `offer_selection`, none of which carries
+  an origin either;
+- what the **seat** gains for this class is only `relative_motion`, which is
+  the input a lock actually delivers.
+
+That is the clipboard's shape (WS-E.2.1) reused, and it is reuse rather than
+resemblance: the core is again the party that decides, the shim is again the
+party that asks, and the state again lives in the core where nothing outside it
+can strand it.
+
+**Why #222 did not see this coming, recorded because the issue's frame was
+reasonable.** #222 asked one question five times: *the seat vocabulary drops
+five classes, decide each*. Four of the five really are seat-vocabulary
+questions — touch, tablet, switches and relative motion are all input events
+with a physical origin. A pointer constraint is not an input event at all; it
+is an application's **ask** and the core's **verdict**. The frame made the
+mismatch invisible and the schema made it undeniable the moment anyone tried to
+write the event down. The transferable lesson is small: *which interface does
+this class grow?* is a question the RNG answers mechanically, and asking it
+first is cheaper than discovering the answer in an IDL draft.
+
+**The owner's decision, 2026-08-10: build it here.** The first draft of this
+section left the whole constraint half downstream. Building only the input half
+would have shipped `relative_motion` — whose serious consumer is a locked
+pointer — with no way to lock a pointer, and would have left
+`zwp_pointer_constraints_v1` advertised inert or not advertised at all. Both
+halves land together.
+
+**And the second owner decision, which is the one with a person on the other
+end of it: while a constraint is active the core hides its own cursor sprite.**
+The app cannot hide it — the core owns the sprite, which is why
+`wp_cursor_shape_manager_v1` is not served (*"the shim has no cursor at all"*,
+`shim/docs/firefox.md`) — so serving the lock without the hide would leave a
+frozen arrow sitting over a game the human is aiming in.
+
+> **THE UN-HIDE OBLIGATION IS THE SAFETY PROPERTY OF THIS ENTIRE CHANGE.**
+> Every path on which a constraint ends must restore the sprite. **A single
+> missed path leaves the human with no visible cursor on a display server they
+> cannot exit**, on this project's only bare-metal machine. That is a worse
+> outcome than any other defect this change could cause.
+
+**So sprite visibility is a derived predicate and never a stored flag**, and
+the argument is arithmetic rather than aesthetic. It is recomputed once per
+frame at the single line in `backend::drm`'s `compose_and_queue` that decides
+it — the one that feeds both the zero-copy and the CPU presentation paths —
+and nothing else in the crate may write it. A flag toggled at N sites strands
+the human's cursor by omission on the N+1st path; this workstream has already
+learned that under a gentler penalty, when `forget_presence_of` was a caller's
+obligation for exactly one review cycle before the realm-death funnel, which
+did not know it existed, became its third caller. A per-frame predicate cannot
+be stranded by omission at all. It can only be stranded by a stuck *record* —
+and a stuck record still cannot hide the sprite unless the realm is focused, no
+overlay is up, and the output is active.
+
+That shape also buys the **reactivation** half for free, which a flag would
+have had to remember: Wayland's `persistent` lifetime requires a lock to become
+active again when its surface regains focus, so a flag needs an un-hide on
+switch-away *and* a re-hide on switch-back — two sites, one of which gets
+forgotten.
+
+**The deactivation paths, split by whether they need code at all.** This split
+*is* the design; the table is not a checklist bolted onto it.
+
+| Class | Paths | What it costs in code |
+|---|---|---|
+| **Record removal** | the app withdraws (`kind = none`); the realm or its shim dies; the seat is paused (VT switch, suspend); the dead-man switch fires; the session tears down; a second ask supersedes the first | Five edits, each at a funnel that already exists. Realm and shim death go **inside `InputRouter::reset_for`**, not at its callers, because `lifecycle::die` reaches teardown by two arms and only the inside covers both |
+| **Transient** | the realm is not focused; a consent card, the lock screen, the dead-man hold or the core notice is up; the surface is uncommitted; the output is inactive; the pointer is outside the region; the shim never minted its seat | **No code.** Each is already a term the predicate reads. This is the entire return on deriving rather than storing |
+
+**Ranked, because the two effects a constraint has are not equally dangerous.**
+A constraint also **freezes** the absolute position the core's own hit tests
+use. The freeze ranks strictly *below* the sprite: a frozen visible cursor
+looks like a hung compositor but leaves the human every escape they had, while
+a hidden one does not. An implementation that has to retreat from one retreats
+from the freeze.
+
+**Why the core still wins, argued rather than assumed.** A client that locks
+and hides the pointer is, on the face of it, a client that stops the pointer
+leaving — which would be a confinement-relevant verb wearing a cosmetic one's
+clothes. Six reasons it is not. Every citation below was re-derived by opening
+the file on 2026-08-10; in this section's first draft, all of the first four
+missed.
+
+1. **The dead-man chord is untouched by construction.** The tap is
+   `hook.observe(&input)` inside `InputRouter::route_into`, called
+   unconditionally one statement *before* `hook.gate` and therefore above every
+   gate. `DeadManHook::observe` reaches `DeadManSwitch::observe_event`, whose
+   second statement destructures `SeatInputKind::Key` and returns on anything
+   else — it is a *keyboard* chord and no pointer state is on its path. The
+   unconditionality is structural: `GateOnlyHook::observe` forwards to its
+   inner hook with no gate consulted, and the `ConsumingGate` trait it wraps
+   declares **no observation method at all**, so an edit inside `crate::lock`
+   cannot make observation conditional because the trait it calls through
+   cannot express one. A constraint sits below both and reaches neither.
+2. **The consent grab runs before the constraint is ever consulted.** The hook
+   point is *after* origin binding and *before* coordinate mapping and
+   hit-testing — the argument is in `crates/vitrin-core/src/input`'s module
+   docs under *"The preemption hook"*, the one citation from this section's
+   first draft that still resolved when checked. A constraint is a delivery
+   decision inside `route_into`'s per-kind match, reached only after
+   `hook.gate` declines to consume and after the realm resolves. The module
+   docs already make this exact argument for the letterbox matte — *"a gate
+   that ran after the app hit-test could be dodged by parking the pointer off
+   the surface"* — and a lock is that dodge with a protocol behind it, landing
+   on the wrong side of the hook point to attempt it. **And the belt:** the
+   predicate goes false while a prompt is up, so during a consent round the
+   pointer is not merely un-hidden but un-frozen. A locked app cannot make a
+   consent card unanswerable, which is the failure that would actually matter.
+3. **The core owns the constraint state and ends it alone.** The shim's request
+   is an ask, not a fact. Record removal lives at `InputRouter::bind_to`,
+   `session::suspend_physical_seat`, `InputRouter::reset_for` and
+   `Runtime::apply_dead_man`; everything else in the table above is transient
+   and needs no site.
+4. **The app cannot hide the cursor, because it never had it** — which is
+   exactly why the hide had to be decided rather than left open: the capability
+   the app is asking for is one only the core can perform.
+5. **The VT escape is outside all of it.** `VtHook` is the outermost member of
+   the hook stack and `Ctrl-Alt-F<n>` is a keyboard chord ([D-031](20-decision-log.md#d-031--the-core-implements-ctrl-alt-fn-itself-because-refusing-to-is-what-trapped-the-human-d-030s-reasoning-stands-and-its-effect-was-its-own-opposite)).
+   A locked, frozen, sprite-less pointer is not on its path at any layer. This
+   reason was absent from the first draft and it is the maintainer's actual
+   last resort on this machine.
+6. **The core's own hit test is unmoved** — [00-conventions.md](../protocol/00-conventions.md)
+   §1.4 invariant 2: *the core's own hit test, never a client's claimed
+   stacking, decides which surface an input event reaches*. A constraint
+   changes only what the **app** is told. The core's accumulated position, the
+   consent card's recorded pointer and the lock screen's passphrase path are
+   all upstream of it, and the freeze is applied where the app-facing position
+   is *minted* rather than by rewriting any of them. The region check reuses
+   the router's existing `pointer_over_surface`, because a second hit test
+   written here would be a second answer to a question invariant 2 says has
+   one.
+
+**The blast radius, stated so nobody mistakes green CI for evidence.** The
+human sprite exists only on bare metal: `backend::winit`'s `window_pixels` is
+handed `None` for it on nested and headless, because the host desktop draws the
+pointer there. **So no test in this workspace can strand a cursor even if the
+logic is wrong**, and CI has no DRM device. Immune everywhere it is cheap to
+test, dangerous in the one place it is not — the shape that lets a defect ship
+green, and the reason the mitigation has to be a named integration rung on the
+target machine, skipped with a stated reason when no DRM device is present,
+rather than a unit test.
+
+#### Gestures — served, at pinch and multi-finger swipe
+
+Two-finger scroll is **already served** — libinput reports it as an axis event
+and `intake_physical` converts pixels to v120 at the documented rate — so the
+gap is pinch and multi-finger swipe, which is a smaller and more honest claim
+than "no gestures". #222 states this correctly and it survives verification.
+
+The demand evidence is real and doubled: the evidence log carries two
+`globals-demand` lines for `zwp_pointer_gestures_v1` (`seq=36` at
+`version_requested=1`, `seq=82` at `version_requested=3`) and summarises them
+`binds=2 version_min=1 version_max=3 status=bound`. The device evidence is the
+two touchpads above.
+
+**Hold is advertised and never sent, and the global goes out at wlroots' own
+version, which is 3.** This paragraph said the opposite — that the global would
+be advertised at **version 2**, serving swipe and pinch completely and claiming
+nothing about hold — and the shipped `shim/src/globals.c` did the opposite of
+what it said. The paragraph was wrong, for a reason checked against this
+machine rather than reasoned about:
+
+- `wlr_pointer_gestures_v1_create(struct wl_display *display)` takes a display
+  and **no version**, so capping the advertisement at 2 is not expressible
+  through wlroots' helper at all. Verified in
+  `/usr/include/wlroots-0.19/wlr/types/wlr_pointer_gestures_v1.h` (package
+  `wlroots0.19 0.19.3-1`) on 2026-08-10.
+- The same header declares `wlr_pointer_gestures_v1_send_hold_begin`/`_hold_end`
+  and a `holds` resource list, and `get_hold_gesture` is `since="3"` in
+  `/usr/share/wayland-protocols/unstable/pointer-gestures/pointer-gestures-unstable-v1.xml`
+  (interface `version="3"`). A wlroots that implements hold advertises 3.
+
+**That is not the half-serving `shim/src/globals.c` refuses elsewhere**, and
+the distinction is the whole answer: the three gesture families live behind
+**one** global, so declining hold would decline swipe and pinch with it, and a
+client learns which gestures exist from **the events it receives** rather than
+from the global — unlike a `wl_seat` capability, which is a positive claim a
+toolkit changes its fallbacks on. Firefox's own two binds, one at version 1 and
+one at version 3, are the same point from the application side. Hold reopens on
+the same terms as anything else here: an application that binds version 3 *and*
+does something with a hold.
+
+#### Touch — deferred, and what would reopen it
+
+**No device on this machine can produce a touch event**, and that is a fact
+about one laptop rather than about the class. Everything below follows from
+that and from nothing else.
+
+`shim/src/globals.c`'s seat-capability comment is the precedent and **it
+stays**: the shim advertises `WL_SEAT_CAPABILITY_POINTER | KEYBOARD` and adds
+no `wl_touch`, because *"a `wl_touch` bound here would have nothing behind it,
+and advertising a capability the shim cannot honour is worse than not
+advertising it: a toolkit that sees TOUCH stops installing its pointer
+fallbacks."* Do not half-serve a class. WS-E.4.2 rewrote that comment so it
+states the narrower claim it always meant — the heading now reads `TOUCH IS NOT
+YET SERVED`, which is the register every surface in this repository owes this
+class. `wl_touch` is the one class here with no `globals-demand` line possible
+either way, because touch is a `wl_seat` capability rather than a global, so
+the ledger cannot record a demand for it even in principle.
+
+**What reopens it:** a machine with a touchscreen (`INPUT_PROP_DIRECT`) in the
+measured device set, **and** an application in the session matrix that needs
+it. Both, because a device with no app that wants it buys a permanent wire
+surface for nobody, and an app that wants it on a machine that cannot produce
+it cannot be tested. The device half is a one-line re-run of the measurement
+above.
+
+#### Tablet — deferred, and the asymmetry is worth seeing
+
+**No pen tool exists on this machine** — and unlike touch, **the app-side
+demand already does**: the evidence log carries a `globals-demand` line for
+`zwp_tablet_manager_v2` (`seq=39`, `version_requested=1`). Firefox binds the
+tablet manager whether or not a tablet is plugged in, which is why that line is
+evidence about GTK and not about this laptop. `shim/docs/firefox.md`'s
+`zwp_tablet_manager_v2` row states the class as **not yet served**, on the same
+not-half-serving rule that keeps `wl_touch` out of the seat capabilities, and
+that row stays provisional by design.
+
+**What reopens it:** a tablet or stylus device in the measured set — any node
+carrying `BTN_TOOL_PEN` or `BTN_STYLUS`. The app half of the evidence is
+already banked, so this deferral turns on the device alone, and it is the
+class most likely to reopen first because a graphics tablet is a thing a person
+buys rather than a thing a laptop has.
+
+### What #222 asserted about today's code that is no longer true
+
+#222 was filed **2026-08-06T08:35Z**, before WS-E Stage 2 (2026-08-08) and
+Stage 3 (2026-08-09). Every "what exists today" claim in it predates two
+stages, and this is the list, checked file by file rather than restated.
+
+**The right-hand column names symbols, not lines, and that is a correction.**
+Its first draft answered every stale line number with a fresh line number —
+which is how this section then went stale a second time inside the same
+change, since WS-E.4.2 inserted well over a thousand lines into the very files
+it cites. The issue's own numbers are kept on the left because they are what
+was written; the answer is a name, which survives the next shift.
+
+| The issue says | The tree says (checked 2026-08-10, after WS-E.4.2) |
+|---|---|
+| `input/mod.rs:1049-1051` (dropped classes), `:1119` (the drop arm) | Both had moved ~1 100 lines by the time the issue was picked up, to `intake_physical`'s doc comment and its `_ => Vec::new()` arm. **The comment's text is now gone as well**: WS-E.4.2 rewrote it, and it no longer names five dropped classes — only touch and tablet, each as a *not yet* |
+| `input/mod.rs:105-109` — *"per-keysym pairing and the warning that a real keymap moves pairing to scancodes"* | **The warning is discharged.** The module docs' section on what a press pairs *by* now records that pairing moved to `KeySource` (the scancode) in WS-E.3.1/#217 under [D-028](20-decision-log.md#d-028--a-bare-metal-session-interprets-the-keyboard-inside-the-core-from-a-pre-compiled-keymap-file-and-key-pairing-moves-to-the-scancode). Citing it as a live warning would have re-decided a decision |
+| `input/mod.rs:482-490` — the `PreemptionHook` contract | Those lines are `SeatInput::physical`/`emulated`. The contract is the `PreemptionHook` trait and its doc prose; the single hook call is `hook.observe` inside `InputRouter::route_into`, one statement above `hook.gate` |
+| `input/mod.rs:1239-1271` — `invariant_keysym` | The function still exists under that name; it has moved twice since the issue was filed |
+| `protocol/vitrin-v0.rng:177,181` — the schema-enforced last-argument rule | The rule is the `seat-event` define's trailing reference to `origin-arg`, and the interface split is the `seat-interface` define. The rule itself is exactly as described and was re-verified in the schema, not taken from the issue. (This section's first draft mis-numbered the interface define by four lines, which is the whole argument for naming defines instead) |
+| *"v0's seat vocabulary is pointer + keyboard … no relative motion"* | Was true of the **wire** and false of the **core** since #218. **Now false of both**: `relative_motion` is on the wire as of WS-E.4.2 |
+| New seat events must *"either ride P2.1.2's version-2 landing or wait for the version after the P2.9.2 spec freeze"* | Version 2 landed **2026-08-06** in WS-E.1.1 (`6abe8dd`) and had been appended to three times before this change (`4fdcab6`, `53cee3a`, `2f7c7cf`), for eleven `since="2"` messages; WS-E.4.2 adds seven more, for eighteen. There was nothing left to ride and nothing to wait for (below) |
+| `protocol/vitrin-v0.xml:1176` — `vitrin_shim_seat` | The interface had five events when the issue was filed, exactly as claimed — `motion`, `button`, `scroll`, `key`, `text` — verified. It now has ten |
+| `shim/src/globals.c:185-192` — the touch choice and `wlr_seat_set_capabilities` | **The one issue citation that had not moved when checked — and WS-E.4.2 then moved it**, by inserting the version-2 seat paragraph above it. Both are now found by the comment heading `TOUCH IS NOT YET SERVED` and by the `wlr_seat_set_capabilities` call under it |
+| `libinput list-devices` on the target machine | The command does not exist here (above) |
+
+### Version scheduling: there is nothing to schedule
+
+#222 treats the version as a hard constraint, citing
+[02-phase-2-semantic-epochs.md](02-phase-2-semantic-epochs.md):303 — *"Nothing
+may bump to version 3: P2.1.2 owns the single bump for the whole phase."* That
+line is **half stale, and the same document already fixed the half that
+matters**: `:383-390` says in as many words that *"the 1→2 version bump is
+owned by whoever lands first, not by P2.1.2 by name … If it does, it performs
+the bump and P2.1.2 rides it; the invariant that actually matters is unchanged
+— one bump, and every later addition at `since="2"`."* WS-E.1.1 did land first.
+So `:303`'s literal *"P2.1.2 — the protocol 1→2 bump"* now describes a bump
+that has already happened, while *"nothing may bump to version 3"* is untouched
+and is not tested by this work.
+
+**That paragraph belongs to the Phase-2 plan and this workstream does not edit
+it.** A WS-E issue rewriting the Phase-2 schedule is the competing roadmap the
+tracking model forbids; the exact text is quoted here for whoever owns
+[02-phase-2-semantic-epochs.md](02-phase-2-semantic-epochs.md).
+
+Everything else about the version question is settled in
+[D-032](20-decision-log.md#d-032--relative-motion-and-pointer-gestures-grow-the-seat-vocabulary-pointer-constraints-grow-the-shim-session-instead-and-touch-and-tablet-are-deferred-against-named-evidence)(6),
+including the one finding that would have stopped this work if it had gone the
+other way: **version 2 has never been released, frozen or negotiated by
+anything outside this repository**, so appending `since="2"` siblings to it is
+ordinary additive growth rather than a silent redefinition of a shipped
+version.
+
+### The wire shape, and where each arm attaches
+
+Five new `since="2"` sibling events on `vitrin_shim_seat`, event opcodes
+**5–9** (document order; `motion`=0 … `text`=4), each ending with `origin`
+because the schema will not accept it otherwise:
+
+| Event | Signature |
+|---|---|
+| `relative_motion` | `(dx: fixed, dy: fixed, dx_unaccel: fixed, dy_unaccel: fixed, origin)` |
+| `gesture_begin` | `(kind: uint enum gesture_kind, fingers: uint, origin)` |
+| `gesture_swipe_update` | `(dx: fixed, dy: fixed, origin)` |
+| `gesture_pinch_update` | `(dx: fixed, dy: fixed, scale: fixed, rotation: fixed, origin)` |
+| `gesture_end` | `(kind: uint enum gesture_kind, state: uint enum gesture_state, origin)` |
+
+plus two enums on the same interface, `gesture_kind {swipe=0, pinch=1}` and
+`gesture_state {completed=0, cancelled=1}`. Swipe and pinch **share** their
+begin and end because those two signatures are identical in Wayland's own
+gesture protocol, and a signature is immutable forever — four events with no
+dead argument beat six with duplicated ones, and beat two phase-tagged events
+whose deltas and `cancelled` flag would each be meaningless in two phases out
+of three.
+
+**No timestamp argument, deliberately.** The five existing seat events carry
+none, and `shim/src/seat.c` stamps each replay with its own `now_msec()`. A
+device timestamp on the wire would put a second, unsynchronised clock beside
+that one — which is the reason `wp_presentation` is not served
+(`shim/docs/firefox.md`) — so the cost is paid instead: a consumer integrating
+deltas over `dt` gets the shim's arrival time, not the device's event time.
+
+**And the pointer-constraint pair on `vitrin_shim_session`**, whose signatures
+are normative in the IDL and on [page 09](../protocol/09-vitrin_shim_session.md)
+and are not restated here: a shim→core request `pointer_constraint(serial,
+surface, kind, lifetime, x, y, width, height)` and a core→shim event
+`pointer_constraint_state(serial, state)`, plus `pointer_constraint_kind`,
+`pointer_constraint_lifetime` and `pointer_constraint_status`. Three shape
+choices are worth carrying here because they are the ones a reader will
+question:
+
+- **One message, not `set`/`unset` siblings.** `kind = none` is the
+  withdrawal, so the core's state machine has exactly one input and a
+  withdrawal cannot race a set.
+- **`inactive = 0`, departing from `selection_status`'s `ok = 0`.** Zero is
+  where a mis-decode and a zeroed struct land, and *"not constrained"* is the
+  safe reading of a byte nobody can trust.
+- **Fire-and-forget, not reply-bearing.** A constraint's state changes for
+  reasons the shim never asked about — the human switched realms — so binding
+  the answer 1:1 to the ask would leave an app locked with no message that
+  could ever tell it otherwise, which is the exact latch this design exists to
+  prevent. The core sends at most one state per transition and never coalesces
+  two different states.
+
+**Every arm attaches at the one hook point, and by the one mechanism.** Each
+input class becomes a new `SeatInputKind` variant, and `InputRouter::route_into`
+takes a `SeatInput` — so `presence.note`, `hook.observe` and `hook.gate` see it
+before any mapping, without a line of new plumbing. Nothing can route around
+the hook without constructing a `SeatDelivery` directly, and `SeatDelivery`'s
+construction sites are all inside `InputRouter`. Concretely:
+
+- `intake_physical` gains `InputEvent::PointerMotion` and the six
+  `Gesture{Swipe,Pinch}{Begin,Update,End}` arms, all before its
+  `_ => Vec::new()` arm;
+- `backend/drm.rs`'s `PointerMotion` arm returns **two** `SeatInput`s — the
+  accumulated absolute motion it already mints, and the raw delta — so both
+  pass the same tap. It must not keep intercepting the class privately;
+- `SeatDeliveryKind`, `SeatDelivery::encode` and `event_label` gain one arm
+  each, all three exhaustive with no catch-all, so a kind that forgets its
+  recorder label does not compile.
+
+**Pairing, and how a dropped end is stopped from latching the app.** A
+`gesture_begin` with no `gesture_end` is the latched-modifier bug in a new
+shape, and the razor is the one `pressed`/`pressed_keys` already enforce:
+
+- `RealmSeat` holds at most one in-flight gesture, per realm like everything
+  else in it. A second `begin` while one is live is dropped and traced rather
+  than trusted away — libinput will not produce one, and the core is not in the
+  business of believing that.
+- An `update` or an `end` is delivered **iff its own `begin` was delivered**,
+  exactly as *"a release is delivered iff its own press was"*. A gate-consumed
+  `begin` therefore starts nothing, and its updates and end are dropped.
+- A consumed `end` whose `begin` **was** delivered is reconciled the way a
+  consumed release is: bookkeeping cleared, nothing on the wire, and the app
+  left mid-gesture — the gate implementor's debt. The pairing contract on
+  `PreemptionHook` gained one sentence saying a gate that begins consuming
+  mid-gesture should keep answering `Gate::Deliver` for `gesture_end`, for the
+  reason it already gives for releases.
+- **A drain**, `InputRouter::end_physical_gesture`, sibling to
+  `release_physical_keys` and `release_physical_buttons`. It emits
+  `gesture_end(kind, cancelled)` — cancelled rather than completed, because the
+  human did not finish it. §6's *"a realm switch mid-gesture tells the app the
+  human let go"* limit already names this exact trade for keys and buttons; a
+  touchpad gesture joins it rather than inventing a new one.
+
+**The drain runs on two paths, and this section first claimed five.** The
+correction matters more than most, because the over-claim reached the IDL,
+where a `<description>` is normative and outranks every prose page. The two
+real ones are `InputRouter::bind_to` (a realm switch) and
+`session::suspend_physical_seat` (a seat pause); on both, the human's fingers
+are still down and no end can ever arrive, so one is minted rather than waited
+for. Of the three that were claimed:
+
+- **a consent prompt** and **a raised screen lock** mint nothing. Both gates
+  answer `Gate::Deliver` for `GestureEnd` — checked in `ConsentGrab`'s and
+  `LockGate`'s judge arms on 2026-08-10 — so they withhold the *updates* and
+  then deliver the device's own end when the human lifts. No latch forms, so
+  this is a gap rather than a defect, but an app that was previewing a zoom is
+  told the human **completed** what they in fact abandoned behind a card they
+  could not see past. Closing it needs `scenes` in reach of the consent-round
+  service point and is owed as a separate change.
+- **the dead-man switch** never took physical input away in the first place; it
+  revokes grants, so that clause was vacuous.
+
+`NestedState::handle_focus` is a fourth non-caller and a *deliberate* one,
+documented where it sits: a gesture is pointer-side, so it follows the buttons'
+exclusion rather than the keys' inclusion — and smithay's winit backend
+surfaces no gesture events at all, so a nested session can never have one in
+flight.
+
+`relative_motion` needs no pairing of its own — it has no begin and no end.
+Its latch shape lives in the constraint instead: while one is active the core
+stops emitting absolute `motion` and freezes the position its own hit tests
+use, so a constraint whose end is lost would be a pointer that never moves
+again. That is why the constraint's state is core-owned, why its removal lives
+*inside* `InputRouter::reset_for` rather than at each caller, and why an
+**emulated** motion must not move that frozen position while a constraint is
+active — the defensive rule `pointer_constraint_state`'s IDL description
+already states, now with a second reason to need it.
+
+**Allocation, checked repo-wide** (§5 of
+[02-phase-2-semantic-epochs.md](02-phase-2-semantic-epochs.md) is the registry
+and this consumes nothing in it): no verb bit — `Verb::VALID_MASK` stays
+**575** — because nothing agent-facing is added; no new prose page, since these
+extend [page 11](../protocol/11-vitrin_shim_seat.md) and
+[page 09](../protocol/09-vitrin_shim_session.md), and `docs/protocol/`'s 12–15
+stay reserved; event opcodes 5–9 on `vitrin_shim_seat` were unclaimed, request
+opcode 3 and event opcode 3 on `vitrin_shim_session` likewise, and the three
+Appendix-A seams that will also want seat opcodes (focus, the keymap relay plus
+keycode, per-principal delivery) reserve **no numbers**, so whoever lands
+`focus` next starts at 10 rather than at 5. `vitrin_shim_seat`'s own `version`
+attribute moves 1 → 2, on the precedent of `vitrin_principal`, `vitrin_grant`
+and `vitrin_shim_session`, each of which bumped its counter in the commit that
+gave it a `since="2"` message.
+
+**One name is already spoken for.** `constraint` in this protocol means a
+*petition* constraint — `request_grant`'s `flags`, and Appendix A's
+`set_constraint` builder row. The pointer variety must always be qualified
+`pointer_constraint`, in the IDL, in prose, in Rust and in C, or two unrelated
+capabilities share a noun in a document that cannot rename either.
+
+### Handoff
+
+- **WS-E.4.3 (#223)** takes the lid switch, unchanged from #222's reading.
+- **WS-E.4.4 (#224)** publishes the deferrals. The register is dictated here
+  for §4.2's reason: every surface states touch and tablet as **not yet
+  served** and names the evidence that reopens each. §6's bullet is rewritten
+  below on the same rule.
+- **The paired IDL + prose edit, the core arms, the shim replay and the globals
+  change landed with this section** (WS-E.4.2), and so — on the owner's
+  decision of 2026-08-10 — did the pointer-constraint half that this section's
+  first draft left downstream. **What has not happened is a run.** No gesture,
+  no relative-motion event and no constraint verdict has yet reached a
+  connected application on real hardware, and the cursor-sprite property is
+  unreachable from every backend CI can execute. Until a named
+  `tests/integration/test_real_*.py` rung runs on the target machine under a
+  documented runbook and its result is dated, the status of everything in this
+  section is **landed in the tree, unproven on hardware** — the same status
+  Stage 3's DRM work had to carry, for the same reason.
+- **Owed, and named rather than smoothed over:** cancelling an in-flight
+  gesture when a consent card or the lock screen raises (above); and the
+  hardware rung itself.
 
 ## 5. The target machine, and why no number here generalizes
 
@@ -713,9 +1324,53 @@ this workstream owns, not inherits:
   seat — so it arrives with structurally weaker evidence than anything else in
   the tree. That is an asymmetry against D12 and it is published, not
   discovered.
-- **No touch, gestures, tablet, switches or relative motion**: v0's seat
-  vocabulary is pointer + keyboard only, so on a laptop that means no touchpad
-  gestures and no lid switch.
+- **Input classes on the wire: partly closed by WS-E.4.2 (#222), and the
+  remainder is split three ways.** This bullet used to read *"no touch,
+  gestures, tablet, switches or relative motion on the wire"* and to say the
+  limit was *"unchanged and real"* until the work landed. **It landed**
+  ([§4.3](#43-the-five-input-classes-the-seat-vocabulary-drops-a-verdict-each),
+  [D-032](20-decision-log.md#d-032--relative-motion-and-pointer-gestures-grow-the-seat-vocabulary-pointer-constraints-grow-the-shim-session-instead-and-touch-and-tablet-are-deferred-against-named-evidence)),
+  and the old sentence survived into the commit that falsified it — recorded
+  here because this is a published-limits section, where an error in the
+  optimistic direction is the one that misleads a user. The five classes never
+  shared a verdict and now share even less:
+  - **SERVED, and unproven on hardware.** `relative_motion` and four gesture
+    events (`gesture_begin`, the two updates, `gesture_end`) on
+    `vitrin_shim_seat`; a `pointer_constraint` ask-and-verdict pair on
+    `vitrin_shim_session`; and three shim globals —
+    `zwp_relative_pointer_manager_v1`, `zwp_pointer_gestures_v1` and
+    `zwp_pointer_constraints_v1`. **No run has yet delivered any of them to a
+    connected application.** CI has no touchpad and no DRM device, so the
+    evidence behind this row is unit and component tests, not a mock-free gate;
+    a named `tests/integration/test_real_*.py` rung on the target machine is
+    owed and is not yet written. Two-finger scroll is **not** in this set: it
+    has always worked, as a scroll axis.
+  - **SERVED, with two gaps named rather than smoothed over.** A pointer
+    lock deactivates and the human's cursor sprite returns on every path the
+    core knows about, but that property can only be observed on bare metal —
+    nested and headless draw no human sprite at all — so it is the one
+    behaviour in this workstream that CI is structurally unable to check. And
+    an in-flight gesture is ended `cancelled` on a realm switch and a seat
+    pause, but **not** when a consent card or the lock screen raises: those
+    withhold the gesture's updates and then deliver the device's own end, so an
+    app that was previewing a zoom is told the human completed what they in
+    fact abandoned. Closing that is owed.
+  - **NOT YET SERVED: touch, and tablet or stylus.** Neither has a wire event,
+    and `wl_touch` stays out of the shim's seat capabilities (the comment
+    heading is `TOUCH IS NOT YET SERVED`) because a class advertised with
+    nothing behind it is worse than an absent one — a toolkit that sees TOUCH
+    stops installing its pointer fallbacks. Both are deferrals with named
+    reopening evidence, not permanent decisions: **touch** reopens on a
+    touchscreen in the measured device set *together with* an application that
+    needs it; **tablet** reopens on a pen or stylus device in that set, the
+    application half of its evidence being already on record. This machine has
+    neither device, which is a measurement of one laptop and not a property of
+    the protocol. Published in that register, with the reopening evidence
+    named, by WS-E.4.4/#224.
+  - **NOT A SEAT QUESTION: the lid switch**, handed to WS-E.4.3/#223. Wayland
+    clients do not receive switch events at all — the compositor consumes them,
+    and on this machine logind does — so a wire message for one would sit under
+    something no application could use.
 - ~~**Several realms run, one is visible, and a capture cannot tell them
   apart**~~ (created by WS-E.1.2, **closed by WS-E.1.3**). Raising the cap
   landed before the scene bound an output to a realm, so for one workstream
@@ -894,7 +1549,7 @@ this workstream owns, not inherits:
   understand why.
 
 - **A locked screen an agent can still watch** (created by WS-E.2.2/#214,
-  and **decided rather than deferred** — [D-025](20-decision-log.md#d-025)).
+  and **decided rather than deferred** — [D-025](20-decision-log.md#d-025--a-locked-screen-does-not-suspend-agent-observation-the-gap-is-published-not-papered-over)).
   The lock screen consumes every physical event and covers the output, and it
   does not touch a grant: an `observe` holder keeps capturing the realm across
   a lock and an `actuate_*` holder keeps acting. Correct against the IDL
@@ -1043,7 +1698,7 @@ this workstream owns, not inherits:
   *chord* rather than #216's proposed bare `Print` for a structural reason —
   `crate::chord::ModChord` refuses a modifier-less chord, so a bare-key gesture
   would have meant a second matcher in the stack the off-switch lives in, which
-  is the thing [D-024](20-decision-log.md#d-024) exists to forbid — and the
+  is the thing [D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing) exists to forbid — and the
   side effect is that **bare PrintScreen is still delivered**, so an app that
   binds it keeps it. That is the first time this workstream has taken a gesture
   without taking the key. The collision check `main.rs` runs is now over five
@@ -1101,13 +1756,22 @@ second machine, never from inside the running desktop. This is the same hazard
 class as injecting input into a live session, and it is written here so no task
 has to rediscover it.
 
-**The escape route is VT switching and an installer USB, not SSH.** This rule
+**The escape route is a Hyprland-side shell and an installer USB, not SSH — and
+VT switching is back, but only because the core now implements it.** This rule
 originally required an SSH session from a second machine;
-[D-028](20-decision-log.md#d-028--the-drm-bring-up-escape-route-is-vt-switching-and-an-installer-usb-not-ssh)
+[D-031 (the first of two entries with that number)](20-decision-log.md#d-031--the-drm-bring-up-escape-route-is-a-hyprland-side-shell-and-an-installer-usb-not-ssh-and-not-vt-switching)
 (2026-08-09) records the maintainer's decision not to run an sshd, the route
 that replaces it, and its cost — **a wedged DRM master with no live console is a
-reboot rather than a command.** The step-by-step version, written against this
-machine's actual VTs, cards and connectors, is
+reboot rather than a command.** That entry was amended the same day by the first
+bare-metal run, which found `Ctrl+Alt+F<n>` did nothing once `vitrind` held the
+display and left the maintainer trapped on `tty3`;
+[D-031 (the second)](20-decision-log.md#d-031--the-core-implements-ctrl-alt-fn-itself-because-refusing-to-is-what-trapped-the-human-d-030s-reasoning-stands-and-its-effect-was-its-own-opposite)
+then made the core implement the VT chord itself. **Both are numbered D-031;
+neither is renumbered, because the id is cited from landed code.** (This
+paragraph cited them as `D-028` until 2026-08-10, which is the numbering
+collision doing exactly the damage it was predicted to do — in a
+safety rule, where the reader most needs the link to land.) The step-by-step
+version, written against this machine's actual VTs, cards and connectors, is
 [`docs/drm-bringup.md`](../drm-bringup.md) step 0. The rule above is unchanged;
 only the recovery path is.
 

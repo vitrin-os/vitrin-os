@@ -23,6 +23,7 @@
 
 #include "ledger.h"
 #include "clipboard.h"
+#include "constraint.h"
 #include "seat.h"
 #include "upstream.h"
 
@@ -125,6 +126,12 @@ struct vitrin_shim {
 	 * work, plus the two directions the CORE drives. Nothing here ever
 	 * speaks upstream unasked. */
 	struct vitrin_clipboard clipboard;
+	/* Pointer constraints (WS-E.4.2, constraint.h): the
+	 * `zwp_pointer_constraints_v1` global, the one constraint being relayed,
+	 * and the serial it was asked under. Like the clipboard, nothing here
+	 * ever speaks upstream unasked -- an ask is sent because the APP created
+	 * a lock, and the verdict comes back on the core's own schedule. */
+	struct vitrin_constraint constraint;
 	struct wlr_xdg_decoration_manager_v1 *xdg_decoration;
 	struct wl_listener new_deco; /* xdg_decoration.new_toplevel_decoration */
 

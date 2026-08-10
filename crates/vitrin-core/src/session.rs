@@ -740,6 +740,27 @@ pub(crate) trait Presenter {
     /// and opens no file** — the strip's whole cost, syscalls included, is
     /// behind the flag.
     fn refresh_status(&mut self, now: std::time::SystemTime, mono: Instant) -> bool;
+
+    /// **The two pointer-constraint gates only the output's owner can answer**
+    /// (WS-E.4.2, issue #222): whether an overlay needs the compositor this
+    /// round, and whether the output is active at all.
+    ///
+    /// One method returning a struct rather than two predicates, for the reason
+    /// `crate::input::PresentationGates` is a struct: the same two facts are
+    /// read by the reconciler here *and*, on bare metal, by the composite that
+    /// decides whether to draw the human's cursor, and a future gate must not
+    /// be silently answered by only one of them.
+    ///
+    /// The default is the headless posture — no overlay exists to raise, no
+    /// output to pause — and it is safe rather than merely convenient: both
+    /// defaults are the *permissive* values, so a backend that forgot to
+    /// override this could only ever leave a constraint active longer than it
+    /// should. On every backend CI can run that costs nothing at all, because
+    /// `window_pixels` is handed `None` for the human cursor there and there is
+    /// no sprite to hide.
+    fn output_gates(&self) -> crate::input::OutputGates {
+        crate::input::OutputGates::default()
+    }
 }
 
 /// A backend state type that carries a [`Runtime`], split into provably
@@ -968,6 +989,20 @@ impl<H: PreemptionHook> Runtime<H> {
         );
         let revoked = effect.revoked.len();
         let denied = effect.denied.len();
+        // **And every pointer constraint in the session** (WS-E.4.2, issue
+        // #222), which the grant sweep above cannot and must not reach: a
+        // constraint is asked for by the confined APP over its shim connection
+        // and is derived from no grant row, so `revoke_principal` never sees
+        // one. The precedent for "a thing that is not a grant but must still
+        // go" is one line inside `deadman::apply` — the clipboard slot, cleared
+        // there for exactly this reason.
+        //
+        // Session-wide, deliberately: a constraint in a realm the chord was not
+        // held over goes too. The switch is session-wide by construction and a
+        // locked pointer anywhere is part of what the human is taking back.
+        let withdrawn = self.router.constraints().borrow_mut().withdraw_all();
+        let constraints = withdrawn.len();
+        send_constraint_verdicts(&self.realms, withdrawn);
         for resolution in effect.denied {
             deliver(self, resolution, now);
         }
@@ -976,6 +1011,7 @@ impl<H: PreemptionHook> Runtime<H> {
             held_ms = trigger.held.as_millis(),
             revoked_grants = revoked,
             denied_petitions = denied,
+            withdrawn_pointer_constraints = constraints,
             "dead-man chord completed: every grant in this session is revoked and the grant \
              table is sealed"
         );
@@ -3145,6 +3181,15 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
 /// [`InputRouter::release_physical_buttons`] was added for (issue #212,
 /// decision 3), and until this call site it had exactly one caller.
 ///
+/// **And the gesture in flight** ([`InputRouter::end_physical_gesture`],
+/// WS-E.4.2, issue #222), which follows the buttons for the same reason and
+/// with the same asymmetry against nested focus loss. It lands harder here
+/// than either: `libinput_suspend` has closed the devices, so no update and no
+/// end can arrive for the whole pause, and a `gesture_begin` with no
+/// `gesture_end` leaves the app accumulating a pinch that nothing can finish.
+/// It is ended `cancelled`, because the human did not let go — the same
+/// published trade the keys and buttons make.
+///
 /// # Agents are untouched
 ///
 /// Only the human's presses are drained, by the same rule
@@ -3193,6 +3238,26 @@ pub(crate) fn suspend_physical_seat<H: crate::input::PreemptionHook>(
     };
     let mut owed = router.release_physical_keys(&bound);
     owed.extend(router.release_physical_buttons(&bound));
+    // And the gesture in flight, `cancelled` (WS-E.4.2, issue #222). Same
+    // argument as the buttons one paragraph up, and it lands harder: the
+    // devices are closed for the whole pause, so no update and no end can
+    // ever arrive to finish a pinch the app is still accumulating.
+    owed.extend(router.end_physical_gesture(&bound));
+    // **And the pointer constraint** (WS-E.4.2, issue #222), which is the same
+    // latch shape one step further out: `libinput_suspend` has closed the
+    // devices, so for the whole pause no motion can carry the pointer out of
+    // the region and no withdrawal can arrive from an app that is not being
+    // told anything. Left recorded, it would be an app believing it holds a
+    // lock over a seat that is gone. Withdrawn rather than merely deactivated,
+    // and the shim is TOLD (`withdrawn`) rather than left to guess.
+    //
+    // It is also transient over the same interval — `output_gates().active` is
+    // false while the seat is away, so the sprite is back on the first frame
+    // after the pause regardless — but the record removal is what stops the
+    // constraint silently reactivating when the human comes back to a session
+    // whose app was never told anything happened.
+    let withdrawn = router.constraints().borrow_mut().withdraw(&bound);
+    send_constraint_verdicts(realms, withdrawn.into_iter().collect());
     let count = owed.len();
     for delivery in owed {
         tracing::debug!(
@@ -3555,6 +3620,133 @@ fn apply_selection_answer<H: RuntimeHost>(host: &mut H, realm_id: &RealmId, now:
     }
 }
 
+/// **Deliver every owed `pointer_constraint_state`** (WS-E.4.2, issue #222).
+///
+/// The one place a constraint verdict reaches a wire, so that "the core sends
+/// at most one of these per transition" is a property of one function rather
+/// than of six call sites. A realm with no shim (dead, or never started) is
+/// skipped in silence: there is nobody to tell, which is the same fact
+/// `InputRouter::reset_for`'s silent `forget` records.
+///
+/// **A send failure is never fatal here.** The shim has stopped reading; the
+/// transport's own slow-reader policy kills the connection on the next dispatch
+/// through the one funnel that classifies deaths, and taking the session down
+/// over an app that will not listen to being told its lock ended is the wrong
+/// trade. The record is already gone or already updated either way — the wire
+/// is the *report*, not the state.
+fn send_constraint_verdicts(
+    realms: &BTreeMap<RealmId, RealmRuntime>,
+    verdicts: Vec<crate::input::ConstraintVerdict>,
+) {
+    for verdict in verdicts {
+        let Some(realm) = realms.get(&verdict.realm) else {
+            continue;
+        };
+        let Some(server) = realm.server.as_ref() else {
+            continue;
+        };
+        let mut send = |frame: &[u8]| realm.outbox.send(frame);
+        match server.send_pointer_constraint_state(verdict.serial, verdict.state, &mut send) {
+            Ok(()) => tracing::debug!(
+                realm = %verdict.realm,
+                serial = verdict.serial,
+                state = ?verdict.state,
+                "pointer constraint state sent"
+            ),
+            Err(err) => tracing::warn!(
+                realm = %verdict.realm,
+                %err,
+                "pointer_constraint_state could not be sent"
+            ),
+        }
+    }
+}
+
+/// Fold a shim's parked `pointer_constraint` ask into the table (WS-E.4.2,
+/// issue #222), and send whatever that ask settles by itself.
+///
+/// The sibling of [`apply_selection_answer`] and drained on the same turn, from
+/// the same place in [`dispatch_shim`], for the same reason: an ask parked by a
+/// shim the core is about to bury must not reach the session's state.
+///
+/// What it does **not** do is decide whether the constraint is in force. That is
+/// derived, and [`reconcile_pointer_constraints`] answers it on the same
+/// dispatch round — so an ask and its `active` can arrive one after the other
+/// without this function knowing anything about overlays or focus.
+fn apply_pointer_constraint_ask<H: RuntimeHost>(host: &mut H, realm_id: &RealmId) {
+    let Runtime { realms, router, .. } = host.runtime();
+    let Some(ask) = realms
+        .get_mut(realm_id)
+        .and_then(|realm| realm.server.as_mut())
+        .and_then(|server| server.take_pointer_constraint_ask())
+    else {
+        return;
+    };
+    let owed = router.constraints().borrow_mut().ask(realm_id, ask);
+    send_constraint_verdicts(realms, owed);
+}
+
+/// **Recompute every pointer constraint from live state and tell the shims what
+/// changed** (WS-E.4.2, issue #222).
+///
+/// Level-triggered, edge-reported, and called once per dispatch round from
+/// [`post_dispatch`] **before the dirty gate** — the same position and the same
+/// argument as `set_agent_cursor`: a constraint going inactive because the
+/// human switched realms is a change nothing else in the round would announce,
+/// and an app owes no commit for it.
+///
+/// **This is the app-facing half of the derived design.** The human-facing half
+/// — whether the core draws its own cursor sprite — is
+/// `crate::input::hides_human_sprite`, evaluated separately inside the
+/// bare-metal composite from the same gates. Neither is *called* to announce a
+/// deactivation, so neither can be stranded by a call site that forgot: the
+/// consent card, the lock cover, the core notice, the dead-man hold, the realm
+/// switch, the unmapped surface and the paused output all reach both through
+/// [`Presenter::output_gates`] and the scene, with no code of their own.
+fn reconcile_pointer_constraints<H: RuntimeHost>(host: &mut H) {
+    let (runtime, view) = host.split();
+    let focused = view.focused().cloned();
+    let gates = crate::input::PresentationGates {
+        focused: focused.as_ref(),
+        output: view.output_gates(),
+        surface: focused
+            .as_ref()
+            .and_then(|realm| view.scene(realm))
+            .and_then(crate::scene::Scene::surface_size),
+        view: view.view_size(),
+        // The HUMAN's pointer, never the shared one: an agent's actuation must
+        // not be able to activate a lock, because activating one hides the
+        // human's own cursor (`RealmSeat::human_pointer`).
+        pointer: focused
+            .as_ref()
+            .and_then(|realm| runtime.router.human_pointer(realm)),
+    };
+    let owed = runtime.router.constraints().borrow_mut().reconcile(&gates);
+    // **The frame, not just the record.** `set_agent_cursor` twenty lines below
+    // takes exactly this shape for exactly this reason, and the sprite needs it
+    // more: its visibility is DERIVED per composed frame, so the predicate can
+    // never answer stale — but on a damage-driven backend nothing else in this
+    // round asks for a frame after a constraint ends, and the confined app owes
+    // no commit for having been unlocked. Without this the panel keeps the last
+    // frame composed while the constraint was active: the one with no cursor in
+    // it. Found by driving each deactivation path and watching the present
+    // counter stay at zero, after the derived design had already been reviewed
+    // and called sound.
+    if runtime
+        .router
+        .constraints()
+        .borrow_mut()
+        .take_repaint_owed()
+    {
+        runtime.dirty = true;
+        view.request_present();
+    }
+    if owed.is_empty() {
+        return;
+    }
+    send_constraint_verdicts(&runtime.realms, owed);
+}
+
 /// Turn a gated attention press into an open window (WS-E.1.7, issue #232):
 /// resolve who holds layout authority, tell exactly them, and open the window
 /// naming exactly that set.
@@ -3805,6 +3997,10 @@ fn dispatch_shim<H: RuntimeHost>(
             // accepted: a `selection` answer parked by a shim the core is about
             // to bury must not fill the human's clipboard (WS-E.2.1).
             apply_selection_answer(host, realm_id, Instant::now());
+            // ...and its sibling, on the same terms and for the same reason
+            // (WS-E.4.2): a `pointer_constraint` ask from a shim that has just
+            // violated the protocol must not reach the constraint table.
+            apply_pointer_constraint_ask(host, realm_id);
         }
         ConnectionEvent::Disconnected => {
             tracing::info!(realm = %realm_id, "shim connection closed");
@@ -3952,6 +4148,12 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
     // shape `service_consent` already set here; the two are microseconds apart
     // and neither compares against the other's sample.
     host.service_lock(Instant::now());
+    // ...and the pointer constraints, immediately after both, because both are
+    // gates it derives from: a card raised or a cover lowered one line above
+    // changes what every recorded constraint is worth. Before the dirty gate
+    // for `set_agent_cursor`'s reason — nothing else in this round would say a
+    // lock ended, and the confined app owes no commit for it.
+    reconcile_pointer_constraints(host);
     let fatal = {
         let (runtime, view) = host.split();
         // Also before the dirty gate, and for the same shape of reason: an
@@ -4292,6 +4494,18 @@ mod tests {
         /// can say what the human would have been shown, without this rig
         /// growing a second compositor to draw it with.
         attention: bool,
+        /// Whether the lock cover is up, for [`Presenter::output_gates`]
+        /// (WS-E.4.2). A plain flag rather than a real
+        /// [`crate::lock::LockSurface`], because this rig composites nothing
+        /// and what the pointer-constraint tests need is the *gate*, which is
+        /// one boolean either way. The consent half of the same gate is read
+        /// off the real [`Self::consent`], which a grab really does raise.
+        lock_raised: bool,
+        /// Whether the output can be presented to — the bare-metal
+        /// `DrmOutput::active` in miniature, cleared by the seat's pause arm.
+        /// `true` by default, which is the posture of every backend with no
+        /// seat to lose.
+        output_active: bool,
     }
 
     impl TestView {
@@ -4353,6 +4567,18 @@ mod tests {
         /// comparison would make them a function of wall time.
         fn refresh_status(&mut self, _now: std::time::SystemTime, _mono: Instant) -> bool {
             false
+        }
+        /// The pointer-constraint gates (WS-E.4.2, issue #222).
+        ///
+        /// The consent term reads the **real** surface a grab raises a card on,
+        /// so `a_consent_card_deactivates_a_pointer_constraint` drives the
+        /// production path rather than a fixture; the other two are flags this
+        /// rig has no compositor to derive.
+        fn output_gates(&self) -> crate::input::OutputGates {
+            crate::input::OutputGates {
+                overlay_up: self.consent.prompt().is_some() || self.lock_raised,
+                active: self.output_active,
+            }
         }
         fn scene_mut(&mut self, realm: &RealmId) -> &mut Scene {
             self.scenes.scene_mut(realm)
@@ -4615,6 +4841,8 @@ mod tests {
                     size: VIEW,
                     cursor_offered: None,
                     attention: false,
+                    lock_raised: false,
+                    output_active: true,
                 },
                 handle: handle.clone(),
                 signal: event_loop.get_signal(),
@@ -8076,9 +8304,41 @@ mod tests {
         // a verb bit (`Verb::VALID_MASK` is still 575). D-018(2) invariant 2 is
         // untouched. What they do add is a cross-realm channel the human drives
         // with two physical chords; that is D-024, not this invariant.
+        // Re-pinned 40 -> 45 by WS-E.4.2 (issue #222), decision taken rather
+        // than skipped: the five added messages are `relative_motion`,
+        // `gesture_begin`, `gesture_swipe_update`, `gesture_pinch_update` and
+        // `gesture_end` -- all EVENTS on `vitrin_shim_seat`, an interface the
+        // schema forbids from defining any request at all (B2), on the shim
+        // connection class no principal can address. None is a request on
+        // either layout interface, none adds an arrangement this scene cannot
+        // honour, and none allocates a verb bit (`Verb::VALID_MASK` is still
+        // 575). D-018(2) invariant 2 is untouched. What they do add is a
+        // pairing obligation on the core -- one `gesture_end` per
+        // `gesture_begin` delivered, on every path input is taken away; that
+        // is D-032, not this invariant.
+        // Re-pinned 45 -> 47 by WS-E.4.2's second half (issue #222), and this
+        // one needed the decision made rather than waved through, because it
+        // is the first addition since #213 that includes a REQUEST and the
+        // first ever that touches input ROUTING. The two added messages are
+        // `vitrin_shim_session.pointer_constraint` (a request) and
+        // `.pointer_constraint_state` (an event), both on the shim bootstrap
+        // object, on the shim connection class no principal can address.
+        // Neither is a request on either layout interface, neither adds an
+        // arrangement this scene cannot honour, and neither allocates a verb
+        // bit (`Verb::VALID_MASK` is still 575) -- so D-018(2) invariant 2's
+        // first half is untouched.
+        // Its SECOND half is the one worth stating: a pointer constraint
+        // changes what the APP is told, never what the core believes. The
+        // core's own hit test still decides which surface an input event
+        // reaches; an active constraint is applied where the app-facing
+        // position is MINTED, downstream of every gate and of the core's own
+        // geometry, and it is gated on `Origin::Physical` so a confined app
+        // cannot re-express a principal's actuation either. A constraint is
+        // also derived from no grant, so it adds no verb whose requests the
+        // server could fail to enforce. That is D-032, not this invariant.
         assert_eq!(
             vitrin_protocol::generated::MESSAGE_COUNT,
-            40,
+            47,
             "a message was added to the IDL. If it is a request on \
              vitrin_layout_arrange or vitrin_layout_focus, D-018(2) invariant 2 is at \
              stake: this scene shows one realm, unstacked and unoverlapped, so it cannot \
@@ -9710,5 +9970,455 @@ mod tests {
              pairing table's entry, never minted (B2)."
         );
         assert_ne!(a, b);
+    }
+
+    // ---- pointer constraints (WS-E.4.2, issue #222) ------------------------
+    //
+    // The state machine itself is unit-tested in `crate::input::constraint`.
+    // What these tests are about is the WIRING: that the reconciler really runs
+    // once per dispatch round, that the verdicts really reach a shim over a
+    // real socket, and that the four session-level events that must withdraw a
+    // constraint do -- and that the one that must NOT, does not.
+
+    /// Record a lock over `realm` and reconcile the session once, so the
+    /// constraint is in force by the production path.
+    ///
+    /// The record is placed straight into the router's own table rather than
+    /// through a `pointer_constraint` frame, because `vitrin-mock-shim` sends
+    /// none: this is a **component** test of the core's own arms and is stated
+    /// as such (CLAUDE.md's milestone rule). Everything downstream of the
+    /// record — the reconciler, the gates, the delivery — is the production
+    /// code.
+    fn lock_pointer_in(rig: &mut Rig, realm: &RealmId, serial: u32) {
+        use vitrin_protocol::generated::vitrin_shim_session::{
+            PointerConstraintKind, PointerConstraintLifetime,
+        };
+        let _ = rig.host.runtime.router.constraints().borrow_mut().ask(
+            realm,
+            crate::input::PointerConstraintAsk {
+                serial,
+                surface: Some(2),
+                kind: PointerConstraintKind::Lock,
+                lifetime: PointerConstraintLifetime::Persistent,
+                region: crate::input::ConstraintRegion {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+            },
+        );
+    }
+
+    /// Put the human's pointer in the middle of `realm`'s surface, through the
+    /// production intake, so the constraint has something to activate against.
+    fn human_pointer_onto(rig: &mut Rig, at: (f64, f64)) {
+        use crate::input::tests::physical_for_test;
+        route_physical_turn(
+            &mut rig.host.runtime,
+            &rig.host.view.scenes,
+            None,
+            vec![physical_for_test(crate::input::SeatInputKind::Motion {
+                x: at.0,
+                y: at.1,
+            })],
+            VIEW,
+            Instant::now(),
+        );
+    }
+
+    fn constraint_active(rig: &Rig, realm: &RealmId) -> bool {
+        rig.host
+            .runtime
+            .router
+            .constraints()
+            .borrow()
+            .is_active(realm)
+    }
+
+    /// A rig with one realm, a committed surface, the human's pointer on it,
+    /// and a lock in force.
+    fn locked_rig(label: &str) -> (Rig, RealmId, std::sync::MutexGuard<'static, ()>) {
+        // The guard is HANDED BACK rather than dropped here: it quiesces the
+        // fd-counting tests against this rig's forked shim, and a guard
+        // released at the end of this function would be no guard at all.
+        let fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            label,
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        rig.start_realm(&["--serve", "--seat"]);
+        rig.pump(Duration::from_millis(400));
+        let realm = RealmId::new(crate::realm::WELL_KNOWN_REALM_ID);
+        commit_into(&mut rig, &realm, VIEW.0, VIEW.1, 0x33);
+        human_pointer_onto(&mut rig, (VIEW.0 as f64 / 2.0, VIEW.1 as f64 / 2.0));
+        lock_pointer_in(&mut rig, &realm, 1);
+        reconcile_pointer_constraints(&mut rig.host);
+        assert!(
+            constraint_active(&rig, &realm),
+            "the fixture must put a lock into force, or every assertion below is vacuous"
+        );
+        (rig, realm, fd)
+    }
+
+    /// **A consent card raised over a locked pointer unfreezes it** (path 6),
+    /// **and the sharper negative: a locked app cannot make a consent card
+    /// unclickable.**
+    ///
+    /// This is the failure mode that would actually matter. A pointer lock is a
+    /// request from a *confined app*; the consent card is the trusted path the
+    /// human answers an agent's petition on. If a lock could freeze the pointer
+    /// while a card is up, an app could make its realm's own petitions
+    /// unanswerable — and the human's cursor invisible while they tried.
+    ///
+    /// It cannot, structurally, twice over. `ConsentGrab::judge_parts` records
+    /// the human's absolute pointer before any grab decision and the constraint
+    /// lives *below* `hook.gate`, so it is never consulted first. And the
+    /// prompt is one term of `overlay_needs_the_window`, which is
+    /// `Presenter::output_gates`' own first term — so the constraint is
+    /// deactivated for as long as the card is up. This asserts the second,
+    /// against a **real** card raised by a real petition, because it is the one
+    /// an edit could break; and it asserts the decision still commits.
+    #[test]
+    fn a_locked_pointer_cannot_make_a_consent_card_unclickable() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "constraint-consent",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let grab = rig.attach_grab();
+        rig.start_realm(&["--serve", "--seat"]);
+        rig.pump(Duration::from_millis(400));
+        let realm = RealmId::new(crate::realm::WELL_KNOWN_REALM_ID);
+        commit_into(&mut rig, &realm, VIEW.0, VIEW.1, 0x33);
+        let centre = (VIEW.0 as f64 / 2.0, VIEW.1 as f64 / 2.0);
+        human_pointer_onto(&mut rig, centre);
+        lock_pointer_in(&mut rig, &realm, 1);
+        reconcile_pointer_constraints(&mut rig.host);
+        assert!(constraint_active(&rig, &realm));
+
+        // The negative control, so the assertion below is not vacuous: with the
+        // lock in force and no card up, the human's absolute motion really IS
+        // dropped by the freeze.
+        human_pointer_onto(&mut rig, (4.0, 4.0));
+        assert_eq!(
+            rig.host.runtime.router.human_pointer(&realm),
+            Some(centre),
+            "the freeze must actually be freezing, or the rest of this test proves nothing"
+        );
+
+        // A real petition raises a real card on the real consent surface.
+        let mut client = agent(&rig.socket);
+        send_preamble(&mut client);
+        send_petition(&mut client);
+        let petition = pump_until_armed(&mut rig, &grab);
+        assert!(rig.host.view.consent.prompt().is_some());
+
+        reconcile_pointer_constraints(&mut rig.host);
+        assert!(
+            !constraint_active(&rig, &realm),
+            "a raised consent card must deactivate every pointer constraint: otherwise the \
+             pointer stays frozen and the human cannot reach Allow or Deny"
+        );
+        human_pointer_onto(&mut rig, (4.0, 4.0));
+        assert_eq!(
+            rig.host.runtime.router.human_pointer(&realm),
+            Some((4.0, 4.0)),
+            "the human's pointer must move again while a card is up"
+        );
+
+        // ...and the decision the human makes still commits.
+        grab.borrow_mut().queue_decision(Decision {
+            petition,
+            choice: Choice::Allow(PersistenceRung::Once),
+        });
+        rig.pump(Duration::from_millis(400));
+        assert_eq!(
+            rig.host.runtime.kernel.grants.rows(Instant::now()).count(),
+            1,
+            "an app holding a pointer lock must not be able to stop a human answering a card"
+        );
+
+        // The card comes down and the lock comes back by itself: nothing
+        // anywhere re-applies it, which is the persistent lifetime working.
+        human_pointer_onto(&mut rig, centre);
+        reconcile_pointer_constraints(&mut rig.host);
+        assert!(
+            constraint_active(&rig, &realm),
+            "a persistent lifetime must reactivate with no new ask once the card is down"
+        );
+    }
+
+    /// **A raised lock cover deactivates every pointer constraint** (path 7).
+    ///
+    /// Twice over, independently: the cover is a term of
+    /// `overlay_needs_the_window`, which this asserts, and `LockGate::judge`
+    /// consumes every physical pointer kind while raised, so a constrained app
+    /// receives nothing whatever the record says.
+    #[test]
+    fn a_raised_lock_deactivates_every_pointer_constraint() {
+        let (mut rig, realm, _fd) = locked_rig("constraint-lock");
+        rig.host.view.lock_raised = true;
+        reconcile_pointer_constraints(&mut rig.host);
+        assert!(!constraint_active(&rig, &realm));
+        rig.host.view.lock_raised = false;
+        reconcile_pointer_constraints(&mut rig.host);
+        assert!(
+            constraint_active(&rig, &realm),
+            "and it comes back on unlock"
+        );
+    }
+
+    /// **The dead-man chord withdraws every pointer constraint in the
+    /// session** (path 8).
+    ///
+    /// Not a transient deactivation but a **record removal**, and session-wide:
+    /// a constraint in a realm the chord was not held over goes too, because
+    /// the switch is session-wide by construction and a locked pointer anywhere
+    /// is part of what the human is taking back.
+    ///
+    /// The grant sweep cannot do this and must not be made to. A pointer
+    /// constraint is asked for by the confined app over its shim connection and
+    /// is derived from no grant row, so `revoke_principal` never sees one —
+    /// which is exactly why this needs its own line and its own test.
+    #[test]
+    fn the_dead_man_chord_withdraws_every_pointer_constraint_in_the_session() {
+        let (mut rig, realm, _fd) = locked_rig("constraint-deadman");
+        // A second realm the chord was NOT held over, to pin "session-wide".
+        let elsewhere = RealmId::new("realm-b");
+        lock_pointer_in(&mut rig, &elsewhere, 2);
+
+        rig.host.runtime.apply_dead_man(
+            &crate::deadman::Trigger {
+                chord: crate::deadman::DeadManConfig::default().chord.name(),
+                held: Duration::from_millis(1200),
+            },
+            Instant::now(),
+        );
+
+        let table = rig.host.runtime.router.constraints();
+        assert!(
+            table.borrow().get(&realm).is_none(),
+            "the chord must withdraw the constraint in the realm on screen"
+        );
+        assert!(
+            table.borrow().get(&elsewhere).is_none(),
+            "...and in every other realm too: the switch is session-wide"
+        );
+    }
+
+    /// **A seat pause withdraws the pointer constraint and tells the shim**
+    /// (path 9).
+    ///
+    /// The same latch shape the held keys, the held buttons and the in-flight
+    /// gesture already have, one step further out: `libinput_suspend` has
+    /// closed the devices, so for the whole pause no motion can carry the
+    /// pointer out of the region and no withdrawal can arrive from an app that
+    /// is being told nothing. Left recorded, it is an app believing it holds a
+    /// lock over a seat that is gone.
+    #[test]
+    fn a_seat_pause_withdraws_the_pointer_constraint_and_tells_the_shim() {
+        let (mut rig, realm, _fd) = locked_rig("constraint-seat-pause");
+        let switch = std::cell::RefCell::new(crate::deadman::DeadManSwitch::new(
+            crate::deadman::DeadManConfig::default(),
+        ));
+        suspend_physical_seat(&mut rig.host.runtime, &rig.host.view.scenes, &switch);
+        assert!(
+            rig.host
+                .runtime
+                .router
+                .constraints()
+                .borrow()
+                .get(&realm)
+                .is_none(),
+            "a constraint left recorded across a VT switch is a lock nothing can end"
+        );
+        // ...and it does not silently come back when the seat returns.
+        reconcile_pointer_constraints(&mut rig.host);
+        assert!(!constraint_active(&rig, &realm));
+    }
+
+    /// **Revoking every grant leaves an app's pointer constraint alone** (path
+    /// 11 — the one entry on the deactivation list whose answer is "nowhere").
+    ///
+    /// The property is that the two lifecycles do not touch. A pointer
+    /// constraint belongs to the confined app and is derived from no grant row;
+    /// an edge from grant revocation to constraint state would make an
+    /// **agent's** grant lifecycle able to move a **human's** cursor
+    /// visibility. Writing the "no" down as a test is how it stays absent — an
+    /// unrecorded "no" is how a reviewer adds a wrong edge later.
+    #[test]
+    fn revoking_every_grant_leaves_an_apps_pointer_constraint_alone() {
+        let (mut rig, realm, _fd) = locked_rig("constraint-grants");
+        let identity = PrincipalIdentity::parse(DEMO_IDENTITY).unwrap();
+        let revoked = rig.host.runtime.kernel.grants.revoke_principal(&identity);
+        // Whether any row existed is beside the point: the sweep ran, and the
+        // constraint is untouched either way.
+        let _ = revoked;
+        reconcile_pointer_constraints(&mut rig.host);
+        assert!(
+            constraint_active(&rig, &realm),
+            "a grant sweep must not reach the constraint table"
+        );
+    }
+
+    /// **A realm switch deactivates its pointer constraint and switching back
+    /// reactivates it** (path 3), driven through the production binding.
+    ///
+    /// The round trip is the point: only a round trip catches a one-way flag.
+    /// Wayland's `persistent` lifetime requires the lock to reactivate when the
+    /// surface regains focus, which a stored flag would need TWO call sites
+    /// for — one of which gets forgotten.
+    #[test]
+    fn a_realm_switch_deactivates_its_pointer_constraint_and_switching_back_reactivates_it() {
+        let (mut rig, realm, _fd) = locked_rig("constraint-switch");
+        let other = RealmId::new("realm-b");
+
+        rig.host.view.bind_output(&other);
+        reconcile_pointer_constraints(&mut rig.host);
+        assert!(
+            !constraint_active(&rig, &realm),
+            "the human is looking at another realm; the lock is not in force"
+        );
+
+        rig.host.view.bind_output(&realm);
+        reconcile_pointer_constraints(&mut rig.host);
+        assert!(
+            constraint_active(&rig, &realm),
+            "and it comes back with no new ask -- which is the whole of `persistent`"
+        );
+    }
+
+    /// **A dispatch round reconciles constraints, and a shim really receives
+    /// the verdict.**
+    ///
+    /// The wiring test the others rest on: `post_dispatch` must call the
+    /// reconciler **before** its dirty gate, or a session with nothing else
+    /// changing would never tell an app its lock ended. Asserted by driving a
+    /// clean (non-dirty) round.
+    #[test]
+    fn a_dispatch_round_reconciles_pointer_constraints_before_the_dirty_gate() {
+        let (mut rig, realm, _fd) = locked_rig("constraint-round");
+        rig.host.view.lock_raised = true;
+        rig.host.runtime.dirty = false;
+        post_dispatch(&mut rig.host);
+        assert!(
+            !constraint_active(&rig, &realm),
+            "post_dispatch must reconcile above the dirty gate: an idle session still has to \
+             tell an app that its lock stopped being in force"
+        );
+    }
+
+    /// **A constraint ending asks for the frame that redraws the sprite.**
+    ///
+    /// The predicate is derived per composed frame, so it can never answer
+    /// stale — but a predicate nobody samples changes nothing on a panel. On
+    /// the damage-driven DRM backend `compose_and_queue` runs only from
+    /// `service_present`, gated on `output.wanted`, and after a lock ends
+    /// nothing else in the round wants a frame: the record is gone, the app
+    /// owes no commit for having been unlocked, and `runtime.dirty` stays
+    /// false. Without the drain in `reconcile_pointer_constraints` the last
+    /// composed frame — composed while the constraint was Active, hence with
+    /// `human_cursor = None` — stays on scanout, and the human has no cursor
+    /// until some unrelated thing asks for a redraw.
+    ///
+    /// This asserts the *frame*, not the record. Two other tests already assert
+    /// the record and the predicate, and both passed while this was broken.
+    #[test]
+    fn a_constraint_ending_requests_the_frame_that_brings_the_sprite_back() {
+        let (mut rig, realm, _fd) = locked_rig("constraint-repaint");
+        // Quiesce: the fixture's own activation already owed a frame.
+        post_dispatch(&mut rig.host);
+        rig.host.runtime.dirty = false;
+        let presents_before = rig.host.view.presents;
+
+        // The app withdraws its own lock (path 1) — the quietest deactivation
+        // there is, and the one that strands hardest.
+        let owed = rig
+            .host
+            .runtime
+            .router
+            .constraints()
+            .borrow_mut()
+            .withdraw(&realm);
+        assert!(
+            owed.is_some(),
+            "the fixture's lock must have been withdrawable"
+        );
+        post_dispatch(&mut rig.host);
+
+        assert!(
+            rig.host.view.presents > presents_before,
+            "a constraint ending must ask for a frame: the sprite is derived per composed \
+             frame, so a deactivation nobody composes leaves the human looking at the last \
+             frame drawn while the pointer was locked — the one with no cursor in it"
+        );
+    }
+
+    /// **Session shutdown leaves no pointer constraint behind** (path 10).
+    ///
+    /// The sprite obligation is **vacuous** here and that is worth saying
+    /// rather than smoothing over with a call that does nothing: there is no
+    /// next frame, so nothing can be hidden. What is not vacuous is the record.
+    /// Shim connections go through path 4's death funnel; principal
+    /// connections go through `teardown_open_connections`, which touches no
+    /// constraint because a constraint belongs to no principal — and the table
+    /// itself drops with the `Rc` when the `Runtime` drops.
+    ///
+    /// Asserted rather than argued, because "the table empties" is the only
+    /// observable that distinguishes it from "the process happened to exit".
+    #[test]
+    fn session_shutdown_leaves_no_pointer_constraint_behind() {
+        let (mut rig, realm, _fd) = locked_rig("constraint-shutdown");
+        rig.host.runtime.teardown_open_connections();
+        assert!(
+            rig.host
+                .runtime
+                .router
+                .constraints()
+                .borrow()
+                .get(&realm)
+                .is_some(),
+            "a PRINCIPAL teardown must not touch an app's constraint: the two lifecycles do \
+             not meet, which is the same property the grant test pins from the other side"
+        );
+        // The realm's own death is what takes it, and after that the session
+        // holds nothing.
+        close_realm(&mut rig.host, &realm, DeathCause::ConnectionClosed);
+        assert_eq!(
+            rig.host.runtime.router.constraints().borrow().len(),
+            0,
+            "the session must end holding no constraint record at all"
+        );
+    }
+
+    /// **A realm's death takes its constraint with it, through the one death
+    /// funnel** (path 4), and leaves the session with nothing recorded (path
+    /// 10).
+    #[test]
+    fn a_realms_death_takes_its_pointer_constraint_with_it() {
+        let (mut rig, realm, _fd) = locked_rig("constraint-death");
+        close_realm(&mut rig.host, &realm, DeathCause::ConnectionClosed);
+        assert!(
+            rig.host
+                .runtime
+                .router
+                .constraints()
+                .borrow()
+                .get(&realm)
+                .is_none(),
+            "the death funnel reaches the constraint table through InputRouter::reset_for"
+        );
+        // ...and `rebind_output_after_death` needs nothing of its own (path 5):
+        // the record is already gone and a dead realm cannot be focused.
+        rebind_output_after_death(&mut rig.host);
+        reconcile_pointer_constraints(&mut rig.host);
+        assert!(!constraint_active(&rig, &realm));
     }
 }

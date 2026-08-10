@@ -18,7 +18,10 @@
 
 use smithay::backend::input::{
     AbsolutePositionEvent, AxisRelativeDirection, AxisSource, Device, DeviceCapability, Event,
-    InputBackend, KeyboardKeyEvent, Keycode, PointerAxisEvent, PointerButtonEvent, UnusedEvent,
+    GestureBeginEvent, GestureEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
+    GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
+    InputBackend, KeyboardKeyEvent, Keycode, PointerAxisEvent, PointerButtonEvent,
+    PointerMotionEvent, UnusedEvent,
 };
 
 use smithay::backend::input as host;
@@ -172,6 +175,152 @@ impl KeyboardKeyEvent<SyntheticHost> for SyntheticKey {
     }
 }
 
+/// Relative pointer motion, with the accelerated and unaccelerated deltas
+/// held independently — they are two different numbers on a real device and
+/// [`super::SeatInputKind::RelativeMotion`] carries both, so a fixture that
+/// tied them together could not catch the one bug worth catching here (a
+/// translation that copies one into the other's field).
+pub(crate) struct SyntheticRelativeMotion {
+    pub dx: f64,
+    pub dy: f64,
+    pub dx_unaccel: f64,
+    pub dy_unaccel: f64,
+}
+
+impl Event<SyntheticHost> for SyntheticRelativeMotion {
+    fn time(&self) -> u64 {
+        0
+    }
+    fn device(&self) -> SyntheticDevice {
+        SyntheticDevice
+    }
+}
+
+impl PointerMotionEvent<SyntheticHost> for SyntheticRelativeMotion {
+    fn delta_x(&self) -> f64 {
+        self.dx
+    }
+    fn delta_y(&self) -> f64 {
+        self.dy
+    }
+    fn delta_x_unaccel(&self) -> f64 {
+        self.dx_unaccel
+    }
+    fn delta_y_unaccel(&self) -> f64 {
+        self.dy_unaccel
+    }
+}
+
+/// A gesture begin. One type serves swipe and pinch, exactly as the wire's
+/// one `gesture_begin` does: Smithay's `GestureSwipeBeginEvent` and
+/// `GesturePinchBeginEvent` are both empty marker traits over
+/// [`GestureBeginEvent`], so the two host events differ only in which
+/// `InputEvent` variant carries them.
+pub(crate) struct SyntheticGestureBegin {
+    pub fingers: u32,
+}
+
+impl Event<SyntheticHost> for SyntheticGestureBegin {
+    fn time(&self) -> u64 {
+        0
+    }
+    fn device(&self) -> SyntheticDevice {
+        SyntheticDevice
+    }
+}
+
+impl GestureBeginEvent<SyntheticHost> for SyntheticGestureBegin {
+    fn fingers(&self) -> u32 {
+        self.fingers
+    }
+}
+
+impl GestureSwipeBeginEvent<SyntheticHost> for SyntheticGestureBegin {}
+impl GesturePinchBeginEvent<SyntheticHost> for SyntheticGestureBegin {}
+
+/// A gesture end, likewise shared. `cancelled` is the libinput flag the
+/// intake turns into `gesture_state`.
+pub(crate) struct SyntheticGestureEnd {
+    pub cancelled: bool,
+}
+
+impl Event<SyntheticHost> for SyntheticGestureEnd {
+    fn time(&self) -> u64 {
+        0
+    }
+    fn device(&self) -> SyntheticDevice {
+        SyntheticDevice
+    }
+}
+
+impl GestureEndEvent<SyntheticHost> for SyntheticGestureEnd {
+    fn cancelled(&self) -> bool {
+        self.cancelled
+    }
+}
+
+impl GestureSwipeEndEvent<SyntheticHost> for SyntheticGestureEnd {}
+impl GesturePinchEndEvent<SyntheticHost> for SyntheticGestureEnd {}
+
+/// A swipe's motion: the centre delta since the gesture's previous event.
+pub(crate) struct SyntheticSwipeUpdate {
+    pub dx: f64,
+    pub dy: f64,
+}
+
+impl Event<SyntheticHost> for SyntheticSwipeUpdate {
+    fn time(&self) -> u64 {
+        0
+    }
+    fn device(&self) -> SyntheticDevice {
+        SyntheticDevice
+    }
+}
+
+impl GestureSwipeUpdateEvent<SyntheticHost> for SyntheticSwipeUpdate {
+    fn delta_x(&self) -> f64 {
+        self.dx
+    }
+    fn delta_y(&self) -> f64 {
+        self.dy
+    }
+}
+
+/// A pinch's motion. The four quantities are independent here for the same
+/// reason they are independent on the wire: `scale` is absolute since the
+/// begin while the other three are deltas, and a fixture that derived one
+/// from another could not catch a translation that swapped them.
+pub(crate) struct SyntheticPinchUpdate {
+    pub dx: f64,
+    pub dy: f64,
+    pub scale: f64,
+    pub rotation: f64,
+}
+
+impl Event<SyntheticHost> for SyntheticPinchUpdate {
+    fn time(&self) -> u64 {
+        0
+    }
+    fn device(&self) -> SyntheticDevice {
+        SyntheticDevice
+    }
+}
+
+impl GesturePinchUpdateEvent<SyntheticHost> for SyntheticPinchUpdate {
+    fn delta_x(&self) -> f64 {
+        self.dx
+    }
+    fn delta_y(&self) -> f64 {
+        self.dy
+    }
+    fn scale(&self) -> f64 {
+        self.scale
+    }
+    fn rotation(&self) -> f64 {
+        self.rotation
+    }
+}
+
 pub(crate) struct SyntheticHost;
 
 impl InputBackend for SyntheticHost {
@@ -179,14 +328,14 @@ impl InputBackend for SyntheticHost {
     type KeyboardKeyEvent = SyntheticKey;
     type PointerAxisEvent = SyntheticScroll;
     type PointerButtonEvent = SyntheticButton;
-    type PointerMotionEvent = UnusedEvent;
+    type PointerMotionEvent = SyntheticRelativeMotion;
     type PointerMotionAbsoluteEvent = SyntheticMotion;
-    type GestureSwipeBeginEvent = UnusedEvent;
-    type GestureSwipeUpdateEvent = UnusedEvent;
-    type GestureSwipeEndEvent = UnusedEvent;
-    type GesturePinchBeginEvent = UnusedEvent;
-    type GesturePinchUpdateEvent = UnusedEvent;
-    type GesturePinchEndEvent = UnusedEvent;
+    type GestureSwipeBeginEvent = SyntheticGestureBegin;
+    type GestureSwipeUpdateEvent = SyntheticSwipeUpdate;
+    type GestureSwipeEndEvent = SyntheticGestureEnd;
+    type GesturePinchBeginEvent = SyntheticGestureBegin;
+    type GesturePinchUpdateEvent = SyntheticPinchUpdate;
+    type GesturePinchEndEvent = SyntheticGestureEnd;
     type GestureHoldBeginEvent = UnusedEvent;
     type GestureHoldEndEvent = UnusedEvent;
     type TouchDownEvent = UnusedEvent;

@@ -395,6 +395,17 @@ pub(crate) struct ShimServer {
     /// before that drain replaces the first — a shim that answers twice is
     /// answering a question that was asked once.
     selection_answer: Option<SelectionAnswer>,
+    /// The `pointer_constraint` ask this shim sent and the runtime has not yet
+    /// drained (WS-E.4.2, issue #222).
+    ///
+    /// Parked for exactly the reason [`Self::selection_answer`] is: this type
+    /// knows about one connection's object graph and nothing about the realm
+    /// registry, the scene, or the router that holds the constraint table. The
+    /// runtime drains it with [`Self::take_pointer_constraint_ask`] on the same
+    /// turn, and a second ask before that drain replaces the first — which is
+    /// the same answer the table itself gives a second ask, so the two cannot
+    /// disagree about which one won.
+    pointer_constraint_ask: Option<crate::input::PointerConstraintAsk>,
 }
 
 /// One shim's answer to a `request_selection`, waiting for the runtime.
@@ -422,12 +433,47 @@ impl ShimServer {
             retained_dmabuf: None,
             copy_meter: CopyMeter::default(),
             selection_answer: None,
+            pointer_constraint_ask: None,
         }
     }
 
     /// Take this shim's pending `selection` answer, if it sent one.
     pub fn take_selection_answer(&mut self) -> Option<SelectionAnswer> {
         self.selection_answer.take()
+    }
+
+    /// Take this shim's pending `pointer_constraint` ask, if it sent one
+    /// (WS-E.4.2, issue #222). The sibling of [`Self::take_selection_answer`],
+    /// drained on the same turn by the same dispatch path.
+    pub fn take_pointer_constraint_ask(&mut self) -> Option<crate::input::PointerConstraintAsk> {
+        self.pointer_constraint_ask.take()
+    }
+
+    /// Send `vitrin_shim_session.pointer_constraint_state` — the core's verdict
+    /// on one `pointer_constraint` ask, and its running state afterwards
+    /// (WS-E.4.2, issue #222).
+    ///
+    /// **Addressed to the session object, never the seat.** That is a second,
+    /// independent reason the pair lives on `vitrin_shim_session`: a shim that
+    /// asks for a lock before it has processed `get_seat` still gets its
+    /// answer, because the answer does not need a seat to have a destination.
+    ///
+    /// **Not a terminal reply.** Conventions 6.1's exactly-one-terminal rule
+    /// does not apply: a constraint's state changes for reasons the shim never
+    /// asked about — the human switched realms, a consent card went up — so
+    /// binding the answer 1:1 to the ask would leave an app locked with no
+    /// message that could ever tell it otherwise. That is the latch this design
+    /// exists to prevent.
+    pub fn send_pointer_constraint_state<F>(
+        &self,
+        serial: u32,
+        state: session::PointerConstraintStatus,
+        send: &mut F,
+    ) -> Result<(), TransportError>
+    where
+        F: FnMut(&[u8]) -> Result<(), TransportError>,
+    {
+        send(&session::events::PointerConstraintState { serial, state }.encode(SHIM_SESSION_ID))
     }
 
     /// Send `vitrin_shim_session.request_selection` — the first half of the
@@ -617,6 +663,51 @@ impl ShimServer {
                         status: req.status,
                         mime: req.mime,
                         data: req.data,
+                    });
+                    Ok(false)
+                }
+                session::requests::PointerConstraint::OPCODE => {
+                    // Decoding is where the razor's second clause is already
+                    // enforced: an out-of-range `kind` or `lifetime` is fatal
+                    // `invalid_argument` before a byte of this reaches the
+                    // core's own state.
+                    let (_, req) = session::requests::PointerConstraint::decode(&msg.bytes, msg.fd)
+                        .map_err(ShimViolation::from)?;
+                    // ...and the razor's FIRST clause, which decoding cannot
+                    // reach: a surface id this connection never minted is the
+                    // shim violating its own object graph, so it is fatal
+                    // `invalid_object` rather than a refusal. Note the
+                    // asymmetry with the surface-is-gone case, which is not a
+                    // violation at all: version 1 has no destructors, so a
+                    // minted surface stays minted and the only way to name one
+                    // that is not here is to invent it.
+                    if let Some(surface) = req.surface {
+                        if !self.surfaces.contains_key(&surface) {
+                            return Err(ShimViolation::InvalidObject {
+                                object_id: surface,
+                                detail: "pointer_constraint names a surface this connection \
+                                         never minted",
+                            }
+                            .into());
+                        }
+                    }
+                    // Parked, never acted on here (field docs). A `kind=none`
+                    // withdrawal carries a null surface and an ignored region,
+                    // and both travel as they arrived: the table is where the
+                    // "the core ignores them in that case rather than treating
+                    // a decorated withdrawal as data" rule is applied, because
+                    // that is where the state machine is.
+                    self.pointer_constraint_ask = Some(crate::input::PointerConstraintAsk {
+                        serial: req.serial,
+                        surface: req.surface,
+                        kind: req.kind,
+                        lifetime: req.lifetime,
+                        region: crate::input::ConstraintRegion {
+                            x: req.x,
+                            y: req.y,
+                            width: req.width,
+                            height: req.height,
+                        },
                     });
                     Ok(false)
                 }
@@ -2943,5 +3034,182 @@ mod tests {
         }
         let _ = spawned.child_mut().wait();
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- pointer constraints (WS-E.4.2, issue #222) ------------------------
+
+    fn send_pointer_constraint(
+        shim: &mut Connection,
+        serial: u32,
+        surface: Option<u32>,
+        kind: session::PointerConstraintKind,
+    ) {
+        let req = session::requests::PointerConstraint {
+            serial,
+            surface,
+            kind,
+            lifetime: session::PointerConstraintLifetime::Persistent,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+        shim.send_message(&req.encode(SHIM_SESSION_ID), None)
+            .expect("send pointer_constraint");
+    }
+
+    /// **A `pointer_constraint` is parked, never acted on** — the discipline
+    /// this type keeps for every cross-cutting effect.
+    ///
+    /// The server knows about one connection's object graph and nothing about
+    /// the realm registry or the router's constraint table, so all it may do is
+    /// decode, check the object graph, and hand the ask to the runtime.
+    #[test]
+    fn a_pointer_constraint_ask_is_parked_for_the_runtime_to_drain() {
+        let (mut server, mut scene, mut core, mut shim) = setup();
+        let create = session::requests::CreateSurface {
+            surface: SURFACE_ID,
+        };
+        shim.send_message(&create.encode(SHIM_SESSION_ID), None)
+            .expect("create_surface");
+        send_pointer_constraint(
+            &mut shim,
+            42,
+            Some(SURFACE_ID),
+            session::PointerConstraintKind::Lock,
+        );
+        process_n(&mut server, &mut scene, &mut core, 2).expect("both are legal");
+
+        let ask = server
+            .take_pointer_constraint_ask()
+            .expect("the ask is parked for the runtime");
+        assert_eq!(ask.serial, 42);
+        assert_eq!(ask.surface, Some(SURFACE_ID));
+        assert_eq!(ask.kind, session::PointerConstraintKind::Lock);
+        assert!(
+            server.take_pointer_constraint_ask().is_none(),
+            "the drain empties the slot: an ask is acted on exactly once"
+        );
+    }
+
+    /// **A second ask before the drain replaces the first** — the same answer
+    /// the constraint table itself gives a second ask, so the two halves cannot
+    /// disagree about which one won.
+    #[test]
+    fn a_second_ask_before_the_drain_replaces_the_first() {
+        let (mut server, mut scene, mut core, mut shim) = setup();
+        let create = session::requests::CreateSurface {
+            surface: SURFACE_ID,
+        };
+        shim.send_message(&create.encode(SHIM_SESSION_ID), None)
+            .expect("create_surface");
+        send_pointer_constraint(
+            &mut shim,
+            1,
+            Some(SURFACE_ID),
+            session::PointerConstraintKind::Lock,
+        );
+        send_pointer_constraint(
+            &mut shim,
+            2,
+            Some(SURFACE_ID),
+            session::PointerConstraintKind::Confine,
+        );
+        process_n(&mut server, &mut scene, &mut core, 3).expect("all three are legal");
+        let ask = server.take_pointer_constraint_ask().expect("one ask");
+        assert_eq!(ask.serial, 2);
+    }
+
+    /// **A constraint naming a surface this connection never minted is fatal
+    /// `invalid_object`** — the error razor's first clause, which decoding
+    /// cannot reach.
+    ///
+    /// Version 1 has no destructors, so a minted surface stays minted: the only
+    /// way to name one that is not here is to invent it, which is the shim
+    /// violating its own object graph rather than asking for something the
+    /// deployment declines.
+    #[test]
+    fn a_pointer_constraint_over_an_unminted_surface_is_fatal() {
+        let (mut server, mut scene, mut core, mut shim) = setup();
+        send_pointer_constraint(
+            &mut shim,
+            1,
+            Some(4242),
+            session::PointerConstraintKind::Lock,
+        );
+        let err = process_n(&mut server, &mut scene, &mut core, 1)
+            .expect_err("a surface this connection never minted is a violation");
+        assert!(
+            matches!(
+                err,
+                ShimFault::Violation(ShimViolation::InvalidObject {
+                    object_id: 4242,
+                    ..
+                })
+            ),
+            "expected invalid_object, got {err}"
+        );
+        assert!(
+            server.take_pointer_constraint_ask().is_none(),
+            "a violating ask must not reach the constraint table"
+        );
+    }
+
+    /// **A withdrawal carries a null surface and is perfectly legal.**
+    ///
+    /// The `kind=none` arm is the whole state machine's withdrawal input, and
+    /// its `surface` MUST be null — so the object-graph check above must not
+    /// fire on it.
+    #[test]
+    fn a_withdrawal_with_a_null_surface_is_accepted() {
+        let (mut server, mut scene, mut core, mut shim) = setup();
+        send_pointer_constraint(&mut shim, 7, None, session::PointerConstraintKind::None);
+        process_n(&mut server, &mut scene, &mut core, 1).expect("a withdrawal is legal");
+        let ask = server.take_pointer_constraint_ask().expect("parked");
+        assert_eq!(ask.kind, session::PointerConstraintKind::None);
+        assert_eq!(ask.surface, None);
+    }
+
+    /// **An ask before `get_seat` still gets its verdict** (path 16).
+    ///
+    /// A second, independent reason the pair lives on `vitrin_shim_session`:
+    /// the verdict is addressed to the session object (implicit id 1), so a
+    /// shim that has not minted its seat is not left waiting. Modelled on
+    /// `seat_event_before_get_seat_is_dropped_not_an_error`, which pins the
+    /// mirror-image fact for the seat's own events.
+    #[test]
+    fn a_pointer_constraint_ask_before_get_seat_is_parked_and_the_verdict_still_arrives() {
+        let (mut server, mut scene, mut core, mut shim) = setup();
+        let create = session::requests::CreateSurface {
+            surface: SURFACE_ID,
+        };
+        shim.send_message(&create.encode(SHIM_SESSION_ID), None)
+            .expect("create_surface");
+        send_pointer_constraint(
+            &mut shim,
+            5,
+            Some(SURFACE_ID),
+            session::PointerConstraintKind::Lock,
+        );
+        process_n(&mut server, &mut scene, &mut core, 2).expect("legal without a seat");
+        assert!(!server.seat_minted(), "no get_seat was ever sent");
+        assert!(server.take_pointer_constraint_ask().is_some());
+
+        // ...and the verdict goes out anyway, addressed to the session object.
+        server
+            .send_pointer_constraint_state(
+                5,
+                session::PointerConstraintStatus::Inactive,
+                &mut |frame| core.send_message(frame, None),
+            )
+            .expect("the verdict needs no seat to have a destination");
+        // Drain configure first: it is the guaranteed-first event.
+        let _configure = shim.recv_message().expect("recv").expect("configure");
+        let msg = shim.recv_message().expect("recv").expect("the verdict");
+        let (object_id, ev) = session::events::PointerConstraintState::decode(&msg.bytes, msg.fd)
+            .expect("decodes as the verdict");
+        assert_eq!(object_id, SHIM_SESSION_ID);
+        assert_eq!(ev.serial, 5);
+        assert_eq!(ev.state, session::PointerConstraintStatus::Inactive);
     }
 }

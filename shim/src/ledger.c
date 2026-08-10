@@ -293,6 +293,14 @@ static const char *const vitrin_v0_contract[] = {
 	"wl_output",
 	"xdg_wm_base",
 	"wl_seat",
+	/* The three version-2 pointer interfaces (WS-E.4.2, issue #222). They
+	 * must be here as well as in globals.c, and the omission would not be
+	 * quiet: `in_v0_contract` is what stops the probe catalogue advertising a
+	 * SECOND, inert copy that the app could bind instead of the real one, and
+	 * the teardown wire check would report `globals-contract-drift` for each. */
+	"zwp_relative_pointer_manager_v1",
+	"zwp_pointer_gestures_v1",
+	"zwp_pointer_constraints_v1",
 	"wl_data_device_manager",
 	"zxdg_decoration_manager_v1",
 	"zwp_linux_dmabuf_v1", /* only with --dmabuf; see is_optional below */

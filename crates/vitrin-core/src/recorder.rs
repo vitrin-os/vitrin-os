@@ -561,6 +561,19 @@ impl ActuationDetail {
                 // text path is `Text`); typed and shape-only if it ever
                 // does, so no future variant can leak by default.
                 SeatInputKind::Key { .. } => None,
+                // Nor can the version-2 physical classes (WS-E.4.2, issue
+                // #222). No actuator mints a relative delta or a gesture --
+                // `vitrin_actuator_pointer.move` is absolute and no verb
+                // grants a gesture at all -- so a use carrying one is
+                // unconstructible today. Listed rather than caught by a
+                // wildcard so that whoever adds the actuator half has to
+                // decide here what an audit entry may say about it, which is
+                // this function's whole reason for living in the recorder.
+                SeatInputKind::RelativeMotion { .. }
+                | SeatInputKind::GestureBegin { .. }
+                | SeatInputKind::GestureSwipeUpdate { .. }
+                | SeatInputKind::GesturePinchUpdate { .. }
+                | SeatInputKind::GestureEnd { .. } => None,
             },
         }
     }

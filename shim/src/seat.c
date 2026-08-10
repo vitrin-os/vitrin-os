@@ -31,6 +31,8 @@
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_pointer_gestures_v1.h>
+#include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/util/box.h>
@@ -50,6 +52,55 @@ _Static_assert(VITRIN_SHIM_SEAT_ORIGIN_PHYSICAL == 0,
 	"origin.physical must be 0, which is why the tag is stored biased");
 _Static_assert(VITRIN_ORIGIN_UNSET == 0,
 	"the unset tag must be the all-zeroes value");
+
+/* `delivered[]` is indexed by opcode and sized from gesture_end's, so every
+ * opcode this file counts must fit. Spelled out per opcode rather than as one
+ * `max()`: an opcode that outgrows the array fails at the line that names it,
+ * instead of writing past the end of the struct at runtime. An opcode appended
+ * AFTER gesture_end is caught by the message-count pin below.
+ *
+ * This is the check that was missing when the array was a literal `5` -- the
+ * version-2 append would have made the first replayed relative_motion
+ * corrupt whatever follows `delivered` in `struct vitrin_seat_replay`. */
+_Static_assert(VITRIN_SHIM_SEAT_EVT_MOTION_OPCODE < VITRIN_SEAT_EVENT_SLOTS, "opcode fits");
+_Static_assert(VITRIN_SHIM_SEAT_EVT_BUTTON_OPCODE < VITRIN_SEAT_EVENT_SLOTS, "opcode fits");
+_Static_assert(VITRIN_SHIM_SEAT_EVT_SCROLL_OPCODE < VITRIN_SEAT_EVENT_SLOTS, "opcode fits");
+_Static_assert(VITRIN_SHIM_SEAT_EVT_KEY_OPCODE < VITRIN_SEAT_EVENT_SLOTS, "opcode fits");
+_Static_assert(VITRIN_SHIM_SEAT_EVT_TEXT_OPCODE < VITRIN_SEAT_EVENT_SLOTS, "opcode fits");
+_Static_assert(VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_OPCODE < VITRIN_SEAT_EVENT_SLOTS,
+	"opcode fits");
+_Static_assert(VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_OPCODE < VITRIN_SEAT_EVENT_SLOTS, "opcode fits");
+_Static_assert(VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_OPCODE < VITRIN_SEAT_EVENT_SLOTS,
+	"opcode fits");
+_Static_assert(VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_OPCODE < VITRIN_SEAT_EVENT_SLOTS,
+	"opcode fits");
+_Static_assert(VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE < VITRIN_SEAT_EVENT_SLOTS, "opcode fits");
+
+/* THE ASSERTS ABOVE COVER ONLY OPCODES THAT ALREADY EXIST, and the list is as
+ * hand-maintained as the literal `5` it replaced. This is what catches an event
+ * appended AFTER gesture_end.
+ *
+ * The comments here used to claim the per-opcode asserts did that. THEY DID
+ * NOT, and it was proved rather than reasoned about: a probe event appended
+ * after gesture_end took opcode 10, `delivered[10]` was written in a 10-element
+ * array, and `src_seat.c.o` compiled clean under -Wall -Wextra -Werror. That is
+ * a real out-of-bounds write, and a comment telling the next maintainer a guard
+ * exists is worse than no comment when the guard does not.
+ *
+ * The pin works because the generated header emits no per-interface event
+ * count, so "is gesture_end still the last vitrin_shim_seat event" is not
+ * expressible here -- but ANY new message raises VITRIN_MESSAGE_COUNT, so this
+ * fails first and sends the maintainer to the paragraph above.
+ *
+ * WHEN THIS FAILS: bump the number. Then, iff the new message is a
+ * vitrin_shim_seat EVENT, re-derive VITRIN_SEAT_EVENT_SLOTS (seat.h) from the
+ * new last opcode and add its `_Static_assert` above -- BEFORE any replay
+ * indexes delivered[] with it. The core's own `session.rs` pins the same
+ * constant for the same reason, so a message added to the IDL turns two
+ * unrelated files red on purpose. */
+_Static_assert(VITRIN_MESSAGE_COUNT == 47,
+	"a message was appended to the IDL -- read the paragraph above before touching "
+	"delivered[]");
 
 /* The keysym the IDL mandates for a newline in `text`: "a newline (\\n)
  * MUST be rendered as Return and a tab (\\t) as Tab". This is NOT what
@@ -753,6 +804,221 @@ static void replay_scroll(struct vitrin_seat_replay *r, struct vitrin_origin ori
 		value120, value);
 }
 
+/* ---- relative pointer replay (protocol version 2) --------------------- */
+
+/* `relative_motion` -> `zwp_relative_pointer_v1.relative_motion`.
+ *
+ * THIS DOES NOT MOVE THE POINTER, and that is the whole shape of the event.
+ * The absolute `motion` that accompanies it is what moves the cursor and
+ * drives the hit test; this carries the delta an app integrates for itself.
+ * Replaying it as a motion instead would double every movement.
+ *
+ * FOCUS IS THE GATE. `wlr_relative_pointer_manager_v1_send_relative_motion`
+ * fans out to the relative-pointer objects of the seat's FOCUSED client only
+ * (wlroots checks `seat->pointer_state.focused_surface`'s client), so a delta
+ * arriving before the app has pointer focus reaches nobody. The check is made
+ * here as well, and not left to wlroots, for the trace's sake: a silent
+ * no-delivery would be recorded as `delivered=1`, and the trace is the only
+ * evidence the origin tag survived the hop.
+ *
+ * NO FRAME. `wl_pointer.frame` groups wl_pointer events, and this is not one
+ * -- the relative-pointer protocol has no frame of its own and wlroots emits
+ * none. Arming `frame_pending` here would make the shim send a frame for an
+ * empty group whenever a delta arrived with no wl_pointer event beside it.
+ *
+ * MICROSECONDS, not milliseconds: this one wlroots entry point takes usec
+ * (its header says so in as many words), where every other one here takes
+ * msec. Stamped with the shim's own clock, as every replay is -- the wire
+ * carries no timestamp, deliberately, so there is no device clock to prefer. */
+static void replay_relative_motion(struct vitrin_seat_replay *r, struct vitrin_origin origin,
+		double dx, double dy, double dx_unaccel, double dy_unaccel) {
+	struct vitrin_shim *s = r->shim;
+	if (r->relative_pointers == NULL) {
+		r->dropped++;
+		trace(r, origin, "relative_motion", false, "no-global",
+			"dx=%.3f,%.3f unaccel=%.3f,%.3f", dx, dy, dx_unaccel, dy_unaccel);
+		return;
+	}
+	if (s->seat->pointer_state.focused_surface == NULL) {
+		r->dropped++;
+		trace(r, origin, "relative_motion", false, "no-focus",
+			"dx=%.3f,%.3f unaccel=%.3f,%.3f", dx, dy, dx_unaccel, dy_unaccel);
+		return;
+	}
+
+	uint64_t time_usec = (uint64_t)now_msec() * 1000u;
+	wlr_relative_pointer_manager_v1_send_relative_motion(
+		r->relative_pointers, s->seat, time_usec, dx, dy, dx_unaccel, dy_unaccel);
+	r->delivered[VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_OPCODE]++;
+	trace(r, origin, "relative_motion", true, "ok",
+		"dx=%.3f,%.3f unaccel=%.3f,%.3f", dx, dy, dx_unaccel, dy_unaccel);
+}
+
+/* ---- gesture replay (protocol version 2) ------------------------------ */
+
+static const char *gesture_kind_name(vitrin_shim_seat_gesture_kind_t kind) {
+	return kind == VITRIN_SHIM_SEAT_GESTURE_KIND_PINCH ? "pinch" : "swipe";
+}
+
+/* Every gesture replay needs the same two things to be true, and reports the
+ * same two failures the same way. Returns false having already traced. */
+static bool gesture_ready(struct vitrin_seat_replay *r, struct vitrin_origin origin,
+		const char *event, const char *detail) {
+	if (r->gestures == NULL) {
+		r->dropped++;
+		trace(r, origin, event, false, "no-global", "%s", detail);
+		return false;
+	}
+	if (r->shim->seat->pointer_state.focused_surface == NULL) {
+		r->dropped++;
+		trace(r, origin, event, false, "no-focus", "%s", detail);
+		return false;
+	}
+	return true;
+}
+
+static void replay_gesture_begin(struct vitrin_seat_replay *r, struct vitrin_origin origin,
+		vitrin_shim_seat_gesture_kind_t kind, uint32_t fingers) {
+	char detail[64];
+	snprintf(detail, sizeof(detail), "kind=%s fingers=%u", gesture_kind_name(kind), fingers);
+	if (!gesture_ready(r, origin, "gesture_begin", detail)) {
+		return;
+	}
+	/* The IDL's "at most one gesture is in flight per seat", enforced rather
+	 * than trusted. A second begin is the core's bug: replaying it would give
+	 * the app two begins to pair one end against, and the app's own
+	 * accounting -- not this shim's -- is what would be left broken. Ignored
+	 * and logged; the connection stays up, because log-and-close is the
+	 * remedy for a SHIM's violation and an app must not die of the core's. */
+	if (r->gesture_live) {
+		r->dropped++;
+		trace(r, origin, "gesture_begin", false, "already-in-flight",
+			"%s in_flight=%s", detail, gesture_kind_name(r->gesture_kind));
+		return;
+	}
+
+	uint32_t time = now_msec();
+	if (kind == VITRIN_SHIM_SEAT_GESTURE_KIND_PINCH) {
+		wlr_pointer_gestures_v1_send_pinch_begin(r->gestures, r->shim->seat, time, fingers);
+	} else {
+		wlr_pointer_gestures_v1_send_swipe_begin(r->gestures, r->shim->seat, time, fingers);
+	}
+	/* Recorded only on the delivered path, exactly as `pressed[]` is: an app
+	 * that was never told a gesture began must never be sent its updates or
+	 * its end. */
+	r->gesture_live = true;
+	r->gesture_kind = kind;
+	r->delivered[VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_OPCODE]++;
+	trace(r, origin, "gesture_begin", true, "ok", "%s", detail);
+}
+
+/* Shared by both update events: an update is replayed iff a gesture of ITS
+ * kind is the one this shim has in flight. `event` and `detail` are the
+ * caller's so the trace names the actual event. */
+static bool gesture_update_ready(struct vitrin_seat_replay *r, struct vitrin_origin origin,
+		vitrin_shim_seat_gesture_kind_t kind, const char *event, const char *detail) {
+	if (!gesture_ready(r, origin, event, detail)) {
+		return false;
+	}
+	if (!r->gesture_live) {
+		r->dropped++;
+		trace(r, origin, event, false, "no-gesture-in-flight", "%s", detail);
+		return false;
+	}
+	if (r->gesture_kind != kind) {
+		/* A pinch update inside a swipe. The app is tracking a swipe; handing
+		 * it pinch motion would be motion for a gesture of a shape it is not
+		 * making. */
+		r->dropped++;
+		trace(r, origin, event, false, "wrong-gesture-kind",
+			"%s in_flight=%s", detail, gesture_kind_name(r->gesture_kind));
+		return false;
+	}
+	return true;
+}
+
+static void replay_gesture_swipe_update(struct vitrin_seat_replay *r,
+		struct vitrin_origin origin, double dx, double dy) {
+	char detail[64];
+	snprintf(detail, sizeof(detail), "dx=%.3f dy=%.3f", dx, dy);
+	if (!gesture_update_ready(r, origin, VITRIN_SHIM_SEAT_GESTURE_KIND_SWIPE,
+			"gesture_swipe_update", detail)) {
+		return;
+	}
+	wlr_pointer_gestures_v1_send_swipe_update(r->gestures, r->shim->seat, now_msec(), dx, dy);
+	r->delivered[VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_OPCODE]++;
+	trace(r, origin, "gesture_swipe_update", true, "ok", "%s", detail);
+}
+
+static void replay_gesture_pinch_update(struct vitrin_seat_replay *r,
+		struct vitrin_origin origin, double dx, double dy, double scale, double rotation) {
+	char detail[96];
+	/* `scale` is absolute since the begin while the other three are deltas
+	 * (IDL). Nothing here differences or accumulates it -- it is passed
+	 * through, because wlroots' `send_pinch_update` takes the same absolute
+	 * quantity `zwp_pointer_gestures_v1` defines. The two agree by
+	 * construction, which is why this is a forward and not a conversion. */
+	snprintf(detail, sizeof(detail), "dx=%.3f dy=%.3f scale=%.3f rotation=%.3f",
+		dx, dy, scale, rotation);
+	if (!gesture_update_ready(r, origin, VITRIN_SHIM_SEAT_GESTURE_KIND_PINCH,
+			"gesture_pinch_update", detail)) {
+		return;
+	}
+	wlr_pointer_gestures_v1_send_pinch_update(
+		r->gestures, r->shim->seat, now_msec(), dx, dy, scale, rotation);
+	r->delivered[VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_OPCODE]++;
+	trace(r, origin, "gesture_pinch_update", true, "ok", "%s", detail);
+}
+
+static void replay_gesture_end(struct vitrin_seat_replay *r, struct vitrin_origin origin,
+		vitrin_shim_seat_gesture_kind_t kind, vitrin_shim_seat_gesture_state_t state) {
+	bool cancelled = state == VITRIN_SHIM_SEAT_GESTURE_STATE_CANCELLED;
+	char detail[80];
+	snprintf(detail, sizeof(detail), "kind=%s state=%s",
+		gesture_kind_name(kind), cancelled ? "cancelled" : "completed");
+
+	/* Checked BEFORE `gesture_ready`, and the order is the point. An end with
+	 * nothing in flight is dropped whatever the state of the globals; but if
+	 * a gesture IS live and the app has since lost pointer focus, the local
+	 * bookkeeping must still be cleared -- the gesture is over either way,
+	 * and leaving it live would make every later gesture in this shim's life
+	 * be refused as "already in flight". Same shape as the key path's
+	 * `no-keyboard-focus` release arm, which reconciles and then reports the
+	 * truth. */
+	if (!r->gesture_live) {
+		r->dropped++;
+		trace(r, origin, "gesture_end", false, "no-gesture-in-flight", "%s", detail);
+		return;
+	}
+	/* The gesture that is actually in flight is the one that gets ended,
+	 * never the one the event named. `kind` is redundant by construction and
+	 * is carried so that a disagreement is a DETECTABLE core bug rather than
+	 * a silent mis-replay (IDL); ending nothing on a mismatch would leave the
+	 * app accumulating the real gesture forever, which is the failure the
+	 * argument exists to catch. */
+	vitrin_shim_seat_gesture_kind_t live = r->gesture_kind;
+	if (live != kind) {
+		wlr_log(WLR_ERROR,
+			"gesture_end names %s but %s is in flight; ending the one in flight "
+			"(a core bug -- the wire carries `kind` so this is visible rather than silent)",
+			gesture_kind_name(kind), gesture_kind_name(live));
+	}
+	r->gesture_live = false;
+
+	if (!gesture_ready(r, origin, "gesture_end", detail)) {
+		return; /* already traced, and the bookkeeping is reconciled above */
+	}
+	uint32_t time = now_msec();
+	if (live == VITRIN_SHIM_SEAT_GESTURE_KIND_PINCH) {
+		wlr_pointer_gestures_v1_send_pinch_end(r->gestures, r->shim->seat, time, cancelled);
+	} else {
+		wlr_pointer_gestures_v1_send_swipe_end(r->gestures, r->shim->seat, time, cancelled);
+	}
+	r->delivered[VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE]++;
+	trace(r, origin, "gesture_end", true, live == kind ? "ok" : "kind-mismatch",
+		"%s ended=%s", detail, gesture_kind_name(live));
+}
+
 void vitrin_seat_frame_boundary(struct vitrin_shim *s) {
 	struct vitrin_seat_replay *r = &s->replay;
 	if (!r->frame_pending) {
@@ -1181,6 +1447,71 @@ void vitrin_seat_handle_event(struct vitrin_shim *s, const uint8_t *frame, size_
 		replay_text(r, vitrin_origin_from_wire(ev.origin), ev.text.data, ev.text.len);
 		break;
 	}
+	case VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_OPCODE: {
+		vitrin_shim_seat_evt_relative_motion_t ev;
+		vitrin_decode_status_t st = vitrin_shim_seat_evt_relative_motion_decode(
+			frame, len, -1, &object_id, &ev);
+		if (st != VITRIN_DECODE_OK) {
+			wlr_log(WLR_ERROR, "malformed relative_motion: %s",
+				vitrin_decode_status_string(st));
+			return;
+		}
+		replay_relative_motion(r, vitrin_origin_from_wire(ev.origin),
+			vitrin_fixed_to_double(ev.dx), vitrin_fixed_to_double(ev.dy),
+			vitrin_fixed_to_double(ev.dx_unaccel), vitrin_fixed_to_double(ev.dy_unaccel));
+		break;
+	}
+	case VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_OPCODE: {
+		vitrin_shim_seat_evt_gesture_begin_t ev;
+		vitrin_decode_status_t st =
+			vitrin_shim_seat_evt_gesture_begin_decode(frame, len, -1, &object_id, &ev);
+		if (st != VITRIN_DECODE_OK) {
+			wlr_log(WLR_ERROR, "malformed gesture_begin: %s",
+				vitrin_decode_status_string(st));
+			return;
+		}
+		replay_gesture_begin(r, vitrin_origin_from_wire(ev.origin), ev.kind, ev.fingers);
+		break;
+	}
+	case VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_OPCODE: {
+		vitrin_shim_seat_evt_gesture_swipe_update_t ev;
+		vitrin_decode_status_t st = vitrin_shim_seat_evt_gesture_swipe_update_decode(
+			frame, len, -1, &object_id, &ev);
+		if (st != VITRIN_DECODE_OK) {
+			wlr_log(WLR_ERROR, "malformed gesture_swipe_update: %s",
+				vitrin_decode_status_string(st));
+			return;
+		}
+		replay_gesture_swipe_update(r, vitrin_origin_from_wire(ev.origin),
+			vitrin_fixed_to_double(ev.dx), vitrin_fixed_to_double(ev.dy));
+		break;
+	}
+	case VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_OPCODE: {
+		vitrin_shim_seat_evt_gesture_pinch_update_t ev;
+		vitrin_decode_status_t st = vitrin_shim_seat_evt_gesture_pinch_update_decode(
+			frame, len, -1, &object_id, &ev);
+		if (st != VITRIN_DECODE_OK) {
+			wlr_log(WLR_ERROR, "malformed gesture_pinch_update: %s",
+				vitrin_decode_status_string(st));
+			return;
+		}
+		replay_gesture_pinch_update(r, vitrin_origin_from_wire(ev.origin),
+			vitrin_fixed_to_double(ev.dx), vitrin_fixed_to_double(ev.dy),
+			vitrin_fixed_to_double(ev.scale), vitrin_fixed_to_double(ev.rotation));
+		break;
+	}
+	case VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE: {
+		vitrin_shim_seat_evt_gesture_end_t ev;
+		vitrin_decode_status_t st =
+			vitrin_shim_seat_evt_gesture_end_decode(frame, len, -1, &object_id, &ev);
+		if (st != VITRIN_DECODE_OK) {
+			wlr_log(WLR_ERROR, "malformed gesture_end: %s",
+				vitrin_decode_status_string(st));
+			return;
+		}
+		replay_gesture_end(r, vitrin_origin_from_wire(ev.origin), ev.kind, ev.state);
+		break;
+	}
 	default:
 		/* Version skew, not an attack -- the core is the TCB. Discard and
 		 * keep serving, as the conventions' tolerate-unknown-events posture
@@ -1273,16 +1604,38 @@ void vitrin_seat_finish(struct vitrin_shim *s) {
 	if (r->keyboard != NULL) {
 		wlr_log(WLR_INFO,
 			"seat replay down: motion=%llu button=%llu scroll=%llu key=%llu text=%llu "
+			"relative_motion=%llu gesture_begin=%llu gesture_swipe_update=%llu "
+			"gesture_pinch_update=%llu gesture_end=%llu "
 			"dropped=%llu keys=%llu codepoints=%llu unmappable=%llu keymaps=%llu",
 			(unsigned long long)r->delivered[VITRIN_SHIM_SEAT_EVT_MOTION_OPCODE],
 			(unsigned long long)r->delivered[VITRIN_SHIM_SEAT_EVT_BUTTON_OPCODE],
 			(unsigned long long)r->delivered[VITRIN_SHIM_SEAT_EVT_SCROLL_OPCODE],
 			(unsigned long long)r->delivered[VITRIN_SHIM_SEAT_EVT_KEY_OPCODE],
 			(unsigned long long)r->delivered[VITRIN_SHIM_SEAT_EVT_TEXT_OPCODE],
+			(unsigned long long)r->delivered[VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_OPCODE],
+			(unsigned long long)r->delivered[VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_OPCODE],
+			(unsigned long long)
+				r->delivered[VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_OPCODE],
+			(unsigned long long)
+				r->delivered[VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_OPCODE],
+			(unsigned long long)r->delivered[VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE],
 			(unsigned long long)r->dropped, (unsigned long long)r->keys_synthesized,
 			(unsigned long long)r->codepoints_delivered,
 			(unsigned long long)r->codepoints_unmappable,
 			(unsigned long long)r->keymap_generations);
+	}
+	/* A gesture the app was told had begun, with the shim now going down.
+	 * Nothing can be sent -- the seat is about to be destroyed and the client
+	 * with it -- so this is a log line and not a repair. It is worth one: a
+	 * shim that exits mid-gesture is either the realm dying or a bug, and the
+	 * core owes exactly one end per begin, so an unpaired one here is the
+	 * single place that debt becomes visible from this side. */
+	if (r->gesture_live) {
+		wlr_log(WLR_INFO,
+			"seat replay down with a %s gesture still in flight; the app was told it "
+			"began and will not be told it ended",
+			gesture_kind_name(r->gesture_kind));
+		r->gesture_live = false;
 	}
 	/* Order matters: `wlr_keyboard_finish` asserts that nothing is still
 	 * listening to the keyboard's signals, and it synthesizes a release for

@@ -159,6 +159,17 @@ do *not* advertise is otherwise completely invisible — is documented in
 | `xdg_wm_base` | 6 | 6 | |
 | `wl_data_device_manager` | 3 | 3 | added in P1.6.3 for GDK |
 | `zxdg_decoration_manager_v1` | 1 | — | **never bound.** Firefox draws its own decorations and does not negotiate; the global costs nothing and is kept for apps that do. |
+| `zwp_relative_pointer_manager_v1` | 1 | 1 | **added in WS-E.4.2.** `class=probe` at the time of *this* run (seq=81) — the demand line is what admitted it; see below. |
+| `zwp_pointer_gestures_v1` | 3 | 1 and 3 | **added in WS-E.4.2.** `class=probe` at the time of this run (seq=36 and seq=82), two binds from two connections. |
+| `zwp_pointer_constraints_v1` | 1 | 1 | **added in WS-E.4.2.** `class=probe` at the time of this run (seq=80); see below for why it took the wire's request/verdict pair to serve it. |
+
+The last three rows are **anachronistic on purpose**: at the time this run was
+recorded all three were probe globals, which is precisely why the run contains
+their `globals-demand` lines at all (`in_v0_contract` never arms a probe for an
+interface already in the v0 set). They are listed here rather than only in the
+prose below so the two tables stay a complete partition of what the run
+touched — a reader who checks one interface against one table must not have to
+know which half-issue moved it.
 
 ### The addition: `wl_subcompositor`
 
@@ -201,11 +212,45 @@ so they composite into the same buffer and travel upstream as ordinary damage.
 
 ### What Firefox asked for and did not get
 
-Fifteen interfaces, all refused deliberately. The list is mirrored in
+Twelve interfaces. The list is mirrored in
 [`firefox-refused-globals.txt`](firefox-refused-globals.txt), which the
 acceptance script enforces. Firefox degrades gracefully on every one — it
 renders, repaints, scrolls and navigates without them, which is the empirical
 part of "no more than is genuinely needed".
+
+It was fifteen until WS-E.4.2 (issue #222), and it is now twelve. Protocol
+version 2 grew `relative_motion` and the four gesture events, so
+`zwp_relative_pointer_manager_v1` and `zwp_pointer_gestures_v1` entered the v0
+set — each added on the evidence rule, citing the `globals-demand` lines this
+very run produced (seq=81, and seq=36/82). `zwp_pointer_constraints_v1`
+followed in the same workstream (seq=80). That is the ledger doing the job it
+was built for: a demand line recorded in 2026 became the argument for a global
+in 2026, without anyone having to remember.
+
+**The third took longer than the other two, and the reason is the interesting
+part.** Relative motion and gestures are input *classes*: the core already knew
+how to mint them, so serving them was a replay and the global followed the wire
+events. A pointer constraint is an *ask* — the app wants the core to do
+something — and it could not be served until the wire grew a request and a
+verdict for it (`vitrin_shim_session.pointer_constraint` and
+`pointer_constraint_state`). Until then the global would have advertised a
+capability nothing could answer, which is the half-serving this whole mechanism
+exists to prevent. What settled the objection recorded against it below is not
+that the objection was wrong: it is that the answer moved to the core, which is
+the only party that can weigh an app's ask against a human's screen. See
+[`../include/constraint.h`](../include/constraint.h) for the shim's half and
+`docs/plan/20-decision-log.md` D-032 for the decision.
+
+**Not every row below is a refusal, and the two registers are kept apart on
+purpose.** Most are genuine decisions against a capability. Two —
+`zwp_tablet_manager_v2`, and `wl_touch` (a `wl_seat` capability rather than a
+global, so it can appear in no ledger in either direction) — are **not yet
+served**: no wire vocabulary exists for them, and the machine the input
+classes were measured on has neither device, which is evidence about one
+laptop and not a property of a class. What would reopen each is recorded in
+this repository's decision log. Firefox binds the tablet manager whether or
+not a tablet is present, so its demand line says something about GTK rather
+than about this hardware.
 
 | Interface | Why not |
 |---|---|
@@ -213,10 +258,7 @@ part of "no more than is genuinely needed".
 | `wp_fractional_scale_manager_v1` | Same reason, fractional. The realm view has one integer scale. |
 | `wp_presentation` | Presentation timestamps. v0 paces the app with the core's `frame_done` relay (PRD Doc 2 §4.4) — that *is* the presentation clock, and a second, unsynchronised one would be a lie about when pixels were shown. |
 | `wp_cursor_shape_manager_v1` | Lets a client name a cursor instead of supplying a buffer. The shim has no cursor at all — the core owns the pointer, and cursor rendering is the core's business. |
-| `zwp_pointer_constraints_v1` | Pointer lock/confinement. Would fight the actuation model head-on: D10 says the agent addresses realm-view pixel coordinates, and a client that can warp or confine the pointer can invalidate what the agent observed between observation and actuation. Needs a deliberate design pass, not a stub. |
-| `zwp_relative_pointer_manager_v1` | The other half of pointer lock. Same argument; also, v0's seat vocabulary has no relative-motion event to feed it. |
-| `zwp_pointer_gestures_v1` | Pinch/swipe/hold. v0 has no gesture event on the wire; advertising this invites a client to wait for gestures that can never arrive. |
-| `zwp_tablet_manager_v2` | Same shape, for a device class the realm has no vocabulary for. |
+| `zwp_tablet_manager_v2` | **Not yet served**, and the distinction from the refusals above is the point. There is no tablet vocabulary on the wire, so the global would have nothing behind it — the same not-half-serving rule that keeps `wl_touch` out of the seat capabilities. What would reopen it: a tablet in the measured device set. Note that this demand line is evidence about GTK and not about this hardware — GTK binds the tablet manager whether or not a tablet is present — so the *app* half of the case is already banked. |
 | `zwp_text_input_manager_v3` | IME. This is explicitly the **Phase-2 E2.8 workstream** (D7): the dynamic-keymap technique is the Phase-1 answer and `text-input-v3` is what retires it. Adding an inert one now would make apps *stop* using the keymap path that works. |
 | `zwp_primary_selection_device_manager_v1` | Middle-click paste. Unlike `wl_data_device_manager` — which GDK treats as a prerequisite for having a seat at all — nothing depends on this to function; it is convenience, and the same one-client argument that makes it harmless also makes it useless. |
 | `zwp_keyboard_shortcuts_inhibit_manager_v1` | Lets a client ask the compositor to stop intercepting shortcuts. The shim intercepts none: every key it delivers came from the core. Nothing to inhibit. |

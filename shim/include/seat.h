@@ -4,8 +4,8 @@
  *
  * SPDX-License-Identifier: MPL-2.0
  *
- * This is the actuation half of artifact A5. `upstream.c` receives the five
- * seat events off the wire; everything that happens to them afterwards lives
+ * This is the actuation half of artifact A5. `upstream.c` receives the seat
+ * events off the wire; everything that happens to them afterwards lives
  * here. The core is a router, this file is the replayer, and the app is an
  * ordinary Wayland client that cannot tell it is being driven.
  *
@@ -16,6 +16,20 @@
  *   scroll(axis, v120, origin)  -> wl_pointer axis (high-resolution v120)
  *   key(keysym, state, origin)  -> wl_keyboard key against a dynamic keymap
  *   text(string, origin)        -> a run of key press/release pairs, ditto
+ *
+ * ...and, since protocol version 2 (WS-E.4.2, issue #222):
+ *
+ *   relative_motion(dx, dy, dx_unaccel, dy_unaccel, origin)
+ *                               -> zwp_relative_pointer_v1.relative_motion
+ *   gesture_begin(kind, fingers, origin)
+ *   gesture_swipe_update(dx, dy, origin)
+ *   gesture_pinch_update(dx, dy, scale, rotation, origin)
+ *   gesture_end(kind, state, origin)
+ *                               -> zwp_pointer_gestures_v1, swipe or pinch
+ *
+ * Both of those need a global the v0 set did not advertise, and each was
+ * added on the evidence rule globals.c states: a `globals-demand` line from a
+ * real app in a real pre-addition run. See globals.c for the citations.
  *
  * ====================================================================
  * B2: HOW THE ORIGIN TAG SURVIVES DELIVERY, STRUCTURALLY, IN C
@@ -71,7 +85,8 @@
  *      encoding its origin is a compile error".
  *
  * WHERE THE TAG BECOMES OBSERVABLE. There is no shim -> core message on
- * `vitrin_shim_seat` (0 requests, 5 events) and none anywhere else for
+ * `vitrin_shim_seat` at all -- the schema forbids this interface from having
+ * requests -- and none anywhere else for
  * input acknowledgement, so the core's flight recorder
  * (crates/vitrin-core/src/recorder.rs) structurally cannot record what the
  * shim *delivered* -- only what it *sent*. The shim therefore emits its own
@@ -224,6 +239,8 @@
 
 struct vitrin_shim;
 struct wlr_keyboard;
+struct wlr_pointer_gestures_v1;
+struct wlr_relative_pointer_manager_v1;
 struct wlr_surface;
 struct xkb_context;
 
@@ -295,6 +312,24 @@ const char *vitrin_origin_name(struct vitrin_origin o);
  * `wlr_keyboard` tracks at most 32 simultaneously pressed keys, and a
  * pointer has five buttons a human can hold; both caps are generous. */
 #define VITRIN_MAX_PRESSED_BUTTONS 8
+
+/* Slots in the per-opcode delivery counter: one per `vitrin_shim_seat` event,
+ * derived from the generated header's LAST event opcode rather than written
+ * as a literal.
+ *
+ * This was a hand-written `5` until version 2 appended opcodes 5..9
+ * (WS-E.4.2, issue #222), at which point the first replayed
+ * `relative_motion` would have written one past the end of the array. Deriving
+ * it means the next appended event grows the array by construction -- PROVIDED
+ * the derivation still names the last opcode. Nothing in the generated header
+ * can say whether it does, so seat.c pins `VITRIN_MESSAGE_COUNT` instead: an
+ * event appended after `gesture_end` fails the build THERE, and sends the
+ * maintainer back here before anything can index `delivered[]` with it.
+ *
+ * An earlier version of this comment claimed seat.c `_Static_assert`ed that
+ * gesture_end really was the last opcode. It did not, and the gap was a real
+ * out-of-bounds write rather than a documentation slip -- see seat.c. */
+#define VITRIN_SEAT_EVENT_SLOTS ((unsigned)VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE + 1u)
 
 /* One keycode slot's binding. `held` is what keeps the FIFO recycler from
  * pulling a keycode out from under a key the app still believes is down. */
@@ -370,9 +405,50 @@ struct vitrin_seat_replay {
 	/* A pointer event has been sent since the last `wl_pointer.frame`. */
 	bool frame_pending;
 
+	/* ---- the two version-2 pointer extensions (WS-E.4.2, issue #222) ----
+	 *
+	 * Created in globals.c, where every wl_global this shim advertises is
+	 * created and where each one's evidence is written down; held here
+	 * rather than in `struct vitrin_shim` because they are input-replay
+	 * machinery and nothing outside this file touches them.
+	 *
+	 * Either may be NULL: creation is best-effort, on the same reasoning
+	 * `--dmabuf` uses. A shim that could not create the relative-pointer
+	 * global still replays absolute motion, which is the whole of the v0
+	 * pointer path; killing the realm over an optional extension would trade
+	 * a degraded app for no app. The replay helpers check. */
+	struct wlr_relative_pointer_manager_v1 *relative_pointers;
+	struct wlr_pointer_gestures_v1 *gestures;
+
+	/* THE GESTURE IN FLIGHT, or `gesture_live == false`.
+	 *
+	 * The shim's half of the IDL's "at most one gesture is in flight per
+	 * seat", and it exists because this side has to be able to tell a
+	 * mis-sequenced event from a legitimate one WITHOUT trusting the core to
+	 * be correct. Three rules hang off it, all from `gesture_begin`'s and
+	 * `gesture_end`'s own descriptions:
+	 *
+	 *   - a second begin while one is live is IGNORED (never replayed, and
+	 *     never closes the connection: log-and-close is the remedy for a
+	 *     SHIM's violation, and an app must not die of the core's mistake);
+	 *   - an update or an end with nothing live is IGNORED, because replaying
+	 *     it would tell the app to move or finish a gesture it never saw
+	 *     begin;
+	 *   - an end whose `kind` disagrees with `gesture_kind` ends the gesture
+	 *     THIS SIDE actually has, and logs. Ending nothing would leave the
+	 *     app accumulating the real one forever, which is the failure the
+	 *     redundant `kind` argument exists to make detectable.
+	 *
+	 * wlroots keeps no such state for us: `wlr_pointer_gestures_v1` is a
+	 * pure sender, so an unpaired `send_pinch_end` would go straight out to
+	 * the client. */
+	bool gesture_live;
+	vitrin_shim_seat_gesture_kind_t gesture_kind;
+
 	/* ---- instrumentation, and the delivery trace's sequence number ---- */
 	uint64_t seq;
-	uint64_t delivered[5]; /* indexed by opcode: motion/button/scroll/key/text */
+	/* Indexed by seat-event opcode; see VITRIN_SEAT_EVENT_SLOTS. */
+	uint64_t delivered[VITRIN_SEAT_EVENT_SLOTS];
 	uint64_t dropped;
 	uint64_t keys_synthesized;
 	uint64_t codepoints_delivered;

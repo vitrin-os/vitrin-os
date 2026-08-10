@@ -89,6 +89,8 @@ static int sink = 0;
     X(vitrin_shim_session_req_selection)                                     \
     X(vitrin_shim_session_evt_request_selection)                             \
     X(vitrin_shim_session_evt_offer_selection)                               \
+    X(vitrin_shim_session_req_pointer_constraint)                            \
+    X(vitrin_shim_session_evt_pointer_constraint_state)                      \
     X(vitrin_shim_surface_req_attach)                                        \
     X(vitrin_shim_surface_req_damage)                                        \
     X(vitrin_shim_surface_req_commit)                                        \
@@ -99,6 +101,11 @@ static int sink = 0;
     X(vitrin_shim_seat_evt_scroll)                                           \
     X(vitrin_shim_seat_evt_key)                                              \
     X(vitrin_shim_seat_evt_text)                                             \
+    X(vitrin_shim_seat_evt_relative_motion)                                  \
+    X(vitrin_shim_seat_evt_gesture_begin)                                    \
+    X(vitrin_shim_seat_evt_gesture_swipe_update)                             \
+    X(vitrin_shim_seat_evt_gesture_pinch_update)                             \
+    X(vitrin_shim_seat_evt_gesture_end)                                      \
     X(vitrin_launcher_req_launch)                                            \
     X(vitrin_launcher_evt_launched)                                          \
     X(vitrin_layout_focus_req_focus)                                         \
@@ -176,7 +183,17 @@ static void check_every_symbol_type_checks(void) {
         sink += (status_str != NULL) ? 1 : 0;
     }
 
-    /* ---- enum/bitfield validity predicates, one per enum in the IDL ---- */
+    /* ---- enum/bitfield validity predicates, one per enum in the IDL ----
+     *
+     * UNLIKE the message list above, this one has NO count gate: there is no
+     * generated VITRIN_ENUM_COUNT to _Static_assert against, so an enum
+     * appended to the IDL silently goes untype-checked here. It had, twice,
+     * and both were found and closed while adding the two below:
+     * `vitrin_layout_arrange_mode` (WS-E.1.4) and
+     * `vitrin_shim_session_selection_status` (WS-E.2.1) were missing. That
+     * is the exact failure the banner comment records for the MESSAGE list
+     * before it gained its gate; whoever next touches the generator should
+     * consider emitting an enum count so this list gets one too. */
     CHECK_IS_VALID(vitrin_handshake_error_is_valid);
     CHECK_IS_VALID(vitrin_grant_verb_is_valid);
     CHECK_IS_VALID(vitrin_grant_persistence_is_valid);
@@ -187,10 +204,14 @@ static void check_every_symbol_type_checks(void) {
     CHECK_IS_VALID(vitrin_view_frame_flags_is_valid);
     CHECK_IS_VALID(vitrin_actuator_pointer_button_state_is_valid);
     CHECK_IS_VALID(vitrin_actuator_pointer_axis_is_valid);
+    CHECK_IS_VALID(vitrin_shim_session_selection_status_is_valid);
     CHECK_IS_VALID(vitrin_shim_surface_kind_is_valid);
     CHECK_IS_VALID(vitrin_shim_surface_buffer_status_is_valid);
     CHECK_IS_VALID(vitrin_shim_seat_key_state_is_valid);
     CHECK_IS_VALID(vitrin_shim_seat_origin_is_valid);
+    CHECK_IS_VALID(vitrin_shim_seat_gesture_kind_is_valid);
+    CHECK_IS_VALID(vitrin_shim_seat_gesture_state_is_valid);
+    CHECK_IS_VALID(vitrin_layout_arrange_mode_is_valid);
 
     /* ---- every message's encode + decode, in header (document) order ---- */
     VITRIN_EVERY_MESSAGE(CHECK_MESSAGE)

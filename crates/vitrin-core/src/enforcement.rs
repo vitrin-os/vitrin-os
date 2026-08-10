@@ -1522,11 +1522,18 @@ mod tests {
     struct Rule<'r> {
         what: &'r str,
         needle: &'r str,
-        /// A longer phrase whose occurrences are excused everywhere by
-        /// subtraction: it contains the needle without naming the
+        /// Longer phrases whose occurrences are excused everywhere by
+        /// subtraction: each contains the needle without naming the
         /// guarded item (the chokepoint's own outcome variant shares
-        /// the wire event's `Refused` name).
-        excused: Option<&'r str>,
+        /// the wire event's `Refused` name, and so does an unrelated
+        /// wire enum on another interface).
+        ///
+        /// **Every excusal must be a QUALIFIED path**, never a bare
+        /// alias, which is what keeps the subtraction honest: a bare
+        /// `Refused` anywhere outside the home module still trips the
+        /// rule, so an excused enum can only spend its excusal by
+        /// spelling out which enum it is.
+        excused: &'r [&'r str],
         home: &'r str,
         /// Exact non-test occurrence count required in enforcement.rs.
         in_enforcement: usize,
@@ -1566,6 +1573,14 @@ mod tests {
         // P1.4.5 flight recorder) can match on it anywhere.
         let refusal_name = format!("{}used", "Ref");
         let outcome_variant = format!("UseOutcome::{}used", "Ref");
+        // ...and a THIRD name that is not this vocabulary at all: the wire's
+        // `vitrin_shim_session.pointer_constraint_status` has a `refused`
+        // entry (WS-E.4.2, issue #222), and an app being told its pointer lock
+        // was declined has nothing to do with a principal's grant being
+        // refused. It is excused by its own qualified path, exactly as the
+        // chokepoint's outcome variant is, so a BARE `Refused` in
+        // `input/constraint.rs` still trips this rule.
+        let constraint_status = format!("PointerConstraintStatus::{}used", "Ref");
         // (4) The capture mechanics entry has exactly one caller outside
         // its home module: the chokepoint, after admission.
         let capture_entry = format!("render_{}", "frame");
@@ -1581,35 +1596,40 @@ mod tests {
             Rule {
                 what: "chokepoint table query",
                 needle: &table_query,
-                excused: None,
+                excused: &[],
                 home: "grants.rs",
                 in_enforcement: 1,
             },
             Rule {
                 what: "refusal event name",
                 needle: &refusal_name,
-                excused: Some(&outcome_variant),
+                excused: &[&outcome_variant, &constraint_status],
                 home: "enforcement.rs",
                 in_enforcement: 2,
             },
             Rule {
                 what: "capture mechanics entry",
                 needle: &capture_entry,
-                excused: None,
+                excused: &[],
                 home: "capture.rs",
                 in_enforcement: 1,
             },
             Rule {
                 what: "emulated-input mint",
                 needle: &emulated_ctor,
-                excused: None,
+                excused: &[],
                 home: "input/mod.rs",
                 in_enforcement: 1,
             },
         ];
         for rule in &rules {
             let net = |text: &str| {
-                count(text, rule.needle) - rule.excused.map_or(0, |excused| count(text, excused))
+                count(text, rule.needle)
+                    - rule
+                        .excused
+                        .iter()
+                        .map(|excused| count(text, excused))
+                        .sum::<usize>()
             };
             let mut in_enforcement = 0;
             for (path, text) in &sources {

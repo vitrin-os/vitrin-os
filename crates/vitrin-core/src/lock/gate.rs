@@ -462,7 +462,13 @@ impl LockScreen {
             | SeatInputKind::Button {
                 state: ButtonState::Released,
                 ..
-            } => Gate::Deliver,
+            }
+            // A gesture's end is a release for this purpose (WS-E.4.2,
+            // issue #222): if the app was mid-pinch when the lock came up,
+            // consuming its end leaves it accumulating that pinch forever,
+            // and the router already drops any end whose begin it did not
+            // deliver — so, like the two above, this can leak nothing.
+            | SeatInputKind::GestureEnd { .. } => Gate::Deliver,
             SeatInputKind::Key {
                 keysym,
                 state: KeyState::Pressed,
@@ -471,13 +477,19 @@ impl LockScreen {
                 self.type_key(*keysym);
                 Gate::Consume
             }
-            // Motion, scroll, button presses and text. Exhaustive by intent: a
-            // new input kind must be classified here rather than defaulting to
+            // Motion, scroll, button presses and text — plus relative motion
+            // and a gesture's begin and updates, which are input to the app
+            // exactly as the first four are. Exhaustive by intent: a new
+            // input kind must be classified here rather than defaulting to
             // reaching an app behind a locked screen.
             SeatInputKind::Motion { .. }
             | SeatInputKind::Scroll { .. }
             | SeatInputKind::Button { .. }
-            | SeatInputKind::Text { .. } => Gate::Consume,
+            | SeatInputKind::Text { .. }
+            | SeatInputKind::RelativeMotion { .. }
+            | SeatInputKind::GestureBegin { .. }
+            | SeatInputKind::GestureSwipeUpdate { .. }
+            | SeatInputKind::GesturePinchUpdate { .. } => Gate::Consume,
         }
     }
 
@@ -628,6 +640,7 @@ mod tests {
     use super::*;
     use crate::chord::Trigger;
     use crate::input::{InputRouter, KeySource, NoopHook, SeatInputKind};
+    use vitrin_protocol::generated::vitrin_shim_seat::{GestureKind, GestureState};
 
     fn chord() -> ModChord {
         ModChord::parse("ctrl+alt+delete").expect("the default lock chord parses")
@@ -898,6 +911,66 @@ mod tests {
                 t0
             ),
             Gate::Consume
+        );
+        // The version-2 classes (WS-E.4.2, issue #222). A delta leaks the same
+        // path a motion does, and a gesture's begin and updates are input --
+        // but its END is a release for the contract's purpose: consuming it
+        // would leave the app accumulating a pinch the human began before the
+        // lock came up, forever.
+        let phys = crate::input::tests::physical_for_test;
+        assert_eq!(
+            s.judge(
+                &phys(SeatInputKind::RelativeMotion {
+                    dx: 1.0,
+                    dy: 2.0,
+                    dx_unaccel: 1.0,
+                    dy_unaccel: 2.0,
+                }),
+                t0
+            ),
+            Gate::Consume
+        );
+        assert_eq!(
+            s.judge(
+                &phys(SeatInputKind::GestureBegin {
+                    kind: GestureKind::Swipe,
+                    fingers: 3,
+                }),
+                t0
+            ),
+            Gate::Consume
+        );
+        assert_eq!(
+            s.judge(
+                &phys(SeatInputKind::GestureSwipeUpdate { dx: 1.0, dy: 0.0 }),
+                t0
+            ),
+            Gate::Consume
+        );
+        assert_eq!(
+            s.judge(
+                &phys(SeatInputKind::GesturePinchUpdate {
+                    dx: 0.0,
+                    dy: 0.0,
+                    scale: 1.5,
+                    rotation: 10.0,
+                }),
+                t0
+            ),
+            Gate::Consume
+        );
+        assert_eq!(
+            s.judge(
+                &phys(SeatInputKind::GestureEnd {
+                    kind: GestureKind::Swipe,
+                    state: GestureState::Completed,
+                }),
+                t0
+            ),
+            Gate::Deliver,
+            "the pairing contract, third shape: the router drops an end whose begin it \
+             did not deliver, so delivering this can leak nothing -- and consuming it \
+             latches a gesture no drain can afterwards repair"
         );
     }
 

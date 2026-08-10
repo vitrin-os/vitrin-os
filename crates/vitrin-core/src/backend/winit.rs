@@ -608,10 +608,11 @@ pub(crate) fn capture_pixels(scene: &Scene, size: Size<i32, Physical>) -> Option
 // cannot be reused from here; [`NestedInput`]'s pointer/axis event structs
 // and button-code table are copied 1:1 from Smithay's own
 // `backend::winit::input` (verified line-for-line against the pinned
-// source), only the marker type differs. Touch, gestures, and tablet events
-// are `UnusedEvent` — `intake_physical` has never resolved them (its match
-// falls through to `_ => Vec::new()` today, on the private `WinitInput` this
-// backend used before), so nothing observable regresses by not modeling them.
+// source), only the marker type differs. Touch, gestures and tablet events
+// are `UnusedEvent` here, so this backend produces none — `intake_physical`
+// resolves gestures since WS-E.4.2 but can never see one from winit, and
+// still resolves neither touch nor tablet. Nothing observable regresses by
+// not modeling them.
 
 /// Marker used to define the [`InputBackend`] types for this backend's own
 /// winit event pump — the crate-local counterpart of Smithay's private
@@ -1460,6 +1461,16 @@ pub(crate) struct NestedView {
     /// from [`crate::status::StatusStrip::raster`] — the *same* cache the CPU
     /// blit uses — so the two paths cannot draw different strips.
     status_texture: Option<(u64, u32, GlesTexture)>,
+    /// The dead-man switch, shared with [`NestedState::deadman`] and the
+    /// router's hook (WS-E.4.2, issue #222).
+    ///
+    /// Unlike `backend::drm`'s copy this one is **not** read by the composite —
+    /// `try_redraw` samples the hold from `NestedState`, which has the whole
+    /// state in hand. It is here for [`session::Presenter::output_gates`],
+    /// which is a `&NestedView` method called from the runtime's dispatch round
+    /// where only the view is reachable, and which must answer whether a
+    /// dead-man hold is in progress.
+    deadman: Rc<RefCell<DeadManSwitch>>,
 }
 
 /// Per-run state of the nested backend: its presentation half, the session
@@ -1898,6 +1909,13 @@ fn run_inner(
             attention: false,
             status: crate::status::StatusStrip::new(status),
             status_texture: None,
+            // An `Rc` clone of the same switch `NestedState` holds and the
+            // router's hook watches, on `backend::drm`'s precedent: the view
+            // needs to *read* whether a hold is in progress, because a hold is
+            // one of the four overlays that deactivates a pointer constraint
+            // (WS-E.4.2). A second switch would answer for a hold nobody is
+            // making.
+            deadman: Rc::clone(&deadman),
         },
         runtime: Runtime::new(
             seed.take().expect("the seed is consumed exactly once"),
@@ -2338,6 +2356,12 @@ impl NestedState {
     /// end a drag the human is still making. A realm switch is the other case:
     /// there the human's next release is addressed to a different realm
     /// whatever the host does, so both tables have to be paid.
+    ///
+    /// **Nor the gesture drain** ([`input::InputRouter::end_physical_gesture`],
+    /// WS-E.4.2): a gesture is pointer-side, so it follows the buttons'
+    /// exclusion and not the keys' inclusion. It costs nothing here for a
+    /// second, sharper reason — smithay's winit backend surfaces no gesture
+    /// events at all, so a nested session can never have one in flight.
     ///
     /// Ordering: the hold is forgotten *before* the drain, so a chord in
     /// progress is already cancelled when the releases go out. The chord's
@@ -3100,6 +3124,29 @@ impl session::Presenter for NestedView {
         self.status.refresh(now, mono, self.scenes.focused())
     }
 
+    /// The pointer-constraint gates (WS-E.4.2, issue #222).
+    ///
+    /// Overridden here even though **this backend has no sprite to hide** —
+    /// [`window_pixels`] is handed `None` for `human_cursor` in nested mode, so
+    /// the safety property is vacuous. What is not vacuous is the app-facing
+    /// half: an app locked in a nested realm must still be told `inactive` when
+    /// a consent card goes up over it, and the freeze in
+    /// `crate::input::route_into` must still lift. Answering the default here
+    /// would have left a nested lock in force behind a consent prompt.
+    ///
+    /// `active` is unconditionally `true`: there is no seat to pause, so this
+    /// backend's output never becomes unpresentable in the sense the bare-metal
+    /// one's does.
+    fn output_gates(&self) -> crate::input::OutputGates {
+        let hold = self.deadman.borrow().hold_progress(Instant::now());
+        crate::input::OutputGates {
+            // `None` for the notice: nested has no VT to escape from, which is
+            // the same argument `try_redraw` already makes at its own call.
+            overlay_up: overlay_needs_the_window(hold, &self.consent, &self.lock, None),
+            active: true,
+        }
+    }
+
     /// The scene, `None` for the retained half, and the dmabuf importer
     /// bound to this backend's live `GlesRenderer` (P1.3.5, issue #117).
     ///
@@ -3215,6 +3262,65 @@ mod tests {
         ) {
         }
         assert_lock_outermost(PhantomData::<NestedHook>);
+    }
+
+    /// **The nested backend never hands `window_pixels` a human cursor**
+    /// (WS-E.4.2, issue #222) — so the pointer-constraint change's safety
+    /// property is *structurally* vacuous here, rather than incidentally so.
+    ///
+    /// This matters more than its size suggests. The core hides its own cursor
+    /// sprite while a pointer constraint is in force, and a missed un-hide on
+    /// **bare metal** is a human with no visible pointer on a display server
+    /// they cannot exit. On this backend the host desktop draws the human's
+    /// pointer over the window, so no sprite is composited at all and nothing
+    /// can be hidden — which is why every mode CI can run is immune to the
+    /// worst failure this change could cause, and why that immunity has to be
+    /// **pinned**: it is exactly the asymmetry that lets a defect ship green,
+    /// and a nested backend that started drawing a sprite would silently
+    /// acquire the hazard with no test noticing.
+    ///
+    /// Held as a shape, because presenting needs an EGL context and a host
+    /// window that CI does not have — the same instrument `window_pixels` and
+    /// `zero_copy_source` were split out for.
+    #[test]
+    fn the_nested_backend_never_hands_window_pixels_a_human_cursor() {
+        let source = include_str!("winit.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file ends with its own test module")
+            .0;
+        // The CALL, not the definition: `let pixels = window_pixels(` is the
+        // one upload site, inside `try_redraw`.
+        let after = source
+            .split("let pixels = window_pixels(")
+            .nth(1)
+            .expect("this backend uploads through window_pixels");
+        let args = after
+            .split_once(");")
+            .expect("the call's arguments end at its closing paren")
+            .0;
+        assert!(
+            args.contains("None"),
+            "the nested upload must pass `None` for the human cursor: the host desktop draws \
+             it, so a sprite here would be a second cursor for one mouse -- and it is what \
+             makes this backend structurally unable to strand a human's pointer under a \
+             pointer constraint. Args were: {args}"
+        );
+        // ...and the zero-copy branch, which draws through a different
+        // function and so could regress independently.
+        let after = source
+            .split("let _sync = present_human_visible(")
+            .nth(1)
+            .expect("the zero-copy branch presents through present_human_visible");
+        let args = after
+            .split_once(")?")
+            .expect("the call's arguments end at its closing paren")
+            .0;
+        assert!(
+            args.contains("None"),
+            "the zero-copy branch must pass `None` for the human cursor too: a sprite drawn on \
+             one path and not the other would appear and disappear as the branch engaged. Args \
+             were: {args}"
+        );
     }
 
     /// **Every overlay forces the CPU path**, the lock included (WS-E.2.2).

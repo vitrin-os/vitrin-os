@@ -14,6 +14,34 @@
 # One interface per line. Blank lines and '#' comments ignored. The argument
 # for each is in firefox.md, section "What Firefox asked for and did not get".
 #
+# NOT EVERY LINE IS A REFUSAL, despite the filename (which is load-bearing --
+# the acceptance script reads this path). `zwp_tablet_manager_v2` is NOT YET
+# SERVED: no tablet vocabulary exists on the wire, and the device set the
+# input classes were measured against has no tablet -- which is evidence about
+# one machine, not a property of the class. firefox.md keeps the two registers
+# apart; a demand line here is "the shim does not provide it today", and only
+# firefox.md says whether that is a decision or a not-yet.
+#
+# THREE ENTRIES LEFT THIS FILE IN WS-E.4.2 (issue #222), which is the
+# mechanism working rather than an exception to it:
+# `zwp_relative_pointer_manager_v1`, `zwp_pointer_gestures_v1` and
+# `zwp_pointer_constraints_v1` were added to the v0 set in
+# shim/src/globals.c, each citing the `globals-demand` line in the evidence
+# log below, because protocol version 2 grew the wire messages that feed them.
+# They are removed from here rather than left as stale entries: the check is
+# one-directional (every demand must be listed), so leaving them would not
+# have failed anything -- it would only have made this file claim a refusal
+# that is no longer true.
+#
+# The third arrived one half-issue after the other two, and the delay is the
+# point rather than an accident: relative motion and gestures are input
+# CLASSES the core already had events for, so serving them was a replay. A
+# pointer constraint is an ASK, and it could not be served until the wire grew
+# the request/verdict pair (`vitrin_shim_session.pointer_constraint` and
+# `pointer_constraint_state`) for the core to answer it with. Until then the
+# global would have been a promise the shim could not keep, which is the
+# half-serving this whole mechanism exists to prevent.
+#
 # Evidence: globals-touched-firefox-140.12.0esr.log
 
 wp_cursor_shape_manager_v1
@@ -23,10 +51,7 @@ wp_viewporter
 xdg_activation_v1
 zwp_idle_inhibit_manager_v1
 zwp_keyboard_shortcuts_inhibit_manager_v1
-zwp_pointer_constraints_v1
-zwp_pointer_gestures_v1
 zwp_primary_selection_device_manager_v1
-zwp_relative_pointer_manager_v1
 zwp_tablet_manager_v2
 zwp_text_input_manager_v3
 zxdg_exporter_v2

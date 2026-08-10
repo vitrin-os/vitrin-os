@@ -5,12 +5,12 @@
 // Source: protocol/vitrin-v0.xml
 // Regenerate with: cargo xtask codegen
 
-//! Interface `vitrin_shim_seat`, version 1.
+//! Interface `vitrin_shim_seat`, version 2.
 //!
 //! input delivery to the shim (events only, origin-tagged)
 
 pub const INTERFACE_NAME: &str = "vitrin_shim_seat";
-pub const INTERFACE_VERSION: u32 = 1;
+pub const INTERFACE_VERSION: u32 = 2;
 
 pub mod events {
 
@@ -556,6 +556,582 @@ pub mod events {
             Ok((header.object_id, Text { text, origin }))
         }
     }
+
+    /// Event `relative_motion` (opcode 5) on `vitrin_shim_seat`.
+    ///
+    /// pointer moved, as a delta
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RelativeMotion {
+        /// accelerated delta x, realm-view pixels
+        pub dx: crate::fixed::Fixed,
+        /// accelerated delta y, realm-view pixels
+        pub dy: crate::fixed::Fixed,
+        /// unaccelerated delta x, realm-view pixels
+        pub dx_unaccel: crate::fixed::Fixed,
+        /// unaccelerated delta y, realm-view pixels
+        pub dy_unaccel: crate::fixed::Fixed,
+        /// who caused this event
+        pub origin: crate::generated::vitrin_shim_seat::Origin,
+    }
+
+    impl RelativeMotion {
+        pub const OPCODE: u8 = 5;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_int(&mut out, self.dx.to_bits());
+            crate::wire::write_int(&mut out, self.dy.to_bits());
+            crate::wire::write_int(&mut out, self.dx_unaccel.to_bits());
+            crate::wire::write_int(&mut out, self.dy_unaccel.to_bits());
+            crate::wire::write_uint(&mut out, self.origin.to_wire());
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let dx = crate::fixed::Fixed::from_bits(crate::wire::read_int(bytes, &mut pos)?);
+            let dy = crate::fixed::Fixed::from_bits(crate::wire::read_int(bytes, &mut pos)?);
+            let dx_unaccel =
+                crate::fixed::Fixed::from_bits(crate::wire::read_int(bytes, &mut pos)?);
+            let dy_unaccel =
+                crate::fixed::Fixed::from_bits(crate::wire::read_int(bytes, &mut pos)?);
+            let origin = crate::generated::vitrin_shim_seat::Origin::from_wire(
+                crate::wire::read_uint(bytes, &mut pos)?,
+            )?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((
+                header.object_id,
+                RelativeMotion {
+                    dx,
+                    dy,
+                    dx_unaccel,
+                    dy_unaccel,
+                    origin,
+                },
+            ))
+        }
+    }
+
+    /// Event `gesture_begin` (opcode 6) on `vitrin_shim_seat`.
+    ///
+    /// a multi-finger gesture began
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GestureBegin {
+        /// which gesture began
+        pub kind: crate::generated::vitrin_shim_seat::GestureKind,
+        /// finger count, fixed for this gesture's life
+        pub fingers: u32,
+        /// who caused this event
+        pub origin: crate::generated::vitrin_shim_seat::Origin,
+    }
+
+    impl GestureBegin {
+        pub const OPCODE: u8 = 6;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_uint(&mut out, self.kind.to_wire());
+            crate::wire::write_uint(&mut out, self.fingers);
+            crate::wire::write_uint(&mut out, self.origin.to_wire());
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let kind = crate::generated::vitrin_shim_seat::GestureKind::from_wire(
+                crate::wire::read_uint(bytes, &mut pos)?,
+            )?;
+            let fingers = crate::wire::read_uint(bytes, &mut pos)?;
+            let origin = crate::generated::vitrin_shim_seat::Origin::from_wire(
+                crate::wire::read_uint(bytes, &mut pos)?,
+            )?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((
+                header.object_id,
+                GestureBegin {
+                    kind,
+                    fingers,
+                    origin,
+                },
+            ))
+        }
+    }
+
+    /// Event `gesture_swipe_update` (opcode 7) on `vitrin_shim_seat`.
+    ///
+    /// an in-flight swipe moved
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GestureSwipeUpdate {
+        /// delta x since this gesture's previous event, realm-view pixels
+        pub dx: crate::fixed::Fixed,
+        /// delta y since this gesture's previous event, realm-view pixels
+        pub dy: crate::fixed::Fixed,
+        /// who caused this event
+        pub origin: crate::generated::vitrin_shim_seat::Origin,
+    }
+
+    impl GestureSwipeUpdate {
+        pub const OPCODE: u8 = 7;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_int(&mut out, self.dx.to_bits());
+            crate::wire::write_int(&mut out, self.dy.to_bits());
+            crate::wire::write_uint(&mut out, self.origin.to_wire());
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let dx = crate::fixed::Fixed::from_bits(crate::wire::read_int(bytes, &mut pos)?);
+            let dy = crate::fixed::Fixed::from_bits(crate::wire::read_int(bytes, &mut pos)?);
+            let origin = crate::generated::vitrin_shim_seat::Origin::from_wire(
+                crate::wire::read_uint(bytes, &mut pos)?,
+            )?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((header.object_id, GestureSwipeUpdate { dx, dy, origin }))
+        }
+    }
+
+    /// Event `gesture_pinch_update` (opcode 8) on `vitrin_shim_seat`.
+    ///
+    /// an in-flight pinch moved, scaled or rotated
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GesturePinchUpdate {
+        /// centre delta x since this gesture's previous event, realm-view pixels
+        pub dx: crate::fixed::Fixed,
+        /// centre delta y since this gesture's previous event, realm-view pixels
+        pub dy: crate::fixed::Fixed,
+        /// scale relative to this gesture's begin, 1.0 at the begin
+        pub scale: crate::fixed::Fixed,
+        /// degrees turned since this gesture's previous event, positive clockwise
+        pub rotation: crate::fixed::Fixed,
+        /// who caused this event
+        pub origin: crate::generated::vitrin_shim_seat::Origin,
+    }
+
+    impl GesturePinchUpdate {
+        pub const OPCODE: u8 = 8;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_int(&mut out, self.dx.to_bits());
+            crate::wire::write_int(&mut out, self.dy.to_bits());
+            crate::wire::write_int(&mut out, self.scale.to_bits());
+            crate::wire::write_int(&mut out, self.rotation.to_bits());
+            crate::wire::write_uint(&mut out, self.origin.to_wire());
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let dx = crate::fixed::Fixed::from_bits(crate::wire::read_int(bytes, &mut pos)?);
+            let dy = crate::fixed::Fixed::from_bits(crate::wire::read_int(bytes, &mut pos)?);
+            let scale = crate::fixed::Fixed::from_bits(crate::wire::read_int(bytes, &mut pos)?);
+            let rotation = crate::fixed::Fixed::from_bits(crate::wire::read_int(bytes, &mut pos)?);
+            let origin = crate::generated::vitrin_shim_seat::Origin::from_wire(
+                crate::wire::read_uint(bytes, &mut pos)?,
+            )?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((
+                header.object_id,
+                GesturePinchUpdate {
+                    dx,
+                    dy,
+                    scale,
+                    rotation,
+                    origin,
+                },
+            ))
+        }
+    }
+
+    /// Event `gesture_end` (opcode 9) on `vitrin_shim_seat`.
+    ///
+    /// a multi-finger gesture ended
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GestureEnd {
+        /// which gesture ended; repeats the in-flight kind
+        pub kind: crate::generated::vitrin_shim_seat::GestureKind,
+        /// whether the human completed the gesture
+        pub state: crate::generated::vitrin_shim_seat::GestureState,
+        /// who caused this event
+        pub origin: crate::generated::vitrin_shim_seat::Origin,
+    }
+
+    impl GestureEnd {
+        pub const OPCODE: u8 = 9;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_uint(&mut out, self.kind.to_wire());
+            crate::wire::write_uint(&mut out, self.state.to_wire());
+            crate::wire::write_uint(&mut out, self.origin.to_wire());
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let kind = crate::generated::vitrin_shim_seat::GestureKind::from_wire(
+                crate::wire::read_uint(bytes, &mut pos)?,
+            )?;
+            let state = crate::generated::vitrin_shim_seat::GestureState::from_wire(
+                crate::wire::read_uint(bytes, &mut pos)?,
+            )?;
+            let origin = crate::generated::vitrin_shim_seat::Origin::from_wire(
+                crate::wire::read_uint(bytes, &mut pos)?,
+            )?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((
+                header.object_id,
+                GestureEnd {
+                    kind,
+                    state,
+                    origin,
+                },
+            ))
+        }
+    }
 }
 
 /// Enum `key_state` on `vitrin_shim_seat`.
@@ -625,6 +1201,84 @@ impl Origin {
             _ => Err(crate::error::DecodeError::InvalidEnumValue {
                 interface: "vitrin_shim_seat",
                 enum_name: "origin",
+                value,
+            }),
+        }
+    }
+
+    /// The wire value for this entry.
+    pub fn to_wire(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Enum `gesture_kind` on `vitrin_shim_seat`.
+///
+/// which gesture a shared begin or end names
+///
+/// Plain enum: a wire value MUST exactly equal one defined entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum GestureKind {
+    /// multi-finger swipe; motion arrives as gesture_swipe_update
+    Swipe = 0,
+    /// pinch; motion arrives as gesture_pinch_update
+    Pinch = 1,
+}
+
+impl GestureKind {
+    /// Every defined entry, in document order. Lets generic code (property
+    /// tests, a future C backend) enumerate valid values without hardcoding
+    /// them, so an appended entry can never be silently missed.
+    pub const ALL: &'static [GestureKind] = &[GestureKind::Swipe, GestureKind::Pinch];
+
+    /// Decode a wire value, by whole-value membership in the defined entries.
+    pub fn from_wire(value: u32) -> Result<Self, crate::error::DecodeError> {
+        match value {
+            0 => Ok(GestureKind::Swipe),
+            1 => Ok(GestureKind::Pinch),
+            _ => Err(crate::error::DecodeError::InvalidEnumValue {
+                interface: "vitrin_shim_seat",
+                enum_name: "gesture_kind",
+                value,
+            }),
+        }
+    }
+
+    /// The wire value for this entry.
+    pub fn to_wire(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Enum `gesture_state` on `vitrin_shim_seat`.
+///
+/// how a gesture ended
+///
+/// Plain enum: a wire value MUST exactly equal one defined entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum GestureState {
+    /// the human finished the gesture
+    Completed = 0,
+    /// the gesture did not finish; a preview should be undone
+    Cancelled = 1,
+}
+
+impl GestureState {
+    /// Every defined entry, in document order. Lets generic code (property
+    /// tests, a future C backend) enumerate valid values without hardcoding
+    /// them, so an appended entry can never be silently missed.
+    pub const ALL: &'static [GestureState] = &[GestureState::Completed, GestureState::Cancelled];
+
+    /// Decode a wire value, by whole-value membership in the defined entries.
+    pub fn from_wire(value: u32) -> Result<Self, crate::error::DecodeError> {
+        match value {
+            0 => Ok(GestureState::Completed),
+            1 => Ok(GestureState::Cancelled),
+            _ => Err(crate::error::DecodeError::InvalidEnumValue {
+                interface: "vitrin_shim_seat",
+                enum_name: "gesture_state",
                 value,
             }),
         }

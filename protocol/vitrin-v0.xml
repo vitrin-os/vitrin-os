@@ -1048,7 +1048,16 @@
       alongside the consent overlay and the trust indicator - so a human
       cursor can no more appear in a captured frame than a consent card
       can, and the observe_cursor rule above is unaffected by which
-      backend is running.
+      backend is running. Where the core does draw that sprite it also
+      HIDES it while a pointer constraint is active on the realm the
+      output is bound to (vitrin_shim_session.pointer_constraint_state),
+      which is the one case in this protocol where an app's ask changes
+      what the human sees of their own pointer. That is precisely why the
+      hiding is the CORE's and not the app's: the app asks, the core
+      decides, and the core owns restoring the sprite on every path that
+      ends a constraint. A realm that could hide the human's pointer
+      itself could mislead the human about where their input is going,
+      which is the same reason a realm may not supply the bitmap.
       Streaming capture is a deliberate
       deferral, not an omission: if a later version adds it, it arrives
       as since-gated sibling messages beside this poll pair, which stays
@@ -1326,6 +1335,20 @@
       EOF is shim death: the core survives, closes every in-flight buffer
       fd, and drops the realm's surface - agents' next captures refuse
       "no_surface". Version 1 has no restart policy.
+
+      VERSION 2 ADDS TWO CONVERSATIONS TO THIS OBJECT, and both are here
+      for the same structural reason rather than by accumulation. The
+      cross-realm clipboard (request_selection, selection, offer_selection)
+      is here because the CORE is the party that asks, and it must be able
+      to ask a shim that has done nothing but read configure - which rules
+      out a facet, since a facet needs something to mint it. The pointer
+      constraint (pointer_constraint, pointer_constraint_state) is here
+      because the APP is the party that asks, and vitrin_shim_seat can
+      carry neither half: it defines no requests at all, and every event on
+      it ends with an origin tag naming a human's device or a principal's
+      actuator, which a confined app is neither. So this object carries the
+      only two exchanges in the protocol whose asking party is not the one
+      the interface it would otherwise belong to was built around.
     </description>
 
     <event name="configure">
@@ -1448,6 +1471,141 @@
       <arg name="data" type="string" summary="the clipboard contents as UTF-8 (max 61440 bytes)"/>
     </event>
 
+    <request name="pointer_constraint" since="2">
+      <description summary="ask the core to lock or confine the pointer to a surface">
+        The confined app's ask, relayed by its shim. THE APP ASKS AND THE
+        CORE DECIDES - the mirror of request_selection, where the core asks
+        and the shim answers. That reversal is stated rather than left to
+        be inferred, because a reader who carries the clipboard's direction
+        over to this pair will read every rule below backwards. serial is
+        minted by the SHIM here, and is strictly increasing within the
+        connection and never reused, exactly as the core's own serials are.
+
+        ONE MESSAGE IS THE WHOLE STATE MACHINE'S INPUT. kind none is the
+        WITHDRAWAL, so there is no separate unset message a withdrawal
+        could race a set against, and no order in which the two could be
+        applied wrongly. When kind is none, surface MUST be null and x, y,
+        width and height MUST be zero; the core ignores them in that case
+        rather than treating a decorated withdrawal as data - the same
+        discipline the selection request states for mime and data on a
+        refusing status.
+
+        THE REGION IS ONE RECTANGLE, and its cost is named here rather than
+        discovered later. x and y are the region's origin in surface-local
+        pixels and width and height its extent; width and height both zero
+        means the whole surface, which is the null-region meaning of
+        Wayland's own pointer-constraint vocabulary carried across without
+        inventing a nullable rectangle type. Wayland permits an arbitrary
+        region; this carries a rectangle, so a genuinely non-rectangular
+        confinement is reduced to its bounding box and the app is NOT told
+        that it was. An app needing an exact region must ask for a
+        rectangle it can live with, or accept the widening. The coordinates
+        are int and the extents uint rather than fixed: fixed is reserved
+        for vitrin_shim_seat motion, and a region is not motion.
+
+        lifetime carries Wayland's own two, so a shim can honour a one-shot
+        lock's destroy semantics without inventing a policy of its own.
+        Nothing in this system has yet NEEDED oneshot; it is carried
+        because a signature is immutable forever and adding it afterwards
+        would be a whole new message.
+
+        FIRE-AND-FORGET, NOT REPLY-BEARING, and here that classification is
+        load-bearing rather than bookkeeping. The verdict does arrive, as a
+        pointer_constraint_state carrying this serial, but it is NOT a
+        terminal event and the exactly-one-terminal rule deliberately does
+        not apply: a constraint's state changes for reasons the shim never
+        asked about - the human switched realms, raised a consent card,
+        locked the screen - so binding the answer one-to-one to the ask
+        would leave an app locked with no message that could ever tell it
+        otherwise. That is the exact latch this design exists to prevent.
+        The coalescing licence that ordinarily accompanies fire-and-forget
+        is OVERRIDDEN in the strict direction: the core sends at most one
+        pointer_constraint_state per transition and never coalesces two
+        different states.
+
+        A SECOND ASK REPLACES THE FIRST. One record exists per connection;
+        a second ask supersedes the earlier one, whose serial is answered
+        superseded and hears nothing further.
+
+        ERRORS. A constraint this deployment will not serve is RECOVERABLE:
+        the answer is state refused, the connection lives, and the app's own
+        lock object is left inert - a legal Wayland state, since a
+        compositor may decline to activate a lock, and that is what lets a
+        refusal not wedge the app. What is fatal is unchanged decode-level
+        ground: a surface id this connection never minted, or one at or
+        below its watermark, is invalid_object (the shim violating its OWN
+        object graph), and an out-of-range kind or lifetime is
+        invalid_argument - on a shim connection both mean log-and-close.
+        This request adds NO log-only condition of its own: an ask naming a
+        surface that has never committed is a legitimate ask answered
+        inactive, not a bad_order.
+
+        NAME IT pointer_constraint OR "pointer lock", never bare
+        "constraint": in this protocol that word already means a PETITION
+        constraint (vitrin_realm.request_grant's flags), and every
+        identifier this pair mints carries the qualifier for that reason.
+      </description>
+      <arg name="serial" type="uint" summary="shim-minted; names the answer this ask expects"/>
+      <arg name="surface" type="object" interface="vitrin_shim_surface" allow-null="true" summary="the surface the constraint applies to; MUST be null when kind is none"/>
+      <arg name="kind" type="uint" enum="pointer_constraint_kind" summary="lock, confine, or none to withdraw"/>
+      <arg name="lifetime" type="uint" enum="pointer_constraint_lifetime" summary="oneshot or persistent; ignored when kind is none"/>
+      <arg name="x" type="int" summary="region origin x, surface-local pixels"/>
+      <arg name="y" type="int" summary="region origin y, surface-local pixels"/>
+      <arg name="width" type="uint" summary="region width; zero with height zero means the whole surface"/>
+      <arg name="height" type="uint" summary="region height; zero with width zero means the whole surface"/>
+    </request>
+
+    <event name="pointer_constraint_state" since="2">
+      <description summary="the core's verdict on a pointer_constraint, and its running state">
+        The verdict AND the running state, on one message. They are not
+        split into two because two ways to learn the same fact is how the
+        two come to disagree. This is a SERVER DIRECTIVE, in the class
+        configure occupies: correlated to an ask by serial, never terminal
+        to it.
+
+        LEVEL-TRIGGERED, EDGE-REPORTED. The core recomputes each record's
+        state from live conditions and sends this event only when that
+        state CHANGED. Consecutive identical states are not sent, and two
+        different states are never coalesced into one. A serial the shim
+        does not recognise is stale - a later ask superseded it - and is
+        ignored, the same rule request_selection states for its own
+        serials.
+
+        A REFUSAL CANNOT WEDGE AN APP, and the reason is that the shim does
+        nothing at all on refused. It does not destroy the app's constraint
+        object and does not raise an error on it; it simply never sends the
+        activation the object is waiting for. An inert lock object is a
+        legal Wayland state, so the app's own state machine handles a
+        refusal with no behaviour specific to this system.
+
+        WHAT ACTIVE MEANS FOR THE HUMAN, stated on the wire because an app
+        must not have to discover it by experiment. While a constraint is
+        active the core stops delivering absolute motion to that realm,
+        keeps delivering relative_motion, freezes the position its own hit
+        tests use, and - on a backend where it draws one - HIDES ITS OWN
+        HUMAN CURSOR SPRITE. The app cannot hide that sprite and there is
+        deliberately no message by which it could: the sprite is the
+        core's, and a realm able to hide the human's pointer could mislead
+        the human about where their input is going (vitrin_view states the
+        same rule for the bitmap). The core therefore owns the un-hiding
+        too, on every path that ends a constraint, without exception - a
+        constraint that ended without its sprite returning would leave a
+        human with no visible pointer, which is a worse failure than any
+        this pair otherwise risks.
+
+        WHAT AN ACTIVE CONSTRAINT DOES NOT REACH. It never confines a
+        principal's actuation: an emulated pointer move follows its grant
+        and is delivered absolutely whatever this record says, so an app
+        cannot acquire authority over an agent by locking a pointer. It
+        never reaches the core's own overlays either - a consent card, the
+        lock screen, the dead-man hold and the core's notice all take the
+        pointer back, and each of those is a path on which this event
+        reports the constraint inactive.
+      </description>
+      <arg name="serial" type="uint" summary="the serial of the pointer_constraint ask this concerns"/>
+      <arg name="state" type="uint" enum="pointer_constraint_status" summary="what the core did with that ask, and what is in force now"/>
+    </event>
+
     <enum name="selection_status">
       <description summary="why a selection answer carries no data">
         Answers are exhaustive rather than optional: every request_selection
@@ -1464,6 +1622,66 @@
       <entry name="empty" value="1" summary="the app has no selection at all"/>
       <entry name="wrong_type" value="2" summary="the selection is not well-formed text/plain;charset=utf-8"/>
       <entry name="too_large" value="3" summary="the selection exceeds data's byte bound"/>
+    </enum>
+
+    <enum name="pointer_constraint_kind">
+      <description summary="what a pointer_constraint asks for, including nothing">
+        The three things one ask can say. lock pins the pointer where it is
+        and leaves relative_motion as the only movement the app receives;
+        confine lets the pointer keep moving but keeps it inside the
+        region. none WITHDRAWS whatever this connection had, and carrying
+        it here is why there is no separate unset message to race.
+
+        Entries are appended, never renumbered, like every enum here.
+      </description>
+      <entry name="none" value="0" summary="withdraw this connection's constraint; surface MUST be null"/>
+      <entry name="lock" value="1" summary="pin the pointer; movement reaches the app as relative_motion only"/>
+      <entry name="confine" value="2" summary="keep the pointer inside the region; absolute motion continues within it"/>
+    </enum>
+
+    <enum name="pointer_constraint_lifetime">
+      <description summary="whether a constraint survives its own deactivation">
+        Wayland's own two, carried across so a shim never has to invent a
+        policy its app did not ask for. oneshot ends for good the first
+        time it deactivates: the record is dropped and the app's object is
+        finished with. persistent may deactivate and become active again
+        with no new ask - which is what makes a realm switch survivable,
+        since the human coming back re-activates what they left.
+
+        persistent survives a DEACTIVATION, not a WITHDRAWAL: a state of
+        withdrawn is terminal for the serial that carries it, so a
+        constraint the core withdrew - a seat pause, the dead-man chord -
+        needs a new ask, and the app is told by the withdrawn rather than
+        left to discover it.
+
+        Entries are appended, never renumbered, like every enum here.
+      </description>
+      <entry name="oneshot" value="0" summary="ends for good at its first deactivation"/>
+      <entry name="persistent" value="1" summary="may deactivate and reactivate with no new ask"/>
+    </enum>
+
+    <enum name="pointer_constraint_status">
+      <description summary="what the core did with a pointer_constraint, and what is in force">
+        THE ZERO VALUE IS DELIBERATELY NOT AN "ok". That departs from
+        selection_status, where ok is 0, and the departure is argued here
+        rather than left standing as an inconsistency: zero is where a
+        mis-decode and a zeroed struct both land, and "not constrained" is
+        the safe reading of a byte nobody can trust, while "constrained"
+        is not.
+
+        inactive and active are the two live states, and one record moves
+        between them as often as the human's own actions require, with no
+        further ask. withdrawn, refused and superseded are terminal for the
+        serial that carries them: nothing follows on that serial ever
+        again.
+
+        Entries are appended, never renumbered, like every enum here.
+      </description>
+      <entry name="inactive" value="0" summary="recorded but not in force; may become active later with no new ask"/>
+      <entry name="active" value="1" summary="in force: absolute motion stops, relative_motion continues, the core hides its own cursor sprite"/>
+      <entry name="withdrawn" value="2" summary="the record is gone: the shim withdrew it, or what it named went away"/>
+      <entry name="refused" value="3" summary="not recorded at all; the app's object stays inert and this serial is not re-asked"/>
+      <entry name="superseded" value="4" summary="a later ask on this connection replaced it; this serial gets nothing further"/>
     </enum>
   </interface>
 
@@ -1582,7 +1800,7 @@
     </enum>
   </interface>
 
-  <interface name="vitrin_shim_seat" version="1">
+  <interface name="vitrin_shim_seat" version="2">
     <description summary="input delivery to the shim (events only, origin-tagged)">
       Input delivery from core to shim. The shim replays these events to
       its app through its own virtual seat; the core owns the mapping from
@@ -1606,8 +1824,26 @@
       reason the core needs a defensive rule keeping emulated motion from
       relocating the position a consent grab hit-tests. Per-principal
       delivery arrives as since-gated sibling events that also name the
-      principal, each still ending with origin so the B2 rule holds; these
-      five events stay valid forever.
+      principal, each still ending with origin so the B2 rule holds; the
+      version-1 five stay valid forever, and so does everything appended
+      to them.
+
+      VERSION 2 APPENDS FIVE MORE, and appending is the only way this
+      interface ever grows: relative_motion, and the four that carry a
+      touchpad gesture - gesture_begin, gesture_swipe_update,
+      gesture_pinch_update, gesture_end. They exist because a pointer
+      vocabulary of destinations alone cannot express what a pointer lock
+      delivers or what two fingers do, not because a device set demanded
+      arguments of its own: every argument in the five is a delta, a
+      finger count, a scale, a rotation or a tag, and none of them names a
+      device. Touch and tablet have no event here, and they are NOT YET
+      SERVED rather than refused - a difference that is load-bearing. What
+      kept them out is a measurement of one machine's devices, which is
+      evidence about a machine and not a property of a class, and a
+      permanent wire protocol may not foreclose a device class on that
+      ground. What would reopen each is recorded in this repository's
+      decision log rather than here, because a wire can say what it
+      carries but cannot say what evidence would change it.
     </description>
 
     <event name="motion">
@@ -1690,6 +1926,208 @@
       <arg name="origin" type="uint" enum="origin" summary="who caused this event"/>
     </event>
 
+    <event name="relative_motion" since="2">
+      <description summary="pointer moved, as a delta">
+        Pointer motion expressed as a delta rather than as a destination.
+        This event ACCOMPANIES motion, it does not replace it: one
+        physical movement produces both, and a shim replays both, because
+        an app binds whichever of the two it understands and must not be
+        made to guess which one this core sends. Deltas are realm-view
+        pixels and are fixed-point for motion's reason.
+
+        TWO DELTAS, NOT ONE, and both are load-bearing. dx and dy are the
+        movement after the core applied pointer acceleration - the
+        movement that agrees with where the pointer visibly went.
+        dx_unaccel and dy_unaccel are the same movement before
+        acceleration, which is what a camera control or a drawing tool
+        wants and is most of the reason this event exists at all.
+        Carrying one alone would force a shim to copy it into the other,
+        producing a field it would then be lying about; carrying both
+        leaves the choice with the app that knows which it needs.
+
+        NO TIMESTAMP, deliberately. No event on this interface carries
+        one, and a shim stamps each replay with its own clock. A device
+        clock on the wire beside that one is a second, unsynchronised
+        clock, which this system refuses elsewhere for the same reason.
+        The cost is real and is paid rather than argued away: a consumer
+        integrating deltas over dt gets the time the shim replayed them,
+        not the time the device produced them.
+
+        NO PAIRING OF ITS OWN - there is no begin and no end. Where a
+        latch could form is the pointer lock this event is the input half
+        of: a lock stops absolute motion and freezes the position the
+        core's own hit tests use, so a lock whose end is lost is a pointer
+        that never moves again. That is why such state is the core's to
+        own and to end, on every path that takes input away, and why an
+        emulated motion must not relocate the frozen position - the
+        defensive rule this interface's description already asks for, now
+        with a second reason to want it.
+
+        THE LOCK ITSELF IS NOT AN EVENT ON THIS INTERFACE, and the reason
+        is structural. Every event here ends with origin, and origin has
+        exactly two values: a human's device, or a principal's actuator. A
+        lock is asked for by the confined app, which is neither, so any
+        tag it carried would be false - on the one interface whose whole
+        design idea is that the tag never drifts. The ask and the core's
+        verdict therefore belong on vitrin_shim_session, which already
+        carries shim-to-core requests, and version 2 defines them there:
+        the pointer_constraint request and the pointer_constraint_state
+        event. This event is emitted for ordinary unlocked motion as well
+        as under a lock - it is the input half either way, and a lock
+        changes what accompanies it rather than whether it arrives. Name
+        it "pointer lock" or "pointer constraint" and never bare
+        "constraint": in this protocol that word already means a PETITION
+        constraint (vitrin_realm.request_grant's flags - request_grant is
+        a request on the realm handle, not on vitrin_grant).
+
+        Version 2 defines no emulated source of a delta - the agent-facing
+        vitrin_actuator_pointer.move is absolute - so a version-2 core
+        emits this event with origin physical only. The tag is mandatory
+        here as everywhere on this interface, and is exactly what keeps a
+        later emulated source purely additive.
+      </description>
+      <arg name="dx" type="fixed" summary="accelerated delta x, realm-view pixels"/>
+      <arg name="dy" type="fixed" summary="accelerated delta y, realm-view pixels"/>
+      <arg name="dx_unaccel" type="fixed" summary="unaccelerated delta x, realm-view pixels"/>
+      <arg name="dy_unaccel" type="fixed" summary="unaccelerated delta y, realm-view pixels"/>
+      <arg name="origin" type="uint" enum="origin" summary="who caused this event"/>
+    </event>
+
+    <event name="gesture_begin" since="2">
+      <description summary="a multi-finger gesture began">
+        A multi-finger touchpad gesture began. Swipe and pinch SHARE this
+        event, and share gesture_end, because the begin and end signatures
+        of the two are identical in the pointer-gesture vocabulary these
+        events serve. A signature is immutable forever, so four events
+        with no dead argument is the shape - rather than six with
+        duplicated ones, and rather than two phase-tagged events whose
+        deltas and completion flag would each be meaningless in two phases
+        out of three. kind says which gesture began.
+
+        fingers is how many fingers the gesture began with, and is FIXED
+        for its life: a gesture that gains or loses a finger ends, and a
+        new one begins.
+
+        AT MOST ONE GESTURE IS IN FLIGHT PER SEAT. Every
+        gesture_swipe_update, gesture_pinch_update and gesture_end that
+        follows belongs to this begin until that end. The core does not
+        send a second begin while one is in flight, and does not send an
+        update or an end for a begin it did not send. A shim that receives
+        one anyway has met a core bug and IGNORES it: it must not replay a
+        gesture its app never saw begin, and it must not close the
+        connection either, because an app must not die of the core's
+        mistake. Log-and-close on a shim connection is for a SHIM's own
+        violations; this is not one.
+
+        WHAT THE CORE OWES IN RETURN is exactly one gesture_end for every
+        gesture_begin it sent, without exception. A begin with no end
+        leaves an app accumulating a gesture forever, which is the
+        latched-modifier failure wearing a new shape. When something takes
+        input away mid-gesture for good - a realm switch, a seat pause -
+        the core MINTS an end, cancelled, rather than dropping the gesture
+        silently. gesture_end states which paths those are, and which
+        paths withhold a gesture's updates without minting one.
+
+        In version 2 the only source is a physical device: no actuator
+        mints a gesture and no verb grants one. The origin tag is
+        mandatory anyway, and is what keeps a later emulated source a pure
+        addition rather than a change here.
+      </description>
+      <arg name="kind" type="uint" enum="gesture_kind" summary="which gesture began"/>
+      <arg name="fingers" type="uint" summary="finger count, fixed for this gesture's life"/>
+      <arg name="origin" type="uint" enum="origin" summary="who caused this event"/>
+    </event>
+
+    <event name="gesture_swipe_update" since="2">
+      <description summary="an in-flight swipe moved">
+        How far the finger group moved since the previous event of the
+        gesture in flight, in realm-view pixels. A DELTA, never a
+        position, and never cumulative.
+
+        Valid only between a gesture_begin whose kind is swipe and that
+        gesture's gesture_end. It is a separate event from
+        gesture_pinch_update rather than a shared one, because pinch
+        additionally carries scale and rotation: a single shared update
+        would freeze two arguments meaningless for swipe into a signature
+        that can never afterwards be changed.
+      </description>
+      <arg name="dx" type="fixed" summary="delta x since this gesture's previous event, realm-view pixels"/>
+      <arg name="dy" type="fixed" summary="delta y since this gesture's previous event, realm-view pixels"/>
+      <arg name="origin" type="uint" enum="origin" summary="who caused this event"/>
+    </event>
+
+    <event name="gesture_pinch_update" since="2">
+      <description summary="an in-flight pinch moved, scaled or rotated">
+        The motion of the pinch in flight. Valid only between a
+        gesture_begin whose kind is pinch and that gesture's gesture_end.
+
+        THE FOUR QUANTITIES DO NOT SHARE A REFERENCE POINT, and reading
+        one as though it were another is the mistake this paragraph exists
+        to prevent.
+
+        dx and dy are how far the centre of the finger group moved since
+        THIS GESTURE'S PREVIOUS EVENT, in realm-view pixels. Deltas.
+
+        scale is the pinch's scale relative to ITS OWN BEGIN, not to the
+        previous event. It is 1.0 at the begin, and an app applies it to
+        the size the object had at the begin - multiplying successive
+        values into a running product is wrong and compounds. Absolute,
+        not a delta.
+
+        rotation is the angle turned since THIS GESTURE'S PREVIOUS EVENT,
+        in degrees, positive clockwise. A delta again.
+
+        That asymmetry is inherited rather than invented: it is what the
+        pointer-gesture vocabulary defines and what the device layer under
+        the core reports. It is written out here because a wire that
+        quietly reinterpreted either quantity would be wrong in a way apps
+        cannot detect - a scale read as a delta zooms toward zero, and a
+        rotation read as absolute snaps back on every event.
+      </description>
+      <arg name="dx" type="fixed" summary="centre delta x since this gesture's previous event, realm-view pixels"/>
+      <arg name="dy" type="fixed" summary="centre delta y since this gesture's previous event, realm-view pixels"/>
+      <arg name="scale" type="fixed" summary="scale relative to this gesture's begin, 1.0 at the begin"/>
+      <arg name="rotation" type="fixed" summary="degrees turned since this gesture's previous event, positive clockwise"/>
+      <arg name="origin" type="uint" enum="origin" summary="who caused this event"/>
+    </event>
+
+    <event name="gesture_end" since="2">
+      <description summary="a multi-finger gesture ended">
+        Ends the gesture the last gesture_begin started. This is the
+        second half of the guarantee gesture_begin states: exactly one of
+        these per begin the core sent, always, on every path.
+
+        state distinguishes the two ways a gesture stops, and the
+        distinction is what lets an app commit rather than guess.
+        completed means the human finished it and what it did should
+        stand. cancelled means it did not finish and a preview should be
+        undone. Cancelled covers the device layer's own cancellation AND
+        the core's own. Version 2 ends a gesture cancelled on exactly two
+        core paths: a realm switch, and a seat pause. On both, the human's
+        fingers are still down and no end can ever arrive, so an end is
+        minted rather than waited for. A consent prompt and a screen lock
+        do NOT mint one: they withhold the gesture's updates and then
+        deliver the device's own end when the human lifts, so no latch
+        forms - but an app that was previewing is told the human completed
+        what they in fact abandoned. That gap is named here rather than
+        smoothed over, and closing it is owed. Where an end IS minted, the
+        app is told the truth about the gesture rather than a convenient
+        falsehood about the human, which is the same trade this system
+        already makes for keys and buttons held across such a moment.
+
+        kind repeats the in-flight gesture's kind. It is redundant by
+        construction - only one gesture is ever in flight - and it is
+        carried anyway so that a disagreement with what the shim has in
+        flight is a DETECTABLE core bug rather than a silent mis-replay. A
+        shim that sees one ends the gesture it actually has and logs; as
+        with an unpaired update, it does not close the connection over the
+        core's mistake.
+      </description>
+      <arg name="kind" type="uint" enum="gesture_kind" summary="which gesture ended; repeats the in-flight kind"/>
+      <arg name="state" type="uint" enum="gesture_state" summary="whether the human completed the gesture"/>
+      <arg name="origin" type="uint" enum="origin" summary="who caused this event"/>
+    </event>
+
     <enum name="key_state">
       <description summary="key states"/>
       <entry name="released" value="0" summary="key released"/>
@@ -1707,6 +2145,37 @@
       </description>
       <entry name="physical" value="0" summary="produced by a physical human input device"/>
       <entry name="emulated" value="1" summary="produced by a principal's actuator"/>
+    </enum>
+
+    <enum name="gesture_kind">
+      <description summary="which gesture a shared begin or end names">
+        gesture_begin and gesture_end are shared by every gesture kind, so
+        this is the argument that says which one. Version 2 defines two:
+        swipe, whose motion arrives as gesture_swipe_update, and pinch,
+        whose motion arrives as gesture_pinch_update.
+
+        A FURTHER KIND IS AN APPENDED ENTRY, not a new begin or end. A
+        hold, for instance, has the same begin and end shape and no motion
+        at all, so serving it would add one entry here and no event -
+        which is the whole reason begin and end are shared. Values are
+        immutable and entries are never renumbered, like every enum here.
+        Nothing beyond swipe and pinch is served yet; that is not-yet,
+        and what would reopen it is recorded in this repository's decision
+        log rather than on the wire.
+      </description>
+      <entry name="swipe" value="0" summary="multi-finger swipe; motion arrives as gesture_swipe_update"/>
+      <entry name="pinch" value="1" summary="pinch; motion arrives as gesture_pinch_update"/>
+    </enum>
+
+    <enum name="gesture_state">
+      <description summary="how a gesture ended">
+        The two ways gesture_end can arrive. This is an enum rather than a
+        bare flag because every state argument on this interface is
+        enum-typed and because the difference is what an app acts on: a
+        completed pinch keeps its zoom, a cancelled one puts it back.
+      </description>
+      <entry name="completed" value="0" summary="the human finished the gesture"/>
+      <entry name="cancelled" value="1" summary="the gesture did not finish; a preview should be undone"/>
     </enum>
   </interface>
 

@@ -90,6 +90,8 @@ type Configure = gen::vitrin_shim_session::events::Configure;
 type SessionSelection = gen::vitrin_shim_session::requests::Selection;
 type RequestSelection = gen::vitrin_shim_session::events::RequestSelection;
 type OfferSelection = gen::vitrin_shim_session::events::OfferSelection;
+type SessionPointerConstraint = gen::vitrin_shim_session::requests::PointerConstraint;
+type SessionPointerConstraintState = gen::vitrin_shim_session::events::PointerConstraintState;
 type Attach = gen::vitrin_shim_surface::requests::Attach;
 type Damage = gen::vitrin_shim_surface::requests::Damage;
 type Commit = gen::vitrin_shim_surface::requests::Commit;
@@ -100,6 +102,11 @@ type SeatButton = gen::vitrin_shim_seat::events::Button;
 type SeatScroll = gen::vitrin_shim_seat::events::Scroll;
 type SeatKey = gen::vitrin_shim_seat::events::Key;
 type SeatText = gen::vitrin_shim_seat::events::Text;
+type SeatRelativeMotion = gen::vitrin_shim_seat::events::RelativeMotion;
+type SeatGestureBegin = gen::vitrin_shim_seat::events::GestureBegin;
+type SeatGestureSwipeUpdate = gen::vitrin_shim_seat::events::GestureSwipeUpdate;
+type SeatGesturePinchUpdate = gen::vitrin_shim_seat::events::GesturePinchUpdate;
+type SeatGestureEnd = gen::vitrin_shim_seat::events::GestureEnd;
 
 /// One fresh, close-on-exec fd -- `decode` takes ownership of it, so every
 /// call site that wants to hand one over needs its own.
@@ -237,6 +244,11 @@ impl_decode_msg_no_fd!(
     SeatScroll,
     SeatKey,
     SeatText,
+    SeatRelativeMotion,
+    SeatGestureBegin,
+    SeatGestureSwipeUpdate,
+    SeatGesturePinchUpdate,
+    SeatGestureEnd,
     Launch,
     Launched,
     GetLayoutFocus,
@@ -246,6 +258,8 @@ impl_decode_msg_no_fd!(
     SessionSelection,
     RequestSelection,
     OfferSelection,
+    SessionPointerConstraint,
+    SessionPointerConstraintState,
 );
 // The two fd-bearing messages in v0.xml (grep for an `fd`-typed arg),
 // matching tests/roundtrip.rs's dedicated-block split.
@@ -308,6 +322,8 @@ static DECODERS: &[Decoder] = decoder_table!(
     Configure,
     RequestSelection,
     OfferSelection,
+    SessionPointerConstraint,
+    SessionPointerConstraintState,
     Attach,
     Damage,
     Commit,
@@ -318,6 +334,11 @@ static DECODERS: &[Decoder] = decoder_table!(
     SeatScroll,
     SeatKey,
     SeatText,
+    SeatRelativeMotion,
+    SeatGestureBegin,
+    SeatGestureSwipeUpdate,
+    SeatGesturePinchUpdate,
+    SeatGestureEnd,
     Launch,
     Launched,
     LayoutFocus,

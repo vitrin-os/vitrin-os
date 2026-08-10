@@ -16,7 +16,9 @@ in this repository, and it is published as such in
 >
 > **On this machine there is no SSH escape route, by the owner's decision**
 > (2026-08-09, recorded as
-> [D-028](plan/20-decision-log.md#d-028--the-drm-bring-up-escape-route-is-vt-switching-and-an-installer-usb-not-ssh)).
+> [D-031, the *first* of two entries with that number](plan/20-decision-log.md#d-031--the-drm-bring-up-escape-route-is-a-hyprland-side-shell-and-an-installer-usb-not-ssh-and-not-vt-switching)
+> — this line cited `D-028` until 2026-08-10, which is the keymap decision; the
+> collision is reported at both D-031 headings).
 > Issue #220 required an SSH session from a second machine and called it
 > non-negotiable; it is not there. What replaces it is **step 0**, and the cost
 > is stated plainly: **a wedged DRM master with no live console is now a reboot,
@@ -216,31 +218,30 @@ disk is encrypted), `arch-chroot`, edit whatever wedged it, `exit`, reboot.
 Have the USB physically present in the room before you start. If it is in a
 drawer in another room, you do not have a third line; you have an errand.
 
-### 0.4 Optional, and a real security trade: raise the SysRq mask.
+### 0.4 SysRq: the keyboard combo is inert here, and the sudo path is elsewhere.
 
-`/proc/sys/kernel/sysrq` is **`16`** on this machine, with no `sysctl.d`
-override. [verified] `16` is *sync only*. **REISUB does not work here** — no
-`b` (reboot), no `e`/`i` (signal processes), no `r` (take the keyboard out of
-raw mode). If you were counting on Alt+SysRq as a safety net, you do not have
-one.
+`/proc/sys/kernel/sysrq` is **`16`** on this machine, set by
+`/usr/lib/sysctl.d/50-default.conf:19`. [verified 2026-08-10] `16` is *sync
+only*: `Alt+SysRq+s` works from the physical keyboard and **every other letter
+does not** — no `b` (reboot), no `e`/`i` (signal processes), no `u` (remount
+read-only), no `r` (take the keyboard out of raw mode). The physical REISUB
+sequence is inert here.
 
-Making it one is a deliberate change, before the bring-up, not during:
+> **This page used to recommend raising the mask with `sysctl kernel.sysrq=1`,
+> and that recommendation is deleted rather than softened.** The owner settled
+> it on 2026-08-10: **the kernel mask is not touched.** Raising it hands
+> `REISUB` to anyone at the physical keyboard of a machine whose whole premise
+> is confining what runs on it, and no bring-up convenience buys that. Do not
+> reinstate it, and do not propose it as an option.
 
-```bash
-# TEMPORARY, this boot only. Restores itself on reboot.
-sudo sysctl kernel.sysrq=1
-```
-
-What you are buying: `Alt+SysRq+r` (unraw — recovers a keyboard a wedged
-compositor left grabbed) and `Alt+SysRq+e,i,s,u,b` (the REISUB sequence — a
-clean-ish reboot without the power button). What you are paying: **anyone at
-this physical keyboard can now reboot the machine and kill any process**, with
-no authentication, until you reboot. On a laptop that never leaves your desk
-that is a small price for a bring-up session; it is still a price, and it is
-yours to decide.
-
-Set it back with `sudo sysctl kernel.sysrq=16` when you are done, or just
-reboot — it is not persisted. [verified: no `sysctl.d` file sets it]
+**What replaces it is a `sudo`-only path that does not need the mask at all.**
+The kernel gates the *keyboard* path on that bitmask and allows
+`/proc/sysrq-trigger` to a privileged user regardless — verified against the
+kernel's own documentation and source, with the correct sequence, the
+destructive steps marked, and the reachable-shell caveat stated, in
+[**the recovery runbook**](book/src/recovery.md#route-3--sysrq-through-procsysrq-trigger-sudo-only).
+It is a way to end a session safely without the power button, not a way to
+un-wedge a display, and it needs a shell you can still reach.
 
 ### 0.5 What you are explicitly NOT doing
 
@@ -517,6 +518,14 @@ From the VT `vitrind` is on: `Ctrl+C`. Then `Ctrl+Alt+F1`.
 
 Work down this list. Do not skip to R4 because the first two feel slow.
 
+> **The full recovery page is [`docs/book/src/recovery.md`](book/src/recovery.md).**
+> R1–R4 below stay here because they are indexed to *this* procedure's steps.
+> The book page is the one to read when you are wedged and not mid-bring-up: it
+> carries the `sudo`-only `/proc/sysrq-trigger` path, the `logind` settings the
+> lid and suspend behaviour depend on, and the **session-lifecycle checklist
+> (L1–L6: 10 VT switches, 5 suspend/resume, 5 lid cycles, blank/unblank, one
+> deliberate wedge)** that the checklist below does not contain and never did.
+
 ### R1 — the desktop is gone but the keyboard works
 
 **`Ctrl+Alt+F1`.** You are back in Hyprland.
@@ -555,13 +564,18 @@ escape-route substitution is stated at the top of this page.
 
 1. **Try `Ctrl+Alt+F1` anyway.** The keyboard may only *look* dead because
    nothing is drawing. Give it a few seconds — a mode set is not instant.
-2. **Try `Alt+SysRq+r`** (unraw), then `Ctrl+Alt+F1` again — **only if you did
-   step 0.4.** With the default mask of `16` this does nothing at all.
-   [verified]
-3. **If you did step 0.4: `Alt+SysRq+e`, `i`, `s`, `u`, `b`**, a couple of
-   seconds apart. That is a sync-and-reboot without the power button, which is
-   strictly better for your filesystem than the next line.
-4. **Hold the power button.** With no SSH, this is where the substitution lands.
+2. **Do not reach for `Alt+SysRq`.** With the mask at `16` every letter except
+   `s` is inert from the keyboard (step 0.4), and that is not being changed.
+   [verified 2026-08-10]
+3. **If you can still reach a shell anywhere — a VT, or the Hyprland session on
+   tty1 — you are not in R2**, you are in R1, and the `sudo`-only
+   `/proc/sysrq-trigger` path in
+   [the recovery runbook](book/src/recovery.md#route-3--sysrq-through-procsysrq-trigger-sudo-only)
+   is how you bring the machine down safely without the power button. That path
+   needs a shell by construction, which is exactly why it does not help in the
+   case R2 is written for.
+4. **Hold the power button.** With no SSH and no shell, this is where the
+   substitution lands.
    State it plainly: **this is a reboot, where #220's design assumed it was a
    command.**
 5. If the machine does not come back up cleanly, that is what the installer USB

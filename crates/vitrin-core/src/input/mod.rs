@@ -3106,6 +3106,74 @@ pub(crate) fn invariant_keysym(evdev_code: u32) -> Option<u32> {
         111 => 0xffff,                         // KEY_DELETE     -> XK_Delete
         125 => 0xffeb,                         // KEY_LEFTMETA   -> XK_Super_L
         126 => 0xffec,                         // KEY_RIGHTMETA  -> XK_Super_R
+        // ---- The XF86 media and brightness block (WS-E.4.3, issue #223) ----
+        //
+        // These belong here on THIS TABLE'S OWN CRITERION, not as a favour to a
+        // laptop: each is one physical key at one scancode whose keysym is not
+        // a function of any layout. Verified structurally rather than assumed --
+        // `grep -lE 'XF86Audio(Mute|RaiseVolume|LowerVolume)'
+        // /usr/share/X11/xkb/symbols/*` returns only `inet` and two vendor
+        // files; `us`, `tr`, `de`, `fr`, `gb` and `ru` bind none of them. They
+        // come from the MODEL/inet compatibility component, which is precisely
+        // what "layout-invariant" means.
+        //
+        // **Where they actually matter**, which is narrower than "media keys
+        // were dropped": on bare metal WITH `--keymap` these resolve through
+        // `keymap::CoreKeymap` and xkb's own `inet(evdev)` already delivered
+        // them, so nothing was being lost there. The two paths these rows fix
+        // are bare metal WITHOUT `--keymap` (which falls back to this table) and
+        // NESTED, where winit reports them as `Key::Named` so `host_keysym`
+        // answers `None` and `resolve_key_seat` falls through to here.
+        //
+        // **And the honest residual**: a delivered `XF86MonBrightnessUp` reaches
+        // the focused realm's shim seat, and no confined app can write
+        // `/sys/class/backlight`. So this converts "the key is dropped at
+        // intake" into "the key is delivered to an app that cannot act on it".
+        // Backlight and volume actuation are DEFERRED, and the evidence that
+        // would reopen them is either a shell client holding a named verb
+        // (WS-E Stage 2's design) or an owner decision to let the core write
+        // `/sys/class/backlight` -- which D-030 already names as a display-power
+        // interface DRM master does not gate.
+        113 => 0x1008ff12, // KEY_MUTE          -> XF86AudioMute
+        114 => 0x1008ff11, // KEY_VOLUMEDOWN    -> XF86AudioLowerVolume
+        115 => 0x1008ff13, // KEY_VOLUMEUP      -> XF86AudioRaiseVolume
+        163 => 0x1008ff17, // KEY_NEXTSONG      -> XF86AudioNext
+        // `XF86AudioPlay`, NOT `XF86MediaPlayPause` (0x1008_10a4): the live
+        // binding in `symbols/inet` is `key <I172> { [ XF86AudioPlay,
+        // XF86AudioPause ] }` and the MediaPlayPause alternative in the same
+        // file is commented out, so this is what every other desktop delivers.
+        // The level-2 divergence is precedented rather than new -- this table is
+        // single-level, so Shift+PlayPause stays `XF86AudioPlay` here while a
+        // keymap build resolves `XF86AudioPause`, exactly as KEY_TAB already
+        // stays `XK_Tab` where xkb says `ISO_Left_Tab`.
+        164 => 0x1008ff14, // KEY_PLAYPAUSE     -> XF86AudioPlay
+        165 => 0x1008ff16, // KEY_PREVIOUSSONG  -> XF86AudioPrev
+        166 => 0x1008ff15, // KEY_STOPCD        -> XF86AudioStop
+        224 => 0x1008ff03, // KEY_BRIGHTNESSDOWN-> XF86MonBrightnessDown
+        225 => 0x1008ff02, // KEY_BRIGHTNESSUP  -> XF86MonBrightnessUp
+        // The highest code `keysym_is_intakeable`'s `0..256` scan still reaches,
+        // and worth the note because 249 would not be. If a row above 255 is
+        // ever wanted, that scan has to widen with it or the chord vocabulary
+        // and the table silently stop agreeing.
+        248 => 0x1008ffb2, // KEY_MICMUTE       -> XF86AudioMicMute
+        //
+        // **Excluded on POLICY, not on this table's criterion**: KEY_POWER
+        // (116), KEY_SLEEP (142), KEY_WAKEUP (143), KEY_SWITCHVIDEOMODE (227)
+        // and KEY_RFKILL (247) are all in range and all layout-invariant, so the
+        // criterion above would admit them. #223's key decision is that suspend
+        // and power policy belong to systemd-logind rather than to this core, so
+        // adding those rows would forward a system-power key into a confined
+        // app's shim seat instead of leaving it where the policy lives. That is
+        // why the refusal is written down here rather than left as an absence.
+        //
+        // **DEFERRED, with the evidence named**: KEY_KBDILLUMTOGGLE (228),
+        // KEY_KBDILLUMDOWN (229) and KEY_KBDILLUMUP (230) are in range and
+        // layout-invariant and would pass on the criterion. They are left out
+        // because the target machine has no keyboard backlight -- `/sys/class/
+        // leds` on it holds only capslock/numlock/scrolllock, the NIC's and the
+        // wifi phy's -- so adding them would be three rows nothing could ever
+        // press. A `*kbd_backlight*` entry under `/sys/class/leds` on the
+        // machine this runs on is the evidence that reopens them.
         _ => return None,
     })
 }
@@ -3593,6 +3661,121 @@ pub(crate) mod tests {
         assert_eq!(invariant_keysym(30), None); // KEY_A
         assert_eq!(invariant_keysym(2), None); // KEY_1
         assert_eq!(invariant_keysym(51), None); // KEY_COMMA
+    }
+
+    /// **The XF86 media and brightness block** (WS-E.4.3, issue #223), pinned
+    /// value by value against `linux/input-event-codes.h` and
+    /// `X11/XF86keysym.h`.
+    ///
+    /// Spelled out rather than spot-checked, because every one of these is a
+    /// two-number pair a typo would silently corrupt into some *other* real
+    /// keysym: `0x1008ff11` and `0x1008ff13` are volume down and up, and
+    /// swapping them gives an app a working key that does the opposite thing.
+    ///
+    /// The three assertions after the table are the ones that keep this a
+    /// principled extension rather than a list somebody grew:
+    ///
+    /// * every row is inside the `0..256` window `keysym_is_intakeable` scans,
+    ///   so the chord vocabularies that consult it see a consistent table;
+    /// * no row is layout-dependent -- the negatives above (`KEY_A`, `KEY_1`,
+    ///   `KEY_COMMA`) still answer `None`;
+    /// * the system-power keys are **excluded on policy**, not on the table's
+    ///   criterion, and that refusal is asserted so it cannot be quietly
+    ///   reversed by someone applying the criterion mechanically.
+    #[test]
+    fn the_xf86_media_block_matches_the_kernel_and_x11_headers() {
+        for (code, keysym, name) in [
+            (113u32, 0x1008ff12u32, "KEY_MUTE -> XF86AudioMute"),
+            (114, 0x1008ff11, "KEY_VOLUMEDOWN -> XF86AudioLowerVolume"),
+            (115, 0x1008ff13, "KEY_VOLUMEUP -> XF86AudioRaiseVolume"),
+            (163, 0x1008ff17, "KEY_NEXTSONG -> XF86AudioNext"),
+            (164, 0x1008ff14, "KEY_PLAYPAUSE -> XF86AudioPlay"),
+            (165, 0x1008ff16, "KEY_PREVIOUSSONG -> XF86AudioPrev"),
+            (166, 0x1008ff15, "KEY_STOPCD -> XF86AudioStop"),
+            (
+                224,
+                0x1008ff03,
+                "KEY_BRIGHTNESSDOWN -> XF86MonBrightnessDown",
+            ),
+            (225, 0x1008ff02, "KEY_BRIGHTNESSUP -> XF86MonBrightnessUp"),
+            (248, 0x1008ffb2, "KEY_MICMUTE -> XF86AudioMicMute"),
+        ] {
+            assert_eq!(invariant_keysym(code), Some(keysym), "{name}");
+            assert!(
+                code < 256,
+                "{name} is outside the 0..256 window `keysym_is_intakeable` scans, so the \
+                 table and the chord vocabularies would stop agreeing about it"
+            );
+            assert!(
+                keysym_is_intakeable(keysym),
+                "{name} must be reachable through the same predicate the dead-man and \
+                 attention chords validate against"
+            );
+        }
+
+        // **KEY_PLAYPAUSE is XF86AudioPlay, not XF86MediaPlayPause.** The live
+        // binding is `symbols/inet`'s `key <I172> { [ XF86AudioPlay,
+        // XF86AudioPause ] }`; the MediaPlayPause alternative in the same file
+        // is commented out. Getting this one wrong produces a keysym no other
+        // desktop sends, which is the quietest possible failure.
+        assert_ne!(invariant_keysym(164), Some(0x1008_10a4));
+
+        // **Excluded on POLICY, not on the criterion** (#223's key decision:
+        // suspend and power policy are logind's, not this core's). All five are
+        // in range and layout-invariant, so the criterion alone would admit
+        // them -- and admitting them would forward a system-power key into a
+        // confined app's shim seat instead of leaving it where the policy lives.
+        for (code, name) in [
+            (116u32, "KEY_POWER"),
+            (142, "KEY_SLEEP"),
+            (143, "KEY_WAKEUP"),
+            (227, "KEY_SWITCHVIDEOMODE"),
+            (247, "KEY_RFKILL"),
+        ] {
+            assert_eq!(
+                invariant_keysym(code),
+                None,
+                "{name} must NOT be in this table. It passes the layout-invariance criterion, \
+                 which is exactly why the refusal is a decision rather than an omission: \
+                 delegating power and lid policy to systemd-logind means this core does not \
+                 hand those keys to a confined app either"
+            );
+        }
+
+        // **DEFERRED**, with the evidence that reopens it named: the keyboard
+        // backlight keys pass the criterion and are left out because the target
+        // machine has no keyboard backlight at all (`/sys/class/leds` holds only
+        // the lock LEDs, the NIC's and the wifi phy's). A `*kbd_backlight*`
+        // entry there is what would reopen them.
+        for code in [228u32, 229, 230] {
+            assert_eq!(invariant_keysym(code), None);
+        }
+    }
+
+    /// **The media block widens no chord vocabulary**, which is the property
+    /// that keeps it a table extension rather than a configuration change.
+    ///
+    /// Adding rows widens [`keysym_is_intakeable`], which
+    /// `deadman::Chord::parse` and `attention::AttentionChord::parse` consult —
+    /// but `chord::Trigger::parse` *also* requires the name to be in
+    /// `Trigger::VOCABULARY`, which is unchanged. So no new chord became
+    /// configurable, no operator's `--keymap` became invalid through
+    /// `CoreKeymap`'s `DisarmsChord` check, and nothing an operator can type on
+    /// a command line changed meaning.
+    #[test]
+    fn the_media_block_makes_no_new_chord_configurable() {
+        for name in ["xf86audiomute", "volumeup", "brightnessup", "playpause"] {
+            assert!(
+                crate::chord::Trigger::parse(name).is_err(),
+                "`{name}` became a configurable chord trigger: the media block is a delivery \
+                 table, not a vocabulary, and a gesture nobody designed must not become \
+                 spellable by widening it"
+            );
+        }
+        // ...and the keys that WERE in the vocabulary still are, so this is not
+        // passing because `Trigger::parse` broke.
+        assert!(crate::chord::Trigger::parse("delete").is_ok());
+        assert!(crate::chord::Trigger::parse("print").is_ok());
     }
 
     /// WS-E.2.4 (issue #216): the screenshot chord's trigger key is reachable

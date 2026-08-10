@@ -823,6 +823,26 @@ pub(crate) trait RuntimeHost: Sized + 'static {
     /// `--headless` at startup, so no configuration can reach this default with
     /// a lock armed behind it.
     fn service_lock(&mut self, _now: Instant) {}
+
+    /// Service the **screen's own lifecycle** for this round (WS-E.4.3, issue
+    /// #223): the idle blank's countdown and cover, and the post-hoc detection
+    /// of a suspend that just ended.
+    ///
+    /// Takes both clocks because it needs both and the round already reads both:
+    /// `now` is `CLOCK_MONOTONIC`, which does not advance across a suspend, and
+    /// `wall` is `CLOCK_REALTIME`, which does. Their disagreement **is** the
+    /// resume detector ([`crate::backend::blank::ResumeWatch`]), and there is
+    /// nothing else to detect one with — the core speaks no D-Bus, and libseat
+    /// delivers no event for a suspend at all.
+    ///
+    /// The default is a **no-op**, which is correct and not merely convenient:
+    /// only a backend that owns a display controller can power a panel down, and
+    /// only a backend whose hook stack contains the lock gate has anything
+    /// writing the activity clock a blank is postponed and woken by. `main`
+    /// refuses `--blank-idle` on both other backends at startup
+    /// ([`crate::backend::blank::BLANK_NEEDS_THE_OUTPUT`]), so no configuration
+    /// can reach this default with a blank armed behind it.
+    fn service_screen(&mut self, _wall: std::time::SystemTime, _now: Instant) {}
 }
 
 impl<H: PreemptionHook> Runtime<H> {
@@ -1765,16 +1785,21 @@ pub(crate) fn deliver<H: PreemptionHook>(
 /// be exactly that drift-prone shadow state. So the embedder answers the
 /// question once per round, from the same fact it presents by.
 ///
-/// # There is deliberately no third variant for a dark panel
+/// # The third variant arrived, and D-030(4) said which change would owe it
 ///
-/// The obvious sibling — "the output is powered down" — is **not** here, and
-/// its absence is a decision rather than an omission. This core has no DPMS: it
-/// never sets a display-power state, never reads one, and while it holds DRM
-/// master nothing else may set one either. A variant for a condition nothing in
-/// the process can produce would be an unreachable guard that reads as a live
-/// protection, which this codebase has already shipped once (the `preempted`
-/// hook no backend stacked, from P1.4.4 until issue #212's review, while the
-/// book described it as live). D-030(4) states that in full.
+/// This paragraph used to say there was deliberately no variant for a dark
+/// panel, on the ground that "this core has no DPMS: it never sets a
+/// display-power state, never reads one". That was true and is now false —
+/// WS-E.4.3 (issue #223) implements the idle blank, and D-030(4) deferred "a
+/// dark-output gate — to whichever change implements DPMS, **as that change's
+/// own acceptance criterion**". [`PromptVisibility::ScreenIsDark`] is that gate.
+///
+/// It is a separate variant rather than a reuse of
+/// [`PromptVisibility::ScreenNotOurs`] because the two facts differ and the
+/// flight recorder has to be able to say which: a paused session's card can
+/// never reach a panel and never will, while a dark session's reaches it the
+/// instant the human touches anything. `ScreenIsDark` is therefore strictly
+/// *less* obstructive than `ScreenNotOurs`, and saying so is the honest record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptVisibility {
     /// The embedder is presenting to a display it owns, so a card raised this
@@ -1795,6 +1820,27 @@ pub(crate) enum PromptVisibility {
         )
     )]
     ScreenNotOurs,
+    /// The session powered its own panel down after `--blank-idle` seconds with
+    /// no physical input (WS-E.4.3, [`crate::backend::blank`]). A card
+    /// composited now is on a display that is off, so raising one would write
+    /// `consent_transition{shown}` — the flight recorder's record that **a human
+    /// was asked** — about a human who is looking at a dark screen, and would
+    /// set `prompt_shown` so the chokepoint starts refusing that principal
+    /// `consent_held` citing a card nobody can see.
+    ///
+    /// The petition stays pending, unshown and unjournalled, and the ordinary
+    /// advisory sweep resolves it `timed_out`, which reaches the agent as a
+    /// refusal. Fail-closed, and the same treatment a paused seat gets.
+    #[cfg_attr(
+        not(feature = "drm-backend"),
+        allow(
+            dead_code,
+            reason = "only a display controller can be powered down, and only the bare-metal \
+                      backend owns one; a default build compiles this path and tests it \
+                      through the rig"
+        )
+    )]
+    ScreenIsDark,
 }
 
 /// Service one turn of interactive consent: retire a prompt whose petition
@@ -2015,17 +2061,122 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
                 //
                 // Only the guard moves; the petition's own deadline does not.
                 // A lock does not buy the human more time to decide.
-                if grab.borrow_mut().restart_guard(now) {
-                    tracing::debug!(
-                        "consent guard restarted: a prompt became visible when the lock lowered"
-                    );
-                }
+                //
+                // Through [`screen_became_visible`] since WS-E.4.3, not
+                // `restart_guard` directly: "the human can see this card again
+                // as of now" is now true on four occasions -- an unlock, a seat
+                // return, an idle-blank wake and a resume -- and four naked
+                // calls would be four places for the fifth one to be forgotten.
+                screen_became_visible(grab, now);
                 crate::recorder::Event::SessionUnlocked
             }
         };
         runtime.kernel.recorder.record(event);
     }
     changed
+}
+
+/// Drive the **idle blank** for one dispatch round (WS-E.4.3, issue #223):
+/// advance the countdown, abandon a wake that never completed, and mirror the
+/// phase onto the cover.
+///
+/// Returns whether human-visible output changed, so the caller marks the frame
+/// dirty and asks for a present — [`service_consent_round`]'s and
+/// [`service_lock_round`]'s contract, so a cover appearing and a card appearing
+/// take the same path to the screen.
+///
+/// # No timer of its own, and that is the point
+///
+/// This is called from [`post_dispatch`], the loop's per-iteration callback, and
+/// the loop is woken at least once a second by the session's own unconditional
+/// sweep ([`SWEEP_INTERVAL`]). [`crate::lock::LockScreen::tick`]'s docs give the
+/// rule and this inherits it: the round already samples one instant, and a
+/// second clock would be a second thing to keep in step. The cost is up to one
+/// second of lateness against a multi-minute timeout, which is not a number
+/// anyone can see.
+///
+/// # The two states are mirrored, never duplicated
+///
+/// [`crate::backend::blank::SessionActivity`] is the single source of truth and
+/// [`crate::backend::blank::BlankSurface`] is told what it already decided —
+/// [`service_lock_round`]'s discipline exactly. A cover raised without the state
+/// machine would be a black screen nothing can lift; a state machine that went
+/// dark without the cover would power the panel down over the human's last
+/// screenful, which is the disclosure the cover exists to prevent.
+///
+/// # It does NOT touch the lock, in either direction
+///
+/// On idle the screen goes dark and the session stays unlocked (Taha,
+/// 2026-08-10). The two share [`crate::backend::blank::SessionActivity`]'s clock
+/// and nothing else, and in particular this must never suppress
+/// `LockScreen::tick`: a session with `--blank-idle 300 --lock-idle 600` would
+/// then never lock, because the blank would silently disable the lock — the
+/// class of unchosen behaviour D-030(2) was written to catch.
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        dead_code,
+        reason = "the one production caller is the bare-metal backend's `service_screen`, \
+                  because only a backend that owns a display controller can blank one; a \
+                  default build compiles this and drives it through the session rig's own \
+                  override, which is where CI's coverage of the state machine lives"
+    )
+)]
+pub(crate) fn service_blank_round(
+    activity: &mut crate::backend::blank::SessionActivity,
+    surface: &mut crate::backend::blank::BlankSurface,
+    now: Instant,
+) -> bool {
+    // The countdown first, so a session that went idle this round covers on
+    // this round's frame rather than the next one.
+    activity.tick(now);
+    // A wake that outran its deadline with no flip behind it is abandoned, so
+    // the session is not left in a state where every subsequent press is
+    // swallowed as "still waking". Fail open on input; the property that stops
+    // a clickjack is the consent guard restart, not the consume.
+    if activity.wake_expired(now) {
+        tracing::warn!(
+            "the screen did not come back within the wake deadline; abandoning the wake so \
+             physical input reaches the session again"
+        );
+        activity.force_lit();
+    }
+    surface.set_covering(activity.is_covering())
+}
+
+/// **The human can see this session's trusted surfaces again as of `now`** —
+/// the one call three different returns make.
+///
+/// [`ConsentGrab::restart_guard`] clears `armed` and restarts `GUARD_INTERVAL`
+/// without touching the petition's own deadline. It is owed whenever "raised"
+/// and "visible" came apart and have just come back together, and by WS-E.4.3
+/// there are three ways that happens:
+///
+/// 1. the lock lowered ([`service_lock_round`]'s `Unlocked` arm);
+/// 2. the seat came back after a VT switch ([`resume_physical_seat`]);
+/// 3. the screen woke from an idle blank, or the machine resumed from a suspend
+///    (`crate::backend::drm`).
+///
+/// Three naked `restart_guard` calls were already a smell; five would mean "the
+/// human can see this card again" was asserted from five places, and the sixth
+/// would be the one that forgot. So the fact has one name and one site.
+///
+/// **What it closes**, in the blank's case: a press armed on Allow before the
+/// panel went dark, released after the human comes back with the pointer
+/// unmoved, would otherwise commit a grant decided against a card that spent its
+/// whole guard interval on a screen that was off. `commit` re-checks only the
+/// last *physical* pointer position, and going dark does not reset one.
+///
+/// **Only the guard moves.** The petition's deadline is deliberately untouched:
+/// it bounds how long the human has to decide, and a blank, a VT switch or a
+/// suspend does not buy them more of it. Refreshing it would also let an agent
+/// extend its own petition's life by inducing churn.
+pub(crate) fn screen_became_visible(grab: &std::cell::RefCell<ConsentGrab>, now: Instant) -> bool {
+    let restarted = grab.borrow_mut().restart_guard(now);
+    if restarted {
+        tracing::debug!("consent guard restarted: a prompt became visible again");
+    }
+    restarted
 }
 
 /// Send the petitioner its `vitrin_consent.state(shown)`, the wire half of
@@ -3305,11 +3456,10 @@ pub(crate) fn suspend_physical_seat<H: crate::input::PreemptionHook>(
     )
 )]
 pub(crate) fn resume_physical_seat(grab: &std::cell::RefCell<ConsentGrab>, now: Instant) -> bool {
-    let restarted = grab.borrow_mut().restart_guard(now);
-    if restarted {
-        tracing::debug!("consent guard restarted: a prompt became visible when the seat returned");
-    }
-    restarted
+    // Delegated rather than open-coded (WS-E.4.3): "the human can see this card
+    // again as of now" is one fact with one implementation, and a seat return is
+    // one of the three ways it becomes true. See [`screen_became_visible`].
+    screen_became_visible(grab, now)
 }
 
 /// Turn the human's queued screenshot chords into files on disk (WS-E.2.4,
@@ -4148,6 +4298,24 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
     // shape `service_consent` already set here; the two are microseconds apart
     // and neither compares against the other's sample.
     host.service_lock(Instant::now());
+    // ...and the screen's own lifecycle (WS-E.4.3, issue #223), immediately
+    // after the lock and on the same terms: raising or lowering the idle cover
+    // is exactly what makes the frame dirty, so it must run before the gate
+    // below reads `dirty`.
+    //
+    // **After the lock, deliberately, and it is the same reason the lock is
+    // after consent**: the two share an activity clock and nothing else, and
+    // the journal must read in the order the human experienced. A round in
+    // which the session both locks and blanks locked first and then went dark
+    // — never "the screen went dark and then, behind it, something locked".
+    //
+    // Both clocks are sampled here rather than inside, because the resume
+    // detector's whole substance is their disagreement and a detector that read
+    // them at two different points in the round would manufacture skew of its
+    // own. Backends that own no display inherit the trait's no-op and pay two
+    // `clock_gettime` calls, which is what `refresh_status` below already pays
+    // unconditionally.
+    host.service_screen(std::time::SystemTime::now(), Instant::now());
     // ...and the pointer constraints, immediately after both, because both are
     // gates it derives from: a card raised or a cover lowered one line above
     // changes what every recorded constraint is worth. Before the dirty gate
@@ -4506,6 +4674,18 @@ mod tests {
         /// `true` by default, which is the posture of every backend with no
         /// seat to lose.
         output_active: bool,
+        /// **The idle blank's cover** (WS-E.4.3, issue #223), and unlike
+        /// [`Self::lock_raised`] this is the **real**
+        /// [`crate::backend::blank::BlankSurface`] rather than a flag.
+        ///
+        /// It has to be real, because the property CI is asked to prove about
+        /// the blank is a statement about *composited bytes*: that a covered
+        /// frame carries no pixel of the realm view and still carries an intact
+        /// trusted band. A boolean could not answer that, and a second
+        /// compositor written here to answer it would be the drift D-019 names.
+        /// [`Self::human_visible`] therefore passes this one through the very
+        /// function both shipped backends compose with.
+        blank: crate::backend::blank::BlankSurface,
     }
 
     impl TestView {
@@ -4532,6 +4712,7 @@ mod tests {
                 self.scenes.bound(),
                 &mut self.consent,
                 &mut no_lock(),
+                &self.blank,
                 &mut no_status(),
                 w,
                 h,
@@ -4578,6 +4759,10 @@ mod tests {
             crate::input::OutputGates {
                 overlay_up: self.consent.prompt().is_some() || self.lock_raised,
                 active: self.output_active,
+                // Read off the real cover this rig composites through, so a
+                // constraint test and the blank's own composite test cannot
+                // disagree about whether the screen is dark.
+                dark: self.blank.is_covering(),
             }
         }
         fn scene_mut(&mut self, realm: &RealmId) -> &mut Scene {
@@ -4687,7 +4872,31 @@ mod tests {
         /// [`PromptVisibility`] — the bare-metal backend's `DrmOutput::active`
         /// in miniature. `Reachable` by default, so every existing consent test
         /// is unaffected; a pause test flips it.
+        ///
+        /// **Not the whole answer since WS-E.4.3**: a blank test wants the
+        /// visibility the *production* backend derives, not a fixture, so
+        /// [`TestHost::service_consent`] resolves `ScreenIsDark` off the real
+        /// cover exactly as `DrmState::service_consent` does, and falls back to
+        /// this field otherwise.
         screen: PromptVisibility,
+        /// The session's activity clock and blank state machine (WS-E.4.3,
+        /// issue #223), when a test attaches one.
+        ///
+        /// `None` by default, so every existing test gets the trait's no-op
+        /// [`RuntimeHost::service_screen`] and is unaffected — [`Self::grab`]'s
+        /// posture, for the same reason. A blank test attaches one with
+        /// [`Rig::attach_blank`] and the override below then drives
+        /// [`service_blank_round`] each dispatch round, exactly as the
+        /// bare-metal backend does.
+        activity: Option<Rc<RefCell<crate::backend::blank::SessionActivity>>>,
+        resume: crate::backend::blank::ResumeWatch,
+        /// The wall clock this rig reports to [`RuntimeHost::service_screen`],
+        /// overriding `SystemTime::now()` when a test sets it.
+        ///
+        /// Required for the resume detector, whose whole substance is the wall
+        /// clock advancing further than the monotonic one: a test that had to
+        /// *actually suspend the machine* to produce that would be no test.
+        wall: Option<std::time::SystemTime>,
     }
 
     impl RuntimeHost for TestHost {
@@ -4714,14 +4923,52 @@ mod tests {
             let Some(grab) = self.grab.clone() else {
                 return;
             };
+            // The bare-metal backend's resolution, in miniature and in the same
+            // order (WS-E.4.3): a paused screen first, then a dark one, then
+            // reachable. Derived from the real cover rather than from a field,
+            // so this rig cannot claim a visibility its own composite
+            // contradicts.
+            let visibility = if self.view.blank.is_covering() {
+                PromptVisibility::ScreenIsDark
+            } else {
+                self.screen
+            };
             let mut grab = grab.borrow_mut();
             if service_consent_round(
                 &mut grab,
                 &mut self.runtime,
                 &mut self.view.consent,
                 now,
-                self.screen,
+                visibility,
             ) {
+                self.runtime.dirty = true;
+            }
+        }
+
+        /// The bare-metal backend's [`RuntimeHost::service_screen`] in
+        /// miniature: the resume detector, then the blank's round.
+        fn service_screen(&mut self, wall: std::time::SystemTime, now: Instant) {
+            let Some(activity) = self.activity.clone() else {
+                return;
+            };
+            let wall = self.wall.unwrap_or(wall);
+            if let Some(_gap) = self.resume.sample(wall, now) {
+                if let Some(grab) = self.grab.clone() {
+                    screen_became_visible(&grab, now);
+                }
+                self.runtime.dirty = true;
+            }
+            // Scoped exactly as the bare-metal override scopes it, and for the
+            // reason written up there: the guard is on the very cell a present
+            // reads, so holding it across one is a panic in the compositor. The
+            // two implementations are kept the same shape deliberately -- a rig
+            // that was safe by accident would stop being a model of the thing it
+            // stands in for.
+            let changed = {
+                let mut activity = activity.borrow_mut();
+                service_blank_round(&mut activity, &mut self.view.blank, now)
+            };
+            if changed {
                 self.runtime.dirty = true;
             }
         }
@@ -4843,12 +5090,16 @@ mod tests {
                     attention: false,
                     lock_raised: false,
                     output_active: true,
+                    blank: crate::backend::blank::BlankSurface::for_test(),
                 },
                 handle: handle.clone(),
                 signal: event_loop.get_signal(),
                 fatal: None,
                 grab: None,
                 screen: PromptVisibility::Reachable,
+                activity: None,
+                resume: crate::backend::blank::ResumeWatch::new(),
+                wall: None,
             };
             install(&handle, &mut host.runtime).expect("install runtime sources");
             Rig {
@@ -4873,6 +5124,26 @@ mod tests {
             let grab = Rc::new(RefCell::new(ConsentGrab::new()));
             self.host.grab = Some(Rc::clone(&grab));
             grab
+        }
+
+        /// Arm the idle blank and return a shared handle to its state
+        /// (WS-E.4.3, issue #223).
+        ///
+        /// [`Self::attach_grab`]'s shape and its purpose: this is what turns
+        /// [`TestHost::service_screen`] from the trait's no-op into the driven
+        /// path, so every [`post_dispatch`] runs [`service_blank_round`] against
+        /// the real [`crate::backend::blank::BlankSurface`] the rig composites
+        /// through — the fake presenter #223's acceptance criteria ask for.
+        fn attach_blank(
+            &mut self,
+            after: Duration,
+        ) -> Rc<RefCell<crate::backend::blank::SessionActivity>> {
+            let activity = Rc::new(RefCell::new(crate::backend::blank::SessionActivity::new(
+                Some(after),
+                Instant::now(),
+            )));
+            self.host.activity = Some(Rc::clone(&activity));
+            activity
         }
 
         /// Fork the real mock-shim binary into this rig's scratch runtime
@@ -5177,7 +5448,9 @@ mod tests {
             crate::chord::ModChord::parse(crate::lock::DEFAULT_LOCK_CHORD).unwrap(),
             None,
             None,
-            t0,
+            Rc::new(RefCell::new(crate::backend::blank::SessionActivity::new(
+                None, t0,
+            ))),
         );
         let mut surface = LockSurface::new(crate::consent::TrustedIndicator::for_test());
         // No prompt is up in these cases, so `restart_guard` answers `false`;
@@ -6968,6 +7241,223 @@ mod tests {
             "and only then may the run journal consent_transition{{shown}}; got {:?}",
             entries.iter().map(|e| e.str("kind")).collect::<Vec<_>>()
         );
+    }
+
+    /// **The idle blank's whole state machine, driven through the real
+    /// dispatch round against the rig's presenter** (WS-E.4.3, issue #223).
+    ///
+    /// This is the half of #223 CI can carry, and the criterion the issue
+    /// states in as many words: the timer, the cover and the transitions, on the
+    /// existing headless/synthetic pattern. What it deliberately does **not**
+    /// touch is `DrmSurface::clear` — no runner has a display controller, and
+    /// `DrmState` cannot be constructed without a real `DrmDevice`,
+    /// `LibSeatSession`, `GbmDevice` and `GlesRenderer`. The display-power call
+    /// itself is held by a source assertion in `backend::drm`, exactly as
+    /// D-030's three gates are, and by nothing else until the owner runs the
+    /// hardware checklist.
+    ///
+    /// Every transition is asserted through [`post_dispatch`] rather than by
+    /// poking the state machine, because the thing that would silently break is
+    /// the *wiring*: a `service_screen` that stopped being called leaves
+    /// `blank.rs`'s own unit tests entirely green.
+    #[test]
+    fn the_idle_blank_covers_the_output_and_a_human_takes_it_back() {
+        use crate::backend::blank::Phase;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "idle-blank",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let activity = rig.attach_blank(Duration::from_secs(300));
+        let t0 = activity.borrow().last_activity();
+
+        // A round before the deadline changes nothing, which is the control:
+        // without it every assertion below would pass against a cover that was
+        // always up.
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(activity.borrow().phase(), Phase::Lit);
+        let lit = rig.host.view.human_visible();
+
+        // The deadline passes. The rig's clock is the real one, so the round is
+        // driven with a stamp far enough back to be idle -- the same seam
+        // `LockScreen`'s own tests use.
+        activity.borrow_mut().tick(t0 + Duration::from_secs(300));
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(
+            activity.borrow().phase(),
+            Phase::Covering,
+            "the round must raise the cover before anything powers a panel down"
+        );
+
+        // ...and the cover really is in the frame the human would be shown,
+        // through the same `compose_human_visible` both shipped backends use.
+        let covered = rig.host.view.human_visible();
+        assert_ne!(
+            lit, covered,
+            "a covered frame must differ from a lit one, or the cover reached no composite"
+        );
+        let band = (VIEW.0 as usize) * (crate::consent::TRUST_BAND_HEIGHT as usize) * 4;
+        assert!(
+            covered[band..]
+                .chunks_exact(4)
+                .all(|px| px == [0x00, 0x00, 0x00, 0xff]),
+            "every row below the trusted band must be the cover"
+        );
+
+        // The panel goes dark once the cover's own flip lands, and only then.
+        assert!(!activity.borrow().dpms_owed());
+        activity.borrow_mut().note_frame_queued();
+        assert!(activity.borrow().dpms_owed());
+        activity.borrow_mut().went_dark();
+        assert!(
+            rig.host.view.output_gates().dark,
+            "a dark output must be visible to the pointer-constraint reconciler through the \
+             SAME field the composite reads, or a locked pointer survives a blank the human \
+             can neither see nor free"
+        );
+
+        // The human comes back. Any physical event does it; here the state
+        // machine is driven directly, because what this test is about is the
+        // round's reaction rather than the gate's verdict
+        // (`lock::gate::tests::every_physical_event_postpones_the_blank_and_wakes_a_dark_screen`
+        // holds that half against the real router stack).
+        assert!(activity
+            .borrow_mut()
+            .note_physical(Instant::now())
+            .consumes());
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(activity.borrow().phase(), Phase::Waking);
+        assert_eq!(
+            rig.host.view.human_visible(),
+            lit,
+            "the cover must come down on the wake, or the frame that re-enables the display \
+             is the black one"
+        );
+        assert!(!rig.host.view.output_gates().dark);
+
+        // ...and the wake ends at the first completed flip, not before.
+        assert!(activity.borrow_mut().note_flip_completed());
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(activity.borrow().phase(), Phase::Lit);
+    }
+
+    /// **A consent prompt cannot be resolved across a blank** (WS-E.4.3, issue
+    /// #223's named acceptance criterion; D-030(4)'s deferred dark-output gate,
+    /// discharged).
+    ///
+    /// Two independent failures, and both have to be closed or the criterion is
+    /// only half met:
+    ///
+    /// * **A card must not be raised onto a dark panel at all.** `raise` writes
+    ///   `consent_transition{shown}` — the flight recorder's record that *a
+    ///   human was asked* — and sets `prompt_shown`, so the enforcement
+    ///   chokepoint starts refusing that principal `consent_held` citing a card
+    ///   nobody can see. `no_prompt_is_raised_while_the_screen_is_not_ours`
+    ///   holds the identical property for a seat pause; this is the same
+    ///   falsehood reachable from a *timer* rather than from a human's chord,
+    ///   which makes it routine rather than occasional.
+    /// * **A press armed before the blank must not commit after it.** The human
+    ///   left with the pointer over Allow, the panel went dark, and `commit`
+    ///   re-checks only the last *physical* pointer position — which going dark
+    ///   does not reset. Without the guard restart the first release after they
+    ///   come back grants authority decided against a card that spent its whole
+    ///   guard interval on a screen that was off.
+    ///
+    /// The positive half is in the same test on purpose: the negative alone
+    /// passes in a run where the consent machinery is simply broken, so the same
+    /// petition — no reconnect, no second petition — is raised the moment the
+    /// screen comes back.
+    #[test]
+    fn a_consent_prompt_cannot_be_resolved_across_a_blank() {
+        use crate::backend::blank::Phase;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "consent-blank",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::Interactive,
+                config: PetitionConfig::default(),
+            },
+        );
+        let grab = rig.attach_grab();
+        let activity = rig.attach_blank(Duration::from_secs(300));
+        let t0 = activity.borrow().last_activity();
+
+        // The screen is already dark when the petition arrives.
+        {
+            let mut a = activity.borrow_mut();
+            assert!(a.tick(t0 + Duration::from_secs(300)));
+            a.note_frame_queued();
+            a.went_dark();
+            assert_eq!(a.phase(), Phase::Dark);
+        }
+
+        let mut client = agent(&rig.socket);
+        send_preamble(&mut client);
+        send_petition(&mut client);
+        rig.pump(Duration::from_millis(400));
+
+        // The petition really did arrive and really is pending -- otherwise
+        // everything below is vacuous.
+        let front = rig
+            .host
+            .runtime
+            .kernel
+            .petitions
+            .front_pending()
+            .expect("the petition must be queued and awaiting a human");
+        assert!(
+            grab.borrow().armed_petition().is_none(),
+            "a card was raised onto a panel this session had powered down: no human could \
+             have seen it, and the record would say one was asked"
+        );
+        assert!(
+            rig.host.view.consent.card_origin(VIEW.0, VIEW.1).is_none(),
+            "the consent surface must have nothing on it while the screen is dark"
+        );
+        let petitioner =
+            PrincipalIdentity::parse(DEMO_IDENTITY).expect("the rig's demo identity parses");
+        assert!(
+            !rig.host.runtime.kernel.petitions.prompt_up_for(&petitioner),
+            "`prompt_shown` was set for a card on a dark screen, so the enforcement chokepoint \
+             would refuse this principal `consent_held` citing it"
+        );
+        let entries = rig.entries();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.str("kind") == "consent_transition" && e.str("state") == "shown"),
+            "the flight recorder journalled `shown` for a prompt on a screen that was off; \
+             got {:?}",
+            entries.iter().map(|e| e.str("kind")).collect::<Vec<_>>()
+        );
+
+        // The human touches something. The cover comes down, the panel comes
+        // back, and the SAME petition is raised -- no reconnect, no second
+        // petition, only the visibility answer changing.
+        activity.borrow_mut().note_physical(Instant::now());
+        activity.borrow_mut().note_flip_completed();
+        let petition = pump_until_armed(&mut rig, &grab);
+        assert_eq!(
+            petition, front,
+            "the petition that waited out the blank is the one raised"
+        );
+        assert!(
+            rig.host.view.consent.card_origin(VIEW.0, VIEW.1).is_some(),
+            "the card must go up the moment the panel is lit again"
+        );
+
+        // The guard half of "cannot be resolved across a blank" is held one
+        // module over, against the real grab and a real armed press:
+        // `consent::grab::tests::a_prompt_that_spanned_an_idle_blank_gets_a_fresh_guard_and_loses_its_armed_press`.
+        // It is there rather than here because the property is about
+        // `ConsentGrab`'s own judgement of a press, and this rig has no pointer
+        // to press with -- but it is the same `screen_became_visible` call the
+        // wake makes on bare metal, so the two halves meet.
     }
 
     /// **A seat pause pays the app every press the human is holding — keys

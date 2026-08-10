@@ -190,36 +190,32 @@ pub(crate) struct LockScreen {
     /// How long without physical input before the lock raises itself; `None`
     /// disables the idle raise entirely (`--lock-idle` omitted).
     idle_after: Option<Duration>,
-    /// When physical input was last seen, or — before the first event — when
-    /// the session armed.
+    /// **The session's one activity clock**, shared with the idle blank
+    /// (WS-E.4.3, issue #223).
     ///
-    /// **Seeded at construction rather than left `None`**, because "no input
-    /// has ever arrived" and "no input has arrived recently" are the same
-    /// situation for an idle lock, and a `None` that meant "never lock" would
-    /// leave a session that came up in front of an empty chair unlocked
-    /// forever. The fail-closed reading is the one that is also the obvious
-    /// one.
-    last_activity: Instant,
-    /// Whether the seat has been taken away from this session — on bare metal,
-    /// the human switched to another VT (D-030(7)).
+    /// This used to be a plain `last_activity: Instant` on this struct, and the
+    /// blank needs the same fact: "when did the human last touch this session".
+    /// Two fields would be two clocks, they would drift, and the drift would be
+    /// invisible — so the field was lifted into
+    /// [`crate::backend::blank::SessionActivity`] behind an `Rc<RefCell<..>>`,
+    /// on [`crate::input::InputRouter`]'s presence-record pattern: minted once,
+    /// handed to everyone who reads it, written at exactly one site.
     ///
-    /// While true the idle clock does not run. **This is an owner decision,
-    /// not a derivation** (Taha, 2026-08-09): switching away must not lock the
-    /// session. Without it the behaviour is one nobody chose — physical input
-    /// is suspended for the whole switch, so `last_activity` cannot advance,
-    /// so a session with `--lock-idle` locks *during* the absence, at a moment
-    /// no human could see, and the human returns to a passphrase prompt they
-    /// did not ask for.
+    /// That one site is [`Self::judge`], below its `Origin::Physical` check —
+    /// the very line that was already there. The blank therefore inherits, as a
+    /// property of the code rather than as a second rule, the thing
+    /// `an_agents_actuation_never_holds_the_idle_lock_open` pins for the lock:
+    /// **an agent's actuations postpone neither timer.**
     ///
-    /// The accepted cost is stated rather than hidden: a session switched away
-    /// from for eight hours is unlocked when it is switched back to, because
-    /// vitrind saw no idle time pass. A configurable policy — lock on switch,
-    /// lock on idle, never — is filed as its own issue rather than guessed at
-    /// here.
-    ///
-    /// Deliberately NOT a lowering: a lock already up stays up across a
-    /// switch. This suppresses only the *raise*.
-    seat_absent: bool,
+    /// It also carries `seat_absent` (D-030(7), Taha 2026-08-09): while the
+    /// human is on another VT the idle clock does not run, because physical
+    /// input is suspended for the whole switch so the stamp cannot advance, and
+    /// a session that counted that time would lock itself at an instant no human
+    /// could observe. The accepted cost is stated rather than hidden: a session
+    /// switched away from for eight hours is unlocked when it is switched back
+    /// to. Deliberately NOT a lowering — a lock already up stays up across a
+    /// switch; this suppresses only the *raise*.
+    activity: Rc<RefCell<crate::backend::blank::SessionActivity>>,
     /// The stored digest an attempt is checked against, or `None` for a
     /// privacy screen with no authentication ([`UnlockMethod`]).
     verifier: Option<PassphraseFile>,
@@ -270,7 +266,7 @@ impl LockScreen {
         chord: ModChord,
         idle_after: Option<Duration>,
         verifier: Option<PassphraseFile>,
-        now: Instant,
+        activity: Rc<RefCell<crate::backend::blank::SessionActivity>>,
     ) -> Self {
         Self {
             locked: None,
@@ -280,8 +276,10 @@ impl LockScreen {
             matcher: ChordMatcher::new(vec![(chord, LockGesture::Lock)])
                 .expect("a single binding cannot collide with itself"),
             idle_after,
-            last_activity: now,
-            seat_absent: false,
+            // Taken rather than minted: the clock this gate stamps must be the
+            // clock the blank reads and the clock the backend composites off, or
+            // the two idle timers are measuring different sessions.
+            activity,
             verifier,
             journal: Vec::new(),
         }
@@ -299,10 +297,11 @@ impl LockScreen {
     /// was frozen mid-way. A human who returns to their own screen has, by
     /// returning, done the one thing the idle timer is asking about.
     pub(crate) fn set_seat_absent(&mut self, absent: bool, now: Instant) {
-        if !absent && self.seat_absent {
-            self.last_activity = now;
-        }
-        self.seat_absent = absent;
+        // Forwarded to the one shared record (WS-E.4.3), which also forces the
+        // blank's phase back to lit: a paused session must not hold a blank it
+        // cannot undo, since `DrmSurface::clear` answers `DeviceInactive` while
+        // the seat is somebody else's.
+        self.activity.borrow_mut().set_seat_absent(absent, now);
     }
 
     /// Forget the lock chord's modifier bits and consumed set across a seat
@@ -404,15 +403,29 @@ impl LockScreen {
         // The seat is somebody else's right now (D-030(7)). Time the human
         // spends on another VT is not idle time, and counting it would lock
         // the session at an instant nobody could observe.
-        if self.seat_absent {
+        // Read through the shared record, never a second copy of the flag.
+        //
+        // **Deliberately NOT also suppressed while the screen is dark**
+        // (WS-E.4.3). Blanking and locking are uncoupled by owner decision, and
+        // the coupling that would be easiest to introduce by accident is this
+        // one: a `tick` that returned early on a dark screen would mean
+        // `--blank-idle 300 --lock-idle 600` never locks, because the shorter
+        // timer would silently disable the longer. Blanking while unlocked and
+        // then locking behind the dark screen is the correct behaviour --
+        // the human touches a key, the wake is consumed, and the screen comes
+        // back showing the lock card. `a_blank_does_not_disable_the_idle_lock`
+        // pins it.
+        let activity = self.activity.borrow();
+        if activity.seat_absent() {
             return false;
         }
         let Some(after) = self.idle_after else {
             return false;
         };
-        if now.saturating_duration_since(self.last_activity) < after {
+        if now.saturating_duration_since(activity.last_activity()) < after {
             return false;
         }
+        drop(activity);
         self.raise(LockCause::Idle)
     }
 
@@ -428,12 +441,43 @@ impl LockScreen {
         if input.origin() != Origin::Physical {
             return Gate::Deliver;
         }
-        self.last_activity = now;
 
         // Modifier tracking, then the match. Sound here — rather than in an
         // `observe` — only because this gate is outermost; see the module docs
         // and `the_lock_gate_is_the_outermost_hook`.
         self.matcher.observe(input);
+
+        // **The activity stamp and the wake verdict, in one call, and HERE**
+        // (WS-E.4.3, issue #223). The position is the whole point and it is
+        // wedged between two constraints:
+        //
+        // * it must be **after** `self.matcher.observe`, or a consumed wake
+        //   press desyncs the chord's modifier bits. Concretely: screen dark,
+        //   the human presses Ctrl to wake it (eaten), then Alt, then Delete —
+        //   a matcher that never saw Ctrl go down does not raise the lock. That
+        //   is the `forget_physical_state` bug with a new cause.
+        // * it must be **before** `self.matcher.gate` and before `type_key`,
+        //   or the press that woke the screen fires the lock chord, or is typed
+        //   into a passphrase attempt as an invisible stray character.
+        //
+        // And it must be inside *this* gate rather than in a `BlankGate`
+        // stacked outside it: an outer gate eats whatever the human happened to
+        // press first, which is very often a bare modifier, and that is the
+        // first bullet again with nothing tracking the modifier at all.
+        // `crate::backend::blank`'s module docs carry the full argument.
+        //
+        // **A release is stamped and wakes, but is never consumed**, which is
+        // this gate's own pairing contract applied one rule up. A human holding
+        // a modifier while the idle timer fires -- unlikely, but a `--blank-idle
+        // 300` and a key held five minutes is all it takes -- would otherwise
+        // have that key's release eaten by the wake, and the confined app is
+        // left holding it down for the rest of the session. That is the P1.7.2
+        // regression exactly, and consuming a release buys nothing: the app
+        // already saw the press, so there is nothing left to hide from it.
+        if self.activity.borrow_mut().note_physical(now).consumes() && !is_pairing_release(input) {
+            return Gate::Consume;
+        }
+
         let (chord_gate, gesture) = self.matcher.gate(input);
         if let Some(LockGesture::Lock) = gesture {
             // Already locked: the chord is inert rather than a toggle. A chord
@@ -578,6 +622,28 @@ impl LockScreen {
     }
 }
 
+/// Whether this event is the second half of a pair a confined app may already
+/// be holding (WS-E.4.3).
+///
+/// [`LockScreen::judge`]'s own rule — "this gate never consumes a release" —
+/// hoisted to a named predicate because the wake verdict now needs it too, and
+/// because a rule stated twice is a rule that will one day be stated
+/// differently. A gesture's end counts: consuming it leaves the app
+/// accumulating a pinch forever, and the router already drops any end whose
+/// begin it did not deliver.
+fn is_pairing_release(input: &SeatInput) -> bool {
+    matches!(
+        input.kind(),
+        SeatInputKind::Key {
+            state: KeyState::Released,
+            ..
+        } | SeatInputKind::Button {
+            state: ButtonState::Released,
+            ..
+        } | SeatInputKind::GestureEnd { .. }
+    )
+}
+
 /// Which character, if any, a keysym types.
 ///
 /// The `keysymdef.h` convention ([`crate::input::host_keysym`]): codepoints
@@ -646,8 +712,15 @@ mod tests {
         ModChord::parse("ctrl+alt+delete").expect("the default lock chord parses")
     }
 
+    /// A fresh activity record for a test that does not care about the blank.
+    fn clock(now: Instant) -> Rc<RefCell<crate::backend::blank::SessionActivity>> {
+        Rc::new(RefCell::new(crate::backend::blank::SessionActivity::new(
+            None, now,
+        )))
+    }
+
     fn screen(idle: Option<Duration>, now: Instant) -> LockScreen {
-        LockScreen::new(chord(), idle, None, now)
+        LockScreen::new(chord(), idle, None, clock(now))
     }
 
     /// One physical event, built through the crate-visible emulated
@@ -986,7 +1059,7 @@ mod tests {
             chord(),
             None,
             None,
-            t0,
+            clock(t0),
         )));
         let now = Rc::new(Cell::new(t0));
         let mut router =
@@ -1016,7 +1089,7 @@ mod tests {
     fn typing_the_right_passphrase_unlocks_and_a_wrong_one_does_not() {
         let t0 = Instant::now();
         let file = super::super::tests::cheap_verifier(b"hunter2");
-        let mut s = LockScreen::new(chord(), None, Some(file), t0);
+        let mut s = LockScreen::new(chord(), None, Some(file), clock(t0));
         s.raise(LockCause::Idle);
         let _ = s.take_journal();
 
@@ -1068,7 +1141,7 @@ mod tests {
         // would leave the wrong one resident in the core.
         let t0 = Instant::now();
         let file = super::super::tests::cheap_verifier(b"ok");
-        let mut s = LockScreen::new(chord(), None, Some(file), t0);
+        let mut s = LockScreen::new(chord(), None, Some(file), clock(t0));
         s.raise(LockCause::Idle);
         for ch in "no".chars() {
             s.judge(&press(ch as u32), t0);
@@ -1085,7 +1158,7 @@ mod tests {
     fn backspace_and_escape_edit_the_attempt() {
         let t0 = Instant::now();
         let file = super::super::tests::cheap_verifier(b"ab");
-        let mut s = LockScreen::new(chord(), None, Some(file), t0);
+        let mut s = LockScreen::new(chord(), None, Some(file), clock(t0));
         s.raise(LockCause::Idle);
         // "abx", backspace, Enter -> "ab" -> unlocked.
         for ch in "abx".chars() {
@@ -1116,7 +1189,7 @@ mod tests {
         // human's passphrase at wire speed.
         let t0 = Instant::now();
         let file = super::super::tests::cheap_verifier(b"a");
-        let mut s = LockScreen::new(chord(), None, Some(file), t0);
+        let mut s = LockScreen::new(chord(), None, Some(file), clock(t0));
         s.raise(LockCause::Idle);
         let _ = s.take_journal();
         for keysym in [0x61u32, KEYSYM_RETURN] {
@@ -1155,7 +1228,7 @@ mod tests {
     fn the_attempt_is_bounded() {
         let t0 = Instant::now();
         let file = super::super::tests::cheap_verifier(b"x");
-        let mut s = LockScreen::new(chord(), None, Some(file), t0);
+        let mut s = LockScreen::new(chord(), None, Some(file), clock(t0));
         s.raise(LockCause::Idle);
         for _ in 0..(MAX_ATTEMPT_BYTES * 4) {
             s.judge(&press(0x61), t0);
@@ -1218,7 +1291,12 @@ mod tests {
 
         let t0 = Instant::now();
         let now = Rc::new(Cell::new(t0));
-        let screen = Rc::new(RefCell::new(LockScreen::new(chord(), None, None, t0)));
+        let screen = Rc::new(RefCell::new(LockScreen::new(
+            chord(),
+            None,
+            None,
+            clock(t0),
+        )));
         let switch = Rc::new(RefCell::new(DeadManSwitch::new(DeadManConfig::default())));
         let grab = Rc::new(RefCell::new(ConsentGrab::new()));
 
@@ -1306,6 +1384,115 @@ mod tests {
         );
     }
 
+    /// **The human's off-switch works at a dark screen** (WS-E.4.3, issue #223).
+    ///
+    /// The wake consumes the press so it reaches no app — and the dead-man must
+    /// arm on it anyway, because it detects in `PreemptionHook::observe`, which
+    /// `GateOnlyHook` forwards unconditionally and no gate can suppress. The
+    /// hold then completes on its own clock rather than on a vblank, which
+    /// matters here specifically: a dark CRTC produces no vblanks at all, so a
+    /// hold paced by presentation would never complete on the one screen state
+    /// where the human most needs it to.
+    ///
+    /// `docs/book/src/limits.md` publishes this. Without this test that is a
+    /// claim about architecture that nobody re-checks — and the blank is a
+    /// brand-new consumer of the human's press, which is exactly when an
+    /// architectural argument stops being self-evidently still true.
+    #[test]
+    fn the_dead_man_arms_on_the_press_that_wakes_a_dark_screen() {
+        use crate::consent::grab::{ConsentGate, ConsentGrab};
+        use crate::deadman::{DeadManConfig, DeadManHook, DeadManSwitch, DEFAULT_HOLD};
+
+        let t0 = Instant::now();
+        let now = Rc::new(Cell::new(t0));
+        let activity = Rc::new(RefCell::new(SessionActivity::new(
+            Some(Duration::from_secs(60)),
+            t0,
+        )));
+        let screen = Rc::new(RefCell::new(LockScreen::new(
+            chord(),
+            None,
+            None,
+            Rc::clone(&activity),
+        )));
+        let switch = Rc::new(RefCell::new(DeadManSwitch::new(DeadManConfig::default())));
+        let grab = Rc::new(RefCell::new(ConsentGrab::new()));
+
+        let mut router = InputRouter::detached(lock_gate(
+            Rc::clone(&screen),
+            Rc::clone(&now),
+            ConsentGate::new(
+                Rc::clone(&grab),
+                Rc::clone(&now),
+                DeadManHook::new(Rc::clone(&switch), Rc::clone(&now), NoopHook),
+            ),
+        ));
+        let realm = crate::grants::RealmId::new("realm-0");
+        assert!(router.bind_to(&realm).is_none());
+        let view = (640, 480);
+
+        // The screen goes dark on the idle timer, with the session UNLOCKED --
+        // Decision 1's shape: idle blanks, it does not lock.
+        let blanked_at = t0 + Duration::from_secs(60);
+        {
+            let mut a = activity.borrow_mut();
+            assert!(a.tick(blanked_at));
+            a.note_frame_queued();
+            a.went_dark();
+        }
+        // The router's own clock moves with the activity clock: the hold below
+        // is measured from when the human actually pressed, not from t0.
+        now.set(blanked_at);
+        assert!(
+            !screen.borrow().is_locked(),
+            "the fixture must leave the session unlocked, or this tests the lock path instead"
+        );
+
+        // A sanity control FIRST, so nothing below can pass because nothing is
+        // being consumed: an ordinary key is eaten by the wake and reaches no app.
+        assert!(
+            router
+                .route_physical(press(0x61), view, Some(view))
+                .is_none(),
+            "the wake must be consuming physical input for this test to mean anything"
+        );
+
+        // Re-dark, so the chord below is also a wake press rather than an
+        // ordinary one on an already-lit screen.
+        {
+            let mut a = activity.borrow_mut();
+            a.note_frame_queued();
+            a.went_dark();
+        }
+
+        // THE property: the press that wakes the screen still arms the switch.
+        assert!(
+            router
+                .route_physical(crate::input::tests::chord_press(), view, Some(view))
+                .is_none(),
+            "the chord's press is consumed as a wake and reaches no app"
+        );
+        assert_eq!(
+            switch.borrow().deadline(),
+            Some(blanked_at + DEFAULT_HOLD),
+            "a dark screen must not be able to blind the human's off-switch. If this fails, a \
+             human whose screen blanked on a timer -- unattended and routinely -- can no longer \
+             revoke an agent's authority by the one gesture the whole design promises always \
+             works"
+        );
+
+        // ...and it completes on its own clock, with no vblank to pace it.
+        let due = blanked_at + DEFAULT_HOLD;
+        now.set(due);
+        router.observe_at(due);
+        switch.borrow_mut().fire_if_due(due);
+        let trigger = switch
+            .borrow_mut()
+            .take_trigger()
+            .expect("a completed hold must fire while the panel is dark");
+        assert_eq!(trigger.held, DEFAULT_HOLD);
+    }
+
     /// The same stack, the other direction: while the lock is up, the hooks
     /// *below* it are short-circuited — no clipboard gesture, no attention
     /// window, no consent decision.
@@ -1320,7 +1507,12 @@ mod tests {
 
         let t0 = Instant::now();
         let now = Rc::new(Cell::new(t0));
-        let screen = Rc::new(RefCell::new(LockScreen::new(chord(), None, None, t0)));
+        let screen = Rc::new(RefCell::new(LockScreen::new(
+            chord(),
+            None,
+            None,
+            clock(t0),
+        )));
         let signal = Rc::new(RefCell::new(ClipboardSignal::detached()));
         let mut hook = lock_gate(
             Rc::clone(&screen),
@@ -1358,6 +1550,402 @@ mod tests {
         assert!(
             signal.borrow_mut().take_pending().is_empty(),
             "a clipboard gesture must not fire while the session is locked"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // WS-E.4.3, issue #223: the idle blank shares this gate's activity clock,
+    // and takes its wake verdict inside this gate's `judge`.
+    // ------------------------------------------------------------------
+
+    use crate::backend::blank::{Phase, SessionActivity};
+
+    /// A screen already dark, with the lock armed on the same clock.
+    fn dark_screen(
+        idle: Option<Duration>,
+        now: Instant,
+    ) -> (LockScreen, Rc<RefCell<SessionActivity>>) {
+        let activity = Rc::new(RefCell::new(SessionActivity::new(
+            Some(Duration::from_secs(60)),
+            now,
+        )));
+        let screen = LockScreen::new(chord(), idle, None, Rc::clone(&activity));
+        {
+            let mut a = activity.borrow_mut();
+            assert!(a.tick(now + Duration::from_secs(60)));
+            a.note_frame_queued();
+            a.went_dark();
+            assert_eq!(a.phase(), Phase::Dark);
+        }
+        (screen, activity)
+    }
+
+    /// **THE position test** (WS-E.4.3): the wake verdict is taken *after*
+    /// `ChordMatcher::observe` and *before* `ChordMatcher::gate`, so a press
+    /// swallowed to wake the screen still leaves the chord's modifier bits
+    /// correct.
+    ///
+    /// This is the failure the whole "no `BlankGate` outside `LockGate`"
+    /// argument exists to prevent, and it is not hypothetical: a wake gate
+    /// stacked above this one eats whatever the human happens to press first,
+    /// which is very often a bare modifier, and the lock chord then stops
+    /// working after every blank. Moving the `note_physical` call above
+    /// `self.matcher.observe(input)` reproduces it exactly and turns this red.
+    ///
+    /// The control comes first, or the assertion would pass against a matcher
+    /// that never tracked a modifier at all.
+    #[test]
+    fn a_wake_press_is_swallowed_but_the_lock_chords_modifiers_are_not() {
+        let t0 = Instant::now();
+
+        // The control: lit, ctrl+alt+delete raises the lock.
+        let mut s = screen(None, t0);
+        s.judge(&press(0xffe3), t0);
+        s.judge(&press(0xffe9), t0);
+        assert_eq!(s.judge(&press(0xffff), t0), Gate::Consume);
+        assert!(s.is_locked(), "the fixture must reach the chord at all");
+
+        // The real case: the human comes back to a dark screen holding down
+        // ctrl, then alt, then delete.
+        let (mut s, activity) = dark_screen(None, t0);
+        let wake = t0 + Duration::from_secs(90);
+        assert_eq!(
+            s.judge(&press(0xffe3), wake),
+            Gate::Consume,
+            "the press that wakes the screen must not reach an app the human cannot see"
+        );
+        assert_eq!(activity.borrow().phase(), Phase::Waking);
+        assert_eq!(
+            s.judge(&press(0xffe9), wake),
+            Gate::Consume,
+            "and neither must the next one, until the panel is actually back"
+        );
+        assert!(
+            !s.is_locked(),
+            "a swallowed press must not fire a chord either -- the human was reaching for a \
+             screen, not for a gesture"
+        );
+
+        // The panel comes back...
+        activity.borrow_mut().note_flip_completed();
+        assert_eq!(activity.borrow().phase(), Phase::Lit);
+
+        // ...and the modifiers the human has been holding all along are still
+        // recorded, so their Delete is the chord. THIS is what a wake gate
+        // stacked outside this one would break.
+        assert_eq!(
+            s.judge(&press(0xffff), wake + Duration::from_millis(120)),
+            Gate::Consume
+        );
+        assert!(
+            s.is_locked(),
+            "the wake swallowed ctrl and alt as EVENTS but must not have swallowed them as \
+             MODIFIER STATE: `matcher.observe` runs before the wake verdict precisely so \
+             ctrl+alt+delete still raises the lock after a blank"
+        );
+    }
+
+    /// A wake press types nothing into a passphrase attempt.
+    ///
+    /// The other half of the position argument: the verdict is taken *before*
+    /// `type_key`, so the key a human pressed at a dark screen does not become
+    /// an invisible stray character in front of the passphrase they are about
+    /// to type.
+    #[test]
+    fn a_wake_press_is_not_typed_into_the_passphrase() {
+        let t0 = Instant::now();
+        let file = super::super::tests::cheap_verifier(b"ok");
+        let activity = Rc::new(RefCell::new(SessionActivity::new(
+            Some(Duration::from_secs(60)),
+            t0,
+        )));
+        let mut s = LockScreen::new(chord(), None, Some(file), Rc::clone(&activity));
+        s.raise(LockCause::Chord);
+        let _ = s.take_journal();
+        {
+            let mut a = activity.borrow_mut();
+            assert!(a.tick(t0 + Duration::from_secs(60)));
+            a.note_frame_queued();
+            a.went_dark();
+        }
+
+        // The human bumps the keyboard to wake the screen: an `x`.
+        let wake = t0 + Duration::from_secs(90);
+        assert_eq!(s.judge(&press(0x78), wake), Gate::Consume);
+        activity.borrow_mut().note_flip_completed();
+
+        // ...and now types the passphrase. If the `x` had been typed, the
+        // attempt would be "xok" and this would stay locked.
+        for ch in "ok".chars() {
+            s.judge(&press(ch as u32), wake + Duration::from_millis(200));
+        }
+        s.judge(&press(KEYSYM_RETURN), wake + Duration::from_millis(200));
+        assert!(
+            !s.is_locked(),
+            "the key that woke the screen must not have been typed into the attempt: a stray \
+             invisible character in front of a passphrase is a lock nobody can open"
+        );
+    }
+
+    /// **An agent's actuation neither postpones the blank nor wakes the
+    /// screen** (WS-E.4.3).
+    ///
+    /// The postpone half is inherited structurally from
+    /// `an_agents_actuation_never_holds_the_idle_lock_open` — the origin check
+    /// sits above the one site that stamps the clock, so sharing the clock made
+    /// the blank inherit it rather than restate it. The **wake** half is the
+    /// sharper property and has its own argument: there is no verb in the IDL
+    /// for "power the human's display", so an agent that could wake a panel
+    /// would be making an unrequested change to the human's physical
+    /// environment, remotely triggerable, under no grant at all.
+    #[test]
+    fn an_agents_actuation_neither_postpones_the_blank_nor_wakes_the_screen() {
+        let t0 = Instant::now();
+        let activity = Rc::new(RefCell::new(SessionActivity::new(
+            Some(Duration::from_secs(60)),
+            t0,
+        )));
+        let mut s = LockScreen::new(chord(), None, None, Rc::clone(&activity));
+        let emulated = SeatInput::emulated(SeatInputKind::Key {
+            source: KeySource::Keysym,
+            keysym: 0x61,
+            state: KeyState::Pressed,
+        });
+
+        // Working through the night: the blank still falls on schedule.
+        for i in 0..60 {
+            assert_eq!(
+                s.judge(&emulated, t0 + Duration::from_secs(i)),
+                Gate::Deliver
+            );
+        }
+        assert!(
+            activity.borrow_mut().tick(t0 + Duration::from_secs(60)),
+            "an agent's actuations must not hold the screen awake for a human who went home: \
+             it spends the machine's battery and lights an empty room under no authority"
+        );
+        activity.borrow_mut().note_frame_queued();
+        activity.borrow_mut().went_dark();
+
+        // ...and it cannot turn the panel back on, either.
+        for i in 0..10 {
+            assert_eq!(
+                s.judge(&emulated, t0 + Duration::from_secs(100 + i)),
+                Gate::Deliver,
+                "an agent's admitted actuation stays the chokepoint's business"
+            );
+        }
+        assert_eq!(
+            activity.borrow().phase(),
+            Phase::Dark,
+            "an agent that could wake the human's display would hold a remotely-triggerable \
+             primitive over their physical environment that no grant names"
+        );
+    }
+
+    /// **Every physical event postpones the blank, and every physical event
+    /// wakes it** — presses and releases, pointer and keyboard alike.
+    ///
+    /// Enumerated rather than sampled because the rule is "everything physical
+    /// and nothing else", and a rule with one accidental exception is a screen
+    /// that goes dark under a human's hand.
+    #[test]
+    fn every_physical_event_postpones_the_blank_and_wakes_a_dark_screen() {
+        use vitrin_protocol::generated::vitrin_shim_seat::{GestureKind, GestureState};
+        let phys = crate::input::tests::physical_for_test;
+        let t0 = Instant::now();
+
+        let kinds: Vec<SeatInput> = vec![
+            press(0x61),
+            release(0x61),
+            phys(SeatInputKind::Motion { x: 4.0, y: 5.0 }),
+            phys(SeatInputKind::Scroll {
+                axis: vitrin_protocol::generated::vitrin_actuator_pointer::Axis::Vertical,
+                value120: 120,
+            }),
+            phys(SeatInputKind::Button {
+                button: 0x110,
+                state: ButtonState::Pressed,
+            }),
+            phys(SeatInputKind::Button {
+                button: 0x110,
+                state: ButtonState::Released,
+            }),
+            phys(SeatInputKind::Text {
+                text: "hi".to_string(),
+            }),
+            phys(SeatInputKind::RelativeMotion {
+                dx: 1.0,
+                dy: 2.0,
+                dx_unaccel: 1.0,
+                dy_unaccel: 2.0,
+            }),
+            phys(SeatInputKind::GestureBegin {
+                kind: GestureKind::Swipe,
+                fingers: 3,
+            }),
+            phys(SeatInputKind::GestureSwipeUpdate { dx: 1.0, dy: 0.0 }),
+            phys(SeatInputKind::GesturePinchUpdate {
+                dx: 0.0,
+                dy: 0.0,
+                scale: 1.5,
+                rotation: 10.0,
+            }),
+            phys(SeatInputKind::GestureEnd {
+                kind: GestureKind::Swipe,
+                state: GestureState::Completed,
+            }),
+        ];
+
+        for input in &kinds {
+            // Postpone: the deadline moves out by exactly the event's instant.
+            let activity = Rc::new(RefCell::new(SessionActivity::new(
+                Some(Duration::from_secs(60)),
+                t0,
+            )));
+            let mut s = LockScreen::new(chord(), None, None, Rc::clone(&activity));
+            s.judge(input, t0 + Duration::from_secs(59));
+            assert!(
+                !activity.borrow_mut().tick(t0 + Duration::from_secs(118)),
+                "{input:?} must postpone the blank"
+            );
+            assert!(activity.borrow_mut().tick(t0 + Duration::from_secs(119)));
+
+            // Wake: from dark, this one event wakes the screen. **Presses are
+            // swallowed and releases are not** -- this gate's own pairing
+            // contract, applied to the wake for the same reason: a human
+            // holding a modifier when the idle timer fires would otherwise have
+            // its release eaten, and the confined app is left holding that key
+            // down for the rest of the session (the P1.7.2 regression). The app
+            // already saw the press, so consuming the release hides nothing.
+            let (mut s, activity) = dark_screen(None, t0);
+            let wake = t0 + Duration::from_secs(90);
+            let expected = if is_pairing_release(input) {
+                Gate::Deliver
+            } else {
+                Gate::Consume
+            };
+            assert_eq!(
+                s.judge(input, wake),
+                expected,
+                "{input:?} must wake a dark screen, and be swallowed doing it unless it is \
+                 the release half of a pair the app is already holding"
+            );
+            assert_eq!(
+                activity.borrow().phase(),
+                Phase::Waking,
+                "{input:?} must wake the screen either way -- a human letting go of a key IS \
+                 a human at the keyboard"
+            );
+        }
+    }
+
+    /// **A key held across a blank is released in the app** — the P1.7.2
+    /// regression, reached from an idle *timer* rather than from a prompt.
+    ///
+    /// The wake consumes presses so a keystroke aimed at a dark screen reaches
+    /// no app. If it consumed releases too, a human holding a modifier when the
+    /// idle timeout expires would let go into a swallowed event, and the
+    /// confined app would hold that modifier down for the rest of the session —
+    /// silently rewriting everything typed afterwards. Driven through the REAL
+    /// router, because what has to be true is that the delivery funnel sees it.
+    #[test]
+    fn a_modifier_held_when_the_screen_blanks_is_released_in_the_app() {
+        let t0 = Instant::now();
+        let activity = Rc::new(RefCell::new(SessionActivity::new(
+            Some(Duration::from_secs(60)),
+            t0,
+        )));
+        let screen = Rc::new(RefCell::new(LockScreen::new(
+            chord(),
+            None,
+            None,
+            Rc::clone(&activity),
+        )));
+        let now = Rc::new(Cell::new(t0));
+        let mut router =
+            InputRouter::detached(lock_gate(Rc::clone(&screen), Rc::clone(&now), NoopHook));
+        let realm = crate::grants::RealmId::new("realm-0");
+        assert!(router.bind_to(&realm).is_none());
+        let view = (100, 100);
+        let surface = Some((100, 100));
+
+        // Shift goes down while the screen is lit: the app is holding it.
+        assert!(
+            router
+                .route_physical(press(0xffe1), view, surface)
+                .is_some(),
+            "a lit session delivers the press"
+        );
+
+        // ...and the human keeps holding it until the idle timer fires.
+        {
+            let mut a = activity.borrow_mut();
+            assert!(a.tick(t0 + Duration::from_secs(60)));
+            a.note_frame_queued();
+            a.went_dark();
+        }
+
+        let up = router.route_physical(release(0xffe1), view, surface);
+        assert!(
+            up.is_some(),
+            "the release of a press the app already saw MUST reach the app even though it is \
+             also the event that wakes the screen: consuming it latches the modifier in the \
+             confined app for the rest of the session"
+        );
+        assert_eq!(
+            activity.borrow().phase(),
+            Phase::Waking,
+            "...and it still woke the screen"
+        );
+    }
+
+    /// **A blank must not disable the idle lock.**
+    ///
+    /// The two are uncoupled by owner decision (Taha, 2026-08-10) and share
+    /// only the activity clock, so a session configured `--blank-idle 300
+    /// --lock-idle 600` must still lock at 600 — behind a screen that has been
+    /// dark since 300. A `LockScreen::tick` that returned early on a dark
+    /// screen would mean the shorter timer silently switched the longer one
+    /// off, which is exactly the class of unchosen behaviour D-030(2) was
+    /// written to catch.
+    #[test]
+    fn a_blank_does_not_disable_the_idle_lock() {
+        let t0 = Instant::now();
+        let activity = Rc::new(RefCell::new(SessionActivity::new(
+            Some(Duration::from_secs(300)),
+            t0,
+        )));
+        let mut s = LockScreen::new(
+            chord(),
+            Some(Duration::from_secs(600)),
+            None,
+            Rc::clone(&activity),
+        );
+
+        // The screen goes dark at 300 and the session is still UNLOCKED, which
+        // is the published consequence of the decision rather than a bug.
+        assert!(activity.borrow_mut().tick(t0 + Duration::from_secs(300)));
+        activity.borrow_mut().note_frame_queued();
+        activity.borrow_mut().went_dark();
+        assert!(
+            !s.is_locked(),
+            "idle BLANKS, it does not lock: an unlocked session behind a dark screen is the \
+             owner's decision and is published, not softened"
+        );
+        assert!(!s.tick(t0 + Duration::from_secs(599)));
+
+        // ...and the lock still fires at 600, behind the dark screen.
+        assert!(
+            s.tick(t0 + Duration::from_secs(600)),
+            "a dark screen must not freeze the idle lock, or `--blank-idle 300 --lock-idle \
+             600` silently never locks"
+        );
+        assert_eq!(s.cause(), Some(LockCause::Idle));
+        assert_eq!(
+            activity.borrow().phase(),
+            Phase::Dark,
+            "and locking behind the cover does not itself wake anything"
         );
     }
 

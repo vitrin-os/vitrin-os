@@ -31,6 +31,7 @@
 
 #include "seat.h"
 #include "clipboard.h"
+#include "constraint.h"
 #include "server.h"
 #include "upstream.h"
 #include "vitrin-protocol.h"
@@ -639,6 +640,13 @@ static bool upstream_message(void *data, const uint8_t *frame, size_t len) {
 			handle_request_selection(s, frame, len);
 		} else if (hdr.opcode == VITRIN_SHIM_SESSION_EVT_OFFER_SELECTION_OPCODE) {
 			handle_offer_selection(s, frame, len);
+		} else if (hdr.opcode ==
+				VITRIN_SHIM_SESSION_EVT_POINTER_CONSTRAINT_STATE_OPCODE) {
+			/* The core's verdict on a pointer constraint, and its running
+			 * state afterwards (WS-E.4.2). Everything past the routing
+			 * decision lives in constraint.c; see constraint.h for why a
+			 * `refused` must do nothing at all. */
+			vitrin_constraint_handle_state(s, frame, len);
 		} else {
 			wlr_log(WLR_ERROR, "unknown session event opcode %u", hdr.opcode);
 		}

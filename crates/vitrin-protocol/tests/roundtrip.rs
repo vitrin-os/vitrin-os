@@ -82,6 +82,8 @@ type Configure = gen::vitrin_shim_session::events::Configure;
 type SessionSelection = gen::vitrin_shim_session::requests::Selection;
 type RequestSelection = gen::vitrin_shim_session::events::RequestSelection;
 type OfferSelection = gen::vitrin_shim_session::events::OfferSelection;
+type SessionPointerConstraint = gen::vitrin_shim_session::requests::PointerConstraint;
+type SessionPointerConstraintState = gen::vitrin_shim_session::events::PointerConstraintState;
 
 type Attach = gen::vitrin_shim_surface::requests::Attach;
 type Damage = gen::vitrin_shim_surface::requests::Damage;
@@ -94,6 +96,11 @@ type SeatButton = gen::vitrin_shim_seat::events::Button;
 type SeatScroll = gen::vitrin_shim_seat::events::Scroll;
 type SeatKey = gen::vitrin_shim_seat::events::Key;
 type SeatText = gen::vitrin_shim_seat::events::Text;
+type SeatRelativeMotion = gen::vitrin_shim_seat::events::RelativeMotion;
+type SeatGestureBegin = gen::vitrin_shim_seat::events::GestureBegin;
+type SeatGestureSwipeUpdate = gen::vitrin_shim_seat::events::GestureSwipeUpdate;
+type SeatGesturePinchUpdate = gen::vitrin_shim_seat::events::GesturePinchUpdate;
+type SeatGestureEnd = gen::vitrin_shim_seat::events::GestureEnd;
 
 // ---------------------------------------------------------------------------
 // Shared field-level strategies.
@@ -220,6 +227,8 @@ impl_message!(
     SessionSelection,
     RequestSelection,
     OfferSelection,
+    SessionPointerConstraint,
+    SessionPointerConstraintState,
     Attach,
     Damage,
     Commit,
@@ -230,6 +239,11 @@ impl_message!(
     SeatScroll,
     SeatKey,
     SeatText,
+    SeatRelativeMotion,
+    SeatGestureBegin,
+    SeatGestureSwipeUpdate,
+    SeatGesturePinchUpdate,
+    SeatGestureEnd,
     Launch,
     Launched,
     GetLayoutFocus,
@@ -521,6 +535,58 @@ fn offer_selection() -> impl Strategy<Value = OfferSelection> {
         .prop_map(|(mime, data)| OfferSelection { mime, data })
 }
 
+/// A nullable `object` argument. `None` is the null object id, which is `0`
+/// on the wire and legal only where `allow-null` is declared (conventions
+/// section 3); `Some(0)` is deliberately never generated, because `0` *is*
+/// the null id and is not a value a conformant sender can mean by `Some`.
+/// The first such argument in the protocol is `pointer_constraint.surface`.
+fn nullable_object() -> impl Strategy<Value = Option<u32>> {
+    prop_oneof![
+        1 => Just(None),
+        4 => (1u32..=u32::MAX).prop_map(Some),
+    ]
+}
+
+/// The pointer-constraint pair (WS-E.4.2, issue #222).
+///
+/// `surface` is exercised both null and non-null: `kind = none` is the
+/// withdrawal, and the IDL requires `surface` to be null in exactly that
+/// arm — but that is a *semantic* rule the core enforces, not a codec one,
+/// so the round trip deliberately generates every combination the wire
+/// admits rather than only the well-formed ones.
+fn session_pointer_constraint() -> impl Strategy<Value = SessionPointerConstraint> {
+    (
+        any_u32(),
+        nullable_object(),
+        plain_enum(gen::vitrin_shim_session::PointerConstraintKind::ALL),
+        plain_enum(gen::vitrin_shim_session::PointerConstraintLifetime::ALL),
+        any_i32(),
+        any_i32(),
+        any_u32(),
+        any_u32(),
+    )
+        .prop_map(|(serial, surface, kind, lifetime, x, y, width, height)| {
+            SessionPointerConstraint {
+                serial,
+                surface,
+                kind,
+                lifetime,
+                x,
+                y,
+                width,
+                height,
+            }
+        })
+}
+
+fn session_pointer_constraint_state() -> impl Strategy<Value = SessionPointerConstraintState> {
+    (
+        any_u32(),
+        plain_enum(gen::vitrin_shim_session::PointerConstraintStatus::ALL),
+    )
+        .prop_map(|(serial, state)| SessionPointerConstraintState { serial, state })
+}
+
 /// Non-fd fields of `attach`, in field order; the fd itself is spliced in by
 /// the dedicated `proptest!` block below.
 type AttachFields = (
@@ -624,6 +690,77 @@ fn seat_text() -> impl Strategy<Value = SeatText> {
         .prop_map(|(text, origin)| SeatText { text, origin })
 }
 
+fn seat_relative_motion() -> impl Strategy<Value = SeatRelativeMotion> {
+    (
+        any_fixed(),
+        any_fixed(),
+        any_fixed(),
+        any_fixed(),
+        plain_enum(gen::vitrin_shim_seat::Origin::ALL),
+    )
+        .prop_map(
+            |(dx, dy, dx_unaccel, dy_unaccel, origin)| SeatRelativeMotion {
+                dx,
+                dy,
+                dx_unaccel,
+                dy_unaccel,
+                origin,
+            },
+        )
+}
+
+fn seat_gesture_begin() -> impl Strategy<Value = SeatGestureBegin> {
+    (
+        plain_enum(gen::vitrin_shim_seat::GestureKind::ALL),
+        any_u32(),
+        plain_enum(gen::vitrin_shim_seat::Origin::ALL),
+    )
+        .prop_map(|(kind, fingers, origin)| SeatGestureBegin {
+            kind,
+            fingers,
+            origin,
+        })
+}
+
+fn seat_gesture_swipe_update() -> impl Strategy<Value = SeatGestureSwipeUpdate> {
+    (
+        any_fixed(),
+        any_fixed(),
+        plain_enum(gen::vitrin_shim_seat::Origin::ALL),
+    )
+        .prop_map(|(dx, dy, origin)| SeatGestureSwipeUpdate { dx, dy, origin })
+}
+
+fn seat_gesture_pinch_update() -> impl Strategy<Value = SeatGesturePinchUpdate> {
+    (
+        any_fixed(),
+        any_fixed(),
+        any_fixed(),
+        any_fixed(),
+        plain_enum(gen::vitrin_shim_seat::Origin::ALL),
+    )
+        .prop_map(|(dx, dy, scale, rotation, origin)| SeatGesturePinchUpdate {
+            dx,
+            dy,
+            scale,
+            rotation,
+            origin,
+        })
+}
+
+fn seat_gesture_end() -> impl Strategy<Value = SeatGestureEnd> {
+    (
+        plain_enum(gen::vitrin_shim_seat::GestureKind::ALL),
+        plain_enum(gen::vitrin_shim_seat::GestureState::ALL),
+        plain_enum(gen::vitrin_shim_seat::Origin::ALL),
+    )
+        .prop_map(|(kind, state, origin)| SeatGestureEnd {
+            kind,
+            state,
+            origin,
+        })
+}
+
 fn launch() -> impl Strategy<Value = Launch> {
     Just(Launch {})
 }
@@ -707,6 +844,14 @@ roundtrip_test!(
     roundtrip_vitrin_shim_session_offer_selection,
     offer_selection()
 );
+roundtrip_test!(
+    roundtrip_vitrin_shim_session_pointer_constraint,
+    session_pointer_constraint()
+);
+roundtrip_test!(
+    roundtrip_vitrin_shim_session_pointer_constraint_state,
+    session_pointer_constraint_state()
+);
 
 // vitrin_shim_surface.attach: fd-bearing, see dedicated block below.
 roundtrip_test!(roundtrip_vitrin_shim_surface_damage, damage());
@@ -719,6 +864,23 @@ roundtrip_test!(roundtrip_vitrin_shim_seat_button, seat_button());
 roundtrip_test!(roundtrip_vitrin_shim_seat_scroll, seat_scroll());
 roundtrip_test!(roundtrip_vitrin_shim_seat_key, seat_key());
 roundtrip_test!(roundtrip_vitrin_shim_seat_text, seat_text());
+roundtrip_test!(
+    roundtrip_vitrin_shim_seat_relative_motion,
+    seat_relative_motion()
+);
+roundtrip_test!(
+    roundtrip_vitrin_shim_seat_gesture_begin,
+    seat_gesture_begin()
+);
+roundtrip_test!(
+    roundtrip_vitrin_shim_seat_gesture_swipe_update,
+    seat_gesture_swipe_update()
+);
+roundtrip_test!(
+    roundtrip_vitrin_shim_seat_gesture_pinch_update,
+    seat_gesture_pinch_update()
+);
+roundtrip_test!(roundtrip_vitrin_shim_seat_gesture_end, seat_gesture_end());
 
 roundtrip_test!(roundtrip_vitrin_launcher_launch, launch());
 roundtrip_test!(roundtrip_vitrin_launcher_launched, launched());

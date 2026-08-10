@@ -6,6 +6,8 @@
  * elsewhere -- server.c and output.c respectively):
  *
  *   wl_compositor, wl_subcompositor, xdg_wm_base, wl_seat,
+ *   zwp_relative_pointer_manager_v1, zwp_pointer_gestures_v1,
+ *   zwp_pointer_constraints_v1,
  *   wl_data_device_manager, zxdg_decoration_manager_v1
  *   (+ zwp_linux_dmabuf_v1 iff --dmabuf)
  *
@@ -42,6 +44,8 @@
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_linux_dmabuf_v1.h>
+#include <wlr/types/wlr_pointer_gestures_v1.h>
+#include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
@@ -50,6 +54,7 @@
 
 #include "ledger.h"
 #include "clipboard.h"
+#include "constraint.h"
 #include "server.h"
 
 /* Decline server-side decorations: whenever a client asks for a decoration
@@ -179,18 +184,168 @@ bool vitrin_create_globals(struct vitrin_shim *s) {
 	/* wl_seat. Capabilities describe child objects only; they do not change
 	 * the registry.
 	 *
-	 * POINTER and KEYBOARD, and neither more nor less. Both are now backed
+	 * POINTER and KEYBOARD, and STILL neither more nor less. Both are backed
 	 * by real replay (P1.6.3, seat.c): pointer motion/button/scroll and key
-	 * are exactly the five `vitrin_shim_seat` events, and each maps onto one
-	 * of these two capabilities. TOUCH is deliberately absent -- v0's seat
-	 * vocabulary has no touch event, so advertising it would invite clients
-	 * to bind a `wl_touch` that could never produce anything. */
+	 * map onto one of these two capabilities each.
+	 *
+	 * THE VERSION-2 EVENTS CHANGE NOTHING HERE, and that is worth saying
+	 * rather than leaving to be inferred. `relative_motion` and the four
+	 * gesture events are POINTER-side extensions -- `zwp_relative_pointer_v1`
+	 * is created from a `wl_pointer` and `zwp_pointer_gestures_v1` shares the
+	 * pointer's focus -- so they are already covered by the capability
+	 * advertised here. A capability is widened only for a class actually
+	 * served, and nothing new is served through a capability.
+	 *
+	 * TOUCH IS NOT YET SERVED, which is a narrower claim than the one this
+	 * comment used to make. The seat vocabulary carries no touch event, so a
+	 * `wl_touch` bound here would have nothing behind it, and advertising a
+	 * capability the shim cannot honour is worse than not advertising it: a
+	 * toolkit that sees TOUCH stops installing its pointer fallbacks. That
+	 * argument is about not half-serving a class -- it says nothing about
+	 * whether the class should be served. The wire may grow touch later; what
+	 * would reopen the question -- a machine with a touchscreen in the
+	 * measured device set, and an app that needs it -- is recorded in this
+	 * repository's decision log rather than here. The same holds for tablet,
+	 * which is a global rather than a capability. */
 	s->seat = wlr_seat_create(s->display, "seat0");
 	if (s->seat == NULL) {
 		return false;
 	}
 	wlr_seat_set_capabilities(
 		s->seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+
+	/* zwp_relative_pointer_manager_v1.
+	 *
+	 * ADDED EMPIRICALLY IN WS-E.4.2 (issue #222), on this file's own rule,
+	 * and the citation is a `globals-demand` line from a real pre-addition
+	 * run already in the tree:
+	 *
+	 *   globals-demand: seq=81 interface=zwp_relative_pointer_manager_v1
+	 *     version_requested=1 (the app bound a PROBE global ...)
+	 *
+	 * -- shim/docs/globals-touched-firefox-140.12.0esr.log:154, summarised at
+	 * :286 as `class=probe advertised=1 binds=1 version_min=1 version_max=1
+	 * status=bound`. (:281 was cited here and is a `globals-demand` line for
+	 * `zwp_text_input_manager_v3`, a different interface entirely. This file is
+	 * where the cite-your-evidence rule is ENFORCED, so a miscitation in the
+	 * enforcing comment weakens the one mechanism the file runs.)
+	 * That run is a shipping-state
+	 * ledger, and it can carry the demand line precisely because this
+	 * interface was NOT in the v0 contract at the time (ledger.c's
+	 * in_v0_contract never arms a probe for an interface already in it). It
+	 * IS in the contract now, listed in `vitrin_v0_contract[]` -- without
+	 * that, the probe catalogue would advertise a second, inert copy and the
+	 * app could bind the one that does nothing.
+	 *
+	 * WHAT IT IS FOR. `vitrin_shim_seat.relative_motion` has no other way to
+	 * reach an app: `wl_pointer.motion` carries a destination, and a delta is
+	 * not a destination. Every pointing device on a bare-metal seat produces
+	 * deltas, and this is the only interface that carries the unaccelerated
+	 * pair a camera control or a drawing tool needs.
+	 *
+	 * IT GRANTS NOTHING ACROSS THE REALM BOUNDARY. It is an extension of this
+	 * seat's own `wl_pointer`, it shares that pointer's focus, and a shim
+	 * serves exactly one client -- so it reaches the same app the pointer
+	 * already reaches and nothing else. It cannot warp, confine or lock the
+	 * pointer; that is `zwp_pointer_constraints_v1`, created just below now
+	 * that the wire carries the ask-and-verdict pair it needs.
+	 *
+	 * Best-effort, like the dmabuf global below: an app that never binds it
+	 * is unaffected, and one that does degrades to absolute motion, which is
+	 * the whole v0 pointer path. */
+	s->replay.relative_pointers = wlr_relative_pointer_manager_v1_create(s->display);
+	if (s->replay.relative_pointers == NULL) {
+		wlr_log(WLR_ERROR,
+			"zwp_relative_pointer_manager_v1 could not be created; relative_motion "
+			"will be dropped and absolute motion will still be replayed");
+	}
+
+	/* zwp_pointer_gestures_v1.
+	 *
+	 * ADDED EMPIRICALLY IN WS-E.4.2 (issue #222), same rule, and this one has
+	 * TWO demand lines from two separate connections of the same run:
+	 *
+	 *   globals-demand: seq=36 interface=zwp_pointer_gestures_v1 version_requested=1
+	 *   globals-demand: seq=82 interface=zwp_pointer_gestures_v1 version_requested=3
+	 *
+	 * -- shim/docs/globals-touched-firefox-140.12.0esr.log:99 and :156,
+	 * summarised at :287 as `binds=2 version_min=1 version_max=3
+	 * status=bound`. Advertised at wlroots' own version rather than at 1: the
+	 * app asked for 3, and version 3 is what adds the hold gesture, which is
+	 * inert here (the core sends no hold) and costs nothing to advertise.
+	 *
+	 * WHAT IT IS FOR: the four `vitrin_shim_seat` gesture events. There is no
+	 * fallback -- a pinch has no expression in core `wl_pointer` at all, and
+	 * two-finger scroll (which does) is already served as `scroll`, which is
+	 * why the gap this closes is pinch and multi-finger swipe specifically
+	 * rather than "gestures".
+	 *
+	 * IT GRANTS NOTHING ACROSS THE REALM BOUNDARY, by the same argument: it
+	 * shares this seat's pointer focus and this shim serves one client. It is
+	 * a pure sender -- there are no requests on it beyond `release`, so the
+	 * app cannot ask for anything through it.
+	 *
+	 * HOLD IS ADVERTISED BUT NEVER SENT, and that is not the half-serving
+	 * globals.c refuses elsewhere: the interface's three gesture families
+	 * live behind one global, so declining hold would mean declining swipe
+	 * and pinch too. A client learns which gestures exist from the events it
+	 * receives, not from the global -- unlike a `wl_seat` capability, which
+	 * is a positive claim a toolkit changes its behaviour on. */
+	s->replay.gestures = wlr_pointer_gestures_v1_create(s->display);
+	if (s->replay.gestures == NULL) {
+		wlr_log(WLR_ERROR,
+			"zwp_pointer_gestures_v1 could not be created; gesture events will be "
+			"dropped");
+	}
+
+	/* zwp_pointer_constraints_v1.
+	 *
+	 * ADDED IN WS-E.4.2 (issue #222), on this file's own rule, and the
+	 * citation is a `globals-demand` line from the same pre-addition run the
+	 * two extensions above cite:
+	 *
+	 *   globals-demand: seq=80 interface=zwp_pointer_constraints_v1
+	 *     version_requested=1 (the app bound a PROBE global ...)
+	 *
+	 * -- shim/docs/globals-touched-firefox-140.12.0esr.log:152, summarised at
+	 * :285 as `class=probe advertised=1 binds=1 version_min=1 version_max=1
+	 * status=bound`. Both lines were read before this comment was written.
+	 * Like its two neighbours it IS in `vitrin_v0_contract[]` (ledger.c) now
+	 * -- without that, the probe catalogue would advertise a second, inert
+	 * copy and the app could bind the one that does nothing.
+	 *
+	 * WHAT CHANGED SINCE THE COMMENT ABOVE SAID IT WAS NOT CREATED. The
+	 * objection was never the demand, which was already in the tree; it was
+	 * that a constraints global with no ask-and-verdict pair behind it would
+	 * be a promise this shim cannot keep. Version 2 of the wire carries that
+	 * pair -- `vitrin_shim_session.pointer_constraint` and
+	 * `pointer_constraint_state` -- so the promise is now one the shim can
+	 * keep by relaying it. constraint.h is the whole design.
+	 *
+	 * WHAT IT IS FOR: a first-person game, a 3-D viewport, a drawing tool.
+	 * There is no fallback at all -- `wl_pointer` cannot express "pin the
+	 * pointer", which is why an app that wants one and cannot have one spins
+	 * its camera off to infinity on the first mouse move.
+	 *
+	 * IT GRANTS NOTHING ACROSS THE REALM BOUNDARY, and this one is worth
+	 * spelling out because it is the one global here that asks the core to DO
+	 * something rather than merely to send something. The ask names this
+	 * shim's own surface, it is answered per realm, and the core decides:
+	 * whether a constraint is in force, whether the human's cursor sprite is
+	 * drawn, and whether absolute motion stops are all its judgements, made
+	 * from state this process cannot see. A confined app cannot lock a
+	 * pointer in a realm it is not in, cannot keep a lock while the human is
+	 * looking elsewhere, cannot survive a consent card or the lock screen,
+	 * and -- the one that matters most -- cannot confine an AGENT's actuation,
+	 * because the core gates the freeze on `Origin::Physical`.
+	 *
+	 * IT DOES NOT WIDEN `wl_seat`'s CAPABILITIES. This is a global, not a
+	 * capability, and a capability is widened only for a class actually
+	 * served; nothing new is served through one.
+	 *
+	 * Best-effort, like the two above: an app that never binds it is
+	 * unaffected, and one that does keeps an unconstrained pointer. */
+	vitrin_constraint_create(s);
 
 	/* The virtual keyboard and its dynamic keymap, before the socket is
 	 * bound: the app's first `wl_keyboard` bind must already find a keymap

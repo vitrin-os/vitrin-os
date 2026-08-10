@@ -877,14 +877,30 @@ impl ConsentGrab {
                 state: KeyState::Released,
                 ..
             } => Gate::Deliver,
+            // A gesture's end joins them, and for the identical reason
+            // (WS-E.4.2, issue #222): the app may have been mid-pinch when
+            // this card went up, and the router delivers an end only if it
+            // delivered that gesture's own begin — so this can leak nothing,
+            // while consuming it would leave the app accumulating a gesture
+            // with no end ever coming, which no later drain can repair.
+            SeatInputKind::GestureEnd { .. } => Gate::Deliver,
             // Motion, scroll, key presses — and text, which physical intake
             // never produces but which would be human-aimed if it ever did.
+            // Relative motion and a gesture's begin and updates join them:
+            // a human answering a consent card is not driving the app, and a
+            // consumed begin starts nothing, so its updates and its end are
+            // dropped by the router's own pairing rather than needing a rule
+            // here.
             // Exhaustive by intent: a new input kind must be classified
             // here rather than defaulting to reaching the app mid-prompt.
             SeatInputKind::Motion { .. }
             | SeatInputKind::Scroll { .. }
             | SeatInputKind::Key { .. }
-            | SeatInputKind::Text { .. } => Gate::Consume,
+            | SeatInputKind::Text { .. }
+            | SeatInputKind::RelativeMotion { .. }
+            | SeatInputKind::GestureBegin { .. }
+            | SeatInputKind::GestureSwipeUpdate { .. }
+            | SeatInputKind::GesturePinchUpdate { .. } => Gate::Consume,
         }
     }
 
@@ -1026,6 +1042,7 @@ impl<H: PreemptionHook> PreemptionHook for ConsentGate<H> {
 mod tests {
     use vitrin_protocol::generated::vitrin_actuator_pointer::Axis;
     use vitrin_protocol::generated::vitrin_grant::{Persistence as WirePersistence, Verb};
+    use vitrin_protocol::generated::vitrin_shim_seat::{GestureKind, GestureState};
 
     use super::*;
     use crate::consent::tests::PROMPT_IDENTITY;
@@ -1220,6 +1237,26 @@ mod tests {
             SeatInputKind::Text {
                 text: "typed".into(),
             },
+            // The version-2 classes (WS-E.4.2, issue #222). A delta is
+            // motion by another name, and a gesture's begin and updates are
+            // the human driving the app rather than answering the card.
+            SeatInputKind::RelativeMotion {
+                dx: 1.0,
+                dy: 1.0,
+                dx_unaccel: 1.0,
+                dy_unaccel: 1.0,
+            },
+            SeatInputKind::GestureBegin {
+                kind: GestureKind::Pinch,
+                fingers: 2,
+            },
+            SeatInputKind::GestureSwipeUpdate { dx: 1.0, dy: 1.0 },
+            SeatInputKind::GesturePinchUpdate {
+                dx: 1.0,
+                dy: 1.0,
+                scale: 2.0,
+                rotation: 0.0,
+            },
         ] {
             assert_eq!(
                 grab.judge_parts(Origin::Physical, &kind, now),
@@ -1227,7 +1264,18 @@ mod tests {
                 "{kind:?} must not reach the app while a prompt is up"
             );
         }
-        for kind in [release(BTN_LEFT), key(0xffe1, KeyState::Released)] {
+        for kind in [
+            release(BTN_LEFT),
+            key(0xffe1, KeyState::Released),
+            // A gesture's end joins the two releases, and consuming it would
+            // be worse than consuming either: the app would accumulate the
+            // pinch forever and no drain could repair it, because the router
+            // clears its own record on a consumed end.
+            SeatInputKind::GestureEnd {
+                kind: GestureKind::Pinch,
+                state: GestureState::Completed,
+            },
+        ] {
             assert_eq!(
                 grab.judge_parts(Origin::Physical, &kind, now),
                 Gate::Deliver,

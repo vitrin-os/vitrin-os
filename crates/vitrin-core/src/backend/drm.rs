@@ -34,16 +34,29 @@
 //! is the paired IDL + `docs/protocol/06-vitrin_view.md` edit this backend
 //! forced.
 //!
+//! **And because the core owns that sprite, the core is the only thing that can
+//! hide it** (WS-E.4.2, issue #222). While a realm's pointer constraint is in
+//! force the sprite is not drawn, and this file holds the single line where
+//! that is decided ([`DrmView::compose_and_queue`]'s `human_cursor` local, read
+//! by both presentation branches). It is a **derived predicate**
+//! ([`crate::input::hides_human_sprite`]) evaluated per frame, never a stored
+//! flag: a flag toggled at N sites strands the human's cursor by omission on
+//! the N+1st path, on a display server with no way out. See
+//! `crate::input::constraint` for the whole argument and the deactivation list.
+//!
 //! **3. libinput gives a scancode and a relative delta, and neither is what
 //! the wire carries.** The keyboard arm resolves through the core's own xkb
 //! keymap (WS-E.3.1, D-028, [`crate::input::keymap_key`]) rather than
 //! [`crate::input::intake_physical`]'s scancode-only arm, which maps no letter
-//! and no digit; the pointer arm accumulates `PointerMotion`'s relative delta
-//! into the absolute view position `SeatInputKind::Motion` is defined in
-//! ([`accumulate_pointer`]), because `intake_physical` drops relative motion
-//! and an ordinary mouse emits nothing else. Everything else — buttons, axes,
-//! absolute motion from a touchscreen — goes through `intake_physical`
-//! unchanged, which is where the origin tag and the v120 conversion live.
+//! and no digit; the pointer arm mints **both halves** of one host event
+//! (WS-E.4.2): `intake_physical` translates the delta into
+//! `SeatInputKind::RelativeMotion`, and this backend additionally accumulates
+//! that same delta into the absolute view position `SeatInputKind::Motion` is
+//! defined in ([`accumulate_pointer`]), because only the side that owns the
+//! output can hold and clamp a position. Everything else — buttons, axes,
+//! absolute motion from a touchscreen, the two gesture families — goes through
+//! `intake_physical` unchanged, which is where the origin tag and the v120
+//! conversion live.
 //!
 //! **4. Nothing here may be fatal to the session.** The runtime stops the loop
 //! for exactly one condition, a `redraw` that returns `Err`
@@ -484,6 +497,20 @@ pub(crate) struct DrmView {
     /// a copy of its state: a second switch would animate an indicator for a
     /// hold the router is not watching.
     deadman: Rc<RefCell<DeadManSwitch>>,
+    /// **The session's pointer-constraint records** (WS-E.4.2, issue #222),
+    /// shared with the router by an `Rc` clone, on `deadman`'s exact precedent
+    /// and for the same reason: the presentation half has to *read* whether a
+    /// constraint is in force, and here the composite is driven by the panel's
+    /// own clock through [`session::Presenter::request_present`] and
+    /// [`DrmState::on_vblank`], where only the view is reachable.
+    ///
+    /// An `Rc` clone of the router's own table, not a copy of its state — and
+    /// not a table this view could mint, because
+    /// `crate::input::PointerConstraintTable::new` is private to
+    /// `crate::input`. A second table would be a sprite decided from records
+    /// nothing writes, which is precisely the failure the whole derived design
+    /// exists to make unbuildable.
+    constraints: Rc<RefCell<crate::input::PointerConstraintTable>>,
 }
 
 impl DrmView {
@@ -492,6 +519,20 @@ impl DrmView {
             self.output.mode.w.max(0) as u32,
             self.output.mode.h.max(0) as u32,
         )
+    }
+
+    /// The two backend-owned pointer-constraint gates, from an `overlay_up` the
+    /// caller has already sampled (WS-E.4.2, issue #222).
+    ///
+    /// Split from [`session::Presenter::output_gates`] so `compose_and_queue`,
+    /// which has already computed `overlay_up` for the zero-copy decision, can
+    /// reuse *that* sample rather than take a second one — one clock read per
+    /// frame, and one answer per frame about whether an overlay is up.
+    fn output_gates_of(&self, overlay_up: bool) -> crate::input::OutputGates {
+        crate::input::OutputGates {
+            overlay_up,
+            active: self.output.active,
+        }
     }
 
     /// Queue a page flip carrying the current state, if one is owed and the
@@ -542,10 +583,38 @@ impl DrmView {
         let overlay_up =
             overlay_needs_the_window(hold, &self.consent, &self.lock, Some(&self.notice));
         let agent_cursor = self.agent_cursor;
-        // Always `Some` on this backend, and that is the whole of decision 6:
-        // there is no host desktop drawing this, so a `None` here is a session
-        // with no visible pointer.
-        let human_cursor = Some(self.human_cursor);
+        // **THE SPRITE CHOKEPOINT.** `Some` on this backend unless a pointer
+        // constraint is in force -- there is no host desktop drawing this, so a
+        // `None` here is a session with no visible pointer, which is the whole
+        // of decision 6 and the reason this is one line rather than N.
+        //
+        // Both branches below read this one local: the zero-copy present and
+        // the CPU composite. **Nothing anywhere else in this crate may write
+        // sprite visibility**, and `the_sprite_has_exactly_one_chokepoint` is
+        // what holds that -- so no deactivation path can strand the human's
+        // cursor by forgetting to un-hide, because none of them un-hides at
+        // all. The predicate is re-derived from live state for every composed
+        // frame (`crate::input::hides_human_sprite`).
+        let human_cursor = (!crate::input::hides_human_sprite(
+            &self.constraints.borrow(),
+            &crate::input::PresentationGates {
+                focused: self.scenes.focused(),
+                output: self.output_gates_of(overlay_up),
+                surface: self
+                    .scenes
+                    .focused()
+                    .and_then(|realm| self.scenes.scene(realm))
+                    .and_then(crate::scene::Scene::surface_size),
+                view: (size.w.max(0) as u32, size.h.max(0) as u32),
+                // This backend's own accumulated position, which IS the human's
+                // pointer here: `DrmView::human_cursor` is fed only by
+                // `handle_libinput`, and the sprite is drawn at the same value.
+                // So what the hit test judges and what the human sees cannot
+                // drift.
+                pointer: Some(self.human_cursor),
+            },
+        ))
+        .then_some(self.human_cursor);
 
         if zero_copy_source(&self.scenes, &self.dmabuf_content, overlay_up).is_some() {
             let indicator = self.indicator;
@@ -793,6 +862,29 @@ impl Presenter for DrmView {
     /// looking at.
     fn refresh_status(&mut self, now: std::time::SystemTime, mono: Instant) -> bool {
         self.status.refresh(now, mono, self.scenes.focused())
+    }
+
+    /// The pointer-constraint gates only this backend can answer (WS-E.4.2).
+    ///
+    /// **Both terms are the composite's own**, resolved through
+    /// [`Self::output_gates_of`] so this method and `compose_and_queue` cannot
+    /// come to different conclusions about the same frame: `overlay_up` is
+    /// literally [`overlay_needs_the_window`], which is where the consent card,
+    /// the lock cover, the dead-man hold and the core notice already live, and
+    /// `active` is the flag the seat's pause arm clears.
+    ///
+    /// Sampling the hold here costs one clock read per dispatch round, which is
+    /// the same price `compose_and_queue` already pays per frame and for the
+    /// same reason: a hold that completes mid-round must be judged consistently
+    /// within it.
+    fn output_gates(&self) -> crate::input::OutputGates {
+        let hold = self.deadman.borrow().hold_progress(Instant::now());
+        self.output_gates_of(overlay_needs_the_window(
+            hold,
+            &self.consent,
+            &self.lock,
+            Some(&self.notice),
+        ))
     }
 
     /// The dying realm's scene and a dmabuf importer over **its own** retained
@@ -1123,29 +1215,66 @@ impl DrmState {
     ///   libinput through it would give a session that cannot type. With no
     ///   keymap configured this falls back to exactly that table, which is the
     ///   degraded configuration `Self::keymap` documents.
-    /// * **Pointer motion** is *relative* on libinput, and
-    ///   `SeatInputKind::Motion` is absolute view coordinates —
-    ///   `intake_physical` drops relative motion outright (its `_ =>
-    ///   Vec::new()` arm). So the delta is accumulated here through
-    ///   [`accumulate_pointer`] and minted absolute
-    ///   ([`crate::input::physical_motion`]). Absolute motion (a touchscreen)
-    ///   is resolved through the same [`AbsolutePositionEvent`] methods
-    ///   `intake_physical` would use, so both classes land on one stored
-    ///   position.
-    /// * **Everything else** — buttons, axes, and the classes v0's seat
-    ///   vocabulary does not carry — goes through `intake_physical` unchanged,
-    ///   which is where the v120 conversion and the drop policy live.
+    /// * **Pointer motion** is *relative* on libinput, and it now mints
+    ///   **two** wire events rather than one (WS-E.4.2, issue #222).
+    ///   `SeatInputKind::Motion` is an absolute view coordinate, so the delta
+    ///   is accumulated here through [`accumulate_pointer`] and minted
+    ///   absolute ([`crate::input::physical_motion`]) — that half is
+    ///   unchanged, and it is this backend's own novelty because only the
+    ///   side that owns the output can hold and clamp a position. The delta
+    ///   **itself** now also goes on the wire as `relative_motion`, and that
+    ///   half is minted by `intake_physical` from the very same host event:
+    ///   the IDL says `relative_motion` accompanies `motion` rather than
+    ///   replacing it, because an app binds whichever of the two it
+    ///   understands and must not have to guess which one this core sends.
+    ///   The order is delta first, then destination — what
+    ///   `zwp_relative_pointer_v1` asks of a compositor, and what an app
+    ///   integrating deltas against a position expects. Absolute motion (a
+    ///   touchscreen) is resolved through the same [`AbsolutePositionEvent`]
+    ///   methods `intake_physical` would use, so both classes land on one
+    ///   stored position; it has no delta and so mints no second event.
+    /// * **Everything else** — buttons, axes, the two gesture families, and
+    ///   the classes the seat vocabulary does not yet carry — goes through
+    ///   `intake_physical` unchanged, which is where the v120 conversion, the
+    ///   gesture translation and the drop policy live.
     fn handle_libinput(&mut self, event: &InputEvent<LibinputInputBackend>) {
         let view = self.view.view_size();
         let inputs = match event {
-            InputEvent::PointerMotion { event } => {
-                let moved = accumulate_pointer(
-                    self.view.human_cursor,
-                    (event.delta_x(), event.delta_y()),
-                    view,
-                );
-                self.set_human_cursor(moved);
-                input::physical_motion(moved.0, moved.1)
+            // The inner event is bound under a second name so `event` still
+            // names the whole `InputEvent` below: the delta half is minted by
+            // `intake_physical`, from this same event, rather than by a
+            // second translation here that could drift from it.
+            InputEvent::PointerMotion { event: motion } => {
+                // **THE FREEZE** (WS-E.4.2, issue #222). While the realm on
+                // screen holds an active pointer constraint the delta still
+                // goes on the wire -- that is what a lock IS -- but this
+                // backend neither moves its own accumulated position nor mints
+                // the absolute `motion` that would follow it. Freezing HERE, at
+                // the point the app-facing position is minted, is what keeps
+                // the core's own hit test (`DrmView::human_cursor`, which the
+                // consent card and the sprite both read) from being rewritten
+                // by an app's lock.
+                //
+                // `crate::input::route_into` drops absolute motion for the same
+                // realm independently, so the rule holds for a future backend
+                // that never reaches this arm. Two sites reading one predicate,
+                // by design; neither invents a second hit test.
+                let frozen = self
+                    .view
+                    .scenes
+                    .focused()
+                    .is_some_and(|realm| self.view.constraints.borrow().is_active(realm));
+                let mut inputs = input::intake_physical(event, (view.0 as i32, view.1 as i32));
+                if !frozen {
+                    let moved = accumulate_pointer(
+                        self.view.human_cursor,
+                        (motion.delta_x(), motion.delta_y()),
+                        view,
+                    );
+                    self.set_human_cursor(moved);
+                    inputs.extend(input::physical_motion(moved.0, moved.1));
+                }
+                inputs
             }
             InputEvent::PointerMotionAbsolute { event } => {
                 let at = (
@@ -2020,6 +2149,12 @@ fn run_inner(
             human_cursor: (f64::from(view_size.0) / 2.0, f64::from(view_size.1) / 2.0),
             attention: false,
             deadman: Rc::clone(&deadman),
+            // Taken OUT of the router that was just built, never minted here
+            // (WS-E.4.2): `PointerConstraintTable::new` is private to
+            // `crate::input`, so "the view composites against the table its own
+            // router writes" is unconstructible-otherwise rather than a wiring
+            // step this function could get wrong.
+            constraints: router.constraints(),
         },
         runtime: Runtime::new(
             seed.take().expect("the seed is consumed exactly once"),
@@ -2491,6 +2626,220 @@ mod tests {
             "the CPU branch stopped passing the human cursor, so the pointer would vanish \
              whenever the zero-copy path is unavailable -- an overlay up, or an unimportable \
              client buffer"
+        );
+    }
+
+    /// **The sprite has exactly one chokepoint** (WS-E.4.2, issue #222).
+    ///
+    /// The safety property of the pointer-constraint change, held as a shape
+    /// rather than as a value, because no test in this workspace can run this
+    /// backend at all: `window_pixels` is handed `None` for the human cursor on
+    /// nested and headless, so every mode CI can run is structurally immune to
+    /// the failure this guards against — a human on a bare-metal session with
+    /// no visible pointer and no way out.
+    ///
+    /// Two assertions, and they are the whole argument for a derived predicate
+    /// over a stored flag:
+    ///
+    /// * `hides_human_sprite(` appears **exactly once** in the entire crate. A
+    ///   second call site is a second decision about the same pixel; N call
+    ///   sites toggling a flag is a cursor stranded by omission on the N+1st
+    ///   deactivation path.
+    /// * That one call is inside `compose_and_queue`, feeding the one
+    ///   `human_cursor` local both presentation branches read — so it is a
+    ///   value recomputed per frame from live gates, never a state anything
+    ///   writes.
+    ///
+    /// Source-scan tests are idiomatic here rather than invented: two
+    /// assertions above scan this same file's bodies, and `session.rs` records
+    /// `enforcement.rs` doing it crate-wide for the chokepoint's identifiers.
+    #[test]
+    fn the_sprite_has_exactly_one_chokepoint() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).expect("the crate source tree is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("a readable source file");
+                    // Truncated at the test module, exactly as `source()` is:
+                    // otherwise the tests that drive the predicate would count
+                    // as production call sites.
+                    let production = text
+                        .split_once("\n#[cfg(test)]\nmod tests {")
+                        .map(|(before, _)| before.to_string())
+                        .unwrap_or(text);
+                    out.push((path, production));
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        rust_sources(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut sources,
+        );
+        assert!(
+            sources.iter().any(|(p, _)| p.ends_with("drm.rs")),
+            "the scan must cover this file, or it proves nothing"
+        );
+
+        let mut callers: Vec<String> = Vec::new();
+        for (path, text) in &sources {
+            // The definition and the re-export name it without calling it;
+            // only an open paren after the name is a call.
+            let calls = text.matches("hides_human_sprite(").count()
+                - text.matches("fn hides_human_sprite(").count();
+            for _ in 0..calls {
+                callers.push(path.display().to_string());
+            }
+        }
+        assert_eq!(
+            callers.len(),
+            1,
+            "`hides_human_sprite(` must be called from exactly ONE place in this crate -- the \
+             bare-metal composite. A second call is a second decision about whether the human \
+             can see their own pointer, and on this backend there is no host desktop drawing a \
+             spare one. Callers found: {callers:?}"
+        );
+        assert!(
+            callers[0].ends_with("drm.rs"),
+            "the one caller must be this backend: {}",
+            callers[0]
+        );
+
+        let after = source()
+            .split("fn compose_and_queue(&mut self")
+            .nth(1)
+            .expect("this backend composes through compose_and_queue");
+        let body = after
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        assert!(
+            body.contains("hides_human_sprite("),
+            "the one call must be inside `compose_and_queue`, on the line that decides \
+             `human_cursor` for BOTH presentation branches -- anywhere else and the two \
+             branches could disagree about whether the pointer is drawn"
+        );
+        // And the inverse: nothing in this method may write a stored visibility
+        // flag. `human_cursor` is a `let` computed here and read twice.
+        assert_eq!(
+            body.matches("let human_cursor").count(),
+            1,
+            "the sprite must be ONE derived local per frame, never a field assigned from \
+             several places"
+        );
+    }
+
+    /// **The constraint gates read every overlay this backend can raise**
+    /// (WS-E.4.2, issue #222) — paths 6, 7, 12 and 13 of the deactivation list.
+    ///
+    /// Those four are transient by design: they deactivate a pointer constraint
+    /// and restore the human's cursor with **no code of their own**, purely
+    /// because `overlay_needs_the_window` already folds all four into one
+    /// boolean and this method hands that boolean to the predicate. The whole
+    /// no-code claim therefore rests on one call being made with the right
+    /// arguments, on a `&DrmView` method no test in this workspace can invoke.
+    ///
+    /// Two things are pinned. That `output_gates` reaches
+    /// `overlay_needs_the_window` at all — losing that call would silently make
+    /// a lock survive a consent card. And that it passes the notice, because
+    /// `Some(&self.notice)` is the ONE argument that distinguishes this
+    /// backend's four overlays from the nested backend's three: the notice
+    /// exists to tell a trapped human something, and a hidden cursor is the
+    /// state a trapped human is most likely to be in.
+    #[test]
+    fn the_constraint_gates_read_every_overlay() {
+        let after = source()
+            .split("fn output_gates(&self)")
+            .nth(1)
+            .expect("this backend answers the constraint gates");
+        let body = after
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        assert!(
+            body.contains("overlay_needs_the_window("),
+            "the constraint gates must be the SAME overlay judgement the zero-copy branch \
+             makes: a second opinion here would let a lock outlive the consent card that is \
+             covering the app"
+        );
+        assert!(
+            body.contains("hold_progress("),
+            "a dead-man hold in progress must deactivate a pointer constraint -- the human \
+             gets their cursor back the moment they start asking for their machine back, not \
+             when the chord completes"
+        );
+        assert!(
+            body.contains("&self.notice"),
+            "the core notice must be one of the gates: it is this backend's fourth overlay and \
+             the only one nested does not have"
+        );
+        // ...and the output's own liveness, which is the seat-pause half.
+        let of = source()
+            .split("fn output_gates_of(&self")
+            .nth(1)
+            .expect("the shared resolver exists");
+        let of = of
+            .split_once("\n    }\n")
+            .expect("the method body ends at its closing brace")
+            .0;
+        assert!(
+            of.contains("self.output.active"),
+            "a paused output must deactivate a pointer constraint, so the sprite is back on \
+             the first frame after a VT switch regardless of what the record says"
+        );
+    }
+
+    /// **A locked pointer does not move this backend's own accumulated
+    /// position** (WS-E.4.2, issue #222).
+    ///
+    /// `handle_libinput` is a `&mut DrmState` method and `DrmState` cannot be
+    /// constructed without a real `DrmDevice`, `LibSeatSession`, `GbmDevice`
+    /// and `GlesRenderer`, so no test in this workspace can call it. What is
+    /// left for this file is the **shape**, exactly as
+    /// `the_vt_switch_is_reached_only_from_the_input_drain` holds the shape of
+    /// a call nothing can drive: the pointer arm must consult the constraint
+    /// table, and both `set_human_cursor` and `physical_motion` must sit behind
+    /// that consultation.
+    ///
+    /// The behaviour itself is held one crate module over, on the router's own
+    /// arm, by `input::tests::an_active_constraint_freezes_the_position_the_core_hit_tests_with`
+    /// — which is where the property is actually tested. This pins the wiring
+    /// that no test can otherwise reach.
+    #[test]
+    fn the_pointer_arm_freezes_behind_the_constraint_table() {
+        let after = source()
+            .split("InputEvent::PointerMotion { event: motion } =>")
+            .nth(1)
+            .expect("this backend accumulates libinput's relative deltas");
+        let arm = after
+            .split_once("\n            InputEvent::PointerMotionAbsolute")
+            .expect("the next arm ends this one")
+            .0;
+
+        assert!(
+            arm.contains("is_active("),
+            "the pointer arm must ask the constraint table before it moves the core's own \
+             position: the IDL promises a lock \"freezes the position the core's own hit tests \
+             use\", and this backend's `human_cursor` IS that position"
+        );
+        for behind in ["set_human_cursor", "physical_motion"] {
+            let at = arm
+                .find(behind)
+                .unwrap_or_else(|| panic!("the pointer arm must still call `{behind}`"));
+            let gate = arm.find("is_active(").expect("checked above");
+            assert!(
+                gate < at,
+                "`{behind}` must sit BEHIND the constraint check, not before it: moving the \
+                 position and then declining to deliver it would leave the sprite drifting \
+                 while the app was told nothing"
+            );
+        }
+        assert!(
+            arm.contains("intake_physical("),
+            "and the delta must still be minted unconditionally -- a lock that stopped \
+             `relative_motion` would stop the only thing a locked app receives"
         );
     }
 

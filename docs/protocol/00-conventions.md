@@ -260,9 +260,22 @@ only into human-visible output — never into a captured frame — at the same
 output stage as the consent overlay and the trust indicator; nested mode draws
 it always, and `--headless --agent-cursor` on request (the headless
 human-visible framebuffer is otherwise measured byte-for-byte against the realm
-view by the trusted-band witness). No *human* cursor is composited: in nested
-operation the host desktop draws it, outside the realm view entirely. Delivery
-is a separate thing from drawing, and delivery has not changed: version 1 still
+view by the trusted-band witness). **Whether a *human* cursor is composited
+depends on who owns the display**, and the answer changes nothing above: in
+nested operation the core composites none, because the host desktop draws it
+outside the realm view entirely; on bare metal, where there is no host desktop,
+the core draws the human's pointer itself, or the human has none. This paragraph
+said flatly that no human cursor is composited until WS-E.4.2 corrected it; the
+IDL (`vitrin_view`'s description) had been nested-conditional since WS-E.3.2,
+and prose restating the IDL is the rule, so the prose was the surface that was
+wrong. Where the core *does* draw that sprite it also **hides** it while a
+pointer constraint is active on the bound realm
+([`vitrin_shim_session.pointer_constraint_state`](09-vitrin_shim_session.md#pointer_constraint_state-since-2)),
+which is the one case in this protocol where an app's ask changes what the human
+sees of their own pointer — and is precisely why the hiding, and the un-hiding
+on every path that ends a constraint, are the **core's** and not the app's.
+Delivery is a separate thing from drawing, and delivery has not changed:
+version 1 still
 delivers **one shared pointer position** per realm view to the shim, and
 per-principal delivery stays deferred to M2 (D-017, D-019). Of the three verbs this section governs, `layout_arrange` and `layout_focus`
 are **servable** — each has a facet interface, and the reference core serves
@@ -620,12 +633,26 @@ distinct event rather than a sentinel string.
 
 `move`, `button`, `scroll` (`vitrin_actuator_pointer`); `type`
 (`vitrin_actuator_text`); `attach`, `damage`, `commit`
-(`vitrin_shim_surface`). These carry no reply. Their **refusals MAY be
-coalesced**:
+(`vitrin_shim_surface`); `selection` and `pointer_constraint`
+(`vitrin_shim_session`, both *since 2*). These carry no reply. Their **refusals
+MAY be coalesced**:
 
 - at most one `refused(rate_limited)` per grant per bucket-refill window;
 - at most one `refused` per grant per `(verb, code)` pair until a subsequent
   request on that grant succeeds.
+
+Two qualifications on the shim-connection pair, both stated rather than left to
+be inferred. `selection` was **missing from this list** until WS-E.4.2 and is
+added here with the message that noticed it; it has no refusal at all, so the
+coalescing rule is vacuous for it. `pointer_constraint` **does** get an answer —
+`vitrin_shim_session.pointer_constraint_state`, correlated by serial — but that
+answer is not a terminal event and [§6.1](#61-reply-bearing-requests)'s
+exactly-one-terminal rule deliberately does not apply to it: a constraint's
+state changes for reasons the shim never asked about, so an answer bound
+one-to-one to the ask would leave an app locked with no message able to tell it
+otherwise. For that message the coalescing licence above is **overridden in the
+strict direction**: the core sends at most one `pointer_constraint_state` per
+transition and never coalesces two different states.
 
 ### 6.3 Non-error, legal-but-noteworthy cases
 
@@ -769,17 +796,38 @@ else:
 | `vitrin_launcher` | request `launch`, event `launched` |
 | `vitrin_layout_focus` | request `focus` |
 | `vitrin_layout_arrange` | request `set_fullscreen` |
+| `vitrin_shim_session` | events `request_selection`, `offer_selection`, `pointer_constraint_state`; requests `selection`, `pointer_constraint` |
+| `vitrin_shim_seat` | events `relative_motion`, `gesture_begin`, `gesture_swipe_update`, `gesture_pinch_update`, `gesture_end` |
 
-> **This paragraph had drifted, and the correction is recorded rather than
-> silently applied.** It read "`vitrin_grant.get_launcher`, and
+Plus, at the same version and for the same reason, six enums that carry
+arguments of those messages and are defined nowhere else:
+`vitrin_shim_session.selection_status`,
+`vitrin_shim_session.pointer_constraint_kind`,
+`vitrin_shim_session.pointer_constraint_lifetime`,
+`vitrin_shim_session.pointer_constraint_status`,
+`vitrin_shim_seat.gesture_kind` and
+`vitrin_shim_seat.gesture_state`. Enum entries carry no `since` of their own
+(see [§7.4](#74-growth-rules-wayland-style)), so the version a new enum belongs
+to is recorded here or nowhere.
+
+> **This paragraph had drifted twice, and both corrections are recorded rather
+> than silently applied.** It read "`vitrin_grant.get_launcher`, and
 > `vitrin_launcher`'s `launch`/`launched` — nothing else" until WS-E.1.7. That
-> was already false before this issue touched it: WS-E.1.4 landed four more
+> was already false before that issue touched it: WS-E.1.4 landed four more
 > `since="2"` messages (`get_layout_focus`, `get_layout_arrange`, `focus`,
-> `set_fullscreen`) without updating it, and WS-E.1.7 adds a fifth
-> (`attention`). A closed enumeration nobody re-reads when appending is a
-> tripwire that only ever fires late; the growth rules below now say in as many
-> words that this table is normative and must be extended with every `since=`
-> addition.
+> `set_fullscreen`) without updating it, and WS-E.1.7 added a fifth
+> (`attention`). **It then went stale a second time, in exactly the way the rule
+> below was written to prevent**: WS-E.2.1's three cross-realm-clipboard
+> messages on `vitrin_shim_session` landed without extending this table, and the
+> omission stood until WS-E.4.2 came to append to it. Both rows are now present.
+> A closed enumeration nobody re-reads while appending is a tripwire that only
+> ever fires late — twice, so far — which is why the growth rules below say in
+> as many words that this table is normative and must be extended in the same
+> edit as any `since=` addition. WS-E.4.2's own two additions — the seat's five
+> events, then the session's pointer-constraint pair and its **three** enums —
+> were each made in the edit that landed them, which is what the rule asks for.
+> Three enums in one change is the largest single addition this paragraph has
+> taken, and therefore the likeliest to be dropped next time.
 
 A version-1
 connection is served exactly as before: it never sees a `since="2"` event, and
@@ -813,8 +861,10 @@ recoverable).
   It is a closed list of what separates one protocol version from another, so a
   message appended without it makes the document state something false about
   the wire — and, being a list nobody re-reads while appending, it goes stale
-  silently and is discovered late. It has gone stale exactly once, and that is
-  recorded there rather than quietly fixed.
+  silently and is discovered late. It has gone stale **twice**, and both are
+  recorded there rather than quietly fixed. A new **enum** belongs in that
+  table too: entries carry no `since` (below), so there is no other place a
+  reader can learn which version first defined one.
 - **Enum entries** are appended (values are immutable; a `deprecated-since`
   mark never removes). Entries carry **no `since`**: an enum's wire validation
   is one mask or membership table with no version dimension, so a
@@ -932,6 +982,10 @@ record of *how* it arrived, which is what a later seam copies.
 | `set_constraint` builder | new `since="2"` request preceding `request_grant` | value-bearing constraints (e.g. focus conditions) arrive as a builder request; boolean constraints use reserved `flags` bits — `request_grant`'s signature is frozen |
 | focus event | new `since="2"` tagged event on `vitrin_shim_seat` | version 0 synthesizes focus shim-side (single-surface); the new event still ends with `origin`, satisfying B2 structurally |
 | keymap relay + keycode event | new `since="2"` `keymap(fd, size, origin)` + keycode event on `vitrin_shim_seat` | keysym `key` events stay valid; raw-scancode fidelity is added alongside, one fd per message (one-fd rule holds) |
+| **relative pointer motion** *(landed, version 2)* | one `since="2"` event `relative_motion(dx, dy, dx_unaccel, dy_unaccel, origin)` on [`vitrin_shim_seat`](11-vitrin_shim_seat.md#relative_motion), at event opcode 5, and **no verb bit** | Appended beside `motion` rather than changing it, because a signature is immutable forever and because the two are not alternatives: one physical movement produces both, and an app binds whichever it understands. It ends with `origin`, so B2 holds structurally. **Both an accelerated and an unaccelerated delta are carried**, since an app that wants the raw one cannot reconstruct it and a shim asked to supply one from the other would be inventing a value. **No timestamp**, deliberately — the shim stamps its own replay clock, and a device clock beside it would be a second unsynchronised one; the cost (a consumer integrating over `dt` gets arrival time, not event time) is paid rather than argued away. **No verb bit, positively**: this is core→shim delivery on the physical path, `vitrin_shim_seat` carries no `@verb` and no requests, and an emulated source stays additive because the tag is already there |
+| **pinch and multi-finger swipe** *(landed, version 2)* | four `since="2"` events on [`vitrin_shim_seat`](11-vitrin_shim_seat.md#gesture_begin) at opcodes 6–9 — `gesture_begin(kind, fingers, origin)`, `gesture_swipe_update(dx, dy, origin)`, `gesture_pinch_update(dx, dy, scale, rotation, origin)`, `gesture_end(kind, state, origin)` — plus the `gesture_kind` and `gesture_state` enums, and **no verb bit** | Swipe and pinch **share** their begin and end because those two signatures are identical in the gesture vocabulary being served, and a signature is immutable forever: four events with no dead argument, rather than six with duplicated ones or two phase-tagged events whose deltas and completion flag are meaningless in two phases out of three. A further kind (a hold, say) is therefore an **appended `gesture_kind` entry and no new event** — which is what makes the shared begin/end pay for itself. Two-finger scroll was **already served** by `scroll`, so this row closes a narrower gap than "gestures". The one non-obvious cost is a *pairing* obligation, not a signature one: the core owes exactly one `gesture_end` per `gesture_begin` it sent, on every path, or a begin with no end is the latched-modifier failure wearing a new shape — an obligation, not yet fully discharged: the core mints a `cancelled` end on a realm switch and a seat pause, and **not** when a consent card or the lock screen raises, which withhold the updates and then deliver the device's own end. `gesture_end`'s IDL description names that gap and says closing it is owed |
+| **pointer lock: the ask and the core's verdict** *(landed, version 2)* | two `since="2"` messages on [`vitrin_shim_session`](09-vitrin_shim_session.md#pointer_constraint-since-2) — the `pointer_constraint` request at request opcode 3 and the `pointer_constraint_state` event at event opcode 3 — plus the `pointer_constraint_kind`, `pointer_constraint_lifetime` and `pointer_constraint_status` enums, and **no verb bit**; **not** on `vitrin_shim_seat` | **The interface choice was forced by B2, not chosen.** Every `vitrin_shim_seat` event ends with `origin`, and `origin` names a human's device or a principal's actuator; a lock is asked for by the *confined app*, which is neither, so any tag it carried would be false on the one interface whose design idea is that the tag never drifts. `vitrin_shim_seat` also defines no requests by schema, so it could not carry the ask at all. The session bootstrap already carries shim→core requests and reuses the cross-realm clipboard's shape *with the asking party reversed*: the app asks, the core decides, and the state lives where nothing outside the core can strand it. The input half had already landed as `relative_motion`, so this pair added no seat event and took no seat opcode. **One message is the whole state machine's input** — `kind = none` is the withdrawal — so a withdrawal cannot race a set, and the verdict is deliberately **not** a terminal event (§6.2): a constraint deactivates for reasons the shim never asked about, and an answer bound one-to-one to the ask would leave an app locked with nothing able to tell it otherwise. `surface` is the protocol's **first `object` argument**, and its first nullable one. **No verb bit, positively**: the asking party is a confined app rather than a wire principal, so a constraint is derived from no grant and revoking every grant in a session leaves it untouched. Two costs are named on the request itself rather than left to be discovered: the region is one **rectangle**, so a non-rectangular confinement is widened to its bounding box without the app being told, and `lifetime` carries Wayland's `oneshot` though nothing here has yet needed it. Qualify it **`pointer_constraint`** or *pointer lock*: bare `constraint` already means a **petition** constraint here (`request_grant`'s `flags`, and the `set_constraint` builder row above) |
+| touch and tablet events | new `since="2"` events on `vitrin_shim_seat`, each ending with `origin` | **Not yet served, not refused** — the distinction is load-bearing. The decision that left them out rests on one machine's measured device set (no `INPUT_PROP_DIRECT` node, no pen tool), which is evidence about a laptop rather than a property of a class, and a permanent wire protocol may not foreclose a device class on that ground. Each carries the evidence that reopens it: for **touch**, a touchscreen in the measured device set *and* an application that needs it; for **tablet**, a tablet or stylus device, the application half already being banked. Purely additive whenever either arrives — appended events, B2 satisfied structurally, nothing already here changed — and until then the correct behavior is the one already shipped: **do not advertise a `wl_seat` capability the wire cannot deliver**, because a class advertised and never delivered is worse than an absent one |
 | `hello_fd` credential sibling | new `since="2"` fd-borne request on `vitrin_handshake` | `hello`'s signature is frozen forever; oversized credentials arrive via a sibling carrying one fd, so the 32768-byte in-frame bound is never a wall |
 | proof-of-possession credential exchange | new `since="2"` challenge event + response request on `vitrin_handshake` | version-0 schemes are bearer-shaped (presented whole in `hello`); a `credential_type` demanding proof of possession (e.g. X.509-SVID) adds a server-driven exchange inside VERIFYING as appended messages — the exchange is part of the handshake itself, so the response request is exempt from the queued-until-BOUND rule (which scopes to non-handshake requests, §7.1) and the unauthenticated deadline stays armed while the server awaits the response; `hello` and `bound` stay frozen, and version-1 connections and bearer schemes never see the new messages |
 | dmabuf params builder | new `since="2"` builder on `vitrin_shim_surface`, one fd per add | `attach` stays single-plane linear (no modifier argument to fail to honor); explicit modifiers / multi-planar formats accumulate fds across messages, preserving the one-fd rule |

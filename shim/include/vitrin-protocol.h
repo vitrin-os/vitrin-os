@@ -315,7 +315,7 @@ static inline vitrin_decode_status_t vitrin_frame_header_decode(
 /* test_header_compiles.c) checks its own list length against this with */
 /* _Static_assert, so a message added to the IDL cannot ship without a */
 /* compile-time proof that its marshal functions type-check. */
-#define VITRIN_MESSAGE_COUNT 40
+#define VITRIN_MESSAGE_COUNT 47
 
 /* ==================================================================== */
 /* Section 1: per-interface metadata and enums.                          */
@@ -742,6 +742,90 @@ static inline bool vitrin_shim_session_selection_status_is_valid(uint32_t v) {
     }
 }
 
+/* Enum `pointer_constraint_kind` on `vitrin_shim_session`.
+ *
+ * what a pointer_constraint asks for, including nothing
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* withdraw this connection's constraint; surface MUST be null */
+    VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_KIND_NONE = 0,
+    /* pin the pointer; movement reaches the app as relative_motion only */
+    VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_KIND_LOCK = 1,
+    /* keep the pointer inside the region; absolute motion continues within it */
+    VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_KIND_CONFINE = 2,
+} vitrin_shim_session_pointer_constraint_kind_t;
+
+/* Whole-value membership check for `vitrin_shim_session_pointer_constraint_kind_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_shim_session_pointer_constraint_kind_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_KIND_NONE:
+        case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_KIND_LOCK:
+        case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_KIND_CONFINE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Enum `pointer_constraint_lifetime` on `vitrin_shim_session`.
+ *
+ * whether a constraint survives its own deactivation
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* ends for good at its first deactivation */
+    VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_LIFETIME_ONESHOT = 0,
+    /* may deactivate and reactivate with no new ask */
+    VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_LIFETIME_PERSISTENT = 1,
+} vitrin_shim_session_pointer_constraint_lifetime_t;
+
+/* Whole-value membership check for `vitrin_shim_session_pointer_constraint_lifetime_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_shim_session_pointer_constraint_lifetime_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_LIFETIME_ONESHOT:
+        case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_LIFETIME_PERSISTENT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Enum `pointer_constraint_status` on `vitrin_shim_session`.
+ *
+ * what the core did with a pointer_constraint, and what is in force
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* recorded but not in force; may become active later with no new ask */
+    VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_INACTIVE = 0,
+    /* in force: absolute motion stops, relative_motion continues, the core hides its own cursor sprite */
+    VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_ACTIVE = 1,
+    /* the record is gone: the shim withdrew it, or what it named went away */
+    VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_WITHDRAWN = 2,
+    /* not recorded at all; the app's object stays inert and this serial is not re-asked */
+    VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_REFUSED = 3,
+    /* a later ask on this connection replaced it; this serial gets nothing further */
+    VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_SUPERSEDED = 4,
+} vitrin_shim_session_pointer_constraint_status_t;
+
+/* Whole-value membership check for `vitrin_shim_session_pointer_constraint_status_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_shim_session_pointer_constraint_status_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_INACTIVE:
+        case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_ACTIVE:
+        case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_WITHDRAWN:
+        case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_REFUSED:
+        case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_SUPERSEDED:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* ==== vitrin_shim_surface (version 1) ==== */
 /* shim-to-core buffer path */
 
@@ -802,11 +886,11 @@ static inline bool vitrin_shim_surface_buffer_status_is_valid(uint32_t v) {
     }
 }
 
-/* ==== vitrin_shim_seat (version 1) ==== */
+/* ==== vitrin_shim_seat (version 2) ==== */
 /* input delivery to the shim (events only, origin-tagged) */
 
 #define VITRIN_SHIM_SEAT_INTERFACE_NAME "vitrin_shim_seat"
-#define VITRIN_SHIM_SEAT_INTERFACE_VERSION 1u
+#define VITRIN_SHIM_SEAT_INTERFACE_VERSION 2u
 
 /* Enum `key_state` on `vitrin_shim_seat`.
  *
@@ -850,6 +934,54 @@ static inline bool vitrin_shim_seat_origin_is_valid(uint32_t v) {
     switch (v) {
         case VITRIN_SHIM_SEAT_ORIGIN_PHYSICAL:
         case VITRIN_SHIM_SEAT_ORIGIN_EMULATED:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Enum `gesture_kind` on `vitrin_shim_seat`.
+ *
+ * which gesture a shared begin or end names
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* multi-finger swipe; motion arrives as gesture_swipe_update */
+    VITRIN_SHIM_SEAT_GESTURE_KIND_SWIPE = 0,
+    /* pinch; motion arrives as gesture_pinch_update */
+    VITRIN_SHIM_SEAT_GESTURE_KIND_PINCH = 1,
+} vitrin_shim_seat_gesture_kind_t;
+
+/* Whole-value membership check for `vitrin_shim_seat_gesture_kind_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_shim_seat_gesture_kind_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_SHIM_SEAT_GESTURE_KIND_SWIPE:
+        case VITRIN_SHIM_SEAT_GESTURE_KIND_PINCH:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Enum `gesture_state` on `vitrin_shim_seat`.
+ *
+ * how a gesture ended
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* the human finished the gesture */
+    VITRIN_SHIM_SEAT_GESTURE_STATE_COMPLETED = 0,
+    /* the gesture did not finish; a preview should be undone */
+    VITRIN_SHIM_SEAT_GESTURE_STATE_CANCELLED = 1,
+} vitrin_shim_seat_gesture_state_t;
+
+/* Whole-value membership check for `vitrin_shim_seat_gesture_state_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_shim_seat_gesture_state_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_SHIM_SEAT_GESTURE_STATE_COMPLETED:
+        case VITRIN_SHIM_SEAT_GESTURE_STATE_CANCELLED:
             return true;
         default:
             return false;
@@ -3303,6 +3435,150 @@ static inline vitrin_decode_status_t vitrin_shim_session_req_selection_decode(
     return VITRIN_DECODE_OK;
 }
 
+/* Request `pointer_constraint` (opcode 3) on `vitrin_shim_session`.
+ *
+ * ask the core to lock or confine the pointer to a surface
+ */
+typedef struct {
+    /* shim-minted; names the answer this ask expects */
+    uint32_t serial;
+    /* the surface the constraint applies to; MUST be null when kind is none (object: vitrin_shim_surface; 0 = null) */
+    uint32_t surface;
+    /* lock, confine, or none to withdraw */
+    vitrin_shim_session_pointer_constraint_kind_t kind;
+    /* oneshot or persistent; ignored when kind is none */
+    vitrin_shim_session_pointer_constraint_lifetime_t lifetime;
+    /* region origin x, surface-local pixels */
+    int32_t x;
+    /* region origin y, surface-local pixels */
+    int32_t y;
+    /* region width; zero with height zero means the whole surface */
+    uint32_t width;
+    /* region height; zero with width zero means the whole surface */
+    uint32_t height;
+} vitrin_shim_session_req_pointer_constraint_t;
+
+#define VITRIN_SHIM_SESSION_REQ_POINTER_CONSTRAINT_OPCODE ((uint8_t)3)
+#define VITRIN_SHIM_SESSION_REQ_POINTER_CONSTRAINT_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SESSION_REQ_POINTER_CONSTRAINT_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_session_req_pointer_constraint_encode(const vitrin_shim_session_req_pointer_constraint_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SESSION_REQ_POINTER_CONSTRAINT_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SESSION_REQ_POINTER_CONSTRAINT_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, msg->serial);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, msg->surface);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->kind);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->lifetime);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->x);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->y);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, msg->width);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, msg->height);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_session_req_pointer_constraint_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_session_req_pointer_constraint_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SESSION_REQ_POINTER_CONSTRAINT_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SESSION_REQ_POINTER_CONSTRAINT_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SESSION_REQ_POINTER_CONSTRAINT_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_serial = vitrin_raw_read_u32(in, in_len, &pos, &out->serial);
+    if (st_serial != VITRIN_DECODE_OK) { return st_serial; }
+    vitrin_decode_status_t st_surface = vitrin_raw_read_u32(in, in_len, &pos, &out->surface);
+    if (st_surface != VITRIN_DECODE_OK) { return st_surface; }
+    uint32_t kind_raw;
+    vitrin_decode_status_t st_kind = vitrin_raw_read_u32(in, in_len, &pos, &kind_raw);
+    if (st_kind != VITRIN_DECODE_OK) { return st_kind; }
+    if (!vitrin_shim_session_pointer_constraint_kind_is_valid(kind_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->kind = (vitrin_shim_session_pointer_constraint_kind_t)kind_raw;
+    uint32_t lifetime_raw;
+    vitrin_decode_status_t st_lifetime = vitrin_raw_read_u32(in, in_len, &pos, &lifetime_raw);
+    if (st_lifetime != VITRIN_DECODE_OK) { return st_lifetime; }
+    if (!vitrin_shim_session_pointer_constraint_lifetime_is_valid(lifetime_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->lifetime = (vitrin_shim_session_pointer_constraint_lifetime_t)lifetime_raw;
+    uint32_t x_raw;
+    vitrin_decode_status_t st_x = vitrin_raw_read_u32(in, in_len, &pos, &x_raw);
+    if (st_x != VITRIN_DECODE_OK) { return st_x; }
+    out->x = (int32_t)x_raw;
+    uint32_t y_raw;
+    vitrin_decode_status_t st_y = vitrin_raw_read_u32(in, in_len, &pos, &y_raw);
+    if (st_y != VITRIN_DECODE_OK) { return st_y; }
+    out->y = (int32_t)y_raw;
+    vitrin_decode_status_t st_width = vitrin_raw_read_u32(in, in_len, &pos, &out->width);
+    if (st_width != VITRIN_DECODE_OK) { return st_width; }
+    vitrin_decode_status_t st_height = vitrin_raw_read_u32(in, in_len, &pos, &out->height);
+    if (st_height != VITRIN_DECODE_OK) { return st_height; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
 /* Event `configure` (opcode 0) on `vitrin_shim_session`.
  *
  * realm identity and view geometry
@@ -3596,6 +3872,107 @@ static inline vitrin_decode_status_t vitrin_shim_session_evt_offer_selection_dec
     if (st_mime != VITRIN_DECODE_OK) { return st_mime; }
     vitrin_decode_status_t st_data = vitrin_raw_read_string(in, in_len, &pos, 61440u, &out->data);
     if (st_data != VITRIN_DECODE_OK) { return st_data; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `pointer_constraint_state` (opcode 3) on `vitrin_shim_session`.
+ *
+ * the core's verdict on a pointer_constraint, and its running state
+ */
+typedef struct {
+    /* the serial of the pointer_constraint ask this concerns */
+    uint32_t serial;
+    /* what the core did with that ask, and what is in force now */
+    vitrin_shim_session_pointer_constraint_status_t state;
+} vitrin_shim_session_evt_pointer_constraint_state_t;
+
+#define VITRIN_SHIM_SESSION_EVT_POINTER_CONSTRAINT_STATE_OPCODE ((uint8_t)3)
+#define VITRIN_SHIM_SESSION_EVT_POINTER_CONSTRAINT_STATE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SESSION_EVT_POINTER_CONSTRAINT_STATE_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_session_evt_pointer_constraint_state_encode(const vitrin_shim_session_evt_pointer_constraint_state_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SESSION_EVT_POINTER_CONSTRAINT_STATE_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SESSION_EVT_POINTER_CONSTRAINT_STATE_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, msg->serial);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->state);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_session_evt_pointer_constraint_state_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_session_evt_pointer_constraint_state_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SESSION_EVT_POINTER_CONSTRAINT_STATE_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SESSION_EVT_POINTER_CONSTRAINT_STATE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SESSION_EVT_POINTER_CONSTRAINT_STATE_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_serial = vitrin_raw_read_u32(in, in_len, &pos, &out->serial);
+    if (st_serial != VITRIN_DECODE_OK) { return st_serial; }
+    uint32_t state_raw;
+    vitrin_decode_status_t st_state = vitrin_raw_read_u32(in, in_len, &pos, &state_raw);
+    if (st_state != VITRIN_DECODE_OK) { return st_state; }
+    if (!vitrin_shim_session_pointer_constraint_status_is_valid(state_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->state = (vitrin_shim_session_pointer_constraint_status_t)state_raw;
     if (pos != in_len) {
         return VITRIN_DECODE_ERR_TRAILING_BYTES;
     }
@@ -4673,6 +5050,594 @@ static inline vitrin_decode_status_t vitrin_shim_seat_evt_text_decode(
     size_t pos = VITRIN_HEADER_LEN;
     vitrin_decode_status_t st_text = vitrin_raw_read_string(in, in_len, &pos, 4096u, &out->text);
     if (st_text != VITRIN_DECODE_OK) { return st_text; }
+    uint32_t origin_raw;
+    vitrin_decode_status_t st_origin = vitrin_raw_read_u32(in, in_len, &pos, &origin_raw);
+    if (st_origin != VITRIN_DECODE_OK) { return st_origin; }
+    if (!vitrin_shim_seat_origin_is_valid(origin_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->origin = (vitrin_shim_seat_origin_t)origin_raw;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `relative_motion` (opcode 5) on `vitrin_shim_seat`.
+ *
+ * pointer moved, as a delta
+ */
+typedef struct {
+    /* accelerated delta x, realm-view pixels */
+    vitrin_fixed_t dx;
+    /* accelerated delta y, realm-view pixels */
+    vitrin_fixed_t dy;
+    /* unaccelerated delta x, realm-view pixels */
+    vitrin_fixed_t dx_unaccel;
+    /* unaccelerated delta y, realm-view pixels */
+    vitrin_fixed_t dy_unaccel;
+    /* who caused this event */
+    vitrin_shim_seat_origin_t origin;
+} vitrin_shim_seat_evt_relative_motion_t;
+
+#define VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_OPCODE ((uint8_t)5)
+#define VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_seat_evt_relative_motion_encode(const vitrin_shim_seat_evt_relative_motion_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->dx);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->dy);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->dx_unaccel);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->dy_unaccel);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->origin);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_seat_evt_relative_motion_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_seat_evt_relative_motion_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SEAT_EVT_RELATIVE_MOTION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    uint32_t dx_raw;
+    vitrin_decode_status_t st_dx = vitrin_raw_read_u32(in, in_len, &pos, &dx_raw);
+    if (st_dx != VITRIN_DECODE_OK) { return st_dx; }
+    out->dx = (vitrin_fixed_t)dx_raw;
+    uint32_t dy_raw;
+    vitrin_decode_status_t st_dy = vitrin_raw_read_u32(in, in_len, &pos, &dy_raw);
+    if (st_dy != VITRIN_DECODE_OK) { return st_dy; }
+    out->dy = (vitrin_fixed_t)dy_raw;
+    uint32_t dx_unaccel_raw;
+    vitrin_decode_status_t st_dx_unaccel = vitrin_raw_read_u32(in, in_len, &pos, &dx_unaccel_raw);
+    if (st_dx_unaccel != VITRIN_DECODE_OK) { return st_dx_unaccel; }
+    out->dx_unaccel = (vitrin_fixed_t)dx_unaccel_raw;
+    uint32_t dy_unaccel_raw;
+    vitrin_decode_status_t st_dy_unaccel = vitrin_raw_read_u32(in, in_len, &pos, &dy_unaccel_raw);
+    if (st_dy_unaccel != VITRIN_DECODE_OK) { return st_dy_unaccel; }
+    out->dy_unaccel = (vitrin_fixed_t)dy_unaccel_raw;
+    uint32_t origin_raw;
+    vitrin_decode_status_t st_origin = vitrin_raw_read_u32(in, in_len, &pos, &origin_raw);
+    if (st_origin != VITRIN_DECODE_OK) { return st_origin; }
+    if (!vitrin_shim_seat_origin_is_valid(origin_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->origin = (vitrin_shim_seat_origin_t)origin_raw;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `gesture_begin` (opcode 6) on `vitrin_shim_seat`.
+ *
+ * a multi-finger gesture began
+ */
+typedef struct {
+    /* which gesture began */
+    vitrin_shim_seat_gesture_kind_t kind;
+    /* finger count, fixed for this gesture's life */
+    uint32_t fingers;
+    /* who caused this event */
+    vitrin_shim_seat_origin_t origin;
+} vitrin_shim_seat_evt_gesture_begin_t;
+
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_OPCODE ((uint8_t)6)
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_seat_evt_gesture_begin_encode(const vitrin_shim_seat_evt_gesture_begin_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->kind);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, msg->fingers);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->origin);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_seat_evt_gesture_begin_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_seat_evt_gesture_begin_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SEAT_EVT_GESTURE_BEGIN_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    uint32_t kind_raw;
+    vitrin_decode_status_t st_kind = vitrin_raw_read_u32(in, in_len, &pos, &kind_raw);
+    if (st_kind != VITRIN_DECODE_OK) { return st_kind; }
+    if (!vitrin_shim_seat_gesture_kind_is_valid(kind_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->kind = (vitrin_shim_seat_gesture_kind_t)kind_raw;
+    vitrin_decode_status_t st_fingers = vitrin_raw_read_u32(in, in_len, &pos, &out->fingers);
+    if (st_fingers != VITRIN_DECODE_OK) { return st_fingers; }
+    uint32_t origin_raw;
+    vitrin_decode_status_t st_origin = vitrin_raw_read_u32(in, in_len, &pos, &origin_raw);
+    if (st_origin != VITRIN_DECODE_OK) { return st_origin; }
+    if (!vitrin_shim_seat_origin_is_valid(origin_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->origin = (vitrin_shim_seat_origin_t)origin_raw;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `gesture_swipe_update` (opcode 7) on `vitrin_shim_seat`.
+ *
+ * an in-flight swipe moved
+ */
+typedef struct {
+    /* delta x since this gesture's previous event, realm-view pixels */
+    vitrin_fixed_t dx;
+    /* delta y since this gesture's previous event, realm-view pixels */
+    vitrin_fixed_t dy;
+    /* who caused this event */
+    vitrin_shim_seat_origin_t origin;
+} vitrin_shim_seat_evt_gesture_swipe_update_t;
+
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_OPCODE ((uint8_t)7)
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_seat_evt_gesture_swipe_update_encode(const vitrin_shim_seat_evt_gesture_swipe_update_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->dx);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->dy);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->origin);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_seat_evt_gesture_swipe_update_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_seat_evt_gesture_swipe_update_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SEAT_EVT_GESTURE_SWIPE_UPDATE_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    uint32_t dx_raw;
+    vitrin_decode_status_t st_dx = vitrin_raw_read_u32(in, in_len, &pos, &dx_raw);
+    if (st_dx != VITRIN_DECODE_OK) { return st_dx; }
+    out->dx = (vitrin_fixed_t)dx_raw;
+    uint32_t dy_raw;
+    vitrin_decode_status_t st_dy = vitrin_raw_read_u32(in, in_len, &pos, &dy_raw);
+    if (st_dy != VITRIN_DECODE_OK) { return st_dy; }
+    out->dy = (vitrin_fixed_t)dy_raw;
+    uint32_t origin_raw;
+    vitrin_decode_status_t st_origin = vitrin_raw_read_u32(in, in_len, &pos, &origin_raw);
+    if (st_origin != VITRIN_DECODE_OK) { return st_origin; }
+    if (!vitrin_shim_seat_origin_is_valid(origin_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->origin = (vitrin_shim_seat_origin_t)origin_raw;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `gesture_pinch_update` (opcode 8) on `vitrin_shim_seat`.
+ *
+ * an in-flight pinch moved, scaled or rotated
+ */
+typedef struct {
+    /* centre delta x since this gesture's previous event, realm-view pixels */
+    vitrin_fixed_t dx;
+    /* centre delta y since this gesture's previous event, realm-view pixels */
+    vitrin_fixed_t dy;
+    /* scale relative to this gesture's begin, 1.0 at the begin */
+    vitrin_fixed_t scale;
+    /* degrees turned since this gesture's previous event, positive clockwise */
+    vitrin_fixed_t rotation;
+    /* who caused this event */
+    vitrin_shim_seat_origin_t origin;
+} vitrin_shim_seat_evt_gesture_pinch_update_t;
+
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_OPCODE ((uint8_t)8)
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_seat_evt_gesture_pinch_update_encode(const vitrin_shim_seat_evt_gesture_pinch_update_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->dx);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->dy);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->scale);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->rotation);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->origin);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_seat_evt_gesture_pinch_update_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_seat_evt_gesture_pinch_update_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SEAT_EVT_GESTURE_PINCH_UPDATE_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    uint32_t dx_raw;
+    vitrin_decode_status_t st_dx = vitrin_raw_read_u32(in, in_len, &pos, &dx_raw);
+    if (st_dx != VITRIN_DECODE_OK) { return st_dx; }
+    out->dx = (vitrin_fixed_t)dx_raw;
+    uint32_t dy_raw;
+    vitrin_decode_status_t st_dy = vitrin_raw_read_u32(in, in_len, &pos, &dy_raw);
+    if (st_dy != VITRIN_DECODE_OK) { return st_dy; }
+    out->dy = (vitrin_fixed_t)dy_raw;
+    uint32_t scale_raw;
+    vitrin_decode_status_t st_scale = vitrin_raw_read_u32(in, in_len, &pos, &scale_raw);
+    if (st_scale != VITRIN_DECODE_OK) { return st_scale; }
+    out->scale = (vitrin_fixed_t)scale_raw;
+    uint32_t rotation_raw;
+    vitrin_decode_status_t st_rotation = vitrin_raw_read_u32(in, in_len, &pos, &rotation_raw);
+    if (st_rotation != VITRIN_DECODE_OK) { return st_rotation; }
+    out->rotation = (vitrin_fixed_t)rotation_raw;
+    uint32_t origin_raw;
+    vitrin_decode_status_t st_origin = vitrin_raw_read_u32(in, in_len, &pos, &origin_raw);
+    if (st_origin != VITRIN_DECODE_OK) { return st_origin; }
+    if (!vitrin_shim_seat_origin_is_valid(origin_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->origin = (vitrin_shim_seat_origin_t)origin_raw;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `gesture_end` (opcode 9) on `vitrin_shim_seat`.
+ *
+ * a multi-finger gesture ended
+ */
+typedef struct {
+    /* which gesture ended; repeats the in-flight kind */
+    vitrin_shim_seat_gesture_kind_t kind;
+    /* whether the human completed the gesture */
+    vitrin_shim_seat_gesture_state_t state;
+    /* who caused this event */
+    vitrin_shim_seat_origin_t origin;
+} vitrin_shim_seat_evt_gesture_end_t;
+
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE ((uint8_t)9)
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_END_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SEAT_EVT_GESTURE_END_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_seat_evt_gesture_end_encode(const vitrin_shim_seat_evt_gesture_end_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SEAT_EVT_GESTURE_END_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->kind);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->state);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->origin);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_seat_evt_gesture_end_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_seat_evt_gesture_end_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SEAT_EVT_GESTURE_END_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SEAT_EVT_GESTURE_END_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    uint32_t kind_raw;
+    vitrin_decode_status_t st_kind = vitrin_raw_read_u32(in, in_len, &pos, &kind_raw);
+    if (st_kind != VITRIN_DECODE_OK) { return st_kind; }
+    if (!vitrin_shim_seat_gesture_kind_is_valid(kind_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->kind = (vitrin_shim_seat_gesture_kind_t)kind_raw;
+    uint32_t state_raw;
+    vitrin_decode_status_t st_state = vitrin_raw_read_u32(in, in_len, &pos, &state_raw);
+    if (st_state != VITRIN_DECODE_OK) { return st_state; }
+    if (!vitrin_shim_seat_gesture_state_is_valid(state_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->state = (vitrin_shim_seat_gesture_state_t)state_raw;
     uint32_t origin_raw;
     vitrin_decode_status_t st_origin = vitrin_raw_read_u32(in, in_len, &pos, &origin_raw);
     if (st_origin != VITRIN_DECODE_OK) { return st_origin; }

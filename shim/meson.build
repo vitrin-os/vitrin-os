@@ -209,6 +209,33 @@ if probe_missing.length() > 0
     ' check (D) will fail its EXPECT_CATALOGUE assertion')
 endif
 
+# --- WS-E.4.2: the one probe interface that became real ------------------
+# `wlr_pointer_constraints_v1.h` includes the CANONICALLY named generated
+# header ("pointer-constraints-unstable-v1-protocol.h") for
+# `enum zwp_pointer_constraints_v1_lifetime`, so src/constraint.c cannot
+# compile without it. The probe loop above emits the same XML under a
+# `probe-` prefixed name (Meson requires distinct output filenames), which
+# wlroots' `#include` cannot find.
+#
+# SERVER HEADER ONLY, deliberately: the marshalling tables for this interface
+# are already compiled and linked from `probe-zwp_pointer_constraints_v1-
+# protocol.c` above, and a second `private-code` for the same XML would be a
+# duplicate definition of `zwp_pointer_constraints_v1_interface` at link time.
+# wayland-scanner derives a header's include guard from the protocol name, so
+# both headers carry the SAME guard and including both is a no-op.
+#
+# The row stays in `probe_protocols` even though the interface is now in the
+# v0 contract, exactly as `zwp_relative_pointer_manager_v1` and
+# `zwp_pointer_gestures_v1` do: `ledger.c`'s `in_v0_contract` is what declines
+# to arm a probe for it at runtime (never shadowing a real global with an
+# inert one), and the catalogue size is a number a bring-up run asserts.
+protocol_headers += custom_target(
+  'pointer-constraints-server-header',
+  input: wl_protocol_dir / 'unstable/pointer-constraints/pointer-constraints-unstable-v1.xml',
+  output: 'pointer-constraints-unstable-v1-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+
 probe_catalogue_h = configure_file(
   output: 'probe-catalogue.h',
   configuration: {
@@ -250,6 +277,7 @@ shim_exe = executable(
     'src/xdg.c',
     'src/seat.c',
     'src/clipboard.c',
+    'src/constraint.c',
     'src/wire.c',
     'src/upstream.c',
     'src/ledger.c',
@@ -306,6 +334,7 @@ if wlcs_opt.enabled() or (wlcs_opt.auto() and wlcs_dep.found())
       'src/xdg.c',
       'src/seat.c',
       'src/clipboard.c',
+      'src/constraint.c',
       'src/wire.c',
       'src/upstream.c',
       'src/ledger.c',

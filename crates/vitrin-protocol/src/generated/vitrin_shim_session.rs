@@ -317,6 +317,146 @@ pub mod requests {
             ))
         }
     }
+
+    /// Request `pointer_constraint` (opcode 3) on `vitrin_shim_session`.
+    ///
+    /// ask the core to lock or confine the pointer to a surface
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PointerConstraint {
+        /// shim-minted; names the answer this ask expects
+        pub serial: u32,
+        /// the surface the constraint applies to; MUST be null when kind is none (object: vitrin_shim_surface)
+        pub surface: Option<u32>,
+        /// lock, confine, or none to withdraw
+        pub kind: crate::generated::vitrin_shim_session::PointerConstraintKind,
+        /// oneshot or persistent; ignored when kind is none
+        pub lifetime: crate::generated::vitrin_shim_session::PointerConstraintLifetime,
+        /// region origin x, surface-local pixels
+        pub x: i32,
+        /// region origin y, surface-local pixels
+        pub y: i32,
+        /// region width; zero with height zero means the whole surface
+        pub width: u32,
+        /// region height; zero with width zero means the whole surface
+        pub height: u32,
+    }
+
+    impl PointerConstraint {
+        pub const OPCODE: u8 = 3;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_uint(&mut out, self.serial);
+            crate::wire::write_uint(&mut out, self.surface.unwrap_or(0));
+            crate::wire::write_uint(&mut out, self.kind.to_wire());
+            crate::wire::write_uint(&mut out, self.lifetime.to_wire());
+            crate::wire::write_int(&mut out, self.x);
+            crate::wire::write_int(&mut out, self.y);
+            crate::wire::write_uint(&mut out, self.width);
+            crate::wire::write_uint(&mut out, self.height);
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let serial = crate::wire::read_uint(bytes, &mut pos)?;
+            let surface = crate::wire::read_uint(bytes, &mut pos)?;
+            let surface = if surface == 0 { None } else { Some(surface) };
+            let kind = crate::generated::vitrin_shim_session::PointerConstraintKind::from_wire(
+                crate::wire::read_uint(bytes, &mut pos)?,
+            )?;
+            let lifetime =
+                crate::generated::vitrin_shim_session::PointerConstraintLifetime::from_wire(
+                    crate::wire::read_uint(bytes, &mut pos)?,
+                )?;
+            let x = crate::wire::read_int(bytes, &mut pos)?;
+            let y = crate::wire::read_int(bytes, &mut pos)?;
+            let width = crate::wire::read_uint(bytes, &mut pos)?;
+            let height = crate::wire::read_uint(bytes, &mut pos)?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((
+                header.object_id,
+                PointerConstraint {
+                    serial,
+                    surface,
+                    kind,
+                    lifetime,
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+            ))
+        }
+    }
 }
 
 pub mod events {
@@ -621,6 +761,106 @@ pub mod events {
             Ok((header.object_id, OfferSelection { mime, data }))
         }
     }
+
+    /// Event `pointer_constraint_state` (opcode 3) on `vitrin_shim_session`.
+    ///
+    /// the core's verdict on a pointer_constraint, and its running state
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PointerConstraintState {
+        /// the serial of the pointer_constraint ask this concerns
+        pub serial: u32,
+        /// what the core did with that ask, and what is in force now
+        pub state: crate::generated::vitrin_shim_session::PointerConstraintStatus,
+    }
+
+    impl PointerConstraintState {
+        pub const OPCODE: u8 = 3;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_uint(&mut out, self.serial);
+            crate::wire::write_uint(&mut out, self.state.to_wire());
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let serial = crate::wire::read_uint(bytes, &mut pos)?;
+            let state = crate::generated::vitrin_shim_session::PointerConstraintStatus::from_wire(
+                crate::wire::read_uint(bytes, &mut pos)?,
+            )?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((header.object_id, PointerConstraintState { serial, state }))
+        }
+    }
 }
 
 /// Enum `selection_status` on `vitrin_shim_session`.
@@ -662,6 +902,148 @@ impl SelectionStatus {
             _ => Err(crate::error::DecodeError::InvalidEnumValue {
                 interface: "vitrin_shim_session",
                 enum_name: "selection_status",
+                value,
+            }),
+        }
+    }
+
+    /// The wire value for this entry.
+    pub fn to_wire(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Enum `pointer_constraint_kind` on `vitrin_shim_session`.
+///
+/// what a pointer_constraint asks for, including nothing
+///
+/// Plain enum: a wire value MUST exactly equal one defined entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum PointerConstraintKind {
+    /// withdraw this connection's constraint; surface MUST be null
+    None = 0,
+    /// pin the pointer; movement reaches the app as relative_motion only
+    Lock = 1,
+    /// keep the pointer inside the region; absolute motion continues within it
+    Confine = 2,
+}
+
+impl PointerConstraintKind {
+    /// Every defined entry, in document order. Lets generic code (property
+    /// tests, a future C backend) enumerate valid values without hardcoding
+    /// them, so an appended entry can never be silently missed.
+    pub const ALL: &'static [PointerConstraintKind] = &[
+        PointerConstraintKind::None,
+        PointerConstraintKind::Lock,
+        PointerConstraintKind::Confine,
+    ];
+
+    /// Decode a wire value, by whole-value membership in the defined entries.
+    pub fn from_wire(value: u32) -> Result<Self, crate::error::DecodeError> {
+        match value {
+            0 => Ok(PointerConstraintKind::None),
+            1 => Ok(PointerConstraintKind::Lock),
+            2 => Ok(PointerConstraintKind::Confine),
+            _ => Err(crate::error::DecodeError::InvalidEnumValue {
+                interface: "vitrin_shim_session",
+                enum_name: "pointer_constraint_kind",
+                value,
+            }),
+        }
+    }
+
+    /// The wire value for this entry.
+    pub fn to_wire(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Enum `pointer_constraint_lifetime` on `vitrin_shim_session`.
+///
+/// whether a constraint survives its own deactivation
+///
+/// Plain enum: a wire value MUST exactly equal one defined entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum PointerConstraintLifetime {
+    /// ends for good at its first deactivation
+    Oneshot = 0,
+    /// may deactivate and reactivate with no new ask
+    Persistent = 1,
+}
+
+impl PointerConstraintLifetime {
+    /// Every defined entry, in document order. Lets generic code (property
+    /// tests, a future C backend) enumerate valid values without hardcoding
+    /// them, so an appended entry can never be silently missed.
+    pub const ALL: &'static [PointerConstraintLifetime] = &[
+        PointerConstraintLifetime::Oneshot,
+        PointerConstraintLifetime::Persistent,
+    ];
+
+    /// Decode a wire value, by whole-value membership in the defined entries.
+    pub fn from_wire(value: u32) -> Result<Self, crate::error::DecodeError> {
+        match value {
+            0 => Ok(PointerConstraintLifetime::Oneshot),
+            1 => Ok(PointerConstraintLifetime::Persistent),
+            _ => Err(crate::error::DecodeError::InvalidEnumValue {
+                interface: "vitrin_shim_session",
+                enum_name: "pointer_constraint_lifetime",
+                value,
+            }),
+        }
+    }
+
+    /// The wire value for this entry.
+    pub fn to_wire(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Enum `pointer_constraint_status` on `vitrin_shim_session`.
+///
+/// what the core did with a pointer_constraint, and what is in force
+///
+/// Plain enum: a wire value MUST exactly equal one defined entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum PointerConstraintStatus {
+    /// recorded but not in force; may become active later with no new ask
+    Inactive = 0,
+    /// in force: absolute motion stops, relative_motion continues, the core hides its own cursor sprite
+    Active = 1,
+    /// the record is gone: the shim withdrew it, or what it named went away
+    Withdrawn = 2,
+    /// not recorded at all; the app's object stays inert and this serial is not re-asked
+    Refused = 3,
+    /// a later ask on this connection replaced it; this serial gets nothing further
+    Superseded = 4,
+}
+
+impl PointerConstraintStatus {
+    /// Every defined entry, in document order. Lets generic code (property
+    /// tests, a future C backend) enumerate valid values without hardcoding
+    /// them, so an appended entry can never be silently missed.
+    pub const ALL: &'static [PointerConstraintStatus] = &[
+        PointerConstraintStatus::Inactive,
+        PointerConstraintStatus::Active,
+        PointerConstraintStatus::Withdrawn,
+        PointerConstraintStatus::Refused,
+        PointerConstraintStatus::Superseded,
+    ];
+
+    /// Decode a wire value, by whole-value membership in the defined entries.
+    pub fn from_wire(value: u32) -> Result<Self, crate::error::DecodeError> {
+        match value {
+            0 => Ok(PointerConstraintStatus::Inactive),
+            1 => Ok(PointerConstraintStatus::Active),
+            2 => Ok(PointerConstraintStatus::Withdrawn),
+            3 => Ok(PointerConstraintStatus::Refused),
+            4 => Ok(PointerConstraintStatus::Superseded),
+            _ => Err(crate::error::DecodeError::InvalidEnumValue {
+                interface: "vitrin_shim_session",
+                enum_name: "pointer_constraint_status",
                 value,
             }),
         }

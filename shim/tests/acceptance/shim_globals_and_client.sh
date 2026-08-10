@@ -44,10 +44,12 @@ WANT_DMABUF="${WANT_DMABUF:-0}"
 # Expected registry, one interface per line, sorted. wl_shm/wl_output are
 # created by the shim just like the rest; dmabuf is opt-in.
 #
-# TWO ENTRIES HERE WERE ADDED EMPIRICALLY, and each traces to a named failure
-# rather than to a guess -- the "contract, not a floor" rule (plan E6/R2) cuts
-# both ways, so an addition has to be argued and this list is where the
-# argument is enforced.
+# FIVE ENTRIES HERE WERE ADDED EMPIRICALLY, and each traces to a named failure
+# or a named demand line rather than to a guess -- the "contract, not a floor"
+# rule (plan E6/R2) cuts both ways, so an addition has to be argued and this
+# list is where the argument is enforced. THIS SCRIPT IS THE ENFORCEMENT: a
+# global created in src/globals.c and not added here fails right below, which
+# is what happened when WS-E.4.2 landed its first two.
 #
 #   wl_data_device_manager (P1.6.3): GDK will not construct a seat without it
 #     (GTK 4 refuses the display outright, GTK 3 silently gets no keyboard),
@@ -60,11 +62,26 @@ WANT_DMABUF="${WANT_DMABUF:-0}"
 #     docs/globals-demand-wl_subcompositor-140.12.0esr.log (a PRE-addition run:
 #     the shipping shim arms no probe for an interface already in the set, so
 #     docs/globals-touched-firefox-140.12.0esr.log shows only a class=v0 bind).
+#   zwp_relative_pointer_manager_v1, zwp_pointer_gestures_v1 (WS-E.4.2, issue
+#     #222): protocol version 2 grew `relative_motion` and the four gesture
+#     events, and neither has any other way to reach an app -- `wl_pointer.motion`
+#     carries a destination, and a pinch has no expression in core wl_pointer
+#     at all. Evidence: docs/globals-touched-firefox-140.12.0esr.log:154, and
+#     :99 + :156.
+#   zwp_pointer_constraints_v1 (WS-E.4.2, same issue, second half): a pointer
+#     lock or confinement, which -- unlike the two above -- is an ASK rather
+#     than a class, so it could not be served until the wire grew the
+#     request/verdict pair (`vitrin_shim_session.pointer_constraint` and
+#     `pointer_constraint_state`) for the core to answer it with. Evidence:
+#     the same log at :152. See include/constraint.h.
 #
-# Both are app-internal by construction -- one client per shim means both ends
-# of any transfer, and both ends of any subsurface relation, are the same app.
-# See the arguments at their constructors in src/globals.c.
-expected=(wl_compositor wl_subcompositor wl_shm wl_seat wl_output xdg_wm_base wl_data_device_manager zxdg_decoration_manager_v1)
+# The first two are app-internal by construction -- one client per shim means
+# both ends of any transfer, and both ends of any subsurface relation, are the
+# same app. The three pointer interfaces extend THIS seat's own wl_pointer and
+# share its focus, so they reach the same single client the pointer already
+# reaches; the constraints one additionally asks the core for something, and
+# the core decides. See the arguments at their constructors in src/globals.c.
+expected=(wl_compositor wl_subcompositor wl_shm wl_seat wl_output xdg_wm_base wl_data_device_manager zxdg_decoration_manager_v1 zwp_relative_pointer_manager_v1 zwp_pointer_gestures_v1 zwp_pointer_constraints_v1)
 if [[ "$WANT_DMABUF" == "1" ]]; then
 	expected+=(zwp_linux_dmabuf_v1)
 fi

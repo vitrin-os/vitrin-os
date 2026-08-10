@@ -281,15 +281,41 @@
 
 use smithay::backend::input as host;
 use smithay::backend::input::{
-    AbsolutePositionEvent, InputBackend, InputEvent, KeyboardKeyEvent, PointerAxisEvent,
-    PointerButtonEvent,
+    AbsolutePositionEvent, GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent,
+    GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyboardKeyEvent, PointerAxisEvent,
+    PointerButtonEvent, PointerMotionEvent,
 };
 use vitrin_protocol::generated::vitrin_actuator_pointer::{Axis, ButtonState};
 use vitrin_protocol::generated::vitrin_shim_seat as seat;
-use vitrin_protocol::generated::vitrin_shim_seat::{KeyState, Origin};
+use vitrin_protocol::generated::vitrin_shim_seat::{GestureKind, GestureState, KeyState, Origin};
 use vitrin_protocol::Fixed;
 
 use crate::scene::layout;
+
+/// **Pointer constraints** (WS-E.4.2, issue #222): the record a shim's
+/// `pointer_constraint` ask makes, the derived state its `pointer_constraint_state`
+/// reports, and the one predicate that decides whether the core hides its own
+/// human cursor sprite.
+///
+/// A submodule of this one rather than a sibling of it, because the constraint
+/// table lives inside [`InputRouter`] and is reachable only through
+/// [`InputRouter::constraints`] — the same discipline [`InputRouter::presence`]
+/// follows, and for the same reason: a backend composing against a table its
+/// own router does not write would be a sprite decided from stale state.
+pub(crate) mod constraint;
+
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        unused_imports,
+        reason = "`hides_human_sprite`'s one production caller is the bare-metal composite, \
+                  which is behind `drm-backend`"
+    )
+)]
+pub(crate) use constraint::{
+    hides_human_sprite, OutputGates, PointerConstraintAsk, PointerConstraintTable,
+    PresentationGates, Region as ConstraintRegion, Verdict as ConstraintVerdict,
+};
 
 /// xkb keycodes are evdev scancodes offset by 8 (the historical X11
 /// convention); Smithay's `KeyboardKeyEvent::key_code` is in the xkb
@@ -424,6 +450,68 @@ pub(crate) enum SeatInputKind {
     /// Runtime-reachable since the M1.1 wiring: an agent's `actuate.text`
     /// reaches `session::route_seat` and the shim's virtual seat.
     Text { text: String },
+
+    /// Pointer motion as a **delta**, in view pixels — the class every
+    /// pointing device on a bare-metal seat actually produces (WS-E.4.2,
+    /// issue #222).
+    ///
+    /// It **accompanies** [`Self::Motion`] rather than replacing it (IDL
+    /// `vitrin_shim_seat.relative_motion`): one physical movement mints both,
+    /// because an app binds whichever of the two it understands. The absolute
+    /// twin is minted by the backend that owns the accumulated position
+    /// ([`crate::backend::drm`]'s `accumulate_pointer`); this half is what
+    /// [`intake_physical`] translates, since a delta needs no position to
+    /// interpret.
+    ///
+    /// Both deltas travel because `zwp_relative_pointer_v1` defines both and
+    /// libinput supplies both: `dx`/`dy` are the movement after pointer
+    /// acceleration (it agrees with where the pointer visibly went),
+    /// `dx_unaccel`/`dy_unaccel` the same movement before it (what a camera
+    /// control or a drawing tool wants). Carrying one alone would force the
+    /// shim to copy it into a field it would then be lying about.
+    RelativeMotion {
+        dx: f64,
+        dy: f64,
+        dx_unaccel: f64,
+        dy_unaccel: f64,
+    },
+    /// A multi-finger touchpad gesture began. Swipe and pinch share this
+    /// event and share [`Self::GestureEnd`], because their begin and end
+    /// signatures are identical in the pointer-gesture vocabulary these
+    /// serve; `kind` says which.
+    ///
+    /// `fingers` is fixed for the gesture's life — a gesture that gains or
+    /// loses a finger ends and a new one begins, which is libinput's own
+    /// behaviour and the IDL's rule.
+    GestureBegin { kind: GestureKind, fingers: u32 },
+    /// How far the finger group moved since this gesture's previous event,
+    /// in view pixels. A delta, never a position and never cumulative.
+    GestureSwipeUpdate { dx: f64, dy: f64 },
+    /// A pinch's motion. **The four quantities do not share a reference
+    /// point** and the IDL spells the asymmetry out because reading one as
+    /// another is undetectable app-side: `dx`/`dy` and `rotation` (degrees,
+    /// positive clockwise) are deltas since this gesture's previous event,
+    /// while `scale` is absolute — relative to this gesture's own begin,
+    /// 1.0 at the begin. Multiplying successive `scale`s into a running
+    /// product zooms toward zero.
+    GesturePinchUpdate {
+        dx: f64,
+        dy: f64,
+        scale: f64,
+        rotation: f64,
+    },
+    /// The gesture in flight ended. `state` distinguishes the two ways it
+    /// can stop, and that is what lets an app commit rather than guess: a
+    /// completed pinch keeps its zoom, a cancelled one puts it back.
+    ///
+    /// `kind` is what *intake* believes ended. The router answers with the
+    /// kind **it** has in flight (see [`RealmSeat::gesture`]), so a
+    /// disagreement is a logged, detectable bug rather than a silent
+    /// mis-replay.
+    GestureEnd {
+        kind: GestureKind,
+        state: GestureState,
+    },
 }
 
 /// One input event at intake: origin bound at construction (B2), view
@@ -498,11 +586,51 @@ pub(crate) struct SeatDelivery {
 /// The wire-shaped payload of a [`SeatDelivery`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SeatDeliveryKind {
-    Motion { x: Fixed, y: Fixed },
-    Button { button: u32, state: ButtonState },
-    Scroll { axis: Axis, value120: i32 },
-    Key { keysym: u32, state: KeyState },
-    Text { text: String },
+    Motion {
+        x: Fixed,
+        y: Fixed,
+    },
+    Button {
+        button: u32,
+        state: ButtonState,
+    },
+    Scroll {
+        axis: Axis,
+        value120: i32,
+    },
+    Key {
+        keysym: u32,
+        state: KeyState,
+    },
+    Text {
+        text: String,
+    },
+    /// The wire twin of [`SeatInputKind::RelativeMotion`], widened to 24.8
+    /// fixed-point for [`Self::Motion`]'s sub-pixel reason.
+    RelativeMotion {
+        dx: Fixed,
+        dy: Fixed,
+        dx_unaccel: Fixed,
+        dy_unaccel: Fixed,
+    },
+    GestureBegin {
+        kind: GestureKind,
+        fingers: u32,
+    },
+    GestureSwipeUpdate {
+        dx: Fixed,
+        dy: Fixed,
+    },
+    GesturePinchUpdate {
+        dx: Fixed,
+        dy: Fixed,
+        scale: Fixed,
+        rotation: Fixed,
+    },
+    GestureEnd {
+        kind: GestureKind,
+        state: GestureState,
+    },
 }
 
 impl SeatDelivery {
@@ -519,9 +647,14 @@ impl SeatDelivery {
     }
 
     /// The seat event kind as the stable label the flight recorder writes
-    /// ([`crate::recorder::Event::SeatDelivered`]): `motion`/`button`/
-    /// `scroll`/`key`/`text`. Shape only, deliberately no payload -- an audit
-    /// entry carrying keysyms or typed bytes would be a keylogger.
+    /// ([`crate::recorder::Event::SeatDelivered`]): the IDL's own event name,
+    /// one per [`SeatDeliveryKind`] variant. Shape only, deliberately no
+    /// payload -- an audit entry carrying keysyms or typed bytes would be a
+    /// keylogger, and one carrying gesture deltas would be a coarse one.
+    ///
+    /// Exhaustive with no catch-all, deliberately: a new delivery kind that
+    /// forgot its label would otherwise be journaled as an existing one, and
+    /// the recorder is the only record of what the core sent.
     pub fn event_label(&self) -> &'static str {
         match &self.kind {
             SeatDeliveryKind::Motion { .. } => "motion",
@@ -529,6 +662,11 @@ impl SeatDelivery {
             SeatDeliveryKind::Scroll { .. } => "scroll",
             SeatDeliveryKind::Key { .. } => "key",
             SeatDeliveryKind::Text { .. } => "text",
+            SeatDeliveryKind::RelativeMotion { .. } => "relative_motion",
+            SeatDeliveryKind::GestureBegin { .. } => "gesture_begin",
+            SeatDeliveryKind::GestureSwipeUpdate { .. } => "gesture_swipe_update",
+            SeatDeliveryKind::GesturePinchUpdate { .. } => "gesture_pinch_update",
+            SeatDeliveryKind::GestureEnd { .. } => "gesture_end",
         }
     }
 
@@ -579,6 +717,50 @@ impl SeatDelivery {
                 origin: self.origin,
             }
             .encode(seat_object_id),
+            SeatDeliveryKind::RelativeMotion {
+                dx,
+                dy,
+                dx_unaccel,
+                dy_unaccel,
+            } => seat::events::RelativeMotion {
+                dx: *dx,
+                dy: *dy,
+                dx_unaccel: *dx_unaccel,
+                dy_unaccel: *dy_unaccel,
+                origin: self.origin,
+            }
+            .encode(seat_object_id),
+            SeatDeliveryKind::GestureBegin { kind, fingers } => seat::events::GestureBegin {
+                kind: *kind,
+                fingers: *fingers,
+                origin: self.origin,
+            }
+            .encode(seat_object_id),
+            SeatDeliveryKind::GestureSwipeUpdate { dx, dy } => seat::events::GestureSwipeUpdate {
+                dx: *dx,
+                dy: *dy,
+                origin: self.origin,
+            }
+            .encode(seat_object_id),
+            SeatDeliveryKind::GesturePinchUpdate {
+                dx,
+                dy,
+                scale,
+                rotation,
+            } => seat::events::GesturePinchUpdate {
+                dx: *dx,
+                dy: *dy,
+                scale: *scale,
+                rotation: *rotation,
+                origin: self.origin,
+            }
+            .encode(seat_object_id),
+            SeatDeliveryKind::GestureEnd { kind, state } => seat::events::GestureEnd {
+                kind: *kind,
+                state: *state,
+                origin: self.origin,
+            }
+            .encode(seat_object_id),
         }
     }
 }
@@ -616,12 +798,26 @@ pub(crate) fn origin_label(origin: Origin) -> &'static str {
 /// own bounded-write discipline while adding no auditable fact the surrounding
 /// button/scroll/key/text lines do not. The physical-vs-emulated distinction
 /// B2 exists for is carried in full by those discrete events.
+///
+/// **`relative_motion` and the two gesture updates join it** (WS-E.4.2), for
+/// exactly that reason and no other: all three arrive at raw device rate, and
+/// `relative_motion` arrives *beside* the very motion already excluded, so
+/// journaling it would flood the recorder at double the rate the argument
+/// above rejects. `gesture_begin` and `gesture_end` are journaled — they are
+/// discrete, bounded by the human's fingers, and they are the pair whose
+/// balance an audit can actually check.
 pub(crate) fn record_seat_delivery(
     recorder: &mut crate::recorder::Recorder,
     realm: &crate::grants::RealmId,
     delivery: &SeatDelivery,
 ) {
-    if matches!(delivery.kind(), SeatDeliveryKind::Motion { .. }) {
+    if matches!(
+        delivery.kind(),
+        SeatDeliveryKind::Motion { .. }
+            | SeatDeliveryKind::RelativeMotion { .. }
+            | SeatDeliveryKind::GestureSwipeUpdate { .. }
+            | SeatDeliveryKind::GesturePinchUpdate { .. }
+    ) {
         return;
     }
     recorder.record(crate::recorder::Event::SeatDelivered {
@@ -647,6 +843,16 @@ pub(crate) enum Gate {
     /// and per-keysym pairing already drops unpaired ones, so answering
     /// [`Gate::Deliver`] for a release can never leak input the app should
     /// not see.
+    ///
+    /// **A consumed [`SeatInputKind::GestureEnd`] is reconciled the same
+    /// way** (WS-E.4.2): the router forgets the gesture it had in flight,
+    /// nothing goes on the wire, and the app is left accumulating the
+    /// gesture — the latched-modifier failure in a new shape, and the gate
+    /// implementor's debt exactly as a consumed release is. It is stated
+    /// here rather than left implicit because a gesture has no second chance:
+    /// once the router has forgotten it, no later drain can pay it down. Do
+    /// not consume a `gesture_end` whose begin the router delivered; see the
+    /// pairing contract on [`PreemptionHook`].
     Consume,
 }
 
@@ -682,6 +888,21 @@ pub(crate) enum Gate {
 /// unconditionally, so the pair is atomic by construction rather than by a
 /// classification). The rule above is otherwise absolute: a gate must not
 /// consume a release whose press the *router* delivered.
+///
+/// **[`SeatInputKind::GestureEnd`] is a release for this purpose**
+/// (WS-E.4.2, issue #222), and the rule is word for word the same. A gate
+/// that begins consuming mid-gesture — a consent prompt raised while a human
+/// is pinching, a lock — should keep answering [`Gate::Deliver`] for
+/// `gesture_end`, for the reason it already gives for releases: the router
+/// delivers an end **iff** it delivered that gesture's own begin, so a
+/// blanket-delivered end can never leak input the app should not see. A gate
+/// that consumes one instead does not wedge the router (the in-flight record
+/// is cleared; see [`Gate::Consume`]) but leaves the app accumulating a
+/// gesture with no end ever coming — the same failure a latched modifier is,
+/// and one no later drain can repair, because the router has already
+/// forgotten there was a gesture. `gesture_begin` and the two updates are
+/// ordinary consumable input: a consumed begin starts nothing, so its updates
+/// and its end are dropped by the router's own pairing.
 ///
 /// # Session-wide by construction: **no** hook is ever told a realm
 ///
@@ -1185,6 +1406,20 @@ pub(crate) struct RealmSeat {
     /// Updated at intake (a physical fact), even for events the gate
     /// consumes, so a released grab never hit-tests a stale position.
     pointer: Option<(f64, f64)>,
+    /// Last known **physical** pointer position, in view coordinates — the
+    /// position a pointer constraint is judged against (WS-E.4.2, issue #222).
+    ///
+    /// The exact mirror of [`Self::agent_pointer`], written by the other origin
+    /// and for the same reason read the other way round. [`Self::pointer`] takes
+    /// both origins, because the app has one pointer; judging a **human's**
+    /// cursor visibility against it would let an agent's actuation activate a
+    /// lock — and so hide the human's own sprite — by moving the shared position
+    /// onto the app's surface. `agent_pointer` exists to stop a sprite following
+    /// the human's mouse; this exists to stop a hide following the agent's.
+    ///
+    /// Updated at intake beside [`Self::pointer`], before gating, because where
+    /// a pointer *is* is a fact rather than a delivery outcome.
+    human_pointer: Option<(f64, f64)>,
     /// Last known **emulated** pointer position, in view coordinates — the
     /// position the agent cursor sprite is drawn at
     /// ([`crate::cursor::composite_agent_cursor`]).
@@ -1245,6 +1480,32 @@ pub(crate) struct RealmSeat {
     /// per-`(pairing, origin)`: the app has one keyboard, and its latch state
     /// counts presses, not who made them.
     pressed_keys: Vec<HeldKey>,
+    /// **The one gesture this realm's app was told had begun**, or `None`
+    /// (WS-E.4.2, issue #222). The gesture twin of [`Self::pressed`] and
+    /// [`Self::pressed_keys`], and the same razor: an update or an end is
+    /// delivered **iff** its own begin was.
+    ///
+    /// An `Option`, not a `Vec`, because the IDL pins at most one gesture in
+    /// flight per seat — a second `gesture_begin` while one is live is a core
+    /// bug, so the router drops and traces it rather than trusting libinput
+    /// not to produce one. Per realm like everything else here: a gesture
+    /// begun in realm A must not be endable by an event addressed to realm B.
+    ///
+    /// The tag rides along for [`Self::pressed`]'s reason — the drain
+    /// ([`InputRouter::end_physical_gesture`]) reads it back off the record
+    /// rather than minting one, and drains only what a human began.
+    gesture: Option<InFlightGesture>,
+}
+
+/// One delivered-and-unended gesture ([`RealmSeat::gesture`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InFlightGesture {
+    /// The kind the app was told began. The router answers a `gesture_end`
+    /// with **this** kind rather than the one intake claimed, so a
+    /// disagreement is a logged core bug instead of a silent mis-replay
+    /// (IDL `gesture_end`: "kind repeats the in-flight gesture's kind").
+    kind: GestureKind,
+    origin: Origin,
 }
 
 impl RealmSeat {
@@ -1404,13 +1665,24 @@ pub(crate) struct InputRouter<H: PreemptionHook> {
     /// against ([`crate::realm::MAX_REALMS`]); this changes that accounting by
     /// nothing measurable and is stated so nobody has to wonder.
     seats: std::collections::BTreeMap<crate::grants::RealmId, RealmSeat>,
+    /// **The session's pointer-constraint records** (WS-E.4.2, issue #222),
+    /// shared with the presentation side by an `Rc` clone.
+    ///
+    /// Held here rather than beside the router for the reason `presence` is:
+    /// the bare-metal composite has to *read* the same table this router writes
+    /// in order to decide whether to draw the human's cursor, and only the view
+    /// is reachable from the panel's own clock. A second table would be a
+    /// sprite decided from state nothing updates. [`Self::constraints`] is the
+    /// only way to obtain the handle, and `PointerConstraintTable::new` is
+    /// private to `crate::input`, so a backend cannot mint a rival one.
+    constraints: std::rc::Rc<std::cell::RefCell<PointerConstraintTable>>,
 }
 
-/// The three things [`InputRouter::route_into`] needs from `self` besides the
-/// seats: the session-wide policy stack, the per-realm presence map, and this
-/// turn's instant.
+/// The four things [`InputRouter::route_into`] needs from `self` besides the
+/// seats: the session-wide policy stack, the per-realm presence map, the
+/// per-realm constraint table, and this turn's instant.
 ///
-/// A struct rather than three parameters so the two addressing rules
+/// A struct rather than four parameters so the two addressing rules
 /// ([`InputRouter::route_physical`] and [`InputRouter::route_emulated`]) build
 /// it identically, and so a future field cannot be silently passed by only one
 /// of them. `now` is copied out of the cell here, once per event, because the
@@ -1419,6 +1691,7 @@ pub(crate) struct InputRouter<H: PreemptionHook> {
 struct Tap<'a, H: PreemptionHook> {
     hook: &'a mut H,
     presence: &'a std::rc::Rc<std::cell::RefCell<PhysicalPresenceMap>>,
+    constraints: &'a std::rc::Rc<std::cell::RefCell<PointerConstraintTable>>,
     now: std::time::Instant,
 }
 
@@ -1441,6 +1714,7 @@ impl<H: PreemptionHook> InputRouter<H> {
             now,
             bound: None,
             seats: std::collections::BTreeMap::new(),
+            constraints: std::rc::Rc::new(std::cell::RefCell::new(PointerConstraintTable::new())),
         }
     }
 
@@ -1449,6 +1723,19 @@ impl<H: PreemptionHook> InputRouter<H> {
     /// what makes "the kernel reads the map the router writes" structural.
     pub fn presence(&self) -> std::rc::Rc<std::cell::RefCell<PhysicalPresenceMap>> {
         std::rc::Rc::clone(&self.presence)
+    }
+
+    /// **The pointer-constraint table this router owns** (WS-E.4.2), for the
+    /// backend that composites the human's cursor to read once per frame.
+    ///
+    /// Minted by [`Self::new`] rather than taken as a parameter, unlike
+    /// `presence`, because the *only* other reader is the view the same
+    /// backend constructs a few lines later — and the structural guarantee is
+    /// bought the other way here: `PointerConstraintTable::new` is private to
+    /// `crate::input`, so an `Rc` clone from this method is the only table a
+    /// backend can obtain at all.
+    pub fn constraints(&self) -> std::rc::Rc<std::cell::RefCell<PointerConstraintTable>> {
+        std::rc::Rc::clone(&self.constraints)
     }
 
     /// The attention signal this router's hook stack carries, if any
@@ -1547,6 +1834,17 @@ impl<H: PreemptionHook> InputRouter<H> {
         self.seats.get(realm).and_then(|seat| seat.agent_pointer)
     }
 
+    /// Where the **human's** pointer last was in `realm`, in view coordinates
+    /// (WS-E.4.2, issue #222), or `None` before their first motion there.
+    ///
+    /// Read by `session::reconcile_pointer_constraints`, which judges a
+    /// constraint's region against it. The human's position specifically, for
+    /// the reason [`RealmSeat::human_pointer`] gives: an agent's motion must
+    /// not be able to activate a lock and so hide the human's own sprite.
+    pub fn human_pointer(&self, realm: &crate::grants::RealmId) -> Option<(f64, f64)> {
+        self.seats.get(realm).and_then(|seat| seat.human_pointer)
+    }
+
     /// **Move the human's attention to `realm`**, and hand back what the realm
     /// being left is owed.
     ///
@@ -1571,7 +1869,10 @@ impl<H: PreemptionHook> InputRouter<H> {
     ///
     /// **The buttons are new here** (issue #212, decision 3). A press held
     /// across a switch used to be forgotten with no delivery at all, which
-    /// wedges an implicit pointer grab in the losing app for good.
+    /// wedges an implicit pointer grab in the losing app for good. **And the
+    /// gesture in flight is newer still** (WS-E.4.2, issue #222): it is ended
+    /// `cancelled`, because a begin with no end leaves the losing app
+    /// accumulating a pinch forever — see [`Self::end_physical_gesture`].
     ///
     /// **The agent's held presses are deliberately left alone**, and that is
     /// the whole difference this change makes: an agent addressed to the
@@ -1611,6 +1912,10 @@ impl<H: PreemptionHook> InputRouter<H> {
         let losing = self.bound.replace(realm.clone())?;
         let mut owed = self.release_physical_keys(&losing);
         owed.extend(self.release_physical_buttons(&losing));
+        // Third, so an app that is mid-drag *and* mid-gesture sees the
+        // pointer settle before the gesture is called off. Order within a
+        // kind is press order; order between kinds is keys, buttons, gesture.
+        owed.extend(self.end_physical_gesture(&losing));
         self.forget_presence_of(&losing);
         Some((losing, owed))
     }
@@ -1668,6 +1973,15 @@ impl<H: PreemptionHook> InputRouter<H> {
     /// `no_surface` before step 5c is reached), which is not a property to
     /// rest on: [`Self::forget_presence_of`] is called here so the ordering
     /// never has to hold.
+    ///
+    /// **And the pointer-constraint record goes too** (WS-E.4.2, issue #222),
+    /// silently: the shim is gone, so there is nobody to send a
+    /// `pointer_constraint_state` to. It is cleared *here* rather than beside
+    /// this method's callers for the reason [`Self::forget_presence_of`] is —
+    /// the realm death funnel reaches teardown two ways
+    /// (`ShimServer::connection_closed` for a realm whose shim came up, and a
+    /// bare `router.reset_for` for one that died before it did), and a clear
+    /// written at the first would have a hole at exactly the second.
     pub fn reset_for(&mut self, realm: &crate::grants::RealmId) -> bool {
         let had_seat = self.seats.remove(realm).is_some();
         let was_bound = self.bound.as_ref() == Some(realm);
@@ -1675,7 +1989,8 @@ impl<H: PreemptionHook> InputRouter<H> {
             self.bound = None;
         }
         self.forget_presence_of(realm);
-        had_seat || was_bound
+        let had_constraint = self.constraints.borrow_mut().forget(realm);
+        had_seat || was_bound || had_constraint
     }
 
     /// The realm physical input currently follows, if any.
@@ -1851,6 +2166,74 @@ impl<H: PreemptionHook> InputRouter<H> {
         released
     }
 
+    /// **End the gesture `realm`'s app was told had begun**, `cancelled`, and
+    /// forget it — the third drain, added by WS-E.4.2 (issue #222).
+    ///
+    /// Everything [`Self::release_physical_keys`] says about origins, minted
+    /// tags and the bypassed preemption hook applies here word for word. The
+    /// difference is what the debt *is*: a key latches a modifier and a button
+    /// wedges an implicit grab, and a gesture with no end leaves the app
+    /// accumulating a pinch forever — the same failure in a third shape, and
+    /// the one the IDL names outright ("what the core owes in return is
+    /// exactly one gesture_end for every gesture_begin it sent, without
+    /// exception").
+    ///
+    /// **`cancelled`, never `completed`**, because the human did not finish
+    /// it: something took the input away mid-gesture, which is precisely the
+    /// distinction `gesture_state` exists to carry. An app that was previewing
+    /// a zoom puts it back rather than committing one the human never
+    /// confirmed. `docs/plan/14-workstream-session-mode.md` §6 already
+    /// publishes this trade for keys and buttons — "a realm switch mid-gesture
+    /// tells the app the human let go" — and a touchpad gesture joins that
+    /// published limit rather than inventing a new one.
+    ///
+    /// Returns at most one delivery: the IDL pins at most one gesture in
+    /// flight per seat. A `Vec` anyway, so the call sites can `extend` it into
+    /// the same owed list the other two drains fill, in the same order every
+    /// time.
+    ///
+    /// **Only the human's gesture**, by the filter both siblings use — though
+    /// today no actuator can mint one, so the filter is a guarantee about the
+    /// future rather than a live branch: version 2 defines no emulated source
+    /// of a gesture, so every record this drains was tagged physical at
+    /// intake. It is written as a filter rather than an assertion for exactly
+    /// the reason the other two are: when an emulated source does arrive,
+    /// draining it here would invent an end the principal never sent and
+    /// attribute it to the human.
+    ///
+    /// # Where this is called, and the one place it deliberately is not
+    ///
+    /// Beside [`Self::release_physical_buttons`], at both of its call sites
+    /// and no others: [`Self::bind_to`] (the human's attention moved to
+    /// another realm) and `session::suspend_physical_seat` (the seat gave the
+    /// devices away on a VT switch). **Not** `backend::winit`'s
+    /// `handle_focus`, for the same reason that site drains keys and not
+    /// buttons: it is the host reporting *keyboard* focus loss, pointer state
+    /// is reported separately, and a gesture is pointer-side. That exclusion
+    /// costs nothing today for a second, sharper reason — smithay's winit
+    /// backend produces no gesture events at all, so a nested session can
+    /// never have one in flight to drain.
+    pub fn end_physical_gesture(&mut self, realm: &crate::grants::RealmId) -> Vec<SeatDelivery> {
+        let Some(seat) = self.seats.get_mut(realm) else {
+            return Vec::new();
+        };
+        let Some(live) = seat.gesture else {
+            return Vec::new();
+        };
+        if live.origin != Origin::Physical {
+            return Vec::new();
+        }
+        seat.gesture = None;
+        vec![SeatDelivery {
+            // Read back off the record, never minted — see above.
+            origin: live.origin,
+            kind: SeatDeliveryKind::GestureEnd {
+                kind: live.kind,
+                state: GestureState::Cancelled,
+            },
+        }]
+    }
+
     /// **Route one physical event to the realm the human's attention is bound
     /// to** — the first of the router's two addressing rules.
     ///
@@ -1881,6 +2264,7 @@ impl<H: PreemptionHook> InputRouter<H> {
         let Self {
             hook,
             presence,
+            constraints,
             now,
             bound,
             seats,
@@ -1889,6 +2273,7 @@ impl<H: PreemptionHook> InputRouter<H> {
             Tap {
                 hook,
                 presence,
+                constraints,
                 now: now.get(),
             },
             seats,
@@ -1924,6 +2309,7 @@ impl<H: PreemptionHook> InputRouter<H> {
         let Self {
             hook,
             presence,
+            constraints,
             now,
             seats,
             ..
@@ -1932,6 +2318,7 @@ impl<H: PreemptionHook> InputRouter<H> {
             Tap {
                 hook,
                 presence,
+                constraints,
                 now: now.get(),
             },
             seats,
@@ -1960,16 +2347,41 @@ impl<H: PreemptionHook> InputRouter<H> {
         // physical fact, not a delivery outcome. Into the addressed realm's
         // own seat -- with several realms, one shared position would let a
         // press in one realm hit-test against a pointer another realm moved.
-        if let (Some(realm), SeatInputKind::Motion { x, y }) = (realm, &input.kind) {
+        // **THE FREEZE**, sampled before anything is recorded (WS-E.4.2, issue
+        // #222). The IDL says a lock "stops absolute motion and freezes the
+        // position the core's own hit tests use", and the second half is why
+        // this is here rather than only down in the `Motion` arm: recording the
+        // position anyway would let the pointer drift out of the constraint's
+        // own region while the app is told nothing — and the region test is
+        // what keeps the constraint active. The lock would end because of
+        // motion it was supposed to stop.
+        //
+        // **`Origin::Physical` only**, and the position `RealmSeat::pointer`
+        // holds keeps taking an agent's motion: `route_emulated` is a separate
+        // named entry point precisely so an agent's actuation follows its grant,
+        // and an app that locks the pointer must not thereby confine an agent
+        // (D-032).
+        //
+        // Sampled here rather than acted on here, so nothing below moves: the
+        // preemption hook, the presence tap and every gate still see the event
+        // exactly as they did. A locked pointer must not cost the human their
+        // off-switch, and the way that is guaranteed is that this predicate is
+        // read at two points strictly *below* the tap and never at it.
+        let frozen = input.origin == Origin::Physical
+            && matches!(input.kind, SeatInputKind::Motion { .. })
+            && realm.is_some_and(|realm| tap.constraints.borrow().is_active(realm));
+
+        if let (Some(realm), false, SeatInputKind::Motion { x, y }) = (realm, frozen, &input.kind) {
             let seat = Self::seat_mut(seats, realm);
             seat.pointer = Some((*x, *y));
-            // ...and the agent-owned position beside it, for the display
-            // sprite only, written by this one origin (see
-            // `RealmSeat::agent_pointer`). Not an `else` branch: the shared
-            // position keeps taking both origins, because that is what the
-            // app is delivered.
-            if input.origin == Origin::Emulated {
-                seat.agent_pointer = Some((*x, *y));
+            // ...and the two origin-owned positions beside it, each written by
+            // exactly one origin (see `RealmSeat::agent_pointer` and
+            // `RealmSeat::human_pointer`). Not `else` branches on the shared
+            // position: that keeps taking both origins, because that is what
+            // the app is delivered.
+            match input.origin {
+                Origin::Emulated => seat.agent_pointer = Some((*x, *y)),
+                Origin::Physical => seat.human_pointer = Some((*x, *y)),
             }
         }
 
@@ -1988,6 +2400,7 @@ impl<H: PreemptionHook> InputRouter<H> {
         let Tap {
             hook,
             presence,
+            constraints: _,
             now,
         } = tap;
         presence
@@ -2016,6 +2429,17 @@ impl<H: PreemptionHook> InputRouter<H> {
                         state: KeyState::Released,
                     } => {
                         seat.release_pressed_key(source.pairing(*keysym));
+                    }
+                    // A gesture's end is a release for this purpose
+                    // (WS-E.4.2): the in-flight record is the router's
+                    // bookkeeping for a delivered begin, so a consumed end
+                    // clears it exactly as a consumed button release clears
+                    // the grab. Nothing goes on the wire, and the app is
+                    // left accumulating the gesture -- the gate
+                    // implementor's debt, and the reason `PreemptionHook`'s
+                    // pairing contract asks gates to deliver this one.
+                    SeatInputKind::GestureEnd { .. } => {
+                        seat.gesture = None;
                     }
                     _ => {}
                 }
@@ -2073,6 +2497,21 @@ impl<H: PreemptionHook> InputRouter<H> {
             SeatInputKind::Text { text } => SeatDeliveryKind::Text { text },
 
             SeatInputKind::Motion { x, y } => {
+                // The delivery half of the freeze sampled at the top of this
+                // function: while this realm's constraint is in force the app
+                // gets deltas (`relative_motion`, minted by `intake_physical`
+                // from the very same host event) and no absolute motion at all
+                // — which is what a lock IS.
+                //
+                // Ranked explicitly BELOW the sprite. A frozen but visible
+                // cursor looks like a hung compositor and leaves the human every
+                // escape they had; a hidden one does not. So this arm is the
+                // backstop that makes the rule true for any future backend, and
+                // the bare-metal backend additionally declines to move its own
+                // accumulated position — see `backend::drm`'s `handle_libinput`.
+                if frozen {
+                    return None;
+                }
                 // No committed surface: nothing to point at (and no
                 // placement to map through) — not deliverable.
                 let surface = surface?;
@@ -2118,6 +2557,106 @@ impl<H: PreemptionHook> InputRouter<H> {
                 }
                 SeatDeliveryKind::Scroll { axis, value120 }
             }
+
+            // A delta carries no position of its own, so it hit-tests
+            // against the same stored pointer `scroll` does — the existing
+            // rule for a position-less pointer event, not a new one. Getting
+            // this wrong in the *other* direction is what matters: an app
+            // that was never told the pointer entered it must not be handed
+            // the movement of a pointer that is over the letterbox matte, and
+            // an app mid-drag must keep receiving deltas wherever the pointer
+            // wandered, which is what the implicit-grab clause below gives it.
+            SeatInputKind::RelativeMotion {
+                dx,
+                dy,
+                dx_unaccel,
+                dy_unaccel,
+            } => {
+                if seat.pressed.is_empty() && !seat.pointer_over_surface(view, surface) {
+                    return None;
+                }
+                SeatDeliveryKind::RelativeMotion {
+                    dx: Fixed::from_f64(dx),
+                    dy: Fixed::from_f64(dy),
+                    dx_unaccel: Fixed::from_f64(dx_unaccel),
+                    dy_unaccel: Fixed::from_f64(dy_unaccel),
+                }
+            }
+
+            SeatInputKind::GestureBegin { kind, fingers } => {
+                if seat.pressed.is_empty() && !seat.pointer_over_surface(view, surface) {
+                    return None; // a gesture over the matte is not the app's
+                }
+                // At most one gesture in flight per seat (IDL). A second
+                // begin is a core bug or a device the layer below
+                // mis-reported; either way, believing it would owe the app
+                // two ends for two begins it can only pair one of. Dropped
+                // and traced -- never trusted away.
+                if let Some(live) = seat.gesture {
+                    tracing::debug!(
+                        in_flight = ?live.kind,
+                        arriving = ?kind,
+                        "gesture_begin dropped: one gesture is already in flight for this realm"
+                    );
+                    return None;
+                }
+                // The tag rides into the record with the begin, so the drain
+                // reads it back rather than assuming one.
+                seat.gesture = Some(InFlightGesture { kind, origin });
+                SeatDeliveryKind::GestureBegin { kind, fingers }
+            }
+
+            SeatInputKind::GestureSwipeUpdate { dx, dy } => {
+                // Delivered iff its own begin was, and iff that begin was a
+                // swipe: a pinch update inside a swipe would hand the app
+                // motion for a gesture of a shape it is not tracking.
+                if seat.gesture.map(|g| g.kind) != Some(GestureKind::Swipe) {
+                    return None;
+                }
+                SeatDeliveryKind::GestureSwipeUpdate {
+                    dx: Fixed::from_f64(dx),
+                    dy: Fixed::from_f64(dy),
+                }
+            }
+
+            SeatInputKind::GesturePinchUpdate {
+                dx,
+                dy,
+                scale,
+                rotation,
+            } => {
+                if seat.gesture.map(|g| g.kind) != Some(GestureKind::Pinch) {
+                    return None;
+                }
+                SeatDeliveryKind::GesturePinchUpdate {
+                    dx: Fixed::from_f64(dx),
+                    dy: Fixed::from_f64(dy),
+                    scale: Fixed::from_f64(scale),
+                    rotation: Fixed::from_f64(rotation),
+                }
+            }
+
+            SeatInputKind::GestureEnd { kind, state } => {
+                // Unpaired ends are dropped, exactly as unpaired releases
+                // are: an end the app never saw a begin for would tell it to
+                // finish a gesture it is not making.
+                let live = seat.gesture.take()?;
+                if live.kind != kind {
+                    // The gesture that is actually in flight is the one that
+                    // gets ended -- never the one the event claimed, or the
+                    // app would be left accumulating the real one forever.
+                    tracing::warn!(
+                        in_flight = ?live.kind,
+                        arriving = ?kind,
+                        "gesture_end names a different gesture than the one in flight; \
+                         ending the one in flight"
+                    );
+                }
+                SeatDeliveryKind::GestureEnd {
+                    kind: live.kind,
+                    state,
+                }
+            }
         };
         Some(SeatDelivery { origin, kind })
     }
@@ -2151,10 +2690,28 @@ fn inside(sx: f64, sy: f64, surface: (u32, u32)) -> bool {
 /// window presents the composed view 1:1), so no further conversion
 /// applies at intake.
 ///
-/// Unhandled event classes (touch, gestures, tablet, switches, relative
-/// motion) are dropped here: v0's seat vocabulary is pointer + keyboard
-/// (IDL `vitrin_shim_seat`), and inventing a lossy translation at intake
-/// would bypass the protocol's own growth path.
+/// # What this translates, and what it still drops
+///
+/// Version 2 of `vitrin_shim_seat` grew five events (WS-E.4.2, issue #222),
+/// so three classes that used to fall through the drop arm are served here
+/// now: **relative pointer motion**, **multi-finger swipe** and **pinch**.
+///
+/// Relative motion is the one with a subtlety. The IDL says `relative_motion`
+/// *accompanies* `motion` rather than replacing it — one physical movement
+/// produces both — but this function holds no pointer position and so cannot
+/// mint the absolute half. The backend that owns the accumulated position
+/// does: [`crate::backend::drm`]'s libinput arm mints
+/// [`physical_motion`] and calls this for the delta, so both halves reach the
+/// wire from the one place that can compute both. A caller that only forwards
+/// `PointerMotion` here therefore gets the delta alone, which is honest — it
+/// is all the event itself contains.
+///
+/// **Still dropped, and each for its own reason.** Touch and tablet are *not
+/// yet served*: the wire has no event for either, and inventing a lossy
+/// translation at intake would bypass the protocol's own growth path. That is
+/// a not-yet rather than a never — what would reopen each is recorded in this
+/// repository's decision log, not here. Switch events (a lid closing) and
+/// hold gestures have no wire event either. Device add/remove are not input.
 pub(crate) fn intake_physical<B: InputBackend>(
     event: &InputEvent<B>,
     view: (i32, i32),
@@ -2222,7 +2779,80 @@ pub(crate) fn intake_physical<B: InputBackend>(
             // scancode-only translation (issue #118).
             physical_key(evdev, None, state)
         }
+
+        // Relative motion. Both deltas are taken from the device rather than
+        // derived from one another: `zwp_relative_pointer_v1` defines both,
+        // libinput supplies both, and copying one into the other would put a
+        // number on the wire the app would be entitled to believe.
+        InputEvent::PointerMotion { event } => {
+            vec![SeatInput::physical(SeatInputKind::RelativeMotion {
+                dx: event.delta_x(),
+                dy: event.delta_y(),
+                dx_unaccel: event.delta_x_unaccel(),
+                dy_unaccel: event.delta_y_unaccel(),
+            })]
+        }
+
+        // Gestures. Swipe and pinch share `gesture_begin`/`gesture_end` on
+        // the wire and differ only in their update, which is exactly how
+        // libinput reports them, so the six host events map onto four wire
+        // events with no dead argument in any of them.
+        InputEvent::GestureSwipeBegin { event } => {
+            vec![SeatInput::physical(SeatInputKind::GestureBegin {
+                kind: GestureKind::Swipe,
+                fingers: event.fingers(),
+            })]
+        }
+        InputEvent::GestureSwipeUpdate { event } => {
+            vec![SeatInput::physical(SeatInputKind::GestureSwipeUpdate {
+                dx: event.delta_x(),
+                dy: event.delta_y(),
+            })]
+        }
+        InputEvent::GestureSwipeEnd { event } => {
+            vec![SeatInput::physical(SeatInputKind::GestureEnd {
+                kind: GestureKind::Swipe,
+                state: gesture_state(event.cancelled()),
+            })]
+        }
+        InputEvent::GesturePinchBegin { event } => {
+            vec![SeatInput::physical(SeatInputKind::GestureBegin {
+                kind: GestureKind::Pinch,
+                fingers: event.fingers(),
+            })]
+        }
+        InputEvent::GesturePinchUpdate { event } => {
+            vec![SeatInput::physical(SeatInputKind::GesturePinchUpdate {
+                dx: event.delta_x(),
+                dy: event.delta_y(),
+                // Absolute since this gesture's begin, unlike the three
+                // beside it -- carried through verbatim rather than
+                // differenced, because reinterpreting it is the one mistake
+                // the IDL says an app cannot detect.
+                scale: event.scale(),
+                rotation: event.rotation(),
+            })]
+        }
+        InputEvent::GesturePinchEnd { event } => {
+            vec![SeatInput::physical(SeatInputKind::GestureEnd {
+                kind: GestureKind::Pinch,
+                state: gesture_state(event.cancelled()),
+            })]
+        }
+
         _ => Vec::new(),
+    }
+}
+
+/// libinput's `cancelled` flag as the wire's [`GestureState`]. One line, and
+/// a named one, because the polarity is the kind of thing that inverts
+/// silently in a refactor and an app cannot tell a wrongly-committed pinch
+/// from a rightly-committed one.
+fn gesture_state(cancelled: bool) -> GestureState {
+    if cancelled {
+        GestureState::Cancelled
+    } else {
+        GestureState::Completed
     }
 }
 
@@ -2312,15 +2942,16 @@ pub(crate) fn keymap_key(
 /// bare-metal backend has already resolved** (WS-E.3.2, issue #218).
 ///
 /// The pointer twin of [`keymap_key`], and it exists for a reason of the same
-/// shape. [`intake_physical`] serves `PointerMotionAbsolute` and **drops**
-/// `PointerMotion` — its doc names relative motion among the classes it does
-/// not translate — but an ordinary USB mouse on libinput emits nothing else.
-/// `SeatInputKind::Motion` is an *absolute* view coordinate, so somebody has
-/// to hold the accumulated position and clamp it to the output, and that
-/// somebody is the backend that owns the output ([`crate::backend::drm`]'s
-/// `accumulate_pointer`) — the position it accumulates is also the one it
-/// draws the human's cursor sprite at, so the two cannot disagree about where
-/// the pointer is.
+/// shape. [`intake_physical`] translates `PointerMotion` into the *delta*
+/// event `relative_motion` (WS-E.4.2), which is all the host event itself
+/// contains; `SeatInputKind::Motion` is an *absolute* view coordinate, so
+/// somebody has to hold the accumulated position and clamp it to the output,
+/// and that somebody is the backend that owns the output
+/// ([`crate::backend::drm`]'s `accumulate_pointer`) — the position it
+/// accumulates is also the one it draws the human's cursor sprite at, so the
+/// two cannot disagree about where the pointer is. The DRM backend's
+/// `PointerMotion` arm mints both halves for one host event, which is what the
+/// IDL's "`relative_motion` accompanies `motion`" requires.
 ///
 /// What stays here is the *minting*: `Origin::Physical` is bound by the same
 /// private [`SeatInput::physical`] constructor every other intake path uses
@@ -2547,7 +3178,9 @@ pub(crate) mod tests {
     use vitrin_mock_shim::{MockShim, SeatEvent};
 
     use super::synthetic::{
-        SyntheticButton, SyntheticHost, SyntheticKey, SyntheticMotion, SyntheticScroll,
+        SyntheticButton, SyntheticGestureBegin, SyntheticGestureEnd, SyntheticHost, SyntheticKey,
+        SyntheticMotion, SyntheticPinchUpdate, SyntheticRelativeMotion, SyntheticScroll,
+        SyntheticSwipeUpdate,
     };
     use super::*;
     use crate::scene::Scene;
@@ -2669,6 +3302,96 @@ pub(crate) mod tests {
         InputEvent::Keyboard {
             event: SyntheticKey { evdev, state },
         }
+    }
+
+    // The version-2 host events (WS-E.4.2, issue #222). Constructed through
+    // the same synthetic `InputBackend` the five above use, so every one of
+    // these tests enters the core at `intake_physical` -- the single point
+    // where `Origin::Physical` can be minted -- and never at a weaker seam.
+
+    fn relative_ev(
+        dx: f64,
+        dy: f64,
+        dx_unaccel: f64,
+        dy_unaccel: f64,
+    ) -> InputEvent<SyntheticHost> {
+        InputEvent::PointerMotion {
+            event: SyntheticRelativeMotion {
+                dx,
+                dy,
+                dx_unaccel,
+                dy_unaccel,
+            },
+        }
+    }
+
+    fn swipe_begin_ev(fingers: u32) -> InputEvent<SyntheticHost> {
+        InputEvent::GestureSwipeBegin {
+            event: SyntheticGestureBegin { fingers },
+        }
+    }
+
+    fn swipe_update_ev(dx: f64, dy: f64) -> InputEvent<SyntheticHost> {
+        InputEvent::GestureSwipeUpdate {
+            event: SyntheticSwipeUpdate { dx, dy },
+        }
+    }
+
+    fn swipe_end_ev(cancelled: bool) -> InputEvent<SyntheticHost> {
+        InputEvent::GestureSwipeEnd {
+            event: SyntheticGestureEnd { cancelled },
+        }
+    }
+
+    fn pinch_begin_ev(fingers: u32) -> InputEvent<SyntheticHost> {
+        InputEvent::GesturePinchBegin {
+            event: SyntheticGestureBegin { fingers },
+        }
+    }
+
+    fn pinch_update_ev(dx: f64, dy: f64, scale: f64, rotation: f64) -> InputEvent<SyntheticHost> {
+        InputEvent::GesturePinchUpdate {
+            event: SyntheticPinchUpdate {
+                dx,
+                dy,
+                scale,
+                rotation,
+            },
+        }
+    }
+
+    fn pinch_end_ev(cancelled: bool) -> InputEvent<SyntheticHost> {
+        InputEvent::GesturePinchEnd {
+            event: SyntheticGestureEnd { cancelled },
+        }
+    }
+
+    /// Route one host event through a router and hand back what the wire
+    /// would carry, or `None` if nothing was delivered.
+    ///
+    /// `intake_physical` yields a `Vec`, and every version-2 class yields
+    /// exactly one element; asserting that here rather than in each test is
+    /// what keeps a translation that silently started emitting two from
+    /// passing as one.
+    fn route_host<H: PreemptionHook>(
+        router: &mut InputRouter<H>,
+        event: &InputEvent<SyntheticHost>,
+        view: (u32, u32),
+        surface: Option<(u32, u32)>,
+    ) -> Option<SeatDelivery> {
+        let mut inputs = intake_physical(event, (view.0 as i32, view.1 as i32));
+        assert_eq!(
+            inputs.len(),
+            1,
+            "a version-2 host event translates to exactly one seat input"
+        );
+        let input = inputs.remove(0);
+        assert_eq!(
+            input.origin(),
+            Origin::Physical,
+            "intake is the one place the physical tag is minted (B2)"
+        );
+        router.route_physical(input, view, surface)
     }
 
     // ------------------------------------------------------------------
@@ -6200,5 +6923,862 @@ pub(crate) mod tests {
             "and must carry the press's keysym, so the app releases the key it is holding"
         );
         assert!(router.held_keys(&test_realm()).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // WS-E.4.2 (issue #222): the version-2 seat classes
+    //
+    // Three classes are served -- relative motion, multi-finger swipe and
+    // pinch -- and every test below drives them through the SAME synthetic
+    // `InputBackend` the version-1 classes use, because `intake_physical` is
+    // the only place `Origin::Physical` can be minted and a test that
+    // constructed a `SeatInput` directly would be proving something about a
+    // path production does not have.
+    //
+    // Touch and tablet are NOT YET SERVED, which is a different claim from
+    // refused: the machine these were measured on has neither device, and a
+    // measurement of one laptop is not a property of a class. What would
+    // reopen each is recorded in the decision log, not here.
+    // ------------------------------------------------------------------
+
+    /// Decode a delivery the way the shim will: through the generated
+    /// decoder, off the very bytes `encode` produces. Asserting on
+    /// `SeatDeliveryKind` alone would prove the router agrees with itself;
+    /// this proves the wire carries it, and it is the only way to check the
+    /// `origin` argument the IDL pins as every seat event's last one.
+    const SEAT_ID: u32 = 42;
+
+    /// Every served version-2 class reaches the wire, through the hook, with
+    /// its origin intact and its payload unmangled.
+    ///
+    /// Four properties in one pass, because they are one path:
+    ///
+    /// 1. **It passes the hook.** The `RecordingHook` log must show
+    ///    `observe` then `gate` for every event -- so a new class cannot
+    ///    route around the dead-man tap or the consent grab.
+    /// 2. **The origin survives.** Decoded off the frame bytes, not read
+    ///    back off the struct the encoder was handed.
+    /// 3. **The arguments survive, each in its own field.** The pinch's four
+    ///    quantities are all distinct and none is derivable from another, so
+    ///    a translation that swapped `scale` and `rotation`, or copied `dx`
+    ///    into `dx_unaccel`, fails here.
+    /// 4. **`gesture_kind` is right.** A swipe reported as a pinch would be
+    ///    replayed on the wrong wlroots gesture object.
+    #[test]
+    fn every_version_2_class_reaches_the_wire_through_the_hook_with_origin_intact() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut router = InputRouter::detached(RecordingHook {
+            log: Rc::clone(&log),
+            consume: Rc::new(Cell::new(false)),
+        });
+        assert!(router.bind_to(&test_realm()).is_none());
+        let view = (64, 48);
+        let surface = Some((64, 48));
+        // A pointer-position-less class hit-tests against the stored
+        // pointer, so put the pointer on the app first -- the same
+        // precondition `scroll` has had since v0.
+        assert!(route_host(&mut router, &motion_ev(10.0, 10.0), view, surface).is_some());
+        log.borrow_mut().clear();
+
+        // -- relative_motion -------------------------------------------
+        let d = route_host(
+            &mut router,
+            &relative_ev(3.5, -2.25, 7.0, -4.5),
+            view,
+            surface,
+        )
+        .expect("relative motion is deliverable while the pointer is on the app");
+        let (obj, ev) =
+            seat::events::RelativeMotion::decode(&d.encode(SEAT_ID), None).expect("decodes");
+        assert_eq!(obj, SEAT_ID);
+        assert_eq!(ev.dx, Fixed::from_f64(3.5));
+        assert_eq!(ev.dy, Fixed::from_f64(-2.25));
+        assert_eq!(
+            ev.dx_unaccel,
+            Fixed::from_f64(7.0),
+            "the unaccelerated delta must be the device's own, never a copy of the \
+             accelerated one -- it is most of the reason this event exists"
+        );
+        assert_eq!(ev.dy_unaccel, Fixed::from_f64(-4.5));
+        assert_eq!(ev.origin, Origin::Physical);
+
+        // -- a whole swipe ---------------------------------------------
+        let d = route_host(&mut router, &swipe_begin_ev(3), view, surface).expect("swipe begins");
+        let (_, ev) =
+            seat::events::GestureBegin::decode(&d.encode(SEAT_ID), None).expect("decodes");
+        assert_eq!(ev.kind, GestureKind::Swipe);
+        assert_eq!(ev.fingers, 3);
+        assert_eq!(ev.origin, Origin::Physical);
+
+        let d = route_host(&mut router, &swipe_update_ev(12.0, -3.0), view, surface)
+            .expect("an update after a delivered begin is delivered");
+        let (_, ev) =
+            seat::events::GestureSwipeUpdate::decode(&d.encode(SEAT_ID), None).expect("decodes");
+        assert_eq!(
+            (ev.dx, ev.dy),
+            (Fixed::from_f64(12.0), Fixed::from_f64(-3.0))
+        );
+        assert_eq!(ev.origin, Origin::Physical);
+
+        let d = route_host(&mut router, &swipe_end_ev(false), view, surface).expect("swipe ends");
+        let (_, ev) = seat::events::GestureEnd::decode(&d.encode(SEAT_ID), None).expect("decodes");
+        assert_eq!(ev.kind, GestureKind::Swipe);
+        assert_eq!(
+            ev.state,
+            GestureState::Completed,
+            "libinput's `cancelled == false` is the wire's `completed`; inverting this \
+             makes an app undo a gesture the human finished"
+        );
+        assert_eq!(ev.origin, Origin::Physical);
+
+        // -- a whole pinch ---------------------------------------------
+        let d = route_host(&mut router, &pinch_begin_ev(2), view, surface).expect("pinch begins");
+        let (_, ev) =
+            seat::events::GestureBegin::decode(&d.encode(SEAT_ID), None).expect("decodes");
+        assert_eq!(ev.kind, GestureKind::Pinch);
+        assert_eq!(ev.fingers, 2);
+
+        let d = route_host(
+            &mut router,
+            &pinch_update_ev(1.0, 2.0, 1.75, -30.0),
+            view,
+            surface,
+        )
+        .expect("pinch update");
+        let (_, ev) =
+            seat::events::GesturePinchUpdate::decode(&d.encode(SEAT_ID), None).expect("decodes");
+        assert_eq!((ev.dx, ev.dy), (Fixed::from_f64(1.0), Fixed::from_f64(2.0)));
+        assert_eq!(
+            ev.scale,
+            Fixed::from_f64(1.75),
+            "scale is absolute since the begin; carrying it in the rotation field, or \
+             differencing it, is the mistake apps cannot detect"
+        );
+        assert_eq!(ev.rotation, Fixed::from_f64(-30.0));
+        assert_eq!(ev.origin, Origin::Physical);
+
+        let d = route_host(&mut router, &pinch_end_ev(true), view, surface).expect("pinch ends");
+        let (_, ev) = seat::events::GestureEnd::decode(&d.encode(SEAT_ID), None).expect("decodes");
+        assert_eq!(ev.kind, GestureKind::Pinch);
+        assert_eq!(ev.state, GestureState::Cancelled);
+
+        // 1: the hook saw every one of the seven, observe before gate, and
+        // nothing routed around it.
+        let seen = log.borrow();
+        assert_eq!(
+            seen.len(),
+            14,
+            "seven events, each observed then gated: {seen:?}"
+        );
+        for pair in seen.chunks(2) {
+            assert_eq!(pair[0], ("observe", Origin::Physical));
+            assert_eq!(pair[1], ("gate", Origin::Physical));
+        }
+    }
+
+    /// Each of the five new deliveries carries a distinct recorder label, and
+    /// only the two discrete ones are journaled.
+    ///
+    /// The label is the whole of what an audit entry says about a seat event,
+    /// so two kinds sharing one would make the journal lie by omission. The
+    /// exclusions are the flip side of the same judgement: `relative_motion`
+    /// arrives *beside* the `motion` already excluded for flooding the
+    /// recorder, so journaling it would double the rate the existing argument
+    /// rejects -- while `gesture_begin`/`gesture_end` are bounded by the
+    /// human's fingers and are the pair whose balance an audit can check.
+    #[test]
+    fn the_version_2_deliveries_have_their_own_labels_and_only_the_discrete_ones_are_journaled() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rec, path) = crate::recorder::tests::scratch_recorder("seat-v2-labels");
+        let realm = crate::grants::RealmId::new("realm-9");
+
+        let cases = [
+            (
+                SeatDeliveryKind::RelativeMotion {
+                    dx: Fixed::from_f64(1.0),
+                    dy: Fixed::from_f64(2.0),
+                    dx_unaccel: Fixed::from_f64(3.0),
+                    dy_unaccel: Fixed::from_f64(4.0),
+                },
+                "relative_motion",
+            ),
+            (
+                SeatDeliveryKind::GestureBegin {
+                    kind: GestureKind::Swipe,
+                    fingers: 3,
+                },
+                "gesture_begin",
+            ),
+            (
+                SeatDeliveryKind::GestureSwipeUpdate {
+                    dx: Fixed::from_f64(1.0),
+                    dy: Fixed::from_f64(1.0),
+                },
+                "gesture_swipe_update",
+            ),
+            (
+                SeatDeliveryKind::GesturePinchUpdate {
+                    dx: Fixed::from_f64(1.0),
+                    dy: Fixed::from_f64(1.0),
+                    scale: Fixed::from_f64(2.0),
+                    rotation: Fixed::from_f64(15.0),
+                },
+                "gesture_pinch_update",
+            ),
+            (
+                SeatDeliveryKind::GestureEnd {
+                    kind: GestureKind::Swipe,
+                    state: GestureState::Cancelled,
+                },
+                "gesture_end",
+            ),
+        ];
+        let mut labels = Vec::new();
+        for (kind, label) in cases {
+            let delivery = SeatDelivery {
+                origin: Origin::Physical,
+                kind,
+            };
+            assert_eq!(delivery.event_label(), label);
+            labels.push(label);
+            super::record_seat_delivery(&mut rec, &realm, &delivery);
+        }
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "no two kinds may share a label");
+
+        let entries = crate::recorder::tests::read_log(&path);
+        let delivered = crate::recorder::tests::of_kind(&entries, "seat_delivered");
+        let journaled: Vec<&str> = delivered.iter().map(|e| e.str("event")).collect();
+        assert_eq!(
+            journaled,
+            ["gesture_begin", "gesture_end"],
+            "the three raw-device-rate classes must not reach the log at all"
+        );
+        for entry in &delivered {
+            assert_eq!(entry.str("origin"), "physical");
+            assert_eq!(entry.str("realm"), "realm-9");
+        }
+        crate::recorder::tests::cleanup(&path);
+    }
+
+    /// **The latch test, and the one that matters.** A realm switch mid-swipe
+    /// ends the gesture the losing app was told about -- `cancelled`, exactly
+    /// once, and never twice.
+    ///
+    /// A `gesture_begin` with no `gesture_end` is the latched-modifier failure
+    /// in a new shape: the app accumulates a pinch or a swipe forever, and no
+    /// later event can pay it down because the human's fingers are now
+    /// producing events addressed to a different realm. Delete
+    /// `end_physical_gesture` from `bind_to` and this test fails on its first
+    /// assertion.
+    ///
+    /// `cancelled` rather than `completed` is the load-bearing half: the human
+    /// did not finish the gesture, so an app previewing a zoom must put it
+    /// back rather than commit one nobody confirmed.
+    #[test]
+    fn a_realm_switch_mid_gesture_ends_it_cancelled_and_owes_the_app_nothing_after() {
+        let mut router = router();
+        let view = (64, 48);
+        let surface = Some((64, 48));
+        assert!(route_host(&mut router, &motion_ev(10.0, 10.0), view, surface).is_some());
+        assert!(route_host(&mut router, &swipe_begin_ev(4), view, surface).is_some());
+        assert!(route_host(&mut router, &swipe_update_ev(5.0, 0.0), view, surface).is_some());
+
+        let other = crate::grants::RealmId::new("realm-1");
+        let (losing, owed) = router
+            .bind_to(&other)
+            .expect("the binding moved, so the losing realm is owed its debt");
+        assert_eq!(losing, test_realm());
+        assert_eq!(
+            owed.len(),
+            1,
+            "one gesture in flight, so exactly one end is owed: {owed:?}"
+        );
+        assert_eq!(owed[0].origin(), Origin::Physical);
+        assert_eq!(
+            owed[0].kind(),
+            &SeatDeliveryKind::GestureEnd {
+                kind: GestureKind::Swipe,
+                state: GestureState::Cancelled,
+            },
+            "the app must be told the gesture it was told about ended, and told the \
+             truth about how"
+        );
+
+        // Draining twice must not owe twice: an app told a swipe ended and
+        // then told it ended again would pair the second with nothing.
+        assert!(router.end_physical_gesture(&test_realm()).is_empty());
+        // And the gesture's own events, arriving after the switch, are now
+        // unpaired for the realm they were addressed to -- so the human's
+        // fingers finishing the swipe cannot reach the app it left.
+        assert!(router.bind_to(&test_realm()).is_some());
+        assert!(route_host(&mut router, &swipe_update_ev(5.0, 0.0), view, surface).is_none());
+        assert!(route_host(&mut router, &swipe_end_ev(false), view, surface).is_none());
+    }
+
+    /// A seat pause (a VT switch) owes the same debt, through the same drain.
+    ///
+    /// Its own call site is `session::suspend_physical_seat`; what is asserted
+    /// here is the router half it depends on, so the two cannot drift.
+    #[test]
+    fn the_gesture_drain_reads_the_kind_back_off_the_record_it_delivered() {
+        let mut router = router();
+        let view = (64, 48);
+        let surface = Some((64, 48));
+        assert!(route_host(&mut router, &motion_ev(1.0, 1.0), view, surface).is_some());
+        assert!(route_host(&mut router, &pinch_begin_ev(2), view, surface).is_some());
+
+        let owed = router.end_physical_gesture(&test_realm());
+        assert_eq!(
+            owed.len(),
+            1,
+            "the pinch the app was told about is owed an end"
+        );
+        assert_eq!(
+            owed[0].kind(),
+            &SeatDeliveryKind::GestureEnd {
+                kind: GestureKind::Pinch,
+                state: GestureState::Cancelled,
+            },
+            "the kind comes off the router's own record of what it delivered, so a \
+             pinch is never ended as a swipe"
+        );
+        assert!(
+            router.end_physical_gesture(&test_realm()).is_empty(),
+            "the record is consumed by the drain"
+        );
+    }
+
+    /// **A consumed begin starts nothing**, so its updates and its end can
+    /// never leak -- the gesture twin of "a consumed press starts no implicit
+    /// grab".
+    ///
+    /// This is the second half of the latch protection, and it is the half
+    /// that would fail *open*: if a gate consumed a begin while the router
+    /// still recorded it, the app would receive updates and an end for a
+    /// gesture it was never told had started.
+    #[test]
+    fn a_gate_consumed_gesture_begin_leaks_no_update_and_no_end() {
+        let consume = Rc::new(Cell::new(false));
+        let mut router = InputRouter::detached(RecordingHook {
+            log: Rc::new(RefCell::new(Vec::new())),
+            consume: Rc::clone(&consume),
+        });
+        assert!(router.bind_to(&test_realm()).is_none());
+        let view = (64, 48);
+        let surface = Some((64, 48));
+        assert!(route_host(&mut router, &motion_ev(5.0, 5.0), view, surface).is_some());
+
+        consume.set(true);
+        assert!(
+            route_host(&mut router, &pinch_begin_ev(2), view, surface).is_none(),
+            "a consumed begin is not delivered"
+        );
+        consume.set(false);
+        assert!(
+            route_host(
+                &mut router,
+                &pinch_update_ev(1.0, 1.0, 2.0, 0.0),
+                view,
+                surface
+            )
+            .is_none(),
+            "an update whose begin was consumed must not reach an app that was never \
+             told a pinch started"
+        );
+        assert!(
+            route_host(&mut router, &pinch_end_ev(false), view, surface).is_none(),
+            "and neither must its end"
+        );
+        assert!(
+            router.end_physical_gesture(&test_realm()).is_empty(),
+            "nothing was ever in flight, so the drain owes nothing either"
+        );
+    }
+
+    /// A gate that consumes a `gesture_end` clears the router's record, so the
+    /// router cannot wedge -- the next gesture still works.
+    ///
+    /// The app-side debt this leaves is real and is the gate implementor's,
+    /// exactly as it is for a consumed key release (`Gate::Consume`). What is
+    /// pinned here is that the *router* recovers: keeping the record instead
+    /// would make "at most one gesture in flight" drop every subsequent begin
+    /// forever, which is a wedge rather than a debt.
+    #[test]
+    fn a_consumed_gesture_end_clears_the_record_so_the_next_gesture_still_begins() {
+        let consume = Rc::new(Cell::new(false));
+        let mut router = InputRouter::detached(RecordingHook {
+            log: Rc::new(RefCell::new(Vec::new())),
+            consume: Rc::clone(&consume),
+        });
+        assert!(router.bind_to(&test_realm()).is_none());
+        let view = (64, 48);
+        let surface = Some((64, 48));
+        assert!(route_host(&mut router, &motion_ev(5.0, 5.0), view, surface).is_some());
+        assert!(route_host(&mut router, &swipe_begin_ev(3), view, surface).is_some());
+
+        consume.set(true);
+        assert!(route_host(&mut router, &swipe_end_ev(false), view, surface).is_none());
+        consume.set(false);
+
+        assert!(
+            router.end_physical_gesture(&test_realm()).is_empty(),
+            "the consumed end already reconciled the record; a drain must not now \
+             invent a second end for a gesture the router has forgotten"
+        );
+        assert!(
+            route_host(&mut router, &pinch_begin_ev(2), view, surface).is_some(),
+            "and the next gesture must still begin -- a consuming gate may leave a \
+             debt, but it may never wedge the router"
+        );
+    }
+
+    /// The IDL's "at most one gesture in flight per seat", enforced rather
+    /// than assumed, plus the three shapes of unpaired event.
+    #[test]
+    fn unpaired_gesture_events_are_dropped_and_a_second_begin_is_refused() {
+        let mut router = router();
+        let view = (64, 48);
+        let surface = Some((64, 48));
+        assert!(route_host(&mut router, &motion_ev(5.0, 5.0), view, surface).is_some());
+
+        // Nothing in flight: an update and an end have nothing to belong to.
+        assert!(route_host(&mut router, &swipe_update_ev(1.0, 1.0), view, surface).is_none());
+        assert!(route_host(
+            &mut router,
+            &pinch_update_ev(1.0, 1.0, 1.0, 0.0),
+            view,
+            surface
+        )
+        .is_none());
+        assert!(route_host(&mut router, &swipe_end_ev(false), view, surface).is_none());
+
+        assert!(route_host(&mut router, &swipe_begin_ev(3), view, surface).is_some());
+        assert!(
+            route_host(&mut router, &pinch_begin_ev(2), view, surface).is_none(),
+            "a second begin while one is in flight would owe the app two ends it can \
+             only pair one of"
+        );
+        assert!(
+            route_host(
+                &mut router,
+                &pinch_update_ev(1.0, 1.0, 2.0, 0.0),
+                view,
+                surface
+            )
+            .is_none(),
+            "a pinch update inside a swipe belongs to no gesture the app is tracking"
+        );
+        assert!(
+            route_host(&mut router, &swipe_update_ev(1.0, 1.0), view, surface).is_some(),
+            "the swipe that IS in flight keeps moving"
+        );
+
+        // An end naming the wrong kind still ends the one in flight: leaving
+        // it live would be the latch this whole section exists to prevent.
+        let d = route_host(&mut router, &pinch_end_ev(false), view, surface)
+            .expect("the gesture in flight is ended regardless of what the end names");
+        assert_eq!(
+            d.kind(),
+            &SeatDeliveryKind::GestureEnd {
+                kind: GestureKind::Swipe,
+                state: GestureState::Completed,
+            }
+        );
+        assert!(router.end_physical_gesture(&test_realm()).is_empty());
+    }
+
+    /// The matte is not the app, for the version-2 classes too.
+    ///
+    /// A delta and a gesture carry no position of their own, so they
+    /// hit-test against the stored pointer exactly as `scroll` does. Without
+    /// this an app whose surface does not fill the view would receive the
+    /// movement of a pointer that is demonstrably not over it.
+    #[test]
+    fn relative_motion_and_gestures_are_dropped_when_the_pointer_is_on_the_matte() {
+        let mut router = router();
+        let view = (64, 48);
+        let surface = Some((32, 24)); // centred, so (2, 2) is matte
+        assert!(
+            route_host(&mut router, &motion_ev(2.0, 2.0), view, surface).is_none(),
+            "fixture check: (2, 2) must be matte, or this test asserts nothing"
+        );
+        assert!(route_host(&mut router, &relative_ev(1.0, 1.0, 1.0, 1.0), view, surface).is_none());
+        assert!(route_host(&mut router, &swipe_begin_ev(3), view, surface).is_none());
+        assert!(
+            router.end_physical_gesture(&test_realm()).is_empty(),
+            "a begin that was never delivered leaves nothing to drain"
+        );
+    }
+
+    /// A realm's gesture is its own: a sibling realm's drain must not end it,
+    /// and a sibling's death must not either.
+    #[test]
+    fn one_realms_gesture_is_untouched_by_another_realms_drain_or_death() {
+        let mut router = router();
+        let view = (64, 48);
+        let surface = Some((64, 48));
+        let other = crate::grants::RealmId::new("realm-1");
+        assert!(route_host(&mut router, &motion_ev(5.0, 5.0), view, surface).is_some());
+        assert!(route_host(&mut router, &swipe_begin_ev(3), view, surface).is_some());
+
+        assert!(
+            router.end_physical_gesture(&other).is_empty(),
+            "a realm with no seat at all owes nothing"
+        );
+        router.reset_for(&other);
+        assert_eq!(
+            router.end_physical_gesture(&test_realm()).len(),
+            1,
+            "the sibling's death must leave this realm's in-flight gesture exactly \
+             where it was"
+        );
+    }
+
+    /// An agent's actuation cannot mint a gesture today, and if one ever can,
+    /// the drain must leave it alone -- the same filter the key and button
+    /// drains apply, for the same reason.
+    ///
+    /// Written against the router directly because `intake_physical` cannot
+    /// produce an emulated event by construction (B2), which is the property
+    /// this test relies on rather than works around.
+    #[test]
+    fn the_gesture_drain_leaves_an_emulated_gesture_alone() {
+        let mut router = router();
+        let view = (64, 48);
+        let surface = Some((64, 48));
+        assert!(route_host(&mut router, &motion_ev(5.0, 5.0), view, surface).is_some());
+        assert!(router
+            .route_emulated(
+                &test_realm(),
+                SeatInput::emulated(SeatInputKind::GestureBegin {
+                    kind: GestureKind::Pinch,
+                    fingers: 2,
+                }),
+                view,
+                surface,
+            )
+            .is_some());
+        assert!(
+            router.end_physical_gesture(&test_realm()).is_empty(),
+            "draining it would invent an end the principal never sent and, since the \
+             delivery carries the tag, attribute it to the human"
+        );
+    }
+
+    // ---- pointer constraints (WS-E.4.2, issue #222) ------------------------
+
+    /// Put `realm`'s constraint into force, as the reconciler would.
+    ///
+    /// A test helper rather than a production entry point, deliberately: only
+    /// `PointerConstraintTable::reconcile` may set the state in a shipping
+    /// build, and it derives it. This drives the same function with gates that
+    /// say "focused, nothing in the way, pointer on the surface".
+    fn arm_constraint<H: PreemptionHook>(
+        router: &InputRouter<H>,
+        realm: &crate::grants::RealmId,
+        view: (u32, u32),
+        surface: Option<(u32, u32)>,
+    ) {
+        let table = router.constraints();
+        let mut table = table.borrow_mut();
+        let _ = table.ask(
+            realm,
+            PointerConstraintAsk {
+                serial: 1,
+                surface: Some(7),
+                kind: vitrin_protocol::generated::vitrin_shim_session::PointerConstraintKind::Lock,
+                lifetime:
+                    vitrin_protocol::generated::vitrin_shim_session::PointerConstraintLifetime::Persistent,
+                region: ConstraintRegion {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+            },
+        );
+        let owed = table.reconcile(&PresentationGates {
+            focused: Some(realm),
+            output: OutputGates::default(),
+            surface,
+            view,
+            pointer: Some((view.0 as f64 / 2.0, view.1 as f64 / 2.0)),
+        });
+        assert!(
+            owed.iter().any(|v| v.realm == *realm),
+            "the fixture must actually reconcile the realm it names"
+        );
+        assert!(
+            table.is_active(realm),
+            "the fixture must actually put the constraint into force"
+        );
+    }
+
+    /// **An active lock stops absolute motion and keeps the delta** — which is
+    /// what a lock IS on this wire (WS-E.4.2, issue #222).
+    ///
+    /// The IDL promises that "a lock stops absolute motion and freezes the
+    /// position the core's own hit tests use", and this is the router's half of
+    /// it. The bare-metal backend additionally declines to move its own
+    /// accumulated position, so the two together mean the app is told nothing
+    /// about where the pointer is and everything about how far it moved.
+    #[test]
+    fn an_active_pointer_constraint_stops_absolute_motion_and_keeps_relative_motion() {
+        let mut router = router();
+        let view = (100, 80);
+        let surface = Some((40, 20));
+        // Establish the pointer over the surface first: without a position the
+        // relative arm would be dropped by the matte rule for its own reasons,
+        // and the test would pass for the wrong one.
+        assert!(router
+            .route_physical(phys(motion(50.0, 40.0)), view, surface)
+            .is_some());
+        arm_constraint(&router, &test_realm(), view, surface);
+
+        assert!(
+            router
+                .route_physical(phys(motion(51.0, 41.0)), view, surface)
+                .is_none(),
+            "absolute motion must not reach a locked app"
+        );
+        let delta = router.route_physical(
+            phys(SeatInputKind::RelativeMotion {
+                dx: 1.0,
+                dy: 1.0,
+                dx_unaccel: 1.0,
+                dy_unaccel: 1.0,
+            }),
+            view,
+            surface,
+        );
+        assert!(
+            delta.is_some(),
+            "the delta is the whole point of a lock and must keep flowing"
+        );
+        // ...and the other pointer classes are untouched: a lock is about
+        // position, not about the app going deaf.
+        assert!(router
+            .route_physical(phys(scroll()), view, surface)
+            .is_some());
+        assert!(router
+            .route_physical(phys(press()), view, surface)
+            .is_some());
+    }
+
+    /// **A locked app cannot confine an agent's actuation** (D-032).
+    ///
+    /// The sharpest of the freeze tests. `route_physical` and `route_emulated`
+    /// are two named entry points precisely so an agent's actuation follows its
+    /// grant rather than the human's attention, and an app that acquires a way
+    /// to trap a principal's pointer through a lock would have turned a
+    /// confinement primitive into a capability over somebody else.
+    #[test]
+    fn a_locked_app_cannot_confine_an_agents_actuation() {
+        let mut router = router();
+        let view = (100, 80);
+        let surface = Some((40, 20));
+        assert!(router
+            .route_physical(phys(motion(50.0, 40.0)), view, surface)
+            .is_some());
+        arm_constraint(&router, &test_realm(), view, surface);
+
+        let delivered = router.route_emulated(
+            &test_realm(),
+            SeatInput::emulated(motion(52.0, 42.0)),
+            view,
+            surface,
+        );
+        let delivered = delivered.expect("an agent's absolute motion is not the app's to stop");
+        assert_motion(&delivered, 22.0, 12.0);
+        assert_eq!(delivered.origin(), Origin::Emulated);
+    }
+
+    /// **A realm's death forgets its constraint, and only its own** — path 4 of
+    /// the deactivation list.
+    ///
+    /// Modelled on [`a_siblings_death_leaves_the_bound_realms_held_key_alone`],
+    /// because the failure that matters here is scope rather than existence:
+    /// the clear lives *inside* `reset_for`, which is what makes it reach both
+    /// arms of the death funnel — the one that goes through
+    /// `ShimServer::connection_closed` and the one for a realm that died before
+    /// its shim came up.
+    #[test]
+    fn a_realms_death_forgets_its_pointer_constraint_and_leaves_a_siblings_alone() {
+        let mut router = InputRouter::detached(NoopHook);
+        let view = (100, 80);
+        let surface = Some((40, 20));
+        let bound = test_realm();
+        let sibling = crate::grants::RealmId::new("browser");
+        assert!(router.bind_to(&bound).is_none());
+        assert!(router
+            .route_physical(phys(motion(50.0, 40.0)), view, surface)
+            .is_some());
+        // The sibling's is armed FIRST, so arming the bound realm's leaves it
+        // recorded-but-inactive -- which is exactly the state a hidden realm's
+        // constraint is in, and the one whose removal must not disturb the
+        // realm on screen.
+        arm_constraint(&router, &sibling, view, surface);
+        arm_constraint(&router, &bound, view, surface);
+        assert!(router.constraints().borrow().get(&sibling).is_some());
+
+        assert!(router.reset_for(&sibling));
+        assert!(
+            router.constraints().borrow().get(&sibling).is_none(),
+            "the dying realm's record goes, silently: there is no shim left to tell"
+        );
+        assert!(
+            router.constraints().borrow().is_active(&bound),
+            "a sibling's death must not forget the bound realm's lock"
+        );
+        assert!(router.reset_for(&bound));
+        assert!(!router.constraints().borrow().is_active(&bound));
+        assert!(
+            router
+                .route_physical(phys(motion(51.0, 41.0)), view, surface)
+                .is_none(),
+            "and with the record gone the realm has no seat either, so nothing is delivered \
+             to a shim generation that ended"
+        );
+    }
+
+    /// **The table the router writes is the only one obtainable**, which is
+    /// what makes "the composite reads the router's records" structural rather
+    /// than a wiring step a backend can get wrong.
+    #[test]
+    fn the_constraint_table_handle_is_the_routers_own() {
+        let router = router();
+        let a = router.constraints();
+        let b = router.constraints();
+        assert!(
+            std::rc::Rc::ptr_eq(&a, &b),
+            "every handle must be a clone of the one table"
+        );
+        let realm = test_realm();
+        let _ = a.borrow_mut().ask(
+            &realm,
+            PointerConstraintAsk {
+                serial: 1,
+                surface: Some(7),
+                kind: vitrin_protocol::generated::vitrin_shim_session::PointerConstraintKind::Lock,
+                lifetime:
+                    vitrin_protocol::generated::vitrin_shim_session::PointerConstraintLifetime::Persistent,
+                region: ConstraintRegion {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+            },
+        );
+        assert!(
+            b.borrow().get(&realm).is_some(),
+            "a second handle must see the first handle's write"
+        );
+    }
+
+    /// **A locked pointer does not stop the dead-man chord, and does not stop
+    /// the human typing.**
+    ///
+    /// The single property this whole change must not cost. Structurally it
+    /// cannot: the preemption hook's observe tap runs strictly above the
+    /// per-kind match the freeze lives in — `hook.observe` precedes
+    /// `let realm = realm?`, which precedes every arm — and the freeze only ever
+    /// touches absolute `Motion`. This asserts it against a **real**
+    /// `DeadManHook` stacked on a real router with a lock genuinely in force,
+    /// because "the off-switch still works" is not a property to leave to a
+    /// comment.
+    #[test]
+    fn a_locked_pointer_does_not_stop_the_dead_man_chord() {
+        let deadman = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::deadman::DeadManSwitch::new(crate::deadman::DeadManConfig::default()),
+        ));
+        let now = std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now()));
+        let mut router = InputRouter::detached(crate::deadman::DeadManHook::new(
+            std::rc::Rc::clone(&deadman),
+            std::rc::Rc::clone(&now),
+            NoopHook,
+        ));
+        let view = (100, 80);
+        let surface = Some((40, 20));
+        assert!(router.bind_to(&test_realm()).is_none());
+        assert!(router
+            .route_physical(phys(motion(50.0, 40.0)), view, surface)
+            .is_some());
+        arm_constraint(&router, &test_realm(), view, surface);
+
+        // The control: the freeze really is on, so the assertions below are
+        // about a session that is genuinely locked.
+        assert!(router
+            .route_physical(phys(motion(51.0, 41.0)), view, surface)
+            .is_none());
+
+        router.route_physical(chord_press(), view, surface);
+        assert!(
+            deadman.borrow().deadline().is_some(),
+            "the human's off-switch must arm while an app holds a pointer lock"
+        );
+        // ...and an ordinary key still reaches the app: a lock is about
+        // position, not about the human going mute.
+        assert!(router
+            .route_physical(
+                phys(SeatInputKind::Key {
+                    source: KeySource::Keysym,
+                    keysym: 0xffe1,
+                    state: KeyState::Pressed,
+                }),
+                view,
+                surface,
+            )
+            .is_some());
+    }
+
+    /// **A frozen pointer really is frozen** — the position the core's own hit
+    /// tests use does not move either (WS-E.4.2, issue #222).
+    ///
+    /// Found by a test, not by reading: the first version of the freeze lived
+    /// only in the `Motion` delivery arm, so `RealmSeat::pointer` and
+    /// `RealmSeat::human_pointer` kept tracking the device. That is not a
+    /// cosmetic gap — the constraint's own region test is judged against
+    /// `human_pointer`, so the pointer would have drifted off the surface and
+    /// **ended the lock** using exactly the motion the lock exists to stop,
+    /// while the app was told nothing at all.
+    #[test]
+    fn an_active_constraint_freezes_the_position_the_core_hit_tests_with() {
+        let mut router = router();
+        let view = (100, 80);
+        let surface = Some((40, 20));
+        assert!(router
+            .route_physical(phys(motion(50.0, 40.0)), view, surface)
+            .is_some());
+        arm_constraint(&router, &test_realm(), view, surface);
+
+        assert!(router
+            .route_physical(phys(motion(4.0, 4.0)), view, surface)
+            .is_none());
+        assert_eq!(
+            router.human_pointer(&test_realm()),
+            Some((50.0, 40.0)),
+            "the human's recorded position must not move under a lock"
+        );
+
+        // ...but an AGENT's motion still moves the shared position, because an
+        // app's lock is not authority over a principal.
+        assert!(router
+            .route_emulated(
+                &test_realm(),
+                SeatInput::emulated(motion(52.0, 42.0)),
+                view,
+                surface,
+            )
+            .is_some());
+        assert_eq!(router.agent_pointer(&test_realm()), Some((52.0, 42.0)));
+        assert_eq!(
+            router.human_pointer(&test_realm()),
+            Some((50.0, 40.0)),
+            "and it does not become the human's position by doing so"
+        );
     }
 }

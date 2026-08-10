@@ -289,6 +289,9 @@ log line it came from):
 | `wl_seat` | `wlr_seat_create` (+ the virtual keyboard, `src/seat.c`) |
 | `wl_output` | `wlr_output_create_global` |
 | `wl_data_device_manager` | `wlr_data_device_manager_create` — **P1.6.3**, see above |
+| `zwp_relative_pointer_manager_v1` | `wlr_relative_pointer_manager_v1_create` — **WS-E.4.2**, carries `vitrin_shim_seat.relative_motion` |
+| `zwp_pointer_gestures_v1` | `wlr_pointer_gestures_v1_create` — **WS-E.4.2**, carries the four gesture events |
+| `zwp_pointer_constraints_v1` | `vitrin_constraint_create` (`src/constraint.c`) — **WS-E.4.2**, relays the app's pointer lock/confinement ask to the core and the core's verdict back; see `include/constraint.h` |
 | `zxdg_decoration_manager_v1` | `wlr_xdg_decoration_manager_v1_create` (declines SSD) |
 | `zwp_linux_dmabuf_v1` | `wlr_linux_dmabuf_v1_create_with_renderer` — **only with `--dmabuf`** |
 

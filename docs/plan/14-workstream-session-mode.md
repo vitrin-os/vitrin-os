@@ -66,6 +66,34 @@ D-Bus** (deliberate — it is the AT-SPI backdoor argument), so portals, file
 pickers and notifications degrade; and rendering is software by default, with
 dmabuf behind `--dmabuf`.
 
+**Four things about this table, found by WS-E.4.1 (#221) when it went looking
+for cells to seed a published matrix with, and recorded here rather than left
+standing.**
+
+- **It is undated.** Every row above arrived in one commit (`7863702`,
+  2026-08-06) and there is no log, recorder dump, ledger or screenshot behind
+  any of them. That commit date bounds when the row was *written*, not when the
+  app was *run*. No date may therefore be attached to these cells: a commit's
+  date is not a run's, and reusing it would be the stale-matrix failure #221
+  names as worse than no matrix at all.
+- **The Electron row names three applications that were never run.** Only VS
+  Code was executed; *"so also Discord, Slack, Obsidian"* is an inference from a
+  shared runtime, not three more measurements. A matrix cell exists only if a
+  runner executed it, so those three earn no cell.
+- **`pavucontrol` is in this table and missing from #221's own seed list**, on
+  exactly the same (weak) evidence as gimp and inkscape. Noted so the omission
+  is a decision rather than an accident.
+- **Firefox's row is the one that is stronger than the bar above it.** It is
+  `tests/integration/test_real_firefox.py` — the mock-free M1.2 gate, real core
+  to real shim to real browser to the real SDK, asserting the captured frame's
+  dominant colour — against the **pinned ESR 140.12.0 tarball**
+  (`shim/tests/firefox/firefox-esr.pin`), which is not a Firefox installed on
+  this machine. There is no `firefox` package here at all; what is installed is
+  `firefox-developer-edition 154.0b8-1`. A cell for it must name the pin, never
+  "Firefox".
+
+`xterm`'s row and the bars/launchers row are scoped and measured by §4.2.
+
 ## 3. The four gaps that actually bind
 
 None of these is DRM work. The backend is not the binding constraint.
@@ -157,7 +185,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 | **1 — multi-app, nested** | ~~Runtime app launch~~ (**landed**, WS-E.1.1/#207: `autostart = false` templates, a served `realm_launch` verb, core-minted `<template>.<n>` instance ids, `capacity` at `MAX_REALMS`, and `realm_spawned` naming who asked) · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · ~~a core-owned attention key~~ (**landed**, WS-E.1.7/#232: a tapped, consumed Super lifts `preempted` for one layout use and delivers `vitrin_principal.attention`, so an in-realm shell can switch realms at all) · a shell client (switcher + launcher) | 7–9 w |
 | **2 — livable** | ~~Cross-realm clipboard~~ (**landed**, WS-E.2.1/#213: a core-held single slot the core *pulls* into on Ctrl-Shift-Insert and offers on Shift-Insert, `text/plain;charset=utf-8` at 60 KiB, plus the modifier-aware chord matcher 2.2 and 2.4 consume — §4.1, [D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing)) · ~~core-drawn lock screen on the consent stack~~ (**landed**, WS-E.2.2/#214) · ~~status in the trusted band~~ (**landed**, WS-E.2.3/#215) · ~~human screenshot~~ (**landed**, WS-E.2.4/#216: `ctrl+print` writes one PNG of the REALM VIEW into one audited `--screenshot-dir`, touching no grant — §6) | 4–6 w |
 | **3 — bare metal** | ~~The keymap decision~~ (**landed**, WS-E.3.1/#217: xkbcommon in the core behind the off-by-default `session-keymap` feature, fed a pre-compiled keymap **file** and never a layout name, keysyms normalised to one Unicode convention, and key pairing moved to the scancode — §4, [D-028](20-decision-log.md#d-028--a-bare-metal-session-interprets-the-keyboard-inside-the-core-from-a-pre-compiled-keymap-file-and-key-pairing-moves-to-the-scancode)) · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
-| **4 — long tail** | X11 (defers to E3.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |
+| **4 — long tail** | X11 (defers to E3.2 — **scoped, not built**, WS-E.4.1/#221: six requirements handed to E3.2, the X11-only software measured on this machine, and the interim, all in §4.2) · seat vocabulary for touch/gestures/lid · session lifecycle · the honesty sweep | open |
 
 **Stage 1 is the one that is genuinely dual-use.** Layout verbs are allocated
 and unserved, and multi-realm is Phase-3 fleet work; both get built here
@@ -333,6 +361,297 @@ channel"* stops being true the moment this lands, which is why PRD §15's threat
 row and `docs/book/src/limits.md` are edited in the same commit rather than
 left standing.
 
+## 4.2 X11: what a daily driver needs from E3.2
+
+Stage 4's first deliverable (WS-E.4.1, issue #221), written out here for §4.1's
+reason: the issue closes and this does not.
+
+**This is input to E3.2, and not a second design for it.**
+[03-phase-3-network-x11-fleet.md](03-phase-3-network-x11-fleet.md) §E3.2 already
+owns the shape, the recommendation between the two ways of building it, the
+minimal `_NET_WM_*` coverage list and the anti-keylog exit test. None of that is
+restated below and none of it is re-decided below — a workstream that redesigns
+an epic is the competing roadmap the tracking model forbids outright. What this
+section adds is the one thing an epic written before anybody ran the system
+could not have: a closed list of what one maintainer's actual machine demands of
+it, each item carrying the application that demands it and the measurement that
+found it.
+
+### How this was measured, and what the method cannot say
+
+**Nothing was launched.** Not `vitrind`, not a realm, not a nested compositor,
+not one application under test. Every statement below comes from two read-only
+sources, on **2026-08-10**:
+
+1. **Runs already recorded in this repository** — §2's table,
+   [`docs/drm-bringup.md`](../drm-bringup.md), `shim/docs/`,
+   `tests/integration/`.
+2. **Static inspection of the installed software** — `pacman` for versions, and
+   each binary's transitive `DT_NEEDED` closure read with `readelf -d`,
+   resolving sonames through `ldconfig -p`. `ldd` was deliberately not used: it
+   invokes the dynamic loader and can execute the binary it is asked about.
+
+**Linkage is weaker than a run, and this scan proved it in both directions**, so
+nothing below rests on linkage without saying that is what it is. Five binaries
+whose closure carries `libX11` and no `libwayland-client` have a working Wayland
+path anyway, because they load it at runtime or link their own copy statically:
+`chromium 151.0.7922.108-1`, `blender 17:5.2.0-4`, `scrcpy 4.1-2` (whose X11
+arrives from ffmpeg's `libavdevice` and not from its GUI, which is SDL3),
+`openrgb 1.0rc3-1` and `rpi-imager 2.0.9-1` (Qt loads its platform plugin by
+name; `qt5-wayland 5.15.19+kde+r55-1` and `qt6-wayland 6.11.1-1` are both
+installed). Two more — `alacritty 0.17.0-1` and `kitty 0.48.2-1` — link
+*neither* family and settle it at runtime. A cell in the generated matrix
+([`docs/book/src/session-app-matrix.md`](../book/src/session-app-matrix.md)) is
+an executed run; a classification here is labelled linkage wherever linkage is
+all it is.
+
+**The measured set widens by executing the runbook, never by editing a list.**
+That is the same device P2.8.6 uses on the IME matrix and the reason the matrix
+is generated rather than written.
+
+### The requirement list
+
+Six items. Each names the application that demands it — **an item with no
+demanding application is a wish and is not here**, which is why three things the
+maintainer named out loud (Java, a browser he has installed, and Steam) appear
+in the section after this one instead. That is the measurement disagreeing with
+the recollection that opened this issue, which is what it was for.
+
+1. **An X display a realm's app can open at all.** Demanded by `xterm 410-1`,
+   `feh 3.12.2-1`, `xsel 1.2.1-2` and `nvidia-settings 610.57.04-1`. `xterm` is
+   the only one with a *run* behind it — §2's table, `Can't open display`. The
+   other three are linkage: `feh`'s closure is 41 sonames with
+   `libX11.so.6`/`libX11-xcb.so.1`/`libxcb.so.1` and no Wayland library at all,
+   `xsel`'s is 6, and `nvidia-settings`' whole `NEEDED` set is
+   `[libXxf86vm.so.1] [libjansson.so.4] [libX11.so.6] [libXext.so.6]
+   [libm.so.6] [libc.so.6]` — `libXxf86vm` being an X-server-only extension with
+   no Wayland counterpart to port to. `nvidia-settings` is also the trap that
+   proves a grep is not a method: it *does* carry `wayland` strings, and reading
+   them shows they are NVIDIA's own `libnvidia-wayland-client.so` output-query
+   probes (`wconn_get_wayland_display`, `Wayland Connector Library failed to
+   connect.`), not a GUI backend.
+2. **A physical human's keystrokes reaching an X client.** Demanded by
+   `xterm 410-1`. A terminal that maps a window and repaints and cannot be typed
+   into is not a terminal, and §2's bar is exactly that bar — *"nothing was typed
+   into these"*. The two halves of this are not equally unproven and the
+   difference matters, so it is stated rather than averaged:
+   - **An agent's** actuation into a real toolkit text field **is** proved, at
+     milestone strength: `tests/integration/test_real_actuation.py`'s D7 rung
+     (P1.8.6/#108) types `héllo→世界` through the real chokepoint into
+     `gtk-entry-probe`, which reports the bytes back intact.
+   - **A physical human's** keystrokes have never reached a desktop application
+     here at all. That path has been exercised against `input-echo-client`
+     (`shim/docs/nested-lock-screen.md`, 2026-08-09) and against the core's own
+     lock screen on bare metal (`docs/drm-bringup.md`, item 13) — two repo test
+     surfaces — while the GTK render gate says in as many words that it
+     *"asserts render, not input"* (`tests/integration/test_real_gtk.py:25`).
+
+   What E3.2 inherits from that split: D-028 put xkbcommon in the core behind
+   the off-by-default `session-keymap` feature for the Wayland side, so an X
+   path introduces a **second** interpreter of the same physical keyboard.
+   Which one is authoritative is E3.2's to answer rather than to inherit.
+3. **X selections joined to the clipboard the core already holds — or a refusal
+   that says so.** Demanded by `xterm 410-1` and `xsel 1.2.1-2`. §4.1's slot is
+   filled and offered by three `vitrin_shim_session` messages the **core**
+   initiates against a Wayland shim; an X client's copy lives in an X selection
+   owner that speaks none of them, so an X app in a realm has no route to the
+   one cross-realm channel this workstream built. Worse, and already true: the
+   offer chord is Shift-Insert, *the historical X11 primary-paste chord*, and
+   the core eats it in every realm unconditionally (§4.1 Axis 4, §6). The X
+   client's own paste gesture is gone before the X path exists.
+4. **An X toplevel that fits a scene holding one client surface.** Demanded by
+   `xterm 410-1`, the only X application with a recorded run. §3(1) is the
+   constraint: each `Scene` holds at most one client surface, single-maximized,
+   and that is the model *per app*. Every application in §2's table is a Wayland
+   client whose shim maps one xdg toplevel. Whether an X client behind a
+   rootless server arrives as one surface is E3.2's question; it is recorded
+   here because the constraint belongs to **this** core and E3.2 cannot discover
+   it from its own epic text.
+5. **More than one X application, in more than one realm, at once.** Demanded by
+   the measurement rather than by a single app: `xterm`, `feh`, `xsel` and
+   `nvidia-settings` are four X11-only programs on one machine, and `MAX_REALMS`
+   has been 16 since WS-E.1.2. E3.2's exit criteria already own the isolation
+   that implies and it is not restated here. What this list contributes is only
+   the fact that a one-X-application answer does not clear this machine.
+6. **`DISPLAY` scrubbing must not be what does the isolating.** Demanded by
+   `xterm 410-1` again, and it is the item most easily missed because today it
+   looks like it already works. A realm's app is spawned from an environment
+   built from **nothing** (`spawn.rs`'s "Environment hygiene": `env_clear`, then
+   an allow-list), and `DISPLAY` and `XAUTHORITY` are refused outright by
+   `realm::RESERVED_ENV` (`realm.rs:653`) with the reason recorded in the table
+   itself — *"it addresses the host X server, which the core scrubs at spawn"*.
+   That is **why** the recorded failure is `Can't open display` rather than a
+   protocol error. Under D9 it is also a confinement of the well-behaved only:
+   this machine's host session was running `Xwayland :0 -rootless` (pid 2062)
+   with `/tmp/.X11-unix/X0` present and world-connectable when this was
+   measured, and `spawn.rs` says in as many words that an app which ignores what
+   it was handed *"and connects directly to a path it already knows is not
+   stopped by anything in this file"*. An X path that hands realms a real X
+   server must not be built such that the scrub is the security property.
+
+**Six requirements, and the list ends here.** It is closed against one machine
+on one day. It widens the way the matrix widens — by executing a runbook and
+landing the run — and not by anyone adding a seventh line to it.
+
+### What the measurement found that is *not* a requirement
+
+- **X11 shell components are measured and deliberately excluded.**
+  `picom-git 2855_12.197.g6d676824_2026.06.02-1`, `openbox 3.6.1-14`,
+  `polybar 3.7.2-2`, `lemonbar-git v1.5.r2.g59b0d28-1`, `dmenu 5.4-1` and
+  `slock 1.7-1` are all X11-only by linkage — `polybar`'s `NEEDED` set alone
+  carries `libxcb-ewmh`, `libxcb-icccm`, `libxcb-randr`, `libxcb-composite`,
+  `libxcb-xkb`, `libxcb-cursor` and `libxcb-xrm`, which are X11 window-manager
+  protocols with no Wayland analogue. An X compositor, an X window manager, an X
+  bar, an X launcher and an X screen locker are not applications to run *inside*
+  a per-app X server, so no E3.2 exit criterion returns any of them. They are
+  things this maintainer loses, and the loss is permanent rather than pending:
+  PRD §5.1 keeps window-management policy out of the core, and §6 says there
+  will be no `zwlr_layer_shell_v1` at the app level either.
+- **The waybar/rofi class is not an X11 gap and must never be counted as one.**
+  §2's table records that they connect, bind six globals and never map, for want
+  of `zwlr_layer_shell_v1` — WS-E Stage 2's result, not this one's. Both are
+  Wayland-native by linkage (`waybar 0.15.0-2` and `rofi 2.0.0-1` each link
+  `libwayland-client.so.0` directly). The third name in that table row,
+  `wofi`, **is not installed on this machine**, so its cell cannot be
+  regenerated here by any runbook — the row names something nobody can measure.
+- **#203 shrinks the Wayland set for a reason that has nothing to do with X11.**
+  §1's assertion abort killed every decoration-aware client; it was fixed in
+  `af98130` and **alacritty** was re-run to completion under `vitrind --nested`
+  as #203's own acceptance criterion. **kitty** was proved to crash *before* the
+  fix and there is no record anywhere of it being re-run after. Its cell is
+  therefore weaker than §2's table row reads, and the matrix must not launder
+  the difference.
+- **`google-chrome 151.0.7922.71-1` is an unresolved contradiction, published as
+  one.** Its 71-soname closure carries `libX11.so.6`, `libXext.so.6`,
+  `libXfixes.so.3`, `libXi.so.6`, `libXrandr.so.2`, `libXrender.so.1` and
+  `libxcb*.so` with no `libwayland-client` — yet the binary carries
+  `ozone-platform`, `wl_compositor` and `libwayland-client` strings, and Arch's
+  `chromium 151.0.7922.108-1` classifies **identically** while §2's table
+  records Chromium working under a `vitrind` that serves no X11 whatsoever.
+  Linkage cannot settle this one. It is an **unknown**, not an X11 requirement,
+  and only a run settles it.
+- **The Steam client is the same unknown, and this is the measurement
+  contradicting the recollection that opened the issue.** #221 was written
+  expecting Steam in the X11 set, and the first pass of this scan agreed:
+  `steam 1.0.0.87-1` is only a two-line shell wrapper, so what matters is the
+  Valve-bundled, self-updating binary at
+  `~/.local/share/Steam/ubuntu12_64/steamwebhelper` (10 575 320 bytes,
+  2026-07-22), whose 36-soname closure carries `libX11.so.6`, `libXext.so.6`,
+  `libXfixes.so.3`, `libXi.so.6`, `libXrandr.so.2`, `libXrender.so.1`,
+  `libXtst.so.6` and `libxcb*.so` with **no** `libwayland-client` — a count that
+  is itself bounded by the method, because neither `libcef.so` nor
+  `libSDL3.so.0`, both direct `NEEDED` entries, sits on `ldconfig`'s path, so
+  the walk stops there — and which
+  contains not one `ozone-platform`, `wl_compositor` or `libwayland-client`
+  string of its own. That reads as settled and is not. Its own direct `NEEDED`
+  entry `libcef.so` — the bundled 219 444 168-byte Chromium-embedded library
+  that does the drawing, dated 2026-07-09 — **does** carry the ozone Wayland
+  platform (`chrome_browser_main_extra_parts_ozone.cc`, `enable-wayland-ime`,
+  *"Failed to initialize Wayland platform"*, *"Fatal Wayland protocol error %u
+  on interface %s"*). So the Steam client is exactly `google-chrome`'s case one
+  library deeper, an X11 requirement was nearly published on a scan that stopped
+  at the executable, and the honest answer is **unknown**. Steam remains a
+  measured dependency of this machine in the sense that matters for planning —
+  it is installed, it has been run, `steamapps` holds seven app manifests —
+  and *not* in the sense that would put it on a requirement list.
+- **The system JVM has no Wayland backend, and no application here demands its
+  X one.** `jdk-openjdk 26.0.2.u10-1` ships exactly `libawt.so`,
+  `libawt_xawt.so` and `libawt_headless.so` — measured, and there is no
+  `libawt_wayland.so`; `libawt_xawt.so`'s `NEEDED` set is
+  `libX11`/`libXext`/`libXi`/`libXrender`/`libXtst` with no Wayland library. The
+  one JetBrains-family application installed carries its own runtime that *does*
+  have one: `/opt/android-studio/jbr/lib/libawt_wlawt.so`, JBR 25.0.2. So Java
+  is a measured X11 dependency of a **runtime** and not of any application named
+  on this machine, and by this section's own rule it earns no requirement line.
+  It is recorded because the maintainer named the class, and because "Java needs
+  X11" is exactly the kind of half-true a matrix is supposed to stop.
+- **Electron and the modern toolkits are not X11 dependencies at all.**
+  `/usr/lib/electron43/electron` links **no** `libwayland-*` directly — its
+  103-soname closure reaches `libwayland-client.so.0`, `libwayland-cursor.so.0`
+  and `libwayland-egl.so.1` only through `libgtk-3.so.0`, which is GTK's Wayland
+  and not Electron's, and `/usr/share/code/code`, `/usr/lib/slack/slack`,
+  `/opt/postman/app/postman` and `/opt/Antigravity/antigravity` all measure the
+  same way. What says the ozone machinery is compiled in is `strings -a`:
+  `ozone-platform`/`wl_compositor`/`libwayland-client` match 5 times in both
+  `electron43` and `code`. `nautilus 50.2.2-1` links `libwayland-client.so.0`
+  directly; `gimp 3.2.4-2` reaches it through GTK; `/usr/bin/inkscape` is a
+  7-entry launcher stub whose GUI lives in
+  `/usr/lib/inkscape/libinkscape_base.so`, which carries all three. The
+  maintainer's own `~/.config/code-flags.conf` (287 bytes, 2026-07-21) already
+  carries `--ozone-platform-hint=auto` and `--enable-wayland-ime`. Whatever
+  fails about these under `vitrind`, it will not be X11.
+
+### Games: a measured dependency of one machine, and not a commitment
+
+The Steam bullet above records everything known about the **client**, which is
+that its windowing path is unresolved. The **games** are not measured at all. Of
+those seven app manifests exactly one is a game (appid 3949040,
+`RV There Yet?`); the other six are Proton builds and the three Steam Linux
+Runtimes. No game binary was inspected, and a Proton title's windowing path runs
+through Wine inside a runtime container that no static scan of an installed
+binary reaches. The one component of this stack that is unambiguously
+Wayland-native is `gamescope 3.16.25-1`, which links `libwayland-client.so.0`
+and `libwayland-server.so.0` directly — and which E3.2 already names as its own
+prior art, for a reason that has nothing to do with running a game here.
+
+**E3.2's exit criteria say nothing about games, and nothing in this list asks
+them to.** A game additionally needs relative pointer motion, pointer
+constraints, gamepads and GPU features far past anything E3.2 names — and v0's
+seat vocabulary is pointer + keyboard only, with **no relative motion at all**
+(§6). Recording Steam here is a statement about what one laptop has installed.
+It is not a statement that this project intends to run games, and it must not be
+read or republished as a roadmap item.
+
+### The interim, and what it costs
+
+**The maintainer keeps a second session for X11-only software.** So the sentence
+this whole workstream exists to be able to say — *"I did not have to reboot into
+Hyprland"* — is **false for the named X11 set above**, and stays false until
+E3.2 lands. Nothing in WS-E softens that; the interim is stated here because it
+is what actually happens, confirmed by the maintainer on 2026-08-10 and
+published as an accepted cost.
+
+It is **a workaround the maintainer accepts, not a mitigation this project
+offers**, and the difference is the whole point of writing it down. A mitigation
+would reduce the exposure. This relocates the work to a place where none of the
+exposure is measured:
+
+- A second session on another VT runs **another compositor with full access to
+  the same devices**. Nothing in this stack confines it. It is not a realm, it
+  holds no grant, the core does not know it exists, and no capability this
+  project enforces reaches it.
+- **Switching VTs leaves the confined world entirely.** [D-031](20-decision-log.md#d-031--the-core-implements-ctrl-alt-fn-itself-because-refusing-to-is-what-trapped-the-human-d-030s-reasoning-stands-and-its-effect-was-its-own-opposite)
+  has the core bind `Ctrl-Alt-F<n>` and call `change_vt` itself — superseding
+  D-030(1)'s refusal, which on bare metal welded the hatch shut — and
+  D-030(1)'s band scoping, one screen and one process, is untouched (§6). The
+  interim is the reason a human presses that chord on purpose, repeatedly,
+  every day.
+- It applies to one person. It is not available to anyone evaluating this
+  project as something to run, and it must never be published as though it were
+  advice.
+
+### Handoff to WS-E.4.4 (#224)
+
+#221 publishes to `docs/plan/` and to `docs/book/src/limits.md` and stops there.
+`README.md` and `site/index.html` were **not** edited by this issue — they are
+#224's, so that the project's public claims are enumerated in one place rather
+than drifting surface by surface. The exact text each surface must carry:
+
+| Surface | The claim, as it must read |
+|---|---|
+| `README.md` | **No X11.** Wayland only. There is no X server anywhere in this stack, so `xterm` in a realm fails with `Can't open display` and every X11-only application on the maintainer's own machine fails with it. Per-app X11 with an embedded window manager is Phase 3 (E3.2). Until it lands the maintainer keeps a second session for X11-only software — a workaround he accepts, not something this project confines. The apps that *have* been run are listed, with the observable each run checked, in `docs/book/src/session-app-matrix.md`. |
+| `site/index.html` | **No X11.** Wayland only: `xterm` in a realm fails with `Can't open display`. Per-app X11 is Phase 3. The maintainer runs a second, unconfined session for X11-only software in the meantime. |
+| `docs/book/src/limits.md` | Landed by this issue, in the "No X11 shim" bullet. Reproduced in this table only so #224 can check that three surfaces say the same thing. |
+
+Two constraints on that text, which are why it is dictated here rather than
+summarised for #224 to re-word. **It must not say "Steam"**, for two independent
+reasons: naming it on a public surface implies an intention this project has not
+formed (§"Games"), and the measurement does not support the claim anyway — the
+Steam client's windowing path came out *unknown*, not X11-only. **And it must
+not call the second session a mitigation**; every surface says *workaround*, and
+says whose. A surface that says "no X11 yet" and stops has published half of
+this, and the half it dropped is the one a reader needs.
+
 ## 5. The target machine, and why no number here generalizes
 
 Every WS-E estimate is measured against hardware chosen for being easy:
@@ -367,7 +686,17 @@ this workstream owns, not inherits:
   contrast, sticky or slow keys. The semantic channel is **not** a substitute
   for AT-SPI — it serves agents, not humans. A daily driver with no screen
   reader is a real exclusion and is stated as one.
-- **No X11**, so no Steam and no legacy application.
+- **No X11**, so no Steam and no legacy application (pre-existing; *scoped and
+  measured* by WS-E.4.1/#221). §4.2 carries the six-item list this hands to
+  E3.2, the X11-only software actually measured on this machine, the classes
+  deliberately excluded from that list, and the one contradiction the method
+  could not resolve. The maintainer's interim is **a second session for
+  X11-only software**, so *"I did not have to reboot into Hyprland"* is false
+  for that set until E3.2 lands — a workaround he accepts and one that nothing
+  in this stack confines, since the second session is another compositor with
+  full access to the same devices and switching to it leaves the confined world
+  entirely. Published in `docs/book/src/limits.md`, and the executed runs are in
+  `docs/book/src/session-app-matrix.md`.
 - **No bars, launchers, notifications or OSD** — there is no
   `zwlr_layer_shell_v1` and there will not be one at the app level; the
   replacements are core-owned surfaces.

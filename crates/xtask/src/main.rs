@@ -49,6 +49,21 @@
 //!                                S` narrows to golden tests whose name
 //!                                contains `S` (default: every golden). See
 //!                                `tests/golden/README.md`.
+//!
+//! cargo xtask session-matrix     Regenerate docs/book/src/session-app-matrix.md
+//!                                from the corpus in src/session_matrix.rs
+//!                                (WS-E.4.1, issue #221), in place.
+//!
+//! cargo xtask session-matrix --check
+//!                                Verify the checked-in page is byte-identical
+//!                                to what the generator emits, so a hand edit
+//!                                to a GENERATED page is a red build. Reads
+//!                                the page and compares in memory; writes
+//!                                nothing, anywhere. This is what CI runs --
+//!                                and it is the ONLY part of that page CI can
+//!                                check, because a GitHub runner has no DRM
+//!                                device, no seat and no GPU and therefore
+//!                                cannot run a GUI application at all.
 //! ```
 //!
 //! Calls straight into the `vitrin_scanner` library (`parse`, `rust_gen`,
@@ -63,6 +78,8 @@ use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+
+mod session_matrix;
 
 /// Paths this task operates on, relative to the workspace root.
 const XML_PATH: &str = "protocol/vitrin-v0.xml";
@@ -80,7 +97,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]"
+    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]"
 }
 
 fn run() -> Result<()> {
@@ -154,6 +171,20 @@ fn run() -> Result<()> {
                 }
             }
             bless(filter.as_deref())
+        }
+        "session-matrix" => {
+            let mut check = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--check" => check = true,
+                    "-h" | "--help" => {
+                        println!("{}", usage());
+                        return Ok(());
+                    }
+                    other => bail!("unknown flag '{other}' for 'session-matrix'\n\n{}", usage()),
+                }
+            }
+            session_matrix::session_matrix(&workspace_root()?, check)
         }
         "-h" | "--help" => {
             println!("{}", usage());

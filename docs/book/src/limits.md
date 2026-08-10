@@ -763,6 +763,30 @@ criticises is still what an agent does against it today. The difference so
 far is authorization, not efficiency.
 
 **No X11 shim.** Wayland only. Per-app X11 with an embedded WM is Phase 3.
+There is no X server anywhere in this stack — not in the core, not among the
+globals a shim advertises, not as a process anything here ever starts — and a
+realm's app is handed no `DISPLAY` at all, because `DISPLAY` and `XAUTHORITY`
+are refused outright by the environment the core builds for it. So `xterm` in a
+realm dies before it draws anything, and the failure this project recorded is
+`Can't open display`. That is the fragment the run wrote down; the full line
+`xterm` emitted was not captured, and this page does not reconstruct it.
+
+For anyone thinking of this as a desktop, the consequence is not a footnote. On
+the one machine that has been measured, `xterm`, `feh`, `xsel` and
+`nvidia-settings` are X11-only, as are the X11 window manager, compositor, bar,
+launcher and screen locker installed on it. None of them can run here. The
+maintainer's interim is **a second session, on another virtual terminal, for
+X11-only software** — so "I did not have to go back to my old compositor" is
+false for that set of programs. That is a workaround he accepts, not something
+this project offers or confines: the second session is another compositor with
+full access to the same devices, nothing here knows it exists, and switching to
+it leaves the confined world entirely. It is also one person's arrangement on
+one machine, and it is not advice.
+
+What *has* been run, with the observable each run actually checked, is
+[the session app matrix](session-app-matrix.md). Read it before assuming
+anything else works; it is deliberately shorter than the list of things people
+expect a desktop to run.
 
 **The protocol will break.** v0 is frozen for Phase 1, not forever.
 

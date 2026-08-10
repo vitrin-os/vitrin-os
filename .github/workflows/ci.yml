@@ -7,7 +7,16 @@ name: CI
 #                 two feature slices: gpu-tests (compile-check only) and
 #                 session-keymap (clippy + tests, WS-E.3.1/D-028)
 #   codegen-diff  IDL schema validation + regeneration honesty (the P1.1.2
-#                 contract: checked-in generated code matches vitrin-v0.xml)
+#                 contract: checked-in generated code matches vitrin-v0.xml),
+#                 plus the same contract for the generated session app matrix
+#                 (WS-E.4.1, issue #221: docs/book/src/session-app-matrix.md
+#                 matches what `cargo xtask session-matrix` emits, so a hand
+#                 edit to that page is a red build). Note what this does NOT
+#                 do: a runner has no DRM device, no seat and no GPU, so CI
+#                 cannot run a GUI application and cannot produce a single
+#                 cell of that matrix. It checks the page is generated, and
+#                 nothing about whether the measurements are current -- that
+#                 is the page's own runbook, on the target machine.
 #   deny          the TCB dependency budget (plan risk R7, issue #201):
 #                 `cargo deny check` against the checked-in deny.toml --
 #                 advisories, bans (an itemised multiple-versions decision,
@@ -189,6 +198,10 @@ jobs:
 
   codegen-diff:
     name: codegen-diff (IDL schema + regeneration honesty)
+    # Two generators, one contract: a checked-in artifact must be
+    # byte-identical to what its generator emits, so hand-editing a GENERATED
+    # file fails the build. They share a job because they share the toolchain
+    # install and the cargo cache, and because they fail for the same reason.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -219,6 +232,25 @@ jobs:
         # crates/vitrin-protocol/src/generated + shim/include/vitrin-protocol.h.
         # Fails when generated code drifts from protocol/vitrin-v0.xml.
         run: cargo xtask codegen --check
+
+      - name: cargo xtask session-matrix --check
+        # WS-E.4.1 / issue #221 acceptance criterion 1. Re-renders
+        # docs/book/src/session-app-matrix.md in memory from the corpus in
+        # crates/xtask/src/session_matrix.rs and compares byte-for-byte
+        # against the checked-in page, so a hand edit to that page is a red
+        # build and the app set cannot widen by assertion.
+        #
+        # THIS IS THE ONLY PART OF THAT PAGE CI CAN CHECK. A GitHub runner
+        # has no DRM device, no seat and no GPU, so it cannot run `vitrind`
+        # against a panel and cannot run a GUI application at all -- it
+        # cannot produce a single cell. Whether the cells are still TRUE is
+        # the target machine's runbook, published on the page itself.
+        #
+        # The generator's own gates -- above all the non-vacuity test, which
+        # feeds it an application nobody executed and asserts no row is
+        # emitted -- run in the `rust` job's `cargo test --workspace`,
+        # because xtask is a workspace member.
+        run: cargo xtask session-matrix --check
 
   deny:
     name: deny (TCB dependency budget - plan risk R7)

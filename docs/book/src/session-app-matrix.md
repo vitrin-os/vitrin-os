@@ -25,7 +25,7 @@ internal panel, one kernel. None of it generalises, and reading this page as "Vi
 runs these applications" would be false.
 
 - **Inventory read**: 2026-08-10
-- **Last recorded run in this corpus**: 2026-08-09 — the second bare-metal DRM run (`docs/drm-bringup.md`)
+- **Last recorded run in this corpus**: 2026-08-11 — the operator-driven bare-metal session that ran alacritty and nautilus and produced #268. The last *checklist* run is still 2026-08-09, the second bare-metal DRM run (`docs/drm-bringup.md`)
 - **Kernel**: `7.1.6-arch1-1` — **this is not the kernel the bare-metal evidence was taken on.** Both DRM runs ran on `7.1.5-arch1-2` (`docs/drm-bringup.md`); the machine has since moved up one release
 - **Mesa**: `1:26.1.6-1`
 - **wlroots**: `wlroots0.19 0.19.3-1` — the built shim links `libwlroots-0.19.so` (`readelf -dW shim/build/vitrin-shim`). 0.17 and 0.20 are also installed on this machine and are not what is used
@@ -70,11 +70,12 @@ checklist, an issue's acceptance criterion — the row names that task, and the 
 what the row means. Those rows assert something specific and are much stronger than the
 weak bar.
 
-### The three evidence classes on this page
+### The four evidence classes on this page
 
 | Class | What it proves | Where it appears |
 |---|---|---|
 | Named task | The stated assertion held in a run of the shipped chain | `Bar` column reads `named task: ...` |
+| Operator drove | A human used the application and the named interactions worked. **One person's session, not a repeatable task** — it proves the app was usable that once, by someone who was there | `Bar` column reads `operator drove: ...` |
 | Weak bar | The application mapped a window and repainted, and nothing else was checked | `Bar` column reads `weak bar` |
 | Linkage | An ELF/`strings` measurement of a binary on the machine. **Not a run.** | The three inventory tables near the bottom |
 
@@ -92,6 +93,9 @@ Software a person would daily drive. Every row is a recorded execution against `
 |---|---|---|---|---|---|---|
 | Firefox ESR | 140.12.0esr, sha256 3323ee13…f433d92 (pinned by this repo) | headless | named task: `tests/integration/test_real_firefox.py` | real `vitrind` execs the real `vitrin-shim`, which execs this pinned Firefox rendering a local `file://` page; the real Python SDK captures a frame through the real enforcement/capture path and asserts its dominant colour is the served `#0000ff`, and that the globals ledger contains nothing outside `shim/docs/firefox-refused-globals.txt`. No mock on any seam | met the bar | every PR in CI since `1ebeee2` (2026-07-22) — `tests/integration/test_real_firefox.py`, `shim/docs/firefox.md` §7 (the M1.2 milestone proof) |
 | alacritty | 0.17.0-1 (installed at inventory) | nested under Hyprland | named task: issue #203 acceptance criterion 1 | "a real toolkit terminal (alacritty) runs to completion under `vitrind --nested`" — i.e. a live nested run to completion, after the eager-`set_mode` abort that killed it beforehand | met the bar | 2026-08-06 (the fix landed in `af98130` at 16:38:43 +0900) — issue #203, checked acceptance criterion; commit `af98130` |
+| alacritty | 0.17.0-1 (installed at inventory) | bare-metal DRM/KMS | operator drove: typed into, used as a terminal, and used to launch a second application | **the first real desktop application ever run on the bare-metal backend** — every earlier DRM row is `solid-client`, a test client from `shim/tests`. It mapped as `realm-0`'s app, took keyboard focus, and the operator typed at its prompt and read the output. It survived the session's VT switches. `--blank-idle` blanked and unblanked over it | met the bar | 2026-08-11, during the L1–L7 rung session — `/tmp/vitrind-drm-B.log` from that session — `realm configured … realm=realm-0 command=/usr/bin/alacritty`, `spawned app pid=…: /usr/bin/alacritty`, `keyboard focus taken by the app surface`, `app window mapped: "Alacritty" (Alacritty)`, and 399 `seat-replay: … event=key origin=physical delivered=1 reason=ok` lines. Reported by the operator; issue #268 |
+| Cursor | not recorded at the time of the attempt (installed at inventory) | bare-metal DRM/KMS | weak bar | launched from the alacritty prompt in `realm-0`, the same way nautilus was launched a moment later. Nothing appeared on the panel | **did not map** — it did not open. **The cause is not established**, and nothing here guesses one | 2026-08-11, during the L1–L7 rung session — operator report. **No log covers it** — the retained `/tmp/vitrind-drm-B.log` segment ends before this attempt, and neither the application's own stderr nor its exit status was kept |
+| nautilus | 50.2.2-1 (installed at inventory) | bare-metal DRM/KMS | operator drove: navigated with the mouse, then closed from its own title-bar close button | launched **from the alacritty prompt**, so it was a second toplevel of `realm-0` under the same shim rather than a realm of its own — the only way a second application has ever been started on this backend, since realms come from `realm.toml` and that file names one. It mapped over alacritty, took the keyboard from it, was navigated by mouse, and closed cleanly on its own close button | met the bar | 2026-08-11, during the L1–L7 rung session — operator report; the mechanism is read out in issue #268 against `shim/src/xdg.c` and `shim/src/seat.c` |
 | kitty | 0.48.2-1 (installed at inventory) | headless | weak bar | mapped a window and repainted. Nothing was typed into it, clicked, or checked for correct rendering | met the bar | **undated**; recorded by `7863702` (2026-08-06) — `docs/plan/14-workstream-session-mode.md` §2 "What already works, measured" |
 | Chromium | 151.0.7922.108-1 (installed at inventory) | headless | weak bar | mapped a window and repainted. Nothing was typed into it, clicked, or checked for correct rendering | met the bar | **undated**; recorded by `7863702` (2026-08-06) — `docs/plan/14-workstream-session-mode.md` §2 "What already works, measured" |
 | Visual Studio Code | visual-studio-code-bin 1.131.0-1 (installed at inventory) | headless | weak bar | mapped a window and repainted. Nothing was typed into it, clicked, or checked for correct rendering | met the bar | **undated**; recorded by `7863702` (2026-08-06) — `docs/plan/14-workstream-session-mode.md` §2 "What already works, measured" |
@@ -107,6 +111,9 @@ Software a person would daily drive. Every row is a recorded execution against `
 
 - **Firefox ESR** — this is the pinned Mozilla ESR tarball, not a distro package — Arch ships no `firefox-esr`, and what is installed on the measured machine is `firefox-developer-edition`, which was never run against `vitrind`. The row is about 140.12.0esr and nothing else. The commit that first brought Firefox up in a realm, `cae70f0` (2026-07-20), wired only `firefox_bringup.sh` into CI — under the mock core and declared SKIPPED with `VITRIN_SKIP_FIREFOX_GATE=1` — so it is not this row's provenance.
 - **alacritty** — #203 records only `vitrind --nested`; it does not name the host compositor, so the venue here is this machine's host and not something the record states.
+- **alacritty** — **Nothing was measured.** No latency, no frame count, no correctness check on what the terminal drew — the operator used it and reports that it worked. The log retained on disk covers a 60-second segment ending at a VT switch away, so it corroborates the launch, the focus and the keystroke delivery, and does **not** cover the later part of the session in which #268 was found.
+- **Cursor** — Plausible causes exist and none was checked, so none is recorded: an Electron app needs environment this realm's `env_allow` may not carry, and the row above shows a second toplevel in a realm is a path with a known defect (#268). Both are guesses. What the corpus has is: it was launched, and nothing appeared. Re-running it with the realm's stderr captured is what would turn this row into a cause.
+- **nautilus** — **Closing it broke the session's keyboard, which is issue #268.** `toplevel_unmap` clears keyboard focus to nobody, so alacritty — still mapped and still taking pointer events — could not be typed into again. Read this row as "nautilus itself worked" and not as "two windows in a realm work": the second half of that is a filed bug. Minimize and maximize did nothing, which is **not** a defect — `VITRIN_WM_CAPABILITIES` withholds minimize deliberately and every window is single-maximized at the view size.
 - **kitty** — kitty was proved to **crash** before #203's fix — the abort was reproduced with alacritty and with kitty. #203's acceptance criterion names alacritty alone as re-run to completion afterwards, and no record anywhere shows kitty re-run post-fix. So this row is the weak bar and not #203's named task.
 - **Visual Studio Code** — the recorded row reads "Electron (VS Code — so also Discord, Slack, Obsidian)". Only VS Code was run; the other three are an inference from a shared runtime and are declined below rather than given rows.
 - **xterm** — the repository holds only the fragment `Can't open display`, never the as-emitted line. `libXt`'s format string is `Can't open display: %s`, so the real line carries a colon and the display name; those bytes were not captured and are not reconstructed here.
@@ -114,7 +121,7 @@ Software a person would daily drive. Every row is a recorded execution against `
 
 ## Repository test clients executed against `vitrind`
 
-Clients this repository wrote. Nobody daily drives them, and **the strongest evidence in the tree is about them** — which is exactly why they are in a separate table. In particular: no desktop application has ever run on bare-metal DRM/KMS. Both bare-metal runs used `solid-client`.
+Clients this repository wrote. Nobody daily drives them, and **the strongest evidence in the tree is about them** — which is exactly why they are in a separate table. The two *checklist* runs of the bare-metal backend both used `solid-client`; the desktop applications that have since run on it (2026-08-11) were driven by hand in one session and are recorded at the `operator drove` bar, which is not a repeatable task.
 
 | App | Version | Where it ran | Bar | Observable checked | Outcome | Recorded, and where |
 |---|---|---|---|---|---|---|
@@ -130,7 +137,7 @@ Clients this repository wrote. Nobody daily drives them, and **the strongest evi
 - **weston-terminal** — a real third-party Wayland client with a mock-free gate — stronger evidence than any weak-bar row above — but nobody daily drives it, so it says nothing about a desktop. The cited gate runs on `ubuntu-latest` against apt's `weston` (`shim/ci/install-deps.sh`), whose version this page does not record.
 - **gtk-entry-probe** — this is a GTK3 **fixture**, not nautilus, gimp or inkscape, and it must not be cited as evidence for those three. No GTK4 or Qt6 fixture exists.
 - **clipboard-peer** — the repository's own precedent for how to record a substitution honestly: #213 names alacritty and Firefox, neither of which can be made in CI to put a *known* string on a clipboard without a human's mouse, so a toolkit-free client stands in and the README says so. Not asserted: that a real chord on real hardware produces any of it.
-- **solid-client** — `solid-client` commits `wl_shm` buffers and is not a desktop application. No desktop application has ever run on bare metal, and the second run's own open list notes the shim never emits dmabuf, so the zero-copy scanout path is dead code against every real application.
+- **solid-client** — `solid-client` commits `wl_shm` buffers and is not a desktop application. On the date of this run no desktop application had ever reached bare metal; two did on 2026-08-11, by hand, and their rows are above. The second run's own open list notes the shim never emits dmabuf, so the zero-copy scanout path is dead code against every real application either way.
 - **solid-client** — still `solid-client`. Three items stayed open after this run: `vitrind`'s own log line renders the connector name empty, the shim never emits dmabuf, and `refresh_view_cache` composes for absent consumers.
 - **input-echo-client** — the run found a shipped defect — `TextureKey::current` enumerated every input to `compose_human_visible` except the lock, which is a locked session that looked unlocked. Two further warnings: the page states step 7 is weaker than it reads (`input-echo-client` is static, so every frame carried the identical digest), and the page contradicts itself by also carrying an empty "not yet executed" record block further down. It *was* executed.
 
@@ -235,10 +242,15 @@ is the fragment `Can't open display`. The real format string in `libXt` is `Can'
 display: %s`, so the emitted line has the shape `<progname>: <error type>: Can't open
 display: <display>` — but the bytes `xterm` actually wrote in that realm are gone, and
 they are not reconstructed here. Capturing them is a runbook step.
-- **No desktop application has ever run on bare metal.** Both DRM/KMS runs used
-`solid-client`. There is a named reason to expect a difference, recorded by the second
-run itself: the shim never emits dmabuf, so the zero-copy scanout path is dead code
-against every real application.
+- **Desktop applications have run on bare metal exactly once, by hand.** alacritty and
+nautilus on 2026-08-11, in one operator-driven session — not a checklist run, not
+repeatable by someone who was not there, and measured for nothing. The two runs the
+bring-up runbook records both used `solid-client`. That session also produced a defect
+(#268: closing a second window in a realm leaves the keyboard focused on nobody) and one
+application that did not open at all with no cause established. The named reason to
+expect further difference still stands, recorded by the second checklist run: the shim
+never emits dmabuf, so the zero-copy scanout path is dead code against every real
+application.
 - **Every inventory row is linkage, not behaviour**, and linkage has demonstrated false
 positives in both directions on this machine. Chromium, Blender, scrcpy, OpenRGB and
 rpi-imager all classify X11-only by `DT_NEEDED` and all five have Wayland paths

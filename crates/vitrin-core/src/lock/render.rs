@@ -131,6 +131,12 @@ const LABEL_STILL_RUNNING: &str = "Still running";
 
 const CAUSE_CHORD: &str = "the lock chord";
 const CAUSE_IDLE: &str = "no physical input for the configured idle time";
+/// The seat-change cause (issue #246). It names the **event**, not a gesture:
+/// a session can be deactivated for reasons this core never sees, so the card
+/// says what is certainly true and the policy that turned it into a lock is
+/// named beside it.
+const CAUSE_SEAT: &str = "the seat went to another VT, and this session is set to lock when it \
+                          does";
 
 const UNLOCK_PASSPHRASE: &str =
     "Type the session passphrase and press Enter. Backspace edits; Escape clears.";
@@ -289,6 +295,7 @@ fn rows(content: &LockContent, text: &mut Text) -> Vec<Row> {
         match content.cause {
             LockCause::Chord => CAUSE_CHORD,
             LockCause::Idle => CAUSE_IDLE,
+            LockCause::SeatChange => CAUSE_SEAT,
         },
         VALUE_FG,
     );
@@ -391,6 +398,15 @@ mod tests {
         let mut idle_content = lock_fixture();
         idle_content.cause = LockCause::Idle;
         assert_ne!(chord.rgba, rasterize(&idle_content).rgba);
+
+        // The third cause (issue #246) is drawn as its own line rather than
+        // falling back to one of the other two, which is how a card would come
+        // to tell a human their session locked on an idle timer they never set.
+        let mut seat = lock_fixture();
+        seat.cause = LockCause::SeatChange;
+        let seat_card = rasterize(&seat);
+        assert_ne!(chord.rgba, seat_card.rgba);
+        assert_ne!(rasterize(&idle_content).rgba, seat_card.rgba);
 
         let mut any_key = lock_fixture();
         any_key.unlock = UnlockMethod::AnyKey;

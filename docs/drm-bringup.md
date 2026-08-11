@@ -494,6 +494,42 @@ Wait five seconds. Come back.
 | | Panel comes back black, `vitrind` alive | Master was not reacquired on resume. You still have VT switching — go back to your tty2 escape shell and kill it |
 | | **You cannot switch away at all** | **THIS IS WHAT HAPPENED, 2026-08-09.** The guess this row used to carry — "something is grabbing the keyboard" — was wrong, and following it would have sent you hunting a phantom. Once `vitrind` holds the display the kernel stops handling `Ctrl+Alt+F<n>` entirely; the compositor must call `Session::change_vt`, and D-030(1) refused to implement it. There is nothing to un-grab. Recover with `pkill -TERM -f "vitrind --drm"` from the Hyprland-side shell in Step 0.1 |
 
+### 12a. The other two seat policies (WS-E, issue #246) — NOT YET RUN
+
+Step 12 exercises the **default**, `--lock-on-seat-change never`. The other two
+answers are `immediate` and `idle`, and **no run has ever exercised either**.
+This rung is written before it is executed, on D-033's precedent, so that the
+thing which has to happen is written down rather than implied; leave the record
+block empty until you have actually done it.
+
+Each is a fresh `vitrind` with the step-6 command line plus one flag, and each
+needs a **passphrase file** to be worth anything — without one the card is a
+privacy screen and Enter dismisses it, which proves the raise but not the cost.
+
+```bash
+# 12a-i — immediate: leaving locks, whatever the timers say.
+vitrind --drm --lock-passphrase-file ~/.vitrin-pass \
+        --lock-on-seat-change immediate ... 2>&1 | tee /tmp/vitrind-drm.log
+# 12a-ii — idle: a long absence returns locked, a short one does not.
+vitrind --drm --lock-passphrase-file ~/.vitrin-pass --lock-idle 60 \
+        --lock-on-seat-change idle ... 2>&1 | tee /tmp/vitrind-drm.log
+```
+
+| Rung | Expected [inferred] | Failure | What it means |
+|---|---|---|---|
+| 12a-i | Switch to tty2, come straight back: the panel shows the **lock card**, and it names the seat (`the seat went to another VT…`), not an idle timer that never fired | Panel comes back unlocked | The policy never reached the lock. `grep on_seat_change /tmp/vitrind-drm.log` — the startup banner names it; if it says `never`, `run_inner` dropped the flag |
+| 12a-i | | The card blames the idle timer | Wrong `LockCause` on the raise; the journal's `session_locked` cause should read `seat` |
+| 12a-ii | Switch away, wait **~10 s**, come back: the panel is **unlocked** and the countdown has ~50 s of the absence charged against it | Locked after 10 s | The carry is over-charging, or `--lock-idle` is shorter than you think |
+| 12a-ii | Switch away, wait **> 60 s**, come back: the panel is **locked** on the first round after you return, cause `idle` | Comes back unlocked | The absence was not charged. This is the exact shape issue #257 fixed once already — the instant must come from `session::note_seat_presence`, not from a cell an input turn wrote |
+| 12a-ii | Switch away > 60 s, come back and **type immediately**: still unlocked, and it stays unlocked for a further 60 s | Locks on you as you type | A carry survived physical input, which is the one thing `judge` clears it for |
+
+**Record block — empty on purpose. Do not fill it in from reasoning.**
+
+```text
+12a-i   date: ____  result: ____
+12a-ii  date: ____  result: ____
+```
+
 ## 13. Type a letter (WS-E.3.1)
 
 Type `hello` into the terminal, on your real layout.

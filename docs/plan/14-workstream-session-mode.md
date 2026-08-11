@@ -1589,7 +1589,12 @@ correction is followed here and not the issue.
   real suspend on the target machine.
 - **A configurable lock-on-blank / lock-on-switch policy.** D-030(2) already
   filed it; Decision 1 forbids coupling idle-blank to idle-lock here.
-  **Reopened by:** the owner asking for it.
+  **Reopened by:** the owner asking for it. **The lock-on-switch half is now
+  built** — `--lock-on-seat-change immediate|idle|never` (issue #246,
+  [D-034](20-decision-log.md#d-034--losing-the-seat-is-a-configurable-lock-policy-with-d-0302s-answer-as-the-default-and-lockcause-gains-the-third-variant-that-entry-declined)),
+  defaulting to D-030(2)'s answer so no session that never names the flag
+  changes. The lock-on-**blank** half stands deferred on Decision 1, which is
+  the one this bullet's second sentence is about.
 - **`--blank-idle` on `--nested`.** Refused at startup with a named reason: a
   nested `vitrind` painting its window black would be asserting something about a
   screen the host owns. **Reopened by:** someone naming a host fact that means
@@ -2045,7 +2050,11 @@ this workstream owns, not inherits:
   bullet did not ask, which is that a switch away does *not* raise the lock
   (it would claim a protection the core does not have and charge the human a
   passphrase for using the escape hatch). Published, in the human's words, in
-  `docs/book/src/limits.md`.
+  `docs/book/src/limits.md`. **Still the default, and now one of three**
+  (issue #246, D-034): `--lock-on-seat-change immediate` locks on the way out
+  for an operator who wants that trade, `idle` charges the absence to the idle
+  countdown, and `never` — what every session that says nothing gets — is the
+  behaviour this bullet describes. No policy lowers a lock that is already up.
 - **A passphrase is nested-only, because a headless backend has no keyboard** (created
   by WS-E.2.2, closed only by Stage 3 answering the keymap question). `--lock-passphrase-file`
   is refused at startup with `--headless`, naming the reason. Without it the

@@ -111,17 +111,78 @@
 //! logged at `warn`. The human has no other instrument — the core has no
 //! surface on which to tell them — and a silently dropped screenshot on a full
 //! disk is exactly the failure someone discovers a week later.
+//!
+//! # The encode runs on a worker thread (issue #240)
+//!
+//! It used to run inside the input round. That was measured, not estimated:
+//! **71.7 ms** in a release build to turn one 2560x1600 frame into a 12.3 MB
+//! PNG, which at 240 Hz is ~17 frames the human does not get — every press.
+//! [`crate::capture::render_screenshot`] is now reached from
+//! [`ScreenshotWriter`]'s own thread, and what the compositor pays per press is
+//! one copy of the frame plus a channel send.
+//!
+//! **The frame crossing a thread boundary is the part that needed an argument,
+//! not the latency.** This buffer is the human's screen, and the TCB's safety
+//! story for it was "one place writes it, and that place holds no path". Three
+//! things keep that true, and the change makes two of them *stronger*:
+//!
+//! - **The audited directory descriptor moves to the worker and the compositor
+//!   thread no longer holds one.** [`ScreenshotDir`] is owned by the worker for
+//!   its whole life; [`ScreenshotWriter`] holds a sender, a receiver and a path
+//!   for log lines. So after this change there is no thread in the process that
+//!   can both reach a realm's pixels and open a file in that directory — which
+//!   is narrower than what shipped, not wider.
+//! - **Nothing new can reach the encoder.** The worker's only input is
+//!   [`EncodeJob`], a private type with no public constructor whose only
+//!   producer is [`ScreenshotWriter::submit`], which still takes a
+//!   [`ScreenshotGesture`] the physical-origin matcher produced. The
+//!   [`HumanGesture`] proof is minted on the worker exactly where it was minted
+//!   on the compositor thread — inside [`capture_to_file`] — so the chain a
+//!   principal cannot enter is the same chain, one thread over.
+//! - **The bytes are a copy, and copies of this frame already exist.** The same
+//!   realm view is sealed into a memfd for any `observe` holder
+//!   ([`crate::capture`]); a `Vec<u8>` moved down a channel to a thread of this
+//!   same process is not a new disclosure surface. It is `Send` because it is a
+//!   `Vec<u8>` and nothing else — no descriptor, no `Rc`, no realm handle rides
+//!   with it. What does ride with it is the realm id, so the journal can name
+//!   the realm the frame was of after the compositor has moved on.
+//!
+//! **What happens to a pending encode.** Two answers, and both are decisions:
+//!
+//! - **The session ending waits for it.** [`crate::session::Runtime::into_recorder`]
+//!   — the one funnel every backend leaves through — calls
+//!   [`ScreenshotWriter::finish`], which stops accepting work, waits up to
+//!   [`FINISH_DEADLINE`] for the encodes already accepted, and journals each
+//!   one. So a screenshot taken a moment before `SIGTERM` still lands on disk
+//!   *and* in the log of the run it belongs to. Past the deadline the process
+//!   exits with a `write(2)` possibly half-done — a truncated PNG, which is the
+//!   honest outcome of a filesystem that has stopped answering, and is
+//!   journalled as `writer_timeout` rather than passed over in silence.
+//! - **The dead-man switch does not cancel it, deliberately.** The off-switch
+//!   destroys *authority*, and a human photographing their own screen is not
+//!   authority — the same reasoning that keeps [`crate::deadman::apply`] from
+//!   clearing the writer, and the reason a hold does not suppress the chord in
+//!   the first place. A screenshot taken during a hold therefore shows the
+//!   session as it was before the revocation landed, which was already true
+//!   when the encode was synchronous.
+//!
+//! **The queue is bounded** ([`MAX_QUEUED_ENCODES`]) and a full queue refuses
+//! loudly (`encoder_busy`) rather than growing: each job is a whole frame —
+//! 16 MB on the panel measured above — so an unbounded queue behind a slow disk
+//! is the compositor's memory, spent on pictures nobody is waiting for.
 
 use std::cell::RefCell;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::SystemTime;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::time::{Duration, SystemTime};
 
 use rustix::fs::{Mode, OFlags};
 
 use crate::chord::{ChordMatcher, ChordSpecError, ModChord};
+use crate::grants::RealmId;
 use crate::input::{Gate, PreemptionHook, SeatInput};
 use crate::recorder::ObservationDigest;
 
@@ -624,6 +685,264 @@ pub(crate) fn capture_to_file(
     }
 }
 
+/// How many encodes may be waiting behind the one in flight.
+///
+/// Small on purpose, and the unit is a **whole frame**: one job is
+/// `width * height * 4` bytes — 16 MB on the panel issue #240 measured — so the
+/// queue's real bound is memory, not latency. A human cannot chord faster than
+/// this except by holding the key, and a backlog that outruns the encoder means
+/// the disk has stopped answering, where the useful behaviour is to say so
+/// (`encoder_busy`) rather than to hold three more pictures of the screen in
+/// the compositor's heap.
+const MAX_QUEUED_ENCODES: usize = 2;
+
+/// How long [`ScreenshotWriter::finish`] waits for the encodes it already
+/// accepted, at the end of the session.
+///
+/// Bounded rather than a plain `join`: the worker is inside `write(2)` on a
+/// directory the operator named, and a filesystem that has stopped answering
+/// must not turn "the session ended" into "the session hangs". Five seconds is
+/// far longer than the bounded work can legitimately take —
+/// [`MAX_QUEUED_ENCODES`] + 1 encodes at the measured 72 ms is a fifth of a
+/// second — so reaching it means something outside this process is wrong, and
+/// the timeout is journalled as `writer_timeout` rather than passed over.
+const FINISH_DEADLINE: Duration = Duration::from_secs(5);
+
+/// One frame on its way to the worker.
+///
+/// **Private, with no public constructor**, and that is the whole of why moving
+/// the encode off the compositor thread did not widen anything: the only
+/// producer is [`ScreenshotWriter::submit`], which still takes a
+/// [`ScreenshotGesture`] that only the physical-origin matcher mints. A
+/// principal cannot construct this any more than it could call
+/// [`crate::capture::render_screenshot`] directly.
+///
+/// It carries no descriptor, no handle and no reference — a `Vec<u8>`, two
+/// integers, a realm id and a gesture — so what crosses the thread boundary is
+/// exactly the pixels plus the label the journal needs, and nothing that could
+/// be used to ask for more of them.
+struct EncodeJob {
+    realm: RealmId,
+    gesture: ScreenshotGesture,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+/// What the worker reports back, for the compositor thread to journal.
+///
+/// The journal entry is written on the compositor thread and nowhere else: the
+/// [`crate::recorder::Recorder`] is kernel state, single-threaded like the rest
+/// of it, and handing a second thread a way to write the flight recorder would
+/// be a far larger change to the TCB than moving an encode.
+pub(crate) struct ScreenshotOutcome {
+    /// The realm whose view this was — carried through the worker because the
+    /// compositor's idea of the focused realm may have moved on by the time the
+    /// outcome arrives.
+    pub realm: RealmId,
+    pub width: u32,
+    pub height: u32,
+    /// The file name and its digest, or a fixed label from
+    /// [`capture_to_file`]'s closed vocabulary plus this module's own
+    /// `writer_timeout`.
+    pub result: Result<(String, ObservationDigest), &'static str>,
+}
+
+/// The screenshot key's worker: **the only thing in the process that holds the
+/// audited directory**, and the only place [`capture_to_file`] runs.
+///
+/// The compositor thread keeps a bounded sender, a receiver of outcomes, and
+/// the path for log lines. It cannot write a file, because it no longer owns a
+/// [`ScreenshotDir`].
+///
+/// One thread per session, spawned only when the operator passed
+/// `--screenshot-dir`: a default `vitrind` is exactly as single-threaded as it
+/// was before this existed.
+pub(crate) struct ScreenshotWriter {
+    /// `None` after [`Self::finish`] has taken it: dropping the sender is what
+    /// tells the worker to stop.
+    jobs: Option<SyncSender<EncodeJob>>,
+    outcomes: Receiver<ScreenshotOutcome>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    /// Accepted and not yet reported, oldest first — what [`Self::finish`] has
+    /// to wait for, and the only bookkeeping this type does.
+    ///
+    /// A queue rather than a counter so a job that never comes back can still
+    /// be journalled against **its own realm**: one worker consumes the channel
+    /// in order and reports in order, so the front of this queue is always the
+    /// job the next outcome is for.
+    inflight: std::collections::VecDeque<(RealmId, u32, u32)>,
+    /// What the operator wrote, for the startup log line. Never used to open
+    /// anything — the descriptor that does that is on the worker.
+    path: PathBuf,
+}
+
+impl ScreenshotWriter {
+    /// Take ownership of the audited directory and start the worker.
+    ///
+    /// Fails only if the thread cannot be spawned, which is a startup refusal
+    /// at the one call site (`main`): a session that came up with a screenshot
+    /// key that silently does nothing is the fail-open configuration this
+    /// module's flag parsing already refuses.
+    pub fn spawn(dir: ScreenshotDir) -> io::Result<Self> {
+        let path = dir.path().to_path_buf();
+        let (jobs, inbox) = std::sync::mpsc::sync_channel::<EncodeJob>(MAX_QUEUED_ENCODES);
+        let (report, outcomes) = std::sync::mpsc::channel::<ScreenshotOutcome>();
+        let worker = std::thread::Builder::new()
+            .name("vitrind-screenshot".to_string())
+            .spawn(move || {
+                // `dir` is moved in and lives exactly as long as this loop: the
+                // descriptor is closed when the sender drops and `recv` ends.
+                let mut dir = dir;
+                while let Ok(job) = inbox.recv() {
+                    let result =
+                        capture_to_file(&mut dir, job.gesture, &job.rgba, job.width, job.height);
+                    // A send failure means the compositor is gone; there is
+                    // nobody left to journal for and nothing to clean up.
+                    if report
+                        .send(ScreenshotOutcome {
+                            realm: job.realm,
+                            width: job.width,
+                            height: job.height,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            jobs: Some(jobs),
+            outcomes,
+            worker: Some(worker),
+            inflight: std::collections::VecDeque::new(),
+            path,
+        })
+    }
+
+    /// The directory the operator named, for a log line and the journal.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Hand one frame to the worker, copying it out of the capture cache.
+    ///
+    /// **This is the whole of what a press now costs the compositor thread**: a
+    /// `to_vec` of the realm view and a non-blocking send. Never blocking —
+    /// `try_send` — because the one thing this change must not reintroduce is
+    /// the compositor waiting on a file write.
+    pub fn submit(
+        &mut self,
+        realm: &RealmId,
+        gesture: ScreenshotGesture,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(), &'static str> {
+        let Some(jobs) = self.jobs.as_ref() else {
+            return Err("writer_stopped");
+        };
+        let job = EncodeJob {
+            realm: realm.clone(),
+            gesture,
+            rgba: rgba.to_vec(),
+            width,
+            height,
+        };
+        match jobs.try_send(job) {
+            Ok(()) => {
+                self.inflight.push_back((realm.clone(), width, height));
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => Err("encoder_busy"),
+            // The worker panicked or stopped. A screenshot key that has lost
+            // its writer is a key that does nothing, which is exactly the thing
+            // this module journals rather than hides.
+            Err(TrySendError::Disconnected(_)) => Err("writer_stopped"),
+        }
+    }
+
+    /// Everything the worker has finished since the last call, oldest first.
+    ///
+    /// Non-blocking: called once per dispatch round from
+    /// [`crate::session::post_dispatch`], where the ordinary answer is "nothing"
+    /// and the cost is one `try_recv` on an empty channel.
+    pub fn take_outcomes(&mut self) -> Vec<ScreenshotOutcome> {
+        let mut done = Vec::new();
+        while let Ok(outcome) = self.outcomes.try_recv() {
+            self.inflight.pop_front();
+            done.push(outcome);
+        }
+        done
+    }
+
+    /// Stop accepting work, wait out the encodes already accepted, and report
+    /// every one of them.
+    ///
+    /// Idempotent, so the session's shutdown funnel and a later drop can both
+    /// call it. The wait is bounded by [`FINISH_DEADLINE`]; a job still
+    /// unreported when it expires is returned as `writer_timeout`, because a
+    /// screenshot the human asked for and never got is exactly the failure this
+    /// module refuses to drop silently.
+    pub fn finish(&mut self) -> Vec<ScreenshotOutcome> {
+        // Dropping the sender is the stop signal: the worker's `recv` ends once
+        // the queue is drained, and only then.
+        self.jobs = None;
+        let mut done = Vec::new();
+        let deadline = std::time::Instant::now() + FINISH_DEADLINE;
+        while !self.inflight.is_empty() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match self.outcomes.recv_timeout(left) {
+                Ok(outcome) => {
+                    self.inflight.pop_front();
+                    done.push(outcome);
+                }
+                // Disconnected: the worker is gone and nothing more will
+                // arrive, so the remainder is accounted for below.
+                Err(_) => break,
+            }
+        }
+        for (realm, width, height) in std::mem::take(&mut self.inflight) {
+            tracing::warn!(
+                dir = %self.path.display(),
+                %realm,
+                "a screenshot encode was still in flight when the session ended"
+            );
+            done.push(ScreenshotOutcome {
+                realm,
+                width,
+                height,
+                result: Err("writer_timeout"),
+            });
+        }
+        if let Some(worker) = self.worker.take() {
+            // The worker holds no lock the loop needs and the queue it is
+            // draining is empty by now in every case but the timeout, where the
+            // join is the wait that keeps a half-written PNG from being the
+            // ordinary outcome of an exit.
+            let _ = worker.join();
+        }
+        done
+    }
+}
+
+impl Drop for ScreenshotWriter {
+    /// The safety net for a path that did not call [`Self::finish`] — a test
+    /// rig, or a panic on the way out. It cannot journal (the recorder has
+    /// already gone back to `run_session` by then, which is why `finish` exists
+    /// as a named path at all), but it still waits, so the last file of a
+    /// session is whole.
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            let _ = self.finish();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,8 +1239,14 @@ mod tests {
     /// presses. Planting a whole run of them and asserting ONE press still
     /// writes is what distinguishes "refuses to clobber" from "gives up".
     /// How long one press actually costs the compositor thread, measured
-    /// rather than argued: the encode runs synchronously inside
-    /// `route_physical_turn`, so this is a real stall on the human's frame.
+    /// rather than argued.
+    ///
+    /// **Two numbers since issue #240, and the difference between them is the
+    /// change**: the encode itself is untouched — `vitrin-png` is still the
+    /// dependency-free, stored-block, bitwise-CRC encoder it was, and this
+    /// still reports its cost — but it no longer runs where the press does.
+    /// What the compositor thread pays is the second number: one copy of the
+    /// frame out of the capture cache and a channel send.
     #[test]
     #[ignore = "measurement, not an assertion; run with --ignored"]
     fn measure_encode_cost_at_a_real_panel_size() {
@@ -935,6 +1260,36 @@ mod tests {
             elapsed,
             png.len()
         );
+
+        // ...and what the press now costs the thread that took it.
+        let dir = tmpdir("measure");
+        let rgba = vec![0x5au8; (w * h * 4) as usize];
+        let mut writer = ScreenshotWriter::spawn(ScreenshotDir::open(&dir).expect("clean dir"))
+            .expect("the worker starts");
+        let realm = RealmId::new("realm-0");
+        let start = std::time::Instant::now();
+        writer
+            .submit(&realm, ScreenshotGesture::Full, &rgba, w, h)
+            .expect("the queue is empty");
+        let handoff = start.elapsed();
+        eprintln!("MEASURED compositor-thread hand-off {w}x{h}: {handoff:?} (first press)");
+        // ...and again once the worker has freed the first frame, which is what
+        // a session's second and every later press actually costs: the same
+        // copy into an allocation the process has already faulted in.
+        while writer.take_outcomes().is_empty() {
+            std::thread::yield_now();
+        }
+        let start = std::time::Instant::now();
+        writer
+            .submit(&realm, ScreenshotGesture::Full, &rgba, w, h)
+            .expect("the queue is empty");
+        eprintln!(
+            "MEASURED compositor-thread hand-off {w}x{h}: {:?} (steady state)",
+            start.elapsed()
+        );
+        let outcomes = writer.finish();
+        assert_eq!(outcomes.len(), 1, "the measured frame was really written");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -983,6 +1338,216 @@ mod tests {
             ObservationDigest::of(&on_disk).to_hex(),
             "the journal's digest identifies the bytes on disk"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The encode does not happen on the thread that pressed the key**
+    /// (issue #240), measured against the encode itself rather than against a
+    /// wall-clock constant.
+    ///
+    /// The comparison is the point. A fixed millisecond budget would be a
+    /// machine-speed assertion; timing the *same* encode synchronously first
+    /// and requiring the hand-off to be at least four times cheaper scales with
+    /// whatever runs it, and it is exactly the claim the issue makes: what a
+    /// press costs the compositor is now one copy of the frame and a channel
+    /// send. Against the code this replaces the two timings are the same work,
+    /// so the ratio is ~1 and this fails.
+    ///
+    /// The margin is deliberately loose — the real ratio is two to three orders
+    /// of magnitude — so that a scheduler hiccup cannot turn a structural
+    /// property into a flake.
+    #[test]
+    fn the_encode_does_not_run_on_the_submitting_thread() {
+        let dir = tmpdir("offthread");
+        let (w, h) = (512u32, 512u32);
+        let rgba = vec![0x5au8; (w * h * 4) as usize];
+        let rgb: Vec<u8> = rgba
+            .chunks_exact(4)
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect();
+
+        // What the compositor thread used to pay, on this machine, right now.
+        let start = std::time::Instant::now();
+        let png = vitrin_png::encode_rgb(w, h, &rgb);
+        let synchronous = start.elapsed();
+        assert!(!png.is_empty(), "the fixture must actually encode");
+
+        let mut writer = ScreenshotWriter::spawn(ScreenshotDir::open(&dir).expect("clean dir"))
+            .expect("the worker starts");
+        let realm = RealmId::new("realm-0");
+        let start = std::time::Instant::now();
+        writer
+            .submit(&realm, ScreenshotGesture::Full, &rgba, w, h)
+            .expect("the queue is empty");
+        let handoff = start.elapsed();
+        assert!(
+            handoff * 4 < synchronous,
+            "submitting a frame took {handoff:?} against {synchronous:?} to encode the same \
+             frame here: the press is still paying for the encode, which is the whole of \
+             issue #240"
+        );
+
+        // ...and the work really did happen: the file is the encoding of the
+        // frame, written by the worker, and the outcome names it.
+        let outcomes = writer.finish();
+        assert_eq!(outcomes.len(), 1);
+        let (name, digest) = outcomes[0]
+            .result
+            .as_ref()
+            .expect("the worker wrote the file")
+            .clone();
+        assert_eq!(outcomes[0].realm, realm);
+        let on_disk = std::fs::read(dir.join(&name)).expect("read back");
+        assert_eq!(on_disk, png, "the worker's bytes are the encoder's bytes");
+        assert_eq!(digest.to_hex(), ObservationDigest::of(&on_disk).to_hex());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The encoder has exactly one call site and it is on the worker**, held
+    /// by a source scan rather than by a comment.
+    ///
+    /// The timing test above states the property behaviourally; this one states
+    /// it structurally, and the two fail for different reasons. A second call
+    /// to [`capture_to_file`] — the obvious "just encode it here, it is only
+    /// one frame" — would put a PNG encode back on whatever thread made it,
+    /// with every other test still green, because nothing else in this crate
+    /// can tell which thread it ran on.
+    #[test]
+    fn the_encoder_has_one_call_site_and_it_is_inside_the_worker() {
+        fn rust_sources(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).expect("the crate source tree is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("a readable source file");
+                    // Truncated at the trailing test module and stripped of
+                    // comment lines, the discipline `enforcement.rs`'s census
+                    // and `backend/mod.rs`'s chokepoint scan both use: this is
+                    // about production call sites, and the paragraph above
+                    // names the function on purpose.
+                    let production = text
+                        .split_once("\n#[cfg(test)]\nmod tests {")
+                        .map(|(before, _)| before.to_string())
+                        .unwrap_or(text);
+                    let production = production
+                        .lines()
+                        .filter(|line| !line.trim_start().starts_with("//"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    out.push((path, production));
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        rust_sources(
+            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut sources,
+        );
+        // Assembled at runtime so this test's own source cannot match it.
+        let needle = format!("capture_to_{}(", "file");
+        let mut total = 0;
+        for (path, text) in &sources {
+            let hits = text.matches(needle.as_str()).count();
+            if path.ends_with("screenshot.rs") {
+                total += hits;
+                continue;
+            }
+            assert_eq!(
+                hits,
+                0,
+                "{} calls the screenshot encoder: it must be reachable only from the writer's \
+                 own thread, or the 71.7 ms encode is back on whatever thread that is",
+                path.display()
+            );
+        }
+        assert_eq!(
+            total, 2,
+            "expected exactly the definition and the worker's one call to `{needle}`"
+        );
+        let (_, home) = sources
+            .iter()
+            .find(|(path, _)| path.ends_with("screenshot.rs"))
+            .expect("this module is in the scan, or it proves nothing");
+        let spawn_at = home
+            .find("pub fn spawn(")
+            .expect("the writer's constructor, which owns the worker's body");
+        let call_at = home
+            .rfind(needle.as_str())
+            .expect("the one call site was just counted");
+        assert!(
+            call_at > spawn_at,
+            "the encoder's call site moved out of the worker's body: it is only off the \
+             compositor thread while it is inside the closure `spawn` hands to the thread"
+        );
+    }
+
+    /// **A backlog refuses rather than growing.** Each job is a whole frame, so
+    /// an unbounded queue behind a slow disk is the compositor's memory spent on
+    /// pictures nobody is waiting for. Sixteen rapid presses cannot all be
+    /// accepted: the queue holds [`MAX_QUEUED_ENCODES`] behind the one in
+    /// flight, and copying sixteen frames is orders of magnitude cheaper than
+    /// encoding thirteen of them.
+    #[test]
+    fn a_backlog_is_refused_and_the_refusal_is_named() {
+        let dir = tmpdir("backlog");
+        let (w, h) = (512u32, 512u32);
+        let rgba = vec![0x27u8; (w * h * 4) as usize];
+        let mut writer = ScreenshotWriter::spawn(ScreenshotDir::open(&dir).expect("clean dir"))
+            .expect("the worker starts");
+        let realm = RealmId::new("realm-0");
+        let mut refusals = Vec::new();
+        for _ in 0..16 {
+            if let Err(reason) = writer.submit(&realm, ScreenshotGesture::Full, &rgba, w, h) {
+                refusals.push(reason);
+            }
+        }
+        assert!(
+            refusals.iter().all(|r| *r == "encoder_busy"),
+            "a full queue must refuse under its own label, got {refusals:?}"
+        );
+        assert!(
+            !refusals.is_empty(),
+            "sixteen presses in a row must not all be accepted: the queue is bounded at \
+             {MAX_QUEUED_ENCODES} behind the one in flight, and each job is a whole frame"
+        );
+        // Everything accepted is still reported, and nothing accepted is lost.
+        let accepted = 16 - refusals.len();
+        assert_eq!(writer.finish().len(), accepted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A screenshot accepted a moment before the session ends still lands,
+    /// and still lands in the log.** The wait is
+    /// [`ScreenshotWriter::finish`]'s; the journalling half is
+    /// `session::into_recorder`'s, which calls it.
+    #[test]
+    fn a_pending_encode_survives_the_end_of_the_session() {
+        let dir = tmpdir("pending");
+        let (w, h) = (256u32, 256u32);
+        let rgba = vec![0xc3u8; (w * h * 4) as usize];
+        let mut writer = ScreenshotWriter::spawn(ScreenshotDir::open(&dir).expect("clean dir"))
+            .expect("the worker starts");
+        writer
+            .submit(
+                &RealmId::new("realm-a"),
+                ScreenshotGesture::Full,
+                &rgba,
+                w,
+                h,
+            )
+            .expect("accepted");
+        // No draining in between: the session ends with the encode in flight.
+        let outcomes = writer.finish();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the pending encode is reported, not lost"
+        );
+        let (name, _) = outcomes[0].result.as_ref().expect("written").clone();
+        assert!(dir.join(&name).is_file(), "the file is whole on disk");
+        // Idempotent: a later drop must not wait again or double-report.
+        assert!(writer.finish().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

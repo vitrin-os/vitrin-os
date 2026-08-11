@@ -502,12 +502,14 @@ These were owed to issue #223 and were pasted into it on **2026-08-11**; the run
 is recorded below. Two of them are still owed at their stated counts — L2 ran 4
 of 5 cycles, and L3 ran 2 of 5 of which only one suspended, so it is **one
 usable sample** — and L6's answer was not recoverable at all. `L7` is newer than
-the run and **has never been executed in any form**: it exists to close the
-three defects `L4` found ([#257](https://github.com/vitrin-os/vitrin-os/issues/257),
-[#258](https://github.com/vitrin-os/vitrin-os/issues/258),
-[#259](https://github.com/vitrin-os/vitrin-os/issues/259)), whose fixes are code
-with component tests behind them and nothing more — **CI has no seat and no DRM
-device, so nothing in this repository has observed any of them on hardware**:
+that run and was executed separately, later the same day, **at a 20 s timeout
+and by eye rather than by the clock** — enough to settle
+[#257](https://github.com/vitrin-os/vitrin-os/issues/257) and nothing else.
+[#258](https://github.com/vitrin-os/vitrin-os/issues/258) and
+[#259](https://github.com/vitrin-os/vitrin-os/issues/259) are still fixes with
+component tests behind them and nothing more — the log line and the recorder
+pair they add **were not looked at during the L7 run**, and **CI has no seat and
+no DRM device**, so nothing in this repository has observed either of them:
 
 - L1: how many of 10 switches survived, and the band colour on each return.
 - L2: how many of 5 suspend/resume cycles came back with a working panel, and
@@ -515,11 +517,13 @@ device, so nothing in this repository has observed any of them on hardware**:
 - L3: how many of 5 lid cycles behaved as L2 did.
 - L4: the measured blank latency and the measured wake latency.
 - L6: which route recovered the wedge, and how long it took.
-- L7: how long the panel stayed lit after returning from another VT, and
-  whether `--lock-idle` raised on the return. Owed to
-  [#257](https://github.com/vitrin-os/vitrin-os/issues/257), which was found by
-  the first L4 run and fixed against a component test — **CI has no seat and no
-  DRM device, so nothing in this repository has observed the fix on hardware.**
+- L7: **run 2026-08-11 at a 20 s timeout — the panel stayed lit and the lock did
+  not raise on the return, so [#257](https://github.com/vitrin-os/vitrin-os/issues/257)
+  is settled.** Still owed at this rung: a *timed* figure. The pass was observed
+  by eye — "it did not blank on the way back in, and the lock came up only after
+  I sat there a while" — so the seconds the panel stayed lit were never measured
+  against the timeout, and neither was the absence. A rerun that clocks both is
+  what turns this from a symptom check into a number.
 
 ## Record the run
 
@@ -556,11 +560,16 @@ only the [Login] header, so these are the defaults in effect):
   L4. Blank and unblank .......... blank after 61.2 s; unblank OK
   L5. Blank did not lock ......... PASS (session as left, no lock card)
   L6. Deliberate wedge ........... recovered in ~69 s, route INDETERMINATE
-  L7. Return from another VT ..... NOT EXECUTED -- the rung did not exist yet;
-                                   it was written from this run's #257. Next
-                                   run: panel stayed lit ___ s after the return
-                                   (must be the full --blank-idle timeout);
-                                   --lock-idle pass: raised on return? Y/N
+  L7. Return from another VT ..... RUN SEPARATELY, later on 2026-08-11, at
+                                   --blank-idle 20 --lock-idle 20 (not 60).
+                                   Panel stayed lit on the return -- it did NOT
+                                   blank in ~1.5 s. Lock did NOT raise on the
+                                   return; it raised only after the countdown
+                                   ran again from the return. Both by eye:
+                                   seconds NOT timed, absence NOT timed.
+                                   Next run: panel stayed lit ___ s after the
+                                   return (must be the full --blank-idle
+                                   timeout); absence ___ s.
 
 SysRq step 1 (`printf 's' | sudo tee /proc/sysrq-trigger`) executed? NO
     (still documented and unexecuted)
@@ -630,11 +639,12 @@ D-033 intends, which is L5 and it passes. **L4 is not a clean pass**: the run
 found #257 on the *return* path, and #258 and #259 came out of the same session
 — the unblank logged nothing, so a successful wake and a modeset that left the
 panel dark were indistinguishable, and neither transition reached the flight
-recorder at all. All three now have fixes with component tests behind them and
-**none has been re-observed on hardware**; L7 above is the rung that would close
-them, and the enriched expectations in L4's own row (the `the panel is lit
-again` line, the `screen_blanked`/`screen_woke` pair) describe output that did
-not exist when this run was made.
+recorder at all. All three now have fixes. **#257's has since been observed on
+hardware** — see the L7 record below, run later the same day — but **#258's and
+#259's have not**: the enriched expectations in L4's own row (the `the panel is
+lit again` line, the `screen_blanked`/`screen_woke` pair) describe output that
+did not exist when this run was made and was not looked for during the L7 run
+either.
 
 **L6 — recovered, route indeterminate.** The wedge was produced by `SIGSTOP` on
 the compositor while it held DRM master and the libinput devices — a faithful
@@ -663,10 +673,13 @@ the finding**, and it is why L6 now tells you to choose the route first.
 - **`/proc/sysrq-trigger` route 3 was not exercised.** Still documented and
   unexecuted.
 - L2 and L3 are short of their stated counts, as recorded above.
-- **`L7` was never run, because it did not yet exist.** It was written *from*
-  this run's #257 and is the rung that would establish that the fix works. The
-  same holds for L4's new log and recorder expectations: they were added by the
-  #258/#259 fixes after this run, so nothing in the block above observed them.
+- **`L7` did not exist during this run** — it was written *from* this run's
+  #257. It has since been executed, separately and later the same day; the
+  result is the block below.
+- **L4's new log and recorder expectations were observed by nobody.** They were
+  added by the #258/#259 fixes after this run, so nothing in the block above
+  reached them — and the L7 run that followed did not look at the log or the
+  recorder either. #258 and #259 remain unobserved on hardware.
 
 **Filed from this run:** #257 (returning to a paused session blanks the panel in
 ~1.5 s), #258 (the unblank is silent; success and failure look identical), #259
@@ -674,10 +687,50 @@ the finding**, and it is why L6 now tells you to choose the route first.
 recovery command signalled the rescuer under a shell and nothing at all under
 `systemd-run` — corrected in route 2 above).
 
+### L7 — same day, separate run, `--blank-idle 20 --lock-idle 20`
+
+Run after the fixes for #257–#259 landed on `main`, at a **20 s** timeout rather
+than the 60 s the rung suggests. Both passes were done in one sitting.
+
+```text
+Executed:      2026-08-11, JST, same machine and binary family as above
+                              (rebuilt from main after #263 merged)
+Flags:         --drm --blank-idle 20         (pass 1)
+               --drm --blank-idle 20 --lock-idle 20   (pass 2)
+               --lock-on-seat-change: not passed, so the default `never`
+
+  Pass 1. Panel on return ........ STAYED LIT. It did not blank on the way back
+                                   in, which is the ~1.5 s symptom #257 filed.
+  Pass 2. Lock on return ......... DID NOT RAISE on the return. It raised only
+                                   after the countdown ran again *from* the
+                                   return, with the session sitting idle --
+                                   which is what `--lock-on-seat-change never`
+                                   is specified to do.
+
+  Timed? ....................... NO. Both observations are by eye. The seconds
+                                 the panel stayed lit were not measured, and
+                                 the absence was not measured either.
+  Log lines checked? ........... NO -- `the panel is lit again` (#258) was not
+                                 looked for.
+  Recorder checked? ............ NO -- the `screen_blanked`/`screen_woke` pair
+                                 and `outcome: flip_landed` (#259) were not
+                                 looked at.
+```
+
+**What this settles and what it does not.** It settles #257, which is a symptom
+question — the panel blanked ~1.5 s after a return, and it no longer does; the
+lock demanded a passphrase for coming back, and it no longer does. Both symptoms
+are gone on the machine that produced them, under the default seat policy. It
+settles **nothing** about #258 or #259: those are about what the wake *says*,
+and nobody read the log or the recorder during this run. It also produces no
+number — an eyeball pass at a 20 s timeout cannot distinguish "the full 20 s"
+from "17 s", so the rung's own question, *how long did the panel stay lit*, is
+still unanswered and the record block above says so.
+
 > **This page has now been executed once, on 2026-08-11, and it is still not a
 > clean pass.** Routes 3 and 4 remain careful predictions; L2 and L3 are short
-> of their counts; L6 recovered but by an unknown route; `L7` and the defect
-> fixes it exists to check have never been run at all; and the run's headline
-> finding was that this page's own route-2 command was wrong. Read it that way,
+> of their counts; L6 recovered but by an unknown route; `L7` passed by eye at a
+> 20 s timeout with no figure recorded and #258/#259 unobserved; and the run's
+> headline finding was that this page's own route-2 command was wrong. Read it that way,
 > correct it from your own eyes, and treat a failed observation as a result
 > worth recording rather than a step to retry until it passes.

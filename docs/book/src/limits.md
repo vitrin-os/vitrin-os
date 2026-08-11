@@ -138,11 +138,16 @@ than budgetary. Six of them, named rather than summarised:
   [#259](https://github.com/vitrin-os/vitrin-os/issues/259) — the panel blanking
   ~1.5 s after a return from another VT, a silent unblank, and neither
   transition reaching the flight recorder — all came out of that session, and
-  **all three fixes are code with component tests behind them and none has been
-  re-observed on hardware.** **Still unexecuted:** `L7`, the rung written from
-  #257 to close exactly that; the SysRq route (route 3); and the advisory VKMS
-  rung, which was never attempted. One run on one laptop is a report about that
-  laptop and nothing more.
+  **#257's fix has since been observed on hardware** — rung `L7` was written
+  from it and run later the same day, at a 20 s timeout: the panel stayed lit on
+  the return and the lock did not raise, so both symptoms are gone on the
+  machine that produced them. That pass was **by eye and produced no figure**,
+  so how long the panel stayed lit is still unmeasured. **#258's and #259's
+  fixes remain code with component tests behind them and nothing more** — they
+  concern what the wake logs and journals, and neither the log nor the recorder
+  was read during the `L7` run. **Still unexecuted:** the SysRq route (route 3),
+  and the advisory VKMS rung, which was never attempted. One run on one laptop
+  is a report about that laptop and nothing more.
 
 This is a recorded decision with a scheduled closure in the sense that page's
 last section means: the closure is a dated human run, not a job. The alternative

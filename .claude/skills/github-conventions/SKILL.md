@@ -26,6 +26,8 @@ commit history, grouped by type.
 - **Footer**: reference the tracking issue, e.g. `Closes #10` or `Refs #10`.
   The issue title already carries the phase/epic/task number (e.g.
   "P1.1.1 — ..."), so the commit header doesn't need to repeat it.
+- **Sign-off**: **always commit with `git commit -s`.** See below — this one
+  is enforced by CI and is expensive to fix afterwards.
 
 Example:
 
@@ -36,7 +38,32 @@ protocol/vitrin-v0.xml — 11 interfaces, 29 messages, 14 enums. See
 docs/protocol/00-conventions.md for the normative rules this implements.
 
 Closes #10
+
+Signed-off-by: Your Name <you@example.com>
 ```
+
+## Sign-off — hard requirement, CI-enforced
+
+Every commit must carry a `Signed-off-by:` trailer whose value matches that
+commit's own author. This is decision **D-012**: contributions are taken under
+the [Developer Certificate of Origin](https://developercertificate.org/), not
+a CLA. `.github/workflows/dco.yml` checks **each non-merge commit** in a PR
+individually and fails the whole PR on the first miss.
+
+**Use `git commit -s`. Not `git commit`.** There is no way to add the trailer
+to an existing commit without rewriting it, so an unsigned commit means a
+rebase and a force-push — and where force-push is blocked, re-pushing the
+branch under a new name and losing the old one's review history. The flag
+costs two characters; forgetting it costs a branch.
+
+- Whole branch already unsigned: `git rebase --signoff main && git push
+  --force-with-lease`. Re-signing a commit that already has the trailer does
+  not duplicate it.
+- Last commit only: `git commit --amend -s && git push --force-with-lease`.
+- `Co-Authored-By:` is **not** a sign-off. A commit can carry both; only the
+  `Signed-off-by:` line satisfies the check.
+- The check greps the whole message, not just the last paragraph, so
+  `Signed-off-by:` above a `Closes #10` footer is fine.
 
 **Supersedes** the ad-hoc `P<phase>.<epic>.<task>: summary` header used in
 this repo's earliest commits (e.g. `P1.1.1: author protocol/vitrin-v0.xml

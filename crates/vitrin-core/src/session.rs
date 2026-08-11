@@ -276,7 +276,15 @@ pub(crate) struct Runtime<H: PreemptionHook> {
     /// cannot sit here waiting for a predicate to fail open. That is the same
     /// defence-in-depth posture `RetainedOutput::scrub_retained_frame` takes
     /// for the headless framebuffer, applied to the capture cache.
-    view_cache: BTreeMap<RealmId, Vec<u8>>,
+    ///
+    /// Each entry carries the [`ViewKey`] it was composed under (issue #252),
+    /// **in the same value as the bytes** so the two cannot drift apart: one
+    /// insert writes both, one removal drops both, and there is no second map
+    /// to forget to update. That is the whole answer to the risk #252 names —
+    /// a per-realm freshness fact beside the session-wide `dirty` flag is a
+    /// second definition of "has this realm changed", and two of those that can
+    /// disagree is the shape of #243.
+    view_cache: BTreeMap<RealmId, CachedView>,
     /// The `--capture-dump PATH` diagnostic target from the seed (P1.8.5),
     /// `None` in every ordinary run. When set, [`post_dispatch`] mirrors each
     /// realm's refreshed [`Self::view_cache`] entry to `PATH.<realm-id>` —
@@ -284,6 +292,52 @@ pub(crate) struct Runtime<H: PreemptionHook> {
     capture_dump: Option<PathBuf>,
     /// This session's monotonic zero, for presentation timestamps.
     epoch: Instant,
+}
+
+/// **Everything one realm's composed view is a function of** (issue #252).
+///
+/// [`Scene::compose`] is documented pure — *"same scene + same size = same
+/// bytes"* — and [`Scene::generation`] is documented to change *"exactly when
+/// composed output may have changed (for a fixed view size)"*. Those two
+/// sentences are the whole of this type: `(generation, size)` is the pair the
+/// second sentence's parenthesis names, so two refreshes with equal keys
+/// produce equal bytes, and [`refresh_view_cache`] may skip the second.
+///
+/// **What is deliberately NOT in this key**, checked against
+/// [`crate::backend::human_visible_from_view`]'s parameter list one by one: the
+/// consent surface, the lock cover, the blank cover, the status strip and the
+/// attention flag. None of them belong here, and that is not an omission of the
+/// #243 kind — it is the output-stage fork. `Presenter::view_rgba` serves the
+/// **realm view**, which is upstream of every one of those; a capture that
+/// contained any of them would be the leak `docs/protocol/05-vitrin_consent.md`
+/// forbids outright. If one of them ever *did* reach this cache, the bug would
+/// be that it reached it, not that this key failed to notice.
+///
+/// The one backend that answers `view_rgba` from something other than
+/// `Scene::compose` is headless, which reads back its retained **view**
+/// framebuffer for the bound realm — a framebuffer its own tests pin as a
+/// byte-for-byte identity of `Scene::compose` for the same scene and size
+/// (`retained_framebuffer_is_the_capture_source`), and which is written on the
+/// same redraw this key is taken after. So the identity holds there too, by the
+/// same two sentences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewKey {
+    /// [`Scene::generation`] at the composite this entry came from.
+    generation: u64,
+    /// The output size it was composed at. One output, so one size for every
+    /// realm (decision 3 of issue #209) — carried per entry anyway, because
+    /// "the size the bytes in this entry are of" is a property of the entry and
+    /// reading it from the presenter is what makes a resize round ambiguous.
+    size: (u32, u32),
+}
+
+/// One realm's cached view: the bytes, and what they are a composition **of**.
+///
+/// The two live in one value on purpose — see [`Runtime::view_cache`].
+#[derive(Debug)]
+struct CachedView {
+    key: ViewKey,
+    rgba: Vec<u8>,
 }
 
 /// The capability kernel's state: one verifier, one petition registry, one
@@ -2473,8 +2527,8 @@ fn dispatch_principal<H: RuntimeHost>(
                 // The cache itself is refreshed at redraw time, never here,
                 // so capture stays a pure read of the last completed frame.
                 let realm_view = |realm_id: &RealmId| {
-                    view_cache.get(realm_id).map(|rgba| RealmViewFrame {
-                        rgba: rgba.as_slice(),
+                    view_cache.get(realm_id).map(|cached| RealmViewFrame {
+                        rgba: cached.rgba.as_slice(),
                         width,
                         height,
                     })
@@ -3576,7 +3630,12 @@ fn drain_screenshot_gestures<H: PreemptionHook>(
             fail(kernel, None, "no_bound_realm");
             continue;
         };
-        let Some(rgba) = runtime.view_cache.get(realm_id) else {
+        // `.rgba`, never the whole entry: the [`ViewKey`] beside it is
+        // `refresh_view_cache`'s business, and nothing downstream of the cache
+        // may make a decision on it. A disjoint field borrow rather than an
+        // accessor, because `kernel` is borrowed mutably one line up -- the
+        // same reason the chokepoint destructures the field.
+        let Some(rgba) = runtime.view_cache.get(realm_id).map(|c| c.rgba.as_slice()) else {
             // The realm has no live view: it has never composited, or its shim
             // is gone. The same fact the chokepoint turns into `no_surface`.
             fail(kernel, Some(realm_id), "no_view");
@@ -4540,8 +4599,9 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
     }
 }
 
-/// Recompose **every live realm's** view into [`Runtime::view_cache`], and
-/// mirror each one to its `--capture-dump` file.
+/// Recompose **every live realm whose view could have changed** into
+/// [`Runtime::view_cache`], and mirror each fresh one to its `--capture-dump`
+/// file.
 ///
 /// Split out of [`post_dispatch`] because it is now a loop with a prune
 /// rather than one assignment, and because "which realms does the cache hold"
@@ -4551,9 +4611,46 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
 ///   output's view size. A realm whose view is degenerate (a minimized nested
 ///   window, a readback failure, a realm with no scene) gets no entry, which
 ///   the chokepoint turns into `no_surface`.
+/// - **Skip** — a live realm whose [`ViewKey`] is the one its cached entry
+///   already carries is not composed again (issue #252). See below.
 /// - **Prune** — every other entry is removed, so a dead realm's last frame
 ///   does not sit in the map behind a predicate. `realm_is_live` already
 ///   refuses it; this makes the bytes gone as well as unreachable.
+///
+/// # Why the skip is not the refused optimisation (issue #252)
+///
+/// The obvious saving here — compose only for realms something will read — is
+/// **refused**, twice: `backend/winit.rs`'s `view_rgba` says so in the source
+/// and [D-031](../../../docs/plan/20-decision-log.md) records it as a decision.
+/// Gating on grant state would couple the compositing path to the capability
+/// kernel and make the cache's freshness, and the goldens that pin it, depend
+/// on whether a grant happened to exist. Nothing here routes around that: this
+/// cache is refreshed for **every live realm on every dirty round**, whether
+/// or not anything will read it, exactly as before.
+///
+/// What changed is that a refresh whose result is *already in the map* does not
+/// recompute it. The skip is keyed on [`ViewKey`] — the scene's own generation
+/// and the view size — which is the pair `Scene::compose`'s purity contract is
+/// written in terms of, so a skipped realm's entry is byte-for-byte what a
+/// recompose would have produced. **No reader can tell**, which is the property
+/// that distinguishes this from the refused option: freshness is unchanged, and
+/// only the arithmetic is skipped.
+///
+/// Three consequences worth stating rather than discovering:
+///
+/// - **A `kind=dmabuf` commit bumps no generation** (`crate::shim` returns
+///   before `commit_with_damage`), so such a realm is skipped here. That is the
+///   *same bytes* it was already being served: `apply_dmabuf` never touches the
+///   CPU scene, so composing it again would reproduce whatever CPU content
+///   preceded the dmabuf. This neither creates nor worsens that gap — it is
+///   issue #253's, and the shipped shim never sends one.
+/// - **The `--capture-dump` mirror follows the compose**, not the round. A
+///   skipped realm's dump file already holds those exact bytes, so the
+///   diagnostic's content is unchanged; what changes is that an unmoving realm
+///   stops rewriting a 16 MB file every dirty round.
+/// - **One realm's commit still dirties the round for all of them** — `dirty`
+///   is one session-wide flag — but it no longer costs the others a composite.
+///   That is the multi-realm half of #252's bill.
 ///
 /// # "Live" is `server.is_some()`, not "has a map entry"
 ///
@@ -4582,7 +4679,24 @@ fn refresh_view_cache<K: PreemptionHook, P: Presenter>(runtime: &mut Runtime<K>,
         .map(|(realm_id, _)| realm_id.clone())
         .collect();
     runtime.view_cache.retain(|realm, _| live.contains(realm));
+    let size = view.view_size();
     for realm_id in live {
+        // The key first, and from the same presenter the compose reads: a realm
+        // with no scene has no key, so it takes the `None` arm below exactly as
+        // it always did rather than being skipped into keeping a stale entry.
+        let key = view.scene(&realm_id).map(|scene| ViewKey {
+            generation: scene.generation(),
+            size,
+        });
+        if let (Some(key), Some(cached)) = (key, runtime.view_cache.get(&realm_id)) {
+            if cached.key == key {
+                // Same scene, same size: `Scene::compose` is pure, so the bytes
+                // in the map are already the bytes this round would produce.
+                // See this function's docs for why this is not the gating
+                // `backend::winit` and D-031 refuse.
+                continue;
+            }
+        }
         match view.view_rgba(&realm_id) {
             Some(rgba) => {
                 if let Some(base) = runtime.capture_dump.as_deref() {
@@ -4599,7 +4713,26 @@ fn refresh_view_cache<K: PreemptionHook, P: Presenter>(runtime: &mut Runtime<K>,
                     // a session down.
                     write_capture_dump(&capture_dump_path(base, &realm_id), &rgba);
                 }
-                runtime.view_cache.insert(realm_id, rgba);
+                // The bytes and the key they were composed under, written
+                // together into one value: a realm whose scene has no
+                // generation to record (none exists, so `view_rgba` composed
+                // nothing of it) cannot reach here, and every entry that does
+                // carries what it is a composition of.
+                match key {
+                    Some(key) => {
+                        runtime
+                            .view_cache
+                            .insert(realm_id, CachedView { key, rgba });
+                    }
+                    // Unreachable in practice — `view_rgba` answers `None`
+                    // without a scene on all four presenters — and fail-closed
+                    // rather than asserted: an entry with no key would be
+                    // skipped forever by the check above, which is the one
+                    // failure mode this change could have.
+                    None => {
+                        runtime.view_cache.remove(&realm_id);
+                    }
+                }
             }
             None => {
                 runtime.view_cache.remove(&realm_id);
@@ -4801,6 +4934,16 @@ mod tests {
         /// [`Self::human_visible`] therefore passes this one through the very
         /// function both shipped backends compose with.
         blank: crate::backend::blank::BlankSurface,
+        /// **How many times each realm's view was actually composed** (issue
+        /// #252): one entry per `Presenter::view_rgba` call, keyed by realm.
+        ///
+        /// The rig already counts `redraws` and `presents` for the same reason
+        /// -- "what did one dispatch round cost" is only assertable if
+        /// something counts it -- and the capture cache's refresh was the one
+        /// per-round cost with no counter behind it, so a round that composed
+        /// every live realm and a round that composed one were indistinguishable
+        /// to every test in this file.
+        view_rgbas: BTreeMap<RealmId, usize>,
     }
 
     impl TestView {
@@ -4923,6 +5066,10 @@ mod tests {
         /// bytes for every realm would let a runtime that handed out the
         /// wrong realm's frame pass them.
         fn view_rgba(&mut self, realm: &RealmId) -> Option<Vec<u8>> {
+            // Counted before the `?`: a call that found no scene is still a
+            // call, and a refresh that asked about a realm it should have
+            // skipped must be visible whatever the answer was.
+            *self.view_rgbas.entry(realm.clone()).or_insert(0) += 1;
             Some(self.scenes.scene(realm)?.compose(VIEW.0, VIEW.1))
         }
         /// Counts the requests the nested backend turns into
@@ -5206,6 +5353,7 @@ mod tests {
                     lock_raised: false,
                     output_active: true,
                     blank: crate::backend::blank::BlankSurface::for_test(),
+                    view_rgbas: BTreeMap::new(),
                 },
                 handle: handle.clone(),
                 signal: event_loop.get_signal(),
@@ -8058,6 +8206,23 @@ mod tests {
         );
     }
 
+    /// The bytes of a realm's cached view, without the [`ViewKey`] stored
+    /// beside them (issue #252).
+    ///
+    /// A test reads what a *reader* would be served, which is the projection
+    /// both production readers make. The key is [`refresh_view_cache`]'s
+    /// business, and a test that asserted on it would be pinning the
+    /// optimisation rather than the property.
+    fn cached_view<'r, H: PreemptionHook>(
+        runtime: &'r Runtime<H>,
+        realm: &RealmId,
+    ) -> Option<&'r [u8]> {
+        runtime
+            .view_cache
+            .get(realm)
+            .map(|cached| cached.rgba.as_slice())
+    }
+
     /// What a realm's view composes to at the test host's view size — the
     /// bytes any honest capture of that realm must return.
     fn expected_view((w, h): (u32, u32)) -> Vec<u8> {
@@ -8125,10 +8290,13 @@ mod tests {
         // completed composite.
         rig.host.runtime.dirty = true;
         post_dispatch(&mut rig.host);
-        assert_eq!(rig.host.runtime.view_cache.get(&bound), Some(&want_a));
         assert_eq!(
-            rig.host.runtime.view_cache.get(&hidden),
-            Some(&want_b),
+            cached_view(&rig.host.runtime, &bound),
+            Some(want_a.as_slice())
+        );
+        assert_eq!(
+            cached_view(&rig.host.runtime, &hidden),
+            Some(want_b.as_slice()),
             "a hidden realm's view is composed too, or its capture goes stale"
         );
 
@@ -8242,20 +8410,16 @@ mod tests {
             host.view.surface_of(&hidden).is_some()
         });
         rig.pump(Duration::from_millis(200));
-        let first = rig
-            .host
-            .runtime
-            .view_cache
-            .get(&hidden)
-            .cloned()
-            .expect("the hidden realm's view is cached");
+        let first = cached_view(&rig.host.runtime, &hidden)
+            .expect("the hidden realm's view is cached")
+            .to_vec();
 
         // Over a window, the hidden realm's *cached capture* changes: it is
         // still receiving `frame_done` and still repainting.
         let mut moved = false;
         for _ in 0..40 {
             rig.pump(Duration::from_millis(50));
-            if rig.host.runtime.view_cache.get(&hidden) != Some(&first) {
+            if cached_view(&rig.host.runtime, &hidden) != Some(first.as_slice()) {
                 moved = true;
                 break;
             }
@@ -8341,6 +8505,134 @@ mod tests {
                 .contains_key(&RealmId::new("realm-0")),
             "and the survivor keeps its own"
         );
+    }
+
+    /// **A realm whose scene did not change is not recomposed, and what it
+    /// serves is unchanged** (issue #252).
+    ///
+    /// `refresh_view_cache` composed every live realm on every dirty round,
+    /// whether or not anything would read the result — and one realm's commit
+    /// dirties the round for all of them, so N-1 realms that had not moved were
+    /// recomposed anyway. On the measured panel that is a 16.4 MB allocate,
+    /// fill, copy and free per realm per round.
+    ///
+    /// **This test counts composites; it does not assert that a realm nobody
+    /// observes is skipped.** Gating the refresh on grant state is refused —
+    /// `backend/winit.rs`'s `view_rgba` says so in the source and D-031 records
+    /// it — because it would make the cache's freshness depend on whether a
+    /// grant existed. The saving here is keyed on the *scene*, so a reader
+    /// cannot tell: the three `cached_view` assertions pair every skip with the
+    /// bytes a recompose would have produced, and without them this test would
+    /// pass just as well against a cache that had stopped refreshing.
+    ///
+    /// Four rounds, each failing differently:
+    ///
+    /// 1. **Cold** — no entry, so both realms compose. A skip here would be a
+    ///    cache that never fills.
+    /// 2. **One realm commits** — only that realm composes. This is the round
+    ///    the issue is about, and it costs 2 composites before this change.
+    /// 3. **Nobody commits** — a dirty round composes *nothing*. Before this
+    ///    change every dirty round cost one composite per live realm forever.
+    /// 4. **The output resizes** — both compose again, with no scene touched.
+    ///    `apply_output_resize` deliberately does not bump `Scene::generation`
+    ///    (it bumps `layout_generation`), so a key of generation alone would
+    ///    serve every later capture at the old geometry. This rig composes at a
+    ///    fixed `VIEW` regardless of its output size, so what this round
+    ///    asserts is the *invalidation*, not the geometry.
+    #[test]
+    fn a_realm_whose_scene_did_not_change_is_not_recomposed() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "lazy-view-cache",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let serve: &[&str] = &["--serve"];
+        rig.start_realms(&[("realm-0", serve), ("realm-b", serve)]);
+        let bound = RealmId::new("realm-0");
+        let hidden = RealmId::new("realm-b");
+        const A: (u32, u32) = VIEW;
+        const B: (u32, u32) = (VIEW.0 / 2, VIEW.1 / 2);
+        commit_fixture(&mut rig.host, &bound, A);
+        commit_fixture(&mut rig.host, &hidden, B);
+
+        // Composites since the last `clear`, per realm. No `pump` between the
+        // rounds below: a dispatch could deliver a shim commit and move a
+        // generation under the assertion.
+        fn composed(rig: &Rig, realm: &RealmId) -> usize {
+            rig.host.view.view_rgbas.get(realm).copied().unwrap_or(0)
+        }
+        let round = |rig: &mut Rig| {
+            rig.host.view.view_rgbas.clear();
+            rig.host.runtime.dirty = true;
+            post_dispatch(&mut rig.host);
+        };
+
+        // 1. Cold: nothing is cached, so both realms compose.
+        round(&mut rig);
+        assert_eq!(composed(&rig, &bound), 1, "a cold cache must fill");
+        assert_eq!(composed(&rig, &hidden), 1);
+        let (want_a, want_b) = (expected_view(A), expected_view(B));
+        assert_ne!(want_a, want_b, "the two fixtures must actually differ");
+        assert_eq!(
+            cached_view(&rig.host.runtime, &bound),
+            Some(want_a.as_slice())
+        );
+        assert_eq!(
+            cached_view(&rig.host.runtime, &hidden),
+            Some(want_b.as_slice())
+        );
+
+        // 2. One realm repaints. The other has not moved and is not recomposed
+        // -- and still serves exactly what a recompose would have produced.
+        commit_fixture(&mut rig.host, &bound, A);
+        round(&mut rig);
+        assert_eq!(
+            composed(&rig, &bound),
+            1,
+            "the realm that committed composes"
+        );
+        assert_eq!(
+            composed(&rig, &hidden),
+            0,
+            "a realm whose scene did not change was recomposed anyway: one realm's commit \
+             dirties the round for all of them, which is the cost issue #252 is about"
+        );
+        assert_eq!(
+            cached_view(&rig.host.runtime, &hidden),
+            Some(want_b.as_slice()),
+            "the skipped realm must still serve its own view, byte for byte -- a skip that \
+             cost a reader anything is the refused optimisation wearing this one's clothes"
+        );
+
+        // 3. A dirty round in which nothing repainted composes nothing at all.
+        round(&mut rig);
+        assert_eq!(composed(&rig, &bound), 0);
+        assert_eq!(composed(&rig, &hidden), 0);
+        assert_eq!(
+            cached_view(&rig.host.runtime, &bound),
+            Some(want_a.as_slice())
+        );
+        assert_eq!(
+            cached_view(&rig.host.runtime, &hidden),
+            Some(want_b.as_slice()),
+            "and both realms are still served, so 'composed nothing' is not 'cached nothing'"
+        );
+
+        // 4. The output resizes and no scene is touched: both entries are stale
+        // by size, and both recompose.
+        apply_output_resize(&mut rig.host, (VIEW.0 + 32, VIEW.1 + 16));
+        round(&mut rig);
+        assert_eq!(
+            composed(&rig, &bound),
+            1,
+            "a resize must invalidate every realm's entry: `Scene::generation` deliberately \
+             does not move for one, so a key that read it alone would serve every later \
+             capture at the old geometry"
+        );
+        assert_eq!(composed(&rig, &hidden), 1);
     }
 
     /// **The output does not stay bound to a realm that is gone.**

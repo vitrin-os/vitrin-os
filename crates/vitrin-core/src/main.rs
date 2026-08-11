@@ -437,7 +437,11 @@ USAGE:
                                 about a realm nobody chose (WS-E.1.3). Used by
                                 the real-app fidelity test to prove the capture
                                 path adds no distortion; off by default, and not
-                                a wire feature. Written atomically each redraw.
+                                a wire feature. Written atomically, and only
+                                when that realm's view is recomposed: a realm
+                                whose scene has not changed rewrites nothing,
+                                so the file's mtime is not a signal that a
+                                frame landed.
     vitrind [--clipboard-key KEY]
                                 Trigger key for the cross-realm clipboard
                                 (WS-E.2.1): ctrl+shift+KEY promotes the focused
@@ -499,6 +503,30 @@ USAGE:
                                 agent is working in is still a session the human
                                 left. Off by default; 0 is REFUSED rather than
                                 read as off (it would relock every round).
+    vitrind [--lock-on-seat-change POLICY]
+                                `--drm` ONLY: what a VT switch AWAY does to the
+                                lock. Three policies, and the default is the
+                                behaviour this core has always had:
+                                  immediate -- losing the seat raises the lock
+                                    at once, so coming back always costs a
+                                    passphrase (or an Enter, with no
+                                    --lock-passphrase-file).
+                                  idle      -- the idle countdown keeps running
+                                    across the absence, so a LONG switch-away
+                                    returns to a locked screen and a short one
+                                    does not. Needs --lock-idle to mean
+                                    anything; with no idle timeout there is no
+                                    countdown to keep running.
+                                  never     -- (default) the countdown freezes
+                                    for the absence and restarts on return.
+                                    The cost, published in
+                                    docs/book/src/limits.md: a session you
+                                    switched away from eight hours ago is
+                                    unlocked when you switch back to it.
+                                NO policy lowers a lock that is already up: a
+                                VT switch is never a way past a lock screen.
+                                REFUSED with --nested and --headless, which
+                                have no seat to lose.
     vitrind [--lock-passphrase-file PATH]
                                 NOT with `--headless`: unlock requires the passphrase
                                 whose Argon2id digest PATH holds. Absolute path,
@@ -1022,6 +1050,10 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut lock_idle: Option<Duration> = None;
     let mut blank_idle: Option<Duration> = None;
     let mut lock_passphrase: Option<PathBuf> = None;
+    // `Option` rather than the policy itself, so "not given" and "given
+    // `never`" stay distinguishable: the refusal below is about a flag being
+    // *stored and never read*, and the default value is not a use of the flag.
+    let mut lock_on_seat_change: Option<lock::SeatChangePolicy> = None;
     let mut agent_cursor = false;
     #[cfg(feature = "drm-backend")]
     let mut keymap: Option<PathBuf> = None;
@@ -1158,6 +1190,13 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 )?;
                 set_blank_idle(&mut blank_idle, value)?;
             }
+            "--lock-on-seat-change" => {
+                let value = args.next().ok_or(
+                    "`--lock-on-seat-change` requires a policy (immediate, idle or never, e.g. \
+                     `--lock-on-seat-change immediate`)",
+                )?;
+                set_seat_change_policy(&mut lock_on_seat_change, value)?;
+            }
             "--lock-passphrase-file" => {
                 let value = args.next().ok_or(
                     "`--lock-passphrase-file` requires a path (e.g. \
@@ -1271,6 +1310,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_lock_idle(&mut lock_idle, value)?;
                 } else if let Some(value) = other.strip_prefix("--blank-idle=") {
                     set_blank_idle(&mut blank_idle, value)?;
+                } else if let Some(value) = other.strip_prefix("--lock-on-seat-change=") {
+                    set_seat_change_policy(&mut lock_on_seat_change, value)?;
                 } else if let Some(value) = other.strip_prefix("--lock-passphrase-file=") {
                     set_path(
                         &mut lock_passphrase,
@@ -1621,6 +1662,19 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         return Err(crate::backend::blank::BLANK_NEEDS_THE_OUTPUT.into());
     }
 
+    // **`--lock-on-seat-change` is `--drm` only** (issue #246), and the same
+    // refusal for the same reason one step milder: a nested or headless session
+    // never receives a seat event, so `LockScreen::set_seat_absent` is never
+    // called and the policy would be stored and never read. The predicate is
+    // the one above rather than a second `matches!`, because "this run drives
+    // the panel itself" and "this run holds the seat" are the same fact on
+    // this stack -- the bare-metal backend takes both together or neither --
+    // and two spellings of one fact are two things that can disagree.
+    let has_a_seat = blank_has_an_output;
+    if !has_a_seat && lock_on_seat_change.is_some() {
+        return Err(lock::SEAT_POLICY_NEEDS_A_SEAT.into());
+    }
+
     // The injector channel's two companion refusals (issue #138), taken at
     // PARSE time rather than at first use, which is this parser's rule
     // everywhere else too:
@@ -1774,6 +1828,10 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 chord: lock_chord,
                 idle: lock_idle,
                 passphrase: lock_passphrase,
+                // Not `lock_on_seat_change`: the flag was refused above on this
+                // mode, so this is the default and saying so literally keeps
+                // the nested arm from ever growing a seat policy by accident.
+                on_seat_change: lock::SeatChangePolicy::default(),
             },
             screenshot,
             status,
@@ -1804,6 +1862,9 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 chord: lock_chord,
                 idle: lock_idle,
                 passphrase: lock_passphrase,
+                // The one arm that reads the flag, because it is the one
+                // backend with a seat to lose (issue #246).
+                on_seat_change: lock_on_seat_change.unwrap_or_default(),
             },
             screenshot,
             status,
@@ -2106,6 +2167,25 @@ fn set_blank_idle(slot: &mut Option<Duration>, value: &str) -> Result<(), String
         );
     }
     *slot = Some(Duration::from_secs(secs));
+    Ok(())
+}
+
+/// Record `--lock-on-seat-change` (issue #246), rejecting a repeat flag and an
+/// unknown policy.
+///
+/// [`set_blank_idle`]'s shape, and the repeat refusal matters more here than on
+/// a duration: two policies on one command line have no reading in which the
+/// operator got what they asked for, and silently taking the last one would
+/// hand a session a lock policy nobody chose — which is the whole complaint
+/// this flag exists to answer.
+fn set_seat_change_policy(
+    slot: &mut Option<lock::SeatChangePolicy>,
+    value: &str,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--lock-on-seat-change` given more than once".into());
+    }
+    *slot = Some(lock::SeatChangePolicy::parse(value)?);
     Ok(())
 }
 
@@ -2850,18 +2930,35 @@ where
     // somewhere the operator did not ask for is the failure the whole audit
     // exists to prevent, and "start anyway with the key disabled" would be a
     // session that silently does not do what its command line says.
-    let screenshot_dir = match screenshot_dir {
+    let screenshot_writer = match screenshot_dir {
         Some(path) => match screenshot::ScreenshotDir::open(&path) {
-            Ok(dir) => {
-                tracing::info!(
-                    dir = %dir.path().display(),
-                    "screenshot key armed: it writes the REALM VIEW -- no trusted band, no \
-                     consent prompt, no lock screen, no status strip, no agent cursor. The \
-                     band's colour is this session's secret and the confined app can read \
-                     any file this core writes (see docs/book/src/limits.md)"
-                );
-                Some(dir)
-            }
+            // The descriptor is handed straight to its worker thread and this
+            // thread never holds it again (issue #240): the encode that used to
+            // stall the compositor for 71.7 ms per press happens there. A
+            // session that cannot spawn that thread refuses to start, on the
+            // same reasoning the audit failure below does -- a screenshot key
+            // that silently does nothing is the failure this whole section
+            // exists to prevent.
+            Ok(dir) => match screenshot::ScreenshotWriter::spawn(dir) {
+                Ok(writer) => {
+                    tracing::info!(
+                        dir = %writer.path().display(),
+                        "screenshot key armed: it writes the REALM VIEW -- no trusted band, no \
+                         consent prompt, no lock screen, no status strip, no agent cursor. The \
+                         band's colour is this session's secret and the confined app can read \
+                         any file this core writes (see docs/book/src/limits.md)"
+                    );
+                    Some(writer)
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "fatal: `--screenshot-dir {}`: cannot start the screenshot writer \
+                         thread: {err}",
+                        path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            },
             Err(err) => {
                 tracing::error!("fatal: `--screenshot-dir {}`: {err}", path.display());
                 return ExitCode::FAILURE;
@@ -2880,7 +2977,7 @@ where
         shim,
         indicator,
         capture_dump,
-        screenshot_dir,
+        screenshot_writer,
     };
 
     let (mut recorder, result) = backend(seed);
@@ -3417,15 +3514,74 @@ fn warn_auto_approve(registry: &Path) {
 
 /// Route Smithay's (and our own) `tracing` diagnostics to stderr.
 /// `RUST_LOG` selects the filter; the default is `info`.
+///
+/// **Colour is decided here rather than left to the subscriber's default**
+/// (issue #251). See [`ansi_wanted`] for the whole rule and the reason.
 fn init_tracing() {
+    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let ansi = ansi_wanted(
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        std::env::var_os("NO_COLOR"),
+    );
+    diagnostic_subscriber(std::io::stderr, ansi, filter).init();
+    log_build_identity();
+}
+
+/// Whether this run may write ANSI colour into its diagnostics.
+///
+/// # A redirected log is an artefact somebody has to grep (issue #251)
+///
+/// `tracing-subscriber` 0.3 decides colour from `cfg!(feature = "ansi")` and
+/// `NO_COLOR` alone — **it never asks whether the writer is a terminal**. So
+/// every run redirected to a file got SGR escapes interleaved into it, and the
+/// bring-up runbook makes exactly such a file the only account of what
+/// happened (`docs/drm-bringup.md`: "`tee` is not optional"). The escapes land
+/// *between* a field's name and its `=`, so `grep 'connector='` over the second
+/// DRM run's log matched **zero** lines while `grep connector` matched two:
+/// the operator had to know to `sed 's/\x1b\[[0-9;]*m//g'` first, and a field
+/// nobody can grep is a field the record paraphrases instead of quoting.
+///
+/// # Two switches, both one-way, so there is nothing for them to disagree about
+///
+/// `NO_COLOR` is the conventional opt-out and this function keeps honouring it,
+/// which it has to do by hand: `with_ansi` *overrides* the subscriber's own
+/// `NO_COLOR` check, so calling it at all makes this the only place that
+/// decision is taken. Both inputs can only ever turn colour **off** — a tty
+/// with `NO_COLOR` set is plain, and a pipe is plain whatever `NO_COLOR` says —
+/// so the answer is their conjunction and neither "wins" over the other. There
+/// is deliberately **no flag to force colour on**: the case a flag would serve
+/// is a human watching a pipe, and a human watching a pipe is a human whose log
+/// file is being written for later.
+///
+/// `no_color` is passed in rather than read here so the tests are hermetic —
+/// mutating the environment mid-test is a data race the 2024 edition makes
+/// `unsafe` for good reason, and this decision is worth testing without one.
+fn ansi_wanted(stderr_is_terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
+    // NO_COLOR's own rule: *set to a non-empty value* disables colour, so an
+    // empty `NO_COLOR=` is not an opt-out (no-color.org, and the behaviour
+    // tracing-subscriber implements internally).
+    stderr_is_terminal && no_color.is_none_or(|value| value.is_empty())
+}
+
+/// The diagnostic subscriber, as one expression both `main` and the tests
+/// build — so the test asserts on the formatter this binary actually installs
+/// rather than on a replica of it.
+fn diagnostic_subscriber<W>(
+    writer: W,
+    ansi: bool,
+    filter: tracing_subscriber::EnvFilter,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
-    log_build_identity();
+        .with_writer(writer)
+        .with_ansi(ansi)
+        .finish()
 }
 
 /// **Say which binary this is, in the first lines of every run** (WS-E.3.5).
@@ -3737,6 +3893,45 @@ mod tests {
             "a repeat flag is an error, like every other one-shot flag here"
         );
         assert!(parse_args(["--drm", "--blank-idle", "abc"]).is_err());
+
+        // **`--lock-on-seat-change` is `--drm` only** (issue #246), for the
+        // same reason and by the same predicate: no other backend receives a
+        // seat event, so the policy would be stored and never read.
+        for policy in ["immediate", "idle", "never"] {
+            assert!(
+                parse_args(["--drm", "--lock-on-seat-change", policy]).is_ok(),
+                "{policy} must parse on the one backend that has a seat"
+            );
+        }
+        assert_eq!(
+            seat_policy_of(&parse_args(["--drm", "--lock-on-seat-change=immediate"]).unwrap()),
+            lock::SeatChangePolicy::Immediate
+        );
+        assert_eq!(
+            seat_policy_of(&parse_args(["--drm", "--lock-on-seat-change", "idle"]).unwrap()),
+            lock::SeatChangePolicy::Idle
+        );
+        assert_eq!(
+            seat_policy_of(&parse_args(["--drm"]).unwrap()),
+            lock::SeatChangePolicy::Never,
+            "the default is D-030(2)'s behaviour: a switch away does not lock the session"
+        );
+        let err = parse_args(["--drm", "--lock-on-seat-change", "sometimes"])
+            .expect_err("the vocabulary is closed");
+        assert!(err.contains("immediate") && err.contains("never"), "{err}");
+        assert!(
+            parse_args([
+                "--drm",
+                "--lock-on-seat-change",
+                "idle",
+                "--lock-on-seat-change",
+                "never"
+            ])
+            .is_err(),
+            "two policies on one command line have no reading in which the operator got what \
+             they asked for"
+        );
+        assert!(parse_args(["--drm", "--lock-on-seat-change"]).is_err());
 
         // ...and both injector channels stay headless-only, which the
         // existing guards already enforce -- asserted here so that "the
@@ -5193,6 +5388,11 @@ mod tests {
             chord: chord::ModChord::parse(lock::DEFAULT_LOCK_CHORD).expect("the default parses"),
             idle: None,
             passphrase: None,
+            // D-030(2)'s behaviour: a VT switch away does not lock the session
+            // (issue #246). Spelled rather than `..Default::default()`, so a
+            // change to the default is a change to this line and every parse
+            // test that compares against it.
+            on_seat_change: lock::SeatChangePolicy::Never,
         }
     }
 
@@ -5411,6 +5611,64 @@ mod tests {
         }
     }
 
+    /// The seat-change policy a bare-metal run resolved (issue #246).
+    #[cfg(feature = "drm-backend")]
+    fn seat_policy_of(action: &Action) -> lock::SeatChangePolicy {
+        match action {
+            Action::RunDrm { lock, .. } => lock.on_seat_change,
+            other => panic!("not a bare-metal run action: {other:?}"),
+        }
+    }
+
+    /// **`--lock-on-seat-change` is refused on every backend with no seat**
+    /// (issue #246), rather than accepted as a silent no-op.
+    ///
+    /// `--blank-idle`'s posture, one step milder in consequence and identical
+    /// in shape: a nested session never receives a seat event, so the policy
+    /// could only ever be stored and never read — and an operator who believes
+    /// their nested session locks itself when they alt-tab away has been told
+    /// something false by their own command line.
+    ///
+    /// Asserted in a build **without** `drm-backend` too, where there is no
+    /// mode the flag could be valid in at all.
+    #[test]
+    fn the_seat_change_policy_is_refused_on_every_backend_without_a_seat() {
+        for args in [
+            vec!["--nested", "--lock-on-seat-change", "immediate"],
+            vec!["--nested", "--lock-on-seat-change=immediate"],
+            vec!["--nested", "--lock-on-seat-change", "never"],
+            vec!["--headless", "--lock-on-seat-change", "idle"],
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err("a backend with no seat cannot have a seat-change policy");
+            assert!(
+                err.contains("--lock-on-seat-change") && err.contains("--drm"),
+                "the refusal must name the flag and the one backend it is valid on: {err}"
+            );
+        }
+        // Even the DEFAULT value is refused when named: the refusal is about a
+        // flag being stored and never read, and `never` is not an exception to
+        // that -- accepting it would teach an operator that the flag works
+        // here, and they would go on to write `immediate`.
+        assert!(parse_args(["--nested", "--lock-on-seat-change=never"]).is_err());
+
+        // Named in `USAGE` rather than a bare-metal-only help text, because
+        // the parser has an arm for the flag in every build and answers a
+        // *reason* rather than `unknown argument`.
+        assert!(USAGE.contains("--lock-on-seat-change"));
+        for policy in ["immediate", "idle", "never"] {
+            assert!(
+                USAGE.contains(policy),
+                "the help must name the whole vocabulary: {policy} is missing"
+            );
+        }
+        assert!(
+            USAGE.contains("never a way past a lock screen"),
+            "the help must say the thing no policy changes, where an operator picking one will \
+             read it"
+        );
+    }
+
     #[test]
     fn the_lock_flags_parse_both_spellings_and_default_independently() {
         // The default, pinned for the reason the dead-man's and the attention
@@ -5421,6 +5679,12 @@ mod tests {
         assert_eq!(defaults.chord.spelling(), "ctrl+alt+delete");
         assert_eq!(defaults.idle, None, "no idle raise unless asked for");
         assert_eq!(defaults.passphrase, None);
+        assert_eq!(
+            defaults.on_seat_change,
+            lock::SeatChangePolicy::Never,
+            "a VT switch away does not lock the session unless somebody says otherwise \
+             (D-030(2), issue #246)"
+        );
 
         for args in [
             vec!["--nested", "--lock-chord", "super+f12"],
@@ -5820,5 +6084,111 @@ mod tests {
         assert!(parse_args(["--nested", "--nested"]).is_err());
         assert!(parse_args(["--headless", "--headless"]).is_err());
         assert!(parse_args(["--nested", "--headless"]).is_err());
+    }
+
+    /// A writer that hands every `make_writer` call the same buffer, so a test
+    /// can read back exactly the bytes the subscriber emitted.
+    ///
+    /// `Clone` rather than a borrow because `MakeWriter`'s blanket impl for a
+    /// closure is the only one that fits a shared buffer: `Arc<Mutex<Vec<u8>>>`
+    /// satisfies neither the `Arc<W>` impl (it needs `&W: Write`) nor the
+    /// `Mutex<W>` one (it needs the `Mutex` itself, unwrapped).
+    #[derive(Clone)]
+    struct SharedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Emit one line through the real subscriber builder and return it.
+    ///
+    /// `with_default` rather than a global install: the global slot is
+    /// one-shot per process and these are two cases in one test binary.
+    fn capture_one_line(ansi: bool) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = SharedLog(std::sync::Arc::clone(&buf));
+        let subscriber = diagnostic_subscriber(
+            move || sink.clone(),
+            ansi,
+            tracing_subscriber::EnvFilter::new("info"),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            // The runbook's own field, verbatim, because it is the one the
+            // second DRM run could not grep back out of its log.
+            tracing::info!(connector = "eDP-1", "mode set");
+        });
+        let bytes = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8(bytes).expect("the formatter emits UTF-8")
+    }
+
+    /// **A redirected log is greppable, and a terminal still gets colour**
+    /// (issue #251).
+    ///
+    /// What CI can prove is the formatting layer, which needs no DRM device,
+    /// no seat and no GPU: given a non-tty writer the line carries a literal
+    /// `connector=` and no `ESC[` byte anywhere. What CI **cannot** prove is
+    /// the other half of the acceptance criterion — that `grep 'connector='`
+    /// over a redirected `vitrind` stderr returns the `mode set:` line — since
+    /// no CI runner reaches the DRM path that emits it at all.
+    #[test]
+    fn a_redirected_log_is_greppable_and_a_terminal_still_gets_colour() {
+        let plain = capture_one_line(false);
+        assert!(
+            plain.contains("connector=\"eDP-1\""),
+            "a redirected log must carry the field name, its `=` and its value as adjacent \
+             literal bytes, or the runbook's own grep finds nothing and the record paraphrases \
+             what it cannot quote. Got: {plain:?}"
+        );
+        assert!(
+            !plain.contains('\u{1b}'),
+            "an escape byte anywhere in a redirected log is the defect: it separates a field \
+             name from its `=`. Got: {plain:?}"
+        );
+
+        // Colour is not removed from interactive use -- only from the case
+        // where the bytes are going into a file.
+        let coloured = capture_one_line(true);
+        assert!(
+            coloured.contains('\u{1b}'),
+            "a terminal must still get colour; the fix is a tty test, not a removal. Got: \
+             {coloured:?}"
+        );
+    }
+
+    /// The tty test and `NO_COLOR` are both one-way switches, so the rule is
+    /// their conjunction (issue #251).
+    #[test]
+    fn colour_needs_a_terminal_and_an_unset_no_color() {
+        assert!(
+            ansi_wanted(true, None),
+            "an interactive run keeps its colour"
+        );
+        assert!(
+            !ansi_wanted(false, None),
+            "a pipe or a file gets no escapes, which is the whole fix"
+        );
+        // NO_COLOR is honoured BY HAND because `with_ansi` overrides the
+        // subscriber's own check; forgetting it would silently repeal a
+        // conventional opt-out this binary used to respect.
+        assert!(
+            !ansi_wanted(true, Some(std::ffi::OsString::from("1"))),
+            "NO_COLOR must still turn colour off on a terminal"
+        );
+        // ...and its own rule: only a NON-EMPTY value opts out.
+        assert!(
+            ansi_wanted(true, Some(std::ffi::OsString::new())),
+            "an empty NO_COLOR is not an opt-out (no-color.org)"
+        );
+        assert!(!ansi_wanted(false, Some(std::ffi::OsString::from("1"))));
     }
 }

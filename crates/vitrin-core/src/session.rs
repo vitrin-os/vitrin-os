@@ -180,14 +180,22 @@ pub(crate) struct RuntimeSeed {
     /// runtime consumes.
     pub indicator: crate::consent::TrustedIndicator,
     /// Optional `--capture-dump PATH` target (P1.8.5, issue #107): when set,
-    /// every redraw also writes each live realm's freshly composited
-    /// realm-view readback — the raw RGBA that realm's capture cache entry is
-    /// refreshed from — to **`PATH.<realm-id>`**. It is the **core-internal
-    /// capture**, taken before `render_frame`, the memfd, the wire and the
-    /// SDK decode ever run, so an agent's `observe()` frame can be compared
-    /// against it to prove the grant/capture path adds no distortion against
-    /// a real app. A diagnostic knob, not a wire feature; `None` in every
-    /// ordinary run.
+    /// every *refresh* of a live realm's view also writes that freshly
+    /// composited realm-view readback — the raw RGBA that realm's capture
+    /// cache entry is refreshed from — to **`PATH.<realm-id>`**. It is the
+    /// **core-internal capture**, taken before `render_frame`, the memfd, the
+    /// wire and the SDK decode ever run, so an agent's `observe()` frame can
+    /// be compared against it to prove the grant/capture path adds no
+    /// distortion against a real app. A diagnostic knob, not a wire feature;
+    /// `None` in every ordinary run.
+    ///
+    /// **A refresh, not a redraw** (issue #252). The mirror follows the
+    /// compose rather than the round, and [`refresh_view_cache`] no longer
+    /// composes a realm whose scene and view size are unchanged — so an
+    /// unmoving realm writes nothing and keeps the dump it already has, byte
+    /// for byte what a recompose would have produced. The content a reader
+    /// gets is unaffected; what is *not* available is the file's mtime as a
+    /// signal that a frame landed.
     ///
     /// **The realm suffix is not cosmetic** (WS-E.1.3, issue #209). While a
     /// session held one realm, `PATH` unambiguously named the one view the
@@ -196,15 +204,17 @@ pub(crate) struct RuntimeSeed {
     /// nothing is written to the bare `PATH` at all — every dump names the
     /// realm it is of. See [`capture_dump_path`].
     pub capture_dump: Option<PathBuf>,
-    /// The audited `--screenshot-dir` (WS-E.2.4, issue #216), already opened
-    /// and validated by `main`'s argument parser, or `None` when the operator
-    /// passed no flag -- in which case the screenshot key writes nothing.
+    /// The audited `--screenshot-dir` (WS-E.2.4, issue #216), already opened,
+    /// validated and handed to its worker thread by `main`, or `None` when the
+    /// operator passed no flag -- in which case the screenshot key writes
+    /// nothing and no worker exists.
     ///
-    /// Carried as an **open descriptor**, not a path: by the time it reaches
-    /// here the only thing that can be done with it is write a file the core
-    /// itself named, into the directory the core itself resolved before any
-    /// client existed.
-    pub screenshot_dir: Option<crate::screenshot::ScreenshotDir>,
+    /// Carried as a **writer over an open descriptor**, not a path: by the time
+    /// it reaches here the only thing that can be done with it is submit a
+    /// frame, which becomes a file the core itself named, in the directory the
+    /// core itself resolved before any client existed. Since issue #240 the
+    /// descriptor is not even on this thread -- see [`crate::screenshot`].
+    pub screenshot_writer: Option<crate::screenshot::ScreenshotWriter>,
 }
 
 /// Everything one running session owns that is not presentation, living in
@@ -274,7 +284,15 @@ pub(crate) struct Runtime<H: PreemptionHook> {
     /// cannot sit here waiting for a predicate to fail open. That is the same
     /// defence-in-depth posture `RetainedOutput::scrub_retained_frame` takes
     /// for the headless framebuffer, applied to the capture cache.
-    view_cache: BTreeMap<RealmId, Vec<u8>>,
+    ///
+    /// Each entry carries the [`ViewKey`] it was composed under (issue #252),
+    /// **in the same value as the bytes** so the two cannot drift apart: one
+    /// insert writes both, one removal drops both, and there is no second map
+    /// to forget to update. That is the whole answer to the risk #252 names —
+    /// a per-realm freshness fact beside the session-wide `dirty` flag is a
+    /// second definition of "has this realm changed", and two of those that can
+    /// disagree is the shape of #243.
+    view_cache: BTreeMap<RealmId, CachedView>,
     /// The `--capture-dump PATH` diagnostic target from the seed (P1.8.5),
     /// `None` in every ordinary run. When set, [`post_dispatch`] mirrors each
     /// realm's refreshed [`Self::view_cache`] entry to `PATH.<realm-id>` —
@@ -282,6 +300,52 @@ pub(crate) struct Runtime<H: PreemptionHook> {
     capture_dump: Option<PathBuf>,
     /// This session's monotonic zero, for presentation timestamps.
     epoch: Instant,
+}
+
+/// **Everything one realm's composed view is a function of** (issue #252).
+///
+/// [`Scene::compose`] is documented pure — *"same scene + same size = same
+/// bytes"* — and [`Scene::generation`] is documented to change *"exactly when
+/// composed output may have changed (for a fixed view size)"*. Those two
+/// sentences are the whole of this type: `(generation, size)` is the pair the
+/// second sentence's parenthesis names, so two refreshes with equal keys
+/// produce equal bytes, and [`refresh_view_cache`] may skip the second.
+///
+/// **What is deliberately NOT in this key**, checked against
+/// [`crate::backend::human_visible_from_view`]'s parameter list one by one: the
+/// consent surface, the lock cover, the blank cover, the status strip and the
+/// attention flag. None of them belong here, and that is not an omission of the
+/// #243 kind — it is the output-stage fork. `Presenter::view_rgba` serves the
+/// **realm view**, which is upstream of every one of those; a capture that
+/// contained any of them would be the leak `docs/protocol/05-vitrin_consent.md`
+/// forbids outright. If one of them ever *did* reach this cache, the bug would
+/// be that it reached it, not that this key failed to notice.
+///
+/// The one backend that answers `view_rgba` from something other than
+/// `Scene::compose` is headless, which reads back its retained **view**
+/// framebuffer for the bound realm — a framebuffer its own tests pin as a
+/// byte-for-byte identity of `Scene::compose` for the same scene and size
+/// (`retained_framebuffer_is_the_capture_source`), and which is written on the
+/// same redraw this key is taken after. So the identity holds there too, by the
+/// same two sentences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewKey {
+    /// [`Scene::generation`] at the composite this entry came from.
+    generation: u64,
+    /// The output size it was composed at. One output, so one size for every
+    /// realm (decision 3 of issue #209) — carried per entry anyway, because
+    /// "the size the bytes in this entry are of" is a property of the entry and
+    /// reading it from the presenter is what makes a resize round ambiguous.
+    size: (u32, u32),
+}
+
+/// One realm's cached view: the bytes, and what they are a composition **of**.
+///
+/// The two live in one value on purpose — see [`Runtime::view_cache`].
+#[derive(Debug)]
+struct CachedView {
+    key: ViewKey,
+    rgba: Vec<u8>,
 }
 
 /// The capability kernel's state: one verifier, one petition registry, one
@@ -357,7 +421,17 @@ pub(crate) struct Kernel {
     /// takes a path. The dead-man switch deliberately does **not** clear it --
     /// the off-switch destroys authority, and a human's own screenshot key is
     /// not authority.
-    pub screenshot_dir: Option<crate::screenshot::ScreenshotDir>,
+    ///
+    /// Since issue #240 it is a *writer*, not the directory: the audited
+    /// descriptor lives on the worker thread and this half can only submit a
+    /// frame and read back what happened to it. That is narrower in the one
+    /// sense that holds against a same-uid app -- every write lands relative
+    /// to a descriptor opened `O_DIRECTORY|O_NOFOLLOW`, with
+    /// `O_CREAT|O_EXCL|O_NOFOLLOW` and mode 600 -- and **not** in the sense of
+    /// ambient authority (issue #261): this process is unsandboxed and
+    /// single-uid, so moving a `ScreenshotDir` between threads takes nothing
+    /// away from either. See [`crate::screenshot`]'s module docs.
+    pub screenshot_writer: Option<crate::screenshot::ScreenshotWriter>,
 }
 
 /// The realm's live shim session: the protocol server, the out-of-band send
@@ -899,7 +973,7 @@ impl<H: PreemptionHook> Runtime<H> {
             // rest here, so the runtime deliberately drops it.
             indicator: _,
             capture_dump,
-            screenshot_dir,
+            screenshot_writer,
         } = seed;
         Self {
             kernel: Kernel {
@@ -913,7 +987,7 @@ impl<H: PreemptionHook> Runtime<H> {
                 clipboard,
                 clipboard_slot: crate::clipboard::ClipboardSlot::new(),
                 screenshot,
-                screenshot_dir,
+                screenshot_writer,
             },
             listener: Some(listener),
             conns: BTreeMap::new(),
@@ -961,7 +1035,30 @@ impl<H: PreemptionHook> Runtime<H> {
     /// is no registration left to leak.
     pub fn into_recorder(mut self) -> Recorder {
         self.teardown_open_connections();
+        self.finish_pending_screenshots();
         self.kernel.recorder
+    }
+
+    /// Wait out the screenshot encodes this session accepted and journal them
+    /// (issue #240).
+    ///
+    /// **Here, in the funnel every backend leaves through, and not in a `Drop`
+    /// impl**, for [`Self::teardown_open_connections`]'s reason: a drop runs
+    /// after `run_session` has taken the recorder back, so it could wait but
+    /// could not record. A screenshot the human took a moment before `SIGTERM`
+    /// must land on disk *and* in the log of the run it belongs to; the
+    /// bounded wait that makes the first true is
+    /// [`crate::screenshot::ScreenshotWriter::finish`]'s, and this is what
+    /// makes the second true.
+    ///
+    /// Split out rather than inlined so a test can reach the same wait without
+    /// consuming the runtime -- again exactly as the connection teardown is.
+    pub(crate) fn finish_pending_screenshots(&mut self) {
+        let Some(writer) = self.kernel.screenshot_writer.as_mut() else {
+            return;
+        };
+        let outcomes = writer.finish();
+        record_screenshot_outcomes(&mut self.kernel, outcomes);
     }
 
     /// Run [`PrincipalServer::teardown`] for every connection still open,
@@ -2077,8 +2174,9 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
 }
 
 /// Drive the **idle blank** for one dispatch round (WS-E.4.3, issue #223):
-/// advance the countdown, abandon a wake that never completed, and mirror the
-/// phase onto the cover.
+/// advance the countdown, abandon a wake that never completed, mirror the phase
+/// onto the cover, and **say so in the log and the flight recorder** (issues
+/// #258 and #259).
 ///
 /// Returns whether human-visible output changed, so the caller marks the frame
 /// dirty and asks for a present — [`service_consent_round`]'s and
@@ -2112,6 +2210,26 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
 /// `LockScreen::tick`: a session with `--blank-idle 300 --lock-idle 600` would
 /// then never lock, because the blank would silently disable the lock — the
 /// class of unchosen behaviour D-030(2) was written to catch.
+///
+/// The `lock` parameter is therefore **read-only, and it is read rather than
+/// assumed**. "The blank does not raise a lock" is a statement about what this
+/// round *does*; it says nothing about what it *finds*, and both configurations
+/// above reach a session that is locked while the cover is up. The journal
+/// entries below carry the answer, so `&std::cell::RefCell<..>` — the shape
+/// [`note_seat_presence`] already takes — rather than a `bool` a future caller
+/// could pass wrongly and nothing would catch.
+///
+/// # The observability half lives here, not in the backend (issues #258, #259)
+///
+/// The blank's *power-down* line stays in [`crate::backend::drm`], because only
+/// that site knows whether `DrmSurface::clear` was accepted. Everything else a
+/// human or a journal reader needs to reconstruct the dark window is emitted
+/// from here, for two reasons that point the same way: this is the one function
+/// both the bare-metal backend and the session rig drive, so CI can hold it —
+/// and the wake's own resolution is a *state machine* fact rather than a device
+/// fact, so it belongs where the state machine is read. A wake line written in
+/// `DrmState` would be a line no test in this workspace could ever see, which is
+/// how a silent unblank shipped in the first place.
 #[cfg_attr(
     not(feature = "drm-backend"),
     allow(
@@ -2122,7 +2240,9 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
                   override, which is where CI's coverage of the state machine lives"
     )
 )]
-pub(crate) fn service_blank_round(
+pub(crate) fn service_blank_round<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    lock: &std::cell::RefCell<crate::lock::LockScreen>,
     activity: &mut crate::backend::blank::SessionActivity,
     surface: &mut crate::backend::blank::BlankSurface,
     now: Instant,
@@ -2134,14 +2254,197 @@ pub(crate) fn service_blank_round(
     // the session is not left in a state where every subsequent press is
     // swallowed as "still waking". Fail open on input; the property that stops
     // a clickjack is the consent guard restart, not the consume.
+    //
+    // **Silent here on purpose since #258**: abandoning the wake is exactly the
+    // failed unblank, so it is said once, below, in the arm that also knows how
+    // long the panel was dark -- rather than twice, in two different voices.
     if activity.wake_expired(now) {
-        tracing::warn!(
-            "the screen did not come back within the wake deadline; abandoning the wake so \
-             physical input reaches the session again"
-        );
         activity.force_lit();
     }
-    surface.set_covering(activity.is_covering())
+    let changed = surface.set_covering(activity.is_covering());
+    journal_screen_transition(runtime, lock, activity, now);
+    changed
+}
+
+/// Say what just happened to the human's panel — once, in the log and in the
+/// flight recorder (issues #258 and #259).
+///
+/// Split out of [`service_blank_round`] because it is the only part that needs
+/// the runtime at all, and because the round's three lines above should stay
+/// readable as the state machine they are.
+///
+/// **The grant count and the lock state are read only on a transition.** The
+/// first is an O(rows) scan and this runs every dispatch round; a session with
+/// no `--blank-idle` produces no transition ever, so it pays one `Option`
+/// compare.
+///
+/// **Both are sampled here, at journal time, and neither is inferred.** The
+/// grant count was always read; `locked` was once written as the literal
+/// `false` on the strength of D-033, and that reasoning does not hold: D-033
+/// says the blank never *raises* a lock, not that it never *finds* one. A
+/// chorded lock followed by a walk away, and `--blank-idle 300 --lock-idle 600`,
+/// both reach a locked session behind a dark panel.
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        dead_code,
+        reason = "reached only through `service_blank_round`, which carries the same note"
+    )
+)]
+fn journal_screen_transition<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    lock: &std::cell::RefCell<crate::lock::LockScreen>,
+    activity: &mut crate::backend::blank::SessionActivity,
+    now: Instant,
+) {
+    use crate::backend::blank::{ScreenTransition, WakeOutcome};
+
+    let Some(transition) = activity.take_transition(now) else {
+        return;
+    };
+    // `Active` rows only, through the same liveness every other read surface
+    // folds in: a revoked, expired or spent row holds nothing, and counting one
+    // would put a number on this entry that overstates what could see the human.
+    let live_grants = runtime
+        .kernel
+        .grants
+        .rows(now)
+        .filter(|(_, state)| *state == crate::grants::GrantState::Active)
+        .count();
+    // **`is_locked` and nothing else, and the restriction is load-bearing.**
+    // `LockScreen` holds an `Rc` to the very `SessionActivity` this function
+    // already has `&mut` to, so any read here that reached through to the shared
+    // record -- `LockScreen::tick`, or an `is_locked` that grew an activity
+    // check -- would be an `already mutably borrowed` panic in the compositor on
+    // the first blank. `is_locked` reads one `Option` on the gate itself.
+    let locked = lock.borrow().is_locked();
+    match transition {
+        ScreenTransition::Blanked => {
+            runtime
+                .kernel
+                .recorder
+                .record(crate::recorder::Event::ScreenBlanked {
+                    live_grants,
+                    locked,
+                });
+        }
+        ScreenTransition::Woke { dark, outcome } => {
+            let dark_ms = u64::try_from(dark.as_millis()).unwrap_or(u64::MAX);
+            match outcome {
+                // **The wake line #258 asks for**, at the blank's own level. It
+                // names what woke the panel (physical input -- nothing else can:
+                // an agent's actuation never reaches the clock, and there is no
+                // verb in the IDL for "power the human's display") and that the
+                // modeset was accepted.
+                //
+                // **What it deliberately does NOT claim** is the half that was
+                // wrong when this line was first written: it said the session
+                // "was never locked" and that every grant counted "was live
+                // throughout". Neither is knowable here. A lock can be up across
+                // the whole dark window, and a grant can be minted inside it --
+                // `PromptVisibility::ScreenIsDark` holds interactive prompts
+                // back, but `ConsentPolicy::AutoApprove` and
+                // `vitrin_grant.attenuate` are not interactive. The two fields
+                // are therefore reported as the instantaneous samples they are,
+                // and the sentence says what waking does rather than what the
+                // window contained.
+                WakeOutcome::FlipLanded => tracing::info!(
+                    dark_ms,
+                    live_grants,
+                    locked,
+                    "the panel is lit again: physical input woke the session and the modeset \
+                     was accepted. The wake itself restores no authority -- an idle blank never \
+                     took any away (idle blanks, it does not lock) and lifting one never \
+                     unlocks -- so this is no evidence of WHO woke it. `live_grants` and \
+                     `locked` are samples taken at this instant that BOUND the dark window; \
+                     the grant and lock entries between the pair are what describe its inside"
+                ),
+                // ...and the failed one, distinguishable, which is the whole
+                // point: before this, a wake that worked and a modeset that left
+                // the panel dark produced identical output -- none.
+                WakeOutcome::NoFlip => tracing::warn!(
+                    dark_ms,
+                    live_grants,
+                    locked,
+                    deadline_ms = crate::backend::blank::WAKE_DEADLINE.as_millis(),
+                    "THE WAKE WAS NOT CONFIRMED: no flip landed within the deadline, so the \
+                     panel may still be dark with this session running -- the state \
+                     docs/book/src/recovery.md calls indistinguishable from a wedge. Physical \
+                     input is being delivered again regardless, because a dark session that \
+                     also swallows input is worse"
+                ),
+                // Neither a wake nor a failure: the human left for another VT
+                // while the panel was dark, and this session dropped a blank it
+                // could not have undone (`clear()` answers `DeviceInactive`).
+                WakeOutcome::SeatLost => tracing::info!(
+                    dark_ms,
+                    locked,
+                    "the idle blank ended because the seat took the panel away, not because \
+                     the screen came back; the activate arm's ordinary repaint is what puts a \
+                     picture back"
+                ),
+            }
+            runtime
+                .kernel
+                .recorder
+                .record(crate::recorder::Event::ScreenWoke {
+                    dark_ms,
+                    outcome: outcome.label(),
+                    live_grants,
+                    locked,
+                });
+        }
+    }
+}
+
+/// **The seat took this session's devices away, or gave them back** — the
+/// activity clock's half of a `SessionEvent`, and the one place the instant it
+/// is stamped with is sampled (issue #257).
+///
+/// # Why this is a free function, and why it takes no `now`
+///
+/// A free function for [`suspend_physical_seat`]'s reason: `DrmState` needs a
+/// real `DrmDevice`, `LibSeatSession`, `GbmDevice` and `GlesRenderer`, so
+/// anything left inside its `handle_session_event` is unreachable by every test
+/// in this workspace — and this arm silently regressing would take nothing red
+/// with it. It did, and this function is the fix.
+///
+/// **No `now` parameter, and that absence is the fix rather than a style
+/// choice.** The activate arm used to pass `self.now`, the cell
+/// `route_physical_inputs` samples once per *input turn*. A paused session sees
+/// no input turn — the keypress that switches the VT back is delivered to
+/// whichever session is currently active, never to this one — so that cell still
+/// held an instant from before the absence. The clock was therefore "reset" to a
+/// moment already past the idle threshold, and:
+///
+/// * with `--blank-idle 60` the panel went dark **1.5 s** after the human came
+///   back, measured on the L4 rung on 2026-08-11 (issue #257's evidence);
+/// * and the answer for `--lock-idle` is **not different, it is worse** — the
+///   lock's idle raise reads `last_activity` off the same shared record, so the
+///   same stale stamp hands a returning human a passphrase prompt they never
+///   asked for. That is the stronger claim, so it is stated rather than left
+///   implied: one stamp, two timers, one defect.
+///
+/// # Seat activation counts as activity, and that is the decision (#257)
+///
+/// A reactivation is always *caused* by a human acting on this machine, even
+/// though this session structurally cannot observe the event that caused it. An
+/// idle timer asks "is anybody there"; somebody switching to this VT has just
+/// answered it. The countdown therefore restarts from the return rather than
+/// resuming one frozen mid-way, which is what
+/// [`crate::backend::blank::SessionActivity::set_seat_absent`] already intended
+/// and documented before this — the intent was right and the stamp was stale.
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the bare-metal backend's session-event \
+                  handler, because only that backend has a seat; the behaviour is held in \
+                  every build by this module's own tests"
+    )
+)]
+pub(crate) fn note_seat_presence(lock: &std::cell::RefCell<crate::lock::LockScreen>, absent: bool) {
+    lock.borrow_mut().set_seat_absent(absent, Instant::now());
 }
 
 /// **The human can see this session's trusted surfaces again as of `now`** —
@@ -2442,8 +2745,8 @@ fn dispatch_principal<H: RuntimeHost>(
                 // The cache itself is refreshed at redraw time, never here,
                 // so capture stays a pure read of the last completed frame.
                 let realm_view = |realm_id: &RealmId| {
-                    view_cache.get(realm_id).map(|rgba| RealmViewFrame {
-                        rgba: rgba.as_slice(),
+                    view_cache.get(realm_id).map(|cached| RealmViewFrame {
+                        rgba: cached.rgba.as_slice(),
                         width,
                         height,
                     })
@@ -3488,6 +3791,24 @@ pub(crate) fn resume_physical_seat(grab: &std::cell::RefCell<ConsentGrab>, now: 
 /// with.** There is no principal, no facet and no verb in this function, and
 /// `enforcement.rs`'s source scan asserts that this file and
 /// `crate::screenshot` never name the chokepoint's identifiers.
+///
+/// # What this function no longer does (issue #240)
+///
+/// **It does not encode.** It copies the cache entry and hands it to
+/// [`crate::screenshot::ScreenshotWriter`], whose thread runs the PNG encoder
+/// and the `write(2)`; the measured 71.7 ms this used to spend inside the input
+/// round is now a `memcpy` and a channel send. What it still owns is every
+/// decision that needs the compositor's state — which realm, whether a
+/// directory exists, whether that realm has a view — because none of those are
+/// answerable from a worker, and the refusals for them are still journalled
+/// here, synchronously, under the labels they always had.
+///
+/// The outcome of an accepted job is journalled later, by
+/// [`journal_screenshot_outcomes`] on a subsequent dispatch round. That is the
+/// one observable change: `screenshot_written` lands a few milliseconds after
+/// the press rather than inside it. It is still exactly one entry per accepted
+/// gesture, and the session's own shutdown funnel waits for the stragglers so
+/// none of them can fall outside the run they belong to.
 fn drain_screenshot_gestures<H: PreemptionHook>(
     runtime: &mut Runtime<H>,
     scenes: &crate::scene::realms::RealmScenes,
@@ -3516,7 +3837,7 @@ fn drain_screenshot_gestures<H: PreemptionHook>(
                 .recorder
                 .record(crate::recorder::Event::ScreenshotFailed { realm, reason });
         };
-        let Some(dir) = kernel.screenshot_dir.as_mut() else {
+        let Some(writer) = kernel.screenshot_writer.as_mut() else {
             // The key fired and the session has nowhere to put a file. Not an
             // error the operator can act on mid-session, but the alternative
             // is a key that silently does nothing, which is worse.
@@ -3527,26 +3848,79 @@ fn drain_screenshot_gestures<H: PreemptionHook>(
             fail(kernel, None, "no_bound_realm");
             continue;
         };
-        let Some(rgba) = runtime.view_cache.get(realm_id) else {
+        // `.rgba`, never the whole entry: the [`ViewKey`] beside it is
+        // `refresh_view_cache`'s business, and nothing downstream of the cache
+        // may make a decision on it. A disjoint field borrow rather than an
+        // accessor, because `kernel` is borrowed mutably one line up -- the
+        // same reason the chokepoint destructures the field.
+        let Some(rgba) = runtime.view_cache.get(realm_id).map(|c| c.rgba.as_slice()) else {
             // The realm has no live view: it has never composited, or its shim
             // is gone. The same fact the chokepoint turns into `no_surface`.
             fail(kernel, Some(realm_id), "no_view");
             continue;
         };
-        match crate::screenshot::capture_to_file(dir, gesture, rgba, width, height) {
+        // The frame is copied here and encoded there. A refusal at the queue is
+        // journalled with the same immediacy the three above are, because a
+        // press that produced no job will produce no outcome either and would
+        // otherwise leave the log silent about a key the human pressed.
+        if let Err(reason) = writer.submit(realm_id, gesture, rgba, width, height) {
+            fail(kernel, Some(realm_id), reason);
+        }
+    }
+}
+
+/// Journal every screenshot the worker has finished since the last round
+/// (issue #240).
+///
+/// The flight recorder is kernel state and stays single-threaded: the worker
+/// reports a [`crate::screenshot::ScreenshotOutcome`] and *this* function, on
+/// the compositor thread, turns it into the same `screenshot_written` /
+/// `screenshot_failed` entry [`drain_screenshot_gestures`] used to write
+/// inline. Handing a second thread a way to write the journal would be a much
+/// larger change to the TCB than moving an encode, and it buys nothing.
+///
+/// Called from [`post_dispatch`] — every dispatch round, before the dirty gate,
+/// because a finished encode is not a reason to composite and must not become
+/// one. On a session with no `--screenshot-dir` there is no writer and this is
+/// a `None` check.
+fn journal_screenshot_outcomes<H: PreemptionHook>(runtime: &mut Runtime<H>) {
+    let Some(writer) = runtime.kernel.screenshot_writer.as_mut() else {
+        return;
+    };
+    let outcomes = writer.take_outcomes();
+    record_screenshot_outcomes(&mut runtime.kernel, outcomes);
+}
+
+/// Turn finished encodes into journal entries — the one place either entry is
+/// written, so the shutdown flush and the per-round drain cannot describe the
+/// same event two different ways.
+fn record_screenshot_outcomes(
+    kernel: &mut Kernel,
+    outcomes: Vec<crate::screenshot::ScreenshotOutcome>,
+) {
+    for outcome in outcomes {
+        match outcome.result {
             Ok((file, digest)) => {
-                tracing::info!(realm = %realm_id, file, "screenshot written");
+                tracing::info!(realm = %outcome.realm, file, "screenshot written");
                 kernel
                     .recorder
                     .record(crate::recorder::Event::ScreenshotWritten {
-                        realm: realm_id,
-                        width,
-                        height,
+                        realm: &outcome.realm,
+                        width: outcome.width,
+                        height: outcome.height,
                         digest: &digest,
                         file: &file,
                     });
             }
-            Err(reason) => fail(kernel, Some(realm_id), reason),
+            Err(reason) => {
+                tracing::warn!(reason, realm = %outcome.realm, "screenshot not written");
+                kernel
+                    .recorder
+                    .record(crate::recorder::Event::ScreenshotFailed {
+                        realm: Some(&outcome.realm),
+                        reason,
+                    });
+            }
         }
     }
 }
@@ -4287,6 +4661,24 @@ pub(crate) fn emit_presented<H: PreemptionHook>(runtime: &mut Runtime<H>) {
 }
 
 pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
+    // Before everything, and deliberately before the dirty gate: a screenshot
+    // the worker finished (issue #240) is a journal entry, never a reason to
+    // composite. Doing it here rather than in `drain_screenshot_gestures` is
+    // what makes the entry land promptly on a session where the human pressed
+    // the key and then stopped typing -- that drain is reached only from a
+    // physical input turn, and the encode outlives the turn that started it.
+    //
+    // **The bound on how late it can be is `SWEEP_INTERVAL`**, and that is
+    // load-bearing rather than incidental: `install` arms an unconditional
+    // one-second timer, so this function runs at least once a second in every
+    // session whatever else is quiet, and no outcome can wait longer than that
+    // for its journal entry. Nothing here wakes the loop itself -- a finished
+    // file is not worth a wakeup -- and a session that ends inside that window
+    // still journals it, because `into_recorder` flushes.
+    //
+    // A session with no `--screenshot-dir` has no writer, so this is one
+    // `Option` check per round.
+    journal_screenshot_outcomes(host.split().0);
     // First, before the dirty gate: raising or lowering a consent prompt is
     // exactly what makes the frame dirty, so it must run before the gate below
     // reads `dirty`. Backends that cannot host a prompt inherit the trait's
@@ -4425,8 +4817,9 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
     }
 }
 
-/// Recompose **every live realm's** view into [`Runtime::view_cache`], and
-/// mirror each one to its `--capture-dump` file.
+/// Recompose **every live realm whose view could have changed** into
+/// [`Runtime::view_cache`], and mirror each fresh one to its `--capture-dump`
+/// file.
 ///
 /// Split out of [`post_dispatch`] because it is now a loop with a prune
 /// rather than one assignment, and because "which realms does the cache hold"
@@ -4436,9 +4829,46 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
 ///   output's view size. A realm whose view is degenerate (a minimized nested
 ///   window, a readback failure, a realm with no scene) gets no entry, which
 ///   the chokepoint turns into `no_surface`.
+/// - **Skip** — a live realm whose [`ViewKey`] is the one its cached entry
+///   already carries is not composed again (issue #252). See below.
 /// - **Prune** — every other entry is removed, so a dead realm's last frame
 ///   does not sit in the map behind a predicate. `realm_is_live` already
 ///   refuses it; this makes the bytes gone as well as unreachable.
+///
+/// # Why the skip is not the refused optimisation (issue #252)
+///
+/// The obvious saving here — compose only for realms something will read — is
+/// **refused**, twice: `backend/winit.rs`'s `view_rgba` says so in the source
+/// and [D-031](../../../docs/plan/20-decision-log.md) records it as a decision.
+/// Gating on grant state would couple the compositing path to the capability
+/// kernel and make the cache's freshness, and the goldens that pin it, depend
+/// on whether a grant happened to exist. Nothing here routes around that: this
+/// cache is refreshed for **every live realm on every dirty round**, whether
+/// or not anything will read it, exactly as before.
+///
+/// What changed is that a refresh whose result is *already in the map* does not
+/// recompute it. The skip is keyed on [`ViewKey`] — the scene's own generation
+/// and the view size — which is the pair `Scene::compose`'s purity contract is
+/// written in terms of, so a skipped realm's entry is byte-for-byte what a
+/// recompose would have produced. **No reader can tell**, which is the property
+/// that distinguishes this from the refused option: freshness is unchanged, and
+/// only the arithmetic is skipped.
+///
+/// Three consequences worth stating rather than discovering:
+///
+/// - **A `kind=dmabuf` commit bumps no generation** (`crate::shim` returns
+///   before `commit_with_damage`), so such a realm is skipped here. That is the
+///   *same bytes* it was already being served: `apply_dmabuf` never touches the
+///   CPU scene, so composing it again would reproduce whatever CPU content
+///   preceded the dmabuf. This neither creates nor worsens that gap — it is
+///   issue #253's, and the shipped shim never sends one.
+/// - **The `--capture-dump` mirror follows the compose**, not the round. A
+///   skipped realm's dump file already holds those exact bytes, so the
+///   diagnostic's content is unchanged; what changes is that an unmoving realm
+///   stops rewriting a 16 MB file every dirty round.
+/// - **One realm's commit still dirties the round for all of them** — `dirty`
+///   is one session-wide flag — but it no longer costs the others a composite.
+///   That is the multi-realm half of #252's bill.
 ///
 /// # "Live" is `server.is_some()`, not "has a map entry"
 ///
@@ -4467,7 +4897,24 @@ fn refresh_view_cache<K: PreemptionHook, P: Presenter>(runtime: &mut Runtime<K>,
         .map(|(realm_id, _)| realm_id.clone())
         .collect();
     runtime.view_cache.retain(|realm, _| live.contains(realm));
+    let size = view.view_size();
     for realm_id in live {
+        // The key first, and from the same presenter the compose reads: a realm
+        // with no scene has no key, so it takes the `None` arm below exactly as
+        // it always did rather than being skipped into keeping a stale entry.
+        let key = view.scene(&realm_id).map(|scene| ViewKey {
+            generation: scene.generation(),
+            size,
+        });
+        if let (Some(key), Some(cached)) = (key, runtime.view_cache.get(&realm_id)) {
+            if cached.key == key {
+                // Same scene, same size: `Scene::compose` is pure, so the bytes
+                // in the map are already the bytes this round would produce.
+                // See this function's docs for why this is not the gating
+                // `backend::winit` and D-031 refuse.
+                continue;
+            }
+        }
         match view.view_rgba(&realm_id) {
             Some(rgba) => {
                 if let Some(base) = runtime.capture_dump.as_deref() {
@@ -4484,7 +4931,26 @@ fn refresh_view_cache<K: PreemptionHook, P: Presenter>(runtime: &mut Runtime<K>,
                     // a session down.
                     write_capture_dump(&capture_dump_path(base, &realm_id), &rgba);
                 }
-                runtime.view_cache.insert(realm_id, rgba);
+                // The bytes and the key they were composed under, written
+                // together into one value: a realm whose scene has no
+                // generation to record (none exists, so `view_rgba` composed
+                // nothing of it) cannot reach here, and every entry that does
+                // carries what it is a composition of.
+                match key {
+                    Some(key) => {
+                        runtime
+                            .view_cache
+                            .insert(realm_id, CachedView { key, rgba });
+                    }
+                    // Unreachable in practice — `view_rgba` answers `None`
+                    // without a scene on all four presenters — and fail-closed
+                    // rather than asserted: an entry with no key would be
+                    // skipped forever by the check above, which is the one
+                    // failure mode this change could have.
+                    None => {
+                        runtime.view_cache.remove(&realm_id);
+                    }
+                }
             }
             None => {
                 runtime.view_cache.remove(&realm_id);
@@ -4686,6 +5152,16 @@ mod tests {
         /// [`Self::human_visible`] therefore passes this one through the very
         /// function both shipped backends compose with.
         blank: crate::backend::blank::BlankSurface,
+        /// **How many times each realm's view was actually composed** (issue
+        /// #252): one entry per `Presenter::view_rgba` call, keyed by realm.
+        ///
+        /// The rig already counts `redraws` and `presents` for the same reason
+        /// -- "what did one dispatch round cost" is only assertable if
+        /// something counts it -- and the capture cache's refresh was the one
+        /// per-round cost with no counter behind it, so a round that composed
+        /// every live realm and a round that composed one were indistinguishable
+        /// to every test in this file.
+        view_rgbas: BTreeMap<RealmId, usize>,
     }
 
     impl TestView {
@@ -4808,6 +5284,10 @@ mod tests {
         /// bytes for every realm would let a runtime that handed out the
         /// wrong realm's frame pass them.
         fn view_rgba(&mut self, realm: &RealmId) -> Option<Vec<u8>> {
+            // Counted before the `?`: a call that found no scene is still a
+            // call, and a refresh that asked about a realm it should have
+            // skipped must be visible whatever the answer was.
+            *self.view_rgbas.entry(realm.clone()).or_insert(0) += 1;
             Some(self.scenes.scene(realm)?.compose(VIEW.0, VIEW.1))
         }
         /// Counts the requests the nested backend turns into
@@ -4889,6 +5369,17 @@ mod tests {
         /// [`service_blank_round`] each dispatch round, exactly as the
         /// bare-metal backend does.
         activity: Option<Rc<RefCell<crate::backend::blank::SessionActivity>>>,
+        /// The lock gate the blank's round reads to answer "was a lock up when
+        /// the panel went dark?", installed by [`Rig::attach_blank_seeded`]
+        /// beside the activity record it shares.
+        ///
+        /// **Installed together and read-only from the blank's side**, exactly
+        /// as on the bare-metal backend: `DrmState` owns one `LockScreen` and
+        /// hands `service_blank_round` a shared reference to it. A rig that
+        /// passed a *second*, private lock would be able to journal `locked:
+        /// false` for a session its own gate had locked, which is the defect
+        /// this field exists to make testable rather than a fixture detail.
+        lock: Option<Rc<RefCell<crate::lock::LockScreen>>>,
         resume: crate::backend::blank::ResumeWatch,
         /// The wall clock this rig reports to [`RuntimeHost::service_screen`],
         /// overriding `SystemTime::now()` when a test sets it.
@@ -4951,6 +5442,14 @@ mod tests {
             let Some(activity) = self.activity.clone() else {
                 return;
             };
+            // Installed by the same call that installed the activity record, so
+            // this cannot be `None` while the round runs -- the rig models the
+            // bare-metal backend, where one `LockScreen` and one
+            // `SessionActivity` are built together and share the clock.
+            let lock = self
+                .lock
+                .clone()
+                .expect("the blank's round carries the session's lock, as on bare metal");
             let wall = self.wall.unwrap_or(wall);
             if let Some(_gap) = self.resume.sample(wall, now) {
                 if let Some(grab) = self.grab.clone() {
@@ -4966,7 +5465,13 @@ mod tests {
             // stands in for.
             let changed = {
                 let mut activity = activity.borrow_mut();
-                service_blank_round(&mut activity, &mut self.view.blank, now)
+                service_blank_round(
+                    &mut self.runtime,
+                    &lock,
+                    &mut activity,
+                    &mut self.view.blank,
+                    now,
+                )
             };
             if changed {
                 self.runtime.dirty = true;
@@ -5008,6 +5513,83 @@ mod tests {
         .unwrap()
     }
 
+    /// **Capture the log lines a block of code emits, on this thread only.**
+    ///
+    /// Two of issue #258's acceptance criteria are about log lines and nothing
+    /// else — a successful wake and a failed one must be *distinguishable* —
+    /// and the only honest way to assert that is to read what was emitted.
+    ///
+    /// Thread-local ([`tracing::subscriber::set_default`]) rather than global,
+    /// for two reasons: `main.rs`'s auto-approve banner test already owns the
+    /// one `set_global_default` this test binary may install and says so in its
+    /// own comment, and everything under test here is emitted on the thread
+    /// driving the rig's rounds.
+    struct LogCapture {
+        lines: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+        /// Restores the previous default when the capture goes out of scope.
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl LogCapture {
+        fn install() -> Self {
+            use tracing_subscriber::layer::SubscriberExt;
+
+            let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                tracing_subscriber::registry().with(CaptureLayer(std::sync::Arc::clone(&lines)));
+            let guard = tracing::subscriber::set_default(subscriber);
+            Self {
+                lines,
+                _guard: guard,
+            }
+        }
+
+        /// Everything captured so far, draining the buffer.
+        fn take(&self) -> Vec<(tracing::Level, String)> {
+            std::mem::take(&mut *self.lines.lock().unwrap_or_else(|e| e.into_inner()))
+        }
+
+        /// Whether any captured line contains `needle`, without draining — for
+        /// asserting that something has **not** been said yet.
+        fn contains(&self, needle: &str) -> bool {
+            self.lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(_, message)| message.contains(needle))
+        }
+    }
+
+    struct CaptureLayer(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = MessageField(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((*event.metadata().level(), message.0));
+        }
+    }
+
+    /// Pulls the formatted `message` out of one event; the structured fields are
+    /// deliberately ignored, because what these tests assert is the sentence a
+    /// human reads in the log.
+    struct MessageField(String);
+
+    impl tracing::field::Visit for MessageField {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
     /// A whole session on a scratch socket: the loop, the host, and the log
     /// path so a test can read back what the run recorded.
     struct Rig {
@@ -5033,7 +5615,7 @@ mod tests {
                 shim: crate::spawn::tests::mock_shim_bin(),
                 indicator: crate::consent::TrustedIndicator::for_test(),
                 capture_dump: None,
-                screenshot_dir: None,
+                screenshot_writer: None,
             };
             let event_loop: EventLoop<'static, TestHost> =
                 EventLoop::try_new().expect("event loop");
@@ -5091,6 +5673,7 @@ mod tests {
                     lock_raised: false,
                     output_active: true,
                     blank: crate::backend::blank::BlankSurface::for_test(),
+                    view_rgbas: BTreeMap::new(),
                 },
                 handle: handle.clone(),
                 signal: event_loop.get_signal(),
@@ -5098,6 +5681,7 @@ mod tests {
                 grab: None,
                 screen: PromptVisibility::Reachable,
                 activity: None,
+                lock: None,
                 resume: crate::backend::blank::ResumeWatch::new(),
                 wall: None,
             };
@@ -5138,12 +5722,53 @@ mod tests {
             &mut self,
             after: Duration,
         ) -> Rc<RefCell<crate::backend::blank::SessionActivity>> {
+            self.attach_blank_seeded(after, Instant::now())
+        }
+
+        /// The same, with the activity clock seeded at a chosen instant.
+        ///
+        /// The seam #257's test needs: "the human has been away longer than the
+        /// idle timeout" is a statement about how old the clock is, and the rig
+        /// runs on the real one. Seeding it in the past says that in a
+        /// millisecond instead of five minutes, and it is the *production*
+        /// constructor either way — [`crate::backend::blank::SessionActivity::new`]
+        /// takes the seed for exactly this reason.
+        ///
+        /// **A lock gate is installed beside it**, sharing the one activity
+        /// record, because the bare-metal backend has exactly one and the
+        /// blank's round reads it. Its idle raise is armed at the same timeout,
+        /// so a test that wants the two coupled has them; nothing ticks it
+        /// unless a test asks ([`Self::lock`]), so every existing blank test
+        /// runs against an unlocked session as before.
+        fn attach_blank_seeded(
+            &mut self,
+            after: Duration,
+            seeded: Instant,
+        ) -> Rc<RefCell<crate::backend::blank::SessionActivity>> {
             let activity = Rc::new(RefCell::new(crate::backend::blank::SessionActivity::new(
                 Some(after),
-                Instant::now(),
+                seeded,
             )));
+            self.host.lock = Some(Rc::new(RefCell::new(crate::lock::LockScreen::new(
+                crate::chord::ModChord::parse(crate::lock::DEFAULT_LOCK_CHORD)
+                    .expect("the default lock chord parses"),
+                Some(after),
+                None,
+                Rc::clone(&activity),
+            ))));
             self.host.activity = Some(Rc::clone(&activity));
             activity
+        }
+
+        /// The lock gate [`Self::attach_blank_seeded`] installed beside the
+        /// activity record — the one the blank's round reads.
+        fn lock(&self) -> Rc<RefCell<crate::lock::LockScreen>> {
+            Rc::clone(
+                self.host
+                    .lock
+                    .as_ref()
+                    .expect("attach_blank installs the lock beside the activity record"),
+            )
         }
 
         /// Fork the real mock-shim binary into this rig's scratch runtime
@@ -5306,8 +5931,12 @@ mod tests {
         // The audited directory, opened exactly as `run_session` opens it.
         let shots = rig.dir.join("shots");
         std::fs::create_dir_all(&shots).expect("mkdir");
-        rig.host.runtime.kernel.screenshot_dir =
-            Some(crate::screenshot::ScreenshotDir::open(&shots).expect("a clean private dir"));
+        rig.host.runtime.kernel.screenshot_writer = Some(
+            crate::screenshot::ScreenshotWriter::spawn(
+                crate::screenshot::ScreenshotDir::open(&shots).expect("a clean private dir"),
+            )
+            .expect("the screenshot worker starts"),
+        );
 
         let chord = crate::chord::ModChord::parse(crate::screenshot::DEFAULT_SCREENSHOT_CHORD)
             .expect("the default chord parses");
@@ -5333,6 +5962,15 @@ mod tests {
         for evdev in mods.iter().rev() {
             press(&mut rig, *evdev, KeyState::Released);
         }
+
+        // The encode runs on the writer's own thread since issue #240, so the
+        // file and its journal entry are owed rather than already written. This
+        // is the **production** wait -- the one `into_recorder` performs at the
+        // end of every session -- and not a test-only synchronisation: a
+        // regression that stopped the outcome ever coming back would hang here
+        // for `FINISH_DEADLINE` and then journal `writer_timeout`, which the
+        // assertions below reject.
+        rig.host.runtime.finish_pending_screenshots();
 
         // 1. One press, one file.
         let written: Vec<_> = std::fs::read_dir(&shots)
@@ -7345,6 +7983,478 @@ mod tests {
         assert_eq!(activity.borrow().phase(), Phase::Lit);
     }
 
+    /// **Coming back from another VT is activity: neither the panel nor the
+    /// lock may fire on the round after the human returns** (issue #257).
+    ///
+    /// The defect this pins is not a timer bug. A paused session never sees the
+    /// input that reactivates it — the chord that switches the VT back is
+    /// delivered to whichever session is *currently* active — so the activate
+    /// arm had nothing but `self.now`, the input turn's clock cell, which for a
+    /// returning session still held an instant from before the absence. Resetting
+    /// the countdown to an already-expired instant is worse than not resetting
+    /// it: with `--blank-idle 60` the L4 rung measured the panel going dark
+    /// **1.5 s** after the human came back.
+    ///
+    /// **Both timers are asserted, because both read the one clock**, and the
+    /// lock's is the stronger claim: a panel that blanks on return is an
+    /// annoyance, while a session that demands a passphrase because somebody
+    /// came back to their own screen is the idle lock firing at exactly the
+    /// moment it should not. The answer is therefore the *same* for the two,
+    /// and this is where "the same" is checked rather than asserted in prose.
+    ///
+    /// Driven through [`note_seat_presence`], which is the production body of
+    /// both bare-metal seat arms: `DrmState` needs a real `DrmDevice`,
+    /// `LibSeatSession`, `GbmDevice` and `GlesRenderer`, so anything left inside
+    /// `handle_session_event` is unreachable by every test in this workspace.
+    #[test]
+    fn returning_from_another_vt_restarts_both_idle_countdowns() {
+        use crate::backend::blank::Phase;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "seat-return-idle",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let idle = Duration::from_secs(60);
+        // The clock as a returning session finds it: last touched long before
+        // the human left, because nothing they did on the other VT reached here.
+        let stale = Instant::now() - Duration::from_secs(600);
+
+        // **The vacuity control.** Without it every assertion below would pass
+        // against a rig that simply never blanks. Same clock age, no seat event:
+        // the very next round covers the output.
+        let control = rig.attach_blank_seeded(idle, stale);
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(
+            control.borrow().phase(),
+            Phase::Covering,
+            "a clock this old must blank on the next round, or this test proves nothing"
+        );
+
+        // Now the same clock age, reached the way a returning human reaches it.
+        // The lock is the rig's own — the one the blank's round reads and the
+        // one sharing this activity record — rather than a second gate built
+        // beside it, so "both timers read one clock" is a property of the rig
+        // rather than of this test's fixture.
+        let activity = rig.attach_blank_seeded(idle, stale);
+        let lock = rig.lock();
+
+        note_seat_presence(&lock, true);
+        assert!(
+            activity.borrow().seat_absent(),
+            "the pause must reach the shared activity record"
+        );
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(
+            activity.borrow().phase(),
+            Phase::Lit,
+            "time on another VT is not idle time, and a paused session must hold no blank it \
+             cannot undo"
+        );
+        assert!(
+            !lock.borrow_mut().tick(Instant::now()),
+            "and the lock must not raise itself on a VT nobody is looking at"
+        );
+
+        // The seat gives the devices back. This is the whole fix: the instant
+        // stamped here comes from `note_seat_presence` itself, not from any
+        // cell a paused session could not have refreshed.
+        note_seat_presence(&lock, false);
+        assert!(!activity.borrow().seat_absent());
+
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(
+            activity.borrow().phase(),
+            Phase::Lit,
+            "#257: the panel blanked on the round after the human came back. The idle clock \
+             was reset to an instant from before the absence, which is already past the \
+             threshold"
+        );
+        assert!(
+            !rig.host.view.blank.is_covering(),
+            "and no cover reached the composite either"
+        );
+        assert!(
+            !lock.borrow_mut().tick(Instant::now()),
+            "#257, the stronger half: the idle lock armed on return, so the human is asked for \
+             a passphrase for the offence of coming back to their own screen"
+        );
+        assert!(lock.borrow().cause().is_none());
+
+        // ...and the countdown really did restart rather than being disabled:
+        // an idle session still blanks, measured from the return.
+        assert!(
+            activity
+                .borrow_mut()
+                .tick(Instant::now() + idle + Duration::from_secs(1)),
+            "the fix must restart the countdown, not switch it off"
+        );
+    }
+
+    /// **A wake says so, a failed wake says something else, and both reach the
+    /// flight recorder** (issues #258 and #259).
+    ///
+    /// Before this, a successful unblank and a modeset that left the panel dark
+    /// produced identical output: none. That is not an ordinary missing log
+    /// line — `docs/book/src/recovery.md` names the second one the worst
+    /// credible outcome of its L4 rung and says in as many words that it is
+    /// indistinguishable from a wedge, so the only instrument that could tell
+    /// them apart was a human looking at the panel.
+    ///
+    /// Driven through the rig's real dispatch round for the success path, so
+    /// what is asserted is the **wiring** and not a function called by hand; the
+    /// failure path is driven by calling the same round function with a
+    /// synthetic clock, because [`crate::backend::blank::WAKE_DEADLINE`] is two
+    /// real seconds and no test may sit through one to learn something the
+    /// injected instant already says.
+    #[test]
+    fn a_wake_and_a_failed_wake_are_logged_and_journalled_differently() {
+        use crate::backend::blank::{BlankSurface, SessionActivity, WAKE_DEADLINE};
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "blank-observability",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let activity = rig.attach_blank(Duration::from_secs(300));
+        let t0 = activity.borrow().last_activity();
+
+        // --- the blank, and the entry it owes ------------------------------
+        let log = LogCapture::install();
+        activity.borrow_mut().tick(t0 + Duration::from_secs(300));
+        rig.pump(Duration::from_millis(50));
+
+        // The panel powers down (the bare-metal half), the human presses a key,
+        // and the flip that re-enables the CRTC lands.
+        activity.borrow_mut().note_frame_queued();
+        activity.borrow_mut().went_dark();
+        assert!(activity
+            .borrow_mut()
+            .note_physical(Instant::now())
+            .consumes());
+        assert!(
+            !log.contains("the panel is lit again"),
+            "a press that starts a wake is not a wake: logging here would make a successful \
+             unblank and a failed one produce the same line, which is the defect one rung down \
+             from the silence"
+        );
+        assert!(activity.borrow_mut().note_flip_completed());
+        rig.pump(Duration::from_millis(50));
+
+        let lines = log.take();
+        let wake = lines
+            .iter()
+            .find(|(_, message)| message.contains("the panel is lit again"))
+            .expect("#258: a successful wake must emit a line -- silence is what shipped");
+        assert_eq!(
+            wake.0,
+            tracing::Level::INFO,
+            "the wake belongs at the blank's own level"
+        );
+        assert!(
+            wake.1.contains("no evidence of WHO woke it") && wake.1.contains("BOUND"),
+            "the wake line must claim only what waking does: it restores no authority, so it \
+             is no evidence of who woke it, and its two counts BOUND the dark window rather \
+             than describing it. Got: {}",
+            wake.1
+        );
+        // The two claims this line used to make and cannot: a lock may have been
+        // up for the whole window, and a grant may have been minted inside it
+        // under `AutoApprove` or by `vitrin_grant.attenuate`, neither of which
+        // is held back by `PromptVisibility::ScreenIsDark`.
+        for overclaim in ["was never locked", "live throughout"] {
+            assert!(
+                !wake.1.contains(overclaim),
+                "the wake line asserts `{overclaim}` about a window it only sampled the ends \
+                 of. Got: {}",
+                wake.1
+            );
+        }
+
+        let entries = rig.entries();
+        let blanked = crate::recorder::tests::of_kind(&entries, "screen_blanked");
+        let woke = crate::recorder::tests::of_kind(&entries, "screen_woke");
+        assert_eq!(
+            blanked.len(),
+            1,
+            "#259: the panel going dark left no flight-recorder entry; got kinds {:?}",
+            entries.iter().map(|e| e.str("kind")).collect::<Vec<_>>()
+        );
+        assert_eq!(woke.len(), 1, "#259: neither did the wake");
+        assert_eq!(woke[0].str("outcome"), "flip_landed");
+        // Present-and-numeric rather than a value: the rig runs on the real
+        // clock, so the only honest claim about the span is that it is recorded.
+        woke[0].u64("dark_ms");
+        for entry in blanked.iter().chain(woke.iter()) {
+            assert_eq!(
+                entry.u64("live_grants"),
+                0,
+                "both entries must carry whether any grant was live across the dark window, \
+                 and this session minted none"
+            );
+            assert!(
+                !entry.bool("locked"),
+                "this session's gate never locked, and BOTH ends of the pair must say so: one \
+                 sample cannot describe a window a lock can raise inside \
+                 (`a_locked_session_that_blanks_is_journalled_as_locked` is the other half)"
+            );
+            // `SessionLocked`'s shape: a session-level fact names no principal
+            // and no realm, because no wire message can blank this panel.
+            for absent in ["principal", "realm", "grant"] {
+                assert!(
+                    entry.path(absent).is_none(),
+                    "a session-level entry must carry no `{absent}` field"
+                );
+            }
+        }
+
+        // --- the failed wake, on a synthetic clock -------------------------
+        let mut activity = SessionActivity::new(Some(Duration::from_secs(60)), t0);
+        let mut surface = BlankSurface::for_test();
+        // The session's own gate, still unlocked: the round reads it and this
+        // path must not be the one that decides what `locked` says.
+        let lock = rig.lock();
+        let log = LogCapture::install();
+
+        service_blank_round(
+            &mut rig.host.runtime,
+            &lock,
+            &mut activity,
+            &mut surface,
+            t0 + Duration::from_secs(60),
+        );
+        assert!(activity
+            .note_physical(t0 + Duration::from_secs(90))
+            .consumes());
+        // The deadline passes with no flip behind it: the modeset that would
+        // light the panel was never confirmed.
+        service_blank_round(
+            &mut rig.host.runtime,
+            &lock,
+            &mut activity,
+            &mut surface,
+            t0 + Duration::from_secs(90) + WAKE_DEADLINE,
+        );
+
+        let lines = log.take();
+        let failed = lines
+            .iter()
+            .find(|(_, message)| message.contains("THE WAKE WAS NOT CONFIRMED"))
+            .expect("#258: a failed wake must be distinguishable from a successful one");
+        assert_eq!(
+            failed.0,
+            tracing::Level::WARN,
+            "a modeset that may have left the panel dark is the exact case worth a WARN"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|(_, message)| message.contains("the panel is lit again")),
+            "a failed wake must never emit the success line"
+        );
+
+        let entries = rig.entries();
+        let woke = crate::recorder::tests::of_kind(&entries, "screen_woke");
+        assert_eq!(woke.len(), 2, "the abandoned wake owes an entry too");
+        assert_eq!(
+            woke[1].str("outcome"),
+            "no_flip",
+            "#259: an abandoned wake journalled as `flip_landed` would be the recorder claiming \
+             the human got their screen back on the one path where they may not have"
+        );
+    }
+
+    /// **A session that is already locked when the panel goes dark is journalled
+    /// as locked** — on both ends of the pair (issue #259, review of #257–#259).
+    ///
+    /// `screen_blanked` shipped its `locked` field as the literal `false`,
+    /// reasoning from D-033 that an idle blank does not lock. D-033 is about what
+    /// the blank *does*, not about what it *finds*, and two ordinary
+    /// configurations reach a locked session behind a dark panel:
+    ///
+    /// * the human chords `Ctrl-Alt-Delete` and then walks away past
+    ///   `--blank-idle`, which is this test; and
+    /// * `--blank-idle 300 --lock-idle 600`, where the idle lock raises *behind*
+    ///   a panel that has been dark since 300 s — deliberately not suppressed by
+    ///   the cover, which `crate::lock::gate`'s
+    ///   `a_blank_does_not_disable_the_idle_lock` pins.
+    ///
+    /// A hardcoded `false` is therefore a **false claim in the flight recorder**,
+    /// which is worse than the silence #259 replaced: silence invites a question,
+    /// and a stated `locked: false` answers it wrongly. The recorder's own rule
+    /// for enumerated facts is that they are read, never inferred.
+    #[test]
+    fn a_locked_session_that_blanks_is_journalled_as_locked() {
+        use crate::backend::blank::Phase;
+        use crate::lock::LockCause;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "blank-while-locked",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let activity = rig.attach_blank(Duration::from_secs(300));
+        let lock = rig.lock();
+        let t0 = activity.borrow().last_activity();
+
+        // The human locks the session by hand, then leaves. The lock is up
+        // BEFORE the idle blank fires, which is the whole configuration.
+        assert!(lock.borrow_mut().raise(LockCause::Chord));
+        assert!(lock.borrow().is_locked());
+
+        activity.borrow_mut().tick(t0 + Duration::from_secs(300));
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(
+            activity.borrow().phase(),
+            Phase::Covering,
+            "a lock does not stop the idle blank, and this test is vacuous if the cover never \
+             goes up"
+        );
+
+        let entries = rig.entries();
+        let blanked = crate::recorder::tests::of_kind(&entries, "screen_blanked");
+        assert_eq!(blanked.len(), 1, "#259: the blank still owes one entry");
+        assert!(
+            blanked[0].bool("locked"),
+            "the flight recorder claimed `locked: false` for a session whose own gate was \
+             locked. `LockScreen::is_locked()` is the only source for this field; a literal \
+             cannot be one"
+        );
+
+        // ...and the other end of the pair says so too, because the lock is
+        // still up when the panel comes back: a wake is not an unlock.
+        activity.borrow_mut().note_frame_queued();
+        activity.borrow_mut().went_dark();
+        assert!(activity
+            .borrow_mut()
+            .note_physical(Instant::now())
+            .consumes());
+        assert!(activity.borrow_mut().note_flip_completed());
+        rig.pump(Duration::from_millis(50));
+
+        let entries = rig.entries();
+        let woke = crate::recorder::tests::of_kind(&entries, "screen_woke");
+        assert_eq!(woke.len(), 1, "#259: the wake owes one entry");
+        assert_eq!(woke[0].str("outcome"), "flip_landed");
+        assert!(
+            woke[0].bool("locked"),
+            "waking the panel does not unlock the session: the human is looking at the lock \
+             card, and an entry saying otherwise would misdate the unlock"
+        );
+
+        // **The field is not a constant wearing a different value.** The same
+        // session, the same recorder, one more blank -- this time behind a gate
+        // that was never locked -- and the entry beside the two above says
+        // `false`. Reached by re-arming the rig rather than by unlocking,
+        // because `LockScreen` answers a passphrase or a key through `judge`
+        // and has no unlock seam a test may reach for; adding one to a lock to
+        // satisfy a test is the wrong trade.
+        let fresh = rig.attach_blank(Duration::from_secs(300));
+        assert!(!rig.lock().borrow().is_locked());
+        let t1 = fresh.borrow().last_activity();
+        fresh.borrow_mut().tick(t1 + Duration::from_secs(300));
+        rig.pump(Duration::from_millis(50));
+
+        let entries = rig.entries();
+        let blanked = crate::recorder::tests::of_kind(&entries, "screen_blanked");
+        assert_eq!(blanked.len(), 2, "the second blank owes its own entry");
+        assert!(
+            blanked[0].bool("locked") && !blanked[1].bool("locked"),
+            "both `screen_blanked` entries in one journal must reflect their own gate; got \
+             locked={:?} then locked={:?}",
+            blanked[0].bool("locked"),
+            blanked[1].bool("locked")
+        );
+    }
+
+    /// **A lock that raises while the panel is already dark moves the pair's
+    /// second sample** — which is why there are two (issue #259, review of
+    /// #257–#259).
+    ///
+    /// The configuration is `--blank-idle 300 --lock-idle 600`: the cover goes
+    /// up at 300 s and the idle lock raises at 600 s **behind** it, deliberately
+    /// unsuppressed by the dark screen (`crate::lock::gate`'s
+    /// `a_blank_does_not_disable_the_idle_lock`). A `screen_blanked` /
+    /// `screen_woke` pair that carried one `locked` sample — or, as shipped, a
+    /// hardcoded `false` on the first and nothing on the second — would assert
+    /// an unlocked dark window that was in fact locked for half its length.
+    ///
+    /// Two samples cannot describe the inside of the window either, and are not
+    /// claimed to: they bound it, and the `session_locked` entry
+    /// [`service_lock_round`] writes is what dates the raise. What this test
+    /// pins is that the bound is real rather than decorative.
+    #[test]
+    fn a_lock_raised_behind_the_cover_shows_up_on_the_wake_entry() {
+        use crate::backend::blank::Phase;
+        use crate::lock::LockCause;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "blank-then-lock",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let activity = rig.attach_blank(Duration::from_secs(300));
+        let lock = rig.lock();
+        let t0 = activity.borrow().last_activity();
+
+        // The cover goes up first, on an unlocked session.
+        activity.borrow_mut().tick(t0 + Duration::from_secs(300));
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(activity.borrow().phase(), Phase::Covering);
+        let blanked = {
+            let entries = rig.entries();
+            let blanked = crate::recorder::tests::of_kind(&entries, "screen_blanked");
+            assert_eq!(blanked.len(), 1);
+            blanked[0].bool("locked")
+        };
+        assert!(
+            !blanked,
+            "the session was not locked when the panel went dark, and the entry must say the \
+             thing that was true at the instant it was written"
+        );
+
+        // ...and the idle lock raises behind it, reading the same clock the
+        // blank read. The panel is already dark, so nothing on screen changes.
+        activity.borrow_mut().note_frame_queued();
+        activity.borrow_mut().went_dark();
+        assert!(
+            lock.borrow_mut().tick(t0 + Duration::from_secs(600)),
+            "a dark screen must not freeze the idle lock -- the shorter timer silently \
+             disabling the longer one is the coupling D-030(2) was written to catch"
+        );
+        assert_eq!(lock.borrow().cause(), Some(LockCause::Idle));
+
+        // The human comes back to a lock card on a panel that is lit again.
+        assert!(activity
+            .borrow_mut()
+            .note_physical(Instant::now())
+            .consumes());
+        assert!(activity.borrow_mut().note_flip_completed());
+        rig.pump(Duration::from_millis(50));
+
+        let entries = rig.entries();
+        let woke = crate::recorder::tests::of_kind(&entries, "screen_woke");
+        assert_eq!(woke.len(), 1, "#259: the wake owes one entry");
+        assert!(
+            woke[0].bool("locked"),
+            "the dark window was locked for its second half and the pair says `false` at both \
+             ends: a reader reconstructing this session is told nobody could have been asked \
+             for a passphrase, which is the opposite of what happened"
+        );
+    }
+
     /// **A consent prompt cannot be resolved across a blank** (WS-E.4.3, issue
     /// #223's named acceptance criterion; D-030(4)'s deferred dark-output gate,
     /// discharged).
@@ -7863,7 +8973,7 @@ mod tests {
             "the atomic-write temp must not survive a successful write"
         );
 
-        // A second write overwrites in place (each redraw refreshes it).
+        // A second write overwrites in place (a later refresh rewrites it).
         let frame2: Vec<u8> = frame.iter().rev().copied().collect();
         write_capture_dump(&path, &frame2);
         assert_eq!(std::fs::read(&path).expect("second dump"), frame2);
@@ -7928,6 +9038,23 @@ mod tests {
             crate::scene::SurfaceContent::from_rgba(crate::scene::tests::client_pixels(w, h), w, h)
                 .expect("well-formed fixture"),
         );
+    }
+
+    /// The bytes of a realm's cached view, without the [`ViewKey`] stored
+    /// beside them (issue #252).
+    ///
+    /// A test reads what a *reader* would be served, which is the projection
+    /// both production readers make. The key is [`refresh_view_cache`]'s
+    /// business, and a test that asserted on it would be pinning the
+    /// optimisation rather than the property.
+    fn cached_view<'r, H: PreemptionHook>(
+        runtime: &'r Runtime<H>,
+        realm: &RealmId,
+    ) -> Option<&'r [u8]> {
+        runtime
+            .view_cache
+            .get(realm)
+            .map(|cached| cached.rgba.as_slice())
     }
 
     /// What a realm's view composes to at the test host's view size — the
@@ -7997,10 +9124,13 @@ mod tests {
         // completed composite.
         rig.host.runtime.dirty = true;
         post_dispatch(&mut rig.host);
-        assert_eq!(rig.host.runtime.view_cache.get(&bound), Some(&want_a));
         assert_eq!(
-            rig.host.runtime.view_cache.get(&hidden),
-            Some(&want_b),
+            cached_view(&rig.host.runtime, &bound),
+            Some(want_a.as_slice())
+        );
+        assert_eq!(
+            cached_view(&rig.host.runtime, &hidden),
+            Some(want_b.as_slice()),
             "a hidden realm's view is composed too, or its capture goes stale"
         );
 
@@ -8114,20 +9244,16 @@ mod tests {
             host.view.surface_of(&hidden).is_some()
         });
         rig.pump(Duration::from_millis(200));
-        let first = rig
-            .host
-            .runtime
-            .view_cache
-            .get(&hidden)
-            .cloned()
-            .expect("the hidden realm's view is cached");
+        let first = cached_view(&rig.host.runtime, &hidden)
+            .expect("the hidden realm's view is cached")
+            .to_vec();
 
         // Over a window, the hidden realm's *cached capture* changes: it is
         // still receiving `frame_done` and still repainting.
         let mut moved = false;
         for _ in 0..40 {
             rig.pump(Duration::from_millis(50));
-            if rig.host.runtime.view_cache.get(&hidden) != Some(&first) {
+            if cached_view(&rig.host.runtime, &hidden) != Some(first.as_slice()) {
                 moved = true;
                 break;
             }
@@ -8213,6 +9339,134 @@ mod tests {
                 .contains_key(&RealmId::new("realm-0")),
             "and the survivor keeps its own"
         );
+    }
+
+    /// **A realm whose scene did not change is not recomposed, and what it
+    /// serves is unchanged** (issue #252).
+    ///
+    /// `refresh_view_cache` composed every live realm on every dirty round,
+    /// whether or not anything would read the result — and one realm's commit
+    /// dirties the round for all of them, so N-1 realms that had not moved were
+    /// recomposed anyway. On the measured panel that is a 16.4 MB allocate,
+    /// fill, copy and free per realm per round.
+    ///
+    /// **This test counts composites; it does not assert that a realm nobody
+    /// observes is skipped.** Gating the refresh on grant state is refused —
+    /// `backend/winit.rs`'s `view_rgba` says so in the source and D-031 records
+    /// it — because it would make the cache's freshness depend on whether a
+    /// grant existed. The saving here is keyed on the *scene*, so a reader
+    /// cannot tell: the three `cached_view` assertions pair every skip with the
+    /// bytes a recompose would have produced, and without them this test would
+    /// pass just as well against a cache that had stopped refreshing.
+    ///
+    /// Four rounds, each failing differently:
+    ///
+    /// 1. **Cold** — no entry, so both realms compose. A skip here would be a
+    ///    cache that never fills.
+    /// 2. **One realm commits** — only that realm composes. This is the round
+    ///    the issue is about, and it costs 2 composites before this change.
+    /// 3. **Nobody commits** — a dirty round composes *nothing*. Before this
+    ///    change every dirty round cost one composite per live realm forever.
+    /// 4. **The output resizes** — both compose again, with no scene touched.
+    ///    `apply_output_resize` deliberately does not bump `Scene::generation`
+    ///    (it bumps `layout_generation`), so a key of generation alone would
+    ///    serve every later capture at the old geometry. This rig composes at a
+    ///    fixed `VIEW` regardless of its output size, so what this round
+    ///    asserts is the *invalidation*, not the geometry.
+    #[test]
+    fn a_realm_whose_scene_did_not_change_is_not_recomposed() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "lazy-view-cache",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let serve: &[&str] = &["--serve"];
+        rig.start_realms(&[("realm-0", serve), ("realm-b", serve)]);
+        let bound = RealmId::new("realm-0");
+        let hidden = RealmId::new("realm-b");
+        const A: (u32, u32) = VIEW;
+        const B: (u32, u32) = (VIEW.0 / 2, VIEW.1 / 2);
+        commit_fixture(&mut rig.host, &bound, A);
+        commit_fixture(&mut rig.host, &hidden, B);
+
+        // Composites since the last `clear`, per realm. No `pump` between the
+        // rounds below: a dispatch could deliver a shim commit and move a
+        // generation under the assertion.
+        fn composed(rig: &Rig, realm: &RealmId) -> usize {
+            rig.host.view.view_rgbas.get(realm).copied().unwrap_or(0)
+        }
+        let round = |rig: &mut Rig| {
+            rig.host.view.view_rgbas.clear();
+            rig.host.runtime.dirty = true;
+            post_dispatch(&mut rig.host);
+        };
+
+        // 1. Cold: nothing is cached, so both realms compose.
+        round(&mut rig);
+        assert_eq!(composed(&rig, &bound), 1, "a cold cache must fill");
+        assert_eq!(composed(&rig, &hidden), 1);
+        let (want_a, want_b) = (expected_view(A), expected_view(B));
+        assert_ne!(want_a, want_b, "the two fixtures must actually differ");
+        assert_eq!(
+            cached_view(&rig.host.runtime, &bound),
+            Some(want_a.as_slice())
+        );
+        assert_eq!(
+            cached_view(&rig.host.runtime, &hidden),
+            Some(want_b.as_slice())
+        );
+
+        // 2. One realm repaints. The other has not moved and is not recomposed
+        // -- and still serves exactly what a recompose would have produced.
+        commit_fixture(&mut rig.host, &bound, A);
+        round(&mut rig);
+        assert_eq!(
+            composed(&rig, &bound),
+            1,
+            "the realm that committed composes"
+        );
+        assert_eq!(
+            composed(&rig, &hidden),
+            0,
+            "a realm whose scene did not change was recomposed anyway: one realm's commit \
+             dirties the round for all of them, which is the cost issue #252 is about"
+        );
+        assert_eq!(
+            cached_view(&rig.host.runtime, &hidden),
+            Some(want_b.as_slice()),
+            "the skipped realm must still serve its own view, byte for byte -- a skip that \
+             cost a reader anything is the refused optimisation wearing this one's clothes"
+        );
+
+        // 3. A dirty round in which nothing repainted composes nothing at all.
+        round(&mut rig);
+        assert_eq!(composed(&rig, &bound), 0);
+        assert_eq!(composed(&rig, &hidden), 0);
+        assert_eq!(
+            cached_view(&rig.host.runtime, &bound),
+            Some(want_a.as_slice())
+        );
+        assert_eq!(
+            cached_view(&rig.host.runtime, &hidden),
+            Some(want_b.as_slice()),
+            "and both realms are still served, so 'composed nothing' is not 'cached nothing'"
+        );
+
+        // 4. The output resizes and no scene is touched: both entries are stale
+        // by size, and both recompose.
+        apply_output_resize(&mut rig.host, (VIEW.0 + 32, VIEW.1 + 16));
+        round(&mut rig);
+        assert_eq!(
+            composed(&rig, &bound),
+            1,
+            "a resize must invalidate every realm's entry: `Scene::generation` deliberately \
+             does not move for one, so a key that read it alone would serve every later \
+             capture at the old geometry"
+        );
+        assert_eq!(composed(&rig, &hidden), 1);
     }
 
     /// **The output does not stay bound to a realm that is gone.**

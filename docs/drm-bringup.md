@@ -428,6 +428,15 @@ vitrind --drm --consent=interactive \
 `tee` is not optional. If the panel does something you cannot read, the log on
 disk is the only account of what happened.
 
+**Expect no colour, on screen or in the file.** `vitrind` writes ANSI colour
+only when its stderr is a terminal (issue #251), and `| tee` makes it a pipe —
+so this command's output is plain on both sides. That is the intent: the two
+previous runs' logs interleaved SGR escapes *between* a field's name and its
+`=`, so `grep 'connector=' /tmp/vitrind-drm.log` matched nothing and every grep
+below needed `sed 's/\x1b\[[0-9;]*m//g'` in front of it. Drop the `sed`. Run
+`vitrind` without the pipe and the colour is back; `NO_COLOR=1` still turns it
+off on a terminal.
+
 | Expected [inferred] | Failure | What it means / what to do |
 |---|---|---|
 | The panel blanks briefly, then shows the realm's app with a coloured band along the top | **The screen stays black and the keyboard still works** | The backend did not present. You still have a console — `Ctrl+C`, read `/tmp/vitrind-drm.log`. This is the *good* failure |
@@ -455,13 +464,17 @@ observation. A paraphrase cannot be argued about; bytes can. The line is
 `connector=`, `width`, `height` and `refresh_hz`:
 
 ```bash
-# From the escape shell, against the file step 6 tees. Grep the MESSAGE, not
-# the field name: `vitrind` writes SGR escapes into a redirected stderr and
-# they land between `connector` and its `=`, so `grep 'connector='` over this
-# file matches zero lines while `grep connector` matches (#251). `cat -v` shows
-# the escapes instead of letting your terminal swallow them.
-grep -a 'mode set' /tmp/vitrind-drm.log | cat -v
+# From the escape shell, against the file step 6 tees. Since #251 landed,
+# `vitrind` writes no SGR escapes into a redirected stderr, so the field name
+# greps directly.
+grep 'connector=' /tmp/vitrind-drm.log
 ```
+
+**On a binary built before #251**, the escapes are still there and land between
+`connector` and its `=`, so that grep matches zero lines while `grep connector`
+matches. Use `grep -a 'mode set' /tmp/vitrind-drm.log | cat -v` instead — `cat
+-v` shows the escapes rather than letting your terminal swallow them — and say
+in the record which of the two you ran.
 
 Paste what that prints, verbatim, into the record block at the bottom of this
 page.
@@ -469,6 +482,7 @@ page.
 | Expected [inferred] | Failure | What it means |
 |---|---|---|
 | The log names `eDP-1` and a mode; the mode matches the first line of `/sys/class/drm/card1-eDP-1/modes` from step 1 | A different connector | Device/connector selection bug (H1) |
+| | The grep matches nothing while `grep connector` matches | Escapes are back in the log — the tty test in `init_tracing` regressed (issue #251). Strip them with `sed 's/\x1b\[[0-9;]*m//g'` to finish the run, and file it |
 | | The right connector, a lower refresh | The preferred mode was not taken. Not fatal; record the number — the whole GLES+GBM argument in [WS-E §5](plan/14-workstream-session-mode.md) rests on 240 Hz |
 | | The connector name renders empty, as both previous runs recorded | **Keep the bytes and file them.** `connector_name` cannot produce an empty name and nothing in the log stack drops it (#250), so a third sighting with the literal line attached is the only thing that can move this |
 
@@ -524,6 +538,42 @@ Wait five seconds. Come back.
 | | Panel comes back black, `vitrind` alive | Master was not reacquired on resume. You still have VT switching — go back to your tty2 escape shell and kill it |
 | | **You cannot switch away at all** | **THIS IS WHAT HAPPENED, 2026-08-09.** The guess this row used to carry — "something is grabbing the keyboard" — was wrong, and following it would have sent you hunting a phantom. Once `vitrind` holds the display the kernel stops handling `Ctrl+Alt+F<n>` entirely; the compositor must call `Session::change_vt`, and D-030(1) refused to implement it. There is nothing to un-grab. Recover from the Hyprland-side shell in Step 0.1 — `pgrep -x -a vitrind`, then `kill -TERM <PID>`. **Not** `pkill -f`; step 0 says why |
 
+### 12a. The other two seat policies (WS-E, issue #246) — NOT YET RUN
+
+Step 12 exercises the **default**, `--lock-on-seat-change never`. The other two
+answers are `immediate` and `idle`, and **no run has ever exercised either**.
+This rung is written before it is executed, on D-033's precedent, so that the
+thing which has to happen is written down rather than implied; leave the record
+block empty until you have actually done it.
+
+Each is a fresh `vitrind` with the step-6 command line plus one flag, and each
+needs a **passphrase file** to be worth anything — without one the card is a
+privacy screen and Enter dismisses it, which proves the raise but not the cost.
+
+```bash
+# 12a-i — immediate: leaving locks, whatever the timers say.
+vitrind --drm --lock-passphrase-file ~/.vitrin-pass \
+        --lock-on-seat-change immediate ... 2>&1 | tee /tmp/vitrind-drm.log
+# 12a-ii — idle: a long absence returns locked, a short one does not.
+vitrind --drm --lock-passphrase-file ~/.vitrin-pass --lock-idle 60 \
+        --lock-on-seat-change idle ... 2>&1 | tee /tmp/vitrind-drm.log
+```
+
+| Rung | Expected [inferred] | Failure | What it means |
+|---|---|---|---|
+| 12a-i | Switch to tty2, come straight back: the panel shows the **lock card**, and it names the seat (`the seat went to another VT…`), not an idle timer that never fired | Panel comes back unlocked | The policy never reached the lock. `grep on_seat_change /tmp/vitrind-drm.log` — the startup banner names it; if it says `never`, `run_inner` dropped the flag |
+| 12a-i | | The card blames the idle timer | Wrong `LockCause` on the raise; the journal's `session_locked` cause should read `seat` |
+| 12a-ii | Switch away, wait **~10 s**, come back: the panel is **unlocked** and the countdown has ~50 s of the absence charged against it | Locked after 10 s | The carry is over-charging, or `--lock-idle` is shorter than you think |
+| 12a-ii | Switch away, wait **> 60 s**, come back: the panel is **locked** on the first round after you return, cause `idle` | Comes back unlocked | The absence was not charged. This is the exact shape issue #257 fixed once already — the instant must come from `session::note_seat_presence`, not from a cell an input turn wrote |
+| 12a-ii | Switch away > 60 s, come back and **type immediately**: still unlocked, and it stays unlocked for a further 60 s | Locks on you as you type | A carry survived physical input, which is the one thing `judge` clears it for |
+
+**Record block — empty on purpose. Do not fill it in from reasoning.**
+
+```text
+12a-i   date: ____  result: ____
+12a-ii  date: ____  result: ____
+```
+
 ## 13. Type a letter (WS-E.3.1)
 
 Type `hello` into the terminal, on your real layout.
@@ -570,8 +620,10 @@ Work down this list. Do not skip to R4 because the first two feel slow.
 > The book page is the one to read when you are wedged and not mid-bring-up: it
 > carries the `sudo`-only `/proc/sysrq-trigger` path, the `logind` settings the
 > lid and suspend behaviour depend on, and the **session-lifecycle checklist
-> (L1–L6: 10 VT switches, 5 suspend/resume, 5 lid cycles, blank/unblank, one
-> deliberate wedge)** that the checklist below does not contain and never did.
+> (L1–L7: 10 VT switches, 5 suspend/resume, 5 lid cycles, blank/unblank, the
+> blank-did-not-lock check, one deliberate wedge, and a return from another VT
+> with the blank armed)** that the checklist below does not contain and never
+> did.
 
 ### R1 — the desktop is gone but the keyboard works
 

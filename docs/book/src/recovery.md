@@ -380,6 +380,20 @@ annoying rather than persistent, and is not a reason to reach for the USB.
   discovered:
   [Where this is honest about its limits](limits.md).
 
+  **From a shell, you can now tell the two apart without looking at the panel.**
+  A blank logs `the session went idle` — it always did — but until this release
+  that was the *only* line the whole cycle produced, so a wake that worked and a
+  modeset that left the panel dark were both followed by silence. A wake now
+  logs `the panel is lit again`, and a wake that never completed logs `THE WAKE
+  WAS NOT CONFIRMED` at `WARN` — the case that is genuinely indistinguishable
+  from a wedge *at the panel*, and the one that means route 1. The flight
+  recorder carries the pair as `screen_blanked` and `screen_woke`, neither of
+  which existed before; the wake entry's `outcome` field is `flip_landed` (the
+  panel came back), `no_flip` (it may not have) or `seat_lost` (the blank ended
+  because you switched VT), and both entries carry `locked`, because an idle
+  blank never raises a lock but can perfectly well go up behind one.
+  [verified: `crates/vitrin-core/src/session.rs`, `crates/vitrin-core/src/recorder.rs`]
+
 ## The settings this depends on, which this repository does not own
 
 Suspend, lid and power-key policy is **systemd-logind's**, not `vitrind`'s —
@@ -444,17 +458,21 @@ no DRM device, no ACPI and no backlight. That is stated rather than dressed up
 as a criterion, and it is why this checklist exists.
 
 Run it after a `vitrind --drm` session is up per the bring-up page, with the
-Hyprland-side shell of step 0.1 open the whole time. Rungs are numbered `L1`–`L6`
-so they do not collide with the bring-up page's own 1–15.
+Hyprland-side shell of step 0.1 open the whole time. Rungs are numbered `L1`–`L7`
+so they do not collide with the bring-up page's own 1–15. (`L7` was added by the
+fix for [#257](https://github.com/vitrin-os/vitrin-os/issues/257), which the first
+run of `L4` found; a rung added because a run found something is what this table
+is for.)
 
 | # | Do | Expect | Worst credible failure |
 |---|---|---|---|
 | L1 | **10 VT switches away and back.** `Ctrl-Alt-F2`, wait, `Ctrl-Alt-F3` back. Ten times. | Session survives every one; band the same colour each return; recorder shows paired pause/activate | A dead session, or a black panel with `vitrind` alive (master not reacquired) |
 | L2 | **5 suspend/resume cycles.** `systemctl suspend` from the escape shell. | Machine sleeps, wakes, panel comes back, apps still there | Panel never returns; or apps frozen because no frame clock restarted |
 | L3 | **5 lid close/open cycles.** | logind suspends on close, resumes on open, panel returns | Lid does nothing (check `systemd-inhibit --list`); or resume leaves a black panel |
-| L4 | **Blank and unblank.** Start with `--blank-idle`, leave the machine alone past the timeout, then press a key. | Panel goes dark; any physical input brings it back | Panel dark and input swallowed — this is indistinguishable from a wedge, go to route 1 |
-| L5 | **Confirm the blank did not lock.** After L4's wake, look at what is on screen. | The session as you left it — **not** a lock card | A lock card, which would mean idle-blank and idle-lock got coupled |
+| L4 | **Blank and unblank.** Start with `--blank-idle`, leave the machine alone past the timeout, then press a key. | Panel goes dark; any physical input brings it back; the log carries `the session went idle` **and** `the panel is lit again`, and the recorder a `screen_blanked`/`screen_woke` pair with `outcome: flip_landed` | Panel dark and input swallowed — this is indistinguishable from a wedge, go to route 1. `THE WAKE WAS NOT CONFIRMED` in the log, or `outcome: no_flip` in the recorder, is that case naming itself |
+| L5 | **Confirm the blank did not lock.** After L4's wake, look at what is on screen, and at the `screen_blanked` entry the recorder wrote. | The session as you left it — **not** a lock card — and `locked: false` on the entry | A lock card, which would mean idle-blank and idle-lock got coupled. `locked: true` with no lock card on screen means the *entry* is wrong, which is its own defect |
 | L6 | **One deliberate wedge, recovered by a documented route.** **Choose the route before you wedge anything and write it down as you use it** — see the warning below. | Route 1 or 2 recovers it | Neither does; record how far down the table you had to go |
+| L7 | **Leave and come back with the blank armed.** With `--blank-idle 60` (and, on a second pass, `--lock-idle 60` as well), switch to another VT, stay there **longer than the timeout**, and switch back. Time how long the panel stays lit after the return. | The panel stays lit for the full timeout measured **from the return** — 60 s, not 1.5 s — and the lock does not raise | The panel blanks within a couple of seconds of coming back, or the session demands a passphrase for returning: the idle clock is being stamped with an instant from before the absence ([#257](https://github.com/vitrin-os/vitrin-os/issues/257)) |
 
 Three rungs deserve their own warnings.
 
@@ -483,7 +501,13 @@ record, not a mishap.
 These were owed to issue #223 and were pasted into it on **2026-08-11**; the run
 is recorded below. Two of them are still owed at their stated counts — L2 ran 4
 of 5 cycles, and L3 ran 2 of 5 of which only one suspended, so it is **one
-usable sample** — and L6's answer was not recoverable at all:
+usable sample** — and L6's answer was not recoverable at all. `L7` is newer than
+the run and **has never been executed in any form**: it exists to close the
+three defects `L4` found ([#257](https://github.com/vitrin-os/vitrin-os/issues/257),
+[#258](https://github.com/vitrin-os/vitrin-os/issues/258),
+[#259](https://github.com/vitrin-os/vitrin-os/issues/259)), whose fixes are code
+with component tests behind them and nothing more — **CI has no seat and no DRM
+device, so nothing in this repository has observed any of them on hardware**:
 
 - L1: how many of 10 switches survived, and the band colour on each return.
 - L2: how many of 5 suspend/resume cycles came back with a working panel, and
@@ -491,6 +515,11 @@ usable sample** — and L6's answer was not recoverable at all:
 - L3: how many of 5 lid cycles behaved as L2 did.
 - L4: the measured blank latency and the measured wake latency.
 - L6: which route recovered the wedge, and how long it took.
+- L7: how long the panel stayed lit after returning from another VT, and
+  whether `--lock-idle` raised on the return. Owed to
+  [#257](https://github.com/vitrin-os/vitrin-os/issues/257), which was found by
+  the first L4 run and fixed against a component test — **CI has no seat and no
+  DRM device, so nothing in this repository has observed the fix on hardware.**
 
 ## Record the run
 
@@ -527,6 +556,11 @@ only the [Login] header, so these are the defaults in effect):
   L4. Blank and unblank .......... blank after 61.2 s; unblank OK
   L5. Blank did not lock ......... PASS (session as left, no lock card)
   L6. Deliberate wedge ........... recovered in ~69 s, route INDETERMINATE
+  L7. Return from another VT ..... NOT EXECUTED -- the rung did not exist yet;
+                                   it was written from this run's #257. Next
+                                   run: panel stayed lit ___ s after the return
+                                   (must be the full --blank-idle timeout);
+                                   --lock-idle pass: raised on return? Y/N
 
 SysRq step 1 (`printf 's' | sudo tee /proc/sysrq-trigger`) executed? NO
     (still documented and unexecuted)
@@ -588,11 +622,19 @@ two suspended at all. The detail is what is right, so the line in the block
 reads `1 suspended and behaved as L2, 1 never reached Sleep at all`. Against a
 rung asking for 5 cycles, L3 is **1 usable sample**.
 
-**L4 / L5 — pass, and L4 found the run's most useful defect.** Blank fired at
-61.2 s against `--blank-idle 60`. The panel returned on ordinary physical input,
-twice, with the session unchanged and no lock card — so idle blank and idle lock
-are confirmed uncoupled on hardware, as D-033 intends. The defect is on the
-*return* path and is filed as #257.
+**L4 / L5 — the blank and the lock behaved; the run still filed three defects
+against L4.** Blank fired at 61.2 s against `--blank-idle 60`. The panel
+returned on ordinary physical input, twice, with the session unchanged and no
+lock card — so idle blank and idle lock are confirmed uncoupled on hardware, as
+D-033 intends, which is L5 and it passes. **L4 is not a clean pass**: the run
+found #257 on the *return* path, and #258 and #259 came out of the same session
+— the unblank logged nothing, so a successful wake and a modeset that left the
+panel dark were indistinguishable, and neither transition reached the flight
+recorder at all. All three now have fixes with component tests behind them and
+**none has been re-observed on hardware**; L7 above is the rung that would close
+them, and the enriched expectations in L4's own row (the `the panel is lit
+again` line, the `screen_blanked`/`screen_woke` pair) describe output that did
+not exist when this run was made.
 
 **L6 — recovered, route indeterminate.** The wedge was produced by `SIGSTOP` on
 the compositor while it held DRM master and the libinput devices — a faithful
@@ -621,6 +663,10 @@ the finding**, and it is why L6 now tells you to choose the route first.
 - **`/proc/sysrq-trigger` route 3 was not exercised.** Still documented and
   unexecuted.
 - L2 and L3 are short of their stated counts, as recorded above.
+- **`L7` was never run, because it did not yet exist.** It was written *from*
+  this run's #257 and is the rung that would establish that the fix works. The
+  same holds for L4's new log and recorder expectations: they were added by the
+  #258/#259 fixes after this run, so nothing in the block above observed them.
 
 **Filed from this run:** #257 (returning to a paused session blanks the panel in
 ~1.5 s), #258 (the unblank is silent; success and failure look identical), #259
@@ -630,7 +676,8 @@ recovery command signalled the rescuer under a shell and nothing at all under
 
 > **This page has now been executed once, on 2026-08-11, and it is still not a
 > clean pass.** Routes 3 and 4 remain careful predictions; L2 and L3 are short
-> of their counts; L6 recovered but by an unknown route; and the run's headline
+> of their counts; L6 recovered but by an unknown route; `L7` and the defect
+> fixes it exists to check have never been run at all; and the run's headline
 > finding was that this page's own route-2 command was wrong. Read it that way,
 > correct it from your own eyes, and treat a failed observation as a result
 > worth recording rather than a step to retry until it passes.

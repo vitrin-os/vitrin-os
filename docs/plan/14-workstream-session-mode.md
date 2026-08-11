@@ -1553,11 +1553,13 @@ as D-030 recorded for `handle_session_event`. **Not one hardware criterion of
 #223 is claimed as met by this change.** The 10 VT switches, 5 suspend/resume
 cycles, 5 lid cycles, the blank/unblank and the deliberate wedge are the owner's
 to produce on the target machine, they are written as rungs `L1`–`L6` on the
-recovery page with a record block to paste numbers into, and **#223 stays open
-until he pastes them in.** Note also that **suspend and lid have never been
-exercised on this backend by anyone, in any form** — the bring-up page's existing
-checklist runs 7–15 and contains no suspend, lid or blank rung at all, which is
-why those rungs had to be written before they could be executed.
+recovery page with a record block to paste numbers into (a seventh, `L7`, was
+added later by the fix for #257, which the first `L4` run found), and **#223
+stays open until he pastes them in.** Note also that **suspend and lid have
+never been exercised on this backend by anyone, in any form** — the bring-up
+page's existing checklist runs 7–15 and contains no suspend, lid or blank rung
+at all, which is why those rungs had to be written before they could be
+executed.
 
 > **AMENDED 2026-08-11.** The paragraph above is left as written because it is
 > the honest status *of that change*, but its last sentence stopped being true
@@ -1609,7 +1611,12 @@ correction is followed here and not the issue.
   real suspend on the target machine.
 - **A configurable lock-on-blank / lock-on-switch policy.** D-030(2) already
   filed it; Decision 1 forbids coupling idle-blank to idle-lock here.
-  **Reopened by:** the owner asking for it.
+  **Reopened by:** the owner asking for it. **The lock-on-switch half is now
+  built** — `--lock-on-seat-change immediate|idle|never` (issue #246,
+  [D-034](20-decision-log.md#d-034--losing-the-seat-is-a-configurable-lock-policy-with-d-0302s-answer-as-the-default-and-lockcause-gains-the-third-variant-that-entry-declined)),
+  defaulting to D-030(2)'s answer so no session that never names the flag
+  changes. The lock-on-**blank** half stands deferred on Decision 1, which is
+  the one this bullet's second sentence is about.
 - **`--blank-idle` on `--nested`.** Refused at startup with a named reason: a
   nested `vitrind` painting its window black would be asserting something about a
   screen the host owns. **Reopened by:** someone naming a host fact that means
@@ -1650,9 +1657,11 @@ be re-worded:
    and inherited here. Two surfaces stating them as unrelated accidents would
    misrepresent a deliberate posture as a pair of oversights.
 4. **No hardware claim may be made.** Every lifecycle behaviour here is
-   *unproven on hardware* until #223's L1–L6 numbers exist. #224 must not tidy
+   *unproven on hardware* until #223's L1–L7 numbers exist. #224 must not tidy
    that qualifier away, and if the numbers have landed by then it must cite the
-   dated run rather than dropping the sentence.
+   dated run rather than dropping the sentence. The one rung that *has* been run
+   (`L4`, 2026-08-11) produced #257–#259 rather than a pass, and their fixes are
+   themselves unobserved: a partial run is not a smaller version of a pass.
 
 Also handed to #224, because #223 cannot close them: the two `docs/plan/` and one
 `crates/` prose surfaces that this change falsifies and that live outside the
@@ -1855,9 +1864,9 @@ this workstream owns, not inherits:
   first execution of `L1`–`L6`). Until that date this read *"never exercised by
   anyone, in any form"*, and it was true: the bring-up page's checklist runs
   7–15 and contains no suspend, lid or blank rung at all, so those rungs had to
-  be *written* before they could be executed. They are `L1`–`L6` on
+  be *written* before they could be executed. They are `L1`–`L7` on
   [the recovery runbook](../book/src/recovery.md#the-hardware-checklist), and
-  the owner ran them and pasted the numbers into #223. **It is not a clean
+  the owner ran `L1`–`L6` and pasted the numbers into #223. **It is not a clean
   pass.** `L1` 10/10; `L2` **4 of 5** cycles, all returning a working panel;
   `L3` **2 of 5** lid cycles of which only one ever reached sleep, so **one
   usable lid sample** and nothing established about a short lid close; `L4`
@@ -1865,9 +1874,11 @@ this workstream owns, not inherits:
   could not be reconstructed afterwards**, which leaves the rung's actual
   question unanswered. Route 3 (`/proc/sysrq-trigger`) is still documented and
   unexecuted and the advisory VKMS rung was never attempted. Four defects came
-  out of the run: #257, #258, #259 and #260. So a hardware criterion of #223 may
-  now be cited **only at the count and scope actually recorded** — never as
-  *"suspend works"* or *"lid works"*.
+  out of the run: #257, #258, #259 and #260. **`L7` was written from #257 after
+  the run and has never been executed**, so the fixes for #257–#259 are code
+  with component tests behind them and nothing observed. So a hardware criterion
+  of #223 may now be cited **only at the count and scope actually recorded** —
+  never as *"suspend works"* or *"lid works"*.
 - ~~**Several realms run, one is visible, and a capture cannot tell them
   apart**~~ (created by WS-E.1.2, **closed by WS-E.1.3**). Raising the cap
   landed before the scene bound an output to a realm, so for one workstream
@@ -2070,7 +2081,11 @@ this workstream owns, not inherits:
   bullet did not ask, which is that a switch away does *not* raise the lock
   (it would claim a protection the core does not have and charge the human a
   passphrase for using the escape hatch). Published, in the human's words, in
-  `docs/book/src/limits.md`.
+  `docs/book/src/limits.md`. **Still the default, and now one of three**
+  (issue #246, D-034): `--lock-on-seat-change immediate` locks on the way out
+  for an operator who wants that trade, `idle` charges the absence to the idle
+  countdown, and `never` — what every session that says nothing gets — is the
+  behaviour this bullet describes. No policy lowers a lock that is already up.
 - **A passphrase is nested-only, because a headless backend has no keyboard** (created
   by WS-E.2.2, closed only by Stage 3 answering the keymap question). `--lock-passphrase-file`
   is refused at startup with `--headless`, naming the reason. Without it the

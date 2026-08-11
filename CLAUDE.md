@@ -85,6 +85,17 @@ rule, so the tracker never becomes a second roadmap:
   this repo's earliest commits (`P1.1.1: author protocol/vitrin-v0.xml ...`)
   — adopted so changelogs can be generated straight from commit history by
   type. Do not rewrite that history; the new format applies going forward.
+- **Sign-off (hard requirement)**: **every** commit carries a
+  `Signed-off-by:` trailer matching its own author — `git commit -s`, never
+  `git commit`. This is decision D-012 (DCO, not a CLA) and
+  `.github/workflows/dco.yml` enforces it per commit on every PR, so one
+  unsigned commit anywhere in a branch is a red check that can only be
+  cleared by rewriting history. Committing without `-s` is therefore not a
+  style slip; it is work that has to be redone. If a branch already has
+  unsigned commits: `git rebase --signoff main && git push
+  --force-with-lease` — and if force-push is unavailable, the branch has to
+  be re-pushed under a new name, which is the cost of the missing flag.
+  `Co-Authored-By` is not a sign-off and does not satisfy the check.
 - **Language**: English only, everywhere — code, docs, commits, issues, PRs.
 
 ## Milestone definition-of-done (hard requirement)

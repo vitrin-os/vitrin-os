@@ -1874,6 +1874,13 @@ fn run_inner(
         None,
         Instant::now(),
     )));
+    // **No `with_seat_change_policy` here, deliberately** (issue #246): this
+    // backend has no seat to lose. A host compositor's focus loss is not a seat
+    // loss -- the host keeps the session, the human can still see the window,
+    // and no session event ever reaches this core -- so `set_seat_absent` is
+    // never called on this screen and a policy would be a claim the code does
+    // not implement. `--lock-on-seat-change` is refused with `--nested`
+    // (`crate::lock::SEAT_POLICY_NEEDS_A_SEAT`), so there is nothing to pass.
     let lock_screen = Rc::new(RefCell::new(crate::lock::LockScreen::new(
         lock.chord,
         lock.idle,

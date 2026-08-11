@@ -1243,7 +1243,28 @@ impl session::RuntimeHost for DrmState {
         let (changed, owes_the_panel) = {
             let activity = Rc::clone(&self.view.activity);
             let mut activity = activity.borrow_mut();
-            let changed = session::service_blank_round(&mut activity, &mut self.view.blank, now);
+            // `&mut self.runtime` beside `&mut self.view.blank`: two disjoint
+            // field borrows, the shape every other override here already uses.
+            // The runtime is what lets this round journal the blank and the wake
+            // (issues #258, #259) -- both of which were invisible in the log and
+            // absent from the recorder for the whole of #223's first hardware
+            // run.
+            //
+            // `&self.lock` is read-only here and the round is forbidden from
+            // touching it: the blank does not lock and does not unlock (D-033).
+            // It is passed because the journal entries must say whether a lock
+            // was up, and the only truthful answer is the one this cell holds --
+            // a chorded lock followed by a walk away past `--blank-idle`, and
+            // `--blank-idle 300 --lock-idle 600`, both reach a locked session
+            // behind a dark panel. Borrowed for the length of one `is_locked`
+            // inside, which cannot collide with the `activity` guard above.
+            let changed = session::service_blank_round(
+                &mut self.runtime,
+                &self.lock,
+                &mut activity,
+                &mut self.view.blank,
+                now,
+            );
             // **A wake owes a frame every round until one actually lands.**
             // Edge-triggering this on `changed` alone was a real defect: the
             // CRTC is off while waking, so `on_vblank` -- the only other thing
@@ -1429,6 +1450,15 @@ impl DrmState {
         // same call the seat's activate arm and the lock's unlock arm make --
         // one helper, one meaning, so "the human can see this card again" is
         // asserted from one place rather than four.
+        //
+        // **Nothing is logged from here** (issue #258). This site knows a flip
+        // landed and nothing else -- not how long the panel was dark, and not
+        // whether the alternative outcome (the deadline passing with no flip at
+        // all) has just happened instead. Both are held by the activity record,
+        // so the wake's line and its recorder entry are emitted one round later
+        // from `session::service_blank_round`, which is also the only one of the
+        // two sites CI can reach. A line written here would be a line no test in
+        // this workspace could ever see, which is how the silent unblank shipped.
         let woke = self.view.activity.borrow_mut().note_flip_completed();
         if woke {
             session::screen_became_visible(&self.grab, Instant::now());
@@ -1815,13 +1845,29 @@ impl DrmState {
     ///   [`DrmState::drain_vt_requests`], and never from here. The trusted
     ///   band is still scoped to this screen and this process, and
     ///   `docs/book/src/limits.md` says so in the human's own words.
-    /// * **A switch away does not raise the lock**, and `LockCause` gains no
-    ///   third variant. A lock raised on a seat event would claim a protection
-    ///   this core does not have (the other VT is not covered, and D-025 keeps
-    ///   every grant live regardless) while charging the human a passphrase for
-    ///   using the escape hatch the point above deliberately leaves open. The
-    ///   idle timer already covers the case that matters, identically whichever
-    ///   way the human left — see D-030(2).
+    /// * **A switch away does not raise the lock — under the default, which is
+    ///   still D-030(2)'s answer** (`--lock-on-seat-change never`). That
+    ///   entry's argument is why it is the default and is unchanged: a lock
+    ///   raised on a seat event claims a protection this core does not have
+    ///   (the other VT is not covered, and D-025 keeps every grant live
+    ///   regardless) while charging the human a passphrase for using the
+    ///   escape hatch the point above deliberately leaves open, and the idle
+    ///   timer already covers the case that matters, identically whichever way
+    ///   the human left.
+    ///
+    ///   **Issue #246 made that one of three answers rather than the only
+    ///   one**, and D-034(2) reverses D-030(2)'s refusal of a third cause:
+    ///   [`crate::lock::LockCause::SeatChange`] now exists and carries the
+    ///   attributability argument D-030(2) asked for and declined to make.
+    ///   What did *not* change is this file's part in it. **Neither arm below
+    ///   decides anything about the lock**: each reports the event through
+    ///   [`session::note_seat_presence`], and `LockScreen::set_seat_absent`
+    ///   owns what it means, because the answer is the operator's
+    ///   `--lock-on-seat-change` and not this backend's. A raise decided here
+    ///   would fire under every policy including `never` — so `LockCause` is a
+    ///   forbidden token in the body below, and
+    ///   `the_seat_handler_drains_on_pause_restores_the_guard_on_resume_and_rotates_nothing`
+    ///   is what holds it.
     /// * **The session colour is not re-minted.** Nothing on either arm touches
     ///   [`TrustedIndicator`]: rotation would destroy the stability the whole
     ///   check rests on. D-030(3).
@@ -1868,14 +1914,27 @@ impl DrmState {
                 // holding master over a panel another VT is now driving.
                 self.device.pause();
                 self.libinput.suspend();
-                // Stop the idle clock (D-030(7), Taha's call on 2026-08-09).
-                // Physical input is suspended for the whole absence, so
+                // Tell the lock the seat is gone (D-030(7), Taha's call on
+                // 2026-08-09). Under the default that stops the idle clock:
+                // physical input is suspended for the whole absence, so
                 // `last_activity` cannot advance; without this a session with
                 // `--lock-idle` locks itself *during* the switch-away, at an
                 // instant no human could observe, and the human returns to a
-                // passphrase prompt nobody asked for. A lock already up stays
-                // up -- this suppresses the raise, never a lower.
-                self.lock.borrow_mut().set_seat_absent(true, self.now.get());
+                // passphrase prompt nobody asked for.
+                //
+                // **What the seat event means is not decided here** (issue
+                // #246). Since `--lock-on-seat-change`, this arm reports a fact
+                // and `LockScreen::set_seat_absent` applies the policy -- so
+                // under `immediate` this same line does raise the lock, which
+                // is the operator asking for it and not this backend choosing.
+                // The invariant that holds across all three: a lock already up
+                // stays up. No policy lowers one.
+                //
+                // Through the free function since #257, on both arms, so the
+                // instant has exactly one source: `self.now` is the *input
+                // turn's* sample and there is no input turn on either side of a
+                // seat event. See `session::note_seat_presence`.
+                session::note_seat_presence(&self.lock, true);
                 // **The pause IS the acknowledgement** of a `change_vt` this
                 // core asked for (WS-E.3.5), so the watchdog is disarmed here
                 // and nowhere else. An outstanding timer fires against an
@@ -1956,9 +2015,18 @@ impl DrmState {
                 // to your own screen is the one thing an idle timer is asking
                 // about. Before `active = true`, so no `tick` between the two
                 // can see a running clock against a stale `last_activity`.
-                self.lock
-                    .borrow_mut()
-                    .set_seat_absent(false, self.now.get());
+                //
+                // **This line is issue #257.** It used to pass `self.now`, and
+                // that cell is the input turn's sample: a paused session sees no
+                // input turn, because the chord that switches the VT back is
+                // delivered to whichever session is *currently* active. So the
+                // clock was reset to an instant from before the absence -- one
+                // already past the idle threshold -- and with `--blank-idle 60`
+                // the panel went dark 1.5 s after the human came back. The same
+                // stale stamp arms `--lock-idle` on return, which is worse.
+                // `note_seat_presence` samples the instant itself and takes no
+                // `now` at all, so the mistake is no longer expressible.
+                session::note_seat_presence(&self.lock, false);
                 self.view.output.active = true;
                 // The flip we had in flight died with DRM master, and its
                 // completion event will never arrive: without clearing this
@@ -2297,17 +2365,19 @@ fn run_inner(
              painting until the human comes back"
         );
     }
-    let lock_screen = Rc::new(RefCell::new(crate::lock::LockScreen::new(
-        lock.chord,
-        lock.idle,
-        verifier,
-        Rc::clone(&activity),
-    )));
+    let lock_screen = Rc::new(RefCell::new(
+        crate::lock::LockScreen::new(lock.chord, lock.idle, verifier, Rc::clone(&activity))
+            // **The one backend with a seat names its policy** (issue #246).
+            // Nested deliberately does not call this at all -- see
+            // `LockScreen::with_seat_change_policy`.
+            .with_seat_change_policy(lock.on_seat_change),
+    ));
     {
         let screen = lock_screen.borrow();
         info!(
             chord = screen.chord_spelling(),
             idle_s = lock.idle.map(|d| d.as_secs()),
+            on_seat_change = lock.on_seat_change.as_str(),
             passphrase = matches!(
                 screen.unlock_method(),
                 crate::lock::UnlockMethod::Passphrase
@@ -2318,6 +2388,19 @@ fn run_inner(
              instrument that stops everything is still the dead-man chord, which fires while \
              locked"
         );
+        if lock.on_seat_change == crate::lock::SeatChangePolicy::Idle && lock.idle.is_none() {
+            // Not an error, because it configures nothing dangerous -- but it
+            // is a command line whose author believed something false, and the
+            // whole point of this flag is that nobody should end up with a lock
+            // policy they did not choose. `--lock-on-seat-change idle` keeps a
+            // countdown running; with no `--lock-idle` there is no countdown.
+            warn!(
+                "`--lock-on-seat-change idle` without `--lock-idle` does nothing: it keeps the \
+                 idle countdown running across a VT switch, and this session has no idle \
+                 countdown to keep running. A switch away will not lock it, however long it \
+                 lasts -- add --lock-idle SECS, or say --lock-on-seat-change immediate"
+            );
+        }
     }
 
     // **The VT escape** (WS-E.3.5, D-031). Built before the router because the
@@ -3251,10 +3334,19 @@ mod tests {
         // session cannot undo one, since `DrmSurface::clear` answers
         // `DeviceInactive` while the devices are somebody else's.
         assert!(
-            pause.contains("set_seat_absent(true"),
+            pause.contains("session::note_seat_presence(&self.lock, true)"),
             "the pause arm stopped telling the session's activity record that the seat is \
              gone: the idle clock would keep running on a VT nobody is looking at, and a \
              blank raised during the switch could never be lifted"
+        );
+        // ...and the activate arm must give it back, which is issue #257: this
+        // is the call that restarts the idle countdown from the human's return.
+        assert!(
+            activate.contains("session::note_seat_presence(&self.lock, false)"),
+            "the activate arm stopped restarting the idle countdown: the clock would still be \
+             holding the instant it held when the human left, which is already past the idle \
+             threshold, so the panel blanks -- and `--lock-idle` LOCKS -- on the round after \
+             they come back"
         );
 
         for (forbidden, why) in [
@@ -3265,9 +3357,12 @@ mod tests {
             ),
             (
                 "LockCause",
-                "a VT switch does not raise the lock: it would claim a protection this core \
-                 does not have, and charge the human a passphrase for the escape hatch \
-                 D-030(1) deliberately leaves open",
+                "a `LockCause` in the seat handler is this backend deciding the lock policy \
+                 (issue #246). It has exactly one thing to say about a seat event -- that it \
+                 happened -- and `LockScreen::set_seat_absent` owns what that means, because \
+                 the answer is now the operator's `--lock-on-seat-change` and not this file's. \
+                 A raise decided here would fire under every policy including `never`, which \
+                 is D-030(2)'s default and the behaviour this repository publishes",
             ),
             // Call syntax, not the bare word, on this file's own precedent for
             // `copy_framebuffer(`: the pause arm's comment *names* the verb
@@ -3281,12 +3376,65 @@ mod tests {
                  moves the human without being asked, or one that switches back -- which is \
                  the trap D-030(1) correctly named and D-031 does not license",
             ),
+            // **Issue #257, as one forbidden token.** `self.now` is the *input
+            // turn's* clock sample and a seat event is not an input turn -- a
+            // paused session sees none, because the chord that switches back is
+            // delivered to whatever session is currently active. Stamping the
+            // activity clock with it resets the countdown to an instant from
+            // before the absence, which is already expired. Call syntax rather
+            // than the bare word, on `change_vt(`'s precedent: both arms'
+            // comments name the cell while explaining why they do not use it,
+            // and a test that failed on its own explanation would teach the next
+            // reader to delete the explanation.
+            (
+                "self.now.get()",
+                "the input turn's stale clock sample is back in the seat handler: with \
+                 `--blank-idle 60` the panel goes dark ~1.5 s after the human returns, and \
+                 with `--lock-idle` the session locks on them for coming back",
+            ),
+            (
+                "set_seat_absent(",
+                "the seat handler stamps the activity clock directly again: the instant must \
+                 come from `session::note_seat_presence`, which takes no `now` precisely so \
+                 that a stale one is not expressible (#257)",
+            ),
         ] {
             assert!(
                 !body.contains(forbidden),
                 "`{forbidden}` in the seat handler: {why}"
             );
         }
+    }
+
+    /// **The configured seat-change policy reaches the lock** (issue #246).
+    ///
+    /// The one link in this feature that no behavioural test in this workspace
+    /// can reach: `run_inner` needs a real `DrmDevice`, a real `LibSeatSession`
+    /// and a real GPU, so the CLI→`LockConfig` half is covered by the parse
+    /// tests, the `LockScreen` half by `lock::gate`'s own tests, and the wiring
+    /// between them by shape — the same bound, and the same answer, D-030 and
+    /// issue #223 both record for this file.
+    ///
+    /// It matters because the failure is silent in the safe-looking direction:
+    /// a session that dropped the policy on the floor would run as `never`,
+    /// green tests and all, and the operator who asked for `immediate` would
+    /// find out by coming back to an unlocked screen.
+    #[test]
+    fn the_bare_metal_backend_hands_the_lock_its_configured_seat_policy() {
+        let src = source();
+        assert!(
+            src.contains("with_seat_change_policy(lock.on_seat_change)"),
+            "the bare-metal backend stopped passing `--lock-on-seat-change` to the lock. \
+             `LockScreen::new` defaults to `never`, so the policy would be dropped silently and \
+             the session would behave exactly as it did before the flag existed -- for an \
+             operator who explicitly asked for something else"
+        );
+        assert!(
+            src.contains("on_seat_change = lock.on_seat_change.as_str()"),
+            "the startup banner stopped naming the seat-change policy. Every other lock \
+             parameter is on that line for the reason this one belongs there too: a log read \
+             after the fact must say which of three sessions this was"
+        );
     }
 
     /// **The display power state is set from exactly one place, and only after

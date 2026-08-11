@@ -293,8 +293,12 @@ class RealCaptureFidelity(IntegrationTest):
         )
 
         # -- criterion 3: that same frame agrees with the core-internal capture.
-        # The dump is written every redraw; a static solid scene makes every
-        # redraw byte-identical, so the dump reflects exactly this frame.
+        # The dump is written whenever the core recomposes that realm's view
+        # (issue #252 stopped it recomposing an unchanged scene, so "every
+        # redraw" is no longer true). Either way a static solid scene makes
+        # every composite byte-identical, so the dump reflects exactly this
+        # frame: the skipped rounds are skipped precisely because they would
+        # have reproduced the bytes already there.
         agent_path = self.scratch("agent.xrgb")
         pathlib.Path(agent_path).write_bytes(packed_xrgb(frame))
         dump_path = self._await_dump(capture_dump_path(dump))
@@ -467,10 +471,14 @@ class RealCaptureFidelity(IntegrationTest):
     def _await_dump(self, path, timeout=5.0) -> str:
         """Wait until the core-internal capture file exists and has content.
 
-        `--capture-dump` writes atomically (temp + rename) on each redraw, so
-        the file appears whole once a redraw has run — which it has by the time
-        a content-bearing `observe()` returned. Polled only to close the narrow
-        window between the agent's capture and the next redraw's write.
+        `--capture-dump` writes atomically (temp + rename) every time the core
+        composes that realm's view, so the file appears whole once one composite
+        has run — which it has by the time a content-bearing `observe()`
+        returned, because that frame came from the same cache entry the dump
+        mirrors. Polled only to close the narrow window between the agent's
+        capture and that write landing. Note that since issue #252 an unchanged
+        scene is not recomposed, so this waits for the file to *exist*, never
+        for it to be rewritten.
         """
         expected_len = REALM_WH[0] * REALM_WH[1] * 4
         deadline = time.monotonic() + timeout

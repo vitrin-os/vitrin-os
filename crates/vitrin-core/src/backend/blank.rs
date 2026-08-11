@@ -178,6 +178,64 @@ pub(crate) enum Phase {
     Waking,
 }
 
+/// **Why a blank ended** — a closed vocabulary, on [`crate::lock::LockCause`]'s
+/// precedent and for the recorder's own rule: a label that reaches the flight
+/// recorder is one of a fixed set this file chose, never free-form text and
+/// never an OS string.
+///
+/// Three values rather than a `bool`, because the three are genuinely different
+/// claims and only one of them says the human got their screen back. Collapsing
+/// them would put a `WARN` about an unconfirmed modeset on the ordinary path a
+/// human takes when they leave for another VT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeOutcome {
+    /// A flip landed while waking: the modeset was accepted and this session's
+    /// picture is on the panel again. **The only value that says so.**
+    FlipLanded,
+    /// [`WAKE_DEADLINE`] passed with no flip behind the wake, so the core gave
+    /// up waiting and started delivering physical input again. It does **not**
+    /// say the panel came back: the modeset may have failed and left a dark
+    /// panel with the session running, which `docs/book/src/recovery.md` calls
+    /// indistinguishable from a wedge.
+    NoFlip,
+    /// The seat took the devices away mid-blank (D-030(7)). The blank ended
+    /// because this session stopped owning the panel, which is not the same
+    /// fact as coming back — somebody else's VT is on the screen.
+    SeatLost,
+}
+
+impl WakeOutcome {
+    /// The journal's label. Stable: a reader switches on this string.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            WakeOutcome::FlipLanded => "flip_landed",
+            WakeOutcome::NoFlip => "no_flip",
+            WakeOutcome::SeatLost => "seat_lost",
+        }
+    }
+}
+
+/// A change in what the human's panel is showing, which the log and the flight
+/// recorder each owe one entry for (issues #258 and #259).
+///
+/// Produced by [`SessionActivity::take_transition`] and consumed by
+/// [`crate::session::service_blank_round`] — the state machine decides *that*
+/// something happened and the embedder decides what saying so costs, which is
+/// the same division `LockJournal` already draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScreenTransition {
+    /// The cover went up: the human's picture is gone from the panel.
+    Blanked,
+    /// The blank ended, one way or another.
+    Woke {
+        /// How long the cover was on the panel — the span the human could not
+        /// see, which is the whole reason #259 asks for these entries.
+        dark: Duration,
+        /// Which of the three ways it ended.
+        outcome: WakeOutcome,
+    },
+}
+
 /// What [`SessionActivity::note_physical`] decided about one physical event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wake {
@@ -241,6 +299,27 @@ pub(crate) struct SessionActivity {
     /// Latched so a wake that blows its deadline is logged once rather than once
     /// per event.
     overdue_logged: bool,
+    /// **What the journal has been told** (issue #259): `Some(t)` means an entry
+    /// saying the panel went dark at `t` has been written and the matching wake
+    /// entry is still owed; `None` means the recorder believes this session's
+    /// picture is on the panel.
+    ///
+    /// A second field rather than reading [`Self::phase`], because the phase is
+    /// re-read every round and a pair of entries must be emitted on the *edges*.
+    /// Keeping the journal's own belief here is what makes
+    /// [`Self::take_transition`] idempotent within a round and correct across a
+    /// transition that happened between two rounds — [`Self::note_physical`] and
+    /// [`Self::note_flip_completed`] are both called from outside the round.
+    journalled_dark: Option<Instant>,
+    /// How the current — or most recent — departure from a blank ended.
+    ///
+    /// **Pessimistic by default.** [`Self::force_lit`] sets
+    /// [`WakeOutcome::NoFlip`], and the two callers that know better say so
+    /// immediately afterwards, so a third caller added later claims the weaker
+    /// thing rather than the stronger one. A journal that over-claims "the panel
+    /// came back" is worse than one that under-claims it: the whole point of the
+    /// entry is to distinguish a wake from a modeset that left the panel dark.
+    exit: WakeOutcome,
 }
 
 impl SessionActivity {
@@ -254,6 +333,8 @@ impl SessionActivity {
             cover_queued: false,
             waking_since: None,
             overdue_logged: false,
+            journalled_dark: None,
+            exit: WakeOutcome::NoFlip,
         }
     }
 
@@ -325,9 +406,28 @@ impl SessionActivity {
     ///
     /// Returning advances the clock, so the countdown restarts from the moment
     /// the human comes back rather than resuming one frozen mid-way.
+    ///
+    /// # `now` must be the seat event's own instant (issue #257)
+    ///
+    /// **A stale `now` here is not a stale clock, it is an instantly-expired
+    /// one.** The returning arm's whole job is to move `last` forward to the
+    /// present; handed a stamp from before the absence it moves it forward to a
+    /// moment that is *already* past the idle threshold, and the next
+    /// [`Self::tick`] blanks — which is what shipped, and what the L4 rung
+    /// measured as a panel going dark 1.5 s after the human came back with
+    /// `--blank-idle 60`. The lock's idle raise reads the same field, so the
+    /// same stale stamp arms `--lock-idle` on return as well, which is the
+    /// stronger half of the same defect. The caller is
+    /// [`crate::session::note_seat_presence`], which exists so there is exactly
+    /// one place this instant is sampled and no cell to sample it from.
     pub(crate) fn set_seat_absent(&mut self, absent: bool, now: Instant) {
         if absent {
             self.force_lit();
+            // The blank ended, but not by coming back: somebody else's VT is on
+            // the panel. Said after `force_lit`, which sets the pessimistic
+            // default, so the journal names the reason rather than warning about
+            // an unconfirmed modeset that was never attempted.
+            self.exit = WakeOutcome::SeatLost;
         } else if self.seat_absent {
             self.last = now;
         }
@@ -426,6 +526,11 @@ impl SessionActivity {
             return false;
         }
         self.force_lit();
+        // **The one place that may claim the panel came back** (issue #258): a
+        // flip completing is the only evidence in this core that the modeset
+        // which re-enables the CRTC was accepted. Set after `force_lit`, which
+        // resets to the pessimistic default.
+        self.exit = WakeOutcome::FlipLanded;
         true
     }
 
@@ -445,11 +550,62 @@ impl SessionActivity {
 
     /// Force the screen back to [`Phase::Lit`], dropping the cover and any wake
     /// in progress. The one way out of every non-lit state.
+    ///
+    /// Leaves [`WakeOutcome::NoFlip`] behind it — see [`Self::exit`] for why the
+    /// default is the pessimistic one and who is allowed to overwrite it.
     pub(crate) fn force_lit(&mut self) {
         self.phase = Phase::Lit;
         self.cover_queued = false;
         self.waking_since = None;
         self.overdue_logged = false;
+        self.exit = WakeOutcome::NoFlip;
+    }
+
+    /// **Take the transition the journal owes an entry for**, if any (issues
+    /// #258 and #259).
+    ///
+    /// Called once per dispatch round from
+    /// [`crate::session::service_blank_round`], and edge-triggered against
+    /// [`Self::journalled_dark`] rather than against this round's own changes —
+    /// because two of the three transitions are driven from *outside* the round.
+    /// [`Self::note_physical`] runs in the lock gate's `judge`, and
+    /// [`Self::note_flip_completed`] runs in the bare-metal vblank handler; a
+    /// round that compared the phase it found with the phase it left would see
+    /// neither and journal nothing, which is exactly the silence #259 is about.
+    ///
+    /// [`Phase::Waking`] deliberately produces **nothing**. The cover is down and
+    /// the CRTC is being re-enabled, but no flip has landed, so there is no fact
+    /// yet: the wake entry is written when the wake resolves, and it says which
+    /// way it resolved. Announcing a wake at the press would make a successful
+    /// wake and a failed one produce the same entry — the defect one rung down
+    /// from the one #258 fixes in the log.
+    ///
+    /// **Every [`Phase`] is named and there is no `_` arm**, on
+    /// [`crate::recorder::Event::kind`]'s rule and for its reason: a fourth
+    /// variant added later for, say, a DPMS handshake between `Covering` and
+    /// `Dark` would fall into a catch-all, journal nothing on the way down, and
+    /// leave the `screen_blanked`/`screen_woke` pair permanently unpaired — the
+    /// exact silence #259 exists to close, arriving again with nothing red to
+    /// say so. Naming them costs two arms and makes that a compile error.
+    pub(crate) fn take_transition(&mut self, now: Instant) -> Option<ScreenTransition> {
+        match (self.journalled_dark, self.phase) {
+            (None, Phase::Covering | Phase::Dark) => {
+                self.journalled_dark = Some(now);
+                Some(ScreenTransition::Blanked)
+            }
+            (Some(since), Phase::Lit) => {
+                self.journalled_dark = None;
+                Some(ScreenTransition::Woke {
+                    dark: now.saturating_duration_since(since),
+                    outcome: self.exit,
+                })
+            }
+            // Nothing owed: the journal already believes what the phase says.
+            // `Waking` on both sides for the reason above — a wake in flight is
+            // not yet a fact, in either direction.
+            (None, Phase::Lit | Phase::Waking) => None,
+            (Some(_), Phase::Covering | Phase::Dark | Phase::Waking) => None,
+        }
     }
 }
 
@@ -779,6 +935,144 @@ mod tests {
             "the countdown restarts from the return"
         );
         assert!(a.tick(back + Duration::from_secs(60)));
+    }
+
+    /// **One entry on the way down, one on the way back, and never a pair that
+    /// says the same thing** (issue #259).
+    ///
+    /// Every transition below is driven from where production drives it: the
+    /// round's `tick`, the gate's `note_physical`, the vblank handler's
+    /// `note_flip_completed`. A `take_transition` that only compared this
+    /// round's phase against last round's would see the middle two happen
+    /// between rounds and journal nothing.
+    #[test]
+    fn a_blank_and_a_wake_each_produce_exactly_one_journal_transition() {
+        let t0 = Instant::now();
+        let mut a = armed(60, t0);
+
+        assert_eq!(
+            a.take_transition(t0),
+            None,
+            "a lit session owes the journal nothing"
+        );
+        assert!(a.tick(t0 + Duration::from_secs(60)));
+        assert_eq!(
+            a.take_transition(t0 + Duration::from_secs(60)),
+            Some(ScreenTransition::Blanked)
+        );
+        assert_eq!(
+            a.take_transition(t0 + Duration::from_secs(61)),
+            None,
+            "the blank is one fact, not one per round it lasts"
+        );
+
+        // The panel powers down and the human comes back. Neither the going-dark
+        // nor the press is an entry of its own: the wake is not a fact until it
+        // resolves.
+        a.note_frame_queued();
+        a.went_dark();
+        assert_eq!(a.take_transition(t0 + Duration::from_secs(62)), None);
+        assert_eq!(
+            a.note_physical(t0 + Duration::from_secs(90)),
+            Wake::Consumed
+        );
+        assert_eq!(
+            a.take_transition(t0 + Duration::from_secs(90)),
+            None,
+            "a press that started a wake must not be journalled as a wake: a failed modeset \
+             would then produce the same entry a successful one does"
+        );
+
+        // ...and it resolves at the flip, which is the only evidence in this
+        // core that the modeset was accepted.
+        assert!(a.note_flip_completed());
+        assert_eq!(
+            a.take_transition(t0 + Duration::from_secs(91)),
+            Some(ScreenTransition::Woke {
+                dark: Duration::from_secs(31),
+                outcome: WakeOutcome::FlipLanded,
+            }),
+            "the dark span is measured from the cover, not from the power-down"
+        );
+        assert_eq!(
+            a.take_transition(t0 + Duration::from_secs(92)),
+            None,
+            "and the wake is one fact too"
+        );
+    }
+
+    /// **A wake that never completes is journalled as a wake that never
+    /// completed** (issue #258's second half, in the recorder's vocabulary).
+    ///
+    /// The fail-open path leaves the phase lit so physical input reaches the
+    /// session again — but the panel may still be dark, and an entry that said
+    /// `flip_landed` here would be the log claiming the human got their screen
+    /// back on the exact path where they may not have.
+    #[test]
+    fn an_abandoned_wake_and_a_seat_pause_are_not_journalled_as_a_panel_coming_back() {
+        let t0 = Instant::now();
+        let mut a = armed(60, t0);
+        assert!(a.tick(t0 + Duration::from_secs(60)));
+        assert_eq!(
+            a.take_transition(t0 + Duration::from_secs(60)),
+            Some(ScreenTransition::Blanked)
+        );
+        a.note_frame_queued();
+        a.went_dark();
+        a.note_physical(t0 + Duration::from_secs(70));
+
+        // The deadline passes with no flip behind it; the round abandons the
+        // wake through `force_lit`.
+        assert!(a.wake_expired(t0 + Duration::from_secs(70) + WAKE_DEADLINE));
+        a.force_lit();
+        assert_eq!(
+            a.take_transition(t0 + Duration::from_secs(75)),
+            Some(ScreenTransition::Woke {
+                dark: Duration::from_secs(15),
+                outcome: WakeOutcome::NoFlip,
+            })
+        );
+
+        // The other non-wake exit: the human left for another VT while the
+        // panel was dark. The blank ended, but nothing came back.
+        let mut a = armed(60, t0);
+        assert!(a.tick(t0 + Duration::from_secs(60)));
+        assert_eq!(
+            a.take_transition(t0 + Duration::from_secs(60)),
+            Some(ScreenTransition::Blanked)
+        );
+        a.note_frame_queued();
+        a.went_dark();
+        a.set_seat_absent(true, t0 + Duration::from_secs(61));
+        assert_eq!(
+            a.take_transition(t0 + Duration::from_secs(61)),
+            Some(ScreenTransition::Woke {
+                dark: Duration::from_secs(1),
+                outcome: WakeOutcome::SeatLost,
+            }),
+            "a VT switch away must not be journalled -- or logged -- as an unconfirmed modeset"
+        );
+    }
+
+    /// Every label is distinct and none is free-form: the recorder takes
+    /// `&'static str` from this set and nothing else.
+    #[test]
+    fn the_wake_outcome_vocabulary_is_closed_and_distinct() {
+        let labels = [
+            WakeOutcome::FlipLanded.label(),
+            WakeOutcome::NoFlip.label(),
+            WakeOutcome::SeatLost.label(),
+        ];
+        let mut sorted = labels.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "two outcomes share a label");
+        for label in labels {
+            assert!(
+                label.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{label} is not a snake_case journal label"
+            );
+        }
     }
 
     #[test]

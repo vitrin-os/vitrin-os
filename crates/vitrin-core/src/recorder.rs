@@ -1142,11 +1142,14 @@ pub(crate) enum Event<'a> {
     ///
     /// A session-level fact with no principal and no realm, exactly like
     /// [`Event::DeadManTriggered`]: no wire message locks this session, and
-    /// the only two things that can are the human's own chord and the human's
-    /// own absence.
+    /// the only things that can are the human's own chord, the human's own
+    /// absence, and — under a policy the human configured — the human's own
+    /// departure to another VT.
     SessionLocked {
-        /// `chord` or `idle`, from [`crate::lock::LockCause::label`] -- a
-        /// closed vocabulary, never free-form text.
+        /// `chord`, `idle` or `seat`, from [`crate::lock::LockCause::label`]
+        /// -- a closed vocabulary, never free-form text. `seat` appears only
+        /// under `--lock-on-seat-change immediate` (issue #246); a session that
+        /// never names that flag can never produce it.
         cause: &'static str,
         /// Whether unlocking needs a passphrase. On the line because a journal
         /// reader deciding how much a `session_unlocked` entry is worth needs
@@ -1223,6 +1226,80 @@ pub(crate) enum Event<'a> {
         vt: i32,
         /// How long the core waited for the seat's `PauseSession`.
         after_ms: u64,
+    },
+    /// **The panel went dark on the idle timer** (issue #259):
+    /// [`crate::backend::blank`]'s cover went up, and everything behind it kept
+    /// running.
+    ///
+    /// A session-level fact with no principal and no realm, on
+    /// [`Event::SessionLocked`]'s shape and by [`Event::VtSwitchRequested`]'s
+    /// argument one rung over: the artifact built to reconstruct a session
+    /// afterwards was silent about the panel going dark, and a dark panel is not
+    /// a neutral fact here. **Idle blanks and does not lock** (D-033), so the
+    /// blank itself never changes authority and every agent's grants stay live
+    /// across it — which makes "was the human able to see what the agent was
+    /// doing?" a question this journal could not previously answer at all.
+    ///
+    /// Written when the **cover** goes up rather than when the display power
+    /// state is set, because the cover is the instant the human stops seeing
+    /// their session, and because a `clear()` the display controller refuses
+    /// still leaves them looking at black ([`crate::backend::drm`]'s
+    /// `service_screen_power`).
+    ScreenBlanked {
+        /// How many grants were `Active` at that instant.
+        ///
+        /// **Bounds the dark window, never enumerates it.** A grant minted and
+        /// revoked entirely between this entry and its [`Event::ScreenWoke`]
+        /// appears in neither count; the grant lifecycle entries already in the
+        /// journal are what reconstruct the inside of the window. Stated here so
+        /// a reader does not take the pair for a census.
+        live_grants: usize,
+        /// **Whether a lock was up at this instant** — sampled from
+        /// [`crate::lock::LockScreen::is_locked`], never assumed.
+        ///
+        /// D-033 says an idle blank does not *raise* a lock, and that is a
+        /// statement about what the blank does, **not** about what it finds. The
+        /// two configurations that reach a locked, blanked session are ordinary:
+        /// a human chords the lock and then walks away past `--blank-idle`, and
+        /// `--blank-idle 300 --lock-idle 600` puts the idle lock up behind a
+        /// panel that has been dark since 300 s
+        /// (`crate::lock::gate`'s `a_blank_does_not_disable_the_idle_lock` pins
+        /// the second). A hardcoded `false` here would be the flight recorder
+        /// asserting an unlocked dark window that was in fact locked, which is
+        /// worse than the silence #259 replaced.
+        locked: bool,
+    },
+    /// **The blank ended** (issue #259) — and the entry says *how*, because the
+    /// three ways are not the same fact.
+    ///
+    /// Paired with exactly one preceding [`Event::ScreenBlanked`]; the two are
+    /// edge-triggered from one state field, so neither can repeat while the
+    /// other is owed.
+    ScreenWoke {
+        /// How long the cover was on the panel: the span the human could not
+        /// see. Measured from the cover going up, not from the power-down.
+        dark_ms: u64,
+        /// A fixed label from a closed vocabulary — `flip_landed`, `no_flip` or
+        /// `seat_lost` ([`crate::backend::blank::WakeOutcome::label`]).
+        /// **Only `flip_landed` says the panel came back**: `no_flip` is the
+        /// core giving up on a modeset it never saw complete, which is the
+        /// failure `docs/book/src/recovery.md` calls indistinguishable from a
+        /// wedge.
+        outcome: &'static str,
+        /// How many grants were `Active` when the blank ended.
+        /// [`Event::ScreenBlanked::live_grants`]'s caveat applies unchanged.
+        live_grants: usize,
+        /// Whether a lock was up when the blank ended, sampled at this instant
+        /// exactly as [`Event::ScreenBlanked::locked`] is.
+        ///
+        /// **Carried on both ends on purpose.** A lock can raise or lower while
+        /// the panel is dark — the idle raise reads the same activity clock the
+        /// blank does and is deliberately not suppressed by a dark screen — so
+        /// one sample could not describe the window. Two samples bound it; the
+        /// `session_locked` / `session_unlocked` entries between them are what
+        /// reconstruct its inside, which is `live_grants`' rule applied to the
+        /// other field.
+        locked: bool,
     },
     RealmDied {
         realm: &'a RealmId,
@@ -1302,6 +1379,8 @@ impl Event<'_> {
             Event::VtSwitchRequested { .. } => "vt_switch_requested",
             Event::VtSwitchRefused { .. } => "vt_switch_refused",
             Event::VtSwitchStalled { .. } => "vt_switch_stalled",
+            Event::ScreenBlanked { .. } => "screen_blanked",
+            Event::ScreenWoke { .. } => "screen_woke",
             Event::RealmDied { .. } => "realm_died",
             Event::RealmExited { .. } => "realm_exited",
             Event::ConnectionTeardown { .. } => "connection_teardown",
@@ -1722,6 +1801,34 @@ impl Event<'_> {
             Event::VtSwitchStalled { vt, after_ms } => {
                 field_i64(out, "vt", i64::from(vt));
                 field_u64(out, "after_ms", after_ms);
+            }
+            Event::ScreenBlanked {
+                live_grants,
+                locked,
+            } => {
+                field_u64(out, "live_grants", live_grants as u64);
+                // Stated on the entry rather than left to a reader who knows
+                // D-033, because the absence of a `session_locked` line nearby
+                // is not evidence: the lock may have gone up minutes earlier.
+                // **Sampled, never assumed.** This was written as the literal
+                // `false` and that was a false claim on two ordinary
+                // configurations -- a chorded lock followed by a walk away, and
+                // `--blank-idle 300 --lock-idle 600`, where the idle lock raises
+                // behind a panel that has been dark since 300 s.
+                field_bool(out, "locked", locked);
+            }
+            Event::ScreenWoke {
+                dark_ms,
+                outcome,
+                live_grants,
+                locked,
+            } => {
+                field_u64(out, "dark_ms", dark_ms);
+                field_str(out, "outcome", outcome);
+                field_u64(out, "live_grants", live_grants as u64);
+                // The other end of the pair: one sample cannot describe a window
+                // a lock can raise or lower inside.
+                field_bool(out, "locked", locked);
             }
             Event::RealmDied { realm, pid, cause } => {
                 field_display(out, "realm", realm);

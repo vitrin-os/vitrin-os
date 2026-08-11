@@ -120,21 +120,29 @@ than budgetary. Six of them, named rather than summarised:
   number above is this repository's standing example of how a manual result
   ages once it is taken.
 - **The session-lifecycle checklist has been executed once, on 2026-08-11, and
-  it is not a clean pass either.** Blanking, suspend, lid handling and
-  deliberate-wedge recovery are rungs `L1`–`L6` in
-  [Getting out of a wedged session](recovery.md#the-hardware-checklist), where
-  the dated record now lives. What it establishes, at the counts the rungs
+  it is not a clean pass either.** Blanking, suspend, lid handling,
+  deliberate-wedge recovery and returning from another VT are rungs `L1`–`L7`
+  in [Getting out of a wedged session](recovery.md#the-hardware-checklist),
+  where the dated record now lives. What it establishes, at the counts the rungs
   themselves ask for: `L1` 10 of 10 VT switches with a stable band colour; `L2`
   **4 of the 5** suspend/resume cycles, each returning a working panel; `L3`
   **2 of the 5** lid cycles, and only one of those two ever reached sleep, so
   **one usable sample** and nothing established about a short lid close; `L4`
-  blank at 61.2 s and `L5` no lock card, both pass. `L6` recovered in ~69 s but
-  **by which route could not be reconstructed afterwards**, so the rung's actual
-  question — which route got you out — is unanswered. Four defects were filed
-  from the run (#257–#260), one of them that the recovery page's own published
-  command was wrong. **Still unexecuted:** the SysRq route (route 3), and the
-  advisory VKMS rung, which was never attempted. One run on one laptop is a
-  report about that laptop and nothing more.
+  blank at 61.2 s with the panel returning on physical input, and `L5` no lock
+  card. `L6` recovered in ~69 s but **by which route could not be reconstructed
+  afterwards**, so the rung's actual question — which route got you out — is
+  unanswered. Four defects were filed from the run (#257–#260), one of them that
+  the recovery page's own published command was wrong. **`L4` is therefore not a
+  clean pass**: [#257](https://github.com/vitrin-os/vitrin-os/issues/257),
+  [#258](https://github.com/vitrin-os/vitrin-os/issues/258) and
+  [#259](https://github.com/vitrin-os/vitrin-os/issues/259) — the panel blanking
+  ~1.5 s after a return from another VT, a silent unblank, and neither
+  transition reaching the flight recorder — all came out of that session, and
+  **all three fixes are code with component tests behind them and none has been
+  re-observed on hardware.** **Still unexecuted:** `L7`, the rung written from
+  #257 to close exactly that; the SysRq route (route 3); and the advisory VKMS
+  rung, which was never attempted. One run on one laptop is a report about that
+  laptop and nothing more.
 
 This is a recorded decision with a scheduled closure in the sense that page's
 last section means: the closure is a dated human run, not a job. The alternative
@@ -280,18 +288,29 @@ window — between the realm cap being raised and the output being bound —
 where this was not true and a capture could carry a live sibling's pixels;
 it is closed.
 
-**Every realm renders, whether or not you are looking at it.** A hidden
-realm keeps receiving frame callbacks paced by the output's composites, and
-keeps having its view composed. That is not generosity: a Wayland client
-throttles on frame callbacks, so a realm that stopped being paced would stop
-repainting and its capture would go stale — which the protocol forbids
-outright (`no_surface` is documented as "never a stale frame"). The cost is
-real and is not traded away: on a laptop, up to sixteen apps compositing at
-the output's rate with nobody watching fifteen of them, plus roughly
+**Every realm renders, whether or not you are looking at it — and whether or
+not any agent is connected.** A hidden realm keeps receiving frame callbacks
+paced by the output's composites, and keeps having its view composed. That is
+not generosity: a Wayland client throttles on frame callbacks, so a realm that
+stopped being paced would stop repainting and its capture would go stale —
+which the protocol forbids outright (`no_surface` is documented as "never a
+stale frame"). The second half is the one this page used to leave out: the
+compositor also does **not** ask whether anything will read a composed view.
+With no agent connected, no `--capture-dump` and no `--screenshot-dir`, a
+realm that is painting still has its view composed and cached every round.
+Gating that on whether a grant happens to exist would make what a capture
+returns depend on when the grant appeared, and that trade was declined.
+
+What the compositor does skip is a realm whose scene has not changed since the
+last composite: the cached view is then already byte-for-byte what recomposing
+would produce, so nothing about what any reader is served depends on it. That
+saves the idle case and the sibling case — one realm painting no longer costs
+its fifteen neighbours a composite each — and saves nothing at all for a
+single realm whose app is busy painting. The rest of the cost is real and is
+not traded away: on a laptop, up to sixteen apps compositing at the output's
+rate with nobody watching fifteen of them, plus roughly
 `2 x width x height x 4` bytes of core-side pixels per realm (~590 MiB
-resident at sixteen realms on a 2560x1600 panel, measured). Visibility-aware
-pacing would buy the power back at the cost of capture honesty, and that
-trade was declined.
+resident at sixteen realms on a 2560x1600 panel, measured).
 
 **The agent cursor is drawn only for the visible realm.** The core paints a
 small crosshair where an agent is pointing, so a human can see that an agent
@@ -480,10 +499,14 @@ binds it loses it. `--clipboard-key` moves both to another key, which is not a
 remedy so much as a different loss.
 
 **The lock screen does not lock out agents, and this is the single most
-surprising thing on this page.** As of WS-E.2.2 there is a lock screen:
-Ctrl-Alt-Delete (or `--lock-idle SECS` of no physical input) covers the output
-with a core-drawn card and takes **every physical event** away from every realm
-until you type your passphrase. What it does not do is touch a grant. An agent
+surprising thing on this page.** As of WS-E.2.2 there is a lock screen, and
+**three** things raise it: Ctrl-Alt-Delete, `--lock-idle SECS` of no physical
+input, and — only if you asked for it — a VT switch away under
+`--lock-on-seat-change immediate`, which is described with the other two seat
+policies further down this page and which a session that never names that flag
+can never produce. Whichever one raised it, it covers the output with a
+core-drawn card and takes **every physical event** away from every realm until
+you type your passphrase. What it does not do is touch a grant. An agent
 holding `observe` **keeps capturing the realm across a lock**, frame for frame,
 exactly as if you were sitting there; one holding `actuate_pointer` or
 `actuate_text` keeps acting.
@@ -732,18 +755,29 @@ because the process and its colour keep running. Note too that the chord is a
 *physical* gesture and physical input is suspended for the whole time you are on
 another VT, so from there your only stop is a shell and a signal.
 
-**A VT switch does not raise the lock screen, and a consent prompt raised while
-you are away is not recorded as shown.** Switching away is not treated as
-walking away: it costs no passphrase, because making the escape hatch expensive
-to come back from would erode the reason it is open. **The idle timer is also
-stopped while you are away**, and the countdown restarts when you come back —
-so with `--lock-idle` a switch away does not lock the session either, however
-long it lasts. **The cost of that is plain: a session you switched away from
-eight hours ago is unlocked when you switch back to it.** That is a deliberate
-choice rather than a default, and it is currently the only behaviour available;
-whether leaving should lock immediately, lock on idle, or never lock is a policy
-this release does not let you configure. A lock already up is untouched — a VT
-switch is never a way past a lock screen. What
+**By default a VT switch does not raise the lock screen, and a consent prompt
+raised while you are away is not recorded as shown.** Switching away is not
+treated as walking away: it costs no passphrase, because making the escape hatch
+expensive to come back from would erode the reason it is open. **The idle timer
+is also stopped while you are away**, and the countdown restarts when you come
+back — so with `--lock-idle` a switch away does not lock the session either,
+however long it lasts. **The cost of that is plain: a session you switched away
+from eight hours ago is unlocked when you switch back to it.**
+
+That is the default and it is unchanged, but it is no longer the only behaviour
+available: `--lock-on-seat-change immediate|idle|never` picks one, on `--drm`
+only, and `never` is what you get if you say nothing.
+
+| Policy | What leaving does |
+|---|---|
+| `immediate` | The lock goes up as you leave, so coming back always costs a passphrase (or an Enter, with no `--lock-passphrase-file`). |
+| `idle` | The idle countdown keeps running across the absence, so a long switch-away comes back to a locked screen and a short one does not. Needs `--lock-idle`; with no countdown there is nothing to keep running. |
+| `never` | **The default, described above.** The countdown freezes for the absence and restarts when you return. |
+
+Two things no policy changes. **A lock already up is untouched** — a VT switch is
+never a way past a lock screen, under any of the three. And **none of them
+suspends an agent**: a locked screen does not stop observation or actuation
+(above), so `immediate` buys you a passphrase prompt and not a pause. What
 `vitrind` will not do is put a consent prompt on a screen it does not own: a
 petition that arrives while you are on another VT stays pending, is never
 journalled as shown, and times out on the ordinary sweep, which reaches the
@@ -843,13 +877,24 @@ Four more things belong with it:
   reaches the screenshot hook. The lock one is deliberate rather than
   incidental: a person standing at your locked machine must not be able to write
   the session behind it to a file.
-- **Pressing it stalls the compositor for about 70 ms.** Measured, not
-  estimated: 71.7 ms in a release build to encode one 2560x1600 frame into a
-  12.3 MB PNG, and the encode runs synchronously on the event-loop thread inside
-  the input round. At 240 Hz that is roughly seventeen dropped frames — a
-  visible hitch on every press, and longer on a larger panel. It is bounded (one
-  press, one encode, no queue) and it is not a correctness problem, but a human
-  will see it. Moving the encode off the compositor thread is issue #240.
+- **Pressing it costs the compositor about 4 ms, and the encode no longer
+  happens there at all.** It used to be about 70 ms: 71.7 ms in a release build
+  to encode one 2560x1600 frame into a 12.3 MB PNG, synchronously on the
+  event-loop thread — roughly seventeen dropped frames at 240 Hz, on every
+  press. Since issue #240 the encode runs on a worker thread that owns the
+  screenshot directory, and what the press pays on the compositor thread is one
+  copy of the frame out of the capture cache: **4.2 ms** for the same
+  2560x1600 frame, measured in the same release build (73.9 ms for the encode
+  itself, unchanged, on the same run). That is one frame at 240 Hz rather than
+  seventeen. The remaining cost is the copy, and it scales with pixel count the
+  same way; the queue is bounded at two presses behind the one being encoded,
+  and a press past that is refused and journalled (`encoder_busy`) rather than
+  queued, because each job is a whole frame of memory.
+
+  Both numbers are CPU measurements on the development machine, in a release
+  build — **not** a measurement of a session driving a real panel. What a
+  screenshot does to a bare-metal session's frame timing is knowable only from
+  a run of `docs/drm-bringup.md`, which needs hardware CI does not have.
 - **It DOES work during a dead-man hold, and that is deliberate.** An earlier
   version of this page said otherwise and was simply wrong: `DeadManHook::gate`
   consumes only its own chord's key and delivers every other, so Ctrl+Print
@@ -858,7 +903,13 @@ Four more things belong with it:
   photographing their own screen is not authority — but it means the dead-man
   chord is not a way to stop a screenshot you have already started, and a
   screenshot taken during a hold captures the session as it was before the
-  revocation landed.
+  revocation landed. Since the encode moved to a worker thread this is literal:
+  a hold does not cancel an encode already accepted, and the end of the session
+  waits for it — but only for five seconds. Past that the core stops waiting,
+  the process exits over the top of the worker, and that last file may be
+  truncated. The wait is bounded on purpose and in both halves (the outcome
+  *and* the thread), because a screenshot directory on a mount that has stopped
+  answering must not be able to make `SIGTERM` do nothing.
 
 **Identities are static tokens.** Listed in `principals.toml`. The IDL is
 shaped for SPIFFE/OIDC credentials; the machinery is not here yet.

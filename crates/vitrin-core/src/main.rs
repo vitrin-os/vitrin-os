@@ -3417,15 +3417,74 @@ fn warn_auto_approve(registry: &Path) {
 
 /// Route Smithay's (and our own) `tracing` diagnostics to stderr.
 /// `RUST_LOG` selects the filter; the default is `info`.
+///
+/// **Colour is decided here rather than left to the subscriber's default**
+/// (issue #251). See [`ansi_wanted`] for the whole rule and the reason.
 fn init_tracing() {
+    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let ansi = ansi_wanted(
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        std::env::var_os("NO_COLOR"),
+    );
+    diagnostic_subscriber(std::io::stderr, ansi, filter).init();
+    log_build_identity();
+}
+
+/// Whether this run may write ANSI colour into its diagnostics.
+///
+/// # A redirected log is an artefact somebody has to grep (issue #251)
+///
+/// `tracing-subscriber` 0.3 decides colour from `cfg!(feature = "ansi")` and
+/// `NO_COLOR` alone — **it never asks whether the writer is a terminal**. So
+/// every run redirected to a file got SGR escapes interleaved into it, and the
+/// bring-up runbook makes exactly such a file the only account of what
+/// happened (`docs/drm-bringup.md`: "`tee` is not optional"). The escapes land
+/// *between* a field's name and its `=`, so `grep 'connector='` over the second
+/// DRM run's log matched **zero** lines while `grep connector` matched two:
+/// the operator had to know to `sed 's/\x1b\[[0-9;]*m//g'` first, and a field
+/// nobody can grep is a field the record paraphrases instead of quoting.
+///
+/// # Two switches, both one-way, so there is nothing for them to disagree about
+///
+/// `NO_COLOR` is the conventional opt-out and this function keeps honouring it,
+/// which it has to do by hand: `with_ansi` *overrides* the subscriber's own
+/// `NO_COLOR` check, so calling it at all makes this the only place that
+/// decision is taken. Both inputs can only ever turn colour **off** — a tty
+/// with `NO_COLOR` set is plain, and a pipe is plain whatever `NO_COLOR` says —
+/// so the answer is their conjunction and neither "wins" over the other. There
+/// is deliberately **no flag to force colour on**: the case a flag would serve
+/// is a human watching a pipe, and a human watching a pipe is a human whose log
+/// file is being written for later.
+///
+/// `no_color` is passed in rather than read here so the tests are hermetic —
+/// mutating the environment mid-test is a data race the 2024 edition makes
+/// `unsafe` for good reason, and this decision is worth testing without one.
+fn ansi_wanted(stderr_is_terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
+    // NO_COLOR's own rule: *set to a non-empty value* disables colour, so an
+    // empty `NO_COLOR=` is not an opt-out (no-color.org, and the behaviour
+    // tracing-subscriber implements internally).
+    stderr_is_terminal && no_color.is_none_or(|value| value.is_empty())
+}
+
+/// The diagnostic subscriber, as one expression both `main` and the tests
+/// build — so the test asserts on the formatter this binary actually installs
+/// rather than on a replica of it.
+fn diagnostic_subscriber<W>(
+    writer: W,
+    ansi: bool,
+    filter: tracing_subscriber::EnvFilter,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
-    log_build_identity();
+        .with_writer(writer)
+        .with_ansi(ansi)
+        .finish()
 }
 
 /// **Say which binary this is, in the first lines of every run** (WS-E.3.5).
@@ -5820,5 +5879,111 @@ mod tests {
         assert!(parse_args(["--nested", "--nested"]).is_err());
         assert!(parse_args(["--headless", "--headless"]).is_err());
         assert!(parse_args(["--nested", "--headless"]).is_err());
+    }
+
+    /// A writer that hands every `make_writer` call the same buffer, so a test
+    /// can read back exactly the bytes the subscriber emitted.
+    ///
+    /// `Clone` rather than a borrow because `MakeWriter`'s blanket impl for a
+    /// closure is the only one that fits a shared buffer: `Arc<Mutex<Vec<u8>>>`
+    /// satisfies neither the `Arc<W>` impl (it needs `&W: Write`) nor the
+    /// `Mutex<W>` one (it needs the `Mutex` itself, unwrapped).
+    #[derive(Clone)]
+    struct SharedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Emit one line through the real subscriber builder and return it.
+    ///
+    /// `with_default` rather than a global install: the global slot is
+    /// one-shot per process and these are two cases in one test binary.
+    fn capture_one_line(ansi: bool) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = SharedLog(std::sync::Arc::clone(&buf));
+        let subscriber = diagnostic_subscriber(
+            move || sink.clone(),
+            ansi,
+            tracing_subscriber::EnvFilter::new("info"),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            // The runbook's own field, verbatim, because it is the one the
+            // second DRM run could not grep back out of its log.
+            tracing::info!(connector = "eDP-1", "mode set");
+        });
+        let bytes = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8(bytes).expect("the formatter emits UTF-8")
+    }
+
+    /// **A redirected log is greppable, and a terminal still gets colour**
+    /// (issue #251).
+    ///
+    /// What CI can prove is the formatting layer, which needs no DRM device,
+    /// no seat and no GPU: given a non-tty writer the line carries a literal
+    /// `connector=` and no `ESC[` byte anywhere. What CI **cannot** prove is
+    /// the other half of the acceptance criterion — that `grep 'connector='`
+    /// over a redirected `vitrind` stderr returns the `mode set:` line — since
+    /// no CI runner reaches the DRM path that emits it at all.
+    #[test]
+    fn a_redirected_log_is_greppable_and_a_terminal_still_gets_colour() {
+        let plain = capture_one_line(false);
+        assert!(
+            plain.contains("connector=\"eDP-1\""),
+            "a redirected log must carry the field name, its `=` and its value as adjacent \
+             literal bytes, or the runbook's own grep finds nothing and the record paraphrases \
+             what it cannot quote. Got: {plain:?}"
+        );
+        assert!(
+            !plain.contains('\u{1b}'),
+            "an escape byte anywhere in a redirected log is the defect: it separates a field \
+             name from its `=`. Got: {plain:?}"
+        );
+
+        // Colour is not removed from interactive use -- only from the case
+        // where the bytes are going into a file.
+        let coloured = capture_one_line(true);
+        assert!(
+            coloured.contains('\u{1b}'),
+            "a terminal must still get colour; the fix is a tty test, not a removal. Got: \
+             {coloured:?}"
+        );
+    }
+
+    /// The tty test and `NO_COLOR` are both one-way switches, so the rule is
+    /// their conjunction (issue #251).
+    #[test]
+    fn colour_needs_a_terminal_and_an_unset_no_color() {
+        assert!(
+            ansi_wanted(true, None),
+            "an interactive run keeps its colour"
+        );
+        assert!(
+            !ansi_wanted(false, None),
+            "a pipe or a file gets no escapes, which is the whole fix"
+        );
+        // NO_COLOR is honoured BY HAND because `with_ansi` overrides the
+        // subscriber's own check; forgetting it would silently repeal a
+        // conventional opt-out this binary used to respect.
+        assert!(
+            !ansi_wanted(true, Some(std::ffi::OsString::from("1"))),
+            "NO_COLOR must still turn colour off on a terminal"
+        );
+        // ...and its own rule: only a NON-EMPTY value opts out.
+        assert!(
+            ansi_wanted(true, Some(std::ffi::OsString::new())),
+            "an empty NO_COLOR is not an opt-out (no-color.org)"
+        );
+        assert!(!ansi_wanted(false, Some(std::ffi::OsString::from("1"))));
     }
 }

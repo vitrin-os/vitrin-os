@@ -853,7 +853,11 @@ Four more things belong with it:
   screenshot taken during a hold captures the session as it was before the
   revocation landed. Since the encode moved to a worker thread this is literal:
   a hold does not cancel an encode already accepted, and the end of the session
-  waits for it (up to five seconds) rather than truncating the file.
+  waits for it — but only for five seconds. Past that the core stops waiting,
+  the process exits over the top of the worker, and that last file may be
+  truncated. The wait is bounded on purpose and in both halves (the outcome
+  *and* the thread), because a screenshot directory on a mount that has stopped
+  answering must not be able to make `SIGTERM` do nothing.
 
 **Identities are static tokens.** Listed in `principals.toml`. The IDL is
 shaped for SPIFFE/OIDC credentials; the machinery is not here yet.

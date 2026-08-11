@@ -180,14 +180,22 @@ pub(crate) struct RuntimeSeed {
     /// runtime consumes.
     pub indicator: crate::consent::TrustedIndicator,
     /// Optional `--capture-dump PATH` target (P1.8.5, issue #107): when set,
-    /// every redraw also writes each live realm's freshly composited
-    /// realm-view readback — the raw RGBA that realm's capture cache entry is
-    /// refreshed from — to **`PATH.<realm-id>`**. It is the **core-internal
-    /// capture**, taken before `render_frame`, the memfd, the wire and the
-    /// SDK decode ever run, so an agent's `observe()` frame can be compared
-    /// against it to prove the grant/capture path adds no distortion against
-    /// a real app. A diagnostic knob, not a wire feature; `None` in every
-    /// ordinary run.
+    /// every *refresh* of a live realm's view also writes that freshly
+    /// composited realm-view readback — the raw RGBA that realm's capture
+    /// cache entry is refreshed from — to **`PATH.<realm-id>`**. It is the
+    /// **core-internal capture**, taken before `render_frame`, the memfd, the
+    /// wire and the SDK decode ever run, so an agent's `observe()` frame can
+    /// be compared against it to prove the grant/capture path adds no
+    /// distortion against a real app. A diagnostic knob, not a wire feature;
+    /// `None` in every ordinary run.
+    ///
+    /// **A refresh, not a redraw** (issue #252). The mirror follows the
+    /// compose rather than the round, and [`refresh_view_cache`] no longer
+    /// composes a realm whose scene and view size are unchanged — so an
+    /// unmoving realm writes nothing and keeps the dump it already has, byte
+    /// for byte what a recompose would have produced. The content a reader
+    /// gets is unaffected; what is *not* available is the file's mtime as a
+    /// signal that a frame landed.
     ///
     /// **The realm suffix is not cosmetic** (WS-E.1.3, issue #209). While a
     /// session held one realm, `PATH` unambiguously named the one view the
@@ -8139,7 +8147,7 @@ mod tests {
             "the atomic-write temp must not survive a successful write"
         );
 
-        // A second write overwrites in place (each redraw refreshes it).
+        // A second write overwrites in place (a later refresh rewrites it).
         let frame2: Vec<u8> = frame.iter().rev().copied().collect();
         write_capture_dump(&path, &frame2);
         assert_eq!(std::fs::read(&path).expect("second dump"), frame2);

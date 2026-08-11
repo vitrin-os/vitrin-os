@@ -523,8 +523,10 @@ Work down this list. Do not skip to R4 because the first two feel slow.
 > The book page is the one to read when you are wedged and not mid-bring-up: it
 > carries the `sudo`-only `/proc/sysrq-trigger` path, the `logind` settings the
 > lid and suspend behaviour depend on, and the **session-lifecycle checklist
-> (L1–L6: 10 VT switches, 5 suspend/resume, 5 lid cycles, blank/unblank, one
-> deliberate wedge)** that the checklist below does not contain and never did.
+> (L1–L7: 10 VT switches, 5 suspend/resume, 5 lid cycles, blank/unblank, the
+> blank-did-not-lock check, one deliberate wedge, and a return from another VT
+> with the blank armed)** that the checklist below does not contain and never
+> did.
 
 ### R1 — the desktop is gone but the keyboard works
 

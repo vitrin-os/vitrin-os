@@ -1232,10 +1232,10 @@ pub(crate) enum Event<'a> {
     /// [`Event::SessionLocked`]'s shape and by [`Event::VtSwitchRequested`]'s
     /// argument one rung over: the artifact built to reconstruct a session
     /// afterwards was silent about the panel going dark, and a dark panel is not
-    /// a neutral fact here. **Idle blanks and does not lock** (D-033), so across
-    /// this entry the session stays unlocked and every agent's grants stay live
-    /// — which makes "was the human able to see what the agent was doing?" a
-    /// question this journal could not previously answer at all.
+    /// a neutral fact here. **Idle blanks and does not lock** (D-033), so the
+    /// blank itself never changes authority and every agent's grants stay live
+    /// across it — which makes "was the human able to see what the agent was
+    /// doing?" a question this journal could not previously answer at all.
     ///
     /// Written when the **cover** goes up rather than when the display power
     /// state is set, because the cover is the instant the human stops seeing
@@ -1251,6 +1251,20 @@ pub(crate) enum Event<'a> {
         /// journal are what reconstruct the inside of the window. Stated here so
         /// a reader does not take the pair for a census.
         live_grants: usize,
+        /// **Whether a lock was up at this instant** — sampled from
+        /// [`crate::lock::LockScreen::is_locked`], never assumed.
+        ///
+        /// D-033 says an idle blank does not *raise* a lock, and that is a
+        /// statement about what the blank does, **not** about what it finds. The
+        /// two configurations that reach a locked, blanked session are ordinary:
+        /// a human chords the lock and then walks away past `--blank-idle`, and
+        /// `--blank-idle 300 --lock-idle 600` puts the idle lock up behind a
+        /// panel that has been dark since 300 s
+        /// (`crate::lock::gate`'s `a_blank_does_not_disable_the_idle_lock` pins
+        /// the second). A hardcoded `false` here would be the flight recorder
+        /// asserting an unlocked dark window that was in fact locked, which is
+        /// worse than the silence #259 replaced.
+        locked: bool,
     },
     /// **The blank ended** (issue #259) — and the entry says *how*, because the
     /// three ways are not the same fact.
@@ -1272,6 +1286,17 @@ pub(crate) enum Event<'a> {
         /// How many grants were `Active` when the blank ended.
         /// [`Event::ScreenBlanked::live_grants`]'s caveat applies unchanged.
         live_grants: usize,
+        /// Whether a lock was up when the blank ended, sampled at this instant
+        /// exactly as [`Event::ScreenBlanked::locked`] is.
+        ///
+        /// **Carried on both ends on purpose.** A lock can raise or lower while
+        /// the panel is dark — the idle raise reads the same activity clock the
+        /// blank does and is deliberately not suppressed by a dark screen — so
+        /// one sample could not describe the window. Two samples bound it; the
+        /// `session_locked` / `session_unlocked` entries between them are what
+        /// reconstruct its inside, which is `live_grants`' rule applied to the
+        /// other field.
+        locked: bool,
     },
     RealmDied {
         realm: &'a RealmId,
@@ -1774,24 +1799,33 @@ impl Event<'_> {
                 field_i64(out, "vt", i64::from(vt));
                 field_u64(out, "after_ms", after_ms);
             }
-            Event::ScreenBlanked { live_grants } => {
+            Event::ScreenBlanked {
+                live_grants,
+                locked,
+            } => {
                 field_u64(out, "live_grants", live_grants as u64);
                 // Stated on the entry rather than left to a reader who knows
-                // D-033: the two most consequential things about a dark panel
-                // here are that it is NOT a lock and that authority is
-                // unaffected, and a journal that made a reader infer them from
-                // the absence of a `session_locked` line would be inviting the
-                // wrong inference.
-                field_bool(out, "locked", false);
+                // D-033, because the absence of a `session_locked` line nearby
+                // is not evidence: the lock may have gone up minutes earlier.
+                // **Sampled, never assumed.** This was written as the literal
+                // `false` and that was a false claim on two ordinary
+                // configurations -- a chorded lock followed by a walk away, and
+                // `--blank-idle 300 --lock-idle 600`, where the idle lock raises
+                // behind a panel that has been dark since 300 s.
+                field_bool(out, "locked", locked);
             }
             Event::ScreenWoke {
                 dark_ms,
                 outcome,
                 live_grants,
+                locked,
             } => {
                 field_u64(out, "dark_ms", dark_ms);
                 field_str(out, "outcome", outcome);
                 field_u64(out, "live_grants", live_grants as u64);
+                // The other end of the pair: one sample cannot describe a window
+                // a lock can raise or lower inside.
+                field_bool(out, "locked", locked);
             }
             Event::RealmDied { realm, pid, cause } => {
                 field_display(out, "realm", realm);

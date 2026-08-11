@@ -499,6 +499,30 @@ USAGE:
                                 agent is working in is still a session the human
                                 left. Off by default; 0 is REFUSED rather than
                                 read as off (it would relock every round).
+    vitrind [--lock-on-seat-change POLICY]
+                                `--drm` ONLY: what a VT switch AWAY does to the
+                                lock. Three policies, and the default is the
+                                behaviour this core has always had:
+                                  immediate -- losing the seat raises the lock
+                                    at once, so coming back always costs a
+                                    passphrase (or an Enter, with no
+                                    --lock-passphrase-file).
+                                  idle      -- the idle countdown keeps running
+                                    across the absence, so a LONG switch-away
+                                    returns to a locked screen and a short one
+                                    does not. Needs --lock-idle to mean
+                                    anything; with no idle timeout there is no
+                                    countdown to keep running.
+                                  never     -- (default) the countdown freezes
+                                    for the absence and restarts on return.
+                                    The cost, published in
+                                    docs/book/src/limits.md: a session you
+                                    switched away from eight hours ago is
+                                    unlocked when you switch back to it.
+                                NO policy lowers a lock that is already up: a
+                                VT switch is never a way past a lock screen.
+                                REFUSED with --nested and --headless, which
+                                have no seat to lose.
     vitrind [--lock-passphrase-file PATH]
                                 NOT with `--headless`: unlock requires the passphrase
                                 whose Argon2id digest PATH holds. Absolute path,
@@ -1022,6 +1046,10 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut lock_idle: Option<Duration> = None;
     let mut blank_idle: Option<Duration> = None;
     let mut lock_passphrase: Option<PathBuf> = None;
+    // `Option` rather than the policy itself, so "not given" and "given
+    // `never`" stay distinguishable: the refusal below is about a flag being
+    // *stored and never read*, and the default value is not a use of the flag.
+    let mut lock_on_seat_change: Option<lock::SeatChangePolicy> = None;
     let mut agent_cursor = false;
     #[cfg(feature = "drm-backend")]
     let mut keymap: Option<PathBuf> = None;
@@ -1158,6 +1186,13 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 )?;
                 set_blank_idle(&mut blank_idle, value)?;
             }
+            "--lock-on-seat-change" => {
+                let value = args.next().ok_or(
+                    "`--lock-on-seat-change` requires a policy (immediate, idle or never, e.g. \
+                     `--lock-on-seat-change immediate`)",
+                )?;
+                set_seat_change_policy(&mut lock_on_seat_change, value)?;
+            }
             "--lock-passphrase-file" => {
                 let value = args.next().ok_or(
                     "`--lock-passphrase-file` requires a path (e.g. \
@@ -1271,6 +1306,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_lock_idle(&mut lock_idle, value)?;
                 } else if let Some(value) = other.strip_prefix("--blank-idle=") {
                     set_blank_idle(&mut blank_idle, value)?;
+                } else if let Some(value) = other.strip_prefix("--lock-on-seat-change=") {
+                    set_seat_change_policy(&mut lock_on_seat_change, value)?;
                 } else if let Some(value) = other.strip_prefix("--lock-passphrase-file=") {
                     set_path(
                         &mut lock_passphrase,
@@ -1621,6 +1658,19 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         return Err(crate::backend::blank::BLANK_NEEDS_THE_OUTPUT.into());
     }
 
+    // **`--lock-on-seat-change` is `--drm` only** (issue #246), and the same
+    // refusal for the same reason one step milder: a nested or headless session
+    // never receives a seat event, so `LockScreen::set_seat_absent` is never
+    // called and the policy would be stored and never read. The predicate is
+    // the one above rather than a second `matches!`, because "this run drives
+    // the panel itself" and "this run holds the seat" are the same fact on
+    // this stack -- the bare-metal backend takes both together or neither --
+    // and two spellings of one fact are two things that can disagree.
+    let has_a_seat = blank_has_an_output;
+    if !has_a_seat && lock_on_seat_change.is_some() {
+        return Err(lock::SEAT_POLICY_NEEDS_A_SEAT.into());
+    }
+
     // The injector channel's two companion refusals (issue #138), taken at
     // PARSE time rather than at first use, which is this parser's rule
     // everywhere else too:
@@ -1774,6 +1824,10 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 chord: lock_chord,
                 idle: lock_idle,
                 passphrase: lock_passphrase,
+                // Not `lock_on_seat_change`: the flag was refused above on this
+                // mode, so this is the default and saying so literally keeps
+                // the nested arm from ever growing a seat policy by accident.
+                on_seat_change: lock::SeatChangePolicy::default(),
             },
             screenshot,
             status,
@@ -1804,6 +1858,9 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 chord: lock_chord,
                 idle: lock_idle,
                 passphrase: lock_passphrase,
+                // The one arm that reads the flag, because it is the one
+                // backend with a seat to lose (issue #246).
+                on_seat_change: lock_on_seat_change.unwrap_or_default(),
             },
             screenshot,
             status,
@@ -2106,6 +2163,25 @@ fn set_blank_idle(slot: &mut Option<Duration>, value: &str) -> Result<(), String
         );
     }
     *slot = Some(Duration::from_secs(secs));
+    Ok(())
+}
+
+/// Record `--lock-on-seat-change` (issue #246), rejecting a repeat flag and an
+/// unknown policy.
+///
+/// [`set_blank_idle`]'s shape, and the repeat refusal matters more here than on
+/// a duration: two policies on one command line have no reading in which the
+/// operator got what they asked for, and silently taking the last one would
+/// hand a session a lock policy nobody chose — which is the whole complaint
+/// this flag exists to answer.
+fn set_seat_change_policy(
+    slot: &mut Option<lock::SeatChangePolicy>,
+    value: &str,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--lock-on-seat-change` given more than once".into());
+    }
+    *slot = Some(lock::SeatChangePolicy::parse(value)?);
     Ok(())
 }
 
@@ -3797,6 +3873,45 @@ mod tests {
         );
         assert!(parse_args(["--drm", "--blank-idle", "abc"]).is_err());
 
+        // **`--lock-on-seat-change` is `--drm` only** (issue #246), for the
+        // same reason and by the same predicate: no other backend receives a
+        // seat event, so the policy would be stored and never read.
+        for policy in ["immediate", "idle", "never"] {
+            assert!(
+                parse_args(["--drm", "--lock-on-seat-change", policy]).is_ok(),
+                "{policy} must parse on the one backend that has a seat"
+            );
+        }
+        assert_eq!(
+            seat_policy_of(&parse_args(["--drm", "--lock-on-seat-change=immediate"]).unwrap()),
+            lock::SeatChangePolicy::Immediate
+        );
+        assert_eq!(
+            seat_policy_of(&parse_args(["--drm", "--lock-on-seat-change", "idle"]).unwrap()),
+            lock::SeatChangePolicy::Idle
+        );
+        assert_eq!(
+            seat_policy_of(&parse_args(["--drm"]).unwrap()),
+            lock::SeatChangePolicy::Never,
+            "the default is D-030(2)'s behaviour: a switch away does not lock the session"
+        );
+        let err = parse_args(["--drm", "--lock-on-seat-change", "sometimes"])
+            .expect_err("the vocabulary is closed");
+        assert!(err.contains("immediate") && err.contains("never"), "{err}");
+        assert!(
+            parse_args([
+                "--drm",
+                "--lock-on-seat-change",
+                "idle",
+                "--lock-on-seat-change",
+                "never"
+            ])
+            .is_err(),
+            "two policies on one command line have no reading in which the operator got what \
+             they asked for"
+        );
+        assert!(parse_args(["--drm", "--lock-on-seat-change"]).is_err());
+
         // ...and both injector channels stay headless-only, which the
         // existing guards already enforce -- asserted here so that "the
         // bare-metal table" is complete in one place.
@@ -5252,6 +5367,11 @@ mod tests {
             chord: chord::ModChord::parse(lock::DEFAULT_LOCK_CHORD).expect("the default parses"),
             idle: None,
             passphrase: None,
+            // D-030(2)'s behaviour: a VT switch away does not lock the session
+            // (issue #246). Spelled rather than `..Default::default()`, so a
+            // change to the default is a change to this line and every parse
+            // test that compares against it.
+            on_seat_change: lock::SeatChangePolicy::Never,
         }
     }
 
@@ -5470,6 +5590,64 @@ mod tests {
         }
     }
 
+    /// The seat-change policy a bare-metal run resolved (issue #246).
+    #[cfg(feature = "drm-backend")]
+    fn seat_policy_of(action: &Action) -> lock::SeatChangePolicy {
+        match action {
+            Action::RunDrm { lock, .. } => lock.on_seat_change,
+            other => panic!("not a bare-metal run action: {other:?}"),
+        }
+    }
+
+    /// **`--lock-on-seat-change` is refused on every backend with no seat**
+    /// (issue #246), rather than accepted as a silent no-op.
+    ///
+    /// `--blank-idle`'s posture, one step milder in consequence and identical
+    /// in shape: a nested session never receives a seat event, so the policy
+    /// could only ever be stored and never read — and an operator who believes
+    /// their nested session locks itself when they alt-tab away has been told
+    /// something false by their own command line.
+    ///
+    /// Asserted in a build **without** `drm-backend` too, where there is no
+    /// mode the flag could be valid in at all.
+    #[test]
+    fn the_seat_change_policy_is_refused_on_every_backend_without_a_seat() {
+        for args in [
+            vec!["--nested", "--lock-on-seat-change", "immediate"],
+            vec!["--nested", "--lock-on-seat-change=immediate"],
+            vec!["--nested", "--lock-on-seat-change", "never"],
+            vec!["--headless", "--lock-on-seat-change", "idle"],
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err("a backend with no seat cannot have a seat-change policy");
+            assert!(
+                err.contains("--lock-on-seat-change") && err.contains("--drm"),
+                "the refusal must name the flag and the one backend it is valid on: {err}"
+            );
+        }
+        // Even the DEFAULT value is refused when named: the refusal is about a
+        // flag being stored and never read, and `never` is not an exception to
+        // that -- accepting it would teach an operator that the flag works
+        // here, and they would go on to write `immediate`.
+        assert!(parse_args(["--nested", "--lock-on-seat-change=never"]).is_err());
+
+        // Named in `USAGE` rather than a bare-metal-only help text, because
+        // the parser has an arm for the flag in every build and answers a
+        // *reason* rather than `unknown argument`.
+        assert!(USAGE.contains("--lock-on-seat-change"));
+        for policy in ["immediate", "idle", "never"] {
+            assert!(
+                USAGE.contains(policy),
+                "the help must name the whole vocabulary: {policy} is missing"
+            );
+        }
+        assert!(
+            USAGE.contains("never a way past a lock screen"),
+            "the help must say the thing no policy changes, where an operator picking one will \
+             read it"
+        );
+    }
+
     #[test]
     fn the_lock_flags_parse_both_spellings_and_default_independently() {
         // The default, pinned for the reason the dead-man's and the attention
@@ -5480,6 +5658,12 @@ mod tests {
         assert_eq!(defaults.chord.spelling(), "ctrl+alt+delete");
         assert_eq!(defaults.idle, None, "no idle raise unless asked for");
         assert_eq!(defaults.passphrase, None);
+        assert_eq!(
+            defaults.on_seat_change,
+            lock::SeatChangePolicy::Never,
+            "a VT switch away does not lock the session unless somebody says otherwise \
+             (D-030(2), issue #246)"
+        );
 
         for args in [
             vec!["--nested", "--lock-chord", "super+f12"],

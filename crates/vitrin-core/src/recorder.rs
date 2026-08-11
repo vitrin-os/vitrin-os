@@ -1142,11 +1142,14 @@ pub(crate) enum Event<'a> {
     ///
     /// A session-level fact with no principal and no realm, exactly like
     /// [`Event::DeadManTriggered`]: no wire message locks this session, and
-    /// the only two things that can are the human's own chord and the human's
-    /// own absence.
+    /// the only things that can are the human's own chord, the human's own
+    /// absence, and — under a policy the human configured — the human's own
+    /// departure to another VT.
     SessionLocked {
-        /// `chord` or `idle`, from [`crate::lock::LockCause::label`] -- a
-        /// closed vocabulary, never free-form text.
+        /// `chord`, `idle` or `seat`, from [`crate::lock::LockCause::label`]
+        /// -- a closed vocabulary, never free-form text. `seat` appears only
+        /// under `--lock-on-seat-change immediate` (issue #246); a session that
+        /// never names that flag can never produce it.
         cause: &'static str,
         /// Whether unlocking needs a passphrase. On the line because a journal
         /// reader deciding how much a `session_unlocked` entry is worth needs

@@ -481,10 +481,14 @@ binds it loses it. `--clipboard-key` moves both to another key, which is not a
 remedy so much as a different loss.
 
 **The lock screen does not lock out agents, and this is the single most
-surprising thing on this page.** As of WS-E.2.2 there is a lock screen:
-Ctrl-Alt-Delete (or `--lock-idle SECS` of no physical input) covers the output
-with a core-drawn card and takes **every physical event** away from every realm
-until you type your passphrase. What it does not do is touch a grant. An agent
+surprising thing on this page.** As of WS-E.2.2 there is a lock screen, and
+**three** things raise it: Ctrl-Alt-Delete, `--lock-idle SECS` of no physical
+input, and — only if you asked for it — a VT switch away under
+`--lock-on-seat-change immediate`, which is described with the other two seat
+policies further down this page and which a session that never names that flag
+can never produce. Whichever one raised it, it covers the output with a
+core-drawn card and takes **every physical event** away from every realm until
+you type your passphrase. What it does not do is touch a grant. An agent
 holding `observe` **keeps capturing the realm across a lock**, frame for frame,
 exactly as if you were sitting there; one holding `actuate_pointer` or
 `actuate_text` keeps acting.
@@ -713,18 +717,29 @@ because the process and its colour keep running. Note too that the chord is a
 *physical* gesture and physical input is suspended for the whole time you are on
 another VT, so from there your only stop is a shell and a signal.
 
-**A VT switch does not raise the lock screen, and a consent prompt raised while
-you are away is not recorded as shown.** Switching away is not treated as
-walking away: it costs no passphrase, because making the escape hatch expensive
-to come back from would erode the reason it is open. **The idle timer is also
-stopped while you are away**, and the countdown restarts when you come back —
-so with `--lock-idle` a switch away does not lock the session either, however
-long it lasts. **The cost of that is plain: a session you switched away from
-eight hours ago is unlocked when you switch back to it.** That is a deliberate
-choice rather than a default, and it is currently the only behaviour available;
-whether leaving should lock immediately, lock on idle, or never lock is a policy
-this release does not let you configure. A lock already up is untouched — a VT
-switch is never a way past a lock screen. What
+**By default a VT switch does not raise the lock screen, and a consent prompt
+raised while you are away is not recorded as shown.** Switching away is not
+treated as walking away: it costs no passphrase, because making the escape hatch
+expensive to come back from would erode the reason it is open. **The idle timer
+is also stopped while you are away**, and the countdown restarts when you come
+back — so with `--lock-idle` a switch away does not lock the session either,
+however long it lasts. **The cost of that is plain: a session you switched away
+from eight hours ago is unlocked when you switch back to it.**
+
+That is the default and it is unchanged, but it is no longer the only behaviour
+available: `--lock-on-seat-change immediate|idle|never` picks one, on `--drm`
+only, and `never` is what you get if you say nothing.
+
+| Policy | What leaving does |
+|---|---|
+| `immediate` | The lock goes up as you leave, so coming back always costs a passphrase (or an Enter, with no `--lock-passphrase-file`). |
+| `idle` | The idle countdown keeps running across the absence, so a long switch-away comes back to a locked screen and a short one does not. Needs `--lock-idle`; with no countdown there is nothing to keep running. |
+| `never` | **The default, described above.** The countdown freezes for the absence and restarts when you return. |
+
+Two things no policy changes. **A lock already up is untouched** — a VT switch is
+never a way past a lock screen, under any of the three. And **none of them
+suspends an agent**: a locked screen does not stop observation or actuation
+(above), so `immediate` buys you a passphrase prompt and not a pause. What
 `vitrind` will not do is put a consent prompt on a screen it does not own: a
 petition that arrives while you are on another VT stays pending, is never
 journalled as shown, and times out on the ordinary sweep, which reaches the

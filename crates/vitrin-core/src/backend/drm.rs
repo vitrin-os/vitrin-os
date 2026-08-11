@@ -1243,7 +1243,18 @@ impl session::RuntimeHost for DrmState {
         let (changed, owes_the_panel) = {
             let activity = Rc::clone(&self.view.activity);
             let mut activity = activity.borrow_mut();
-            let changed = session::service_blank_round(&mut activity, &mut self.view.blank, now);
+            // `&mut self.runtime` beside `&mut self.view.blank`: two disjoint
+            // field borrows, the shape every other override here already uses.
+            // The runtime is what lets this round journal the blank and the wake
+            // (issues #258, #259) -- both of which were invisible in the log and
+            // absent from the recorder for the whole of #223's first hardware
+            // run.
+            let changed = session::service_blank_round(
+                &mut self.runtime,
+                &mut activity,
+                &mut self.view.blank,
+                now,
+            );
             // **A wake owes a frame every round until one actually lands.**
             // Edge-triggering this on `changed` alone was a real defect: the
             // CRTC is off while waking, so `on_vblank` -- the only other thing
@@ -1429,6 +1440,15 @@ impl DrmState {
         // same call the seat's activate arm and the lock's unlock arm make --
         // one helper, one meaning, so "the human can see this card again" is
         // asserted from one place rather than four.
+        //
+        // **Nothing is logged from here** (issue #258). This site knows a flip
+        // landed and nothing else -- not how long the panel was dark, and not
+        // whether the alternative outcome (the deadline passing with no flip at
+        // all) has just happened instead. Both are held by the activity record,
+        // so the wake's line and its recorder entry are emitted one round later
+        // from `session::service_blank_round`, which is also the only one of the
+        // two sites CI can reach. A line written here would be a line no test in
+        // this workspace could ever see, which is how the silent unblank shipped.
         let woke = self.view.activity.borrow_mut().note_flip_completed();
         if woke {
             session::screen_became_visible(&self.grab, Instant::now());
@@ -1875,7 +1895,12 @@ impl DrmState {
                 // instant no human could observe, and the human returns to a
                 // passphrase prompt nobody asked for. A lock already up stays
                 // up -- this suppresses the raise, never a lower.
-                self.lock.borrow_mut().set_seat_absent(true, self.now.get());
+                //
+                // Through the free function since #257, on both arms, so the
+                // instant has exactly one source: `self.now` is the *input
+                // turn's* sample and there is no input turn on either side of a
+                // seat event. See `session::note_seat_presence`.
+                session::note_seat_presence(&self.lock, true);
                 // **The pause IS the acknowledgement** of a `change_vt` this
                 // core asked for (WS-E.3.5), so the watchdog is disarmed here
                 // and nowhere else. An outstanding timer fires against an
@@ -1956,9 +1981,18 @@ impl DrmState {
                 // to your own screen is the one thing an idle timer is asking
                 // about. Before `active = true`, so no `tick` between the two
                 // can see a running clock against a stale `last_activity`.
-                self.lock
-                    .borrow_mut()
-                    .set_seat_absent(false, self.now.get());
+                //
+                // **This line is issue #257.** It used to pass `self.now`, and
+                // that cell is the input turn's sample: a paused session sees no
+                // input turn, because the chord that switches the VT back is
+                // delivered to whichever session is *currently* active. So the
+                // clock was reset to an instant from before the absence -- one
+                // already past the idle threshold -- and with `--blank-idle 60`
+                // the panel went dark 1.5 s after the human came back. The same
+                // stale stamp arms `--lock-idle` on return, which is worse.
+                // `note_seat_presence` samples the instant itself and takes no
+                // `now` at all, so the mistake is no longer expressible.
+                session::note_seat_presence(&self.lock, false);
                 self.view.output.active = true;
                 // The flip we had in flight died with DRM master, and its
                 // completion event will never arrive: without clearing this
@@ -3251,10 +3285,19 @@ mod tests {
         // session cannot undo one, since `DrmSurface::clear` answers
         // `DeviceInactive` while the devices are somebody else's.
         assert!(
-            pause.contains("set_seat_absent(true"),
+            pause.contains("session::note_seat_presence(&self.lock, true)"),
             "the pause arm stopped telling the session's activity record that the seat is \
              gone: the idle clock would keep running on a VT nobody is looking at, and a \
              blank raised during the switch could never be lifted"
+        );
+        // ...and the activate arm must give it back, which is issue #257: this
+        // is the call that restarts the idle countdown from the human's return.
+        assert!(
+            activate.contains("session::note_seat_presence(&self.lock, false)"),
+            "the activate arm stopped restarting the idle countdown: the clock would still be \
+             holding the instant it held when the human left, which is already past the idle \
+             threshold, so the panel blanks -- and `--lock-idle` LOCKS -- on the round after \
+             they come back"
         );
 
         for (forbidden, why) in [
@@ -3280,6 +3323,28 @@ mod tests {
                  own chord asks it to. A switch initiated from a seat event is a core that \
                  moves the human without being asked, or one that switches back -- which is \
                  the trap D-030(1) correctly named and D-031 does not license",
+            ),
+            // **Issue #257, as one forbidden token.** `self.now` is the *input
+            // turn's* clock sample and a seat event is not an input turn -- a
+            // paused session sees none, because the chord that switches back is
+            // delivered to whatever session is currently active. Stamping the
+            // activity clock with it resets the countdown to an instant from
+            // before the absence, which is already expired. Call syntax rather
+            // than the bare word, on `change_vt(`'s precedent: both arms'
+            // comments name the cell while explaining why they do not use it,
+            // and a test that failed on its own explanation would teach the next
+            // reader to delete the explanation.
+            (
+                "self.now.get()",
+                "the input turn's stale clock sample is back in the seat handler: with \
+                 `--blank-idle 60` the panel goes dark ~1.5 s after the human returns, and \
+                 with `--lock-idle` the session locks on them for coming back",
+            ),
+            (
+                "set_seat_absent(",
+                "the seat handler stamps the activity clock directly again: the instant must \
+                 come from `session::note_seat_presence`, which takes no `now` precisely so \
+                 that a stale one is not expressible (#257)",
             ),
         ] {
             assert!(

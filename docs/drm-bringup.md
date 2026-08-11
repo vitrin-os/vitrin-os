@@ -116,11 +116,17 @@ This is the step that will be tempted away, by the person most likely to skip
 it, on the machine that matters, at the end of a long session. It costs about
 ninety seconds.
 
-> ## ⚠ CORRECTED BY THE FIRST RUN, 2026-08-09
+> ## ⚠ CORRECTED BY THE FIRST RUN, 2026-08-09 — UPDATED 2026-08-11
 >
 > **VT switching did not work on the first run, and it was this page's first
-> line of defence. It is implemented now (`crate::vt`, WS-E.3.5) and has NOT
-> yet been confirmed on hardware — the second run is what settles it.**
+> line of defence. It is implemented now (`crate::vt`, WS-E.3.5) and the chord
+> has since been confirmed on hardware: 5 chorded switches on 2026-08-09
+> (item 12 below) and 10 of 10 on 2026-08-11 (recovery runbook rung L1).**
+> **All 19 of those chords were pressed against a *healthy* compositor**, so
+> what is confirmed is that the chord works — not that it gets you out. The one
+> deliberate wedge on record, on 2026-08-11, defeated it: a `SIGSTOP`ed
+> compositor cannot call `Session::change_vt` because the code that would is
+> inside the stopped process.
 > On the first bare-metal run `Ctrl+Alt+F1` and `Ctrl+Alt+F2` did nothing and
 > the maintainer was trapped on tty3 until `vitrind` was killed from elsewhere.
 >
@@ -145,9 +151,11 @@ ninety seconds.
 > `pkill -f` matches whole command lines, so the rescuing shell matches its own
 > `argv` and `pkill` — which skips its own PID but not its parent — sends the
 > `TERM` to the rescuer. It also does not match the target on this machine at
-> all: the `~/.local/bin/vitrind` wrapper puts its own arguments
-> (`--shim <path>`, `--blank-idle`) between the binary and `--drm`, so the
-> literal string never appears in the real process's command line — checked
+> all: the `~/.local/bin/vitrind` wrapper puts `--shim <path>` between the
+> binary and whatever you typed, so the literal string never appears in the real
+> process's command line. One injected argument is enough — the wrapper's other
+> job is environment variables, which never reach `argv`, and `--blank-idle` is
+> your own flag and lands *after* `--drm`. Checked
 > read-only against a running session on 2026-08-11, where
 > `pgrep -f 'vitrind --drm'` matched **only the invoking shell** while
 > `pgrep -x -a vitrind` returned the one real PID. And under `systemd-run` there is
@@ -157,9 +165,9 @@ ninety seconds.
 > [verified 2026-08-11]
 >
 > **Do not start a run without a live Hyprland-side shell**, regardless. The
-> escape chord is new, unproven code; the shell is the route that has actually
-> recovered a session. Treat the chord as the thing under test, not as the
-> thing you are relying on.
+> chord is proven only from a healthy session; the shell is the only route that
+> has actually recovered a wedged one. Treat the chord as the thing under test,
+> not as the thing you are relying on.
 
 ### 0.1 First line: a shell inside the running Hyprland session.
 

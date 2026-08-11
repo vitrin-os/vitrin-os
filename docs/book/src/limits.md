@@ -113,19 +113,28 @@ than budgetary. Six of them, named rather than summarised:
   kernel or mesa. The PRD names "hardware matrix" as the first item of the
   support treadmill that consumed prior alternative display servers; this closes
   none of it and must not read as if it does.
-- **The runbook has been executed once**, on 2026-08-09, and it carries its own
-  dated record block. It was not a clean pass: three defects came out of it, one
-  of which was that the page's own first line of recovery did not exist. A runbook nobody has executed is a plan, and the wlcs
+- **The bring-up runbook has been executed twice, both on 2026-08-09**, and it
+  carries a dated record block for each. Neither was a clean pass: three defects
+  came out of the first, one of which was that the page's own first line of
+  recovery did not exist. A runbook nobody has executed is a plan, and the wlcs
   number above is this repository's standing example of how a manual result
   ages once it is taken.
-- **The session-lifecycle checklist has never been executed at all.** Blanking,
-  suspend, lid handling and deliberate-wedge recovery are rungs `L1`–`L6` in
-  [Getting out of a wedged session](recovery.md#the-hardware-checklist), and
-  every one of them is empty. Suspend and lid have never been exercised on this
-  backend by anyone, in any form — the bring-up runbook's own checklist has no
-  suspend, lid or blank step and never did, so those steps had to be *written*
-  before they could be run. Everything this release says about idle blanking is
-  therefore a claim about code, not a report about a laptop.
+- **The session-lifecycle checklist has been executed once, on 2026-08-11, and
+  it is not a clean pass either.** Blanking, suspend, lid handling and
+  deliberate-wedge recovery are rungs `L1`–`L6` in
+  [Getting out of a wedged session](recovery.md#the-hardware-checklist), where
+  the dated record now lives. What it establishes, at the counts the rungs
+  themselves ask for: `L1` 10 of 10 VT switches with a stable band colour; `L2`
+  **4 of the 5** suspend/resume cycles, each returning a working panel; `L3`
+  **2 of the 5** lid cycles, and only one of those two ever reached sleep, so
+  **one usable sample** and nothing established about a short lid close; `L4`
+  blank at 61.2 s and `L5` no lock card, both pass. `L6` recovered in ~69 s but
+  **by which route could not be reconstructed afterwards**, so the rung's actual
+  question — which route got you out — is unanswered. Four defects were filed
+  from the run (#257–#260), one of them that the recovery page's own published
+  command was wrong. **Still unexecuted:** the SysRq route (route 3), and the
+  advisory VKMS rung, which was never attempted. One run on one laptop is a
+  report about that laptop and nothing more.
 
 This is a recorded decision with a scheduled closure in the sense that page's
 last section means: the closure is a dated human run, not a job. The alternative
@@ -578,11 +587,22 @@ So, in this release:
   somebody who cannot leave the screen to read it. If that band ever appears,
   the session is trapped: record it and treat it as serious.
 
-**None of the five bullets above has been confirmed on hardware.** They are a
-design with unit tests behind it. No test in this project can take DRM master
-or a seat, so whether `Ctrl-Alt-F2` really puts a tty on your panel is knowable
-only by running the bring-up runbook, and that has not been done since this
-changed.
+**The first of those five bullets is confirmed on hardware; the other four are
+not.** No test in this project can take DRM master or a seat, so whether
+`Ctrl-Alt-F2` really puts a tty on your panel is knowable only by running the
+runbooks on the one machine that has the hardware — and it has been: 5 chorded
+switches on 2026-08-09 and 10 of 10 on 2026-08-11, with the band the same colour
+on every return. **Every one of those chords was pressed against a healthy
+compositor**, which is a narrower claim than it sounds like: the one deliberate
+wedge on record defeated the chord, because a stopped compositor cannot run the
+code that switches the VT. So the chord is proven as a *feature* and unproven as
+an *escape*, and [the recovery page](recovery.md) is where that distinction is
+argued out. Nothing on hardware has yet exercised the chord under a lock, the
+twelve consumed keys, the startup banner's VT number, or the red band. The four
+`vt_switch_refused already_here` events on 2026-08-09 are not a sighting of that
+band: that path returns before `raise_trapped_notice`, deliberately, because
+chording the VT you are already on is not a failure. **The band that tells you
+the session is trapped has never been drawn on a real panel.**
 
 **The trusted band covers this screen and this process, and nothing else.** The
 coloured strip means one thing: everything above the line on *this* display was
@@ -669,16 +689,25 @@ sentence is corrected here rather than quietly replaced, because a limits page
 that acquires the right words without saying how it had the wrong ones is a page
 you cannot check.
 
-**None of the blanking behaviour above has been confirmed on hardware.** It is a
-design with unit tests behind it. No test in this project can take DRM master, a
-seat, an ACPI event or a backlight, so whether the panel actually goes dark,
-whether it actually comes back, and whether a suspend or a lid close leaves you
-with a working screen are all knowable only by a human running
+**The blanking behaviour above was confirmed on hardware once, on 2026-08-11,
+and the confirmation is narrower than the section.** No test in this project can
+take DRM master, a seat, an ACPI event or a backlight, so all of it is knowable
+only by a human running
 [the recovery runbook's checklist](recovery.md#the-hardware-checklist) on the one
-machine that has the hardware. **Suspend and lid handling have never been
-exercised on this backend by anyone, in any form.** Until those numbers exist and
-are dated, treat every sentence in this section as a prediction about code rather
-than a report about a laptop.
+machine that has the hardware, and one human did. What that run settled: the
+panel does go dark on the timeout (61.2 s against `--blank-idle 60`), it does
+come back on ordinary physical input, and the wake leaves the session as you
+left it with **no lock card** — idle blank and idle lock are uncoupled in fact
+and not only in design. What it did **not** settle: suspend ran 4 of the 5
+cycles the rung asks for and lid ran 2 of 5, of which only one suspended at all,
+so there is a single usable lid sample and no basis at all for a claim about a
+short lid close. The run also found the defects that are the honest headline
+here — returning to a paused session blanks the panel in ~1.5 s (#257), the
+unblank is silent so success and failure look identical (#258), and blank and
+unblank leave no flight-recorder event (#259). Treat this section as confirmed
+to that depth and no further: the frame-clock halt, the agent's indefinitely
+stale frame and the prompt-suppression rules were **not** observed on a panel
+and remain claims about code.
 
 **That check runs in one direction only, and you should know which.** A
 *different* colour on return is a sound alarm: the core you left is not the core

@@ -557,16 +557,31 @@ The premise is true: `DrmView::view_rgba` CPU-composes the retained scene and ne
 > **What actually worked, and is now the first line:** a shell in the *still-running
 > Hyprland session on `tty1`*. A `vitrind` session on `tty3` does not disturb it,
 > so a terminal there — or an agent session running in one — reaches the machine
-> and `pkill -TERM -f "vitrind --drm"` ends it. That is how the first run was
-> recovered, and it is the only escape route this machine has been *observed* to
-> have.
+> and a `SIGTERM` to `vitrind` ends it. That is how the first run was recovered,
+> and it is the only escape route this machine has been *observed* to have.
+>
+> > **The command typed that day was `pkill -TERM -f "vitrind --drm"`. Do not
+> > copy it from this entry.** It is recorded here only as history. **#260,
+> > 2026-08-11:** `pkill -f` matches whole command lines, so a shell running it
+> > has the pattern in its own `argv` and `pkill` — which skips its own PID but
+> > not its parent — signals the rescuer; and against the command line the
+> > `~/.local/bin/vitrind` wrapper actually produces, the literal string
+> > `vitrind --drm` does not appear at all. Whether it matched `vitrind` on
+> > 2026-08-09 or only the shell is not established by anything kept from that
+> > run. The published form resolves the PID and signals the number:
+> > `pgrep -x -a vitrind`, then `kill -TERM <PID>` — see
+> > [the recovery runbook](../book/src/recovery.md#route-2--a-shell-somewhere-else-and-a-signal).
 >
 > The ranking below is therefore inverted from how it was first written: item 1
 > was theory and failed; item 3 is unchanged; the Hyprland-side shell was never
 > listed at all, because nobody had needed it yet. Until the `change_vt` fix
-> lands. **It has since landed** (WS-E.3.5, `crate::vt`) and is unconfirmed on
-> hardware; until a second run says otherwise, the Hyprland-side shell remains
-> the only escape route this machine has been *observed* to have.
+> lands. **It has since landed** (WS-E.3.5, `crate::vt`) and has since been
+> confirmed on hardware — 5 chorded switches on 2026-08-09 and 10 of 10 on
+> 2026-08-11 — **but every one of those was pressed against a healthy
+> compositor.** The one deliberate wedge on record, 2026-08-11, defeated the
+> chord, because a stopped compositor cannot run the code that calls
+> `change_vt`. So the ranking above stands: the Hyprland-side shell remains the
+> only escape route this machine has been *observed* to have.
 
 
 **Status:** accepted (2026-08-09) — amends the escape-route requirement in issue **#220** (WS-E.3.4) and the standing safety rule in workstream [WS-E](14-workstream-session-mode.md) §7; implemented by [`docs/drm-bringup.md`](../drm-bringup.md)
@@ -834,7 +849,7 @@ The no-D-Bus half is unchanged and not re-argued: logind's `PrepareForSleep` wou
 
 1. `echo reisub > /proc/sysrq-trigger` performs `r` and **silently nothing else** — only the first character is processed unless the string is prefixed with `_`.
 2. The kernel's own bulk-mode example, `echo _reisub > /proc/sysrq-trigger`, **is a hard reboot with two no-ops in front of it.** `sysrq_handle_sync` calls `emergency_sync()` and `sysrq_handle_mountro` calls `emergency_remount()`; **both are `schedule_work(...)` and return immediately** (`fs/sync.c`, `fs/super.c`), while `sysrq_handle_reboot` calls `emergency_restart()`, which does not return at all. Bulk mode runs the whole string inside **one** `write()` with no pause between letters — that is what the leading `_` buys. So the sync and the remount are queued and the machine reboots before either can run. The kernel documentation states the same fact about the sync in its own words (*"the sync hasn't taken place until you see the "OK" and "Done" appear on the screen"*), and bulk mode is exactly the form that denies you the chance to see them.
-3. `e` and `i` are wrong for **this** machine independently of the above. The trigger path needs a reachable shell by construction, and on this machine the escape route *is* a shell in the running Hyprland session — so `e`'s SIGTERM-to-everything destroys the thing being recovered with, along with the maintainer's open work. `pkill` is the aimed version of what `e` does bluntly.
+3. `e` and `i` are wrong for **this** machine independently of the above. The trigger path needs a reachable shell by construction, and on this machine the escape route *is* a shell in the running Hyprland session — so `e`'s SIGTERM-to-everything destroys the thing being recovered with, along with the maintainer's open work. Route 2's signal to **one resolved PID** is the aimed version of what `e` does bluntly. (Written as `pkill` here originally; corrected 2026-08-11 per #260 — `pkill -f` on this pattern is not aimed, it signals the rescuer.)
 
 The runbook therefore prescribes **three separate writes with a wait between them** — `s`, wait; `u`, wait; `b` — each destructive step marked as destructive, and drops `e`, `i` and the bulk form entirely. **The caveat is stated plainly:** the trigger file needs a **reachable shell**. It covers *"vitrind wedged the display"* once a VT or the tty1 shell is reachable; it does **not** cover *"input is completely dead"*, which is the only case the physical combo would have covered and which the owner has declined knowingly. No new mitigation is invented — the page documents the routes that exist (D-031's Hyprland-side shell, the core's own `Ctrl-Alt-F<n>`, the installer USB and a chroot).
 
@@ -861,6 +876,24 @@ The runbook therefore prescribes **three separate writes with a wait between the
 - **`--blank-idle` on `--nested`** — refused at startup with a named reason, because a nested `vitrind` painting its own window black would be asserting something about a screen the host owns. **Reopens on:** someone naming a host fact that means *"the human cannot see this"*, which winit's `Occluded` is not — D-030's own wording, and its third standing deferral.
 
 **What cannot be known here, and is therefore not claimed.** CI has no DRM device, no seat, no ACPI and no backlight, and `DrmState` cannot be constructed without a real `DrmDevice`, `LibSeatSession`, `GbmDevice` and `GlesRenderer` — so `DrmSurface::clear()`, the one DPMS call in the design, is unreachable from every test in this workspace, exactly as D-030 recorded for `handle_session_event`. **Not one hardware criterion of #223 is met by this entry.** The 10 VT switches, 5 suspend/resume cycles, 5 lid cycles, the blank/unblank and the deliberate wedge are the owner's to produce on the target machine; they are written as rungs `L1`–`L6` in [`docs/book/src/recovery.md`](../book/src/recovery.md) with a record block, and **#223 stays open until he pastes the numbers in.** **Suspend and lid have never been exercised on this backend by anyone, in any form** — the bring-up page's checklist runs 7–15 and contains no suspend, lid or blank rung, so those rungs had to be written before they could be executed. The honest status of everything in this entry is **landed in the tree, unproven on hardware**, the same status D-031 and D-032 carry for the same reason.
+
+> **AMENDED 2026-08-11 BY THE FIRST EXECUTION OF THOSE RUNGS.** The paragraph
+> above is left as written, because it is the honest status *of this entry* and
+> a decision log that edits its own past is worth nothing. What has changed
+> since: the owner ran `L1`–`L6` on the target machine on 2026-08-11 and pasted
+> the numbers into #223. It is not a clean pass and the counts are not the
+> counts these rungs ask for — `L1` 10/10, `L2` **4 of 5** cycles, `L3` **2 of
+> 5** of which only one ever reached sleep, `L4` blank at 61.2 s, `L5` no lock
+> card, and `L6` recovered in ~69 s **by a route that could not be
+> reconstructed afterwards**. Route 3 (`/proc/sysrq-trigger`) is still
+> documented and unexecuted, and the advisory VKMS rung was never attempted.
+> Four defects came out of it: #257, #258, #259 and #260. So *"suspend and lid
+> have never been exercised"* stops being true on 2026-08-11 and is replaced by
+> *"exercised once, short of the counts, with one usable lid sample"* — the
+> dated record is on
+> [the recovery runbook](../book/src/recovery.md#first-run--2026-08-11-l1l6-on-the-target-machine)
+> and the published limits are in
+> [`docs/book/src/limits.md`](../book/src/limits.md).
 
 ---
 

@@ -158,11 +158,26 @@ target/debug/vitrind --nested --consent=auto-approve \
    discovered. No automated test can observe it: the headless backend — the
    only one CI runs — has a fixed virtual output that never resizes, which is
    why this runbook step exists at all.
-6. **Kill the hidden realm's app** (`pkill -f 'colour ff0000'`). The window is
+6. **Kill the hidden realm's app.** The window is
    unchanged — a sibling's death takes only that realm's surface — and a
    capture under the grant over `second` now refuses `no_surface` while
    `realm-0`'s still delivers.
-7. **Kill the *visible* realm's app** (`pkill -f 'colour 0000ff'`). The window
+
+   **Resolve the PID, then signal it. Do not `pkill -f` these.** The two apps
+   differ only in an argument, so the handle has to be `-f` — but
+   `pkill -f 'colour ff0000'` run from an `sh -c` or an agent shell matches that
+   shell's own `argv` as well, and `pkill` skips its own PID and **not its
+   parent**. Read the number first, check the line you get back is the app and
+   not your own shell, and signal that number:
+
+   ```bash
+   pgrep -f -a "colour ff0000"   # one line, and it must be solid-client
+   kill <PID>
+   ```
+
+   This is the same defect that made the DRM recovery runbook's published
+   command signal the rescuer instead of the target (#260).
+7. **Kill the *visible* realm's app** — same two steps, `colour 0000ff`. The window
    turns **red**: the output does not stay bound to a realm that is gone, it
    moves to the first still-serving realm in id order — the same rule
    `session::physical_seat_target` uses, so the realm you are watching and the

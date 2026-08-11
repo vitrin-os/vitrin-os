@@ -1465,10 +1465,21 @@ Three things about it are decisions rather than prose:
 
 - **The route order is by symptom, and route 2 is first among the ones that have
   ever worked.** `Ctrl-Alt-F<n>` (D-031, second entry) is route 1 because it is
-  the cheapest; a shell on another VT or in the Hyprland session on tty1 plus
-  `pkill -TERM -f "vitrind --drm"` is route 2 and is **the only route that has
-  ever actually recovered a session** — it is what freed the first bare-metal
-  run. The page says so rather than ranking by elegance.
+  the cheapest; a shell on another VT or in the Hyprland session on tty1, plus a
+  signal to `vitrind`, is route 2 and is **the only route that has ever actually
+  recovered a session** — it is what freed the first bare-metal run. The page
+  says so rather than ranking by elegance.
+
+  **The command this bullet originally named — `pkill -TERM -f "vitrind
+  --drm"` — is wrong and must not be copied from here.** It is kept in this
+  sentence only so the correction is legible. **#260, 2026-08-11:** `pkill -f`
+  matches whole command lines, so a shell running it matches its own `argv` and
+  the signal reaches the rescuer rather than the target; and against the command
+  line `~/.local/bin/vitrind` actually produces, the literal string
+  `vitrind --drm` never appears. The published form resolves the PID first —
+  `pgrep -x -a vitrind`, then `kill -TERM <PID>` — and a signal wrapped in a
+  `systemd-run` unit must carry a literal number, because there is no shell
+  there to do the quoting.
 - **The SysRq path is `sudo`-only and the kernel mask is not touched.** Settled
   by the owner on 2026-08-10. `/proc/sys/kernel/sysrq` is `16` here — sync only —
   so the physical `Alt+SysRq` sequence is inert by configuration, and **raising
@@ -1499,8 +1510,10 @@ Three things about it are decisions rather than prose:
      The page therefore prescribes **three separate writes with a wait between
      them** — `s`, wait; `u`, wait; `b` — and drops `e` and `i` entirely, on the
      ground that the trigger path needs a reachable shell by construction, so
-     `pkill` is the aimed version of what `e` does bluntly, and `e` on this
-     machine would destroy the Hyprland session that *is* the escape route.
+     route 2's signal to one resolved PID is the aimed version of what `e` does
+     bluntly, and `e` on this machine would destroy the Hyprland session that
+     *is* the escape route. (Written as `pkill` here originally; corrected
+     2026-08-11 per #260 — `pkill -f` on this pattern is not aimed.)
 - **The caveat is stated plainly:** the trigger file needs a **reachable shell**.
   It covers *"vitrind wedged the display"* once a VT or the tty1 shell is
   reachable; it does **not** cover *"input is completely dead"*, which is the
@@ -1526,7 +1539,7 @@ something was unbuilt while sitting in the change that built it.
 |---|---|
 | Activation transitions (VT switch) | **Already on `main` before #223**, WS-E.3.3/D-030 and D-031. Hardware-confirmed: two pause→activate cycles, second run. #223 adds nothing here. |
 | Resume | **Redefined, not routed.** No session event exists to route; post-hoc detection from the monotonic/wall clock pair is what replaces it. |
-| Blank/unblank | **New.** The state machine, the cover surface and the activity clock; DPMS itself is `DrmSurface::clear()`, which is DRM-only. **Unproven on hardware.** |
+| Blank/unblank | **New.** The state machine, the cover surface and the activity clock; DPMS itself is `DrmSurface::clear()`, which is DRM-only. **Unproven on hardware when this was written; proven once on 2026-08-11** — blank at 61.2 s, unblank on physical input, no lock card — and the same run filed #257, #258 and #259 against it. |
 | Consent and dead-man interaction | **New for the dark case** — a third `PromptVisibility` variant, discharging D-030's explicit *"a dark-output gate — to whichever change implements DPMS, as that change's own acceptance criterion"* deferral. The dead-man switch needs **nothing new**, and that is a finding rather than a shrug: it detects in the router's unconditional `observe` tap, which no gate can suppress, so a held Escape starts its hold on the very press that wakes the screen. |
 | `RuntimeHost` surface | **Answered by landed code, and by neither option #223 offered.** Reactivation is a host-state method delegating to free `session::*` functions with explicit disjoint parameters; `RuntimeHost::split()` was never touched. A `Presenter` method would need both halves of `split()` at once, which is the borrow `split()` exists to avoid. |
 | Media and brightness keys | **New rows in the invariant table**, and #223's list was incomplete — it named volume-**up** and mute but not volume-**down**. |
@@ -1547,6 +1560,15 @@ never been exercised on this backend by anyone, in any form** — the bring-up
 page's existing checklist runs 7–15 and contains no suspend, lid or blank rung
 at all, which is why those rungs had to be written before they could be
 executed.
+
+> **AMENDED 2026-08-11.** The paragraph above is left as written because it is
+> the honest status *of that change*, but its last sentence stopped being true
+> on 2026-08-11: the owner executed `L1`–`L6` and pasted the numbers into #223.
+> The counts are short of what the rungs ask — `L2` 4 of 5, `L3` 2 of 5 with
+> only one cycle ever reaching sleep, `L6` recovered but by an unrecoverable
+> route — and route 3 and the VKMS rung remain unexecuted. The dated record is
+> the [first-run block on the recovery page](../book/src/recovery.md#first-run--2026-08-11-l1l6-on-the-target-machine),
+> and the accepted-cost entry further down this page is narrowed to match.
 
 **The VKMS rung was not attempted by this change, and that is recorded rather
 than left to be noticed.** #223's acceptance criteria ask that it be "attempted
@@ -1837,17 +1859,26 @@ this workstream owns, not inherits:
   anything a user would choose this project for. [PRD](../PRD.md) §5.3's warning
   about the support treadmill, paid in full and recorded as paid.
 
-- **Suspend and lid have never been exercised on this backend by anyone**
-  (created by WS-E.4.3, and open until the owner closes it). Not once, in any
-  form: the bring-up page's checklist runs 7–15 and contains no suspend, lid or
-  blank rung at all, so those rungs had to be *written* before they could be
-  executed. They are `L1`–`L7` on
-  [the recovery runbook](../book/src/recovery.md#the-hardware-checklist) with a
-  record block to paste numbers into, and **#223 stays open until they are
-  filled in.** Only `L4` has been run (once, on 2026-08-11); it found #257–#259
-  and its numbers were never pasted into the block, so the runbook still carries
-  no recorded run. Nothing in this workstream may cite a hardware criterion of
-  #223 as met.
+- **Suspend and lid have been exercised once, on 2026-08-11, short of the counts
+  the rungs ask for** (created by WS-E.4.3; **narrowed, not closed**, by the
+  first execution of `L1`–`L6`). Until that date this read *"never exercised by
+  anyone, in any form"*, and it was true: the bring-up page's checklist runs
+  7–15 and contains no suspend, lid or blank rung at all, so those rungs had to
+  be *written* before they could be executed. They are `L1`–`L7` on
+  [the recovery runbook](../book/src/recovery.md#the-hardware-checklist), and
+  the owner ran `L1`–`L6` and pasted the numbers into #223. **It is not a clean
+  pass.** `L1` 10/10; `L2` **4 of 5** cycles, all returning a working panel;
+  `L3` **2 of 5** lid cycles of which only one ever reached sleep, so **one
+  usable lid sample** and nothing established about a short lid close; `L4`
+  blank at 61.2 s; `L5` no lock card; `L6` recovered in ~69 s **by a route that
+  could not be reconstructed afterwards**, which leaves the rung's actual
+  question unanswered. Route 3 (`/proc/sysrq-trigger`) is still documented and
+  unexecuted and the advisory VKMS rung was never attempted. Four defects came
+  out of the run: #257, #258, #259 and #260. **`L7` was written from #257 after
+  the run and has never been executed**, so the fixes for #257–#259 are code
+  with component tests behind them and nothing observed. So a hardware criterion
+  of #223 may now be cited **only at the count and scope actually recorded** —
+  never as *"suspend works"* or *"lid works"*.
 - ~~**Several realms run, one is visible, and a capture cannot tell them
   apart**~~ (created by WS-E.1.2, **closed by WS-E.1.3**). Raising the cap
   landed before the scene bound an output to a realm, so for one workstream

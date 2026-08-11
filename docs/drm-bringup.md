@@ -402,6 +402,15 @@ vitrind --drm --consent=interactive \
 `tee` is not optional. If the panel does something you cannot read, the log on
 disk is the only account of what happened.
 
+**Expect no colour, on screen or in the file.** `vitrind` writes ANSI colour
+only when its stderr is a terminal (issue #251), and `| tee` makes it a pipe —
+so this command's output is plain on both sides. That is the intent: the two
+previous runs' logs interleaved SGR escapes *between* a field's name and its
+`=`, so `grep 'connector=' /tmp/vitrind-drm.log` matched nothing and every grep
+below needed `sed 's/\x1b\[[0-9;]*m//g'` in front of it. Drop the `sed`. Run
+`vitrind` without the pipe and the colour is back; `NO_COLOR=1` still turns it
+off on a terminal.
+
 | Expected [inferred] | Failure | What it means / what to do |
 |---|---|---|
 | The panel blanks briefly, then shows the realm's app with a coloured band along the top | **The screen stays black and the keyboard still works** | The backend did not present. You still have a console — `Ctrl+C`, read `/tmp/vitrind-drm.log`. This is the *good* failure |
@@ -420,9 +429,17 @@ result, and recording it is the point.**
 
 ## 7. Connector and mode selected
 
+**Quote the line, do not paraphrase it** — that is what this step is for, and
+it is now a plain grep:
+
+```bash
+grep 'connector=' /tmp/vitrind-drm.log
+```
+
 | Expected [inferred] | Failure | What it means |
 |---|---|---|
 | The log names `eDP-1` and a mode; the mode matches the first line of `/sys/class/drm/card1-eDP-1/modes` from step 1 | A different connector | Device/connector selection bug (H1) |
+| | The grep matches nothing while `grep connector` matches | Escapes are back in the log — the tty test in `init_tracing` regressed (issue #251). Strip them with `sed 's/\x1b\[[0-9;]*m//g'` to finish the run, and file it |
 | | The right connector, a lower refresh | The preferred mode was not taken. Not fatal; record the number — the whole GLES+GBM argument in [WS-E §5](plan/14-workstream-session-mode.md) rests on 240 Hz |
 
 ## 8. A real app maps and repaints

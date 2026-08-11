@@ -2077,8 +2077,9 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
 }
 
 /// Drive the **idle blank** for one dispatch round (WS-E.4.3, issue #223):
-/// advance the countdown, abandon a wake that never completed, and mirror the
-/// phase onto the cover.
+/// advance the countdown, abandon a wake that never completed, mirror the phase
+/// onto the cover, and **say so in the log and the flight recorder** (issues
+/// #258 and #259).
 ///
 /// Returns whether human-visible output changed, so the caller marks the frame
 /// dirty and asks for a present — [`service_consent_round`]'s and
@@ -2112,6 +2113,26 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
 /// `LockScreen::tick`: a session with `--blank-idle 300 --lock-idle 600` would
 /// then never lock, because the blank would silently disable the lock — the
 /// class of unchosen behaviour D-030(2) was written to catch.
+///
+/// The `lock` parameter is therefore **read-only, and it is read rather than
+/// assumed**. "The blank does not raise a lock" is a statement about what this
+/// round *does*; it says nothing about what it *finds*, and both configurations
+/// above reach a session that is locked while the cover is up. The journal
+/// entries below carry the answer, so `&std::cell::RefCell<..>` — the shape
+/// [`note_seat_presence`] already takes — rather than a `bool` a future caller
+/// could pass wrongly and nothing would catch.
+///
+/// # The observability half lives here, not in the backend (issues #258, #259)
+///
+/// The blank's *power-down* line stays in [`crate::backend::drm`], because only
+/// that site knows whether `DrmSurface::clear` was accepted. Everything else a
+/// human or a journal reader needs to reconstruct the dark window is emitted
+/// from here, for two reasons that point the same way: this is the one function
+/// both the bare-metal backend and the session rig drive, so CI can hold it —
+/// and the wake's own resolution is a *state machine* fact rather than a device
+/// fact, so it belongs where the state machine is read. A wake line written in
+/// `DrmState` would be a line no test in this workspace could ever see, which is
+/// how a silent unblank shipped in the first place.
 #[cfg_attr(
     not(feature = "drm-backend"),
     allow(
@@ -2122,7 +2143,9 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
                   override, which is where CI's coverage of the state machine lives"
     )
 )]
-pub(crate) fn service_blank_round(
+pub(crate) fn service_blank_round<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    lock: &std::cell::RefCell<crate::lock::LockScreen>,
     activity: &mut crate::backend::blank::SessionActivity,
     surface: &mut crate::backend::blank::BlankSurface,
     now: Instant,
@@ -2134,14 +2157,197 @@ pub(crate) fn service_blank_round(
     // the session is not left in a state where every subsequent press is
     // swallowed as "still waking". Fail open on input; the property that stops
     // a clickjack is the consent guard restart, not the consume.
+    //
+    // **Silent here on purpose since #258**: abandoning the wake is exactly the
+    // failed unblank, so it is said once, below, in the arm that also knows how
+    // long the panel was dark -- rather than twice, in two different voices.
     if activity.wake_expired(now) {
-        tracing::warn!(
-            "the screen did not come back within the wake deadline; abandoning the wake so \
-             physical input reaches the session again"
-        );
         activity.force_lit();
     }
-    surface.set_covering(activity.is_covering())
+    let changed = surface.set_covering(activity.is_covering());
+    journal_screen_transition(runtime, lock, activity, now);
+    changed
+}
+
+/// Say what just happened to the human's panel — once, in the log and in the
+/// flight recorder (issues #258 and #259).
+///
+/// Split out of [`service_blank_round`] because it is the only part that needs
+/// the runtime at all, and because the round's three lines above should stay
+/// readable as the state machine they are.
+///
+/// **The grant count and the lock state are read only on a transition.** The
+/// first is an O(rows) scan and this runs every dispatch round; a session with
+/// no `--blank-idle` produces no transition ever, so it pays one `Option`
+/// compare.
+///
+/// **Both are sampled here, at journal time, and neither is inferred.** The
+/// grant count was always read; `locked` was once written as the literal
+/// `false` on the strength of D-033, and that reasoning does not hold: D-033
+/// says the blank never *raises* a lock, not that it never *finds* one. A
+/// chorded lock followed by a walk away, and `--blank-idle 300 --lock-idle 600`,
+/// both reach a locked session behind a dark panel.
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        dead_code,
+        reason = "reached only through `service_blank_round`, which carries the same note"
+    )
+)]
+fn journal_screen_transition<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    lock: &std::cell::RefCell<crate::lock::LockScreen>,
+    activity: &mut crate::backend::blank::SessionActivity,
+    now: Instant,
+) {
+    use crate::backend::blank::{ScreenTransition, WakeOutcome};
+
+    let Some(transition) = activity.take_transition(now) else {
+        return;
+    };
+    // `Active` rows only, through the same liveness every other read surface
+    // folds in: a revoked, expired or spent row holds nothing, and counting one
+    // would put a number on this entry that overstates what could see the human.
+    let live_grants = runtime
+        .kernel
+        .grants
+        .rows(now)
+        .filter(|(_, state)| *state == crate::grants::GrantState::Active)
+        .count();
+    // **`is_locked` and nothing else, and the restriction is load-bearing.**
+    // `LockScreen` holds an `Rc` to the very `SessionActivity` this function
+    // already has `&mut` to, so any read here that reached through to the shared
+    // record -- `LockScreen::tick`, or an `is_locked` that grew an activity
+    // check -- would be an `already mutably borrowed` panic in the compositor on
+    // the first blank. `is_locked` reads one `Option` on the gate itself.
+    let locked = lock.borrow().is_locked();
+    match transition {
+        ScreenTransition::Blanked => {
+            runtime
+                .kernel
+                .recorder
+                .record(crate::recorder::Event::ScreenBlanked {
+                    live_grants,
+                    locked,
+                });
+        }
+        ScreenTransition::Woke { dark, outcome } => {
+            let dark_ms = u64::try_from(dark.as_millis()).unwrap_or(u64::MAX);
+            match outcome {
+                // **The wake line #258 asks for**, at the blank's own level. It
+                // names what woke the panel (physical input -- nothing else can:
+                // an agent's actuation never reaches the clock, and there is no
+                // verb in the IDL for "power the human's display") and that the
+                // modeset was accepted.
+                //
+                // **What it deliberately does NOT claim** is the half that was
+                // wrong when this line was first written: it said the session
+                // "was never locked" and that every grant counted "was live
+                // throughout". Neither is knowable here. A lock can be up across
+                // the whole dark window, and a grant can be minted inside it --
+                // `PromptVisibility::ScreenIsDark` holds interactive prompts
+                // back, but `ConsentPolicy::AutoApprove` and
+                // `vitrin_grant.attenuate` are not interactive. The two fields
+                // are therefore reported as the instantaneous samples they are,
+                // and the sentence says what waking does rather than what the
+                // window contained.
+                WakeOutcome::FlipLanded => tracing::info!(
+                    dark_ms,
+                    live_grants,
+                    locked,
+                    "the panel is lit again: physical input woke the session and the modeset \
+                     was accepted. The wake itself restores no authority -- an idle blank never \
+                     took any away (idle blanks, it does not lock) and lifting one never \
+                     unlocks -- so this is no evidence of WHO woke it. `live_grants` and \
+                     `locked` are samples taken at this instant that BOUND the dark window; \
+                     the grant and lock entries between the pair are what describe its inside"
+                ),
+                // ...and the failed one, distinguishable, which is the whole
+                // point: before this, a wake that worked and a modeset that left
+                // the panel dark produced identical output -- none.
+                WakeOutcome::NoFlip => tracing::warn!(
+                    dark_ms,
+                    live_grants,
+                    locked,
+                    deadline_ms = crate::backend::blank::WAKE_DEADLINE.as_millis(),
+                    "THE WAKE WAS NOT CONFIRMED: no flip landed within the deadline, so the \
+                     panel may still be dark with this session running -- the state \
+                     docs/book/src/recovery.md calls indistinguishable from a wedge. Physical \
+                     input is being delivered again regardless, because a dark session that \
+                     also swallows input is worse"
+                ),
+                // Neither a wake nor a failure: the human left for another VT
+                // while the panel was dark, and this session dropped a blank it
+                // could not have undone (`clear()` answers `DeviceInactive`).
+                WakeOutcome::SeatLost => tracing::info!(
+                    dark_ms,
+                    locked,
+                    "the idle blank ended because the seat took the panel away, not because \
+                     the screen came back; the activate arm's ordinary repaint is what puts a \
+                     picture back"
+                ),
+            }
+            runtime
+                .kernel
+                .recorder
+                .record(crate::recorder::Event::ScreenWoke {
+                    dark_ms,
+                    outcome: outcome.label(),
+                    live_grants,
+                    locked,
+                });
+        }
+    }
+}
+
+/// **The seat took this session's devices away, or gave them back** — the
+/// activity clock's half of a `SessionEvent`, and the one place the instant it
+/// is stamped with is sampled (issue #257).
+///
+/// # Why this is a free function, and why it takes no `now`
+///
+/// A free function for [`suspend_physical_seat`]'s reason: `DrmState` needs a
+/// real `DrmDevice`, `LibSeatSession`, `GbmDevice` and `GlesRenderer`, so
+/// anything left inside its `handle_session_event` is unreachable by every test
+/// in this workspace — and this arm silently regressing would take nothing red
+/// with it. It did, and this function is the fix.
+///
+/// **No `now` parameter, and that absence is the fix rather than a style
+/// choice.** The activate arm used to pass `self.now`, the cell
+/// `route_physical_inputs` samples once per *input turn*. A paused session sees
+/// no input turn — the keypress that switches the VT back is delivered to
+/// whichever session is currently active, never to this one — so that cell still
+/// held an instant from before the absence. The clock was therefore "reset" to a
+/// moment already past the idle threshold, and:
+///
+/// * with `--blank-idle 60` the panel went dark **1.5 s** after the human came
+///   back, measured on the L4 rung on 2026-08-11 (issue #257's evidence);
+/// * and the answer for `--lock-idle` is **not different, it is worse** — the
+///   lock's idle raise reads `last_activity` off the same shared record, so the
+///   same stale stamp hands a returning human a passphrase prompt they never
+///   asked for. That is the stronger claim, so it is stated rather than left
+///   implied: one stamp, two timers, one defect.
+///
+/// # Seat activation counts as activity, and that is the decision (#257)
+///
+/// A reactivation is always *caused* by a human acting on this machine, even
+/// though this session structurally cannot observe the event that caused it. An
+/// idle timer asks "is anybody there"; somebody switching to this VT has just
+/// answered it. The countdown therefore restarts from the return rather than
+/// resuming one frozen mid-way, which is what
+/// [`crate::backend::blank::SessionActivity::set_seat_absent`] already intended
+/// and documented before this — the intent was right and the stamp was stale.
+#[cfg_attr(
+    not(feature = "drm-backend"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the bare-metal backend's session-event \
+                  handler, because only that backend has a seat; the behaviour is held in \
+                  every build by this module's own tests"
+    )
+)]
+pub(crate) fn note_seat_presence(lock: &std::cell::RefCell<crate::lock::LockScreen>, absent: bool) {
+    lock.borrow_mut().set_seat_absent(absent, Instant::now());
 }
 
 /// **The human can see this session's trusted surfaces again as of `now`** —
@@ -4889,6 +5095,17 @@ mod tests {
         /// [`service_blank_round`] each dispatch round, exactly as the
         /// bare-metal backend does.
         activity: Option<Rc<RefCell<crate::backend::blank::SessionActivity>>>,
+        /// The lock gate the blank's round reads to answer "was a lock up when
+        /// the panel went dark?", installed by [`Rig::attach_blank_seeded`]
+        /// beside the activity record it shares.
+        ///
+        /// **Installed together and read-only from the blank's side**, exactly
+        /// as on the bare-metal backend: `DrmState` owns one `LockScreen` and
+        /// hands `service_blank_round` a shared reference to it. A rig that
+        /// passed a *second*, private lock would be able to journal `locked:
+        /// false` for a session its own gate had locked, which is the defect
+        /// this field exists to make testable rather than a fixture detail.
+        lock: Option<Rc<RefCell<crate::lock::LockScreen>>>,
         resume: crate::backend::blank::ResumeWatch,
         /// The wall clock this rig reports to [`RuntimeHost::service_screen`],
         /// overriding `SystemTime::now()` when a test sets it.
@@ -4951,6 +5168,14 @@ mod tests {
             let Some(activity) = self.activity.clone() else {
                 return;
             };
+            // Installed by the same call that installed the activity record, so
+            // this cannot be `None` while the round runs -- the rig models the
+            // bare-metal backend, where one `LockScreen` and one
+            // `SessionActivity` are built together and share the clock.
+            let lock = self
+                .lock
+                .clone()
+                .expect("the blank's round carries the session's lock, as on bare metal");
             let wall = self.wall.unwrap_or(wall);
             if let Some(_gap) = self.resume.sample(wall, now) {
                 if let Some(grab) = self.grab.clone() {
@@ -4966,7 +5191,13 @@ mod tests {
             // stands in for.
             let changed = {
                 let mut activity = activity.borrow_mut();
-                service_blank_round(&mut activity, &mut self.view.blank, now)
+                service_blank_round(
+                    &mut self.runtime,
+                    &lock,
+                    &mut activity,
+                    &mut self.view.blank,
+                    now,
+                )
             };
             if changed {
                 self.runtime.dirty = true;
@@ -5006,6 +5237,83 @@ mod tests {
             rustix::process::geteuid().as_raw(),
         )
         .unwrap()
+    }
+
+    /// **Capture the log lines a block of code emits, on this thread only.**
+    ///
+    /// Two of issue #258's acceptance criteria are about log lines and nothing
+    /// else — a successful wake and a failed one must be *distinguishable* —
+    /// and the only honest way to assert that is to read what was emitted.
+    ///
+    /// Thread-local ([`tracing::subscriber::set_default`]) rather than global,
+    /// for two reasons: `main.rs`'s auto-approve banner test already owns the
+    /// one `set_global_default` this test binary may install and says so in its
+    /// own comment, and everything under test here is emitted on the thread
+    /// driving the rig's rounds.
+    struct LogCapture {
+        lines: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+        /// Restores the previous default when the capture goes out of scope.
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl LogCapture {
+        fn install() -> Self {
+            use tracing_subscriber::layer::SubscriberExt;
+
+            let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                tracing_subscriber::registry().with(CaptureLayer(std::sync::Arc::clone(&lines)));
+            let guard = tracing::subscriber::set_default(subscriber);
+            Self {
+                lines,
+                _guard: guard,
+            }
+        }
+
+        /// Everything captured so far, draining the buffer.
+        fn take(&self) -> Vec<(tracing::Level, String)> {
+            std::mem::take(&mut *self.lines.lock().unwrap_or_else(|e| e.into_inner()))
+        }
+
+        /// Whether any captured line contains `needle`, without draining — for
+        /// asserting that something has **not** been said yet.
+        fn contains(&self, needle: &str) -> bool {
+            self.lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(_, message)| message.contains(needle))
+        }
+    }
+
+    struct CaptureLayer(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = MessageField(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((*event.metadata().level(), message.0));
+        }
+    }
+
+    /// Pulls the formatted `message` out of one event; the structured fields are
+    /// deliberately ignored, because what these tests assert is the sentence a
+    /// human reads in the log.
+    struct MessageField(String);
+
+    impl tracing::field::Visit for MessageField {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
     }
 
     /// A whole session on a scratch socket: the loop, the host, and the log
@@ -5098,6 +5406,7 @@ mod tests {
                 grab: None,
                 screen: PromptVisibility::Reachable,
                 activity: None,
+                lock: None,
                 resume: crate::backend::blank::ResumeWatch::new(),
                 wall: None,
             };
@@ -5138,12 +5447,53 @@ mod tests {
             &mut self,
             after: Duration,
         ) -> Rc<RefCell<crate::backend::blank::SessionActivity>> {
+            self.attach_blank_seeded(after, Instant::now())
+        }
+
+        /// The same, with the activity clock seeded at a chosen instant.
+        ///
+        /// The seam #257's test needs: "the human has been away longer than the
+        /// idle timeout" is a statement about how old the clock is, and the rig
+        /// runs on the real one. Seeding it in the past says that in a
+        /// millisecond instead of five minutes, and it is the *production*
+        /// constructor either way — [`crate::backend::blank::SessionActivity::new`]
+        /// takes the seed for exactly this reason.
+        ///
+        /// **A lock gate is installed beside it**, sharing the one activity
+        /// record, because the bare-metal backend has exactly one and the
+        /// blank's round reads it. Its idle raise is armed at the same timeout,
+        /// so a test that wants the two coupled has them; nothing ticks it
+        /// unless a test asks ([`Self::lock`]), so every existing blank test
+        /// runs against an unlocked session as before.
+        fn attach_blank_seeded(
+            &mut self,
+            after: Duration,
+            seeded: Instant,
+        ) -> Rc<RefCell<crate::backend::blank::SessionActivity>> {
             let activity = Rc::new(RefCell::new(crate::backend::blank::SessionActivity::new(
                 Some(after),
-                Instant::now(),
+                seeded,
             )));
+            self.host.lock = Some(Rc::new(RefCell::new(crate::lock::LockScreen::new(
+                crate::chord::ModChord::parse(crate::lock::DEFAULT_LOCK_CHORD)
+                    .expect("the default lock chord parses"),
+                Some(after),
+                None,
+                Rc::clone(&activity),
+            ))));
             self.host.activity = Some(Rc::clone(&activity));
             activity
+        }
+
+        /// The lock gate [`Self::attach_blank_seeded`] installed beside the
+        /// activity record — the one the blank's round reads.
+        fn lock(&self) -> Rc<RefCell<crate::lock::LockScreen>> {
+            Rc::clone(
+                self.host
+                    .lock
+                    .as_ref()
+                    .expect("attach_blank installs the lock beside the activity record"),
+            )
         }
 
         /// Fork the real mock-shim binary into this rig's scratch runtime
@@ -7343,6 +7693,478 @@ mod tests {
         assert!(activity.borrow_mut().note_flip_completed());
         rig.pump(Duration::from_millis(50));
         assert_eq!(activity.borrow().phase(), Phase::Lit);
+    }
+
+    /// **Coming back from another VT is activity: neither the panel nor the
+    /// lock may fire on the round after the human returns** (issue #257).
+    ///
+    /// The defect this pins is not a timer bug. A paused session never sees the
+    /// input that reactivates it — the chord that switches the VT back is
+    /// delivered to whichever session is *currently* active — so the activate
+    /// arm had nothing but `self.now`, the input turn's clock cell, which for a
+    /// returning session still held an instant from before the absence. Resetting
+    /// the countdown to an already-expired instant is worse than not resetting
+    /// it: with `--blank-idle 60` the L4 rung measured the panel going dark
+    /// **1.5 s** after the human came back.
+    ///
+    /// **Both timers are asserted, because both read the one clock**, and the
+    /// lock's is the stronger claim: a panel that blanks on return is an
+    /// annoyance, while a session that demands a passphrase because somebody
+    /// came back to their own screen is the idle lock firing at exactly the
+    /// moment it should not. The answer is therefore the *same* for the two,
+    /// and this is where "the same" is checked rather than asserted in prose.
+    ///
+    /// Driven through [`note_seat_presence`], which is the production body of
+    /// both bare-metal seat arms: `DrmState` needs a real `DrmDevice`,
+    /// `LibSeatSession`, `GbmDevice` and `GlesRenderer`, so anything left inside
+    /// `handle_session_event` is unreachable by every test in this workspace.
+    #[test]
+    fn returning_from_another_vt_restarts_both_idle_countdowns() {
+        use crate::backend::blank::Phase;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "seat-return-idle",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let idle = Duration::from_secs(60);
+        // The clock as a returning session finds it: last touched long before
+        // the human left, because nothing they did on the other VT reached here.
+        let stale = Instant::now() - Duration::from_secs(600);
+
+        // **The vacuity control.** Without it every assertion below would pass
+        // against a rig that simply never blanks. Same clock age, no seat event:
+        // the very next round covers the output.
+        let control = rig.attach_blank_seeded(idle, stale);
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(
+            control.borrow().phase(),
+            Phase::Covering,
+            "a clock this old must blank on the next round, or this test proves nothing"
+        );
+
+        // Now the same clock age, reached the way a returning human reaches it.
+        // The lock is the rig's own — the one the blank's round reads and the
+        // one sharing this activity record — rather than a second gate built
+        // beside it, so "both timers read one clock" is a property of the rig
+        // rather than of this test's fixture.
+        let activity = rig.attach_blank_seeded(idle, stale);
+        let lock = rig.lock();
+
+        note_seat_presence(&lock, true);
+        assert!(
+            activity.borrow().seat_absent(),
+            "the pause must reach the shared activity record"
+        );
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(
+            activity.borrow().phase(),
+            Phase::Lit,
+            "time on another VT is not idle time, and a paused session must hold no blank it \
+             cannot undo"
+        );
+        assert!(
+            !lock.borrow_mut().tick(Instant::now()),
+            "and the lock must not raise itself on a VT nobody is looking at"
+        );
+
+        // The seat gives the devices back. This is the whole fix: the instant
+        // stamped here comes from `note_seat_presence` itself, not from any
+        // cell a paused session could not have refreshed.
+        note_seat_presence(&lock, false);
+        assert!(!activity.borrow().seat_absent());
+
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(
+            activity.borrow().phase(),
+            Phase::Lit,
+            "#257: the panel blanked on the round after the human came back. The idle clock \
+             was reset to an instant from before the absence, which is already past the \
+             threshold"
+        );
+        assert!(
+            !rig.host.view.blank.is_covering(),
+            "and no cover reached the composite either"
+        );
+        assert!(
+            !lock.borrow_mut().tick(Instant::now()),
+            "#257, the stronger half: the idle lock armed on return, so the human is asked for \
+             a passphrase for the offence of coming back to their own screen"
+        );
+        assert!(lock.borrow().cause().is_none());
+
+        // ...and the countdown really did restart rather than being disabled:
+        // an idle session still blanks, measured from the return.
+        assert!(
+            activity
+                .borrow_mut()
+                .tick(Instant::now() + idle + Duration::from_secs(1)),
+            "the fix must restart the countdown, not switch it off"
+        );
+    }
+
+    /// **A wake says so, a failed wake says something else, and both reach the
+    /// flight recorder** (issues #258 and #259).
+    ///
+    /// Before this, a successful unblank and a modeset that left the panel dark
+    /// produced identical output: none. That is not an ordinary missing log
+    /// line — `docs/book/src/recovery.md` names the second one the worst
+    /// credible outcome of its L4 rung and says in as many words that it is
+    /// indistinguishable from a wedge, so the only instrument that could tell
+    /// them apart was a human looking at the panel.
+    ///
+    /// Driven through the rig's real dispatch round for the success path, so
+    /// what is asserted is the **wiring** and not a function called by hand; the
+    /// failure path is driven by calling the same round function with a
+    /// synthetic clock, because [`crate::backend::blank::WAKE_DEADLINE`] is two
+    /// real seconds and no test may sit through one to learn something the
+    /// injected instant already says.
+    #[test]
+    fn a_wake_and_a_failed_wake_are_logged_and_journalled_differently() {
+        use crate::backend::blank::{BlankSurface, SessionActivity, WAKE_DEADLINE};
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "blank-observability",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let activity = rig.attach_blank(Duration::from_secs(300));
+        let t0 = activity.borrow().last_activity();
+
+        // --- the blank, and the entry it owes ------------------------------
+        let log = LogCapture::install();
+        activity.borrow_mut().tick(t0 + Duration::from_secs(300));
+        rig.pump(Duration::from_millis(50));
+
+        // The panel powers down (the bare-metal half), the human presses a key,
+        // and the flip that re-enables the CRTC lands.
+        activity.borrow_mut().note_frame_queued();
+        activity.borrow_mut().went_dark();
+        assert!(activity
+            .borrow_mut()
+            .note_physical(Instant::now())
+            .consumes());
+        assert!(
+            !log.contains("the panel is lit again"),
+            "a press that starts a wake is not a wake: logging here would make a successful \
+             unblank and a failed one produce the same line, which is the defect one rung down \
+             from the silence"
+        );
+        assert!(activity.borrow_mut().note_flip_completed());
+        rig.pump(Duration::from_millis(50));
+
+        let lines = log.take();
+        let wake = lines
+            .iter()
+            .find(|(_, message)| message.contains("the panel is lit again"))
+            .expect("#258: a successful wake must emit a line -- silence is what shipped");
+        assert_eq!(
+            wake.0,
+            tracing::Level::INFO,
+            "the wake belongs at the blank's own level"
+        );
+        assert!(
+            wake.1.contains("no evidence of WHO woke it") && wake.1.contains("BOUND"),
+            "the wake line must claim only what waking does: it restores no authority, so it \
+             is no evidence of who woke it, and its two counts BOUND the dark window rather \
+             than describing it. Got: {}",
+            wake.1
+        );
+        // The two claims this line used to make and cannot: a lock may have been
+        // up for the whole window, and a grant may have been minted inside it
+        // under `AutoApprove` or by `vitrin_grant.attenuate`, neither of which
+        // is held back by `PromptVisibility::ScreenIsDark`.
+        for overclaim in ["was never locked", "live throughout"] {
+            assert!(
+                !wake.1.contains(overclaim),
+                "the wake line asserts `{overclaim}` about a window it only sampled the ends \
+                 of. Got: {}",
+                wake.1
+            );
+        }
+
+        let entries = rig.entries();
+        let blanked = crate::recorder::tests::of_kind(&entries, "screen_blanked");
+        let woke = crate::recorder::tests::of_kind(&entries, "screen_woke");
+        assert_eq!(
+            blanked.len(),
+            1,
+            "#259: the panel going dark left no flight-recorder entry; got kinds {:?}",
+            entries.iter().map(|e| e.str("kind")).collect::<Vec<_>>()
+        );
+        assert_eq!(woke.len(), 1, "#259: neither did the wake");
+        assert_eq!(woke[0].str("outcome"), "flip_landed");
+        // Present-and-numeric rather than a value: the rig runs on the real
+        // clock, so the only honest claim about the span is that it is recorded.
+        woke[0].u64("dark_ms");
+        for entry in blanked.iter().chain(woke.iter()) {
+            assert_eq!(
+                entry.u64("live_grants"),
+                0,
+                "both entries must carry whether any grant was live across the dark window, \
+                 and this session minted none"
+            );
+            assert!(
+                !entry.bool("locked"),
+                "this session's gate never locked, and BOTH ends of the pair must say so: one \
+                 sample cannot describe a window a lock can raise inside \
+                 (`a_locked_session_that_blanks_is_journalled_as_locked` is the other half)"
+            );
+            // `SessionLocked`'s shape: a session-level fact names no principal
+            // and no realm, because no wire message can blank this panel.
+            for absent in ["principal", "realm", "grant"] {
+                assert!(
+                    entry.path(absent).is_none(),
+                    "a session-level entry must carry no `{absent}` field"
+                );
+            }
+        }
+
+        // --- the failed wake, on a synthetic clock -------------------------
+        let mut activity = SessionActivity::new(Some(Duration::from_secs(60)), t0);
+        let mut surface = BlankSurface::for_test();
+        // The session's own gate, still unlocked: the round reads it and this
+        // path must not be the one that decides what `locked` says.
+        let lock = rig.lock();
+        let log = LogCapture::install();
+
+        service_blank_round(
+            &mut rig.host.runtime,
+            &lock,
+            &mut activity,
+            &mut surface,
+            t0 + Duration::from_secs(60),
+        );
+        assert!(activity
+            .note_physical(t0 + Duration::from_secs(90))
+            .consumes());
+        // The deadline passes with no flip behind it: the modeset that would
+        // light the panel was never confirmed.
+        service_blank_round(
+            &mut rig.host.runtime,
+            &lock,
+            &mut activity,
+            &mut surface,
+            t0 + Duration::from_secs(90) + WAKE_DEADLINE,
+        );
+
+        let lines = log.take();
+        let failed = lines
+            .iter()
+            .find(|(_, message)| message.contains("THE WAKE WAS NOT CONFIRMED"))
+            .expect("#258: a failed wake must be distinguishable from a successful one");
+        assert_eq!(
+            failed.0,
+            tracing::Level::WARN,
+            "a modeset that may have left the panel dark is the exact case worth a WARN"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|(_, message)| message.contains("the panel is lit again")),
+            "a failed wake must never emit the success line"
+        );
+
+        let entries = rig.entries();
+        let woke = crate::recorder::tests::of_kind(&entries, "screen_woke");
+        assert_eq!(woke.len(), 2, "the abandoned wake owes an entry too");
+        assert_eq!(
+            woke[1].str("outcome"),
+            "no_flip",
+            "#259: an abandoned wake journalled as `flip_landed` would be the recorder claiming \
+             the human got their screen back on the one path where they may not have"
+        );
+    }
+
+    /// **A session that is already locked when the panel goes dark is journalled
+    /// as locked** — on both ends of the pair (issue #259, review of #257–#259).
+    ///
+    /// `screen_blanked` shipped its `locked` field as the literal `false`,
+    /// reasoning from D-033 that an idle blank does not lock. D-033 is about what
+    /// the blank *does*, not about what it *finds*, and two ordinary
+    /// configurations reach a locked session behind a dark panel:
+    ///
+    /// * the human chords `Ctrl-Alt-Delete` and then walks away past
+    ///   `--blank-idle`, which is this test; and
+    /// * `--blank-idle 300 --lock-idle 600`, where the idle lock raises *behind*
+    ///   a panel that has been dark since 300 s — deliberately not suppressed by
+    ///   the cover, which `crate::lock::gate`'s
+    ///   `a_blank_does_not_disable_the_idle_lock` pins.
+    ///
+    /// A hardcoded `false` is therefore a **false claim in the flight recorder**,
+    /// which is worse than the silence #259 replaced: silence invites a question,
+    /// and a stated `locked: false` answers it wrongly. The recorder's own rule
+    /// for enumerated facts is that they are read, never inferred.
+    #[test]
+    fn a_locked_session_that_blanks_is_journalled_as_locked() {
+        use crate::backend::blank::Phase;
+        use crate::lock::LockCause;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "blank-while-locked",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let activity = rig.attach_blank(Duration::from_secs(300));
+        let lock = rig.lock();
+        let t0 = activity.borrow().last_activity();
+
+        // The human locks the session by hand, then leaves. The lock is up
+        // BEFORE the idle blank fires, which is the whole configuration.
+        assert!(lock.borrow_mut().raise(LockCause::Chord));
+        assert!(lock.borrow().is_locked());
+
+        activity.borrow_mut().tick(t0 + Duration::from_secs(300));
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(
+            activity.borrow().phase(),
+            Phase::Covering,
+            "a lock does not stop the idle blank, and this test is vacuous if the cover never \
+             goes up"
+        );
+
+        let entries = rig.entries();
+        let blanked = crate::recorder::tests::of_kind(&entries, "screen_blanked");
+        assert_eq!(blanked.len(), 1, "#259: the blank still owes one entry");
+        assert!(
+            blanked[0].bool("locked"),
+            "the flight recorder claimed `locked: false` for a session whose own gate was \
+             locked. `LockScreen::is_locked()` is the only source for this field; a literal \
+             cannot be one"
+        );
+
+        // ...and the other end of the pair says so too, because the lock is
+        // still up when the panel comes back: a wake is not an unlock.
+        activity.borrow_mut().note_frame_queued();
+        activity.borrow_mut().went_dark();
+        assert!(activity
+            .borrow_mut()
+            .note_physical(Instant::now())
+            .consumes());
+        assert!(activity.borrow_mut().note_flip_completed());
+        rig.pump(Duration::from_millis(50));
+
+        let entries = rig.entries();
+        let woke = crate::recorder::tests::of_kind(&entries, "screen_woke");
+        assert_eq!(woke.len(), 1, "#259: the wake owes one entry");
+        assert_eq!(woke[0].str("outcome"), "flip_landed");
+        assert!(
+            woke[0].bool("locked"),
+            "waking the panel does not unlock the session: the human is looking at the lock \
+             card, and an entry saying otherwise would misdate the unlock"
+        );
+
+        // **The field is not a constant wearing a different value.** The same
+        // session, the same recorder, one more blank -- this time behind a gate
+        // that was never locked -- and the entry beside the two above says
+        // `false`. Reached by re-arming the rig rather than by unlocking,
+        // because `LockScreen` answers a passphrase or a key through `judge`
+        // and has no unlock seam a test may reach for; adding one to a lock to
+        // satisfy a test is the wrong trade.
+        let fresh = rig.attach_blank(Duration::from_secs(300));
+        assert!(!rig.lock().borrow().is_locked());
+        let t1 = fresh.borrow().last_activity();
+        fresh.borrow_mut().tick(t1 + Duration::from_secs(300));
+        rig.pump(Duration::from_millis(50));
+
+        let entries = rig.entries();
+        let blanked = crate::recorder::tests::of_kind(&entries, "screen_blanked");
+        assert_eq!(blanked.len(), 2, "the second blank owes its own entry");
+        assert!(
+            blanked[0].bool("locked") && !blanked[1].bool("locked"),
+            "both `screen_blanked` entries in one journal must reflect their own gate; got \
+             locked={:?} then locked={:?}",
+            blanked[0].bool("locked"),
+            blanked[1].bool("locked")
+        );
+    }
+
+    /// **A lock that raises while the panel is already dark moves the pair's
+    /// second sample** — which is why there are two (issue #259, review of
+    /// #257–#259).
+    ///
+    /// The configuration is `--blank-idle 300 --lock-idle 600`: the cover goes
+    /// up at 300 s and the idle lock raises at 600 s **behind** it, deliberately
+    /// unsuppressed by the dark screen (`crate::lock::gate`'s
+    /// `a_blank_does_not_disable_the_idle_lock`). A `screen_blanked` /
+    /// `screen_woke` pair that carried one `locked` sample — or, as shipped, a
+    /// hardcoded `false` on the first and nothing on the second — would assert
+    /// an unlocked dark window that was in fact locked for half its length.
+    ///
+    /// Two samples cannot describe the inside of the window either, and are not
+    /// claimed to: they bound it, and the `session_locked` entry
+    /// [`service_lock_round`] writes is what dates the raise. What this test
+    /// pins is that the bound is real rather than decorative.
+    #[test]
+    fn a_lock_raised_behind_the_cover_shows_up_on_the_wake_entry() {
+        use crate::backend::blank::Phase;
+        use crate::lock::LockCause;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "blank-then-lock",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let activity = rig.attach_blank(Duration::from_secs(300));
+        let lock = rig.lock();
+        let t0 = activity.borrow().last_activity();
+
+        // The cover goes up first, on an unlocked session.
+        activity.borrow_mut().tick(t0 + Duration::from_secs(300));
+        rig.pump(Duration::from_millis(50));
+        assert_eq!(activity.borrow().phase(), Phase::Covering);
+        let blanked = {
+            let entries = rig.entries();
+            let blanked = crate::recorder::tests::of_kind(&entries, "screen_blanked");
+            assert_eq!(blanked.len(), 1);
+            blanked[0].bool("locked")
+        };
+        assert!(
+            !blanked,
+            "the session was not locked when the panel went dark, and the entry must say the \
+             thing that was true at the instant it was written"
+        );
+
+        // ...and the idle lock raises behind it, reading the same clock the
+        // blank read. The panel is already dark, so nothing on screen changes.
+        activity.borrow_mut().note_frame_queued();
+        activity.borrow_mut().went_dark();
+        assert!(
+            lock.borrow_mut().tick(t0 + Duration::from_secs(600)),
+            "a dark screen must not freeze the idle lock -- the shorter timer silently \
+             disabling the longer one is the coupling D-030(2) was written to catch"
+        );
+        assert_eq!(lock.borrow().cause(), Some(LockCause::Idle));
+
+        // The human comes back to a lock card on a panel that is lit again.
+        assert!(activity
+            .borrow_mut()
+            .note_physical(Instant::now())
+            .consumes());
+        assert!(activity.borrow_mut().note_flip_completed());
+        rig.pump(Duration::from_millis(50));
+
+        let entries = rig.entries();
+        let woke = crate::recorder::tests::of_kind(&entries, "screen_woke");
+        assert_eq!(woke.len(), 1, "#259: the wake owes one entry");
+        assert!(
+            woke[0].bool("locked"),
+            "the dark window was locked for its second half and the pair says `false` at both \
+             ends: a reader reconstructing this session is told nobody could have been asked \
+             for a passphrase, which is the opposite of what happened"
+        );
     }
 
     /// **A consent prompt cannot be resolved across a blank** (WS-E.4.3, issue

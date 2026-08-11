@@ -146,6 +146,21 @@ pub(crate) const PASSPHRASE_NEEDS_A_KEYMAP: &str =
      compositor interprets the layout, or omit the flag to run an unauthenticated privacy \
      screen.";
 
+/// The startup refusal for `--lock-on-seat-change` on a backend with no seat
+/// (WS-E, issue #246).
+///
+/// [`PASSPHRASE_NEEDS_A_KEYMAP`]'s shape and `--blank-idle`'s posture: a flag
+/// whose value could only ever be stored and never read is refused at parse
+/// time rather than accepted as a silent no-op, because a command line that
+/// configured a lock policy which cannot fire is a command line whose author
+/// believed something false about their session.
+pub(crate) const SEAT_POLICY_NEEDS_A_SEAT: &str =
+    "`--lock-on-seat-change` needs `--drm`: only the bare-metal backend has a seat that can be \
+     taken away. A nested session is a client of a host compositor that keeps the seat -- losing \
+     the window's focus is not losing the seat, the human can still see the window, and no \
+     session event ever reaches this core -- and a headless session has no physical input at \
+     all. On either of those the policy would be stored and never read.";
+
 /// The default manual lock chord, `ctrl+alt+delete`.
 ///
 /// # Why this one, out of a vocabulary with no letters in it
@@ -182,10 +197,95 @@ pub(crate) struct LockConfig {
     /// locked somebody out of a demo.
     pub idle: Option<std::time::Duration>,
     pub passphrase: Option<std::path::PathBuf>,
+    /// What losing the seat does to the lock (issue #246).
+    ///
+    /// `Never` on every backend but `--drm`, by construction rather than by
+    /// convention: [`SEAT_POLICY_NEEDS_A_SEAT`] refuses the flag anywhere else,
+    /// and nothing but the bare-metal backend calls
+    /// [`LockScreen::set_seat_absent`](gate::LockScreen::set_seat_absent) at all.
+    pub on_seat_change: SeatChangePolicy,
 }
 
-/// How the session got locked. Two causes, both human-attributable: a gesture
-/// the human made, or a gesture they conspicuously did not make.
+/// What losing the seat — a VT switch away — does to the lock (issue #246).
+///
+/// # Why this is configurable at all, when D-030(2) settled it
+///
+/// D-030(2) is an owner decision (Taha, 2026-08-09) and it is the right
+/// **default**: switching away is not walking away, it costs no passphrase,
+/// and the idle clock does not count time spent on somebody else's VT. What it
+/// is not is the only reasonable answer. Three operators want three, the
+/// published cost of the chosen one is blunt — *"a session you switched away
+/// from eight hours ago is unlocked when you switch back to it"* — and until
+/// now none of them could say so on a command line.
+///
+/// **The default is unchanged.** [`Self::Never`] is `Default`, the flag is
+/// refused on every backend that cannot observe a seat change, and
+/// `a_seat_taken_away_stops_the_idle_clock_and_returning_restarts_it` still
+/// asserts the shipped behaviour verbatim.
+///
+/// # What no policy may do
+///
+/// **None of the three lowers a lock that is already up.** A VT switch must
+/// never be a way past a lock screen, whatever the policy says; that invariant
+/// is not one of the options and
+/// `losing_the_seat_never_lowers_a_lock_that_is_already_up` holds it for all
+/// three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SeatChangePolicy {
+    /// Losing the seat raises the lock at once. Coming back always costs a
+    /// passphrase (or, with no `--lock-passphrase-file`, an Enter).
+    ///
+    /// Raises with [`LockCause::SeatChange`] — see that variant for the
+    /// human-attributability argument D-030(2) asked for and declined to make.
+    Immediate,
+    /// The idle clock keeps running while away, so a long absence returns to a
+    /// locked screen and a short one does not.
+    ///
+    /// **This is what the code did before D-030, by accident rather than by
+    /// choice**, with one deliberate difference: the raise lands on the
+    /// human's *return* rather than at some instant during the absence. The
+    /// outcome the human sees is the same — they come back to a locked screen
+    /// — and D-030(2)'s objection to the inherited behaviour ("it locks at an
+    /// instant no human could observe") is answered rather than reinstated.
+    /// See `LockScreen::set_seat_absent` for the mechanism.
+    Idle,
+    /// The clock freezes for the absence and the countdown restarts on return.
+    /// Today's behaviour, and the default (D-030(2)).
+    #[default]
+    Never,
+}
+
+impl SeatChangePolicy {
+    /// Parse the `--lock-on-seat-change` value, naming the whole vocabulary on
+    /// a miss — this parser's rule for every closed-vocabulary flag.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "immediate" => Ok(Self::Immediate),
+            "idle" => Ok(Self::Idle),
+            "never" => Ok(Self::Never),
+            other => Err(format!(
+                "`--lock-on-seat-change` `{other}` is not a policy (accepted: immediate, idle, \
+                 never). `immediate` raises the lock when the seat goes away; `idle` keeps the \
+                 idle countdown running across the absence, so a long one returns to a locked \
+                 screen; `never` freezes it and restarts on return, which is the default."
+            )),
+        }
+    }
+
+    /// The fixed spelling, for the startup banner and the parse tests — the
+    /// same string the flag accepts, so a log line can be pasted back onto a
+    /// command line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Idle => "idle",
+            Self::Never => "never",
+        }
+    }
+}
+
+/// How the session got locked. Every cause is human-attributable: a gesture the
+/// human made, or a gesture they conspicuously did not make.
 ///
 /// Deliberately **not** carrying a "locked by an agent" variant. No wire message
 /// locks this session and none is designed; a principal that could lock a human
@@ -196,6 +296,31 @@ pub(crate) enum LockCause {
     Chord,
     /// No physical input for `--lock-idle` seconds.
     Idle,
+    /// The seat went to another VT under [`SeatChangePolicy::Immediate`].
+    ///
+    /// # D-030(2) declined this variant; here is the argument it asked for
+    ///
+    /// That entry refused a third cause because "a seat event is neither" of
+    /// the two human-attributable shapes. Two things have changed since, and
+    /// only one of them is this issue.
+    ///
+    /// The first is D-031: on bare metal **this core implements
+    /// `Ctrl-Alt-F<n>` itself**, consumes it, and calls `change_vt` from a
+    /// physical-origin chord match whose producer is private. So on the path
+    /// that actually produces this cause, the seat event is the acknowledgement
+    /// of a chord this core watched the human press — the *first* shape, not a
+    /// third one.
+    ///
+    /// The second is that the policy is the operator's own. Under `immediate`
+    /// they have said in advance that leaving this screen is to be read as
+    /// leaving. A cause raised under a policy nobody but the human configured
+    /// is attributable to the human twice over.
+    ///
+    /// **What is not claimed:** that every pause is a chord. logind can
+    /// deactivate this session for reasons this core never sees, and the card
+    /// says only *the seat was taken away* — which is true of all of them —
+    /// rather than naming a gesture it cannot know happened.
+    SeatChange,
 }
 
 impl LockCause {
@@ -206,6 +331,7 @@ impl LockCause {
         match self {
             LockCause::Chord => "chord",
             LockCause::Idle => "idle",
+            LockCause::SeatChange => "seat",
         }
     }
 }
@@ -692,5 +818,40 @@ pub(crate) mod tests {
     fn the_cause_label_vocabulary_is_closed() {
         assert_eq!(LockCause::Chord.label(), "chord");
         assert_eq!(LockCause::Idle.label(), "idle");
+        assert_eq!(LockCause::SeatChange.label(), "seat");
+    }
+
+    /// The policy's spelling is the flag's spelling, in both directions
+    /// (issue #246), so a banner line can be pasted back onto a command line
+    /// and a journal reader is never guessing which of three sessions they
+    /// have.
+    #[test]
+    fn the_seat_change_policy_round_trips_through_its_own_spelling() {
+        for policy in [
+            SeatChangePolicy::Immediate,
+            SeatChangePolicy::Idle,
+            SeatChangePolicy::Never,
+        ] {
+            assert_eq!(
+                SeatChangePolicy::parse(policy.as_str()),
+                Ok(policy),
+                "{} must parse back to itself",
+                policy.as_str()
+            );
+        }
+        assert_eq!(
+            SeatChangePolicy::default(),
+            SeatChangePolicy::Never,
+            "the default is D-030(2)'s behaviour and changing it here would weaken every \
+             session that never names the flag"
+        );
+        let err = SeatChangePolicy::parse("lock").expect_err("not a policy");
+        assert!(err.contains("immediate"), "{err}");
+        assert!(err.contains("idle"), "{err}");
+        assert!(err.contains("never"), "{err}");
+        // Spelled exactly, never case-folded or abbreviated: this parser has
+        // one spelling per value everywhere else too.
+        assert!(SeatChangePolicy::parse("Never").is_err());
+        assert!(SeatChangePolicy::parse("").is_err());
     }
 }

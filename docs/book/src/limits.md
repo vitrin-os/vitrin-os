@@ -271,18 +271,29 @@ window — between the realm cap being raised and the output being bound —
 where this was not true and a capture could carry a live sibling's pixels;
 it is closed.
 
-**Every realm renders, whether or not you are looking at it.** A hidden
-realm keeps receiving frame callbacks paced by the output's composites, and
-keeps having its view composed. That is not generosity: a Wayland client
-throttles on frame callbacks, so a realm that stopped being paced would stop
-repainting and its capture would go stale — which the protocol forbids
-outright (`no_surface` is documented as "never a stale frame"). The cost is
-real and is not traded away: on a laptop, up to sixteen apps compositing at
-the output's rate with nobody watching fifteen of them, plus roughly
+**Every realm renders, whether or not you are looking at it — and whether or
+not any agent is connected.** A hidden realm keeps receiving frame callbacks
+paced by the output's composites, and keeps having its view composed. That is
+not generosity: a Wayland client throttles on frame callbacks, so a realm that
+stopped being paced would stop repainting and its capture would go stale —
+which the protocol forbids outright (`no_surface` is documented as "never a
+stale frame"). The second half is the one this page used to leave out: the
+compositor also does **not** ask whether anything will read a composed view.
+With no agent connected, no `--capture-dump` and no `--screenshot-dir`, a
+realm that is painting still has its view composed and cached every round.
+Gating that on whether a grant happens to exist would make what a capture
+returns depend on when the grant appeared, and that trade was declined.
+
+What the compositor does skip is a realm whose scene has not changed since the
+last composite: the cached view is then already byte-for-byte what recomposing
+would produce, so nothing about what any reader is served depends on it. That
+saves the idle case and the sibling case — one realm painting no longer costs
+its fifteen neighbours a composite each — and saves nothing at all for a
+single realm whose app is busy painting. The rest of the cost is real and is
+not traded away: on a laptop, up to sixteen apps compositing at the output's
+rate with nobody watching fifteen of them, plus roughly
 `2 x width x height x 4` bytes of core-side pixels per realm (~590 MiB
-resident at sixteen realms on a 2560x1600 panel, measured). Visibility-aware
-pacing would buy the power back at the cost of capture honesty, and that
-trade was declined.
+resident at sixteen realms on a 2560x1600 panel, measured).
 
 **The agent cursor is drawn only for the visible realm.** The core paints a
 small crosshair where an agent is pointing, so a human can see that an agent

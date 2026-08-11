@@ -579,6 +579,14 @@ impl SessionActivity {
     /// way it resolved. Announcing a wake at the press would make a successful
     /// wake and a failed one produce the same entry — the defect one rung down
     /// from the one #258 fixes in the log.
+    ///
+    /// **Every [`Phase`] is named and there is no `_` arm**, on
+    /// [`crate::recorder::Event::kind`]'s rule and for its reason: a fourth
+    /// variant added later for, say, a DPMS handshake between `Covering` and
+    /// `Dark` would fall into a catch-all, journal nothing on the way down, and
+    /// leave the `screen_blanked`/`screen_woke` pair permanently unpaired — the
+    /// exact silence #259 exists to close, arriving again with nothing red to
+    /// say so. Naming them costs two arms and makes that a compile error.
     pub(crate) fn take_transition(&mut self, now: Instant) -> Option<ScreenTransition> {
         match (self.journalled_dark, self.phase) {
             (None, Phase::Covering | Phase::Dark) => {
@@ -592,7 +600,11 @@ impl SessionActivity {
                     outcome: self.exit,
                 })
             }
-            _ => None,
+            // Nothing owed: the journal already believes what the phase says.
+            // `Waking` on both sides for the reason above — a wake in flight is
+            // not yet a fact, in either direction.
+            (None, Phase::Lit | Phase::Waking) => None,
+            (Some(_), Phase::Covering | Phase::Dark | Phase::Waking) => None,
         }
     }
 }

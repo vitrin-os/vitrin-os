@@ -1249,8 +1249,18 @@ impl session::RuntimeHost for DrmState {
             // (issues #258, #259) -- both of which were invisible in the log and
             // absent from the recorder for the whole of #223's first hardware
             // run.
+            //
+            // `&self.lock` is read-only here and the round is forbidden from
+            // touching it: the blank does not lock and does not unlock (D-033).
+            // It is passed because the journal entries must say whether a lock
+            // was up, and the only truthful answer is the one this cell holds --
+            // a chorded lock followed by a walk away past `--blank-idle`, and
+            // `--blank-idle 300 --lock-idle 600`, both reach a locked session
+            // behind a dark panel. Borrowed for the length of one `is_locked`
+            // inside, which cannot collide with the `activity` guard above.
             let changed = session::service_blank_round(
                 &mut self.runtime,
+                &self.lock,
                 &mut activity,
                 &mut self.view.blank,
                 now,

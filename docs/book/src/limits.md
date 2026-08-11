@@ -118,14 +118,24 @@ than budgetary. Six of them, named rather than summarised:
   of which was that the page's own first line of recovery did not exist. A runbook nobody has executed is a plan, and the wlcs
   number above is this repository's standing example of how a manual result
   ages once it is taken.
-- **The session-lifecycle checklist has never been executed at all.** Blanking,
-  suspend, lid handling and deliberate-wedge recovery are rungs `L1`–`L6` in
-  [Getting out of a wedged session](recovery.md#the-hardware-checklist), and
-  every one of them is empty. Suspend and lid have never been exercised on this
-  backend by anyone, in any form — the bring-up runbook's own checklist has no
-  suspend, lid or blank step and never did, so those steps had to be *written*
-  before they could be run. Everything this release says about idle blanking is
-  therefore a claim about code, not a report about a laptop.
+- **The session-lifecycle checklist has one rung executed and no recorded run.**
+  Blanking, suspend, lid handling, deliberate-wedge recovery and returning from
+  another VT are rungs `L1`–`L7` in
+  [Getting out of a wedged session](recovery.md#the-hardware-checklist), and its
+  record block is empty. `L4` (blank and unblank) was run once, on 2026-08-11:
+  it did not pass, and the three defects it found are
+  [#257](https://github.com/vitrin-os/vitrin-os/issues/257),
+  [#258](https://github.com/vitrin-os/vitrin-os/issues/258) and
+  [#259](https://github.com/vitrin-os/vitrin-os/issues/259) — the panel blanking
+  ~1.5 s after a return from another VT, a silent unblank, and neither
+  transition reaching the flight recorder. **All three fixes are code with
+  component tests behind them and none has been re-observed on hardware**, which
+  is what `L7` exists to close. No other rung has been executed in any form:
+  suspend and lid have never been exercised on this backend by anyone, because
+  the bring-up runbook's own checklist has no suspend, lid or blank step and
+  never did, so those steps had to be *written* before they could be run.
+  Everything this release says about idle blanking is a claim about code
+  corrected once by a laptop, not a report from one.
 
 This is a recorded decision with a scheduled closure in the sense that page's
 last section means: the closure is a dated human run, not a job. The alternative

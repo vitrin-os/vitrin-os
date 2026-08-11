@@ -1224,6 +1224,55 @@ pub(crate) enum Event<'a> {
         /// How long the core waited for the seat's `PauseSession`.
         after_ms: u64,
     },
+    /// **The panel went dark on the idle timer** (issue #259):
+    /// [`crate::backend::blank`]'s cover went up, and everything behind it kept
+    /// running.
+    ///
+    /// A session-level fact with no principal and no realm, on
+    /// [`Event::SessionLocked`]'s shape and by [`Event::VtSwitchRequested`]'s
+    /// argument one rung over: the artifact built to reconstruct a session
+    /// afterwards was silent about the panel going dark, and a dark panel is not
+    /// a neutral fact here. **Idle blanks and does not lock** (D-033), so across
+    /// this entry the session stays unlocked and every agent's grants stay live
+    /// — which makes "was the human able to see what the agent was doing?" a
+    /// question this journal could not previously answer at all.
+    ///
+    /// Written when the **cover** goes up rather than when the display power
+    /// state is set, because the cover is the instant the human stops seeing
+    /// their session, and because a `clear()` the display controller refuses
+    /// still leaves them looking at black ([`crate::backend::drm`]'s
+    /// `service_screen_power`).
+    ScreenBlanked {
+        /// How many grants were `Active` at that instant.
+        ///
+        /// **Bounds the dark window, never enumerates it.** A grant minted and
+        /// revoked entirely between this entry and its [`Event::ScreenWoke`]
+        /// appears in neither count; the grant lifecycle entries already in the
+        /// journal are what reconstruct the inside of the window. Stated here so
+        /// a reader does not take the pair for a census.
+        live_grants: usize,
+    },
+    /// **The blank ended** (issue #259) — and the entry says *how*, because the
+    /// three ways are not the same fact.
+    ///
+    /// Paired with exactly one preceding [`Event::ScreenBlanked`]; the two are
+    /// edge-triggered from one state field, so neither can repeat while the
+    /// other is owed.
+    ScreenWoke {
+        /// How long the cover was on the panel: the span the human could not
+        /// see. Measured from the cover going up, not from the power-down.
+        dark_ms: u64,
+        /// A fixed label from a closed vocabulary — `flip_landed`, `no_flip` or
+        /// `seat_lost` ([`crate::backend::blank::WakeOutcome::label`]).
+        /// **Only `flip_landed` says the panel came back**: `no_flip` is the
+        /// core giving up on a modeset it never saw complete, which is the
+        /// failure `docs/book/src/recovery.md` calls indistinguishable from a
+        /// wedge.
+        outcome: &'static str,
+        /// How many grants were `Active` when the blank ended.
+        /// [`Event::ScreenBlanked::live_grants`]'s caveat applies unchanged.
+        live_grants: usize,
+    },
     RealmDied {
         realm: &'a RealmId,
         /// The shim that was serving the realm. It may already be reaped.
@@ -1302,6 +1351,8 @@ impl Event<'_> {
             Event::VtSwitchRequested { .. } => "vt_switch_requested",
             Event::VtSwitchRefused { .. } => "vt_switch_refused",
             Event::VtSwitchStalled { .. } => "vt_switch_stalled",
+            Event::ScreenBlanked { .. } => "screen_blanked",
+            Event::ScreenWoke { .. } => "screen_woke",
             Event::RealmDied { .. } => "realm_died",
             Event::RealmExited { .. } => "realm_exited",
             Event::ConnectionTeardown { .. } => "connection_teardown",
@@ -1722,6 +1773,25 @@ impl Event<'_> {
             Event::VtSwitchStalled { vt, after_ms } => {
                 field_i64(out, "vt", i64::from(vt));
                 field_u64(out, "after_ms", after_ms);
+            }
+            Event::ScreenBlanked { live_grants } => {
+                field_u64(out, "live_grants", live_grants as u64);
+                // Stated on the entry rather than left to a reader who knows
+                // D-033: the two most consequential things about a dark panel
+                // here are that it is NOT a lock and that authority is
+                // unaffected, and a journal that made a reader infer them from
+                // the absence of a `session_locked` line would be inviting the
+                // wrong inference.
+                field_bool(out, "locked", false);
+            }
+            Event::ScreenWoke {
+                dark_ms,
+                outcome,
+                live_grants,
+            } => {
+                field_u64(out, "dark_ms", dark_ms);
+                field_str(out, "outcome", outcome);
+                field_u64(out, "live_grants", live_grants as u64);
             }
             Event::RealmDied { realm, pid, cause } => {
                 field_display(out, "realm", realm);

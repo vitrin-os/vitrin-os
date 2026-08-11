@@ -437,7 +437,11 @@ USAGE:
                                 about a realm nobody chose (WS-E.1.3). Used by
                                 the real-app fidelity test to prove the capture
                                 path adds no distortion; off by default, and not
-                                a wire feature. Written atomically each redraw.
+                                a wire feature. Written atomically, and only
+                                when that realm's view is recomposed: a realm
+                                whose scene has not changed rewrites nothing,
+                                so the file's mtime is not a signal that a
+                                frame landed.
     vitrind [--clipboard-key KEY]
                                 Trigger key for the cross-realm clipboard
                                 (WS-E.2.1): ctrl+shift+KEY promotes the focused
@@ -2926,18 +2930,35 @@ where
     // somewhere the operator did not ask for is the failure the whole audit
     // exists to prevent, and "start anyway with the key disabled" would be a
     // session that silently does not do what its command line says.
-    let screenshot_dir = match screenshot_dir {
+    let screenshot_writer = match screenshot_dir {
         Some(path) => match screenshot::ScreenshotDir::open(&path) {
-            Ok(dir) => {
-                tracing::info!(
-                    dir = %dir.path().display(),
-                    "screenshot key armed: it writes the REALM VIEW -- no trusted band, no \
-                     consent prompt, no lock screen, no status strip, no agent cursor. The \
-                     band's colour is this session's secret and the confined app can read \
-                     any file this core writes (see docs/book/src/limits.md)"
-                );
-                Some(dir)
-            }
+            // The descriptor is handed straight to its worker thread and this
+            // thread never holds it again (issue #240): the encode that used to
+            // stall the compositor for 71.7 ms per press happens there. A
+            // session that cannot spawn that thread refuses to start, on the
+            // same reasoning the audit failure below does -- a screenshot key
+            // that silently does nothing is the failure this whole section
+            // exists to prevent.
+            Ok(dir) => match screenshot::ScreenshotWriter::spawn(dir) {
+                Ok(writer) => {
+                    tracing::info!(
+                        dir = %writer.path().display(),
+                        "screenshot key armed: it writes the REALM VIEW -- no trusted band, no \
+                         consent prompt, no lock screen, no status strip, no agent cursor. The \
+                         band's colour is this session's secret and the confined app can read \
+                         any file this core writes (see docs/book/src/limits.md)"
+                    );
+                    Some(writer)
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "fatal: `--screenshot-dir {}`: cannot start the screenshot writer \
+                         thread: {err}",
+                        path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            },
             Err(err) => {
                 tracing::error!("fatal: `--screenshot-dir {}`: {err}", path.display());
                 return ExitCode::FAILURE;
@@ -2956,7 +2977,7 @@ where
         shim,
         indicator,
         capture_dump,
-        screenshot_dir,
+        screenshot_writer,
     };
 
     let (mut recorder, result) = backend(seed);

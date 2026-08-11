@@ -281,18 +281,29 @@ window — between the realm cap being raised and the output being bound —
 where this was not true and a capture could carry a live sibling's pixels;
 it is closed.
 
-**Every realm renders, whether or not you are looking at it.** A hidden
-realm keeps receiving frame callbacks paced by the output's composites, and
-keeps having its view composed. That is not generosity: a Wayland client
-throttles on frame callbacks, so a realm that stopped being paced would stop
-repainting and its capture would go stale — which the protocol forbids
-outright (`no_surface` is documented as "never a stale frame"). The cost is
-real and is not traded away: on a laptop, up to sixteen apps compositing at
-the output's rate with nobody watching fifteen of them, plus roughly
+**Every realm renders, whether or not you are looking at it — and whether or
+not any agent is connected.** A hidden realm keeps receiving frame callbacks
+paced by the output's composites, and keeps having its view composed. That is
+not generosity: a Wayland client throttles on frame callbacks, so a realm that
+stopped being paced would stop repainting and its capture would go stale —
+which the protocol forbids outright (`no_surface` is documented as "never a
+stale frame"). The second half is the one this page used to leave out: the
+compositor also does **not** ask whether anything will read a composed view.
+With no agent connected, no `--capture-dump` and no `--screenshot-dir`, a
+realm that is painting still has its view composed and cached every round.
+Gating that on whether a grant happens to exist would make what a capture
+returns depend on when the grant appeared, and that trade was declined.
+
+What the compositor does skip is a realm whose scene has not changed since the
+last composite: the cached view is then already byte-for-byte what recomposing
+would produce, so nothing about what any reader is served depends on it. That
+saves the idle case and the sibling case — one realm painting no longer costs
+its fifteen neighbours a composite each — and saves nothing at all for a
+single realm whose app is busy painting. The rest of the cost is real and is
+not traded away: on a laptop, up to sixteen apps compositing at the output's
+rate with nobody watching fifteen of them, plus roughly
 `2 x width x height x 4` bytes of core-side pixels per realm (~590 MiB
-resident at sixteen realms on a 2560x1600 panel, measured). Visibility-aware
-pacing would buy the power back at the cost of capture honesty, and that
-trade was declined.
+resident at sixteen realms on a 2560x1600 panel, measured).
 
 **The agent cursor is drawn only for the visible realm.** The core paints a
 small crosshair where an agent is pointing, so a human can see that an agent
@@ -839,13 +850,24 @@ Four more things belong with it:
   reaches the screenshot hook. The lock one is deliberate rather than
   incidental: a person standing at your locked machine must not be able to write
   the session behind it to a file.
-- **Pressing it stalls the compositor for about 70 ms.** Measured, not
-  estimated: 71.7 ms in a release build to encode one 2560x1600 frame into a
-  12.3 MB PNG, and the encode runs synchronously on the event-loop thread inside
-  the input round. At 240 Hz that is roughly seventeen dropped frames — a
-  visible hitch on every press, and longer on a larger panel. It is bounded (one
-  press, one encode, no queue) and it is not a correctness problem, but a human
-  will see it. Moving the encode off the compositor thread is issue #240.
+- **Pressing it costs the compositor about 4 ms, and the encode no longer
+  happens there at all.** It used to be about 70 ms: 71.7 ms in a release build
+  to encode one 2560x1600 frame into a 12.3 MB PNG, synchronously on the
+  event-loop thread — roughly seventeen dropped frames at 240 Hz, on every
+  press. Since issue #240 the encode runs on a worker thread that owns the
+  screenshot directory, and what the press pays on the compositor thread is one
+  copy of the frame out of the capture cache: **4.2 ms** for the same
+  2560x1600 frame, measured in the same release build (73.9 ms for the encode
+  itself, unchanged, on the same run). That is one frame at 240 Hz rather than
+  seventeen. The remaining cost is the copy, and it scales with pixel count the
+  same way; the queue is bounded at two presses behind the one being encoded,
+  and a press past that is refused and journalled (`encoder_busy`) rather than
+  queued, because each job is a whole frame of memory.
+
+  Both numbers are CPU measurements on the development machine, in a release
+  build — **not** a measurement of a session driving a real panel. What a
+  screenshot does to a bare-metal session's frame timing is knowable only from
+  a run of `docs/drm-bringup.md`, which needs hardware CI does not have.
 - **It DOES work during a dead-man hold, and that is deliberate.** An earlier
   version of this page said otherwise and was simply wrong: `DeadManHook::gate`
   consumes only its own chord's key and delivers every other, so Ctrl+Print
@@ -854,7 +876,13 @@ Four more things belong with it:
   photographing their own screen is not authority — but it means the dead-man
   chord is not a way to stop a screenshot you have already started, and a
   screenshot taken during a hold captures the session as it was before the
-  revocation landed.
+  revocation landed. Since the encode moved to a worker thread this is literal:
+  a hold does not cancel an encode already accepted, and the end of the session
+  waits for it — but only for five seconds. Past that the core stops waiting,
+  the process exits over the top of the worker, and that last file may be
+  truncated. The wait is bounded on purpose and in both halves (the outcome
+  *and* the thread), because a screenshot directory on a mount that has stopped
+  answering must not be able to make `SIGTERM` do nothing.
 
 **Identities are static tokens.** Listed in `principals.toml`. The IDL is
 shaped for SPIFFE/OIDC credentials; the machinery is not here yet.

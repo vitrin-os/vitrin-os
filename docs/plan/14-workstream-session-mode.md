@@ -1875,8 +1875,12 @@ this workstream owns, not inherits:
   question unanswered. Route 3 (`/proc/sysrq-trigger`) is still documented and
   unexecuted and the advisory VKMS rung was never attempted. Four defects came
   out of the run: #257, #258, #259 and #260. **`L7` was written from #257 after
-  the run and has never been executed**, so the fixes for #257–#259 are code
-  with component tests behind them and nothing observed. So a hardware criterion
+  the run, and was itself executed later the same day** at a 20 s timeout: the
+  panel stayed lit on the return and the lock did not raise, so **#257 is
+  settled on hardware** — but by eye, with no figure recorded, so the rung's
+  own question (how long the panel stayed lit) is still unanswered. The fixes
+  for **#258 and #259 remain unobserved**: they concern the wake's log line and
+  recorder pair, and neither was read during that run. So a hardware criterion
   of #223 may now be cited **only at the count and scope actually recorded** —
   never as *"suspend works"* or *"lid works"*.
 - ~~**Several realms run, one is visible, and a capture cannot tell them

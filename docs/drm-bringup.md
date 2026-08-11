@@ -132,11 +132,29 @@ ninety seconds.
 >
 > **The escape route that worked, and is now first:** a shell in the
 > still-running **Hyprland session on tty1**. A `vitrind` session on tty3 does
-> not disturb it, so a terminal there reaches the machine:
+> not disturb it, so a terminal there reaches the machine. **Resolve the PID
+> first and signal that number** — never a `-f` pattern:
 >
 > ```
-> pkill -TERM -f "vitrind --drm"
+> pgrep -x -a vitrind   # -x matches the process NAME, not the command line
+> kill -TERM <PID>      # the one number you just read
 > ```
+>
+> **Do not shorten that to `pkill -TERM -f "vitrind --drm"`**, which this page
+> published until 2026-08-11 and which is broken three ways at once (#260).
+> `pkill -f` matches whole command lines, so the rescuing shell matches its own
+> `argv` and `pkill` — which skips its own PID but not its parent — sends the
+> `TERM` to the rescuer. It also does not match the target on this machine at
+> all: the `~/.local/bin/vitrind` wrapper puts its own arguments
+> (`--shim <path>`, `--blank-idle`) between the binary and `--drm`, so the
+> literal string never appears in the real process's command line — checked
+> read-only against a running session on 2026-08-11, where
+> `pgrep -f 'vitrind --drm'` matched **only the invoking shell** while
+> `pgrep -x -a vitrind` returned the one real PID. And under `systemd-run` there is
+> no shell to strip the quotes for, `--drm` arrives as a second argument,
+> nothing matches, and the unit exits 1 having signalled nothing. Full account
+> in [the recovery runbook](book/src/recovery.md#route-2--a-shell-somewhere-else-and-a-signal).
+> [verified 2026-08-11]
 >
 > **Do not start a run without a live Hyprland-side shell**, regardless. The
 > escape chord is new, unproven code; the shell is the route that has actually
@@ -281,7 +299,7 @@ un-wedge a display, and it needs a shell you can still reach.
 | 4 | `Ctrl+Alt+F3`, log in | A shell on an active VT with a logind session | libseat cannot open the seat |
 | 5 | Confirm the VT is active and the card is the right one | `Active=yes` for your tty3 session | Backend selects `card2` (hazard H1) |
 | 6 | Start `vitrind --drm --consent=interactive` | Panel lights, trusted band on top | **Black screen, no console** — go to Recovery |
-| 7 | Connector + mode | Log names `eDP-1` and the mode it chose | Wrong connector; wrong refresh |
+| 7 | Connector + mode | Log names `eDP-1` and the mode it chose — **paste the literal `mode set:` line** | Wrong connector; wrong refresh |
 | 8 | App maps and repaints | Terminal visible, cursor blinking | Mapped but frozen (frame pacing) |
 | 9 | Trusted band | 8 rows of one colour along the top edge | Band absent — **stop and file it** |
 | 10 | Consent prompt + physical click | Card with a ring in the band's colour; click resolves it | Click does nothing (libinput not routed) |
@@ -420,10 +438,31 @@ result, and recording it is the point.**
 
 ## 7. Connector and mode selected
 
+**Paste the literal line into the record — do not paraphrase it.** Both previous
+runs recorded "the connector name logged empty" in their own words and neither
+kept a copy, so the one artefact that would settle what the panel actually said
+does not exist and #250 could only rule out causes, never explain the
+observation. A paraphrase cannot be argued about; bytes can. The line is
+`vitrind`'s own `mode set: this session owns the panel`, and it carries
+`connector=`, `width`, `height` and `refresh_hz`:
+
+```bash
+# From the escape shell, against the file step 6 tees. Grep the MESSAGE, not
+# the field name: `vitrind` writes SGR escapes into a redirected stderr and
+# they land between `connector` and its `=`, so `grep 'connector='` over this
+# file matches zero lines while `grep connector` matches (#251). `cat -v` shows
+# the escapes instead of letting your terminal swallow them.
+grep -a 'mode set' /tmp/vitrind-drm.log | cat -v
+```
+
+Paste what that prints, verbatim, into the record block at the bottom of this
+page.
+
 | Expected [inferred] | Failure | What it means |
 |---|---|---|
 | The log names `eDP-1` and a mode; the mode matches the first line of `/sys/class/drm/card1-eDP-1/modes` from step 1 | A different connector | Device/connector selection bug (H1) |
 | | The right connector, a lower refresh | The preferred mode was not taken. Not fatal; record the number — the whole GLES+GBM argument in [WS-E §5](plan/14-workstream-session-mode.md) rests on 240 Hz |
+| | The connector name renders empty, as both previous runs recorded | **Keep the bytes and file them.** `connector_name` cannot produce an empty name and nothing in the log stack drops it (#250), so a third sighting with the literal line attached is the only thing that can move this |
 
 ## 8. A real app maps and repaints
 
@@ -475,7 +514,7 @@ Wait five seconds. Come back.
 | `vitrind` survives the switch, the panel comes back, and **the band is the same colour it was before** | A different band colour | The session secret was regenerated, i.e. the human's anchor moved under them. `TrustedIndicator` is generated once per process, so a changed colour means the process restarted — check whether `vitrind` is even the same PID |
 | | `vitrind` died on the switch | `SessionEvent::PauseSession` is unhandled. This is exactly the coupling #218 records: this backend cannot honestly close with that handler unwritten |
 | | Panel comes back black, `vitrind` alive | Master was not reacquired on resume. You still have VT switching — go back to your tty2 escape shell and kill it |
-| | **You cannot switch away at all** | **THIS IS WHAT HAPPENED, 2026-08-09.** The guess this row used to carry — "something is grabbing the keyboard" — was wrong, and following it would have sent you hunting a phantom. Once `vitrind` holds the display the kernel stops handling `Ctrl+Alt+F<n>` entirely; the compositor must call `Session::change_vt`, and D-030(1) refused to implement it. There is nothing to un-grab. Recover with `pkill -TERM -f "vitrind --drm"` from the Hyprland-side shell in Step 0.1 |
+| | **You cannot switch away at all** | **THIS IS WHAT HAPPENED, 2026-08-09.** The guess this row used to carry — "something is grabbing the keyboard" — was wrong, and following it would have sent you hunting a phantom. Once `vitrind` holds the display the kernel stops handling `Ctrl+Alt+F<n>` entirely; the compositor must call `Session::change_vt`, and D-030(1) refused to implement it. There is nothing to un-grab. Recover from the Hyprland-side shell in Step 0.1 — `pgrep -x -a vitrind`, then `kill -TERM <PID>`. **Not** `pkill -f`; step 0 says why |
 
 ## 13. Type a letter (WS-E.3.1)
 
@@ -510,7 +549,7 @@ From the VT `vitrind` is on: `Ctrl+C`. Then `Ctrl+Alt+F1`.
 | Expected | Failure | What it means |
 |---|---|---|
 | `vitrind` exits, the VT returns to a text console, `Ctrl+Alt+F1` restores Hyprland with your windows intact | Hyprland comes back at the wrong resolution or refresh | The panel was left in a mode Hyprland did not re-set. See Recovery R3 |
-| The shim and its app exited too | Stray `vitrin-shim` processes | Realm shutdown ordering. `pkill vitrin-shim` from tty2, and file it |
+| The shim and its app exited too | Stray `vitrin-shim` processes | Realm shutdown ordering. `pkill -x vitrin-shim` from tty2, and file it |
 
 ---
 
@@ -546,12 +585,19 @@ So do not reason about it: kill it. Get to your tty2 escape shell
 (`Ctrl+Alt+F2`) and:
 
 ```bash
-pkill -INT vitrind          # ask it to shut down cleanly first
+pgrep -x -a vitrind               # resolve first: -x matches the NAME, not argv
+PID=<the number you just read>
+kill -INT "$PID"                  # ask it to shut down cleanly first
 sleep 2
-pgrep -a vitrind || echo "gone"
-pkill -KILL vitrind         # only if -INT did nothing
-pkill vitrin-shim           # shims are children of vitrind but check anyway
+kill -0 "$PID" 2>/dev/null && echo "still alive" || echo "gone"
+kill -KILL "$PID"                 # only if -INT did nothing
+pkill -x vitrin-shim              # shims are children of vitrind but check anyway
 ```
+
+Resolve, then signal a number. A `pkill -f` pattern for this process signals the
+rescuer and misses the target — step 0 and
+[the recovery runbook](book/src/recovery.md#route-2--a-shell-somewhere-else-and-a-signal)
+carry the full account (#260).
 
 `-INT` before `-KILL` matters: a clean exit runs `shutdown_realm` and drops
 master in order. `-KILL` leaves the kernel to reclaim master, which usually
@@ -648,8 +694,12 @@ anyone can tell when it was last actually executed.
 Executed:      2026-08-09, by Taha, target laptop, RELEASE build.
 Purpose:       confirm the three fixes, and close checklist items 10 and 11,
                which the first run left NOT TESTED.
-Connector:     EmbeddedDisplayPort (smithay logs it; vitrind's own line still
-               renders it empty -- first run's finding 4, still open)
+Connector:     EmbeddedDisplayPort (smithay logs it; vitrind's own line was
+               again recorded as rendering it empty -- first run's finding 4,
+               still open, but RE-DIAGNOSED 2026-08-11: the code cannot produce
+               an empty name and nothing in the log stack drops it, so the
+               observation stands with no explanation. No copy of the literal
+               line was kept from this run either. See finding 4, #250)
 
   9.  Trusted band ................... PASS -- band at the TOP. The mirror is
                                        fixed (SCANOUT_TRANSFORM = Normal)
@@ -684,7 +734,11 @@ Not on the checklist, and confirmed by accident:
       configured 00aa55, which is exactly xrgb8888 little-endian.
 
 Still open after this run:
-      - vitrind's own log line renders the connector name empty
+      - vitrind's own log line was observed rendering the connector name empty,
+        on both runs, and this is UNEXPLAINED. `connector_name` and the fmt
+        visitor were ruled out as the cause on 2026-08-11 (#250) -- the code
+        cannot produce an empty name -- so what the operator saw has no
+        diagnosis. Neither run kept the literal line; step 7 now requires it
       - the shim never emits dmabuf, so the zero-copy scanout path is dead code
         against every real app
       - refresh_view_cache composes for absent consumers
@@ -695,9 +749,11 @@ Last executed: 2026-08-09, by Taha, on the target laptop (Monster).
                FIRST EXECUTION. The backend had never been run by anyone.
 Kernel:        7.1.5-arch1-2
 Mesa:          1:26.1.6-1
-Connector:     (logged EMPTY -- see finding 4 below; the panel is the laptop's
-               internal eDP, and mode selection worked, but `connector_name`
-               rendered nothing into the log line)
+Connector:     (recorded as logged EMPTY -- see finding 4 below, RE-DIAGNOSED
+               2026-08-11: `connector_name` and the fmt visitor are both ruled
+               out as the cause, the observation is kept and unexplained, and
+               no copy of the literal line was preserved. The panel is the
+               laptop's internal eDP and mode selection worked)
 Selected mode: 2560x1600 @ 240 Hz
 Measured frame cadence: not measured in fps. What WAS measured: `vitrind` at
                99.1% CPU (ps), with the shim forwarding continuous full-frame
@@ -707,7 +763,13 @@ Card opened:   card1 (the iGPU, chosen automatically by udev::primary_gpu --
 
 Observation checklist -- pass/fail and what was seen:
   7.  Connector and mode ............. PASS (2560x1600@240 set on card1);
-                                       connector NAME logged empty
+                                       connector NAME recorded as logged empty
+                                       -- observation kept, cause re-diagnosed
+                                       and unexplained (finding 4, #250). The
+                                       PASS itself is sound: `connector_name`
+                                       is byte-identical at cf0e7ff, the
+                                       commit this run was built from, and it
+                                       cannot render an empty name
   8.  App maps and repaints .......... PASS (solid-client's green square drew)
   9.  Trusted band ................... PASS but MIRRORED -- band drawn along the
                                        BOTTOM edge. The band's fixed position is
@@ -730,10 +792,17 @@ Observation checklist -- pass/fail and what was seen:
       session_locked(chord) -> unlock_attempted(true) -> session_unlocked: the
       lock screen works on bare metal, including the passphrase path
 
-Recovery paths actually used: `pkill -TERM -f "vitrind --drm"` from a shell in
-      the still-running Hyprland session on tty1. VT switching was attempted
-      first, as this page instructed, and did not work. Hyprland and three
-      other working sessions were completely undisturbed throughout.
+Recovery paths actually used: a SIGTERM to vitrind from a shell in the
+      still-running Hyprland session on tty1. VT switching was attempted first,
+      as this page instructed, and did not work. Hyprland and three other
+      working sessions were completely undisturbed throughout.
+      (The exact command typed that day was `pkill -TERM -f "vitrind --drm"`,
+      and the session did end. It is NOT the published form any more and must
+      not be copied from this record -- #260, 2026-08-11: that form signals the
+      rescuing shell, and against a command line produced by the
+      ~/.local/bin/vitrind wrapper it does not match vitrind at all. Whether it
+      matched vitrind on 2026-08-09 or only the shell is not established by
+      anything kept from that run. Resolve the PID and signal it; see step 0.)
 
 Notes: four findings, in severity order --
   1. The image is VERTICALLY MIRRORED (SCANOUT_TRANSFORM = Flipped180).
@@ -747,7 +816,27 @@ Notes: four findings, in severity order --
      composite -- at 240 Hz that is ~3.9 GB/s, which is precisely the cost
      #218's decision 1 calculated in advance and asked to be measured here.
      How much is the test client and how much is real is being investigated.
-  4. `connector=` logs empty.
+  4. `connector=` logs empty. **RE-DIAGNOSED 2026-08-11 (#250): the cause
+     this finding named does not exist. The observation is kept and is now
+     unexplained.** `connector_name` cannot return a name-less string. It is
+     `format!("{}-{}", info.interface().as_str(), info.interface_id())`, and
+     `Interface::as_str` in the pinned `drm 0.14.1` is a total match over all
+     21 variants returning a non-empty `&'static str` for every one -- `"eDP"`
+     for `EmbeddedDisplayPort`, `"Unknown"` for `Unknown`. The floor of that
+     `format!` is `"Unknown-0"`; neither `""` nor a bare `"-1"` is reachable,
+     so neither "the interface kind formatted empty" nor "the connector id was
+     missing" survives. Nothing between it and stderr drops the value either:
+     `init_tracing` installs the stock `tracing_subscriber::fmt()` with no
+     custom formatter, layer or visitor, `backend/drm.rs` uses the ordinary
+     `tracing` macros, and there is no shadowing macro anywhere in `crates/`.
+     What was on the operator's screen is therefore NOT explained by this
+     code, and neither run kept a copy of the literal line, so it cannot be
+     recovered now. One adjacent obstacle to reading it back is filed as #251
+     (`vitrind` writes ANSI escapes into a redirected stderr, so `grep
+     'connector='` over the file step 6 tees matches zero lines) -- that is an
+     obstacle, not an established cause of what was seen. Step 7 now requires
+     the literal `mode set:` line to be pasted into the record so a third run
+     can be argued about from bytes.
 ```
 
 > **This runbook HAS been executed: 2026-08-09, on the target machine, results

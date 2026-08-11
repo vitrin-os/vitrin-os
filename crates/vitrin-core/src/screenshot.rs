@@ -149,15 +149,19 @@
 //!
 //! **What happens to a pending encode.** Two answers, and both are decisions:
 //!
-//! - **The session ending waits for it.** [`crate::session::Runtime::into_recorder`]
-//!   — the one funnel every backend leaves through — calls
-//!   [`ScreenshotWriter::finish`], which stops accepting work, waits up to
-//!   [`FINISH_DEADLINE`] for the encodes already accepted, and journals each
-//!   one. So a screenshot taken a moment before `SIGTERM` still lands on disk
-//!   *and* in the log of the run it belongs to. Past the deadline the process
-//!   exits with a `write(2)` possibly half-done — a truncated PNG, which is the
-//!   honest outcome of a filesystem that has stopped answering, and is
-//!   journalled as `writer_timeout` rather than passed over in silence.
+//! - **The session ending waits for it, for five seconds and not a moment
+//!   longer.** [`crate::session::Runtime::into_recorder`] — the one funnel
+//!   every backend leaves through — calls [`ScreenshotWriter::finish`], which
+//!   stops accepting work, waits up to [`FINISH_DEADLINE`] for the encodes
+//!   already accepted, and journals each one. So a screenshot taken a moment
+//!   before `SIGTERM` still lands on disk *and* in the log of the run it
+//!   belongs to. Past the deadline the worker is **detached rather than
+//!   joined** ([`join_before`]) and the process exits over the top of it, with
+//!   a `write(2)` possibly half-done — a truncated PNG, which is the honest
+//!   outcome of a filesystem that has stopped answering, and is journalled as
+//!   `writer_timeout` rather than passed over in silence. The deadline covers
+//!   the thread as well as its outcomes precisely because a `join` after the
+//!   timeout would put the hang back where it was.
 //! - **The dead-man switch does not cancel it, deliberately.** The off-switch
 //!   destroys *authority*, and a human photographing their own screen is not
 //!   authority — the same reasoning that keeps [`crate::deadman::apply`] from
@@ -706,7 +710,51 @@ const MAX_QUEUED_ENCODES: usize = 2;
 /// [`MAX_QUEUED_ENCODES`] + 1 encodes at the measured 72 ms is a fifth of a
 /// second — so reaching it means something outside this process is wrong, and
 /// the timeout is journalled as `writer_timeout` rather than passed over.
+///
+/// **This one deadline covers the wait for the thread as well as the wait for
+/// its outcomes**, and that is not a detail: an earlier draft of this file
+/// ended `finish` with a plain `worker.join()` after the timed drain, which
+/// made the whole deadline decorative — the measured behaviour was a `finish`
+/// that journalled `writer_timeout` at five seconds and then blocked for
+/// another fifteen inside `join`, so `SIGTERM` on a hung mount never ended the
+/// session. [`join_before`] is what makes the sentence above true of the code.
 const FINISH_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How often [`join_before`] asks whether the worker has returned.
+///
+/// The ordinary path costs at most one of these: by the time the last outcome
+/// has been received the worker has only to see its input channel closed and
+/// fall out of its loop. It is a poll because `std` has no `join_timeout`, and
+/// the shape that avoids polling — waiting for the worker's report channel to
+/// disconnect — would still leave a `join` whose bound rests on an argument
+/// about thread teardown rather than on a check.
+const JOIN_POLL: Duration = Duration::from_millis(1);
+
+/// Join `worker`, but **never past `deadline`**; `false` means the deadline
+/// arrived first and the thread was detached instead.
+///
+/// Dropping a `JoinHandle` detaches: the thread keeps running and the process
+/// exits over the top of it, which for this worker means the `write(2)` it is
+/// stuck in never completes and its file is left truncated. That is the
+/// outcome [`FINISH_DEADLINE`] chooses on purpose — the alternative is a
+/// session that cannot be ended — and it is the reason this function exists
+/// rather than a bare `join`.
+///
+/// `is_finished` first, `join` only after it answers yes: the join is then a
+/// reap of a thread whose body has already returned, not a wait on anything
+/// the worker does.
+fn join_before(worker: std::thread::JoinHandle<()>, deadline: std::time::Instant) -> bool {
+    while !worker.is_finished() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            // Detached. `worker` is dropped here, which does not wait.
+            return false;
+        }
+        std::thread::sleep(left.min(JOIN_POLL));
+    }
+    let _ = worker.join();
+    true
+}
 
 /// One frame on its way to the worker.
 ///
@@ -881,16 +929,28 @@ impl ScreenshotWriter {
     /// every one of them.
     ///
     /// Idempotent, so the session's shutdown funnel and a later drop can both
-    /// call it. The wait is bounded by [`FINISH_DEADLINE`]; a job still
-    /// unreported when it expires is returned as `writer_timeout`, because a
-    /// screenshot the human asked for and never got is exactly the failure this
-    /// module refuses to drop silently.
+    /// call it. **The whole call is bounded by [`FINISH_DEADLINE`]** — the wait
+    /// for outcomes and the wait for the thread itself, which is the half a
+    /// plain `join` used to leave unbounded. A job still unreported when the
+    /// deadline expires is returned as `writer_timeout`, because a screenshot
+    /// the human asked for and never got is exactly the failure this module
+    /// refuses to drop silently.
+    ///
+    /// `writer_timeout` means **"no outcome before the deadline"**, not "no
+    /// file": a worker detached mid-`write(2)` may yet have produced a whole
+    /// PNG, and the process is on its way out with no way to learn which. The
+    /// label is what this thread honestly knows.
     pub fn finish(&mut self) -> Vec<ScreenshotOutcome> {
+        self.finish_by(std::time::Instant::now() + FINISH_DEADLINE)
+    }
+
+    /// [`Self::finish`] against an explicit deadline, so a test can hold the
+    /// bound to a fraction of a second instead of five.
+    fn finish_by(&mut self, deadline: std::time::Instant) -> Vec<ScreenshotOutcome> {
         // Dropping the sender is the stop signal: the worker's `recv` ends once
         // the queue is drained, and only then.
         self.jobs = None;
         let mut done = Vec::new();
-        let deadline = std::time::Instant::now() + FINISH_DEADLINE;
         while !self.inflight.is_empty() {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -906,6 +966,25 @@ impl ScreenshotWriter {
                 Err(_) => break,
             }
         }
+        // The thread itself, under the SAME deadline and before anything is
+        // written off: joining an encoder that has not answered is the wait
+        // this deadline exists to refuse, and a worker that did finish inside
+        // it may have reported an outcome the loop above missed by a hair.
+        if let Some(worker) = self.worker.take() {
+            if !join_before(worker, deadline) {
+                tracing::warn!(
+                    dir = %self.path.display(),
+                    "the screenshot writer thread was still running at the shutdown deadline \
+                     and has been detached: the session ends now and the file it was writing \
+                     may be truncated"
+                );
+            }
+        }
+        // Whatever landed between the drain loop's last timeout and the join.
+        while let Ok(outcome) = self.outcomes.try_recv() {
+            self.inflight.pop_front();
+            done.push(outcome);
+        }
         for (realm, width, height) in std::mem::take(&mut self.inflight) {
             tracing::warn!(
                 dir = %self.path.display(),
@@ -919,15 +998,44 @@ impl ScreenshotWriter {
                 result: Err("writer_timeout"),
             });
         }
-        if let Some(worker) = self.worker.take() {
-            // The worker holds no lock the loop needs and the queue it is
-            // draining is empty by now in every case but the timeout, where the
-            // join is the wait that keeps a half-written PNG from being the
-            // ordinary outcome of an exit.
-            let _ = worker.join();
-        }
         done
     }
+
+    /// A writer whose worker has **accepted a frame and stopped answering** —
+    /// the hung mount [`FINISH_DEADLINE`] exists for, which no directory a test
+    /// can create will produce.
+    ///
+    /// The fabrication is the block, not the plumbing: the channels, the
+    /// bookkeeping and the [`Self::finish_by`] path are the shipped ones, and
+    /// the worker is a real thread holding a real `JoinHandle`. It releases
+    /// itself after [`Self::WEDGE_RELEASE`] whatever the test does, so a
+    /// regression fails the suite rather than wedging the runner.
+    #[cfg(test)]
+    fn wedged_for_test() -> (Self, std::sync::mpsc::Sender<()>) {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let (jobs, inbox) = std::sync::mpsc::sync_channel::<EncodeJob>(MAX_QUEUED_ENCODES);
+        let (report, outcomes) = std::sync::mpsc::channel::<ScreenshotOutcome>();
+        let worker = std::thread::Builder::new()
+            .name("vitrind-screenshot-wedged".to_string())
+            .spawn(move || {
+                let _job = inbox.recv();
+                let _ = blocked.recv_timeout(Self::WEDGE_RELEASE);
+                drop(report);
+            })
+            .expect("the fixture thread starts");
+        let writer = Self {
+            jobs: Some(jobs),
+            outcomes,
+            worker: Some(worker),
+            inflight: std::collections::VecDeque::new(),
+            path: PathBuf::from("/wedged-fixture-never-opened"),
+        };
+        (writer, release)
+    }
+
+    /// The safety valve on [`Self::wedged_for_test`]'s block.
+    #[cfg(test)]
+    const WEDGE_RELEASE: Duration = Duration::from_secs(2);
 }
 
 impl Drop for ScreenshotWriter {
@@ -935,7 +1043,8 @@ impl Drop for ScreenshotWriter {
     /// rig, or a panic on the way out. It cannot journal (the recorder has
     /// already gone back to `run_session` by then, which is why `finish` exists
     /// as a named path at all), but it still waits, so the last file of a
-    /// session is whole.
+    /// session is whole. Bounded by the same [`FINISH_DEADLINE`], so a drop on
+    /// a wedged filesystem cannot hang an exit either.
     fn drop(&mut self) {
         if self.worker.is_some() {
             let _ = self.finish();
@@ -1549,6 +1658,90 @@ mod tests {
         // Idempotent: a later drop must not wait again or double-report.
         assert!(writer.finish().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A worker that has stopped answering does not hold the session open.**
+    ///
+    /// This is the failure the first draft of the change shipped: `finish` ran
+    /// its five-second `recv_timeout` loop, journalled `writer_timeout`, and
+    /// then fell into a plain `worker.join()` that waited for however long the
+    /// `write(2)` took — measured at 20.008 s against a 5 s deadline, and
+    /// unbounded in the case the deadline is written for, a mount that never
+    /// answers at all. `vitrind` would then not exit on `SIGTERM`.
+    ///
+    /// The fixture wedges the worker rather than the filesystem, because no
+    /// directory a test can create blocks a write forever; everything else on
+    /// the path — the channels, the in-flight bookkeeping, `finish_by` — is the
+    /// shipped code, and the deadline is shortened rather than mocked.
+    ///
+    /// **Both halves are asserted, and they fail differently.** The elapsed
+    /// bound is the bug: against a plain `join` it is the fixture's own release
+    /// (`WEDGE_RELEASE`) rather than the deadline. The outcome is the promise
+    /// `finish`'s callers rely on: the accepted press is still accounted for,
+    /// under the label that says this thread never learned what happened to it.
+    #[test]
+    fn a_wedged_worker_does_not_hold_the_session_open() {
+        let (mut writer, release) = ScreenshotWriter::wedged_for_test();
+        let realm = RealmId::new("realm-0");
+        writer
+            .submit(&realm, ScreenshotGesture::Full, &[0u8; 16], 2, 2)
+            .expect("the queue is empty, so the frame is accepted");
+
+        let deadline = Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        let outcomes = writer.finish_by(start + deadline);
+        let waited = start.elapsed();
+
+        assert!(
+            waited < ScreenshotWriter::WEDGE_RELEASE / 2,
+            "shutting down past a wedged encoder took {waited:?} against a {deadline:?} \
+             deadline: the deadline bounds nothing if the wait for the thread past it is a \
+             plain `join`, which is what turned SIGTERM into a hang"
+        );
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the accepted press is still accounted for"
+        );
+        assert_eq!(
+            outcomes[0].result.as_ref().err(),
+            Some(&"writer_timeout"),
+            "a frame whose outcome never arrived is journalled as one"
+        );
+        assert_eq!(outcomes[0].realm, realm);
+        // And the writer is spent: the `Drop` below must not wait a second time.
+        assert!(writer.finish().is_empty());
+        drop(release);
+    }
+
+    /// [`join_before`] is the bound itself, held on its own so the property
+    /// survives a refactor of everything around it: a thread that is still
+    /// running when the deadline arrives is reported as **not joined**, and the
+    /// call returns instead of waiting for it.
+    #[test]
+    fn a_thread_still_running_at_the_deadline_is_reported_as_detached() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::Builder::new()
+            .name("wedged-fixture".to_string())
+            .spawn(move || {
+                let _ = blocked.recv_timeout(ScreenshotWriter::WEDGE_RELEASE);
+            })
+            .expect("the fixture thread starts");
+        let start = std::time::Instant::now();
+        assert!(
+            !join_before(stuck, start + Duration::from_millis(50)),
+            "a thread still running at the deadline must be detached, not joined"
+        );
+        assert!(start.elapsed() < ScreenshotWriter::WEDGE_RELEASE / 2);
+        drop(release);
+
+        // ...and a thread that has finished is joined rather than detached, or
+        // the bound above would be satisfied by never joining anything.
+        let done = std::thread::spawn(|| {});
+        assert!(join_before(
+            done,
+            std::time::Instant::now() + FINISH_DEADLINE
+        ));
     }
 
     /// A degenerate view is refused with a label, and nothing is created.

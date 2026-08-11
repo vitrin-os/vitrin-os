@@ -437,7 +437,11 @@ USAGE:
                                 about a realm nobody chose (WS-E.1.3). Used by
                                 the real-app fidelity test to prove the capture
                                 path adds no distortion; off by default, and not
-                                a wire feature. Written atomically each redraw.
+                                a wire feature. Written atomically, and only
+                                when that realm's view is recomposed: a realm
+                                whose scene has not changed rewrites nothing,
+                                so the file's mtime is not a signal that a
+                                frame landed.
     vitrind [--clipboard-key KEY]
                                 Trigger key for the cross-realm clipboard
                                 (WS-E.2.1): ctrl+shift+KEY promotes the focused

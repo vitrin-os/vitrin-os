@@ -36,12 +36,16 @@ that reads as tested when it is not is worse than one that admits it:
 - **[inferred]** — from the kernel's own source or documentation, or from a
   configuration that is in place but whose *behaviour* was not exercised here.
 
-**Two of the four routes have now been exercised; two have not.** Route 1 was
-run 10 times out of 10 on 2026-08-11 (L1 below). Route 2 recovered the first
-bare-metal session on 2026-08-09 — though the command this page published for it
-until 2026-08-11 was wrong, see the route itself. **Route 3 is documented and
-unexecuted** and **route 4 has never been used.** Treat those two as careful
-predictions.
+**Route 2 is still the only route that has ever recovered a wedged session**, on
+2026-08-09 — and the command this page published for it until 2026-08-11 was
+wrong, so read the route itself before you rely on it. Route 1's chord is now
+confirmed to work **from a healthy session** (10 of 10 on 2026-08-11, L1 below;
+5 more on 2026-08-09), which is a different claim from *it gets you out of a
+wedge*: the one deliberate wedge this page records, L6, defeated the chord
+exactly as route 1 warns it would. **Route 3 is documented and unexecuted** and
+**route 4 has never been used.** Treat every route but 2 as a careful
+prediction, and treat route 2's published command as tested only in its `pgrep`
+half.
 
 ## Which route, by symptom
 
@@ -82,6 +86,15 @@ Four things worth knowing before you rely on it:
   `vt_switch_stalled`. [verified: `crates/vitrin-core/src/recorder.rs`]
 - **If that red band appears, this route is gone.** Go to route 2.
 
+**Confirmed working; not confirmed as an escape.** All 19 chords on record — 10
+in L1 below, 9 in the bring-up page's item 12 — were pressed against a *healthy*
+compositor, and every one behaved. The one deliberate wedge on record, L6, is
+exactly the case this route exists for, and the chord did not get the operator
+out of it: a `SIGSTOP`ed compositor cannot call `Session::change_vt`, because
+the code that would call it is inside the stopped process. That is the boundary
+of what a compositor-implemented chord can do rather than a defect in it, and it
+is why route 2 is below this one on the page and still ahead of it in evidence.
+
 ## Route 2 — a shell somewhere else, and a signal
 
 **This is the only route that has ever actually recovered a session.** On
@@ -118,13 +131,15 @@ exercise the VT chord before you need it.
 >   parent** — so `-TERM` ends the rescuer at the moment the rescue is being
 >   attempted.
 > - **On this machine it never matches the target at all.** The
->   `~/.local/bin/vitrind` wrapper inserts its own arguments (`--shim <path>`,
->   `--blank-idle`) between the binary and `--drm`, so the literal string
->   `vitrind --drm` does not appear anywhere in the real process's command
->   line — it is not a pattern that describes this process. Checked read-only
->   against the running session: `pgrep -f 'vitrind --drm'` returned **only the
->   invoking shell**, while `pgrep -x -a vitrind` returned the one real PID.
->   [verified 2026-08-11]
+>   `~/.local/bin/vitrind` wrapper inserts `--shim <path>` between the binary
+>   and whatever you typed, so the literal string `vitrind --drm` does not
+>   appear anywhere in the real process's command line — it is not a pattern
+>   that describes this process. One injected argument is enough; the wrapper's
+>   other job is environment variables, which never reach `argv` at all, and
+>   `--blank-idle` is the operator's own flag, which lands *after* `--drm`.
+>   Checked read-only against the running session: `pgrep -f 'vitrind --drm'`
+>   returned **only the invoking shell**, while `pgrep -x -a vitrind` returned
+>   the one real PID. [verified 2026-08-11]
 > - **Wrapped in a unit it is silently empty.** `systemd-run` does not go
 >   through a shell, so the quotes are stripped and `--drm` arrives as a second
 >   argument. `pkill` takes one pattern, matches nothing, and the unit exits
@@ -445,10 +460,10 @@ Three rungs deserve their own warnings.
 
 **L2 and L3 came up short on their only run.** 2026-08-11 managed 4 of 5
 suspend/resume cycles and 2 of 5 lid cycles, and one of those two lid cycles
-never reached sleep at all. Every cycle that ran returned a working panel, so
-nothing here is a failure — but the counts this table asks for have not been
-met, and two lid samples establish nothing about short lid closes. Do them with
-the escape shell open and with nothing unsaved.
+never reached sleep at all. Every cycle that *suspended* came back with a
+working panel, so nothing here is a failure — but the counts this table asks for
+have not been met, and one usable lid sample establishes nothing about short lid
+closes. Do them with the escape shell open and with nothing unsaved.
 
 **L6's answer is easy to lose, and it was lost.** On 2026-08-11 the wedge
 recovered in ~69 s and **which route did it could not be reconstructed
@@ -467,7 +482,8 @@ record, not a mishap.
 
 These were owed to issue #223 and were pasted into it on **2026-08-11**; the run
 is recorded below. Two of them are still owed at their stated counts — L2 ran 4
-of 5 cycles and L3 ran 2 of 5 — and L6's answer was not recoverable at all:
+of 5 cycles, and L3 ran 2 of 5 of which only one suspended, so it is **one
+usable sample** — and L6's answer was not recoverable at all:
 
 - L1: how many of 10 switches survived, and the band colour on each return.
 - L2: how many of 5 suspend/resume cycles came back with a working panel, and
@@ -505,8 +521,9 @@ only the [Login] header, so these are the defaults in effect):
     Delay inhibitors on sleep: NetworkManager, rtkit-daemon, upowerd
 
   L1. 10 VT switches ............. 10/10 survived; band colour stable? YES
-  L2. suspend/resume ............. 4/4 panel returned  (see shortfall below)
-  L3. lid close/open ............. 2/2 behaved as L2   (see shortfall below)
+  L2. suspend/resume ............. 4 of 5 cycles run; 4/4 panel returned
+  L3. lid close/open ............. 2 of 5 cycles run; 1 suspended and behaved
+                                   as L2, 1 never reached Sleep at all
   L4. Blank and unblank .......... blank after 61.2 s; unblank OK
   L5. Blank did not lock ......... PASS (session as left, no lock card)
   L6. Deliberate wedge ........... recovered in ~69 s, route INDETERMINATE
@@ -515,15 +532,29 @@ SysRq step 1 (`printf 's' | sudo tee /proc/sysrq-trigger`) executed? NO
     (still documented and unexecuted)
 ```
 
-**L1 — 10/10, and the chord is confirmed on hardware.** 19 VT switches across
-two runs. **0 refused, 0 stalled.** Zero stalls is a positive result rather than
-absent instrumentation: `VtSwitchStalled` is live code fired from a timer for
-the case where `libseat_switch_session` returns `Ok` and no `PauseSession`
-follows — the "chord appears to work and does not" shape that trapped the
-maintainer on the first bare-metal run. It never fired. Chord → seat pause
+**L1 — 10/10, and the chord is confirmed on hardware from a healthy session.**
+**0 refused, 0 stalled** over this run's 10, out of 19 chords across the two
+runs. The other nine are on the bring-up page's item 12, which records them as
+5 switches honoured *plus 4 `vt_switch_refused already_here`* — the human
+chording the VT he was already on, i.e. the code declining a no-op rather than a
+switch failing. The two records are quoted side by side rather than merged into
+one refusal count, because only the operator's recorder logs can say whether the
+`0 refused` above was scoped to this run or to all 19, and nobody has gone back
+to them.
+
+Zero stalls is a positive result rather than absent instrumentation:
+`VtSwitchStalled` is live code fired from a timer for the case where
+`libseat_switch_session` returns `Ok` and no `PauseSession` follows — the "chord
+appears to work and does not" shape that trapped the maintainer on the first
+bare-metal run. It never fired. Chord → seat pause
 latency, n=9: **min 209 ms, median 240 ms, max 312 ms.** Pause/activate pairing
 is exact: 9 pauses against 8 activates in the second run, the missing activate
 being the pause the session was left in.
+
+**What L1 does not establish is route 1.** Every one of those 19 chords was
+pressed against a *healthy* compositor. The rung asks whether the chord works,
+not whether it gets you out — and L6 below, the only wedge on record, is the
+case where it does not.
 
 **L2 — 4 cycles, not 5.** Kernel resume → `vitrind` reclaimed the panel:
 
@@ -549,6 +580,13 @@ behaved as L2 *when they suspended*, but only one of the two suspended at all:
 
 Whether a short lid close reliably does not suspend on this machine is **not
 established by two samples** and is not claimed here.
+
+**The summary line above is corrected, not transcribed.** The #223 comment this
+record comes from writes L3's one-line summary as `2/2 behaved as L2` while its
+own detail — the two bullets above, which are verbatim — says only one of the
+two suspended at all. The detail is what is right, so the line in the block
+reads `1 suspended and behaved as L2, 1 never reached Sleep at all`. Against a
+rung asking for 5 cycles, L3 is **1 usable sample**.
 
 **L4 / L5 — pass, and L4 found the run's most useful defect.** Blank fired at
 61.2 s against `--blank-idle 60`. The panel returned on ordinary physical input,

@@ -424,9 +424,13 @@ pub(crate) struct Kernel {
     ///
     /// Since issue #240 it is a *writer*, not the directory: the audited
     /// descriptor lives on the worker thread and this half can only submit a
-    /// frame and read back what happened to it. That is narrower than what it
-    /// replaced -- no thread in the process now holds both the realm's pixels
-    /// and a way to open a file in that directory.
+    /// frame and read back what happened to it. That is narrower in the one
+    /// sense that holds against a same-uid app -- every write lands relative
+    /// to a descriptor opened `O_DIRECTORY|O_NOFOLLOW`, with
+    /// `O_CREAT|O_EXCL|O_NOFOLLOW` and mode 600 -- and **not** in the sense of
+    /// ambient authority (issue #261): this process is unsandboxed and
+    /// single-uid, so moving a `ScreenshotDir` between threads takes nothing
+    /// away from either. See [`crate::screenshot`]'s module docs.
     pub screenshot_writer: Option<crate::screenshot::ScreenshotWriter>,
 }
 

@@ -129,9 +129,19 @@
 //! - **The audited directory descriptor moves to the worker and the compositor
 //!   thread no longer holds one.** [`ScreenshotDir`] is owned by the worker for
 //!   its whole life; [`ScreenshotWriter`] holds a sender, a receiver and a path
-//!   for log lines. So after this change there is no thread in the process that
-//!   can both reach a realm's pixels and open a file in that directory — which
-//!   is narrower than what shipped, not wider.
+//!   for log lines. What that buys is **TOCTOU and symlink resistance**: every
+//!   file is created relative to a descriptor opened `O_DIRECTORY|O_NOFOLLOW`
+//!   and held open for the session, with `O_CREAT|O_EXCL|O_NOFOLLOW` and mode
+//!   600, so a same-uid app planting an entry at a predictable name cannot
+//!   redirect the write. **What it does not buy is a smaller filesystem reach,
+//!   and the first draft of this paragraph claimed it did** (issue #261): it
+//!   said no thread could both reach a realm's pixels and open a file in that
+//!   directory. `vitrind` runs unsandboxed as a single uid — no namespaces, no
+//!   seccomp, no Landlock (`docs/book/src/limits.md` D9) — so any thread here
+//!   can name any path and call `File::create` on it, with or without a
+//!   [`ScreenshotDir`] to hand. A thread boundary cannot take ambient
+//!   filesystem authority away from a thread; only a sandbox can, and this
+//!   process has none.
 //! - **Nothing new can reach the encoder.** The worker's only input is
 //!   [`EncodeJob`], a private type with no public constructor whose only
 //!   producer is [`ScreenshotWriter::submit`], which still takes a

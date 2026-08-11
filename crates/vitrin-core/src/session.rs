@@ -196,15 +196,17 @@ pub(crate) struct RuntimeSeed {
     /// nothing is written to the bare `PATH` at all — every dump names the
     /// realm it is of. See [`capture_dump_path`].
     pub capture_dump: Option<PathBuf>,
-    /// The audited `--screenshot-dir` (WS-E.2.4, issue #216), already opened
-    /// and validated by `main`'s argument parser, or `None` when the operator
-    /// passed no flag -- in which case the screenshot key writes nothing.
+    /// The audited `--screenshot-dir` (WS-E.2.4, issue #216), already opened,
+    /// validated and handed to its worker thread by `main`, or `None` when the
+    /// operator passed no flag -- in which case the screenshot key writes
+    /// nothing and no worker exists.
     ///
-    /// Carried as an **open descriptor**, not a path: by the time it reaches
-    /// here the only thing that can be done with it is write a file the core
-    /// itself named, into the directory the core itself resolved before any
-    /// client existed.
-    pub screenshot_dir: Option<crate::screenshot::ScreenshotDir>,
+    /// Carried as a **writer over an open descriptor**, not a path: by the time
+    /// it reaches here the only thing that can be done with it is submit a
+    /// frame, which becomes a file the core itself named, in the directory the
+    /// core itself resolved before any client existed. Since issue #240 the
+    /// descriptor is not even on this thread -- see [`crate::screenshot`].
+    pub screenshot_writer: Option<crate::screenshot::ScreenshotWriter>,
 }
 
 /// Everything one running session owns that is not presentation, living in
@@ -357,7 +359,13 @@ pub(crate) struct Kernel {
     /// takes a path. The dead-man switch deliberately does **not** clear it --
     /// the off-switch destroys authority, and a human's own screenshot key is
     /// not authority.
-    pub screenshot_dir: Option<crate::screenshot::ScreenshotDir>,
+    ///
+    /// Since issue #240 it is a *writer*, not the directory: the audited
+    /// descriptor lives on the worker thread and this half can only submit a
+    /// frame and read back what happened to it. That is narrower than what it
+    /// replaced -- no thread in the process now holds both the realm's pixels
+    /// and a way to open a file in that directory.
+    pub screenshot_writer: Option<crate::screenshot::ScreenshotWriter>,
 }
 
 /// The realm's live shim session: the protocol server, the out-of-band send
@@ -899,7 +907,7 @@ impl<H: PreemptionHook> Runtime<H> {
             // rest here, so the runtime deliberately drops it.
             indicator: _,
             capture_dump,
-            screenshot_dir,
+            screenshot_writer,
         } = seed;
         Self {
             kernel: Kernel {
@@ -913,7 +921,7 @@ impl<H: PreemptionHook> Runtime<H> {
                 clipboard,
                 clipboard_slot: crate::clipboard::ClipboardSlot::new(),
                 screenshot,
-                screenshot_dir,
+                screenshot_writer,
             },
             listener: Some(listener),
             conns: BTreeMap::new(),
@@ -961,7 +969,30 @@ impl<H: PreemptionHook> Runtime<H> {
     /// is no registration left to leak.
     pub fn into_recorder(mut self) -> Recorder {
         self.teardown_open_connections();
+        self.finish_pending_screenshots();
         self.kernel.recorder
+    }
+
+    /// Wait out the screenshot encodes this session accepted and journal them
+    /// (issue #240).
+    ///
+    /// **Here, in the funnel every backend leaves through, and not in a `Drop`
+    /// impl**, for [`Self::teardown_open_connections`]'s reason: a drop runs
+    /// after `run_session` has taken the recorder back, so it could wait but
+    /// could not record. A screenshot the human took a moment before `SIGTERM`
+    /// must land on disk *and* in the log of the run it belongs to; the
+    /// bounded wait that makes the first true is
+    /// [`crate::screenshot::ScreenshotWriter::finish`]'s, and this is what
+    /// makes the second true.
+    ///
+    /// Split out rather than inlined so a test can reach the same wait without
+    /// consuming the runtime -- again exactly as the connection teardown is.
+    pub(crate) fn finish_pending_screenshots(&mut self) {
+        let Some(writer) = self.kernel.screenshot_writer.as_mut() else {
+            return;
+        };
+        let outcomes = writer.finish();
+        record_screenshot_outcomes(&mut self.kernel, outcomes);
     }
 
     /// Run [`PrincipalServer::teardown`] for every connection still open,
@@ -3488,6 +3519,24 @@ pub(crate) fn resume_physical_seat(grab: &std::cell::RefCell<ConsentGrab>, now: 
 /// with.** There is no principal, no facet and no verb in this function, and
 /// `enforcement.rs`'s source scan asserts that this file and
 /// `crate::screenshot` never name the chokepoint's identifiers.
+///
+/// # What this function no longer does (issue #240)
+///
+/// **It does not encode.** It copies the cache entry and hands it to
+/// [`crate::screenshot::ScreenshotWriter`], whose thread runs the PNG encoder
+/// and the `write(2)`; the measured 71.7 ms this used to spend inside the input
+/// round is now a `memcpy` and a channel send. What it still owns is every
+/// decision that needs the compositor's state — which realm, whether a
+/// directory exists, whether that realm has a view — because none of those are
+/// answerable from a worker, and the refusals for them are still journalled
+/// here, synchronously, under the labels they always had.
+///
+/// The outcome of an accepted job is journalled later, by
+/// [`journal_screenshot_outcomes`] on a subsequent dispatch round. That is the
+/// one observable change: `screenshot_written` lands a few milliseconds after
+/// the press rather than inside it. It is still exactly one entry per accepted
+/// gesture, and the session's own shutdown funnel waits for the stragglers so
+/// none of them can fall outside the run they belong to.
 fn drain_screenshot_gestures<H: PreemptionHook>(
     runtime: &mut Runtime<H>,
     scenes: &crate::scene::realms::RealmScenes,
@@ -3516,7 +3565,7 @@ fn drain_screenshot_gestures<H: PreemptionHook>(
                 .recorder
                 .record(crate::recorder::Event::ScreenshotFailed { realm, reason });
         };
-        let Some(dir) = kernel.screenshot_dir.as_mut() else {
+        let Some(writer) = kernel.screenshot_writer.as_mut() else {
             // The key fired and the session has nowhere to put a file. Not an
             // error the operator can act on mid-session, but the alternative
             // is a key that silently does nothing, which is worse.
@@ -3533,20 +3582,68 @@ fn drain_screenshot_gestures<H: PreemptionHook>(
             fail(kernel, Some(realm_id), "no_view");
             continue;
         };
-        match crate::screenshot::capture_to_file(dir, gesture, rgba, width, height) {
+        // The frame is copied here and encoded there. A refusal at the queue is
+        // journalled with the same immediacy the three above are, because a
+        // press that produced no job will produce no outcome either and would
+        // otherwise leave the log silent about a key the human pressed.
+        if let Err(reason) = writer.submit(realm_id, gesture, rgba, width, height) {
+            fail(kernel, Some(realm_id), reason);
+        }
+    }
+}
+
+/// Journal every screenshot the worker has finished since the last round
+/// (issue #240).
+///
+/// The flight recorder is kernel state and stays single-threaded: the worker
+/// reports a [`crate::screenshot::ScreenshotOutcome`] and *this* function, on
+/// the compositor thread, turns it into the same `screenshot_written` /
+/// `screenshot_failed` entry [`drain_screenshot_gestures`] used to write
+/// inline. Handing a second thread a way to write the journal would be a much
+/// larger change to the TCB than moving an encode, and it buys nothing.
+///
+/// Called from [`post_dispatch`] — every dispatch round, before the dirty gate,
+/// because a finished encode is not a reason to composite and must not become
+/// one. On a session with no `--screenshot-dir` there is no writer and this is
+/// a `None` check.
+fn journal_screenshot_outcomes<H: PreemptionHook>(runtime: &mut Runtime<H>) {
+    let Some(writer) = runtime.kernel.screenshot_writer.as_mut() else {
+        return;
+    };
+    let outcomes = writer.take_outcomes();
+    record_screenshot_outcomes(&mut runtime.kernel, outcomes);
+}
+
+/// Turn finished encodes into journal entries — the one place either entry is
+/// written, so the shutdown flush and the per-round drain cannot describe the
+/// same event two different ways.
+fn record_screenshot_outcomes(
+    kernel: &mut Kernel,
+    outcomes: Vec<crate::screenshot::ScreenshotOutcome>,
+) {
+    for outcome in outcomes {
+        match outcome.result {
             Ok((file, digest)) => {
-                tracing::info!(realm = %realm_id, file, "screenshot written");
+                tracing::info!(realm = %outcome.realm, file, "screenshot written");
                 kernel
                     .recorder
                     .record(crate::recorder::Event::ScreenshotWritten {
-                        realm: realm_id,
-                        width,
-                        height,
+                        realm: &outcome.realm,
+                        width: outcome.width,
+                        height: outcome.height,
                         digest: &digest,
                         file: &file,
                     });
             }
-            Err(reason) => fail(kernel, Some(realm_id), reason),
+            Err(reason) => {
+                tracing::warn!(reason, realm = %outcome.realm, "screenshot not written");
+                kernel
+                    .recorder
+                    .record(crate::recorder::Event::ScreenshotFailed {
+                        realm: Some(&outcome.realm),
+                        reason,
+                    });
+            }
         }
     }
 }
@@ -4287,6 +4384,24 @@ pub(crate) fn emit_presented<H: PreemptionHook>(runtime: &mut Runtime<H>) {
 }
 
 pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
+    // Before everything, and deliberately before the dirty gate: a screenshot
+    // the worker finished (issue #240) is a journal entry, never a reason to
+    // composite. Doing it here rather than in `drain_screenshot_gestures` is
+    // what makes the entry land promptly on a session where the human pressed
+    // the key and then stopped typing -- that drain is reached only from a
+    // physical input turn, and the encode outlives the turn that started it.
+    //
+    // **The bound on how late it can be is `SWEEP_INTERVAL`**, and that is
+    // load-bearing rather than incidental: `install` arms an unconditional
+    // one-second timer, so this function runs at least once a second in every
+    // session whatever else is quiet, and no outcome can wait longer than that
+    // for its journal entry. Nothing here wakes the loop itself -- a finished
+    // file is not worth a wakeup -- and a session that ends inside that window
+    // still journals it, because `into_recorder` flushes.
+    //
+    // A session with no `--screenshot-dir` has no writer, so this is one
+    // `Option` check per round.
+    journal_screenshot_outcomes(host.split().0);
     // First, before the dirty gate: raising or lowering a consent prompt is
     // exactly what makes the frame dirty, so it must run before the gate below
     // reads `dirty`. Backends that cannot host a prompt inherit the trait's
@@ -5033,7 +5148,7 @@ mod tests {
                 shim: crate::spawn::tests::mock_shim_bin(),
                 indicator: crate::consent::TrustedIndicator::for_test(),
                 capture_dump: None,
-                screenshot_dir: None,
+                screenshot_writer: None,
             };
             let event_loop: EventLoop<'static, TestHost> =
                 EventLoop::try_new().expect("event loop");
@@ -5306,8 +5421,12 @@ mod tests {
         // The audited directory, opened exactly as `run_session` opens it.
         let shots = rig.dir.join("shots");
         std::fs::create_dir_all(&shots).expect("mkdir");
-        rig.host.runtime.kernel.screenshot_dir =
-            Some(crate::screenshot::ScreenshotDir::open(&shots).expect("a clean private dir"));
+        rig.host.runtime.kernel.screenshot_writer = Some(
+            crate::screenshot::ScreenshotWriter::spawn(
+                crate::screenshot::ScreenshotDir::open(&shots).expect("a clean private dir"),
+            )
+            .expect("the screenshot worker starts"),
+        );
 
         let chord = crate::chord::ModChord::parse(crate::screenshot::DEFAULT_SCREENSHOT_CHORD)
             .expect("the default chord parses");
@@ -5333,6 +5452,15 @@ mod tests {
         for evdev in mods.iter().rev() {
             press(&mut rig, *evdev, KeyState::Released);
         }
+
+        // The encode runs on the writer's own thread since issue #240, so the
+        // file and its journal entry are owed rather than already written. This
+        // is the **production** wait -- the one `into_recorder` performs at the
+        // end of every session -- and not a test-only synchronisation: a
+        // regression that stopped the outcome ever coming back would hang here
+        // for `FINISH_DEADLINE` and then journal `writer_timeout`, which the
+        // assertions below reject.
+        rig.host.runtime.finish_pending_screenshots();
 
         // 1. One press, one file.
         let written: Vec<_> = std::fs::read_dir(&shots)

@@ -865,6 +865,35 @@ The runbook therefore prescribes **three separate writes with a wait between the
 ---
 
 
+### D-034 — The screenshot encode moves to a worker thread that owns the directory descriptor; the encoder itself is left alone
+
+**Status:** accepted (2026-08-11) — issue [#240](https://github.com/vitrin-os/vitrin-os/issues/240), workstream [WS-E](14-workstream-session-mode.md). Found in review of WS-E.2.4 (#216), measured on hardware, decided here.
+
+**The problem, measured rather than estimated.** `ScreenshotDir::write` and the PNG encode both ran synchronously inside `route_physical_turn`'s gesture drain, so one press blocked compositing for the whole encode: **71.7 ms** in a release build for one 2560x1600 frame into a 12.3 MB PNG — about seventeen dropped frames at 240 Hz, on every press. It was never a correctness problem. It was plainly visible to the human who pressed the key.
+
+**Decision: option 1 of the issue — move the encode off the compositor thread — and *not* option 2.** `crates/vitrin-png` keeps its stored-block DEFLATE, its bitwise CRC-32 and its per-byte Adler-32. Those are the reason the encode is slow and they are also the reason a ~130-line encoder in the TCB is auditable; a 256-entry CRC table and a chunked Adler are cheap, but they are an optimisation of code that no longer runs anywhere a human can feel it. **No image codec enters any dependency class**, which the issue names as a criterion and `crates/vitrin-core/Cargo.toml` states twice.
+
+**Why a thread in the TCB is acceptable here, stated as the issue demanded rather than assumed.** The frame that crosses the boundary is the human's screen, and the safety argument for it was "one place writes it, and that place holds no path". The change makes that *narrower*, not wider:
+
+- **The audited descriptor moves to the worker and the compositor thread stops holding one.** `Kernel::screenshot_writer` can submit a frame and read back what happened to it; it cannot open a file, because it no longer owns a `ScreenshotDir`. After this change no thread in the process holds both a realm's pixels and a way to create a file in the operator's directory.
+- **Nothing new can reach the encoder.** The worker's only input is a private `EncodeJob` whose only producer is `ScreenshotWriter::submit`, which still takes a `ScreenshotGesture` that only the physical-origin chord matcher mints; `HumanGesture` is still minted inside `capture_to_file`, one thread over. `the_encoder_has_one_call_site_and_it_is_inside_the_worker` scans the crate's sources for it, so a second call — "it is only one frame, encode it here" — fails to build a green suite rather than silently reintroducing the stall.
+- **The bytes are a copy of something the process already keeps.** The same realm view sits in `Runtime::view_cache` and is sealed into a memfd for any `observe` holder. A `Vec<u8>` down a channel carries no descriptor, no `Rc` and no handle.
+- **The journal stays single-threaded.** The worker reports an outcome; `session::journal_screenshot_outcomes` writes the entry on the compositor thread. Giving a second thread the flight recorder would have been a far larger change to the TCB than moving an encode, for nothing.
+
+**What a pending encode does at the two moments the issue asked about.** The **session ending** waits for it: `Runtime::into_recorder` — the one funnel every backend leaves through — calls `ScreenshotWriter::finish`, which stops accepting work, waits up to five seconds for what it already accepted, and journals each result, so a screenshot taken a moment before `SIGTERM` lands on disk *and* in the log of its own run. Past that deadline the process exits and the file may be truncated, journalled `writer_timeout`: a bounded wait, because a filesystem that has stopped answering must not turn "the session ended" into "the session hangs". The **dead-man switch does not cancel it**, deliberately and consistently with #216: the off-switch destroys authority, and a human photographing their own screen is not authority — which is also why a hold does not suppress the chord in the first place.
+
+**What it costs, with the new number measured in the same way as the old one.**
+
+- **A press still costs the compositor 4.2 ms** at 2560x1600 — the copy of the frame out of the capture cache — against 73.9 ms to encode the same frame in the same release build. One frame at 240 Hz instead of seventeen. **Both are CPU measurements on the development machine, not a measurement of a session driving a panel**; what a screenshot does to a bare-metal session's frame timing is a `docs/drm-bringup.md` rung and CI cannot stand in for it.
+- **A bounded queue means a press can be refused.** Two frames may wait behind the one being encoded; a press past that is journalled `encoder_busy` and writes nothing. Each job is a whole frame — 16 MB on the measured panel — so an unbounded queue is the compositor's memory spent on pictures nobody is waiting for.
+- **`screenshot_written` lands a few milliseconds after the press** rather than inside the input round. Still exactly one entry per accepted gesture, still with the digest of the bytes on disk.
+- **A second thread exists in the TCB**, but only when the operator passed `--screenshot-dir`. A default `vitrind` spawns none and is as single-threaded as it was.
+
+**DEFERRED, explicitly:** **making the encoder itself faster** (a CRC table, a chunked Adler, fixed-Huffman DEFLATE). It is now off the frame path, so it buys disk space and worker CPU rather than frames; fixed-Huffman in particular is materially more code in the TCB and would want its own justification. **Reopens on:** a session where the worker's own cost matters — a screenshot burst, or a panel large enough that 12 MB per press is the constraint. **Recycling the frame buffer** between presses would cut the remaining 4.2 ms to the memcpy alone, at the cost of retaining a frame of the human's screen in a pool between presses; not taken here because the retention wants its own argument and one frame at 240 Hz does not force it.
+
+---
+
+
 ## Part B — Open questions (PRD §20), with owners and decide-by gates
 
 Each row: the PRD §20 question (kept verbatim there; summarized here), the epic(s) it blocks, and the milestone or moment by which a decision must exist. Epic IDs refer to [02-phase-2-semantic-epochs.md](02-phase-2-semantic-epochs.md) and [03-phase-3-network-x11-fleet.md](03-phase-3-network-x11-fleet.md); milestones to [00-roadmap.md](00-roadmap.md).

@@ -814,13 +814,24 @@ Four more things belong with it:
   reaches the screenshot hook. The lock one is deliberate rather than
   incidental: a person standing at your locked machine must not be able to write
   the session behind it to a file.
-- **Pressing it stalls the compositor for about 70 ms.** Measured, not
-  estimated: 71.7 ms in a release build to encode one 2560x1600 frame into a
-  12.3 MB PNG, and the encode runs synchronously on the event-loop thread inside
-  the input round. At 240 Hz that is roughly seventeen dropped frames — a
-  visible hitch on every press, and longer on a larger panel. It is bounded (one
-  press, one encode, no queue) and it is not a correctness problem, but a human
-  will see it. Moving the encode off the compositor thread is issue #240.
+- **Pressing it costs the compositor about 4 ms, and the encode no longer
+  happens there at all.** It used to be about 70 ms: 71.7 ms in a release build
+  to encode one 2560x1600 frame into a 12.3 MB PNG, synchronously on the
+  event-loop thread — roughly seventeen dropped frames at 240 Hz, on every
+  press. Since issue #240 the encode runs on a worker thread that owns the
+  screenshot directory, and what the press pays on the compositor thread is one
+  copy of the frame out of the capture cache: **4.2 ms** for the same
+  2560x1600 frame, measured in the same release build (73.9 ms for the encode
+  itself, unchanged, on the same run). That is one frame at 240 Hz rather than
+  seventeen. The remaining cost is the copy, and it scales with pixel count the
+  same way; the queue is bounded at two presses behind the one being encoded,
+  and a press past that is refused and journalled (`encoder_busy`) rather than
+  queued, because each job is a whole frame of memory.
+
+  Both numbers are CPU measurements on the development machine, in a release
+  build — **not** a measurement of a session driving a real panel. What a
+  screenshot does to a bare-metal session's frame timing is knowable only from
+  a run of `docs/drm-bringup.md`, which needs hardware CI does not have.
 - **It DOES work during a dead-man hold, and that is deliberate.** An earlier
   version of this page said otherwise and was simply wrong: `DeadManHook::gate`
   consumes only its own chord's key and delivers every other, so Ctrl+Print
@@ -829,7 +840,9 @@ Four more things belong with it:
   photographing their own screen is not authority — but it means the dead-man
   chord is not a way to stop a screenshot you have already started, and a
   screenshot taken during a hold captures the session as it was before the
-  revocation landed.
+  revocation landed. Since the encode moved to a worker thread this is literal:
+  a hold does not cancel an encode already accepted, and the end of the session
+  waits for it (up to five seconds) rather than truncating the file.
 
 **Identities are static tokens.** Listed in `principals.toml`. The IDL is
 shaped for SPIFFE/OIDC credentials; the machinery is not here yet.

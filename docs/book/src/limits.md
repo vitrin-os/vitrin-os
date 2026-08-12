@@ -186,10 +186,13 @@ than budgetary. Eight of them, named rather than summarised:
   from it and run later the same day, at a 20 s timeout: the panel stayed lit on
   the return and the lock did not raise, so both symptoms are gone on the
   machine that produced them. That pass was **by eye and produced no figure**,
-  so how long the panel stayed lit is still unmeasured. **#258's and #259's
-  fixes remain code with component tests behind them and nothing more** — they
-  concern what the wake logs and journals, and neither the log nor the recorder
-  was read during the `L7` run. **Still unexecuted:** the SysRq route (route 3),
+  so how long the panel stayed lit is still unmeasured. **#258 and #259 have
+  since been observed on hardware too** — a second `L4` execution on 2026-08-12
+  read the log and the recorder rather than only the panel, and found the wake
+  line and the `screen_blanked`/`screen_woke` pair carrying
+  `outcome: flip_landed`. One caveat travels with it: the failed-wake `WARN` has
+  still never been emitted on hardware, since no wake has failed
+  there. **Still unexecuted:** the SysRq route (route 3),
   and the advisory VKMS rung, which was never attempted. One run on one laptop
   is a report about that laptop and nothing more.
 
@@ -921,10 +924,13 @@ so there is a single usable lid sample and no basis at all for a claim about a
 short lid close. The run also found the defects that are the honest headline
 here — returning to a paused session blanks the panel in ~1.5 s (#257), the
 unblank is silent so success and failure look identical (#258), and blank and
-unblank leave no flight-recorder event (#259). Treat this section as confirmed
-to that depth and no further: the frame-clock halt, the agent's indefinitely
-stale frame and the prompt-suppression rules were **not** observed on a panel
-and remain claims about code.
+unblank leave no flight-recorder event (#259). **All three are since fixed, and
+all three fixes have since been observed on this same panel** — #257 by the L7
+run on 2026-08-11, #258 and #259 by a second L4 execution on 2026-08-12 that
+read the log and the recorder instead of only the screen. Treat this section as
+confirmed to that depth and no further: the frame-clock halt, the agent's
+indefinitely stale frame and the prompt-suppression rules were **not** observed
+on a panel and remain claims about code.
 
 **That check runs in one direction only, and you should know which.** A
 *different* colour on return is a sound alarm: the core you left is not the core

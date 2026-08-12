@@ -584,6 +584,93 @@ Type `hello` into the terminal, on your real layout.
 | | Wrong letters | The scancode→keysym resolution is wrong for this layout. Record which key produced which letter |
 | | Letters appear doubled or stick | Key pairing moved from the keysym to the scancode (`input/mod.rs`); a mismatched press/release pair is the classic symptom |
 
+### 13a. The touchpad classes (WS-E.4.2, issue #222) — NOT YET RUN
+
+Steps 10 and 13 exercise the pointer and the keyboard. This rung exercises the
+three classes the seat vocabulary grew afterwards — **relative motion, swipe
+and pinch, and an app-requested pointer lock** — and it is the **only** place
+in this repository where **libinput's own gesture detection** is exercised at
+all.
+
+That is the whole reason it exists, and it is worth being exact about the
+boundary. `tests/integration/test_real_gestures.py` covers everything from
+`input::intake_physical` onward — the router's pairing, the encode, the wire,
+the shim's replay and what a real Wayland client receives — by injecting the
+gesture events on the `physical-input-injector` channel. What it structurally
+cannot cover is the step *before* that entry point: a touchpad reports finger
+contacts, and **libinput** is what decides those contacts are a three-finger
+swipe rather than two-finger scroll or a stray palm. Nothing in CI is evidence
+that a human's three fingers produce a `gesture_begin` at all. Only fingers on
+this laptop's touchpad are, and only through the DRM backend — the nested
+backends never see a gesture, because the host compositor consumes it.
+
+Written before it is executed, on D-033's precedent and 12a's, so the thing
+that has to happen is written down rather than implied. **Leave the record
+block empty until you have actually done it**, and do not fill it in from
+reasoning.
+
+The witness is `gesture-probe`, the same client the integration rung uses
+(`shim/tests/gesture_probe.c`), because it is the only one that keeps pairing
+state and reports `in_flight=` at exit — the one question a log cannot answer.
+Build it with the shim (`meson compile -C shim/build`), point a realm at it,
+and read its lines out of the `tee`'d log, since the app inherits the core's
+stdout:
+
+```toml
+# ~/.config/vitrin/realm-gesture.toml -- one realm, the probe as its app.
+# --run-ms is generous: you are doing this by hand.
+[[realm]]
+id = "realm-0"
+autostart = true
+command = "/home/taha/projects/vitrin/shim/build/gesture-probe"
+args = ["--run-ms", "180000", "--tag", "touchpad"]
+```
+
+```bash
+# Step 6's command line with that realm file, and nothing else changed.
+vitrind --drm --consent=interactive \
+  --realm ~/.config/vitrin/realm-gesture.toml \
+  --principals ~/.config/vitrin/principals.toml \
+  --recorder /tmp/vitrind-drm-$(date +%s).jsonl \
+  2>&1 | tee /tmp/vitrind-gestures.log
+```
+
+Then, with the pointer **over the app's surface** (move it there first — a
+gesture over the letterbox matte belongs to nobody, and the router hit-tests a
+delta against the stored pointer position):
+
+| # | Do, on the real touchpad | Expected [inferred] | Failure | What it means |
+|---|---|---|---|---|
+| 13a-i | Move one finger | `IN pointer_motion` **and** `IN relative_motion` lines, the second with four numbers where `dx`/`dy` and `udx`/`udy` **differ** | Only `pointer_motion` | The relative half is not being minted. The absolute and relative halves come from one libinput event and `intake_physical` produces both; one without the other means the arm at `input/mod.rs` did not fire |
+| 13a-i | | | Four numbers, but `dx == udx` and `dy == udy` exactly, every time | Pointer acceleration is off for this device (plausible, and *not* a bug), **or** the accelerated delta was copied into the unaccelerated field (a bug). `libinput debug-events` on another VT tells you which — but see the note below: this machine ships no `/usr/bin/libinput` |
+| 13a-ii | Three fingers, swipe left | `IN swipe_begin fingers=3`, one or more `IN swipe_update`, then `IN swipe_end cancelled=0 paired=1` | Nothing at all | **This is the observation this rung exists for.** libinput never classified it, or the classification never reached the core. Check the log for `event=gesture_begin`: present means libinput saw it and the router dropped it; absent means libinput did not classify it |
+| 13a-ii | | | `fingers=1` or the wrong count | The count is being flattened in transit. A toolkit dispatches on it (three fingers is a workspace switch where four is an overview), so this is a wrong action, silently |
+| 13a-ii | | | `cancelled=1` on a swipe you finished | Inverted `gesture_state` polarity. An app that was previewing a workspace switch reverts it |
+| 13a-iii | Two fingers, pinch out then in | `IN pinch_begin fingers=2`, several `IN pinch_update` whose `scale` is **absolute since the begin** — it grows past 1.0 as you spread and comes back as you close — then `IN pinch_end` | `scale` never leaves 1.0, or marches monotonically | Accumulated rather than carried through. The three quantities beside it are deltas and `scale` is not; multiplying successive scales zooms toward zero, and it is the one mistake an app cannot detect |
+| 13a-iv | Two fingers, scroll | `IN pointer_axis` lines and **no** gesture lines | Swipe lines with `fingers=2` | Two-finger scroll is served as an axis event and always was (#222's own key decision). A swipe here means the intake is classifying scroll as a gesture, which double-reports every scroll |
+| 13a-v | Three fingers down, hold them, then `Ctrl+Alt+F2` mid-gesture and come back | An `IN swipe_end cancelled=1` **before** the switch takes effect, and `in_flight=none` in the SUMMARY at exit | `in_flight=swipe` at exit | The app is latched. This is #222's acceptance criterion 3 on real hardware: the app can no longer receive your fingers, so the core owes it an end, and a missing one is an app accumulating a gesture forever. Step 12's caveat applies — if you cannot switch VT at all, use a second realm and a `layout.focus` instead |
+| 13a-vi | Restart with `args = [..., "--lock-pointer"]`, move the pointer onto the app | `IN lock_requested tag=…` then `IN pointer_locked`, **the cursor sprite disappears**, and the pointer **stops moving** however far you swipe | `pointer_locked` but the cursor still moves | The verdict is being reported and not enforced. Worse than no lock: the app has been told it may hide its own cursor |
+| 13a-vi | | | `pointer_locked` and the pointer freezes, but the core's own cursor sprite is **still drawn** | `hides_human_sprite` is not consulted in the DRM composite. This is the half **no** headless test can reach — every backend CI runs passes `human_cursor: None` — so it is observable here and nowhere else |
+| 13a-vi | | | Held-Esc while locked does not revoke | The dead-man switch is behind the constraint. Stop the session; this is a security defect, not an input one |
+
+**On measuring the device first.** #222's task 1 was taken one layer below
+`libinput list-devices`, because this machine ships no `/usr/bin/libinput`
+(the `libinput` package is the library only). `libinput-debug-events` is
+therefore not available to cross-check what the kernel reported; read
+`/proc/bus/input/devices` and the log instead, and record the substitution
+rather than making it silently.
+
+**Record block — empty on purpose. Do not fill it in from reasoning.**
+
+```text
+13a-i    (relative motion)      date: ____  result: ____
+13a-ii   (three-finger swipe)   date: ____  result: ____
+13a-iii  (two-finger pinch)     date: ____  result: ____
+13a-iv   (two-finger scroll)    date: ____  result: ____
+13a-v    (switch mid-gesture)   date: ____  result: ____
+13a-vi   (pointer lock)         date: ____  result: ____
+```
+
 ## 14. Measure the frame cadence
 
 Do not eyeball it. Get a number.

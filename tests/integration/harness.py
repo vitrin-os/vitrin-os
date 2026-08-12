@@ -104,6 +104,11 @@ class PhysicalInputInjector:
         attention                       (one whole tap of the configured chord)
         clipboard promote|offer          (one whole modifier chord)
         screenshot                       (one whole modifier chord)
+        relative_motion <dx> <dy> <dx-unaccel> <dy-unaccel>
+        gesture begin swipe|pinch <fingers>
+        gesture update swipe <dx> <dy>
+        gesture update pinch <dx> <dy> <scale> <rotation>
+        gesture end swipe|pinch completed|cancelled
 
     Each becomes a host event handed to the core's **production** intake
     (`input::intake_physical`, or `input::physical_key` for keys), tagged
@@ -123,6 +128,14 @@ class PhysicalInputInjector:
 
     `screenshot` (WS-E.2.4, issue #216) is one whole chord of this run's
     `--screenshot-chord`, on the same terms as `clipboard`.
+
+    `relative_motion` and `gesture` (WS-E.4.2, issue #222) are the classes the
+    seat vocabulary grew for the touchpad, and they are the first lines here
+    that name a wire event rather than a chord. **They do not stand in for
+    libinput's own gesture detection**: a real touchpad reports finger
+    contacts and libinput is what decides those contacts are a three-finger
+    swipe. That decision is upstream of `intake_physical` and nothing reachable
+    from this channel exercises it.
 
     `attention` (WS-E.1.7, issue #232) is one whole tap -- press then release --
     of **this run's configured attention chord**, resolved core-side and fed to
@@ -253,6 +266,70 @@ class PhysicalInputInjector:
         so the gate covers detection as well as effect.
         """
         self._expect_ack("screenshot", 4)
+
+    def relative_motion(
+        self, dx: float, dy: float, dx_unaccel: float, dy_unaccel: float
+    ) -> None:
+        """One `relative_motion` (WS-E.4.2, #222): a pointer DELTA, not a position.
+
+        All four quantities are named by the caller and none is defaulted from
+        another, because on a real device the accelerated and unaccelerated
+        deltas are different numbers and the wire carries both. A harness that
+        passed one twice could not tell a correct shim from one that copied a
+        field.
+
+        It does not move the pointer. The absolute `motion` that accompanies a
+        real movement is a separate line, because the absolute half is minted
+        by the backend that owns the accumulated position and this channel owns
+        none.
+        """
+        self._expect_ack(
+            f"relative_motion {dx} {dy} {dx_unaccel} {dy_unaccel}", 1
+        )
+
+    def gesture_begin(self, kind: str, fingers: int) -> None:
+        """Begin a swipe or a pinch. `kind` is the wire's own spelling."""
+        self._expect_ack(f"gesture begin {kind} {fingers}", 1)
+
+    def gesture_swipe(self, dx: float, dy: float) -> None:
+        """One `gesture_swipe_update`: the finger group's delta since the last."""
+        self._expect_ack(f"gesture update swipe {dx} {dy}", 1)
+
+    def gesture_pinch(self, dx: float, dy: float, scale: float, rotation: float) -> None:
+        """One `gesture_pinch_update`.
+
+        `scale` is **absolute since this gesture's begin** while the other
+        three are deltas since its previous event -- the asymmetry the IDL
+        spells out because reading one as the other is undetectable app-side.
+        Nothing here accumulates it.
+        """
+        self._expect_ack(f"gesture update pinch {dx} {dy} {scale} {rotation}", 1)
+
+    def gesture_end(self, kind: str, cancelled: bool = False) -> None:
+        """End a gesture, `completed` or `cancelled`.
+
+        Spelled out rather than defaulted: the two are what let an app commit
+        rather than guess -- a completed pinch keeps its zoom, a cancelled one
+        puts it back.
+        """
+        state = "cancelled" if cancelled else "completed"
+        self._expect_ack(f"gesture end {kind} {state}", 1)
+
+    def expect_refusal(self, line: str) -> str:
+        """Send a line the core must REFUSE, and return the reason it gave.
+
+        The vocabulary is closed on purpose, and a malformed line is answered
+        `err` rather than dropped, panicked on, or silently accepted as a
+        neighbouring message. A gate that never exercised that would leave the
+        one surface an untrusted peer controls untested.
+        """
+        fields = self._send(line)
+        if fields[0] != "err":
+            raise InjectorFailed(
+                f"{line!r} was ACCEPTED ({' '.join(fields)}); the injector vocabulary is "
+                "closed and a malformed line must be answered `err`"
+            )
+        return " ".join(fields[1:])
 
     def click(self, x: float, y: float, code: int | None = None) -> None:
         """Move, press, release -- the human's version of `grant.pointer.click`."""
@@ -839,14 +916,29 @@ class Core:
         """Everything the core wrote, cached so it can be read more than once.
 
         Reads from the redirect file when one was given (`log_file`), else from
-        the stdout pipe. Either way only after the process has exited, so the
-        text is complete and the read cannot race the writer.
+        the stdout pipe. Either way only after the core has exited — but note
+        that "the core" is not every writer: the shims and the apps under them
+        inherit this same stream and outlive the core by the moment it takes
+        them to notice their connection died and print their own last lines.
+
+        **Read through a SECOND, independent handle, never by seeking this
+        one.** `self._logf` is the very file description the core, both shims
+        and both apps write through, so a `seek(0)` on it moves the offset
+        those still-running writers share: the next line an app printed landed
+        at the top of the file and overwrote whatever was there. The symptom is
+        as bad as it sounds and nothing like a truncation — the file keeps its
+        length, the `SUMMARY` at the end is present, and one line from the
+        MIDDLE of the run is simply gone. It was found that way, from a
+        `test_real_gestures.py` run whose app counted a `swipe_update` it had
+        printed and whose log did not contain the line. A fresh `open()` has
+        its own file description and its own offset, so reading cannot touch
+        what the writers are doing.
         """
         if not self._output and self.proc is not None and self.proc.poll() is not None:
             if self._logf is not None:
                 self._logf.flush()
-                self._logf.seek(0)
-                self._output = self._logf.read() or ""
+                with open(self._logf.name, errors="replace") as handle:
+                    self._output = handle.read() or ""
             elif self.proc.stdout is not None:
                 self._output = self.proc.stdout.read() or ""
         return self._output

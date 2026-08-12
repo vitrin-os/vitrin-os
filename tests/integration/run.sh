@@ -93,6 +93,22 @@ PROPERTY_GATES=(
                                 # missing/file/symlink/world-writable/relative
                                 # `--screenshot-dir` are asserted with a control
                                 # that a clean directory passes.
+  test_real_gestures.py         # WS-E.4.2 (#222): the touchpad classes the seat
+                                # vocabulary grew -- relative motion, swipe,
+                                # pinch and an app-requested pointer lock --
+                                # reach a real Wayland client with every
+                                # quantity where it belongs; `origin=physical`
+                                # survives the wire, read off the C shim's own
+                                # decode trace because the Wayland extension
+                                # events carry no origin argument and the app
+                                # therefore cannot witness it; the journal names
+                                # the begin/end pair and the realm; and a realm
+                                # switch mid-gesture pays the losing
+                                # app a CANCELLED end so no app is left latched.
+                                # What it cannot cover is libinput's own gesture
+                                # detection, which is upstream of
+                                # `intake_physical` and needs a real touchpad --
+                                # `docs/drm-bringup.md` step 13a.
   test_launch.py                # a consented `realm_launch` grant makes the
                                 # TRUSTED CORE fork a process, and the journal
                                 # names who asked (#207). The one gate covering
@@ -173,6 +189,16 @@ fi
 #   run's configured chord through the same `physical_key`. What stays outside
 #   CI, and is a runbook step in `shim/docs/nested-multi-realm.md` rather than a
 #   criterion, is that a real Super press on real hardware produces one.
+#   `test_real_gestures.py` (WS-E.4.2, issue #222) rides it for the touchpad
+#   classes, and the boundary is sharper there than anywhere else on this list:
+#   the channel's `relative_motion` and `gesture` lines feed the same
+#   `intake_physical`, so everything from the core's intake onward is real --
+#   but **libinput's own gesture detection is upstream of that entry point**.
+#   Nothing in CI, with or without this feature, is evidence that a human's
+#   three fingers on a real touchpad produce a `gesture_begin`; that is a
+#   hardware runbook step -- `docs/drm-bringup.md` step 13a, written and NOT
+#   YET RUN -- and the gate's README row says so rather than letting the rung
+#   imply it covers both.
 INJECTORS=vitrin-core/dead-man-injector,vitrin-core/consent-injector,vitrin-core/physical-input-injector
 echo "==> building workspace with $INJECTORS"
 cargo build --workspace --features "$INJECTORS"

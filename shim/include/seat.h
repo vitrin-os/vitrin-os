@@ -221,10 +221,18 @@
  * yet -- see the note in xdg.c -- but nothing here will need to change when
  * they are.)
  *
- * Focus in version 1 is synthesized here: pointer enter on the first motion
- * that lands on a surface, keyboard focus held on the app from the moment
- * its toplevel maps. There is no focus event on the wire; an explicit
- * tagged one is a later version's addition.
+ * Focus is synthesized shim-side: pointer enter on the first motion that
+ * lands on a surface, and the keyboard on the most recently mapped toplevel
+ * that is still mapped -- taken at map, passed to the survivor at unmap,
+ * cleared only when the realm has no window left. There is no focus event on
+ * the wire; an explicit tagged one is a later version's addition.
+ *
+ * That keyboard rule used to read "held on the app from the moment its
+ * toplevel maps", which was version 1's single-window policy. It said nothing
+ * about a second window and the code did the wrong thing when one appeared:
+ * closing it cleared focus to nobody and left the surviving window unable to
+ * be typed into (issue #268). The decision itself lives in xdg.c, which owns
+ * window policy; this file owns the mechanism.
  */
 #ifndef VITRIN_SEAT_H
 #define VITRIN_SEAT_H
@@ -355,6 +363,22 @@ struct vitrin_seat_replay {
 	struct wl_listener modifiers;
 	bool modifiers_wired;
 
+	/* `wlr_seat.events.keyboard_grab_end`, and the reason the shim cares
+	 * (issue #268). Every keyboard focus change this shim makes goes through
+	 * `wlr_seat_keyboard_notify_enter`, which "defers to any keyboard grabs"
+	 * -- and an app's own open menu IS a keyboard grab (`xdg_popup.grab`).
+	 * So a focus handover attempted while a menu is up is silently dropped,
+	 * and without this listener nothing would ever try again: the window the
+	 * keyboard was meant to go to would stay untypable for the rest of the
+	 * session, which is #268's symptom surviving #268's fix. On grab end the
+	 * shim asks window policy to re-apply itself (`vitrin_xdg_refocus`).
+	 *
+	 * Wired here rather than in xdg.c because the signal belongs to the
+	 * seat; the direction of the call matches output.c's, which tells xdg.c
+	 * to re-apply layout when the view resizes. */
+	struct wl_listener keyboard_grab_end;
+	bool keyboard_grab_end_wired;
+
 	/* The xkb context, kept for the life of the shim so keymap
 	 * regeneration is a string compile and nothing more. Created with
 	 * XKB_CONTEXT_NO_DEFAULT_INCLUDES: the generated keymap is
@@ -464,14 +488,34 @@ struct vitrin_seat_replay {
 bool vitrin_seat_init(struct vitrin_shim *s);
 
 /* Take keyboard focus for `surface`, and hold it. Called when the app's
- * toplevel maps (xdg.c). Version 1's realm is single-surface, so this is
- * the whole of focus policy: the app has the keyboard whenever it has a
- * window. */
+ * toplevel maps and when a survivor inherits the keyboard from a window that
+ * unmapped (both in xdg.c, which owns the policy). wlroots sends the previous
+ * holder its `wl_keyboard.leave` as part of this, so moving focus between two
+ * of an app's windows is ONE call, not an unfocus followed by a focus.
+ *
+ * FIRE-AND-FORGET: it defers to an active keyboard grab, and an app's open
+ * menu is one, so this can legitimately do nothing. Callers that need to know
+ * ask `vitrin_seat_keyboard_focus_is`; what makes a deferred focus land in
+ * the end is `vitrin_xdg_refocus`, run from the grab-end listener below. */
 void vitrin_seat_focus_keyboard(struct vitrin_shim *s, struct wlr_surface *surface);
 
-/* Release keyboard focus if `surface` holds it (the toplevel unmapped or
- * was destroyed). */
+/* Release keyboard focus if `surface` holds it -- the realm's LAST window
+ * unmapped or was destroyed. Not the path for a window closing while others
+ * remain: that one hands the keyboard on (xdg.c, `toplevel_unmap`), because
+ * clearing it there is what left a live window untypable in issue #268. */
 void vitrin_seat_unfocus_keyboard(struct vitrin_shim *s, struct wlr_surface *surface);
+
+/* Release keyboard focus whatever holds it. The caller that has already
+ * established there is no window left to hold it and does not know -- or does
+ * not trust -- which surface the seat is still pointing at: a clear issued
+ * while a keyboard grab was live is deferred exactly as an enter is, so the
+ * seat can outlive the window it names (`vitrin_xdg_refocus`). */
+void vitrin_seat_clear_keyboard(struct vitrin_shim *s);
+
+/* Whether `surface` currently holds keyboard focus. The question xdg.c has
+ * to ask before an unmapping window either passes the keyboard on or clears
+ * it: a background window closing must do neither. */
+bool vitrin_seat_keyboard_focus_is(struct vitrin_shim *s, struct wlr_surface *surface);
 
 /* THE replay entry point, and the only exported one: decode one
  * `vitrin_shim_seat` event and replay it. `frame` is a complete wire frame

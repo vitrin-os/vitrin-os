@@ -514,6 +514,49 @@ test(
   timeout: 60,
 )
 
+# --- keyboard focus succession between sibling windows -----------------
+# Issue #268, found on bare metal: an app that opens a SECOND toplevel (a file
+# chooser, a preferences window, any GTK dialog) and closes it again left the
+# realm's keyboard focused on nobody, so the surviving window was visible,
+# still scrolled under the pointer, and could not be typed into. This client
+# maps several toplevels on ONE shim connection, unmaps the one holding the
+# keyboard and asserts the `wl_keyboard.enter` comes back naming the right
+# survivor, then unmaps the last one too and asserts focus is released -- so
+# the fix cannot become "always keep the keyboard somewhere" and aim it at a
+# surface about to be freed. It also checks that `xdg_toplevel`'s ACTIVATED
+# state names the front window, which is what an app reads to draw a solid
+# rather than a hollow text cursor, and it repeats the sequence with an
+# `xdg_popup.grab` open: wlroots defers every focus change to an active
+# keyboard grab and a menu is one, so that is the single input that makes the
+# whole mechanism silently do nothing.
+#
+# A `meson test` for exactly the reason xdg-conformance is one: the shim plus a
+# client built here, headless, pixman, no GPU, no DRM and no seat device -- the
+# virtual keyboard is created unconditionally at bring-up (src/globals.c), so
+# `--no-upstream` is enough to observe real focus events.
+focus_succession_client = executable(
+  'focus-succession-client',
+  files('tests/focus_succession_client.c'),
+  xdg_shell_client_header,
+  xdg_shell_code,
+  include_directories: inc,
+  dependencies: [wayland_client],
+)
+
+test(
+  'focus-succession',
+  find_program('bash'),
+  args: [
+    files('tests/acceptance/focus_succession.sh'),
+    shim_exe,
+    focus_succession_client,
+  ],
+  depends: [shim_exe, focus_succession_client],
+  # Same reasoning as xdg-conformance's: the assertions are a handful of round
+  # trips; the budget is for the shim's bring-up, which the script polls for.
+  timeout: 60,
+)
+
 # The R5 gate's app: a real GTK text entry, so "héllo→世界 arrives intact in a
 # GTK text field" is measured through a real input-method stack rather than
 # inferred from a keysym stream. OPTIONAL on purpose -- the shim's CI job

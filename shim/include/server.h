@@ -193,6 +193,16 @@ bool vitrin_output_resize(struct vitrin_shim *s, uint32_t width, uint32_t height
  * single-maximized layout rule stays in xdg.c, which owns it. */
 void vitrin_xdg_reconfigure_all(struct vitrin_shim *s);
 
+/* Re-assert keyboard focus on the realm's front window. Called by seat.c when
+ * a keyboard grab ends -- the same shape as the call above: a mechanism-level
+ * event asking window policy to re-apply itself, so the policy itself stays in
+ * xdg.c. It is needed because an app's open menu holds an `xdg_popup.grab` and
+ * every focus change the shim makes while one is live is silently deferred by
+ * wlroots; without a re-assert the window the keyboard was handed to would
+ * stay untypable for the rest of the session (issue #268). Safe before phase D
+ * has run and safe with no window mapped: both are handled inside. */
+void vitrin_xdg_refocus(struct vitrin_shim *s);
+
 /* Phase D (xdg.c): the app's toplevel -> scene wiring and the
  * single-maximized layout. */
 bool vitrin_setup_xdg(struct vitrin_shim *s);

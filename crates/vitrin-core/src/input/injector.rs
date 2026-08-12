@@ -72,6 +72,11 @@
 //!                     attention                      (one whole chord tap)
 //!                     clipboard <promote|offer>      (one whole modifier chord)
 //!                     screenshot                     (one whole modifier chord)
+//!                     relative_motion <dx> <dy> <dx-unaccel> <dy-unaccel>
+//!                     gesture begin <swipe|pinch> <fingers>
+//!                     gesture update swipe <dx> <dy>
+//!                     gesture update pinch <dx> <dy> <scale> <rotation>
+//!                     gesture end <swipe|pinch> <completed|cancelled>
 //!
 //!   core -> harness   vitrin-physical-input 1        (banner, once)
 //!                     ack <injected-event-count>     (per accepted request)
@@ -109,6 +114,38 @@
 //! scancodes reaching the real hook stack — as well as the effect half, rather
 //! than asserting the effect and leaving the key to a manual runbook.
 //!
+//! `relative_motion` and `gesture` are WS-E.4.2's classes (issue #222), and
+//! they are the first verbs here that are **not** a name for a chord: they are
+//! the plain wire events `vitrin_shim_seat` grew for the touchpad, spelled the
+//! way the IDL spells them. Both go through [`super::intake_physical`] on
+//! [`super::synthetic`]'s own host-event types — the same types the module's
+//! unit tests hand it — so a `gesture update pinch` line is the identical call
+//! a libinput `GesturePinchUpdate` makes, and nothing here constructs a
+//! [`SeatInput`].
+//!
+//! **What this cannot stand in for is libinput's own gesture detection.** A
+//! real touchpad reports finger contacts; libinput decides those contacts are a
+//! three-finger swipe or a two-finger pinch and only then emits the events this
+//! channel injects. That decision is upstream of `intake_physical` and no test
+//! that starts here exercises it. What a gate built on these lines does prove is
+//! everything from the core's intake onward: the origin tag, the router's
+//! begin/end pairing, the shim's replay, and what the app receives.
+//!
+//! `gesture` takes a phase (`begin`/`update`/`end`) and then a kind, rather
+//! than four verbs, because the phases are what an app pairs and the kind is an
+//! argument of the wire event in three of the four cases. `update` is the one
+//! place the kind picks the *message* rather than an argument — `swipe` and
+//! `pinch` carry different quantities — so it is spelled as a kind there too
+//! and refused if it names a phase's wrong shape (`gesture update swipe` with
+//! four numbers is a different message, not a decorated one).
+//!
+//! Nothing here pairs anything. A harness can send an `end` with no `begin`, or
+//! two `begin`s, and the core will take them: [`super::InputRouter`] is what
+//! holds the pairing discipline and the shim holds a second copy of it, so a
+//! channel that refused an unpaired end would be a third, silently
+//! disagreeing enforcement point — and would make exactly the abuse a gate
+//! wants to inject untestable.
+//!
 //! `ack` counts the [`super::SeatInput`]s the intake produced, not the
 //! deliveries: whether an event reaches an app is the router's and the shim's
 //! business, and a channel that reported delivery would be the core agreeing
@@ -118,7 +155,12 @@
 use smithay::backend::input as host;
 use smithay::backend::input::InputEvent;
 
-use super::synthetic::{SyntheticButton, SyntheticHost, SyntheticMotion};
+use vitrin_protocol::generated::vitrin_shim_seat::{GestureKind, GestureState};
+
+use super::synthetic::{
+    SyntheticButton, SyntheticGestureBegin, SyntheticGestureEnd, SyntheticHost, SyntheticMotion,
+    SyntheticPinchUpdate, SyntheticRelativeMotion, SyntheticSwipeUpdate,
+};
 use super::SeatInput;
 
 /// The longest line the core will accept from the peer, `\n` included.
@@ -174,6 +216,54 @@ pub(crate) enum Request {
     /// it is spelled with is this run's `--screenshot-chord`, not the peer's to
     /// choose.
     Screenshot,
+
+    /// Pointer motion as a **delta**, in view pixels (WS-E.4.2, issue #222).
+    ///
+    /// All four quantities are the peer's, and none is derived from another,
+    /// for [`super::synthetic::SyntheticRelativeMotion`]'s reason: the
+    /// accelerated and unaccelerated deltas are two different numbers on a real
+    /// device, the wire carries both, and a channel that copied one into the
+    /// other could not exercise the one translation bug worth catching.
+    ///
+    /// It does **not** carry the absolute [`Request::Motion`] beside it. On a
+    /// real seat one physical movement mints both halves, but the absolute half
+    /// is minted by the backend that owns the accumulated pointer position and
+    /// this channel owns none — so a harness that wants both sends both lines,
+    /// which is honest about what each one is.
+    RelativeMotion {
+        dx: f64,
+        dy: f64,
+        dx_unaccel: f64,
+        dy_unaccel: f64,
+    },
+    /// A multi-finger touchpad gesture began: `gesture begin <kind> <fingers>`.
+    GestureBegin { kind: GestureKind, fingers: u32 },
+    /// `gesture update swipe <dx> <dy>` — the finger group's motion since this
+    /// gesture's previous event, in view pixels.
+    GestureSwipeUpdate { dx: f64, dy: f64 },
+    /// `gesture update pinch <dx> <dy> <scale> <rotation>`.
+    ///
+    /// The four quantities are independent on the wire and independent here:
+    /// `scale` is absolute since the gesture's own begin while the other three
+    /// are deltas since its previous event, and the IDL spells that asymmetry
+    /// out precisely because reading one as the other is undetectable app-side.
+    /// Nothing here differences or accumulates anything.
+    GesturePinchUpdate {
+        dx: f64,
+        dy: f64,
+        scale: f64,
+        rotation: f64,
+    },
+    /// `gesture end <kind> <completed|cancelled>`.
+    ///
+    /// `cancelled` is spelled out rather than defaulted, because the two are
+    /// what lets an app commit rather than guess — a completed pinch keeps its
+    /// zoom, a cancelled one puts it back — and a channel that defaulted to
+    /// `completed` would make the difference the harness's to forget.
+    GestureEnd {
+        kind: GestureKind,
+        state: GestureState,
+    },
 }
 
 /// Parse one line into a [`Request`], or `None` for anything else.
@@ -217,12 +307,65 @@ pub(crate) fn parse_request(line: &str) -> Option<Request> {
                 _ => return None,
             },
         },
+        "relative_motion" => Request::RelativeMotion {
+            dx: parse_finite(fields.next()?)?,
+            dy: parse_finite(fields.next()?)?,
+            dx_unaccel: parse_finite(fields.next()?)?,
+            dy_unaccel: parse_finite(fields.next()?)?,
+        },
+        // Phase first, kind second: the phase is what an app pairs, and in
+        // three of the four messages the kind is an argument rather than a
+        // choice of message. `update` is the exception and is written as one.
+        "gesture" => match fields.next()? {
+            "begin" => Request::GestureBegin {
+                kind: parse_gesture_kind(fields.next()?)?,
+                // Not range-checked here. libinput reports what the device
+                // reported and the wire carries a `uint`; a core that decided
+                // eleven fingers were impossible would be inventing a policy
+                // the production intake does not have, at the one seam whose
+                // whole job is to be that intake.
+                fingers: fields.next()?.parse().ok()?,
+            },
+            "update" => match fields.next()? {
+                "swipe" => Request::GestureSwipeUpdate {
+                    dx: parse_finite(fields.next()?)?,
+                    dy: parse_finite(fields.next()?)?,
+                },
+                "pinch" => Request::GesturePinchUpdate {
+                    dx: parse_finite(fields.next()?)?,
+                    dy: parse_finite(fields.next()?)?,
+                    scale: parse_finite(fields.next()?)?,
+                    rotation: parse_finite(fields.next()?)?,
+                },
+                _ => return None,
+            },
+            "end" => Request::GestureEnd {
+                kind: parse_gesture_kind(fields.next()?)?,
+                state: match fields.next()? {
+                    "completed" => GestureState::Completed,
+                    "cancelled" => GestureState::Cancelled,
+                    _ => return None,
+                },
+            },
+            _ => return None,
+        },
         _ => return None,
     };
     if fields.next().is_some() {
         return None;
     }
     Some(request)
+}
+
+/// `swipe`/`pinch` and nothing else. The wire's own two spellings, so a
+/// harness names the gesture the IDL names rather than a number whose meaning
+/// is a `#[repr(u32)]` away from silently inverting.
+fn parse_gesture_kind(field: &str) -> Option<GestureKind> {
+    match field {
+        "swipe" => Some(GestureKind::Swipe),
+        "pinch" => Some(GestureKind::Pinch),
+        _ => None,
+    }
 }
 
 /// `press`/`release` and nothing else. A bare boolean spelling (`1`/`0`) is
@@ -356,6 +499,87 @@ pub(crate) fn intake(
         Request::Screenshot => {
             let (mods, trigger) = screenshot.scancodes();
             chord_events(&mods, trigger)
+        }
+
+        // WS-E.4.2's classes, each one host event through the production
+        // intake. `view` is passed for the same reason every arm above passes
+        // it — `intake_physical` takes it — and is unused by these five: a
+        // delta needs no space to resolve into, which is exactly why this
+        // channel can mint the relative half of a movement and not the
+        // absolute one.
+        Request::RelativeMotion {
+            dx,
+            dy,
+            dx_unaccel,
+            dy_unaccel,
+        } => super::intake_physical::<SyntheticHost>(
+            &InputEvent::PointerMotion {
+                event: SyntheticRelativeMotion {
+                    dx,
+                    dy,
+                    dx_unaccel,
+                    dy_unaccel,
+                },
+            },
+            view,
+        ),
+        // The kind picks the host event, exactly as it does on a real seat:
+        // libinput has six gesture events where the wire has four, and
+        // `intake_physical` is the one place that mapping lives. Choosing the
+        // `SeatInputKind` here instead would be that mapping's second copy.
+        Request::GestureBegin { kind, fingers } => {
+            let event = SyntheticGestureBegin { fingers };
+            match kind {
+                GestureKind::Swipe => super::intake_physical::<SyntheticHost>(
+                    &InputEvent::GestureSwipeBegin { event },
+                    view,
+                ),
+                GestureKind::Pinch => super::intake_physical::<SyntheticHost>(
+                    &InputEvent::GesturePinchBegin { event },
+                    view,
+                ),
+            }
+        }
+        Request::GestureSwipeUpdate { dx, dy } => super::intake_physical::<SyntheticHost>(
+            &InputEvent::GestureSwipeUpdate {
+                event: SyntheticSwipeUpdate { dx, dy },
+            },
+            view,
+        ),
+        Request::GesturePinchUpdate {
+            dx,
+            dy,
+            scale,
+            rotation,
+        } => super::intake_physical::<SyntheticHost>(
+            &InputEvent::GesturePinchUpdate {
+                event: SyntheticPinchUpdate {
+                    dx,
+                    dy,
+                    scale,
+                    rotation,
+                },
+            },
+            view,
+        ),
+        // `cancelled` travels as libinput's own boolean, and the *intake* is
+        // what turns it into `gesture_state` (`input::gesture_state`). A line
+        // that carried the wire enum straight through would bypass the one
+        // function whose whole job is that polarity.
+        Request::GestureEnd { kind, state } => {
+            let event = SyntheticGestureEnd {
+                cancelled: state == GestureState::Cancelled,
+            };
+            match kind {
+                GestureKind::Swipe => super::intake_physical::<SyntheticHost>(
+                    &InputEvent::GestureSwipeEnd { event },
+                    view,
+                ),
+                GestureKind::Pinch => super::intake_physical::<SyntheticHost>(
+                    &InputEvent::GesturePinchEnd { event },
+                    view,
+                ),
+            }
         }
     }
 }
@@ -695,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn the_vocabulary_is_exactly_seven_verbs_and_nothing_decorated() {
+    fn the_vocabulary_is_exactly_nine_verbs_and_nothing_decorated() {
         assert_eq!(parse_request("attention"), Some(Request::Attention));
         // Argument-free: which key it is is the core's configuration, not the
         // peer's to choose, so a decorated line is a different message.
@@ -745,6 +969,76 @@ mod tests {
                 pressed: false
             })
         );
+
+        // The eighth and ninth (WS-E.4.2). Same reason as the seventh: this is
+        // the test whose stated job is that the vocabulary is CLOSED.
+        assert_eq!(
+            parse_request("relative_motion 1.5 -2 3 -4.25"),
+            Some(Request::RelativeMotion {
+                dx: 1.5,
+                dy: -2.0,
+                dx_unaccel: 3.0,
+                dy_unaccel: -4.25
+            })
+        );
+        assert_eq!(
+            parse_request("gesture begin swipe 3"),
+            Some(Request::GestureBegin {
+                kind: GestureKind::Swipe,
+                fingers: 3
+            })
+        );
+        assert_eq!(
+            parse_request("gesture update swipe 4 -5"),
+            Some(Request::GestureSwipeUpdate { dx: 4.0, dy: -5.0 })
+        );
+        assert_eq!(
+            parse_request("gesture update pinch 1 2 1.25 -30"),
+            Some(Request::GesturePinchUpdate {
+                dx: 1.0,
+                dy: 2.0,
+                scale: 1.25,
+                rotation: -30.0
+            })
+        );
+        assert_eq!(
+            parse_request("gesture end pinch cancelled"),
+            Some(Request::GestureEnd {
+                kind: GestureKind::Pinch,
+                state: GestureState::Cancelled
+            })
+        );
+        assert_eq!(
+            parse_request("gesture end swipe completed"),
+            Some(Request::GestureEnd {
+                kind: GestureKind::Swipe,
+                state: GestureState::Completed
+            })
+        );
+        // Every field of both is required and closed. A `relative_motion` short
+        // of one delta is not one with a zero in it, an unnamed gesture phase
+        // or kind is not a defaulted one, and a swipe update given a pinch's
+        // four numbers is a DIFFERENT message rather than a swipe with two
+        // fields ignored -- which is the whole reason the trailing-field rule
+        // exists.
+        assert_eq!(parse_request("relative_motion 1 2 3"), None);
+        assert_eq!(parse_request("relative_motion 1 2 3 4 5"), None);
+        assert_eq!(parse_request("relative_motion 1 2 3 nan"), None);
+        assert_eq!(parse_request("gesture"), None);
+        assert_eq!(parse_request("gesture begin"), None);
+        assert_eq!(parse_request("gesture begin swipe"), None);
+        assert_eq!(parse_request("gesture begin hold 3"), None);
+        assert_eq!(parse_request("gesture begin swipe -1"), None);
+        assert_eq!(parse_request("gesture begin swipe 3.5"), None);
+        assert_eq!(parse_request("gesture update"), None);
+        assert_eq!(parse_request("gesture update swipe 1"), None);
+        assert_eq!(parse_request("gesture update swipe 1 2 1.0 0"), None);
+        assert_eq!(parse_request("gesture update pinch 1 2 1.0"), None);
+        assert_eq!(parse_request("gesture middle swipe 1 2"), None);
+        assert_eq!(parse_request("gesture end swipe"), None);
+        assert_eq!(parse_request("gesture end swipe done"), None);
+        assert_eq!(parse_request("gesture end swipe completed extra"), None);
+        assert_eq!(parse_request("gestures begin swipe 3"), None);
 
         // A trailing field is a different message, not a decorated one --
         // otherwise `button 272 press extra` would be accepted as a click and
@@ -955,6 +1249,147 @@ mod tests {
         assert_eq!(parse_request("screenshot"), Some(Request::Screenshot));
         assert_eq!(parse_request("screenshot full"), None);
         assert_eq!(parse_request("screenshots"), None);
+    }
+
+    #[test]
+    fn the_touchpad_lines_reach_the_production_intake_with_every_quantity_where_it_belongs() {
+        // WS-E.4.2 (#222). The bug class this is written against is a
+        // translation that copies one number into another's field: the
+        // accelerated and unaccelerated deltas are different numbers on a real
+        // device, and `scale` is absolute where the three beside it are
+        // deltas, so every value here is distinct and asserted by name.
+        let relative = intake(
+            Request::RelativeMotion {
+                dx: 1.5,
+                dy: -2.5,
+                dx_unaccel: 3.5,
+                dy_unaccel: -4.5,
+            },
+            VIEW,
+            chord(),
+            trigger(),
+            shot(),
+        );
+        assert_eq!(relative.len(), 1);
+        assert_eq!(relative[0].origin(), Origin::Physical);
+        assert_eq!(
+            relative[0].kind(),
+            &SeatInputKind::RelativeMotion {
+                dx: 1.5,
+                dy: -2.5,
+                dx_unaccel: 3.5,
+                dy_unaccel: -4.5
+            },
+            "a relative delta must arrive with all four quantities intact, and none of them \
+             derived from another"
+        );
+
+        // The kind picks the host event, so both spellings are asserted: a
+        // `begin` arm that reached for the wrong `InputEvent` variant would
+        // still produce a `GestureBegin`, with the wrong kind on the wire and
+        // an app pairing an end it never gets.
+        for (kind, fingers) in [(GestureKind::Swipe, 3u32), (GestureKind::Pinch, 2)] {
+            let begin = intake(
+                Request::GestureBegin { kind, fingers },
+                VIEW,
+                chord(),
+                trigger(),
+                shot(),
+            );
+            assert_eq!(begin.len(), 1);
+            assert_eq!(begin[0].origin(), Origin::Physical);
+            assert_eq!(
+                begin[0].kind(),
+                &SeatInputKind::GestureBegin { kind, fingers }
+            );
+        }
+
+        let swipe = intake(
+            Request::GestureSwipeUpdate { dx: 6.0, dy: -7.0 },
+            VIEW,
+            chord(),
+            trigger(),
+            shot(),
+        );
+        assert_eq!(
+            swipe[0].kind(),
+            &SeatInputKind::GestureSwipeUpdate { dx: 6.0, dy: -7.0 }
+        );
+
+        let pinch = intake(
+            Request::GesturePinchUpdate {
+                dx: 8.0,
+                dy: -9.0,
+                scale: 1.25,
+                rotation: -30.0,
+            },
+            VIEW,
+            chord(),
+            trigger(),
+            shot(),
+        );
+        assert_eq!(
+            pinch[0].kind(),
+            &SeatInputKind::GesturePinchUpdate {
+                dx: 8.0,
+                dy: -9.0,
+                // Carried through, never accumulated: multiplying successive
+                // scales into a running product zooms toward zero, and it is
+                // the one mistake an app cannot detect (IDL).
+                scale: 1.25,
+                rotation: -30.0
+            }
+        );
+
+        // `cancelled` is libinput's boolean on the way in and the wire's enum
+        // on the way out, and `input::gesture_state` is the only place the
+        // polarity lives. Both spellings, because an inverted one is
+        // indistinguishable from a correct one at any single call site.
+        for (state, kind) in [
+            (GestureState::Completed, GestureKind::Swipe),
+            (GestureState::Cancelled, GestureKind::Pinch),
+        ] {
+            let end = intake(
+                Request::GestureEnd { kind, state },
+                VIEW,
+                chord(),
+                trigger(),
+                shot(),
+            );
+            assert_eq!(end.len(), 1);
+            assert_eq!(end[0].origin(), Origin::Physical);
+            assert_eq!(end[0].kind(), &SeatInputKind::GestureEnd { kind, state });
+        }
+    }
+
+    #[test]
+    fn the_channel_pairs_nothing_and_leaves_that_to_the_router() {
+        // An end with no begin is accepted here and produces its intake event,
+        // and that is deliberate: the router holds the pairing discipline (and
+        // the shim holds a second copy), so a channel that refused one would be
+        // a third enforcement point -- and would make the abuse a gate wants to
+        // inject untestable. `tests/integration/test_real_gestures.py` sends
+        // exactly this line, and what it observes is that the ROUTER drops it
+        // first: no `seat_delivered` entry, and no `seat-replay:` line in the
+        // shim's own decode trace, so the second enforcement copy is never
+        // reached in that run. Both copies are still wanted — the shim's
+        // guards a shim whose core is not this one — but only the first is
+        // exercised by an unpaired end sent here.
+        let orphan = intake(
+            Request::GestureEnd {
+                kind: GestureKind::Swipe,
+                state: GestureState::Completed,
+            },
+            VIEW,
+            chord(),
+            trigger(),
+            shot(),
+        );
+        assert_eq!(
+            orphan.len(),
+            1,
+            "the channel must hand the core an unpaired end rather than swallowing it"
+        );
     }
 
     #[test]

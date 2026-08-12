@@ -264,6 +264,70 @@ xdg_decoration_client_header = custom_target(
   command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
 )
 
+# Client-side stubs for the three pointer-side extensions WS-E.4.2 (#222)
+# made real, for `gesture_probe.c` -- which is a Wayland CLIENT of the shim,
+# so it needs the client half of each, and the marshalling tables besides.
+#
+# Its own `private-code`, not the probe loop's. The probe targets above emit
+# the same XML under `probe-` prefixed names and are linked into `vitrin-shim`;
+# a client executable links only what it lists, so a second copy here is a
+# second object file, never a duplicate symbol. Sharing them would instead
+# couple this client to a catalogue whose whole point is that rows can be
+# dropped when a machine's wayland-protocols is a release behind -- and a
+# dropped row would then be a client that fails to LINK rather than one that
+# reports a missing global, which is the failure this client is written to
+# report clearly.
+# EXISTENCE-CHECKED, on `probe_protocols`' precedent above and for the reason
+# stated there: a bare `wl_protocol_dir / 'unstable/...'` makes a moved XML a
+# Meson *missing input* error, and that error takes the whole subproject down
+# -- `vitrin-shim` itself would stop configuring because a test CLIENT wanted a
+# file that moved, which is strictly worse than not having the client. A row
+# that resolves to nothing therefore drops `gesture-probe` with a warning
+# naming the protocol; the shim still builds, and the operator is told why
+# before `test_real_gestures.py` fails with "no gesture-probe beside the C
+# shim".
+#
+# No candidate LIST here, unlike `probe_protocols` -- deliberately, and it is
+# the honest shape. A promotion of one of these to `stable/` renames its
+# interfaces (`zwp_` -> `wp_`), so a stable copy would not satisfy
+# `gesture_probe.c`'s `#include`s or its symbol references anyway: falling back
+# to one would trade a clear configure-time warning for a confusing compile
+# error. What the check buys is the failure MODE, not a second source.
+client_protocols = [
+  ['relative-pointer-unstable-v1', 'unstable/relative-pointer/relative-pointer-unstable-v1.xml'],
+  ['pointer-gestures-unstable-v1', 'unstable/pointer-gestures/pointer-gestures-unstable-v1.xml'],
+  ['pointer-constraints-unstable-v1', 'unstable/pointer-constraints/pointer-constraints-unstable-v1.xml'],
+]
+pointer_client_headers = []
+pointer_client_code = []
+client_protocols_missing = []
+foreach p : client_protocols
+  if not fs.exists(wl_protocol_dir / p[1])
+    client_protocols_missing += p[0]
+    continue
+  endif
+  xml = wl_protocol_dir / p[1]
+  pointer_client_headers += custom_target(
+    p[0] + '-client-header',
+    input: xml,
+    output: p[0] + '-client-protocol.h',
+    command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+  )
+  pointer_client_code += custom_target(
+    p[0] + '-client-private-code',
+    input: xml,
+    output: p[0] + '-client-protocol.c',
+    command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+  )
+endforeach
+
+if client_protocols_missing.length() > 0
+  warning('gesture-probe: no XML found for ' + ', '.join(client_protocols_missing) +
+    ' -- gesture-probe will NOT be built, so tests/integration/test_real_gestures.py' +
+    ' will fail with "no gesture-probe beside the C shim". The shim itself is' +
+    ' unaffected.')
+endif
+
 inc = include_directories('include')
 shim_deps = [wlroots, wayland_server, pixman, xkbcommon, drm]
 
@@ -473,6 +537,34 @@ input_echo_client = executable(
   include_directories: inc,
   dependencies: [wayland_client, xkbcommon],
 )
+
+# --- WS-E.4.2 (#222): the touchpad classes, from the app's side ---------
+# `input-echo-client` witnesses `wl_pointer` and `wl_keyboard`; relative
+# motion, gestures and pointer constraints arrive on three OTHER globals, and
+# the fact that gate needs is not "what arrived" but "what is this app still
+# holding" -- pairing state no existing client keeps. It is also the only way
+# to drive a pointer constraint at all: a lock is REQUESTED by the app, so no
+# injector line can produce one. Co-built with vitrin-shim so
+# `tests/integration/test_real_gestures.py` resolves it as a sibling, exactly
+# as the other gates resolve click-target.
+#
+# Guarded by the same resolution the client-protocol loop above reports: this
+# program `#include`s all three generated client headers, so building it
+# against a partial set is a compile error rather than a smaller client. The
+# warning up there names which protocol went missing; here it is simply not
+# built, and `vitrin-shim` is untouched.
+if client_protocols_missing.length() == 0
+  gesture_probe = executable(
+    'gesture-probe',
+    files('tests/gesture_probe.c'),
+    xdg_shell_client_header,
+    xdg_shell_code,
+    pointer_client_headers,
+    pointer_client_code,
+    include_directories: inc,
+    dependencies: [wayland_client],
+  )
+endif
 
 # --- xdg-shell conformance, from the app's side ------------------------
 # Three facts about src/xdg.c that only a client can observe: the initial

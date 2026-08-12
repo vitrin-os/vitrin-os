@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MPL-2.0
 #
-# xdg-shell conformance checks for src/xdg.c that only the app's side of the
-# socket can make: the initial configure is sent on the client's initial
-# commit and NOT before it, `xdg_toplevel.wm_capabilities` arrives once,
-# before that configure, carrying exactly the capabilities the shim
-# implements, and a popup is configured on its own initial commit so that
-# opening a menu does not get the app disconnected. The assertions and the
-# reasoning behind each live in tests/xdg_conformance_client.c; this file only
-# stands a shim up in front of it and reports the client's verdict.
+# Keyboard-focus succession between sibling windows of ONE app in ONE realm
+# (issue #268): mapping a second toplevel moves the keyboard to it, unmapping
+# that toplevel hands the keyboard BACK to the survivor -- which is the bug,
+# found on bare metal with alacritty and nautilus, where the survivor was left
+# visible and untypable -- and unmapping the last one still clears focus to
+# nobody. The sequence is repeated with an `xdg_popup.grab` open, because a
+# menu holds one and wlroots defers every focus change to an active keyboard
+# grab. The assertions and the reasoning behind each live in
+# tests/focus_succession_client.c; this file only stands a shim up in front of
+# it and reports the client's verdict.
 #
-# LIKE tests/acceptance/focus_succession.sh AND UNLIKE THE OTHER SIBLINGS
-# HERE, this one is wired into `meson test` (see the `test('xdg-conformance',
-# ...)` call in meson.build). Both can be: their only dependencies are the
-# shim and a client built from this tree, with no wayland-info, no weston, no
-# GTK and no Firefox, and they are headless and GPU-free. The other acceptance
-# scripts need one of those and so stay separate CI steps.
+# LIKE xdg_conformance.sh AND UNLIKE ITS OTHER SIBLINGS HERE, this one is
+# wired into `meson test` (see the `test('focus-succession', ...)` call in
+# meson.build). It can be: its only dependencies are the shim and a client
+# built from this tree, and it is headless and GPU-free. There is no seat
+# device and no core in the loop either -- `vitrin_seat_init` runs
+# unconditionally at bring-up (src/globals.c), so the virtual keyboard exists
+# and the app can observe real wl_keyboard.enter/leave events under
+# `--no-upstream`.
 #
-# Usage: bash shim/tests/acceptance/xdg_conformance.sh [SHIM_BIN] [CLIENT_BIN]
-#        BUILD_DIR=/path/to/build bash shim/tests/acceptance/xdg_conformance.sh
+# Usage: bash shim/tests/acceptance/focus_succession.sh [SHIM_BIN] [CLIENT_BIN]
+#        BUILD_DIR=/path/to/build bash shim/tests/acceptance/focus_succession.sh
 set -Eeuo pipefail
 
 # Resolved from this script's own location, never from the caller's CWD --
@@ -29,7 +33,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHIM_DIR="$(cd "$HERE/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$SHIM_DIR/build}"
 SHIM_BIN="${1:-${SHIM_BIN:-$BUILD_DIR/vitrin-shim}}"
-CLIENT_BIN="${2:-${CLIENT_BIN:-$BUILD_DIR/xdg-conformance-client}}"
+CLIENT_BIN="${2:-${CLIENT_BIN:-$BUILD_DIR/focus-succession-client}}"
 
 [[ -x "$SHIM_BIN" ]] || { echo "FAIL: missing $SHIM_BIN (run: meson compile -C $BUILD_DIR)" >&2; exit 1; }
 [[ -x "$CLIENT_BIN" ]] || { echo "FAIL: missing $CLIENT_BIN (run: meson compile -C $BUILD_DIR)" >&2; exit 1; }
@@ -40,7 +44,7 @@ CLIENT_BIN="$(cd "$(dirname "$CLIENT_BIN")" && pwd)/$(basename "$CLIENT_BIN")"
 
 SOCKET_TIMEOUT="${SOCKET_TIMEOUT:-10}"
 CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-15}"
-SOCKET_NAME="${SOCKET_NAME:-wl-vitrin-xdgconf-$$}"
+SOCKET_NAME="${SOCKET_NAME:-wl-vitrin-focus-$$}"
 
 # Pure-software headless operation; no seat, no DRM, no GPU.
 export WLR_BACKENDS=headless
@@ -48,7 +52,7 @@ export WLR_RENDERER=pixman
 export WLR_RENDERER_ALLOW_SOFTWARE=1
 export WLR_LIBINPUT_NO_DEVICES=1
 
-RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vitrin-xdgconf.XXXXXX")"
+RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vitrin-focus.XXXXXX")"
 chmod 700 "$RUNTIME_DIR"
 export XDG_RUNTIME_DIR="$RUNTIME_DIR"
 # The shim must be the SERVER here, so drop any inherited session.
@@ -71,8 +75,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# `--no-upstream`: nothing here plays the core, and this test is about what the
-# shim says to its app, not about what it forwards.
+# `--no-upstream`: nothing here plays the core, and focus is synthesized
+# shim-side -- there is no focus event on the wire for a core to send.
 setsid "$SHIM_BIN" --socket "$SOCKET_NAME" --no-upstream >"$SHIM_LOG" 2>&1 &
 SHIM_PID=$!
 
@@ -90,7 +94,7 @@ echo "OK: shim up (pid $SHIM_PID), socket $SOCK"
 CLIENT_OUT="$RUNTIME_DIR/client.txt"
 if ! timeout "$CLIENT_TIMEOUT" "$CLIENT_BIN" >"$CLIENT_OUT" 2>&1; then
 	cat "$CLIENT_OUT" >&2
-	fail "xdg conformance client reported failures; shim log:
+	fail "focus succession client reported failures; shim log:
 $(cat "$SHIM_LOG")"
 fi
 cat "$CLIENT_OUT"
@@ -100,4 +104,4 @@ cat "$CLIENT_OUT"
 # and its exit would otherwise be indistinguishable from one that passed.
 grep -q '^PASS ' "$CLIENT_OUT" || fail "client did not print its PASS verdict"
 
-echo "PASS: xdg-shell configure ordering and wm_capabilities are as specified"
+echo "PASS: the keyboard follows the surviving window and is released with the last one"

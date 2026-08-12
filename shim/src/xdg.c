@@ -17,11 +17,22 @@
  *
  * WHY THE APP IS TOLD IT IS MAXIMIZED AND ACTIVATED. Both are honest facts
  * about a realm, not cosmetics: the app owns the entire realm view (so it
- * is maximized) and it is the only window in it (so it is the active one).
+ * is maximized) and its front window is the active one.
  * Apps draw differently when told otherwise -- inset shadows sized for a
  * floating window, a hollow "unfocused" text cursor -- and every such
  * difference would be a visible artifact of the shim rather than of the
  * app.
+ *
+ * `activated` USED TO BE A CONSTANT HERE, AND THAT WAS A LIE THE MOMENT A
+ * REALM HAD TWO WINDOWS (issue #268). The argument above was written as "it
+ * is the only window in it", and `configure_to_view` set `activated` to
+ * `true` once, at the initial commit, and never revisited it -- so an app
+ * that opened a second toplevel (a file chooser, a preferences window, any
+ * GTK dialog) had BOTH of them told they were active, while only one of them
+ * could hold the keyboard. `activated` is precisely what an app reads to
+ * decide whether to draw a solid or a hollow text cursor, so the constant
+ * produced exactly the artifact this paragraph exists to forbid, one level
+ * down. It now names the front window: see `toplevel_wants_activated`.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -41,8 +52,28 @@ struct vitrin_toplevel {
 	struct wlr_xdg_toplevel *toplevel;
 	struct wlr_scene_tree *tree;
 	/* Membership of `vitrin_shim.toplevels`, so a re-sent `configure` can
-	 * reach every window (`vitrin_xdg_reconfigure_all`). */
+	 * reach every window (`vitrin_xdg_reconfigure_all`) and so the keyboard
+	 * can find a successor when one window of several unmaps
+	 * (`toplevel_unmap`). The list is kept MOST RECENTLY FOCUSED FIRST --
+	 * see `focus_toplevel`, which is the only thing that reorders it. */
 	struct wl_list link;
+	/* On screen right now, as opposed to merely alive. The list above
+	 * carries every toplevel the client has created, and an app is free to
+	 * keep an unmapped-but-undestroyed one around for as long as it likes --
+	 * so "still on the list" is NOT "still a window", and handing the
+	 * keyboard to an unmapped surface would be a worse bug than the one the
+	 * successor search fixes (issue #268).
+	 *
+	 * Deliberately not read from wlroots' own `base->surface->mapped`, even
+	 * though that field says the same thing: the successor search runs
+	 * INSIDE this toplevel's own unmap handler, so its answer for the
+	 * unmapping surface depends on whether wlroots clears that field before
+	 * or after it emits `events.unmap`. This flag is written by exactly two
+	 * lines, both in this file, and the unmap one runs before anything reads
+	 * it -- so the search cannot pick the window that is going away, and the
+	 * proof of that is local to this file rather than to another project's
+	 * emit order. */
+	bool mapped;
 
 	struct wl_listener commit;
 	struct wl_listener map;
@@ -94,6 +125,80 @@ struct vitrin_popup {
 	(WLR_XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE | \
 	 WLR_XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN)
 
+/* THE FRONT WINDOW OF THE REALM, or NULL when the realm has none on screen.
+ *
+ * One definition, three callers, on purpose. The list is most-recently-focused
+ * first (`focus_toplevel`), so its first MAPPED entry is "the most recently
+ * mapped window that is still mapped" -- which is simultaneously the window
+ * that should hold the keyboard, the window that should be told it is
+ * `activated`, and the successor an unmapping holder hands the keyboard to
+ * (issue #268). Writing that rule out three times is how those three answers
+ * would drift apart; the drift would be invisible, and it would look exactly
+ * like the bug being fixed.
+ *
+ * Unmapped entries are skipped rather than absent because `toplevel_destroy`,
+ * not `toplevel_unmap`, is what unlinks: an app may keep an unmapped toplevel
+ * around indefinitely, and the caller inside `toplevel_unmap` has just
+ * cleared its own `mapped` flag precisely so that this walk cannot pick the
+ * window that is going away. */
+static struct vitrin_toplevel *front_toplevel(struct vitrin_shim *s) {
+	struct vitrin_toplevel *t;
+	wl_list_for_each(t, &s->toplevels, link) {
+		if (t->mapped) {
+			return t;
+		}
+	}
+	return NULL;
+}
+
+/* WHAT `activated` MEANS HERE (issue #268, task 3).
+ *
+ * xdg-shell: the activated state is the one an app reads to decide whether it
+ * is the window the user is interacting with, and it is what drives a solid
+ * versus a hollow text cursor, a lit versus a dimmed header bar. With more
+ * than one toplevel in a realm there is exactly one window that can honestly
+ * carry it: the front one, `front_toplevel` above. The answer is re-stated on
+ * every focus change (`sync_activation`).
+ *
+ * IT IS THE SHIM'S POLICY THAT IS READ HERE, NOT WLROOTS' SEAT STATE, and the
+ * difference is not academic. An earlier draft of this fix answered
+ * `vitrin_seat_keyboard_focus_is(...)` -- "is this the surface the seat is
+ * actually pointing at" -- which reads correct and is not: keyboard focus can
+ * be held away from the shim's intent by anything that takes a keyboard grab,
+ * and an `xdg_popup.grab` is what EVERY GTK/Qt/Firefox menu takes.
+ * `wlr_seat_keyboard_notify_enter` "defers to any keyboard grabs"
+ * (wlr_seat.h) and the xdg popup grab's `enter` is a deliberate no-op, so
+ * with a menu open the shim's handover is swallowed -- and a version of this
+ * function that asked the seat would then configure the window that is
+ * physically in front, newly mapped and on screen, as DEACTIVATED. Measured:
+ * open a grabbing popup, map a second toplevel, and the second toplevel is
+ * told `activated=0` while it is the only thing the human can see. That is
+ * the hollow-cursor artifact this file's header exists to forbid, reintroduced
+ * by the fix meant to remove it.
+ *
+ * So `activated` states what the shim INTENDS, the MRU list is the record of
+ * that intent, and making the seat agree with the intent is
+ * `vitrin_xdg_refocus`'s job -- which runs the moment a grab lets go.
+ *
+ * THE ONE EXCEPTION IS THE PRE-MAP CONFIGURE, and it is not a fudge. An
+ * xdg_toplevel cannot map until it has been configured once (xdg-shell's
+ * initial-commit/configure/ack contract), so its first configure necessarily
+ * goes out while it is not the front window of anything -- and the very next
+ * thing that happens is `toplevel_map`, which makes it exactly that.
+ * Answering `false` there would make the app paint its FIRST FRAME in its
+ * unfocused colours and repaint a round trip later: a visible flash that
+ * belongs to the shim, not to the app. Answering `true` is a prediction the
+ * same event cycle fulfils. A toplevel that unmapped and is being brought
+ * back performs the initial commit again (wlroots clears `initialized` in
+ * `reset_xdg_surface`) and gets the same answer, correctly: it is also about
+ * to become the front window at map. */
+static bool toplevel_wants_activated(struct vitrin_toplevel *t) {
+	if (!t->mapped) {
+		return true;
+	}
+	return front_toplevel(t->shim) == t;
+}
+
 /* The realm view fills the output, so "maximized" and "fullscreen" and "the
  * window" are all the same rectangle. Sending it on the initial commit is
  * required by xdg-shell: the client cannot attach a buffer until it has been
@@ -102,7 +207,117 @@ static void configure_to_view(struct vitrin_toplevel *t) {
 	struct vitrin_shim *s = t->shim;
 	wlr_xdg_toplevel_set_size(t->toplevel, s->cfg.width, s->cfg.height);
 	wlr_xdg_toplevel_set_maximized(t->toplevel, true);
-	wlr_xdg_toplevel_set_activated(t->toplevel, true);
+	wlr_xdg_toplevel_set_activated(t->toplevel, toplevel_wants_activated(t));
+}
+
+/* Re-state `activated` on every window that is on screen, after the front
+ * window has changed. Called from `focus_toplevel` and nowhere else:
+ * `activated` is a claim about which window is at the front, and
+ * `focus_toplevel` is the only thing that moves a window there.
+ *
+ * ONLY MAPPED WINDOWS. An unmapped toplevel has no appearance on screen to
+ * get wrong, and the one this sweep would otherwise reach is the surface
+ * currently unmapping -- sending a state change to a window that is going
+ * away, on the way to handing its keyboard to somebody else. It gets its
+ * answer from `configure_to_view` on the initial commit it must perform
+ * before it can ever be seen again.
+ *
+ * `initialized` is the protocol guard the whole file uses: a configure
+ * scheduled before a surface's first commit is not a protocol error but a
+ * wlroots assert, which takes the realm down (see
+ * `toplevel_request_maximize`). */
+static void sync_activation(struct vitrin_shim *s) {
+	struct vitrin_toplevel *t;
+	wl_list_for_each(t, &s->toplevels, link) {
+		if (!t->mapped || !t->toplevel->base->initialized) {
+			continue;
+		}
+		wlr_xdg_toplevel_set_activated(t->toplevel, toplevel_wants_activated(t));
+		wlr_xdg_surface_schedule_configure(t->toplevel->base);
+	}
+}
+
+/* Make `t` the front window: give it the keyboard, and make every window's
+ * `activated` agree.
+ *
+ * THE LIST IS AN MRU STACK, MAINTAINED HERE. `on_new_toplevel` inserts at the
+ * head, so `wl_list_for_each` would otherwise walk newest-CREATED first;
+ * moving the newly focused window back to the head makes it walk most
+ * recently FOCUSED first instead. That is what turns `front_toplevel` into a
+ * first-match walk with no timestamps to keep, and the two orders are not the
+ * same list: an app that creates A, B and C and then raises A has changed
+ * which window the human was last working in without creating anything.
+ *
+ * The reorder is safe for the list's other reader -- `vitrin_xdg_reconfigure_all`
+ * applies the same rule to every entry and does not care in what order.
+ *
+ * THE REORDER HAPPENS EVEN IF THE SEAT REFUSES THE FOCUS, and that is the
+ * design, not an oversight. `wlr_seat_keyboard_notify_enter` defers to any
+ * keyboard grab (wlr_seat.h) and an open menu holds one, so this call can be
+ * swallowed. The list records what the shim MEANT; `vitrin_xdg_refocus` is
+ * what makes the seat catch up when the grab ends. Recording intent only on
+ * success would leave the shim with no memory of what it wanted, which is the
+ * state in which #268 becomes unrecoverable rather than merely deferred. */
+static void focus_toplevel(struct vitrin_toplevel *t) {
+	struct vitrin_shim *s = t->shim;
+	wl_list_remove(&t->link);
+	wl_list_insert(&s->toplevels, &t->link);
+	vitrin_seat_focus_keyboard(s, t->toplevel->base->surface);
+	if (!vitrin_seat_keyboard_focus_is(s, t->toplevel->base->surface)) {
+		/* Not an error and not a repair site: the grab owns the keyboard
+		 * until it ends, and ending it is the app's business. Logged because
+		 * a silent deferral is indistinguishable from #268 itself when
+		 * reading a session log after the fact. */
+		wlr_log(WLR_DEBUG,
+			"keyboard focus deferred to an active grab; will be re-asserted when it ends");
+	}
+	sync_activation(s);
+}
+
+/* MAKE THE SEAT AGREE WITH THE SHIM'S INTENT (issue #268, the grab case).
+ *
+ * Called when a keyboard grab ends (seat.c holds the listener; this is the
+ * same shape as `vitrin_xdg_reconfigure_all`, which output.c calls when the
+ * view resizes -- a mechanism-level event asking window policy to re-apply
+ * itself). While a grab is live every focus change this file makes is
+ * swallowed by wlroots, so the two can be out of step for as long as a menu
+ * is open; this is the one moment they can be brought back together.
+ *
+ * WITHOUT IT #268 SURVIVES ITS OWN FIX. Measured on this tree: two toplevels,
+ * a grabbing popup open on the one holding the keyboard, and that one
+ * unmapped -- `toplevel_unmap` picks the survivor, the grab eats the enter,
+ * and nothing ever tries again. The surviving window is left visible and
+ * permanently untypable, which is the exact end state the issue was filed
+ * for, reached through a path a menu makes ordinary.
+ *
+ * Idempotent by construction: when the seat already points at the front
+ * window this returns without touching anything, so a grab that never
+ * disturbed focus costs one list walk and one comparison. */
+void vitrin_xdg_refocus(struct vitrin_shim *s) {
+	/* The seat is brought up in phase B and this file's list in phase D, so
+	 * a grab ending in between would otherwise walk an uninitialized list.
+	 * The same flag guards teardown for the same reason (server.c). */
+	if (!s->xdg_wired) {
+		return;
+	}
+	struct vitrin_toplevel *front = front_toplevel(s);
+	if (front == NULL) {
+		/* No window on screen. The last unmap already asked for the clear
+		 * and the grab swallowed that too -- `wlr_seat_keyboard_notify_clear_focus`
+		 * defers exactly like the enter does -- so the seat may still be
+		 * aimed at an unmapped surface. Condition 3 of `toplevel_unmap`
+		 * exists to prevent precisely that, and this is where it is honoured
+		 * on the deferred path. */
+		vitrin_seat_clear_keyboard(s);
+		return;
+	}
+	if (vitrin_seat_keyboard_focus_is(s, front->toplevel->base->surface)) {
+		return;
+	}
+	wlr_log(WLR_INFO, "keyboard re-asserted on the front window after a grab: \"%s\" (%s)",
+		front->toplevel->title ? front->toplevel->title : "(untitled)",
+		front->toplevel->app_id ? front->toplevel->app_id : "(no app id)");
+	focus_toplevel(front);
 }
 
 /* ON THE INITIAL COMMIT, AND NOT ONE INSTRUCTION EARLIER.
@@ -143,29 +358,118 @@ static void toplevel_commit(struct wl_listener *listener, void *data) {
 static void toplevel_map(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vitrin_toplevel *t = wl_container_of(listener, t, map);
+	t->mapped = true;
 	/* Single-maximized: the window's origin IS the view's origin. */
 	wlr_scene_node_set_position(&t->tree->node, 0, 0);
 	wlr_scene_node_set_enabled(&t->tree->node, true);
-	/* Keyboard focus is synthesized shim-side and held on the app for as
-	 * long as it has a window -- version 1's whole focus policy, and the
-	 * reason there is no focus event on the wire (seat.h, IDL
-	 * `vitrin_shim_seat`). Taken at map rather than at creation because an
-	 * unmapped surface cannot legally receive input. */
-	vitrin_seat_focus_keyboard(t->shim, t->toplevel->base->surface);
+	/* Keyboard focus is synthesized shim-side -- there is no focus event on
+	 * the wire, so the shim decides (seat.h, IDL `vitrin_shim_seat`) -- and
+	 * the rule is: THE MOST RECENTLY MAPPED WINDOW THAT IS STILL MAPPED
+	 * HOLDS THE KEYBOARD. Taken at map rather than at creation because an
+	 * unmapped surface cannot legally receive input.
+	 *
+	 * THAT SENTENCE REPLACES "the app has the keyboard for as long as it has
+	 * a window", which is what stood here, and which was true only while a
+	 * realm had exactly one window (issue #268). It never said what happens
+	 * to the FIRST window when a second one arrives and leaves again, and the
+	 * code's answer was: nothing -- `toplevel_unmap` cleared focus to nobody
+	 * and no later event could ever give it back, because focus is only ever
+	 * taken at map and the survivor had already mapped. Found on bare metal
+	 * with alacritty and nautilus: a session that looks alive, still scrolls
+	 * under the pointer, and cannot be typed into. The half of the rule that
+	 * lives at unmap is in `toplevel_unmap`. */
+	focus_toplevel(t);
 	wlr_log(WLR_INFO, "app window mapped: \"%s\" (%s)",
 		t->toplevel->title ? t->toplevel->title : "(untitled)",
 		t->toplevel->app_id ? t->toplevel->app_id : "(no app id)");
 }
 
+/* THE OTHER HALF OF THE FOCUS RULE (issue #268): the keyboard is passed on,
+ * not thrown away.
+ *
+ * What stood here was one unconditional `vitrin_seat_unfocus_keyboard`, whose
+ * body clears focus to NOBODY when the surface holds it. With one window per
+ * realm that is correct and complete. With two it is the bug: close the
+ * second window and the first -- still mapped, still visible, still receiving
+ * pointer events -- never gets the keyboard back, because `toplevel_map` is
+ * the only thing that takes it and the survivor mapped long ago.
+ *
+ * Three conditions:
+ *
+ *  1. ONLY IF THIS SURFACE HOLDS THE KEYBOARD -- and this one is a GUARD,
+ *     not a repair. It is currently redundant, and saying so is the point:
+ *     `focus_toplevel` moves the focused window to the head of the MRU list,
+ *     so the front window and the keyboard holder are normally the same
+ *     window, and a background window unmapping would find that same window
+ *     as its "successor" and re-focus it -- which `wlr_seat_keyboard_enter`
+ *     turns into a no-op on an already-focused surface. Deleting this line
+ *     therefore does NOT move the keyboard, and the focus-succession test
+ *     stays green with it gone (measured). What it does stop is a pointless
+ *     `sync_activation` configure sweep aimed at every window on screen every
+ *     time a background one closes, which IS observable and IS asserted --
+ *     see FACT 4 in tests/focus_succession_client.c. The invariant that makes
+ *     it redundant is one policy change away from being false (click-to-focus
+ *     would separate "front" from "holder"), which is why the guard stays and
+ *     why the test measures the traffic rather than the focus.
+ *  2. ONLY A MAPPED SUCCESSOR. Every toplevel the client created is on this
+ *     list, mapped or not, and `toplevel_destroy` -- not this handler -- is
+ *     what unlinks. So THIS toplevel is still on the list while this runs;
+ *     `t->mapped = false` above is what keeps `front_toplevel` from handing
+ *     the keyboard straight back to the window that is going away.
+ *  3. CLEAR WHEN NOTHING IS LEFT. The last window closing must still leave
+ *     the seat pointing at nothing, or the fix would be aiming the keyboard
+ *     at a surface about to be freed -- a worse bug than the one it fixes.
+ *
+ * NONE OF THE THREE IS GUARANTEED TO LAND IMMEDIATELY. Every one of them goes
+ * through wlroots' seat, which defers to an active keyboard grab, and an open
+ * menu is a keyboard grab (`xdg_popup.grab`). What this handler writes is the
+ * shim's intent, into the MRU list; `vitrin_xdg_refocus` is what makes the
+ * seat match it once the grab ends.
+ *
+ * THE POINTER NEEDS NOTHING HERE, AND THAT ARGUMENT STILL HOLDS WITH A
+ * SIBLING (issue #268, task 4). It rests on `replay_motion` (seat.c)
+ * re-hit-testing the scene on every motion event through `wlr_scene_node_at`,
+ * rather than caching a focused surface the way the keyboard path does. The
+ * line above disables this toplevel's scene node, so the very next motion
+ * cannot land on it; with no sibling it finds nothing and clears pointer
+ * focus, and with a sibling it finds the sibling and sends it an enter. Both
+ * are what should happen, from the same unchanged code. wlroots additionally
+ * drops pointer focus itself when the surface is destroyed, which covers an
+ * app that closes a window and never moves the mouse again.
+ *
+ * The one case that is not instant is a drag: while a button the app has seen
+ * is still down, `replay_motion` deliberately keeps the pointer on the
+ * surface that received the press instead of re-hit-testing (a drag that
+ * wanders off a window must not tear focus away mid-gesture), so a window
+ * unmapping mid-drag keeps receiving motion until the button releases or the
+ * surface is destroyed. That is bounded, self-healing, and strictly better
+ * than stranding a pressed button in the app -- and it is the pre-existing
+ * behaviour of the grab path, not something a second window introduces. */
 static void toplevel_unmap(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vitrin_toplevel *t = wl_container_of(listener, t, unmap);
+	struct vitrin_shim *s = t->shim;
+	t->mapped = false;
 	wlr_scene_node_set_enabled(&t->tree->node, false);
-	/* Give the keyboard back before the surface stops being able to hold
-	 * it. (Pointer focus needs no such call: wlroots drops it itself when
-	 * the surface is destroyed, and an unmapped surface is out of the scene
-	 * so the next hit test cannot find it.) */
-	vitrin_seat_unfocus_keyboard(t->shim, t->toplevel->base->surface);
+
+	struct wlr_surface *surface = t->toplevel->base->surface;
+	if (!vitrin_seat_keyboard_focus_is(s, surface)) {
+		return; /* condition 1 */
+	}
+
+	/* Condition 2. `front_toplevel` is the successor a human expects when a
+	 * dialog closes -- the window they were in before it opened -- and it is
+	 * the SAME function that decides who is `activated`, so the two answers
+	 * cannot disagree. */
+	struct vitrin_toplevel *successor = front_toplevel(s);
+	if (successor == NULL) {
+		vitrin_seat_unfocus_keyboard(s, surface); /* condition 3 */
+		return;
+	}
+	focus_toplevel(successor);
+	wlr_log(WLR_INFO, "keyboard passed to the surviving window: \"%s\" (%s)",
+		successor->toplevel->title ? successor->toplevel->title : "(untitled)",
+		successor->toplevel->app_id ? successor->toplevel->app_id : "(no app id)");
 }
 
 static void toplevel_destroy(struct wl_listener *listener, void *data) {
@@ -254,6 +558,15 @@ static void on_new_toplevel(struct wl_listener *listener, void *data) {
 	t->tree = wlr_scene_xdg_surface_create(&s->scene->tree, toplevel->base);
 	if (t->tree == NULL) {
 		wlr_log(WLR_ERROR, "cannot add the toplevel to the scene");
+		/* Unlinked before the free, or the list keeps a node pointing into
+		 * freed memory and every later walk of it dereferences that. The
+		 * comment above promises the link is always removable; this is the
+		 * one path that used to break the promise. Latent until issue #268
+		 * gave the list a second reader -- `toplevel_unmap`'s successor
+		 * search now runs whenever the keyboard-holding window closes, so a
+		 * failure here would turn the next window close into a
+		 * use-after-free rather than into nothing at all. */
+		wl_list_remove(&t->link);
 		free(t);
 		return;
 	}

@@ -315,7 +315,7 @@ task per phase.
 ```bash
 meson setup build            # uses system wlroots-0.19 if available
 ninja -C build
-meson test -C build          # header-compiles, xdg-conformance
+meson test -C build          # header-compiles, xdg-conformance, focus-succession
 
 # Build the vendored wlroots from source (e.g. CI, or no system wlroots-0.19),
 # taking wlroots' own dependencies from the system:
@@ -362,8 +362,10 @@ app that opens a menu maps it instead of being disconnected. The client is
 [`tests/xdg_conformance_client.c`](tests/xdg_conformance_client.c); the
 reasoning for each assertion is in its header comment, and the wlcs failures
 that provoked it are annotated in
-[`wlcs/README.md`](wlcs/README.md). Alone among the scripts here it is wired
-into `meson test`, because it needs nothing but this tree's own binaries.
+[`wlcs/README.md`](wlcs/README.md). It and
+[`tests/acceptance/focus_succession.sh`](tests/acceptance/focus_succession.sh)
+are the two scripts here wired into `meson test`, because they are the two
+that need nothing but this tree's own binaries.
 
 Each of the three was measured failing before the code that makes it pass:
 the popup checks go red on the tree as it stood one commit earlier, with
@@ -377,6 +379,35 @@ checked-in test.
 
 ```bash
 bash tests/acceptance/xdg_conformance.sh ./build/vitrin-shim ./build/xdg-conformance-client
+```
+
+[`tests/acceptance/focus_succession.sh`](tests/acceptance/focus_succession.sh)
+— keyboard-focus succession between **sibling windows of one app in one
+realm** (**#268**, found on bare metal with alacritty and nautilus: closing a
+second window cleared focus to nobody and left the survivor visible and
+untypable). The client is
+[`tests/focus_succession_client.c`](tests/focus_succession_client.c). It maps
+three toplevels **created in one order and mapped in another**, so that "most
+recently mapped" is distinguishable from "most recently created", then closes
+them one at a time: the keyboard must go to the survivor, then stay put when a
+*background* window closes, then be released when the last one goes — with
+`xdg_toplevel`'s `activated` state naming the front window throughout. Two
+more toplevels repeat the sequence with an `xdg_popup.grab` open, because
+wlroots defers every focus change to an active keyboard grab and a menu is
+one, so that is the input that makes the whole mechanism silently do nothing.
+Every assertion's reasoning is in the client's header comment.
+
+This is the second script here wired into `meson test`, on the same grounds as
+`xdg_conformance.sh`: headless, GPU-free, no seat device and no core
+(`--no-upstream`), because `vitrin_seat_init` runs unconditionally at bring-up
+so the virtual keyboard exists and real `wl_keyboard.enter`/`leave` events can
+be observed. It is a **component** test of the shim, not milestone evidence:
+the hardware half of #268's acceptance — open a second window inside a realm
+on bare metal, close it, and type into the first — is a DRM run that CI cannot
+reach.
+
+```bash
+bash tests/acceptance/focus_succession.sh ./build/vitrin-shim ./build/focus-succession-client
 ```
 
 [`tests/acceptance/shim_globals_and_client.sh`](tests/acceptance/shim_globals_and_client.sh)

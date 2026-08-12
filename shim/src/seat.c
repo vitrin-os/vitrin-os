@@ -713,10 +713,22 @@ static void replay_motion(struct vitrin_seat_replay *r, struct vitrin_origin ori
 		return;
 	}
 
-	/* Focus is synthesized here: version 1's realm is single-surface and the
-	 * wire carries no focus event, so pointer-enter happens on the first
-	 * motion that lands on a surface (IDL: "focus in version 1 is
-	 * synthesized shim-side"). */
+	/* Focus is synthesized here: the wire carries no focus event, so
+	 * pointer-enter happens on the first motion that lands on a surface
+	 * (IDL: "focus in version 1 is synthesized shim-side").
+	 *
+	 * THE HIT TEST ABOVE IS ALSO WHAT MAKES THIS CORRECT WITH SEVERAL
+	 * WINDOWS, and that used to be an accident this comment did not know
+	 * about: it read "version 1's realm is single-surface", which stopped
+	 * being true the first time an app opened a second toplevel (issue
+	 * #268). Nothing here needed changing, because `surface_at` re-hit-tests
+	 * the scene on EVERY motion instead of caching a focused surface the way
+	 * the keyboard path does -- so a window that unmaps drops out of the
+	 * scene and out of the answer on the next event, and a sibling under the
+	 * pointer gets an enter from the same unchanged code. The full argument,
+	 * including the one case that is not instant (a drag in progress, which
+	 * takes the grab branch above deliberately), is in xdg.c's
+	 * `toplevel_unmap`; it is not restated here. */
 	r->surface_ox = lx - sx;
 	r->surface_oy = ly - sy;
 	if (surface != focused) {
@@ -1348,22 +1360,70 @@ void vitrin_seat_focus_keyboard(struct vitrin_shim *s, struct wlr_surface *surfa
 	if (s->seat == NULL || surface == NULL || r->keyboard == NULL) {
 		return;
 	}
-	/* Version 1's whole focus policy: one realm, one window, so the app has
-	 * the keyboard for as long as it has a window. Handing over the already
-	 * pressed keycodes and the current modifier state is what makes a
-	 * chord that began before the map survive it. */
+	/* WHERE THE POLICY LIVES, AND WHAT IT NOW SAYS. This function is the
+	 * mechanism -- WHICH surface gets the keyboard is xdg.c's decision, and
+	 * the rule there is "the most recently mapped window that is still
+	 * mapped" (`toplevel_map` / `toplevel_unmap`). What this comment used to
+	 * claim -- "one realm, one window, so the app has the keyboard for as
+	 * long as it has a window" -- was version 1's policy and stopped being
+	 * true the first time an app opened a second toplevel: the survivor of a
+	 * closed dialog got nothing back, because focus is only ever TAKEN at
+	 * map (issue #268).
+	 *
+	 * Handing over the already pressed keycodes and the current modifier
+	 * state is what makes a chord that began before the map survive it -- and
+	 * it is also what makes the keyboard arrive at a successor mid-chord
+	 * without the app seeing a phantom release.
+	 *
+	 * wlroots sends the previous holder its `wl_keyboard.leave` as part of
+	 * this enter, so a caller moving focus between siblings must NOT unfocus
+	 * first: that would put an interval with no holder on the wire, which is
+	 * the state this whole path exists to avoid.
+	 *
+	 * `notify_enter`, NOT `wlr_seat_keyboard_enter`: the notify form "defers
+	 * to any keyboard grabs" (wlr_seat.h) and the bare form does not. The
+	 * bare one would let this shim yank the keyboard out from under an open
+	 * menu, which is the app's own popup grab and none of the shim's
+	 * business. The price is that this call can be a no-op for as long as a
+	 * menu is open, so it is FIRE-AND-FORGET and callers must treat it that
+	 * way: `vitrin_seat_keyboard_focus_is` is how they check, and xdg.c's
+	 * `vitrin_xdg_refocus` is what re-asserts once the grab ends. */
 	wlr_seat_keyboard_notify_enter(s->seat, surface,
 		r->keyboard->keycodes, r->keyboard->num_keycodes, &r->keyboard->modifiers);
 	wlr_log(WLR_DEBUG, "keyboard focus taken by the app surface");
 }
 
-void vitrin_seat_unfocus_keyboard(struct vitrin_shim *s, struct wlr_surface *surface) {
+void vitrin_seat_clear_keyboard(struct vitrin_shim *s) {
 	if (s->seat == NULL) {
 		return;
 	}
-	if (s->seat->keyboard_state.focused_surface == surface) {
-		wlr_seat_keyboard_notify_clear_focus(s->seat);
+	wlr_seat_keyboard_notify_clear_focus(s->seat);
+}
+
+void vitrin_seat_unfocus_keyboard(struct vitrin_shim *s, struct wlr_surface *surface) {
+	if (vitrin_seat_keyboard_focus_is(s, surface)) {
+		vitrin_seat_clear_keyboard(s);
 	}
+}
+
+/* Whether `surface` is the one holding the keyboard right now.
+ *
+ * Exported so xdg.c can ask BEFORE it acts, which is what the two-window
+ * unmap path needs (issue #268): a window that unmaps while a sibling holds
+ * the keyboard must neither clear focus nor go looking for a successor, and
+ * "did my call do anything?" is not something `vitrin_seat_unfocus_keyboard`
+ * can answer after the fact. Reading `seat->keyboard_state` from xdg.c
+ * instead would put wlroots' seat internals in a second file for no gain;
+ * this keeps the seat's state the seat's business, and it is deliberately a
+ * QUERY of wlroots' own field rather than a shim-side copy of focus, for the
+ * reason the pointer-state comment in seat.h gives -- a second copy is a
+ * second thing to invalidate, and the one that got it wrong would be
+ * pointing at freed memory. */
+bool vitrin_seat_keyboard_focus_is(struct vitrin_shim *s, struct wlr_surface *surface) {
+	if (s->seat == NULL || surface == NULL) {
+		return false;
+	}
+	return s->seat->keyboard_state.focused_surface == surface;
 }
 
 /* ---- the entry point -------------------------------------------------- */
@@ -1532,6 +1592,24 @@ static void handle_modifiers(struct wl_listener *listener, void *data) {
 	wlr_seat_keyboard_notify_modifiers(r->shim->seat, &r->keyboard->modifiers);
 }
 
+/* A keyboard grab ended -- an app's menu closed, in practice, since
+ * `xdg_popup.grab` is the only thing in a version-1 realm that takes one.
+ * Every focus change the shim made while it was live was swallowed
+ * (`wlr_seat_keyboard_notify_enter` defers to grabs), so this is the first
+ * moment the seat can be made to agree with window policy again. xdg.c owns
+ * that policy and re-applies the whole of it; nothing is passed in, because
+ * the answer is a property of which windows are mapped and not of which grab
+ * just ended. See `vitrin_xdg_refocus` (issue #268).
+ *
+ * wlroots resets `keyboard_state.grab` to the default grab BEFORE emitting
+ * this signal, so the enter issued from here is not swallowed by the grab
+ * that is ending. */
+static void handle_keyboard_grab_end(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vitrin_seat_replay *r = wl_container_of(listener, r, keyboard_grab_end);
+	vitrin_xdg_refocus(r->shim);
+}
+
 static const struct wlr_keyboard_impl keyboard_impl = {
 	.name = "vitrin-virtual-keyboard",
 	/* No LEDs: there is no device to light up, and a shim that pretended
@@ -1584,6 +1662,13 @@ bool vitrin_seat_init(struct vitrin_shim *s) {
 	r->modifiers.notify = handle_modifiers;
 	wl_signal_add(&r->keyboard->events.modifiers, &r->modifiers);
 	r->modifiers_wired = true;
+
+	/* Attached to the SEAT, not to the keyboard: the grab is seat state.
+	 * Safe this early even though xdg.c's toplevel list is built two phases
+	 * later -- `vitrin_xdg_refocus` returns immediately until it exists. */
+	r->keyboard_grab_end.notify = handle_keyboard_grab_end;
+	wl_signal_add(&s->seat->events.keyboard_grab_end, &r->keyboard_grab_end);
+	r->keyboard_grab_end_wired = true;
 
 	if (!keymap_sync(r)) {
 		return false;
@@ -1644,6 +1729,14 @@ void vitrin_seat_finish(struct vitrin_shim *s) {
 	if (r->modifiers_wired) {
 		wl_list_remove(&r->modifiers.link);
 		r->modifiers_wired = false;
+	}
+	/* The seat is a display global and must have no listeners left on its
+	 * signals when `wl_display_destroy` tears it down -- the same rule the
+	 * xdg-shell listeners follow in server.c, and the same `_wired` flag
+	 * pattern, because bring-up can fail before this one was attached. */
+	if (r->keyboard_grab_end_wired) {
+		wl_list_remove(&r->keyboard_grab_end.link);
+		r->keyboard_grab_end_wired = false;
 	}
 	if (r->keyboard != NULL) {
 		if (s->seat != NULL && wlr_seat_get_keyboard(s->seat) == r->keyboard) {

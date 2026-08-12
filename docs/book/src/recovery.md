@@ -679,7 +679,8 @@ the finding**, and it is why L6 now tells you to choose the route first.
 - **L4's new log and recorder expectations were observed by nobody.** They were
   added by the #258/#259 fixes after this run, so nothing in the block above
   reached them — and the L7 run that followed did not look at the log or the
-  recorder either. #258 and #259 remain unobserved on hardware.
+  recorder either. **A third run, on 2026-08-12, did: see `L4 (second
+  execution)` below.**
 
 **Filed from this run:** #257 (returning to a paused session blanks the panel in
 ~1.5 s), #258 (the unblank is silent; success and failure look identical), #259
@@ -727,10 +728,64 @@ number — an eyeball pass at a 20 s timeout cannot distinguish "the full 20 s"
 from "17 s", so the rung's own question, *how long did the panel stay lit*, is
 still unanswered and the record block above says so.
 
+### L4 (second execution) — 2026-08-12, `--blank-idle 60`
+
+The first run that read the log and the recorder rather than only the panel.
+**#258 and #259 are settled by it**, and nothing else is.
+
+```
+  Executed: 2026-08-12 14:00:57 JST (+0900), by the maintainer, on the same
+            machine as every block above.
+    Binary: vitrind rebuilt from `main` at 13:46 the same day.
+            --blank-idle 60; --lock-idle NOT passed.
+
+  Panel .......................... blanked on the idle timer, stayed dark, and
+                                   came back on a keypress. Observed by eye.
+
+  Log line (#258) ................ YES.
+      the panel is lit again: physical input woke the session and the modeset
+      was accepted. The wake itself restores no authority -- an idle blank
+      never took any.
+  THE WAKE WAS NOT CONFIRMED ..... 0 occurrences.
+
+  Recorder (#259) ................ YES, the pair, from the same wake:
+      {"kind":"screen_blanked","live_grants":0,"locked":false}
+      {"kind":"screen_woke","dark_ms":5630,"outcome":"flip_landed",
+       "live_grants":0,"locked":false}
+
+  Timed? ......................... NO. `dark_ms` is how long the panel was dark
+                                   before a key was pressed, not a latency: it
+                                   measures the human, not the wake.
+```
+
+**The earlier run recorded nothing because of the binary, not the code.** The
+13:42 attempt the same day used a `vitrind` built on 2026-08-11 at 12:34 — five
+hours older than the commit that added both the line and the pair — so it
+blanked and woke while carrying no code to write either down. A wake that
+logs nothing and a build that cannot log are indistinguishable in the artifact;
+only the binary's mtime tells them apart. **Check what you are running before
+reading a silence as a result.**
+
+**What it does not settle.** The WARN arm is unexercised: no wake failed, so
+`THE WAKE WAS NOT CONFIRMED` has still never been emitted on hardware, and its
+absence here is the pass condition rather than a gap. No figure was taken, so
+L7's question is still unanswered.
+
+**A narrow point about `L5`, which passed on 2026-08-11 and is not reopened
+here.** That row asks for two things from one run: no lock card on screen, and
+`locked: false` on the `screen_blanked` entry. The 2026-08-11 run checked the
+screen half with the lock armed and passed it; the recorder entry did not exist
+yet, so there was nothing to read. This run has the entry and it reads
+`locked: false`, but it did not arm the lock, so its clean screen is what an
+unarmed lock looks like rather than evidence about the boundary. **Both halves
+hold, from different runs; the row as written has not been satisfied by a single
+one.** Worth one arming pass, and not worth re-litigating the 2026-08-11 result.
+
 > **This page has now been executed once, on 2026-08-11, and it is still not a
 > clean pass.** Routes 3 and 4 remain careful predictions; L2 and L3 are short
 > of their counts; L6 recovered but by an unknown route; `L7` passed by eye at a
-> 20 s timeout with no figure recorded and #258/#259 unobserved; and the run's
+> 20 s timeout with no figure recorded, and `L5` is still owed because the run
+> that settled #258/#259 did not arm the lock; and the run's
 > headline finding was that this page's own route-2 command was wrong. Read it that way,
 > correct it from your own eyes, and treat a failed observation as a result
 > worth recording rather than a step to retry until it passes.

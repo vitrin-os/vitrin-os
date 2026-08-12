@@ -779,13 +779,26 @@ yet, so there was nothing to read. This run has the entry and it reads
 `locked: false`, but it did not arm the lock, so its clean screen is what an
 unarmed lock looks like rather than evidence about the boundary. **Both halves
 hold, from different runs; the row as written has not been satisfied by a single
-one.** Worth one arming pass, and not worth re-litigating the 2026-08-11 result.
+one.**
+
+**Adjudicated closed by the maintainer on 2026-08-12**, and recorded as an
+adjudication rather than as an observation, because that is what it is. His
+reading is that the 2026-08-11 pass is the substantive one — the lock was armed,
+the blank fired, and no card came up — and that a second run to put both halves
+in one artifact is bookkeeping rather than evidence. That is a reasonable call
+and it is his to make; what it costs is stated here so nobody later reads `L5`
+as something it was not. **What a single arming pass would still buy, and only
+it:** the case where the screen and the journal disagree — a `locked: true`
+entry under a screen with no card, which this row's own failure column names as
+its own defect. Two runs cannot catch a disagreement between them by
+construction. Nobody believes that state is live; it simply has not been looked
+for.
 
 > **This page has now been executed once, on 2026-08-11, and it is still not a
 > clean pass.** Routes 3 and 4 remain careful predictions; L2 and L3 are short
 > of their counts; L6 recovered but by an unknown route; `L7` passed by eye at a
-> 20 s timeout with no figure recorded, and `L5` is still owed because the run
-> that settled #258/#259 did not arm the lock; and the run's
+> 20 s timeout with no figure recorded; `L5` is adjudicated closed rather than
+> re-run; and the run's
 > headline finding was that this page's own route-2 command was wrong. Read it that way,
 > correct it from your own eyes, and treat a failed observation as a result
 > worth recording rather than a step to retry until it passes.

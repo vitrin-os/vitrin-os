@@ -354,6 +354,144 @@ grant.pointer.click(640, 84)</pre>
     </div>
   </section>
 
+  <section id="session">
+    <h2>It can drive a real panel. It is not a desktop.</h2>
+    <p class="sub">
+      Since Phase 1 closed, <code>vitrind</code> has grown a bare-metal DRM/KMS
+      backend, a lock screen, an idle blank, a status strip, a screenshot key and
+      a cross-realm clipboard. It <em>looks</em> like a desktop, which is exactly
+      when unstated gaps mislead — so the gaps are here, on the page that makes
+      the claim.
+    </p>
+
+    <p><strong>Everything below was measured on one machine, on the dates
+    given.</strong> One laptop: an Intel iGPU on <code>/dev/dri/card1</code>
+    driving the only connected output, <code>eDP-1</code>, at 2560×1600 @ 240 Hz,
+    scale 1, on one mesa version and two consecutive Arch kernels. The bring-up
+    runbook was executed twice on <strong>2026-08-09</strong>
+    (<code>7.1.5-arch1-2</code>) and the session-lifecycle checklist once on
+    <strong>2026-08-11</strong> (<code>7.1.6-arch1-1</code>); neither was a clean
+    pass, and the 2026-08-11 session produced five defects — four from the
+    checklist rungs and one from driving real applications. Nothing here
+    generalises to any other GPU, panel or kernel.</p>
+
+    <div class="tw">
+    <table>
+      <thead><tr><th>The gap</th><th>What it means for a person using this</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>No accessibility of any kind</td>
+          <td>No screen reader, no magnifier, no on-screen keyboard, no sticky or
+          slow keys, and no <strong>AT-SPI2</strong> bus <em>advertised</em> to a
+          realm — a missing service, never a confinement. Under decision D9 the
+          host session bus, where <code>org.a11y.Bus</code> is activated, stays
+          connectable; nothing here blocks it, and the adversarial probe that
+          would prove otherwise has not been written.
+          The semantic tree Phase 2 builds for <em>agents</em> is derived from
+          accessibility technology and is <strong>not a substitute for
+          it</strong> — different consumer, different transport, and only under a
+          grant a human approved. It does not make Orca work. Published as an
+          exclusion, not a deferral: there is no schedule.</td>
+        </tr>
+        <tr>
+          <td>CI cannot test the DRM backend</td>
+          <td>A runner has no DRM device, no seat and no GPU. The only job that
+          touches this code is named
+          <code>drm-compile-check (COMPILE ONLY - no display controller is
+          touched)</code> and proves the code type-checks — no mode set, no frame
+          committed, no key delivered. Every hardware claim on this site is a
+          dated run by one person, never a green tick.</td>
+        </tr>
+        <tr>
+          <td>No X11</td>
+          <td>Wayland only: there is <strong>no X server anywhere in this
+          stack</strong>, and a realm's app is handed no <code>DISPLAY</code>, so
+          <code>xterm</code> in a realm fails with <code>Can't open display</code>.
+          Per-app X11 is Phase 3. In the meantime the maintainer runs a second,
+          unconfined session on another virtual terminal for X11-only software —
+          a workaround he accepts, not something this project offers or
+          confines.</td>
+        </tr>
+        <tr>
+          <td>No bars or launchers</td>
+          <td><code>zwlr_layer_shell_v1</code> is not in the shim's global
+          contract, and there is no core-owned surface a client can add to — the
+          trusted band, the consent card, the lock screen and the status strip
+          are drawn by the core and nothing else may draw beside them. A
+          principal cannot draw at all; the shipped switcher is a line-oriented
+          program in a host terminal.</td>
+        </tr>
+        <tr>
+          <td>No portals</td>
+          <td>No <code>xdg-desktop-portal</code>, and a realm is advertised no
+          session bus: no portal file chooser, no screen sharing, no
+          notifications. It buys no security. Under decision D9 there is no
+          sandbox, so the host bus is still on the filesystem and still
+          connectable by any process of this uid.</td>
+        </tr>
+        <tr>
+          <td>One output, one visible realm</td>
+          <td>Up to <strong>16 realms</strong> run at once; the core composites
+          <strong>exactly one output</strong> from one of them, and refuses to
+          start on a second connected display rather than half-serving it. A
+          laptop plus an external monitor does not work. Nothing you can ask for
+          ends a realm — revocation, disconnect and the dead-man switch all leave
+          the process running — and a slot comes back only when the realm's own
+          app exits, so the cap is sixteen <em>simultaneously live</em> realms
+          rather than sixteen launches.</td>
+        </tr>
+        <tr>
+          <td>A cross-realm clipboard</td>
+          <td>Stated as a bound, never as an absence: two physical human
+          gestures move <code>text/plain;charset=utf-8</code>, up to
+          <strong>60 KiB</strong> at a time, one direction each, through a single
+          core-held slot no client can trigger, force or observe. Two colluding
+          realms can move ~60 KiB per gesture pair.</td>
+        </tr>
+        <tr>
+          <td>A lock does not stop an agent</td>
+          <td>An <code>observe</code> holder keeps capturing across a lock and
+          across an idle blank; an <code>actuate</code> holder keeps acting. A
+          lock takes away <em>your</em> input, not an agent's authority — the
+          instrument for "stop everything" is the dead-man chord, which fires
+          through both. And <code>--blank-idle</code> blanks the screen without
+          locking it: a dark laptop is an unlocked session. A blank is worse than
+          a lock for the agent — with the display off, every realm's frame clock
+          stops and the agent is served the pre-blank frame indefinitely, with no
+          staleness signal and no refusal.</td>
+        </tr>
+        <tr>
+          <td>A shell crash loses window management</td>
+          <td>The switcher is an unprivileged client by design, so there is no
+          core-side fallback. Kill it and the core, the realms and their apps all
+          survive, and the last-focused realm keeps taking your input — what you
+          lose is the ability to re-aim it, and recovering means starting the
+          shell again from a terminal that must already be in the realm on
+          screen.</td>
+        </tr>
+        <tr>
+          <td>Idle inhibition is not served</td>
+          <td>Full-screen video will blank the screen.
+          <code>zwp_idle_inhibit_manager_v1</code> needs a new shim global and a
+          new wire verb; that paired change is what reopens it. A <em>not
+          yet</em> with a named condition, not a refusal.</td>
+        </tr>
+        <tr>
+          <td>The band's witness: one backend</td>
+          <td>The band's unspoofability is machine-checked on the headless
+          backend CI can read, and <strong>asserted, not checked</strong>, on the
+          bare-metal backend a human looks at. Nobody has evidence a human
+          <em>notices</em> a wrong band either.</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+
+    <p><a href="docs/limits.html">Each of these is argued out in full on the
+    limits page</a>, which is longer, harder on this project, and the surface
+    that governs if this table and it ever disagree.</p>
+  </section>
+
   <section id="docs">
     <h2>Read on</h2>
     <div class="cards">

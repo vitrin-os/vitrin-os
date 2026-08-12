@@ -1699,13 +1699,265 @@ item's cost is dominated by the machines this list excludes.
 
 WS-E makes a thing that *looks* like a desktop, which is precisely when
 unstated gaps become misleading. Each of these is a published `known-limit`
-this workstream owns, not inherits:
+this workstream owns, not inherits.
 
-- **No accessibility of any kind.** No screen reader, magnifier, high
-  contrast, sticky or slow keys. The semantic channel is **not** a substitute
-  for AT-SPI — it serves agents, not humans. A daily driver with no screen
-  reader is a real exclusion and is stated as one.
-- **No X11**, so no Steam and no legacy application (pre-existing; *scoped and
+### The surfaces, enumerated once (WS-E.4.4/#224)
+
+Until #224 this list existed only as **per-issue handoff tables** —
+[§4.2](#handoff-to-ws-e44-224) dictating #221's three sentences,
+[§4.4](#handoff-to-ws-e44-224-1) dictating #223's — which is a handoff and not
+an enumeration: each one names the surfaces *that issue* touches, so nothing
+anywhere held the set. `CLAUDE.md`'s `known-limit` rule ("enumerate every
+surface when closing one") needs the set to exist in one place. Here it is, and
+it is the only copy; the handoff tables stay as **dictated text for their own
+claims** and are inputs to this table rather than a second enumeration of it.
+
+| Surface | Register it is written in | What it carries | What holds it |
+|---|---|---|---|
+| [`docs/book/src/limits.md`](../book/src/limits.md) | An argument, at length, hard on this project. **This is the governing surface**: where it and any other disagree, it wins. | Every limit in this section, each with its reasoning, its evidence and what it does *not* claim. | `cargo xtask limits-check` (see below): the anchored claims, **and a set cross-check against this section** — plus human review |
+| [`README.md`](../../README.md), §"Running it as a desktop" | A contributor's summary — dense, linked, no argument. Sits directly under "What Phase 1 does *not* give you", because a reader who read that list will otherwise assume it is still the whole list. | The same limit set in one bullet each, every one linking onward. | `cargo xtask limits-check`, for the **anchored** claims only — see below |
+| [`site/index.html`](../../site/index.html), §"It can drive a real panel. It is not a desktop." | A landing page's warning, in a reader's words. | An eleven-row table, **with the measurement dates, the two kernels and the single machine configuration above it**, and a link to the limits page as the surface that governs. | `cargo xtask limits-check` |
+| [`docs/book/src/session-app-matrix.md`](../book/src/session-app-matrix.md) | Generated. Not hand-editable. | Which applications have actually been run, at what bar, with the observable checked. WS-E limits are **cited** from it, never restated in it. | `cargo xtask session-matrix --check` (byte-for-byte) |
+| [`docs/book/src/recovery.md`](../book/src/recovery.md) | A runbook. | The hardware checklist `L1`–`L7` and its dated record; the `logind` settings this repository does not own. | A human executing it, and nothing else |
+| [`NOTICE`](../../NOTICE) | Normative path→license map. | **Nothing from WS-E.** Checked and confirmed: no WS-E limit is licensing-relevant, and the workstream moved no file across a license boundary. Named here so the next sweep does not have to re-derive that it is out of scope. | — |
+| [`docs/PRD.md`](../PRD.md) §15 | The threat model. | Already edited by WS-E.2.1: the row that said a malicious app cannot reach *"the session's real seat/clipboard/a11y bus"* now states the clipboard bound. Not re-edited here. | Human review |
+
+**The site carries a stated subset, and that is a decision rather than an
+oversight.** Eleven rows is already the outer limit of what a landing page can
+carry before a reader stops reading, so it omits the touch/tablet deferral,
+which needs the "deferral with named reopening evidence, not a refusal" framing
+to be read correctly and is meaningless at one line; the second-GPU distinction,
+which is a sentence about one laptop; the media/brightness-key half-fix and the
+missing key repeat, each of which needs its "where the key stops changed, not
+what it does" framing to be read as anything but a fix; and the per-run counts,
+of which the site's preamble carries **only the dates, the two kernels and the
+defect total** — `L1`–`L6`'s individual numbers are on `README.md` and
+`limits.md` and nowhere on the site. Every one of those is on both other
+surfaces, and the site's closing line names the limits page as the surface that
+governs. What the site may **never** do is state a claim the limits page does
+not, or state one more weakly — `limits-check` holds the ones it carries, and
+this paragraph is the record for the ones it does not.
+
+**The mechanism, and it is explicitly temporary.** `cargo xtask limits-check`
+(`crates/xtask/src/limits.rs`, run by the `codegen-diff` job) holds a table of
+claims. Each names the **anchor phrase** every surface must carry *and* the
+**code evidence** that makes the claim true — a constant that must still read
+`61440`, an interface name that must still appear nowhere in `shim/src/`, a CI
+job whose own name must still say `COMPILE ONLY`. Deleting a claim from one
+surface fails it; changing the code without changing the page fails it too, and
+that second half is the one that matters here: **#224's own body carried two
+items that were false of `main`**, and three surfaces agreeing with each other
+would have agreed on both. Issue #172 owns the choice of mechanism for this
+repository's honesty surfaces and has not made it; this is its option (b), built
+narrow, and the module states what replaces it under each of #172's options.
+
+**And a second mechanism, which compares this section's limit set against the
+limits page's — the SET, never the wording.** #224's fifth acceptance criterion
+asks for this section and `limits.md` to be cross-checked *"mechanically, not by
+reading"*, and the obvious instrument is the wrong one: the two documents are
+written in two registers on purpose, this one addressed to whoever maintains the
+project (*"TCB growth for zero differentiator"*) and the limits page to a
+stranger deciding whether to run it (*"anyone who walks up to your dark laptop
+and touches a key is inside your session"*). Demanding a shared anchor phrase
+across them would make an honest rewording of either register a red build, which
+is the *"trains people to weaken the check"* failure #224's own risk list names.
+
+So each limit carries an **identity that survives rewriting** instead: an
+invisible marker comment holding a kebab-case id, in this section and beside the
+matching entry on the limits page. A pair of HTML comments reading
+`limit-set: begin` and `limit-set: end` bound the set below (the corrections and
+measurement subsections have bullets too, and none of them are limits); inside
+it every top-level bullet carries a comment reading either `limit: <id>`,
+meaning the limits page publishes it under that id, or
+`limit-not-on-page: <id> -- why`, which is the escape hatch and **costs a
+written reason**. The delimiters are deliberately written here without their
+comment brackets: the gate reads this file, and a literal delimiter in prose
+would move where it thinks the set starts. The gate refuses a duplicated
+delimiter for that reason. The gate then holds five
+things: the two id sets are equal in both directions; every top-level list item
+in the set carries a marker at all (a limit added here with no marker is one
+nobody was ever told about, which is the failure item 6 of the corrections list
+below records this sweep committing); an off-page reason exists; an off-page id
+does not turn up on the page anyway; and **the comparison is refused outright if
+both sets come out empty**, because two empty sets are equal and a gate that
+prints "the same limit set" having read nothing is worse than no gate at all.
+Reword either document however its register needs — the ids do not move.
+Matching runs over whitespace-normalised text, so a reflow, and a wrapped
+reason, change nothing.
+
+**The fifth rule and two others were added by an adversarial pass over the
+first version of the gate, which found three ways to pass it while holding
+nothing.** Emptying this region and stripping the page's markers was green.
+So was adding any text to the `limit-set: begin` line — the set comparison
+reads normalised text and went on working, while the line-based "every item is
+marked" scan silently never entered the region. So was writing a new limit with
+Markdown's equally valid `* ` instead of `- `. All three are now red, each with
+its own test. They are recorded here rather than only in the code because the
+lesson is not about Markdown: every one of them was a *comparison that held
+between two things neither of which existed*, which is the failure mode this
+whole section is written to refuse.
+
+**Writing that check found two limits this section did not carry.** `one-output`
+and `realm-cap-arithmetic` were published on all three surfaces, both have a row
+in `limits-check`'s claim table, and this enumeration — the one `CLAUDE.md`'s
+`known-limit` rule sends a reader to — did not list either. Both are added
+below, marked as such. That is the criterion working before it was even green,
+and it is recorded here because "the plan document is the set" was an assumption
+nobody had tested.
+
+What the gate **cannot** hold, stated so its green is not over-read. First,
+anything about hardware: "One machine, one GPU, one panel, one kernel", the
+counts from `L1`–`L7`, and every date on this page are claims about the world, a
+runner cannot check one of them, and the gate is silent rather than reassuring.
+
+Second — and this one is easier to over-read because it looks like coverage —
+**the table holds the claims it has rows for, and the "What holds it" column
+above means exactly that**. A published sentence with no row in `CLAIMS` can be
+deleted from two surfaces with the build green. That was not a hypothetical: the
+first draft of this sweep anchored the band-witness claim on `limits.md` alone
+and left the shell-crash and lock/blank claims out of the table entirely, and
+deleting the `README.md` bullet and the `site/index.html` row for any of the
+three passed. Every claim published on all three surfaces now has a row anchored
+on all three; the two claims published on two surfaces (the media/brightness
+half-fix and the missing key repeat) are anchored on those two. The rule this
+sweep leaves behind for the next one: **a claim that is not in the table is not
+held, and adding a published claim to a surface without adding its row is how
+the next stale sentence ships.**
+
+Third, the set cross-check has its own edges, and they are not the same edges.
+**It cannot see an unmarked paragraph on the limits page.** A WS-E limit
+published there with no marker comment is held in neither direction, because
+nothing in the text distinguishes it from that page's many Phase-1 entries,
+which are inherited rather than created here and carry no marker on purpose —
+the portals entry and the static-identities entry are two of them. The
+every-bullet rule covers this section's side of that hole and there is no
+equivalent for the page. **It says nothing about `README.md` or
+`site/index.html`**, which are held claim by claim by the anchors above, because
+the site carries a stated subset and set equality against a deliberate subset
+would be wrong. **It does not check that a marker sits beside the right
+paragraph**: an id moved to a neighbouring entry satisfies every rule, so what
+is held is that the two documents enumerate the same limits and not that each
+pair of entries says the same thing. And **one id is one anchor** — where the
+limits page splits a limit across several paragraphs the marker goes on the
+primary one and the rest are unheld, and where a bullet here covers two limits
+it carries two markers, which is the shape to reach for rather than stretching
+an id's meaning. Twelve limits in the set below are marked
+`limit-not-on-page`, each with its reason; three of those are closed, and the
+other nine are limits this project has written down for itself and published
+nowhere. That list is not a gap in the gate — it is the gate's output, and it is
+the honest state of what §6 carries that no reader ever sees.
+
+### Corrections this sweep had to make before it could publish anything
+
+Six claims were **false of `main` at sweep time** and are recorded here rather
+than quietly fixed, because a sweep that tidies away its own inputs teaches the
+next one nothing. Three came in as inputs; the other three the sweep **wrote
+itself and then had to retract before publishing**, which is the more useful
+half of this list — it is evidence that "verify against the code, not against
+the plan document" is a rule this task could not follow from memory either:
+
+1. **#224's item (6)** asked to publish *"no cross-realm clipboard of any
+   kind"*. WS-E.2.1/#213 shipped one and `limits.md` already published the
+   opposite. Corrected in the issue body on 2026-08-12; published here as the
+   **bound**, never as an absence.
+2. **#224's item (8)** asked to publish *"no lock screen and no idle
+   inhibition"*. WS-E.2.2/#214 shipped the lock screen. Only the
+   idle-inhibition half was true, and only that half is published.
+3. **`limits.md`'s own DRM bullet** read *"Not even a compile-check, yet… **no
+   such rung exists and no such feature exists** — the backend itself is
+   unwritten (#218)"*. #218 landed. `.github/workflows/ci.yml` now carries a job
+   named `drm-compile-check (COMPILE ONLY - no display controller is touched)`
+   and `crates/vitrin-core/Cargo.toml` carries the `drm-backend` feature, so
+   that correction had itself gone stale — in the **understating** direction,
+   which this repository holds to be the more corrosive one. The bullet now
+   keeps both corrections and quotes the job's name rather than paraphrasing it,
+   and `limits-check` gates the quote.
+4. **This sweep's own first draft published *"no AT-SPI2 bus **reachable**
+   inside a realm"*** on all three surfaces — which is the exact
+   advertised-versus-reachable error the sweep's *portals* bullet gets right
+   forty lines earlier, repeated one section later about accessibility.
+   `crates/vitrin-core/src/spawn.rs` says *"That is advertisement, not
+   reachability"* about the session bus, `org.a11y.Bus` is activated **on** that
+   bus, and `RESERVED_ENV` holds five names of which none is a bus address — so
+   `DBUS_SESSION_BUS_ADDRESS` is allow-listable and an operator running Firefox
+   does allow-list it, handing that realm the host's a11y bridge. Phase 2's
+   P2.1.10 exists precisely because the route is open. Published now as
+   **advertised**, with the same missing-service-not-a-confinement sentence the
+   portals bullet carries, and pinned by a `limits-check` evidence row on
+   `spawn.rs` so the stronger word cannot creep back.
+5. **The same draft published that sixteen launches spend the realm cap *"for
+   good"* / *"for the life of the session"*** on `README.md` and
+   `site/index.html`. `Realm::occupies_capacity` excludes the terminal state and
+   the launch refusal in `session.rs` reads `capacity_used()`, not `len()`, so a
+   slot returns when a realm's app exits — there is a shipped test named
+   `capacity_counts_live_realms_and_forgets_exited_ones` asserting exactly that.
+   `limits.md` was half-right and half-wrong on its own: it said *"a realm ends
+   when its own app exits, and not otherwise"* and then, two sentences later,
+   that fifteen launches *"permanently commit"* the remaining slots. #234's
+   title is narrower than what all three surfaces said: it is about **no
+   principal being able to end a realm**, never about the slot not returning.
+   All three now publish both halves together, and `limits-check` anchors the
+   qualifier as well as the number, because a gate that only looked for
+   `16 realms` could not see this.
+6. **The sweep's first draft omitted two limits its own source document
+   enumerates**: the media/brightness keys that now reach an app which cannot
+   act on them (§6 above calls it *"an honest half-fix rather than a fix"*), and
+   the gesture that a consent card or the lock ends the wrong way. Both are
+   published now. A sweep that silently drops an item from the list it was
+   handed is the failure this issue exists to prevent, so the omission is
+   recorded rather than repaired in silence.
+
+**And one limit came out of the sweep that no source document had.** Reading
+`shim/src/seat.c` to check the accessibility list's *"no repeat tuning"* turned
+up a comment asserting *"the core repeats instead, for physical-origin presses
+only"* — describing code that has never existed. The shim sets
+`wlr_keyboard_set_repeat_info` to zero by a good decision (repeat is seat-wide
+and this seat carries an agent's actuations), off a host libinput synthesizes no
+repeat, and the compensating core-side repeat was never written, so **a held key
+on `--drm` produces exactly one character**. The comment is corrected in place,
+the limit is published on `limits.md` and `README.md`, and it is stated as
+**unconfirmed on hardware** because it was found by reading rather than by
+using: CI cannot hold a seat, and the one bare-metal session that drove a
+terminal did not test for it.
+
+And one dictated sentence was **refused rather than published**. §4.4's handoff
+table dictates, for `README.md` and `site/index.html`, *"None of the
+session-lifecycle behaviour has been confirmed on hardware"* — which was true
+when it was written and is not true now. Its own constraint 4 anticipated
+exactly this: *"if the numbers have landed by then it must cite the dated run
+rather than dropping the sentence."* So both surfaces carry the dated run
+instead of the blanket sentence, at the depth each register can hold:
+`README.md` carries the counts actually recorded (2026-08-11: 10/10 VT switches,
+4 of 5 suspend cycles, 2 of 5 lid cycles with one reaching sleep, blank at
+61.2 s, no lock card), and `site/index.html` carries the dates, the two kernels
+and the defect total only, because a landing page that lists six rung counts
+loses the reader before the row that matters. Neither states a number the other
+contradicts, which is the actual requirement.
+
+The limit set follows.
+
+<!-- limit-set: begin -->
+
+- <!-- limit: no-accessibility -->
+  **No accessibility of any kind.** No screen reader, magnifier, on-screen
+  keyboard, sticky or slow keys, high-contrast or reduced-motion signal, and no
+  AT-SPI2 bus *advertised* to a realm — **advertised, not reachable**, in the
+  same register as the portals bullet and for the same reason: under D9 the host
+  session bus, where `org.a11y.Bus` is activated, is still connectable and
+  neither `DBUS_SESSION_BUS_ADDRESS` nor `AT_SPI_BUS_ADDRESS` is in
+  `RESERVED_ENV`. #160 makes the absence real; P2.1.10's adversarial probe is the
+  test that would prove it and does not exist. The semantic channel is **not** a
+  substitute for AT-SPI — different consumer, different transport, under a grant
+  a human approved — and it **does not make Orca work**. A daily driver with no
+  screen reader is a real exclusion and is stated as one. **Published by
+  WS-E.4.4/#224** as an *exclusion, not a deferral*, under its own `##` heading
+  on `docs/book/src/limits.md` and in its own register on `README.md` and
+  `site/index.html`. It has **no issue and is to have none**: an issue implies
+  somebody intends to close it, PRD §5.3 puts human accessibility inside the
+  horizon phase's support treadmill, and that phase's M4 entry gate is unmet on
+  every threshold.
+- <!-- limit: no-x11 -->
+  **No X11**, so no Steam and no legacy application (pre-existing; *scoped and
   measured* by WS-E.4.1/#221). §4.2 carries the six-item list this hands to
   E3.2, the X11-only software actually measured on this machine, the classes
   deliberately excluded from that list, and the one contradiction the method
@@ -1716,10 +1968,12 @@ this workstream owns, not inherits:
   full access to the same devices and switching to it leaves the confined world
   entirely. Published in `docs/book/src/limits.md`, and the executed runs are in
   `docs/book/src/session-app-matrix.md`.
-- **No bars, launchers, notifications or OSD** — there is no
+- <!-- limit: no-layer-shell -->
+  **No bars, launchers, notifications or OSD** — there is no
   `zwlr_layer_shell_v1` and there will not be one at the app level; the
   replacements are core-owned surfaces.
-- **A shell crash loses window management**, because the shell is a client and
+- <!-- limit: shell-crash-loses-re-aim -->
+  **A shell crash loses window management**, because the shell is a client and
   there is no core-side fallback. §3(3)'s invariant is right and this is its
   price. **Measured since WS-E.1.5/#211**, and the shape is narrower than the
   sentence suggests: killing the shell leaves both realms running and the realm
@@ -1728,10 +1982,29 @@ this workstream owns, not inherits:
   wedge is that recovering means running the shell again from a terminal which,
   in a real session, must already be the bound realm. Asserted by
   `tests/integration/test_shell.py`; published in `docs/book/src/limits.md`.
-- **The DRM backend cannot be tested by CI** — no runner has a DRM device or a
+- <!-- limit: drm-has-no-ci-gate -->
+  **The DRM backend cannot be tested by CI** — no runner has a DRM device or a
   seat — so it arrives with structurally weaker evidence than anything else in
   the tree. That is an asymmetry against D12 and it is published, not
   discovered.
+- <!-- limit: one-output -->
+  **The session drives exactly one output, and a second connected display is a
+  startup refusal** (created by WS-E.3.2/#218; the hot-plug gap it leaves has no
+  issue). Both of the session's cardinalities are in the contract rather than in
+  the content — up to 16 realms, one output — so sixteen live realms do not buy a
+  second panel. Coming up on two panels would light whichever connector
+  enumerated first and leave a powered display dark with no message and no verb
+  in the protocol that could move the output to it, so `--drm` refuses to start
+  and names the connectors it found. **A laptop plus an external monitor, the
+  most ordinary desktop arrangement there is, does not work here.** The refusal
+  is a *startup* one: the backend enumerates connectors once and installs no udev
+  monitor, so a panel plugged in mid-session is neither lit nor complained about.
+  Published in `docs/book/src/limits.md`, and held by `limits-check`'s
+  `one-output` claim. **Added to this enumeration by WS-E.4.4/#224**: all three
+  published surfaces carried it and this section did not, which is precisely the
+  divergence the set cross-check described above exists to catch — and it was
+  found by writing that check rather than by reading.
+
 - **Input classes on the wire: partly closed by WS-E.4.2 (#222), and the
   remainder is split three ways.** This bullet used to read *"no touch,
   gestures, tablet, switches or relative motion on the wire"* and to say the
@@ -1742,7 +2015,8 @@ this workstream owns, not inherits:
   here because this is a published-limits section, where an error in the
   optimistic direction is the one that misleads a user. The five classes never
   shared a verdict and now share even less:
-  - **SERVED, and unproven on hardware.** `relative_motion` and four gesture
+  - <!-- limit: pointer-extras-unproven-on-hardware -->
+    **SERVED, and unproven on hardware.** `relative_motion` and four gesture
     events (`gesture_begin`, the two updates, `gesture_end`) on
     `vitrin_shim_seat`; a `pointer_constraint` ask-and-verdict pair on
     `vitrin_shim_session`; and three shim globals —
@@ -1753,7 +2027,12 @@ this workstream owns, not inherits:
     a named `tests/integration/test_real_*.py` rung on the target machine is
     owed and is not yet written. Two-finger scroll is **not** in this set: it
     has always worked, as a scroll axis.
-  - **SERVED, with two gaps named rather than smoothed over.** A pointer
+  - <!-- limit: gesture-ends-wrong-way -->
+    <!-- limit-not-on-page: pointer-lock-release-unobservable-in-ci -- no
+    surface carries it: it is a statement about what CI cannot observe rather
+    than about something a reader meets, and this bullet is its only record
+    -->
+    **SERVED, with two gaps named rather than smoothed over.** A pointer
     lock deactivates and the human's cursor sprite returns on every path the
     core knows about, but that property can only be observed on bare metal —
     nested and headless draw no human sprite at all — so it is the one
@@ -1762,8 +2041,12 @@ this workstream owns, not inherits:
     pause, but **not** when a consent card or the lock screen raises: those
     withhold the gesture's updates and then deliver the device's own end, so an
     app that was previewing a zoom is told the human completed what they in
-    fact abandoned. Closing that is owed.
-  - **NOT YET SERVED: touch, and tablet or stylus.** Neither has a wire event,
+    fact abandoned. Closing that is owed, and **WS-E.4.4/#224 published it** on
+    `docs/book/src/limits.md` beside the touch/tablet paragraph rather than
+    leaving it as an unpublished note here; it stays off `README.md` and
+    `site/index.html` by the stated-subset decision, and #222 owns it.
+  - <!-- limit: no-touch-no-tablet -->
+    **NOT YET SERVED: touch, and tablet or stylus.** Neither has a wire event,
     and `wl_touch` stays out of the shim's seat capabilities (the comment
     heading is `TOUCH IS NOT YET SERVED`) because a class advertised with
     nothing behind it is worse than an absent one — a toolkit that sees TOUCH
@@ -1773,9 +2056,14 @@ this workstream owns, not inherits:
     needs it; **tablet** reopens on a pen or stylus device in that set, the
     application half of its evidence being already on record. This machine has
     neither device, which is a measurement of one laptop and not a property of
-    the protocol. Published in that register, with the reopening evidence
-    named, by WS-E.4.4/#224.
-  - **NOT A SEAT QUESTION: the lid switch**, handed to WS-E.4.3/#223 and
+    the protocol. **Published in that register, with the reopening evidence
+    named, by WS-E.4.4/#224** — on `docs/book/src/limits.md` and `README.md`,
+    and deliberately not on `site/index.html`, where one line cannot carry the
+    deferral-versus-refusal distinction the owner corrected #222 on.
+  - <!-- limit-not-on-page: lid-switch-delegated-to-logind -- published with
+    the recovery runbook, which is where the logind values it delegates to are
+    printed; the limits page does not restate them -->
+    **NOT A SEAT QUESTION: the lid switch**, handed to WS-E.4.3/#223 and
     **decided there** ([§4.4](#44-session-lifecycle-build-what-the-hardware-forces-delegate-the-rest),
     [D-033](20-decision-log.md#d-033--idle-blanks-the-screen-and-does-not-lock-it-suspend-is-detected-after-the-fact-or-not-at-all-and-the-recovery-path-is-sudo-only)):
     delegated to logind, no wire event, and the `logind.conf` values it depends
@@ -1784,7 +2072,8 @@ this workstream owns, not inherits:
     consumes them, and on this machine logind does — so a wire message for one
     would sit under something no application could use.
 
-- **Idle blanks the screen and does not lock it, so a dark panel is an
+- <!-- limit: idle-blank-does-not-lock -->
+  **Idle blanks the screen and does not lock it, so a dark panel is an
   *unlocked* session** (created by WS-E.4.3/#223, and **the owner's decision of
   2026-08-10** — [D-033](20-decision-log.md#d-033--idle-blanks-the-screen-and-does-not-lock-it-suspend-is-detected-after-the-fact-or-not-at-all-and-the-recovery-path-is-sudo-only)).
   `--blank-idle` turns the panel off after a period with no physical input; the
@@ -1796,7 +2085,8 @@ this workstream owns, not inherits:
   machine does under Hyprland today. Published unsoftened in
   `docs/book/src/limits.md`; the owner's trade, stated as one.
 
-- **A dark screen is not evidence that nothing is watching** (created by
+- <!-- limit: blank-does-not-stop-observation -->
+  **A dark screen is not evidence that nothing is watching** (created by
   WS-E.4.3, and **the same policy as the lock**, not a second accident). An
   agent holding `observe` keeps capturing the realm while the panel is off,
   frame for frame — exactly as
@@ -1809,7 +2099,8 @@ this workstream owns, not inherits:
   no gate can suppress, so the very press that wakes the screen also starts the
   hold. Published in `docs/book/src/limits.md`.
 
-- **A blank stops every realm's frame clock, so it halts every agent in the
+- <!-- limit: blank-stops-the-frame-clock -->
+  **A blank stops every realm's frame clock, so it halts every agent in the
   session** (created by WS-E.4.3, and the sharpest thing in this section).
   CRTC disabled → no vblank → `DrmState::on_vblank` never runs →
   `session::emit_presented` is never called → no `frame_done` is discharged →
@@ -1824,7 +2115,8 @@ this workstream owns, not inherits:
   deferral, inherited rather than re-filed. Published in
   `docs/book/src/limits.md`.
 
-- **Idle inhibition is not yet served, so full-screen video blanks the screen**
+- <!-- limit: no-idle-inhibit -->
+  **Idle inhibition is not yet served, so full-screen video blanks the screen**
   (created by WS-E.4.3, deferred with named reopening evidence).
   `zwp_idle_inhibit_manager_v1` needs a new shim global *and* a shim→core wire
   verb — paired IDL and prose work on `track:protocol` — for a comfort feature.
@@ -1832,7 +2124,8 @@ this workstream owns, not inherits:
   refusal, on the register the owner corrected on #222. Published in
   `docs/book/src/limits.md`.
 
-- **The media and brightness keys now reach an app that cannot act on them**
+- <!-- limit: media-keys-reach-an-app-that-cannot-act -->
+  **The media and brightness keys now reach an app that cannot act on them**
   (created by WS-E.4.3, and an honest half-fix rather than a fix). The XF86 rows
   stop those keys being dropped at intake with a trace line — but a delivered
   `XF86MonBrightnessUp` reaches the focused realm's shim seat, and no confined
@@ -1841,8 +2134,34 @@ this workstream owns, not inherits:
   deferred**, reopened by a shell client holding a named verb or by an explicit
   owner decision to let the core write `/sys/class/backlight` — which D-030
   already names as a display-power interface DRM master does not gate.
+  **Published by WS-E.4.4/#224** on `docs/book/src/limits.md` beside the idle and
+  blank entries, and as one bullet on `README.md`; omitted from `site/index.html`
+  by the stated-subset decision above, because at one line it reads as a fix. It
+  has **no issue**, and the reason is that the decision it waits on has never
+  been put to the owner rather than that nobody cares.
 
-- **Behaviour now depends on files this repository does not own** (created by
+- <!-- limit: no-key-repeat-on-drm -->
+  **A held key does not repeat on `--drm`** (pre-existing since WS-E.3.1 and
+  **found by this sweep rather than by using the session**, which is the honest
+  provenance and the reason it is stated as unconfirmed). `shim/src/seat.c` sets
+  `wlr_keyboard_set_repeat_info` to a rate and delay of zero — a good decision,
+  because repeat is seat-wide and this seat carries an agent's actuations beside
+  the human's, so a client-side timer would repeat an agent's held key — and its
+  comment claimed *"the core repeats instead, for physical-origin presses only"*.
+  **No such code has ever existed.** Off a host libinput synthesizes no repeat,
+  so on bare metal a held key produces exactly one character; nested is
+  unaffected because the host compositor repeats and the core forwards each
+  event. The comment is corrected in place and the limit is **published by
+  WS-E.4.4/#224** on `docs/book/src/limits.md` and `README.md`, stated as
+  unconfirmed on hardware: CI cannot hold a seat, and the 2026-08-11 session
+  that typed 399 keystrokes into alacritty did not test for it. It has **no
+  issue**; D-028(5)/#217 is the decision whose second half is missing.
+
+- <!-- limit-not-on-page: logind-settings-not-owned-here -- published in
+  docs/book/src/recovery.md, because the values are read from the running
+  system and a limits page cannot carry a number this checkout does not own
+  -->
+  **Behaviour now depends on files this repository does not own** (created by
   WS-E.4.3, and unavoidable given the delegation above). Lid, power-key and
   suspend-key policy is logind's, so *"suspend works"* is not reproducible from
   this checkout. The mitigation is publication, not ownership: the values are
@@ -1852,14 +2171,18 @@ this workstream owns, not inherits:
   one of them is a systemd default that can move without any change here. A run
   recorded under different values is a run of a different system.
 
-- **TCB growth for zero differentiator, exactly as #223 predicted** (created by
+- <!-- limit-not-on-page: session-mode-tcb-growth -- no surface carries it: it
+  is a cost to this project's trusted computing base rather than something a
+  reader of the limits page meets, and this bullet is its only record -->
+  **TCB growth for zero differentiator, exactly as #223 predicted** (created by
   WS-E.4.3). An idle state machine, a cover surface, a fourth flip-gating term, a
   third `PromptVisibility` variant, an activity clock lifted out of the lock, and
   a wider invariant keysym table — all inside the trusted core, none of it
   anything a user would choose this project for. [PRD](../PRD.md) §5.3's warning
   about the support treadmill, paid in full and recorded as paid.
 
-- **Suspend and lid have been exercised once, on 2026-08-11, short of the counts
+- <!-- limit: lifecycle-checklist-run-once -->
+  **Suspend and lid have been exercised once, on 2026-08-11, short of the counts
   the rungs ask for** (created by WS-E.4.3; **narrowed, not closed**, by the
   first execution of `L1`–`L6`). Until that date this read *"never exercised by
   anyone, in any form"*, and it was true: the bring-up page's checklist runs
@@ -1883,7 +2206,25 @@ this workstream owns, not inherits:
   recorder pair, and neither was read during that run. So a hardware criterion
   of #223 may now be cited **only at the count and scope actually recorded** —
   never as *"suspend works"* or *"lid works"*.
-- ~~**Several realms run, one is visible, and a capture cannot tell them
+- <!-- limit: realm-cap-arithmetic -->
+  **The cap is sixteen *simultaneously live* realms, and no principal can end
+  one** (created by WS-E.1.2/#208, which raised the cap from one;
+  [#234](https://github.com/vitrin-os/vitrin-os/issues/234) owns the second
+  half). Both halves have to be published together or each becomes a lie:
+  `Realm::occupies_capacity` excludes the terminal state and the launch refusal
+  reads `capacity_used()` rather than `len()`, so a slot comes back when a
+  realm's own app exits — and nothing else returns one, because revocation,
+  disconnect and the dead-man switch all leave the process running. So the
+  human's remedies for a realm they no longer want are the app's own quit path,
+  killing the process from a terminal, or restarting `vitrind`; the display
+  server offers none. Published in `docs/book/src/limits.md`, and held by
+  `limits-check`'s `realm-cardinality` claim. **Added to this enumeration by
+  WS-E.4.4/#224**, for the same reason as the one-output entry above.
+
+- <!-- limit-not-on-page: capture-could-carry-a-siblings-pixels -- closed by
+  WS-E.1.3; the limits page publishes the closed property instead, and a gap
+  that is shut must not be republished as a live one -->
+  ~~**Several realms run, one is visible, and a capture cannot tell them
   apart**~~ (created by WS-E.1.2, **closed by WS-E.1.3**). Raising the cap
   landed before the scene bound an output to a realm, so for one workstream
   task a multi-realm session composited one output from one single-surface
@@ -1901,7 +2242,8 @@ this workstream owns, not inherits:
   line that judges its liveness. Landing the cap first was the right order
   (WS-E.1.3 needs more than one realm to bind an output *to*); shipping the
   gap silently would not have been, and it was not.
-- **Every realm renders, visible or not** (created by WS-E.1.3, no owner).
+- <!-- limit: every-realm-renders -->
+  **Every realm renders, visible or not** (created by WS-E.1.3, no owner).
   The price of the item above. A Wayland client throttles on frame
   callbacks, so a realm that stopped being paced would stop repainting and
   its capture would go stale — which `refusal.no_surface` forbids in as many
@@ -1914,13 +2256,17 @@ this workstream owns, not inherits:
   than descriptors). Visibility-aware pacing would buy the power back at the
   cost of capture honesty; that trade was declined rather than overlooked.
   Published in `docs/book/src/limits.md`.
-- **The agent cursor is drawn only for the visible realm** (created by
+- <!-- limit: agent-cursor-visible-realm-only -->
+  **The agent cursor is drawn only for the visible realm** (created by
   WS-E.1.3, fixed by a per-realm indicator nobody has scheduled). D-019 added
   the sprite so a human can see that an agent is acting. It is painted into
   the output, which shows one realm, so an agent actuating inside a hidden
   realm draws nothing — the exact defect D-019 exists to close,
   reintroduced for hidden realms. Published in `docs/book/src/limits.md`.
-- ~~**Only one realm can be actuated, and the rest are refused rather than
+- <!-- limit-not-on-page: one-realm-actuable-rest-refused -- closed by
+  WS-E.1.6/#212; kept struck through as a record, for the same reason as the
+  entry above -->
+  ~~**Only one realm can be actuated, and the rest are refused rather than
   misdelivered**~~ (created by WS-E.1.2, **closed by WS-E.1.6/#212**). The
   write-side twin of the item above, and the one the same review found
   second. There was one input router and one delivery target
@@ -1939,7 +2285,8 @@ this workstream owns, not inherits:
   actuation goes to the realm its **grant** names. `PhysicalPresence` is per
   realm on the same grounds.
 
-- **Per-realm presence narrows a blanket safety behaviour** (created by
+- <!-- limit: per-realm-presence-narrows-preempted -->
+  **Per-realm presence narrows a blanket safety behaviour** (created by
   WS-E.1.6, no owner). The price of the item above, and it is a *loss* worth
   stating on its own: `preempted` used to mean "a human is touching something
   in this session", so a hand on the keyboard suspended every agent
@@ -1951,7 +2298,8 @@ this workstream owns, not inherits:
   at rather than being delivered into a realm. Published in
   `docs/book/src/limits.md`.
 
-- **A realm switch mid-gesture tells the app the human let go** (created by
+- <!-- limit: realm-switch-releases-held-input -->
+  **A realm switch mid-gesture tells the app the human let go** (created by
   WS-E.1.6, no owner). A key or button held across a binding change is
   released into the realm being left, because the human's real release will
   be delivered to the realm they moved to. The app cannot distinguish that
@@ -1961,7 +2309,9 @@ this workstream owns, not inherits:
   focus loss — but it now happens on every switcher keypress rather than only
   on alt-tab. Published in `docs/book/src/limits.md`.
 
-- ~~**`PhysicalPresence` is still fed by nothing in production**~~
+- <!-- limit-not-on-page: physical-presence-fed-by-nothing -- closed by
+  WS-E.1.6/#212 itself; same reason as the two entries above -->
+  ~~**`PhysicalPresence` is still fed by nothing in production**~~
   (pre-existing, surfaced by WS-E.1.6, **closed by WS-E.1.6/#212 itself**).
   `PresenceHook` was an *optional* member of the router's hook stack and no
   shipping backend included it, so no build ever called
@@ -1975,7 +2325,8 @@ this workstream owns, not inherits:
   uncorrected when it landed; corrected in place by WS-E.1.7, which had to read
   the hook stack to add to it.)
 
-- **The core owns a second physical chord, and it eats Super** (created by
+- <!-- limit: super-is-taken-everywhere -->
+  **The core owns a second physical chord, and it eats Super** (created by
   WS-E.1.7/#232, no owner). Tapping Super opens a one-second, single-use window
   in which a layout holder is not refused `preempted`, and delivers an
   argument-free `attention` event to every layout holder. It closes the loop
@@ -1988,7 +2339,8 @@ this workstream owns, not inherits:
   `--attention-chord rsuper`, which is not a remedy. Published in
   `docs/book/src/limits.md`.
 
-- **The attention window is session-wide, and the delivered-to set only narrows
+- <!-- limit: attention-window-is-session-wide -->
+  **The attention window is session-wide, and the delivered-to set only narrows
   it** (created by WS-E.1.7, and unfixable here — D-023(2)). Any principal the
   `attention` event reached may claim the window; the core cannot tell which of
   two layout holders the human meant. Fixing it means choosing a shell, which is
@@ -2000,7 +2352,8 @@ this workstream owns, not inherits:
   thief's lands. It is journaled with the claiming principal and the grant is
   revocable, and it is still a hole. Published in `docs/book/src/limits.md`.
 
-- **A cross-realm channel exists now, with a stated bandwidth** (created by
+- <!-- limit: clipboard-is-a-bounded-channel -->
+  **A cross-realm channel exists now, with a stated bandwidth** (created by
   WS-E.2.1/#213, no owner). [PRD](../PRD.md) §15's first threat row used to say
   a malicious app cannot *"reach the session's real seat/clipboard/a11y bus"*.
   After #213 it can reach a **clipboard** — through a human gesture, one
@@ -2010,7 +2363,8 @@ this workstream owns, not inherits:
   rather than left standing, and the channel is published in
   `docs/book/src/limits.md`. See §4.1 for the bound's derivation.
 
-- **The TCB stores application-authored bytes for the first time** (created by
+- <!-- limit: tcb-stores-application-bytes -->
+  **The TCB stores application-authored bytes for the first time** (created by
   WS-E.2.1, and the maintainer's own accepted cost — [D-024](20-decision-log.md)).
   Nothing else in the core does: it holds client *pixels* it never interprets and
   typed values it validated itself. A password copied from a manager now transits
@@ -2019,7 +2373,8 @@ this workstream owns, not inherits:
   journaling, the idle timeout, the source-realm-death clear and the dead-man
   clear bound it; **none removes it**. Published in `docs/book/src/limits.md`.
 
-- **The core eats two more physical chords, and one of them is a paste key**
+- <!-- limit: clipboard-chords-taken -->
+  **The core eats two more physical chords, and one of them is a paste key**
   (created by WS-E.2.1, no owner). Ctrl-Shift-Insert and Shift-Insert are
   consumed in every realm, unconditionally. Shift-Insert is the historical X11
   primary-paste chord, so an app that binds it loses it with no pass-through and
@@ -2029,13 +2384,16 @@ this workstream owns, not inherits:
   press are consumed so no app can even tell, and the gesture the human lost is
   the gesture they are being given across realms instead.
 
-- **`preempted` on the layout verbs is conditional on invisible core state**
+- <!-- limit: preempted-now-depends-on-hidden-state -->
+  **`preempted` on the layout verbs is conditional on invisible core state**
   (created by WS-E.1.7, no owner). An agent reading its own journal can no longer
   reconstruct why one `focus` landed and an identical one did not without
   correlating the core's attention entries, which it cannot see. The refusal used
   to mean one thing. Published in `docs/book/src/limits.md`.
 
-- **A principal cannot draw, and cannot receive physical input** (pre-existing,
+- <!-- limit: principal-cannot-draw -->
+  <!-- limit: principal-has-no-hotkey -->
+  **A principal cannot draw, and cannot receive physical input** (pre-existing,
   *surfaced and priced* by WS-E.1.5/#211, no owner). Neither is new and neither
   was written down as a user-facing limit until a switcher had to be built
   against them. `vitrin_view` is capture-only and there is no principal-facing
@@ -2051,7 +2409,10 @@ this workstream owns, not inherits:
   realm to reach the core socket, which is a confinement question nobody has
   answered. Published in `docs/book/src/limits.md`.
 
-- **The shell holds `layout.arrange` for the whole output** (created by
+- <!-- limit-not-on-page: layout-arrange-is-single-holder -- no surface
+  carries it: it is a restriction on a second tool rather than on the human's
+  session, and this bullet is its only record -->
+  **The shell holds `layout.arrange` for the whole output** (created by
   WS-E.1.5, and designed rather than accidental — D-018(4)). Arrangement is
   single-holder per output, checked at admission, so while the switcher lives a
   second tool that wants to arrange anything resolves `layout_held` before it
@@ -2060,7 +2421,8 @@ this workstream owns, not inherits:
   correct behaviour and it is also a restriction people will hit before they
   understand why.
 
-- **A locked screen an agent can still watch** (created by WS-E.2.2/#214,
+- <!-- limit: lock-does-not-stop-agents -->
+  **A locked screen an agent can still watch** (created by WS-E.2.2/#214,
   and **decided rather than deferred** — [D-025](20-decision-log.md#d-025--a-locked-screen-does-not-suspend-agent-observation-the-gap-is-published-not-papered-over)).
   The lock screen consumes every physical event and covers the output, and it
   does not touch a grant: an `observe` holder keeps capturing the realm across
@@ -2070,12 +2432,14 @@ this workstream owns, not inherits:
   why it is on the lock card itself as well as in
   `docs/book/src/limits.md`, rather than in a code comment. The instrument for
   "stop everything" remains the dead-man chord, which fires while locked.
-- **In nested mode the lock screen locks a window** (created by WS-E.2.2, and
+- <!-- limit: nested-lock-locks-a-window -->
+  **In nested mode the lock screen locks a window** (created by WS-E.2.2, and
   a Stage-3 item by construction). `vitrind` is a client of the host
   compositor; the host owns the real session and anyone can alt-tab away.
   Stages 1–2 therefore ship a privacy cover, not an authentication boundary
   for the seat. Published.
-- **No protection against VT switching, and the fix is a worse trade**
+- <!-- limit: no-vt-switch-inhibition -->
+  **No protection against VT switching, and the fix is a worse trade**
   (created by WS-E.2.2, **decided by WS-E.3.3 / D-030**). On bare DRM
   `Ctrl-Alt-F<n>` walks past the lock unless the core inhibits it, and
   inhibiting it means a session a human cannot leave when the compositor
@@ -2090,7 +2454,8 @@ this workstream owns, not inherits:
   for an operator who wants that trade, `idle` charges the absence to the idle
   countdown, and `never` — what every session that says nothing gets — is the
   behaviour this bullet describes. No policy lowers a lock that is already up.
-- **A passphrase is nested-only, because a headless backend has no keyboard** (created
+- <!-- limit: passphrase-is-not-headless -->
+  **A passphrase is nested-only, because a headless backend has no keyboard** (created
   by WS-E.2.2, closed only by Stage 3 answering the keymap question). `--lock-passphrase-file`
   is refused at startup with `--headless`, naming the reason. Without it the
   lock is an unauthenticated privacy screen and the card says so. Growing an
@@ -2098,7 +2463,11 @@ this workstream owns, not inherits:
   `input/mod.rs:106-109` records that a real keymap moves key pairing from the
   keysym to the scancode — a router invariant the dead-man switch depends on —
   and that is Stage 3's decision, which a lock-screen issue must not pre-empt.
-- **A KDF is now in the TCB, and it processes operator-supplied input**
+- <!-- limit-not-on-page: kdf-in-the-tcb -- no surface carries it as a limit:
+  the limits page names Argon2id where it describes the passphrase path, but
+  the four-crate dependency cost is recorded here and in
+  crates/vitrin-core/Cargo.toml only -->
+  **A KDF is now in the TCB, and it processes operator-supplied input**
   (created by WS-E.2.2, no owner). Four crates (`argon2`, `base64ct`,
   `blake2`, `subtle`), measured rather than estimated, inside the most
   privileged component. Unlike fontdue — whose justification turns on "the
@@ -2107,7 +2476,8 @@ this workstream owns, not inherits:
   wire. Issue #201 records that `deny.toml` and the `cargo-deny` job still do
   not exist, so `crates/vitrin-core/Cargo.toml`'s comment is the only place
   this budget is checked.
-- **A fourth gate in the input stack, and a fourth chord taken from every
+- <!-- limit: lock-chord-taken -->
+  **A fourth gate in the input stack, and a fourth chord taken from every
   app** (created by WS-E.2.2). `deadman.rs` spends its module docs proving no
   gate bug can stop the off-switch; every gate added is a new chance for that
   proof to stop being true. The compensating controls are structural rather
@@ -2117,13 +2487,19 @@ this workstream owns, not inherits:
   through the real stack. What it also costs: `--dead-man-chord delete` is now
   refused on an otherwise default command line, because the default lock chord
   is `ctrl+alt+delete`.
-- **New always-resident core state on the frame path** (created by WS-E.2.2).
+- <!-- limit-not-on-page: lock-adds-resident-frame-path-state -- no surface
+  carries it: it is a cost inside the compositor rather than a behaviour a
+  reader meets -->
+  **New always-resident core state on the frame path** (created by WS-E.2.2).
   A second `ConsentSurface`-shaped cost: one more `Option<LockContent>`, one
   more cached raster and one more generation counter per backend, and a raised
   lock forces the CPU compositing path exactly as a consent card does — which
   on the WS-E laptop means the zero-copy dmabuf branch is off for as long as
   the screen is locked.
-- **The top strip has now been designed as a whole** (created by WS-E.1.7,
+- <!-- limit-not-on-page: top-strip-composite-order -- not a limit a reader
+  meets: a design record, stated once in crates/vitrin-core/src/status/mod.rs,
+  and kept here so the collision it resolved is not re-litigated -->
+  **The top strip has now been designed as a whole** (created by WS-E.1.7,
   resolved by WS-E.2.3/#215, which landed third and therefore owned the
   collision). The dead-man hold bar, the attention marker and the status strip
   were each designed without the others. The composite order is now stated once,
@@ -2150,7 +2526,8 @@ this workstream owns, not inherits:
     `const` assertion that turns an overgrown marker into a compile error.
   - The **dead-man hold indicator is still composited last of all**, so nothing
     added here can hide a hold in progress.
-- **The status strip is opt-in, and the realm view is still NOT inset**
+- <!-- limit: status-strip-overdraws-the-view -->
+  **The status strip is opt-in, and the realm view is still NOT inset**
   (created by WS-E.2.3). #215 asks for the app to be *configured* smaller by
   `TRUST_BAND_HEIGHT + STATUS_STRIP_HEIGHT`; that is unmet, and the strip
   therefore overdraws 20 rows of client content the way the band already
@@ -2162,7 +2539,8 @@ this workstream owns, not inherits:
   others do not) is strictly worse than none. `--status` is off by default so
   no session pays the overdraw without asking; the cost is published in
   `docs/book/src/limits.md`.
-- **A recurring filesystem read inside the TCB** (created by WS-E.2.3). Before
+- <!-- limit: status-strip-reads-sysfs -->
+  **A recurring filesystem read inside the TCB** (created by WS-E.2.3). Before
   it, the core read `realm.toml` and `principals.toml` once at startup and
   embedded its font at compile time; `crates/vitrin-core/src/status/battery.rs`
   now reads `/sys/class/power_supply` on a 30 s cadence. Bounded to one fixed
@@ -2173,7 +2551,8 @@ this workstream owns, not inherits:
   future sandbox and is recorded here so the ruleset's author does not have to
   rediscover it.
 
-- **A file on disk that is a picture of the human's screen** (created by
+- <!-- limit: screenshots-are-world-readable-to-realms -->
+  **A file on disk that is a picture of the human's screen** (created by
   WS-E.2.4/#216, no owner until E2.6/E2.7 confine the core). The core already
   writes the recorder's log and the `--capture-dump` diagnostic, so this is not
   its first descriptor; it is the first whose *contents* are the screen. Every
@@ -2183,7 +2562,8 @@ this workstream owns, not inherits:
   for the process's life, so the path is resolved exactly once, before any
   client exists; until the core is confined, that audit is the whole of the
   enforcement of the operator's choice.
-- **A vitrin screenshot cannot show a consent prompt, and that is the design**
+- <!-- limit: screenshot-cannot-show-a-prompt -->
+  **A vitrin screenshot cannot show a consent prompt, and that is the design**
   (created by WS-E.2.4, and unfixable without giving up the trusted indicator).
   The file is the **realm view**: no trusted band, no card, no ring, no lock
   cover, no status strip, no agent cursor. "Send me a picture of that weird
@@ -2209,7 +2589,8 @@ this workstream owns, not inherits:
     of the two findings and it is recorded here because it looks thorough.
 
   Published in `docs/book/src/limits.md` and in `--help`.
-- **A fifth core-owned chord, and the first one that pays a cost back**
+- <!-- limit: screenshot-chord-taken -->
+  **A fifth core-owned chord, and the first one that pays a cost back**
   (created by WS-E.2.4). Ctrl-PrintScreen is consumed in every realm. It is a
   *chord* rather than #216's proposed bare `Print` for a structural reason —
   `crate::chord::ModChord` refuses a modifier-less chord, so a bare-key gesture
@@ -2219,7 +2600,10 @@ this workstream owns, not inherits:
   binds it keeps it. That is the first time this workstream has taken a gesture
   without taking the key. The collision check `main.rs` runs is now over five
   chords rather than four.
-- **A PNG encoder is now TCB code** (created by WS-E.2.4). `crates/vitrin-png`
+- <!-- limit-not-on-page: png-encoder-in-the-tcb -- no surface carries it: a
+  trusted-computing-base dependency cost, recorded here and in
+  crates/vitrin-core/Cargo.toml -->
+  **A PNG encoder is now TCB code** (created by WS-E.2.4). `crates/vitrin-png`
   is the golden harness's hand-rolled artifact encoder, promoted to a
   zero-dependency in-tree crate both it and `vitrin-core` depend on, because
   *"no image codec in the core, in any dependency class"* is stated twice in
@@ -2230,6 +2614,8 @@ this workstream owns, not inherits:
   already makes for fontdue. What it costs: ~130 lines written for test
   artifacts must now be reviewed to a TCB bar, and that argument holds only for
   as long as nothing else in the core feeds it bytes it did not itself produce.
+
+<!-- limit-set: end -->
 
 ### Measurements taken for WS-E.2.3
 

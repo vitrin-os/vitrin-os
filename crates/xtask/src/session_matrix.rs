@@ -108,9 +108,8 @@ impl Version {
     }
 }
 
-/// How high the app was made to jump. There are exactly two heights in this
-/// repository and conflating them is the honesty gap issue #221 exists to
-/// close.
+/// How high the app was made to jump. Conflating these is the honesty gap
+/// issue #221 exists to close.
 #[derive(Clone, Copy)]
 pub enum Bar {
     /// The weak bar: the app mapped a window and repainted, and nothing else
@@ -118,6 +117,18 @@ pub enum Bar {
     MappedAndRepainted,
     /// A named task in this repository, which asserts something specific.
     NamedTask(&'static str),
+    /// **A human used the application and the named interactions worked.**
+    ///
+    /// Above [`Bar::MappedAndRepainted`], which explicitly excludes typing and
+    /// clicking, and below [`Bar::NamedTask`], which is repeatable by someone
+    /// who was not there. This one is neither: it is one person's session, so
+    /// the string must name the interactions that were actually performed and
+    /// nothing else. It exists because the first real desktop application on
+    /// the bare-metal backend was driven by hand before any runbook step
+    /// existed to name — recording that as the weak bar would have been false
+    /// in the *understating* direction, and as a named task false in the
+    /// overstating one.
+    OperatorDrove(&'static str),
 }
 
 impl Bar {
@@ -125,12 +136,14 @@ impl Bar {
         match self {
             Bar::MappedAndRepainted => "weak bar".to_string(),
             Bar::NamedTask(task) => format!("named task: {task}"),
+            Bar::OperatorDrove(what) => format!("operator drove: {what}"),
         }
     }
 }
 
-/// Which backend the app ran against. No desktop application in this corpus
-/// has ever run on the bare-metal one, and the page says so.
+/// Which backend the app ran against. Desktop applications reached the
+/// bare-metal one on 2026-08-11 and only there, in a single hand-driven
+/// session; the page says exactly that rather than "it runs on bare metal".
 #[derive(Clone, Copy)]
 pub enum Venue {
     Headless,
@@ -160,6 +173,12 @@ pub enum Cause {
         cause: &'static str,
         owner: &'static str,
     },
+    /// **It failed and nobody knows why.** The attempt is real and recorded;
+    /// the diagnosis is absent, and this variant refuses to supply one. A
+    /// failure whose cause is guessed reads exactly like a failure whose cause
+    /// was established, which is how finding 4 of the DRM bring-up record cost
+    /// two runs before #250 corrected it.
+    NotEstablished(&'static str),
 }
 
 /// What happened.
@@ -180,6 +199,9 @@ impl Verdict {
             }
             Verdict::DidNotMap(Cause::NotAnX11Gap { cause, owner }) => {
                 format!("**did not map** — {cause}. **Not an X11 gap**; owned by {owner}")
+            }
+            Verdict::DidNotMap(Cause::NotEstablished(what)) => {
+                format!("**did not map** — {what}. **The cause is not established**, and nothing here guesses one")
             }
         }
     }
@@ -668,12 +690,15 @@ fn render_reading_guide(p: &mut String) {
          what the row means. Those rows assert something specific and are much stronger than the\n\
          weak bar.\n\n",
     );
-    p.push_str("### The three evidence classes on this page\n\n");
+    p.push_str("### The four evidence classes on this page\n\n");
     p.push_str(
         "| Class | What it proves | Where it appears |\n\
          |---|---|---|\n\
          | Named task | The stated assertion held in a run of the shipped chain | \
          `Bar` column reads `named task: ...` |\n\
+         | Operator drove | A human used the application and the named interactions worked. \
+         **One person's session, not a repeatable task** — it proves the app was usable that \
+         once, by someone who was there | `Bar` column reads `operator drove: ...` |\n\
          | Weak bar | The application mapped a window and repainted, and nothing else was \
          checked | `Bar` column reads `weak bar` |\n\
          | Linkage | An ELF/`strings` measurement of a binary on the machine. **Not a run.** | \
@@ -693,8 +718,9 @@ execution against `vitrind`; there are no inferred rows.\n\n";
 
 const TEST_CLIENT_TABLE_INTRO: &str = "Clients this repository wrote. Nobody daily drives them, \
 and **the strongest evidence in the tree is about them** — which is exactly why they are in a \
-separate table. In particular: no desktop application has ever run on bare-metal DRM/KMS. Both \
-bare-metal runs used `solid-client`.\n\n";
+separate table. The two *checklist* runs of the bare-metal backend both used `solid-client`; the \
+desktop applications that have since run on it (2026-08-11) were driven by hand in one session \
+and are recorded at the `operator drove` bar, which is not a repeatable task.\n\n";
 
 fn render_execution_table(
     p: &mut String,
@@ -866,10 +892,15 @@ fn render_gaps(p: &mut String) {
          they are not reconstructed here. Capturing them is a runbook step.\n",
     );
     p.push_str(
-        "- **No desktop application has ever run on bare metal.** Both DRM/KMS runs used\n\
-         `solid-client`. There is a named reason to expect a difference, recorded by the second\n\
-         run itself: the shim never emits dmabuf, so the zero-copy scanout path is dead code\n\
-         against every real application.\n",
+        "- **Desktop applications have run on bare metal exactly once, by hand.** alacritty and\n\
+         nautilus on 2026-08-11, in one operator-driven session — not a checklist run, not\n\
+         repeatable by someone who was not there, and measured for nothing. The two runs the\n\
+         bring-up runbook records both used `solid-client`. That session also produced a defect\n\
+         (#268: closing a second window in a realm leaves the keyboard focused on nobody) and one\n\
+         application that did not open at all with no cause established. The named reason to\n\
+         expect further difference still stands, recorded by the second checklist run: the shim\n\
+         never emits dmabuf, so the zero-copy scanout path is dead code against every real\n\
+         application.\n",
     );
     p.push_str(
         "- **Every inventory row is linkage, not behaviour**, and linkage has demonstrated false\n\
@@ -1038,7 +1069,9 @@ const WSE_TABLE: &str =
 
 const HEADER: Header = Header {
     inventory_date: "2026-08-10",
-    last_recorded_run: "2026-08-09 — the second bare-metal DRM run (`docs/drm-bringup.md`)",
+    last_recorded_run: "2026-08-11 — the operator-driven bare-metal session that ran alacritty \
+                        and nautilus and produced #268. The last *checklist* run is still \
+                        2026-08-09, the second bare-metal DRM run (`docs/drm-bringup.md`)",
     kernel: "7.1.6-arch1-1",
     kernel_caveat:
         "**this is not the kernel the bare-metal evidence was taken on.** Both DRM runs \
@@ -1092,6 +1125,13 @@ const REQUESTED: &[Requested] = &[
     Requested {
         app: "nautilus",
         why: "named in issue #221's seed list; the GTK4 representative.",
+        see_also: None,
+    },
+    Requested {
+        app: "Cursor",
+        why: "not in issue #221's seed list — the operator reached for it unprompted during the \
+               2026-08-11 bare-metal session, which is the only signal this corpus has about \
+               what a daily driver is actually asked to run.",
         see_also: None,
     },
     Requested {
@@ -1238,6 +1278,84 @@ const EXECUTIONS: &[Execution] = &[
         caveat: Some(
             "#203 records only `vitrind --nested`; it does not name the host compositor, so the \
              venue here is this machine's host and not something the record states.",
+        ),
+    },
+    Execution {
+        app: "alacritty",
+        kind: Kind::DesktopApp,
+        version: Version::InstalledAtInventory("0.17.0-1"),
+        venue: Venue::BareMetalDrm,
+        bar: Bar::OperatorDrove(
+            "typed into, used as a terminal, and used to launch a second application",
+        ),
+        observable: "**the first real desktop application ever run on the bare-metal backend** — \
+                     every earlier DRM row is `solid-client`, a test client from `shim/tests`. It \
+                     mapped as `realm-0`'s app, took keyboard focus, and the operator typed at its \
+                     prompt and read the output. It survived the session's VT switches. \
+                     `--blank-idle` blanked and unblanked over it",
+        verdict: Verdict::Met,
+        when: When::Dated("2026-08-11, during the L1–L7 rung session"),
+        evidence: "`/tmp/vitrind-drm-B.log` from that session — `realm configured … \
+                   realm=realm-0 command=/usr/bin/alacritty`, `spawned app pid=…: \
+                   /usr/bin/alacritty`, `keyboard focus taken by the app surface`, `app window \
+                   mapped: \"Alacritty\" (Alacritty)`, and 399 `seat-replay: … event=key \
+                   origin=physical delivered=1 reason=ok` lines. Reported by the operator; \
+                   issue #268",
+        caveat: Some(
+            "**Nothing was measured.** No latency, no frame count, no correctness check on what \
+             the terminal drew — the operator used it and reports that it worked. The log \
+             retained on disk covers a 60-second segment ending at a VT switch away, so it \
+             corroborates the launch, the focus and the keystroke delivery, and does **not** cover \
+             the later part of the session in which #268 was found.",
+        ),
+    },
+    Execution {
+        app: "Cursor",
+        kind: Kind::DesktopApp,
+        version: Version::InstalledAtInventory("not recorded at the time of the attempt"),
+        venue: Venue::BareMetalDrm,
+        bar: Bar::MappedAndRepainted,
+        observable: "launched from the alacritty prompt in `realm-0`, the same way nautilus was \
+                     launched a moment later. Nothing appeared on the panel",
+        verdict: Verdict::DidNotMap(Cause::NotEstablished("it did not open")),
+        when: When::Dated("2026-08-11, during the L1–L7 rung session"),
+        evidence: "operator report. **No log covers it** — the retained \
+                   `/tmp/vitrind-drm-B.log` segment ends before this attempt, and neither the \
+                   application's own stderr nor its exit status was kept",
+        caveat: Some(
+            "Plausible causes exist and none was checked, so none is recorded: an Electron app \
+             needs environment this realm's `env_allow` may not carry, and the row above shows a \
+             second toplevel in a realm is a path with a known defect (#268). Both are guesses. \
+             What the corpus has is: it was launched, and nothing appeared. Re-running it with \
+             the realm's stderr captured is what would turn this row into a cause.",
+        ),
+    },
+    Execution {
+        app: "nautilus",
+        kind: Kind::DesktopApp,
+        version: Version::InstalledAtInventory("50.2.2-1"),
+        venue: Venue::BareMetalDrm,
+        bar: Bar::OperatorDrove(
+            "navigated with the mouse, then closed from its own title-bar close button",
+        ),
+        observable: "launched **from the alacritty prompt**, so it was a second toplevel of \
+                     `realm-0` under the same shim rather than a realm of its own — the only way \
+                     a second application has ever been started on this backend, since realms \
+                     come from `realm.toml` and that file names one. It mapped over alacritty, \
+                     took the keyboard from it, was navigated by mouse, and closed cleanly on its \
+                     own close button",
+        verdict: Verdict::Met,
+        when: When::Dated("2026-08-11, during the L1–L7 rung session"),
+        evidence: "operator report; the mechanism is read out in issue #268 against \
+                   `shim/src/xdg.c` and `shim/src/seat.c`",
+        caveat: Some(
+            "**Closing it broke the session's keyboard, which is issue #268.** \
+             `toplevel_unmap` clears keyboard focus to nobody, so alacritty — still mapped and \
+             still taking pointer events — could not be typed into again. Read this row as \
+             \"nautilus itself worked\" and not as \"two windows in a realm work\": the second \
+             half of that is a filed bug. Minimize and maximize did nothing, which is **not** a \
+             defect — `VITRIN_WM_CAPABILITIES` withholds minimize deliberately and every window \
+             is single-maximized at the view size.",
         ),
     },
     Execution {
@@ -1509,10 +1627,11 @@ const EXECUTIONS: &[Execution] = &[
         when: When::Dated("2026-08-09, on kernel 7.1.5-arch1-2"),
         evidence: "`docs/drm-bringup.md`, first-run record",
         caveat: Some(
-            "`solid-client` commits `wl_shm` buffers and is not a desktop application. No desktop \
-             application has ever run on bare metal, and the second run's own open list notes the \
-             shim never emits dmabuf, so the zero-copy scanout path is dead code against every \
-             real application.",
+            "`solid-client` commits `wl_shm` buffers and is not a desktop application. On the date \
+             of this run no desktop application had ever reached bare metal; two did on \
+             2026-08-11, by hand, and their rows are above. The second run's own open list notes \
+             the shim never emits dmabuf, so the zero-copy scanout path is dead code against every \
+             real application either way.",
         ),
     },
     Execution {

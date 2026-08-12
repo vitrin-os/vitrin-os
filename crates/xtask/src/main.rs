@@ -64,6 +64,23 @@
 //!                                check, because a GitHub runner has no DRM
 //!                                device, no seat and no GPU and therefore
 //!                                cannot run a GUI application at all.
+//!
+//! cargo xtask limits-check       Verify every published claim in the table in
+//!                                src/limits.rs is (a) present on every surface
+//!                                that must carry it and (b) still true of the
+//!                                code (WS-E.4.4, issue #224) -- and (c) that
+//!                                docs/plan/14-workstream-session-mode.md §6
+//!                                and docs/book/src/limits.md enumerate the
+//!                                same SET of limits, matched by an invisible
+//!                                per-limit marker id rather than by wording,
+//!                                because those two documents are written in
+//!                                two registers on purpose. Reads only; writes
+//!                                nothing. This is what CI runs.
+//!
+//!                                EXPLICITLY TEMPORARY: issue #172 owns the
+//!                                choice of drift mechanism and has not made
+//!                                it. See that module's docs for what replaces
+//!                                this under each of #172's three options.
 //! ```
 //!
 //! Calls straight into the `vitrin_scanner` library (`parse`, `rust_gen`,
@@ -79,6 +96,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+mod limits;
 mod session_matrix;
 
 /// Paths this task operates on, relative to the workspace root.
@@ -97,7 +115,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]"
+    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask limits-check"
 }
 
 fn run() -> Result<()> {
@@ -185,6 +203,18 @@ fn run() -> Result<()> {
                 }
             }
             session_matrix::session_matrix(&workspace_root()?, check)
+        }
+        "limits-check" => {
+            // No flags: the check has exactly one mode. A `--check` spelling
+            // would be noise -- it never writes.
+            if let Some(arg) = args.get(1) {
+                if arg == "-h" || arg == "--help" {
+                    println!("{}", usage());
+                    return Ok(());
+                }
+                bail!("unknown flag '{arg}' for 'limits-check'\n\n{}", usage());
+            }
+            limits::limits_check(&workspace_root()?)
         }
         "-h" | "--help" => {
             println!("{}", usage());

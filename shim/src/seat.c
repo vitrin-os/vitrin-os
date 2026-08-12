@@ -135,8 +135,18 @@ _Static_assert(VITRIN_MESSAGE_COUNT == 47,
  * SEAT-WIDE: this seat carries an agent's actuations beside the human's, the
  * repeat machinery cannot see the per-event `origin` tag, and repeating an
  * agent's held key is exactly the invented keystroke the paragraph above
- * forbids. The core repeats instead, for physical-origin presses only,
- * because it is the only side that still has the tag. */
+ * forbids. The core is the only side that still has the tag, so the core is
+ * where a physical-origin-only repeat would have to live.
+ *
+ * IT DOES NOT LIVE THERE YET. This comment used to read "the core repeats
+ * instead", in the present tense, and no such code has ever existed --
+ * corrected 2026-08-12 by the WS-E.4.4 honesty sweep (issue #224). The
+ * consequence is user-visible on `--drm` and is now published as its own
+ * limit on docs/book/src/limits.md and README.md: a held key produces exactly
+ * one character. Nested is unaffected, because the host compositor repeats
+ * and the core forwards each repeated event individually. Do not restore the
+ * present tense here without the core-side implementation and a hardware run
+ * behind it. */
 #define VITRIN_REPEAT_RATE_HZ 0
 #define VITRIN_REPEAT_DELAY_MS 0
 

@@ -210,6 +210,163 @@ convinces you of more than it should.
 Nothing above is discovered-by-a-reader; each is a decision with a recorded
 rationale in [docs/plan/20-decision-log.md](docs/plan/20-decision-log.md).
 
+### Running it as a desktop: what session mode does not give you
+
+Since Phase 1 closed, a workstream has been making `vitrind` drive a real panel
+on one laptop (`--drm`), with a lock screen, an idle blank, a status strip, a
+screenshot key and a cross-realm clipboard. **It looks like a desktop, which is
+exactly when unstated gaps mislead**, so the list below is published here rather
+than left to be discovered. Every item is argued out at length on
+[`docs/book/src/limits.md`](docs/book/src/limits.md); this is the short form, and
+neither surface is allowed to say something the other contradicts —
+`cargo xtask limits-check` fails the build if one of them drops a claim or if the
+code stops matching one. **Every bullet names the issue behind it, or says
+plainly that it has none and why** — a published limit with nothing tracking it
+is a different promise from one that is scheduled.
+
+- **No accessibility of any kind.** No screen reader, no magnifier, no on-screen
+  keyboard, no sticky or slow keys, no high-contrast or reduced-motion signal,
+  and no **AT-SPI2** bus *advertised* to a realm. Read that word as carefully as
+  the portals bullet below asks you to: the core injects no
+  `DBUS_SESSION_BUS_ADDRESS` and repoints `XDG_RUNTIME_DIR`, so a well-behaved
+  toolkit finds no `org.a11y.Bus` — but under D9 the host session bus, which is
+  where that name is activated, is still on the filesystem and still connectable
+  by any process of this uid, and an operator running Firefox allow-lists
+  `DBUS_SESSION_BUS_ADDRESS` and thereby hands that realm the host's
+  accessibility bridge too. **This is a missing service, never a confinement**;
+  [#160](https://github.com/vitrin-os/vitrin-os/issues/160) is what would make
+  the absence real, and the adversarial probe that would prove it (Phase 2's
+  P2.1.10) does not exist yet. The semantic tree Phase 2
+  builds ([#175](https://github.com/vitrin-os/vitrin-os/issues/175)) is derived
+  from accessibility technology and is **not a substitute for it**: it serves an
+  agent, over this project's own wire protocol, under a grant a human approved.
+  It does not make Orca work. This is stated as an **exclusion, not a deferral** —
+  PRD §5.3 puts human accessibility inside the horizon phase's support treadmill,
+  and that phase's M4 entry gate is unmet on every threshold. **No issue tracks
+  it, deliberately**: an issue would imply somebody intends to close it, and
+  nobody has said so.
+- **CI structurally cannot test the daily-driver backend.** A GitHub runner has
+  no DRM device, no seat and no GPU. The one job that touches this code is named
+  `drm-compile-check (COMPILE ONLY - no display controller is touched)` and that
+  is the whole of what it proves: the code type-checks. It sets no mode, commits
+  no frame and delivers no key. **Where this README or the limits page cites
+  hardware, it cites a dated run by one person on one laptop**, never a green
+  tick. The compile rung came with [#218](https://github.com/vitrin-os/vitrin-os/issues/218); **the functional gate has no
+  issue, because no change to CI could ever produce one.**
+- **No X11.** Wayland only. There is **no X server anywhere in this stack** — not
+  in the core, not among the globals a shim advertises, not as a process anything
+  here starts — and a realm's app is handed no `DISPLAY` at all, so `xterm` in a
+  realm dies with `Can't open display`. Per-app X11 with an embedded window
+  manager is Phase 3 (E3.2) — measured and scoped by [#221](https://github.com/vitrin-os/vitrin-os/issues/221), and E3.2
+  itself has no issue yet. Until it lands the maintainer keeps **a second
+  session on another virtual terminal for X11-only software**, so *"I did not
+  have to go back to my old compositor"* is false for that set of programs. That
+  is a workaround he accepts, not something this project offers or confines: the
+  second session is another compositor with full access to the same devices, and
+  switching to it leaves the confined world entirely. What has actually been run,
+  with the observable each run checked, is
+  [the session app matrix](docs/book/src/session-app-matrix.md).
+- **No bars, launchers, notifications or OSD.** `zwlr_layer_shell_v1` is not in
+  the shim's global contract — measured, not assumed: waybar connects, binds six
+  globals and never maps a surface. A principal cannot draw at all, so the
+  replacements are core-owned surfaces (the trusted band, the consent card, the
+  lock screen, the status strip) that no client can add to, and the shipped
+  switcher is a line-oriented program in a host terminal ([#211](https://github.com/vitrin-os/vitrin-os/issues/211),
+  [#215](https://github.com/vitrin-os/vitrin-os/issues/215)). Serving a layer shell has no issue and is not planned.
+- **No portals, and that absence is a missing service rather than a
+  confinement.** There is no `xdg-desktop-portal` here and a realm is advertised
+  no session bus, so no portal file chooser, no screen sharing, no notifications,
+  no "open this link". It buys **no security**: under D9 the host bus is still on
+  the filesystem and still connectable by any process of this uid — see
+  [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine).
+  Phase-2 confinement ([#160](https://github.com/vitrin-os/vitrin-os/issues/160)) is what makes the absence real; **serving
+  portals properly has no issue at all.**
+- **A shell crash loses window management.** The switcher is an unprivileged
+  client by design, so there is no core-side fallback. Kill it and the core, the
+  realms and their apps all survive and the last-focused realm keeps taking your
+  input; what you lose is the ability to re-aim it, and recovering means starting
+  the shell again from a terminal that must already be in the bound realm.
+  Asserted by `tests/integration/test_shell.py` ([#211](https://github.com/vitrin-os/vitrin-os/issues/211)); **it is the
+  price of the shell-is-a-client invariant and has no issue, because nobody
+  intends to close it.**
+- **One machine, one GPU, one panel, one kernel — and the core models exactly
+  one output**, by contract rather than by omission. There is no hardware
+  matrix. A second connected display is
+  refused at startup rather than half-served, so a laptop plus an external
+  monitor does not work. The laptop's second GPU is **entirely unexercised**
+  rather than "supported and untested": the backend opens the seat's primary GPU
+  and there is no multi-GPU or PRIME path in this repository at all. The
+  one-output refusal came with [#218](https://github.com/vitrin-os/vitrin-os/issues/218); **the hot-plug gap it leaves — a
+  panel plugged in or unplugged mid-session — has no issue.**
+- **At most 16 realms, and nothing you can ask for ends one.** Those are the
+  session's cardinalities: up to **16 realms**, one output, one realm visible.
+  No principal and no wire request closes a realm — revocation, disconnect and
+  the dead-man switch all leave the process
+  running ([#234](https://github.com/vitrin-os/vitrin-os/issues/234)) — and a
+  slot comes back **only** when the realm's own app exits, which the core counts
+  (`Realm::occupies_capacity`) so a session that launched and closed sixteen
+  apps is not permanently spent. Sixteen *simultaneously live* realms is the
+  cap; your remedies for a realm you no longer want are the app's own quit path,
+  killing it from a terminal, or restarting `vitrind`. The cap itself is [#208](https://github.com/vitrin-os/vitrin-os/issues/208).
+- **The cross-realm clipboard exists, and it is published as a bound rather than
+  an absence.** Two physical human gestures move `text/plain;charset=utf-8`, up
+  to **60 KiB** at a time, one direction each, through a single core-held slot
+  that no client can trigger, force or observe. Two colluding realms can
+  therefore move ~60 KiB per gesture pair; Qubes accepts the same bound. The
+  honest statement is that number, never "there is no channel" ([#213](https://github.com/vitrin-os/vitrin-os/issues/213)).
+- **A locked screen, and a dark screen, do not stop an agent.** An `observe`
+  holder keeps capturing across a lock and across an idle blank, and an
+  `actuate_*` holder keeps acting: a lock takes away *your* input, not an
+  agent's authority. The instrument for "stop everything" is the dead-man chord,
+  which fires through both. And **`--blank-idle` blanks the screen without
+  locking it** — anyone who touches a key on your dark laptop is inside your
+  session, because blanking and locking are deliberately not coupled.
+  A blank is **worse than a lock** for the agent, and the limits page does not
+  soften it: with the display off there are no vertical blanks, so every realm's
+  frame clock stops and the agent is served the pre-blank frame **indefinitely,
+  with no staleness signal and no refusal** — it can still act and cannot see the
+  consequences, on a timer nobody chose. Both are
+  decisions rather than gaps — the lock's is [#214](https://github.com/vitrin-os/vitrin-os/issues/214) and D-025, the
+  blank's is [#223](https://github.com/vitrin-os/vitrin-os/issues/223) and D-033 — and **neither has an issue to close,
+  because neither is going to change.**
+- **There is no touch and no tablet on the wire.** The seat serves a pointer and
+  a keyboard; `wl_touch` is deliberately not advertised, because a class announced
+  with nothing behind it makes toolkits drop their pointer fallbacks. Both are
+  deferrals with named reopening evidence (a device in the measured set plus an
+  application that needs it), not refusals
+  ([#222](https://github.com/vitrin-os/vitrin-os/issues/222)).
+- **Idle inhibition is not served**, so full-screen video will blank the screen.
+  `zwp_idle_inhibit_manager_v1` needs a new shim global *and* a new wire verb;
+  that paired IDL-and-prose edit is what reopens it
+  ([#223](https://github.com/vitrin-os/vitrin-os/issues/223)). A *not yet* with a
+  named condition, not a refusal.
+- **The brightness and volume keys reach an app that cannot act on them.** They
+  are no longer dropped at intake, which changed *where they stop* and not what
+  they do: a confined app cannot write `/sys/class/backlight` or open a mixer, so
+  pressing brightness still does nothing. Backlight and volume actuation are
+  deferred behind either a shell verb or an owner decision to let the core write
+  `/sys/class/backlight`; **no issue tracks it.**
+- **A held key does not repeat on `--drm`.** The shim's repeat timer is set to
+  zero on purpose — repeat is seat-wide and this seat carries an agent's
+  actuations beside yours — but the core-side repeat that decision assumes was
+  never written, and libinput synthesizes none. Nested, the host repeats and you
+  never see it. **No issue tracks it**, and no run has confirmed it: this one was
+  found by reading the tree during this sweep.
+- **The trusted band's automated witness covers the headless backend only.** The
+  band's unspoofability is machine-checked where CI can read a framebuffer and
+  asserted, not checked, on the bare-metal backend a human would actually look
+  at. Nobody has evidence a human *notices* a wrong band either
+  ([#173](https://github.com/vitrin-os/vitrin-os/issues/173)).
+- **What hardware has confirmed, at the depth it confirmed it.** The bring-up
+  runbook ran twice on 2026-08-09 and the session-lifecycle checklist once on
+  2026-08-11; neither was a clean pass. The 2026-08-11 run recorded 10 of 10 VT
+  switches, **4 of 5** suspend cycles, **2 of 5** lid cycles of which one reached
+  sleep, a blank at 61.2 s and no lock card on wake. The rungs filed **four
+  defects (#257–#260)** and a **fifth (#268)** came out of driving alacritty and
+  nautilus in the same session, so count five against that date. Two of those
+  fixes are still unobserved on hardware. One run on one laptop is a report
+  about that laptop.
+
 ## Quickstart
 
 From a clean clone to a running demo. Verified against the state of `main`

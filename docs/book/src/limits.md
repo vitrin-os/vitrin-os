@@ -70,27 +70,36 @@ a real GPU (EGL + a DRM render node) and runs only under
 `VITRIN_GPU_TESTS=1 cargo test -p vitrin-core --features gpu-tests --
 --ignored dmabuf`. CI is GPU-free and exercises the shm path exclusively.
 
+<!-- limit: drm-has-no-ci-gate -->
 **The DRM/KMS backend will never have a green gate behind it, and that is the
 weakest evidence in this repository.** Every other claim on this page closes on
 a named, mock-free test. This one cannot, and the reasons are structural rather
-than budgetary. Six of them, named rather than summarised:
+than budgetary. Eight of them, named rather than summarised:
 
 - **No DRM device in CI.** A GitHub runner has no display controller. Nothing
   there can set a mode, commit a frame or receive a page flip.
 - **No seat in CI.** No `logind` session, no `seatd`, nothing for `libseat` to
   open a card through. The backend cannot even reach the point of failing
   usefully.
-- **Not even a compile-check, yet.** An earlier draft of this page said, in the
-  present tense, that a CI rung runs `cargo clippy … --features drm-backend`.
-  **No such rung exists and no such feature exists** — the backend itself is
-  unwritten (#218). The claim is corrected rather than deleted, because a limits
-  page that quietly acquires the right words teaches nothing about how it got
-  the wrong ones, and this is a page whose entire value is that it can be
-  believed. When #218 lands, a compile rung is the *floor* it must bring with
-  it, and even then it proves the code type-checks against the smithay API and
-  nothing whatsoever about behaviour — a green tick in a repository whose
-  readers are trained to trust green ticks is exactly how a compile check gets
-  cited as a functional one.
+- **A compile check, and its own name in CI says `COMPILE ONLY`.** This bullet
+  has now been wrong in **both** directions and the page keeps both corrections,
+  because a limits page that quietly acquires the right words teaches nothing
+  about how it got the wrong ones. It first said, in the present tense, that a
+  CI rung runs `cargo clippy … --features drm-backend` when neither the rung nor
+  the feature existed. It was then corrected to *"no such rung exists and no
+  such feature exists — the backend itself is unwritten (#218)"* — and **#218
+  landed, so that correction is now the stale half**. What is true today:
+  `.github/workflows/ci.yml` carries a job named
+  `drm-compile-check (COMPILE ONLY - no display controller is touched)`, which
+  installs the graphics dev stack, runs
+  `cargo clippy -p vitrin-core --all-targets --features drm-backend -- -D warnings`,
+  asserts that smithay's soft-failing gbm probe actually ran, and runs the
+  backend's device-free unit tests. **It proves the code type-checks against the
+  smithay API and nothing whatsoever about behaviour.** It sets no mode, commits
+  no frame and delivers no key. A green tick in a repository whose readers are
+  trained to trust green ticks is exactly how a compile check gets cited as a
+  functional one, which is why the job's own name shouts the qualifier and why
+  this page quotes the name rather than paraphrasing it.
 - **`vkms-advisory` does not close this, and must never be read as if it did.**
   There is an advisory job that attempts `sudo modprobe vkms` and, when the
   module is available, reports what it found. **What the job actually does is
@@ -113,13 +122,42 @@ than budgetary. Six of them, named rather than summarised:
   kernel or mesa. The PRD names "hardware matrix" as the first item of the
   support treadmill that consumed prior alternative display servers; this closes
   none of it and must not read as if it does.
+
+  Say the second GPU precisely, because the loose word is the misleading one.
+  That laptop has a second DRM device — `/dev/dri/card2`, `nvidia`, with
+  `nvidia_drm` loaded and all four of its connectors disconnected. It is
+  **entirely unexercised, not "supported and untested"**: the backend resolves
+  its card through `udev::primary_gpu(&seat_name)` and opens exactly that one,
+  there is no PRIME path, no multi-GPU renderer and no buffer import between
+  devices anywhere in this repository, and on 2026-08-09 the selection chose
+  `card1` on its own. Nothing here has ever opened `card2`, so there is no
+  result about it to report in either direction. "Untested" would imply a path
+  exists that nobody exercised; none exists. **No issue tracks a hardware
+  matrix**, and none should: a matrix is a support treadmill the PRD names as
+  the thing that consumed prior alternative display servers, not a defect.
+- **The trusted band has an automated witness, and it covers one backend — not
+  the one you would daily drive.** `backend/band_witness.rs` measures the
+  negative half of the band's unspoofability property: that a confined app's own
+  rendering can never reach the band's rows on the human-visible frame, in
+  numbers a harness can hold without ever holding the session secret. It is
+  wired into `backend/headless.rs` and into nothing else. Grep the DRM backend
+  for `band_witness` and there are no hits, because a witness needs a
+  framebuffer a test process can read and a bare-metal session's is a scanout
+  buffer behind DRM master. So the property the whole trust story rests on is
+  machine-checked on the backend CI runs and **asserted, not checked, on the
+  backend a human looks at**. Nothing was weakened to make that true and nothing
+  restores it; the alternative would be a witness on a backend no runner can
+  reach, which is not a check. [#173](https://github.com/vitrin-os/vitrin-os/issues/173) tracks the *human* half nobody has
+  evidence for; **the DRM half has no issue**, because there is nothing a CI
+  change could do about it.
 - **The bring-up runbook has been executed twice, both on 2026-08-09**, and it
   carries a dated record block for each. Neither was a clean pass: three defects
   came out of the first, one of which was that the page's own first line of
   recovery did not exist. A runbook nobody has executed is a plan, and the wlcs
   number above is this repository's standing example of how a manual result
   ages once it is taken.
-- **The session-lifecycle checklist has been executed once, on 2026-08-11, and
+- <!-- limit: lifecycle-checklist-run-once -->
+  **The session-lifecycle checklist has been executed once, on 2026-08-11, and
   it is not a clean pass either.** Blanking, suspend, lid handling,
   deliberate-wedge recovery and returning from another VT are rungs `L1`–`L7`
   in [Getting out of a wedged session](recovery.md#the-hardware-checklist),
@@ -131,8 +169,14 @@ than budgetary. Six of them, named rather than summarised:
   blank at 61.2 s with the panel returning on physical input, and `L5` no lock
   card. `L6` recovered in ~69 s but **by which route could not be reconstructed
   afterwards**, so the rung's actual question — which route got you out — is
-  unanswered. Four defects were filed from the run (#257–#260), one of them that
-  the recovery page's own published command was wrong. **`L4` is therefore not a
+  unanswered. **The rungs filed four defects (#257–#260)**, one of them that the
+  recovery page's own published command was wrong — and a **fifth, #268, came
+  out of the same 2026-08-11 session**, from driving alacritty and nautilus
+  rather than from any rung, so a reader counting defects against that date
+  should count five. The generated
+  [session app matrix](session-app-matrix.md) is where that fifth one is
+  recorded; understating a defect count is the direction this page holds to be
+  the more corrosive one. **`L4` is therefore not a
   clean pass**: [#257](https://github.com/vitrin-os/vitrin-os/issues/257),
   [#258](https://github.com/vitrin-os/vitrin-os/issues/258) and
   [#259](https://github.com/vitrin-os/vitrin-os/issues/259) — the panel blanking
@@ -182,6 +226,34 @@ output follows to the first realm still serving, and to no realm at all once
 none is serving. Treat a multi-realm configuration as "several apps running,
 one of them on screen".
 
+<!-- limit: one-output -->
+**And there is exactly one output, by contract — a second connected display is
+refused at startup rather than half-served.** Those are the session's two
+cardinalities and they do not move: up to **16 realms**, one output. The
+singularity is in the contract rather than in the content, which is why sixteen
+live realms do not buy a second panel: `Presenter::view_size` is one size for the
+whole session and every realm's shim is configured with it once before the first
+fork, `RealmScenes::bound` is a single `Option<RealmId>` that the human's seat
+target and the agent cursor's coordinate space both resolve through, and the
+status strip has one caption. Coming up on two panels anyway would light
+whichever connector enumerated first and leave a powered display dark with **no
+message and no verb in the protocol that could ever move the output to it**, so
+on `--drm` the backend refuses to start and names the connectors it found.
+
+Two consequences, neither closed. **A laptop plus an external monitor — the most
+ordinary desktop arrangement there is — does not work here**, and the refusal
+tells you to unplug one. And the refusal is a *startup* one: this backend
+enumerates connectors once and installs no udev monitor, so a panel plugged in
+mid-session is neither lit nor complained about, and unplugging the only panel
+leaves the session compositing into a surface nobody sees. That gap is
+deliberately unowned rather than absorbed into the seat-pause handling, because a
+paused session still has its panel and is told when it gets it back, while an
+unplugged one has no event promising a return — holding a consent card and a lock
+for a screen that no longer exists is a different decision with a different
+failure mode, and nobody has taken it. The refusal came with WS-E.3.2
+([#218](https://github.com/vitrin-os/vitrin-os/issues/218)); **the hot-plug gap has no issue**, and is a numbered item in
+that workstream's runbook instead.
+
 **Layout is two requests, and the absences are deliberate.** A holder can
 focus a realm and choose whether it fills the output or keeps its own size.
 There is no `place`, no `resize`, no `raise` and no stacking — not requests
@@ -189,6 +261,7 @@ that refuse, but no requests at all, because a scene showing one unstacked
 realm cannot honour them and a verb that silently does less than its name is
 worse than one with no request. Do not plan a tiling shell against this yet.
 
+<!-- limit: principal-cannot-draw -->
 **A principal cannot draw, so nothing a client builds can be on screen.**
 `vitrin_view` is capture-only and there is **no principal-facing surface
 interface anywhere in the IDL** — a grant can read a realm's pixels and can put
@@ -206,6 +279,7 @@ replacements are core-owned surfaces (the trusted band, the consent card, the
 attention marker, the lock screen and the status strip) that no client can add
 to.
 
+<!-- limit: no-layer-shell -->
 **No client status bar is possible, and the core's `--status` strip is the
 whole of the replacement.** `zwlr_layer_shell_v1` is not in the shim's global
 contract, and that was measured rather than assumed: waybar connects, binds six
@@ -225,7 +299,8 @@ fourth core-owned gesture for a status bar. Four further limits belong with it:
   proves itself, the strip only inherits position from it. This makes the
   indicator story three rules where there was one, and a human who cannot state
   the rule cannot apply it.
-- **Every app loses rows while the strip is on.** The realm view is *not* inset
+- <!-- limit: status-strip-overdraws-the-view -->
+  **Every app loses rows while the strip is on.** The realm view is *not* inset
   — the app is not configured smaller, its top rows are overdrawn, exactly as
   the band's 8 rows already are. Issue #215 asks for the inset and it is
   unimplemented; `--status` is off by default so no session pays for a strip it
@@ -236,7 +311,8 @@ fourth core-owned gesture for a status bar. Four further limits belong with it:
   — so `--status-utc-offset +09:00` states a fixed offset and the strip always
   labels the zone it is showing. A session running across a DST boundary shows
   an hour that is wrong until the operator changes the flag.
-- **The strip is a recurring filesystem read inside the TCB.** The battery
+- <!-- limit: status-strip-reads-sysfs -->
+  **The strip is a recurring filesystem read inside the TCB.** The battery
   comes from `/sys/class/power_supply`, re-read every 30 s, bounded to one fixed
   root, 16 directory entries and 16–32 bytes per attribute, with every failure —
   no battery, a desktop, a machine mid-suspend — collapsing to an **empty slot**
@@ -244,6 +320,7 @@ fourth core-owned gesture for a status bar. Four further limits belong with it:
   becomes a rule the core must grant itself, i.e. this widens that future
   sandbox.
 
+<!-- limit: principal-has-no-hotkey -->
 **A principal cannot receive physical input either, so no client has a
 hotkey.** There is no `observe_input` verb and none is designed. The core owns
 five physical gestures — the dead-man switch, the attention key, the two
@@ -258,6 +335,68 @@ window-management policy the core deliberately does not have. What follows for
 a user is concrete: **every layout change starts as a line you type into a
 terminal**, and the terminal has to be somewhere you can reach.
 
+<!-- limit: no-touch-no-tablet -->
+**The seat serves a pointer and a keyboard: there is no touch and no tablet.**
+`wl_touch` is deliberately absent from the shim's advertised seat capabilities —
+`shim/src/globals.c` says `TOUCH IS NOT YET SERVED` in those words — and a
+tablet or stylus has neither a shim global nor a wire event. The absence is
+deliberate rather than a smaller version of support: a class advertised with
+nothing behind it is **worse** than an absent one, because a toolkit that sees
+`TOUCH` stops installing its pointer fallbacks and you get an application that
+responds to nothing at all.
+
+Both are **deferrals with named reopening evidence, not refusals**, and the
+difference is the whole reason they are stated this way. Touch reopens on a
+touchscreen appearing in the measured device set *together with* an application
+that needs it; tablet reopens on a pen or stylus in that set, its application
+half already being on record. The measured machine has neither device, and that
+is a measurement of one laptop rather than a property of the protocol — a wire
+protocol that intends to be permanent may not foreclose a device class because
+one machine lacks one.
+
+<!-- limit: pointer-extras-unproven-on-hardware -->
+**What *is* served is relative motion, pointer gestures and pointer
+constraints** ([#222](https://github.com/vitrin-os/vitrin-os/issues/222)) —
+**and they are landed in the tree and unproven on hardware.** No run has yet
+delivered any of them to a connected application, because CI has no touchpad and
+no DRM device, so what stands behind them is unit and component tests rather
+than a mock-free gate.
+
+<!-- limit: gesture-ends-wrong-way -->
+**A gesture that a consent card or the lock interrupts is ended the wrong
+way, and that is owed rather than argued for.** The router ends an in-flight
+gesture `cancelled` on a realm switch and on a seat pause, for the stated
+reason that a begin with no end leaves the losing app accumulating a gesture
+forever. A consent card or the lock screen raising mid-gesture takes a
+different path on purpose — the gate withholds the gesture's *updates* and
+keeps delivering its end, because the router only ever delivers an end for a
+begin it delivered — but what then arrives is **the device's own end**, so an
+app that was previewing a pinch-zoom when a card came up is told the human
+*completed* what they in fact abandoned. Nothing wedges and nothing leaks; the
+app's state is simply wrong in a way the human did not choose. Owned by
+[#222](https://github.com/vitrin-os/vitrin-os/issues/222).
+
+<!-- limit: no-key-repeat-on-drm -->
+**And on the daily-driver backend a held key does not repeat at all.** The shim
+sets `wlr_keyboard_set_repeat_info` to a rate and delay of zero, so no
+application in a realm ever runs its own repeat timer, and there is no repeat
+implementation anywhere in the core — grep `crates/vitrin-core/src` for one and
+there is nothing but comments about *filtering* a host's autorepeat out.
+Nested, that is invisible: the host compositor repeats and the core forwards
+each repeated event individually, so a held key behaves. On `--drm` there is no
+host, libinput synthesizes no repeat, and holding a key therefore produces
+exactly one character. The refusal to turn the shim's timer back on is a real
+decision and a good one — repeat is **seat-wide**, this seat carries an agent's
+actuations beside the human's, and the repeat machinery cannot see the
+per-event `origin` tag, so a client-side timer would repeat an agent's held key
+— but the compensating core-side repeat that decision assumes **was never
+written**. Read this as an unimplemented half of D-028(5), not as a design: no
+run has confirmed it at a prompt, because CI cannot, and the one bare-metal
+session that drove a terminal (2026-08-11) did not test for it. It has **no
+issue**, because it was found by reading the tree during this sweep rather than
+by using the session.
+
+<!-- limit: shell-crash-loses-re-aim -->
 **If the shell dies, you keep the session and lose the ability to re-aim it.**
 The switcher is a client (PRD §5.1, D-021(4)), so there is no core-side
 fallback — that is the price of the invariant, paid rather than argued away.
@@ -293,6 +432,7 @@ window — between the realm cap being raised and the output being bound —
 where this was not true and a capture could carry a live sibling's pixels;
 it is closed.
 
+<!-- limit: every-realm-renders -->
 **Every realm renders, whether or not you are looking at it — and whether or
 not any agent is connected.** A hidden realm keeps receiving frame callbacks
 paced by the output's composites, and keeps having its view composed. That is
@@ -317,6 +457,7 @@ rate with nobody watching fifteen of them, plus roughly
 `2 x width x height x 4` bytes of core-side pixels per realm (~590 MiB
 resident at sixteen realms on a 2560x1600 panel, measured).
 
+<!-- limit: agent-cursor-visible-realm-only -->
 **The agent cursor is drawn only for the visible realm.** The core paints a
 small crosshair where an agent is pointing, so a human can see that an agent
 is acting. It is painted into the output, which shows one realm — so an
@@ -328,6 +469,7 @@ less: agents can now actually work in hidden realms, so there is more going on
 that nothing draws. The fix is a per-realm indicator in the trusted band and
 it is not built.
 
+<!-- limit: per-realm-presence-narrows-preempted -->
 **A human's hand no longer stops agents in other realms — and that is a
 narrowing of a blanket safety behaviour.** The core refuses an agent's
 actuation `preempted` while physical human input owns the target, and "the
@@ -363,11 +505,13 @@ your own typing.
 
 What it costs you:
 
-- **The core eats Super, everywhere.** A nested compositor, a VM viewer, or a
+- <!-- limit: super-is-taken-everywhere -->
+  **The core eats Super, everywhere.** A nested compositor, a VM viewer, or a
   remote-desktop client running in a realm loses that key with no pass-through
   and no way to ask for one. The only remedy is `--attention-chord rsuper`,
   which is not really a remedy.
-- **The window is session-wide.** If two clients hold layout authority, either
+- <!-- limit: attention-window-is-session-wide -->
+  **The window is session-wide.** If two clients hold layout authority, either
   of them may consume the press — the core cannot know which one you meant, and
   choosing would be window-management policy it deliberately does not have. Your
   own switch then silently fails and the other one lands. The claim is journaled
@@ -379,7 +523,8 @@ What it costs you:
   confers no authority the client did not already hold — but a human who learns
   "press Super when the screen tells me to" has learned a habit an attacker can
   invoke.
-- **`preempted` on the layout verbs is now conditional on core state you cannot
+- <!-- limit: preempted-now-depends-on-hidden-state -->
+  **`preempted` on the layout verbs is now conditional on core state you cannot
   see.** An agent reading its own journal can no longer reconstruct why one
   `focus` landed and an identical one did not.
 - **Other principals lose a guarantee nobody tells them they lost.** "A human
@@ -391,6 +536,7 @@ band — never inside it, because the band has exactly one correct appearance an
 that is the whole of its value. **A focus change that happened with no marker up
 was not yours.**
 
+<!-- limit: realm-switch-releases-held-input -->
 **Switching realms mid-gesture releases what you were holding, into the realm
 you left.** A key or pointer button you are physically holding when the output
 binding moves is released to the app you are leaving, because your actual
@@ -452,10 +598,24 @@ launch grant does not close what it started; nor does closing the connection
 that asked; nor does the dead-man switch, which revokes every *grant* and
 leaves every *process* running. A realm ends when its own app exits, and not
 otherwise. So one approved `realm_launch` grant, exercised 15 times before the
-human revokes it, permanently commits every remaining slot of the 16-realm cap
-— and the core-side memory behind them — for the rest of the session. The only
-remedy is restarting `vitrind`. Revocation bounds *future* launches and nothing
-else; read it that way when deciding whether to approve one.
+human revokes it, commits every remaining slot of the 16-realm cap for as long
+as those fifteen apps keep running, and revocation will not get one back.
+
+<!-- limit: realm-cap-arithmetic -->
+**State the cap's arithmetic precisely, because the loose version overstates
+it.** The cap counts *live* realms, not launches: `Realm::occupies_capacity`
+excludes the terminal state and `capacity_used` — not `len` — is what a launch
+is refused against, so when a realm's app exits its slot returns and the
+session can launch again. Sixteen *simultaneously live* realms is the limit,
+not sixteen launches per session. Both halves have to be published together or
+each becomes a lie: **no principal and no wire request can end a realm** —
+revocation, disconnect and the dead-man switch all leave the process running
+([#234](https://github.com/vitrin-os/vitrin-os/issues/234)) — **and a slot
+comes back only when the realm's own app exits.** So the human's remedies for a
+realm they no longer want are the app's own quit path, killing the process from
+a terminal, or restarting `vitrind`; the display server offers none. Revocation
+bounds *future* launches and nothing else; read it that way when deciding
+whether to approve one.
 
 **Launched realms accumulate for the life of a session.** An exited realm
 keeps its row so `unavailable` keeps meaning *not ever*, so a session that
@@ -465,6 +625,7 @@ bounded only by the grant's rate ceiling and expiry, not by a count. A
 long-lived session driven by an agent launching on a timer will grow that
 table without limit.
 
+<!-- limit: clipboard-is-a-bounded-channel -->
 **A human can now move text between two realms, and that is a channel with a
 stated bandwidth.** Copy-paste between realms exists as of WS-E.2.1: pressing
 Ctrl-Shift-Insert asks the realm you are looking at for its selection and puts
@@ -488,6 +649,7 @@ Read the rest as a bound rather than as an absence, because that is what it is:
   "there is no channel"; the PRD's threat-model row was edited rather than left
   standing.
 
+<!-- limit: tcb-stores-application-bytes -->
 **The trusted core now stores bytes an application authored.** Nothing else in
 it does — it holds client *pixels* it never interprets and typed values it
 validated itself. A password copied from a manager transits `vitrind` and rests
@@ -497,12 +659,14 @@ length and a BLAKE3 digest, never content) and the three clears bound it; none
 removes it. This was decided deliberately, with that cost stated, and it is the
 first time this project has made that trade.
 
+<!-- limit: clipboard-chords-taken -->
 **Two more keys are taken from every app.** Ctrl-Shift-Insert and Shift-Insert
 are consumed by the core in every realm, with no pass-through and no way to ask
 for one. Shift-Insert is the historical X11 primary-paste chord, so an app that
 binds it loses it. `--clipboard-key` moves both to another key, which is not a
 remedy so much as a different loss.
 
+<!-- limit: lock-does-not-stop-agents -->
 **The lock screen does not lock out agents, and this is the single most
 surprising thing on this page.** As of WS-E.2.2 there is a lock screen, and
 **three** things raise it: Ctrl-Alt-Delete, `--lock-idle SECS` of no physical
@@ -562,6 +726,7 @@ So the moment you leave is the moment agent actuation stops being refused
 `preempted`. That is correct (you really are absent) and it means agent
 authority is at its widest exactly when your view of it is at its narrowest.
 
+<!-- limit: nested-lock-locks-a-window -->
 **In nested mode the lock screen locks a window, not a session.** `vitrind`
 runs as a client of your real compositor, which is above it and owns the actual
 session: anyone can alt-tab away from the locked window, and the host's own
@@ -569,6 +734,7 @@ screen lock is still the thing protecting the machine. Treat the nested lock as
 what it is — a privacy cover over the realms `vitrind` is showing — and not as
 an authentication boundary for the seat.
 
+<!-- limit: no-vt-switch-inhibition -->
 **`vitrind` never inhibits VT switching, and on bare metal it has to
 *implement* `Ctrl-Alt-F<n>` for it to work at all.** On the nested backend the
 chord is the host compositor's business and outside this project's reach. On
@@ -648,6 +814,7 @@ rather than trusting your memory of an arbitrary colour: this page already says
 nobody has evidence a human reliably notices a wrong band, and a memory test is
 not a check.
 
+<!-- limit: idle-blank-does-not-lock -->
 **Your screen now goes dark on its own — and a dark screen is not a locked
 session.** With `--blank-idle SECS` on bare metal, `vitrind` turns the panel off
 after that long with no physical input from you. **The session behind it stays
@@ -664,6 +831,7 @@ comfortable with; nothing in the blank will do it for you, and the two timers do
 not know about each other beyond sharing the answer to *"when did a human last
 touch this?"*.
 
+<!-- limit: no-idle-inhibit -->
 Two smaller things that come with it. **Idle inhibition is not yet served**, so
 full-screen video will blank the screen — the client-side protocol for saying
 "don't blank, I'm playing a film" (`zwp_idle_inhibit_manager_v1`) needs both a
@@ -673,6 +841,26 @@ refused on `--nested`**: a `vitrind` running inside your real compositor's
 window would be painting a black rectangle and calling it a dark screen, which
 asserts something about a display it does not own.
 
+<!-- limit: media-keys-reach-an-app-that-cannot-act -->
+**The brightness and volume keys now reach an app that cannot act on them, and
+that is an honest half-fix rather than a fix.** The keymap fallback learned the
+`XF86` media and brightness rows, so those keys are no longer dropped at intake
+on a bare-metal session without `--keymap` or on a nested one — but what changed
+is *where they stop*, not what they do. A delivered `XF86MonBrightnessUp` lands
+on the focused realm's shim seat, and a confined application cannot write
+`/sys/class/backlight` or open a mixer, so **the human presses brightness and
+nothing happens, exactly as before**. State it that way rather than reporting
+that the keys were fixed. Backlight and volume actuation are **deferred, with
+named reopening evidence**: either a shell client holding a verb for it, which
+WS-E Stage 2 sketched and did not build, or an owner decision to let the core
+write `/sys/class/backlight` — a display-power interface that D-030 already
+notes DRM master does **not** gate, which is why it is an authority question
+rather than a plumbing one. **No issue tracks it**; it is a residual named in
+the input router's own comments and in
+[the workstream plan](https://github.com/vitrin-os/vitrin-os/blob/main/docs/plan/14-workstream-session-mode.md), and nobody has
+filed the decision it waits on.
+
+<!-- limit: blank-does-not-stop-observation -->
 **A dark screen is not evidence that nothing is watching, either — and this is
 the same decision as the lock screen, not a second accident.** An agent holding
 `observe` **keeps capturing the realm while your panel is off**, exactly as it
@@ -685,6 +873,7 @@ structural reason rather than a lucky one — the switch watches an input tap no
 gate can suppress, so the very press that wakes your screen is also the first
 press of the hold.
 
+<!-- limit: blank-stops-the-frame-clock -->
 **But it is worse than that, and the honest version is uncomfortable: a blank
 stops every realm's frame clock.** With the display powered off there are no
 vertical blanks, so nothing tells the compositor a frame landed, so no
@@ -790,6 +979,7 @@ agent as a refusal. You will experience that as the system being obstructive.
 It is the fail-closed answer, and the flight recorder carries the reason
 (`petition_resolved{timed_out}` with no `consent_transition{shown}` before it).
 
+<!-- limit: passphrase-is-not-headless -->
 **Without `--lock-passphrase-file` the lock is a privacy screen, and it says
 so.** Enter dismisses it, with no authentication of any kind. The passphrase
 path exists (Argon2id, one digest per session, one journal entry per attempt
@@ -822,6 +1012,7 @@ one convention so all of them type, but the failure it is avoiding is worth
 naming: some of your letters working and some of them silently vanishing looks
 like a typo, not a bug, and it would be discovered at a lock screen.
 
+<!-- limit: lock-chord-taken -->
 **A fourth chord is now taken from every app, and it constrains the other
 three.** Ctrl-Alt-Delete is consumed in every realm. It also means
 `--dead-man-chord delete` is refused at startup on an otherwise default command
@@ -830,6 +1021,7 @@ a lock chord sharing its key would arm your off-switch every single time you
 locked your screen. `--lock-chord` moves it, which — as with the clipboard — is
 a different loss rather than a remedy.
 
+<!-- limit: screenshot-cannot-show-a-prompt -->
 **A vitrin screenshot shows the realm, not what you saw — and it cannot show a
 consent prompt.** As of WS-E.2.4 there is a screenshot key: with
 `--screenshot-dir PATH`, Ctrl-PrintScreen writes one PNG of the focused realm's
@@ -859,12 +1051,14 @@ falls in a handful of screenshots at 1080p.
 
 Four more things belong with it:
 
-- **The screenshots are readable by every app in every realm.** They are files
+- <!-- limit: screenshots-are-world-readable-to-realms -->
+  **The screenshots are readable by every app in every realm.** They are files
   written as your uid, and there is no sandbox (above, D9). The file mode is
   `600`, which keeps them from *other users* and does nothing whatsoever about
   the confined app. This page creates no new hole — that is D9 — but this
   feature creates the files.
-- **A fifth chord is taken from every app.** Ctrl-PrintScreen is consumed in
+- <!-- limit: screenshot-chord-taken -->
+  **A fifth chord is taken from every app.** Ctrl-PrintScreen is consumed in
   every realm. It is a *chord* rather than a bare PrintScreen deliberately, and
   that is the one cost this feature pays back: bare PrintScreen is still
   delivered, so an app that binds it keeps it. `--screenshot-chord` moves the
@@ -925,6 +1119,37 @@ all Phase 2 — which is to say the token-hungry screenshot loop this project
 criticises is still what an agent does against it today. The difference so
 far is authorization, not efficiency.
 
+**No portals, because a realm is advertised no session bus — and that absence is
+a missing service, not a confinement.** There is no `xdg-desktop-portal` here:
+nothing in the core or the shim starts one, talks to one, or advertises one. The
+core injects no `DBUS_SESSION_BUS_ADDRESS` and points `XDG_RUNTIME_DIR` at the
+realm's own private directory, so a well-behaved application looking for a
+session bus finds nothing. What that costs a desktop user is concrete and larger
+than it sounds: **no portal file chooser** (you get whatever dialog the toolkit
+draws itself, which cannot reach a file the application could not already open),
+**no screen sharing**, **no notifications**, and no "open this link in a
+browser" — a click that would hand a URL to another application does nothing.
+
+Read the next sentence as the whole point of this entry. **This is not a
+security property, and it must never be cited as one.** Under D9 there is no
+sandbox: `/run/user/<uid>/bus` is still on the filesystem and still connectable
+by any process of this uid, and the abstract-socket namespace is shared, so a
+determined application connects to the host session bus with no help from
+anybody. In practice an operator running Firefox allow-lists
+`DBUS_SESSION_BUS_ADDRESS` in `realm.toml`, which turns the implicit hole into an
+audited one — and hands that realm the **host's** bus, with whatever services the
+host happens to be running on it, entirely outside anything this project
+mediates. What a toolkit then does with a host portal from inside a realm is
+**unmeasured**; nobody has run it. The thing that will make the absence real is
+Phase-2 confinement ([#160](https://github.com/vitrin-os/vitrin-os/issues/160),
+E2.6/E2.7), which gives the realm a mount and network namespace so there is
+nothing to reach rather than nothing advertised. Serving portals *properly* — a
+core-mediated file chooser under a grant — is the Phase-2 powerbox's job and is a
+different thing again from restoring the toolkit's. **Serving portals has no
+issue and appears in no plan document**, so read this as an absence nobody has
+scheduled rather than as work in a queue.
+
+<!-- limit: no-x11 -->
 **No X11 shim.** Wayland only. Per-app X11 with an embedded WM is Phase 3.
 There is no X server anywhere in this stack — not in the core, not among the
 globals a shim advertises, not as a process anything here ever starts — and a
@@ -952,6 +1177,89 @@ anything else works; it is deliberately shorter than the list of things people
 expect a desktop to run.
 
 **The protocol will break.** v0 is frozen for Phase 1, not forever.
+
+<!-- limit: no-accessibility -->
+## No accessibility of any kind
+
+This project builds an accessibility-derived semantic tree for **agents** and
+provides **none at all for humans**. Somebody was going to write that sentence
+about this project eventually; it is better here, in our own words, than as an
+external finding.
+
+Concretely, and this is the whole list rather than a sample:
+
+- **No screen reader.** Nothing here speaks, and nothing here can be spoken to.
+- **No magnifier.** No zoom, no lens, no focus-follows-magnifier.
+- **No on-screen keyboard.** There is no `input-method`/`text-input` support at
+  all — the same absence that stops you composing text in any non-Latin script —
+  so there is nothing for one to type through even if one existed.
+- **No sticky keys, no slow keys, no bounce keys, and no repeat tuning** — on
+  the daily-driver backend, no key repeat at all (see the entry below, which
+  publishes that as its own limit rather than as an accessibility footnote).
+  The input router forwards what the device reports.
+- **No high-contrast signal and no reduced-motion signal.** A confined app has
+  no way to ask what the human needs and no way to be told.
+- **No AT-SPI2 bus is advertised to a realm** — and read that word exactly, in
+  the register the portals entry above uses, because the stronger word is the
+  one this project must not use about itself. There is no accessibility bridge,
+  bus or client in the core, the shim, the wire protocol or the SDK; the core
+  injects no `DBUS_SESSION_BUS_ADDRESS` and points `XDG_RUNTIME_DIR` at the
+  realm's private directory, so a well-behaved toolkit looking for
+  `org.a11y.Bus` finds nothing, and the shim's own acceptance runs *disable* the
+  bridge a toolkit would otherwise start — `GTK_A11Y=none` and `NO_AT_BRIDGE=1`,
+  for the stated reason *"neither exists here"*.
+
+  **That is advertisement, not reachability, and it is a missing service rather
+  than a confinement.** `crates/vitrin-core/src/spawn.rs` says it about the
+  session bus in exactly those words, and `org.a11y.Bus` is activated *on* that
+  bus: under D9 `/run/user/<uid>/bus` is still on the filesystem, still
+  connectable by any process of this uid, and neither
+  `DBUS_SESSION_BUS_ADDRESS` nor `AT_SPI_BUS_ADDRESS` is in `RESERVED_ENV`, so
+  either can be allow-listed in `realm.toml`. In practice an operator running
+  Firefox allow-lists `DBUS_SESSION_BUS_ADDRESS` — which hands that realm the
+  **host's** accessibility bridge along with everything else on that bus.
+  [#160](https://github.com/vitrin-os/vitrin-os/issues/160) (E2.6/E2.7) is what
+  makes the absence real; the test that would *prove* it — P2.1.10's adversarial
+  probe, which attempts `org.a11y.Bus` activation on every reachable bus from
+  inside a realm — **does not exist yet**, and it is scheduled precisely because
+  the route is open today. Grep the core, the shim, the wire protocol and the
+  SDK for `AT-SPI` and there are no hits, and `cargo xtask limits-check` holds
+  that absence; the only mentions anywhere in this repository are prose about
+  the backdoor this project exists to close, and the gate that holds this
+  sentence.
+
+**The semantic tree does not make Orca work, and reading it as accessibility is
+the misreading this section exists to prevent.** The AccessKit/AT-SPI2 bridge
+([#175](https://github.com/vitrin-os/vitrin-os/issues/175), Phase 2) is
+*derived* from accessibility technology and serves a different consumer over a
+different transport under a different authority: it hands **an agent** a
+versioned tree over the Vitrin wire protocol, only where a **human has approved
+a grant** that names the realm. An assistive technology on this machine is a
+program running as the human, expecting a D-Bus bus name it can talk to without
+asking anybody's permission, for a person who is not going to answer a consent
+card in order to read their own screen. Nothing in the agent path becomes the
+human path by being pointed at a different reader. If Phase 2 ships in full,
+Orca still does not work here.
+
+**This is an exclusion, not a deferral, and the distinction is deliberate.**
+"Deferred" implies a schedule and there is none. [PRD](https://github.com/vitrin-os/vitrin-os/blob/main/docs/PRD.md)
+§5.3 places human accessibility inside the support treadmill that the horizon
+phase carries — *"hardware matrix, HDR, color management, fractional scaling,
+human accessibility, IME for every user"* — and that phase opens only on the
+**M4 gate**, whose thresholds (an independent implementer's statement of intent,
+two regular non-author contributors, grant funding signed, a published
+benchmark) are **unmet**, every one of them. There is no issue tracking this,
+and that is on purpose: an issue would imply somebody intends to close it, and
+nobody has said so.
+
+The reasons, stated so this does not read as indifference: there is no
+assistive-technology stack in this project and building one is not weeks of
+work; there is no session bus inside a realm for an existing stack to attach to
+(see the portals entry above), and the sandbox that would make that absence
+meaningful is itself unbuilt; and there is one maintainer. None of those is an
+argument that the exclusion is acceptable. **A daily driver with no screen
+reader excludes people, and the honest thing to publish is the exclusion, not a
+promise.** If that reads badly, it is supposed to.
 
 ## Project gaps
 

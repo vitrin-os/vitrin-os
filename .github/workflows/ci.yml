@@ -17,6 +17,18 @@ name: CI
 #                 cell of that matrix. It checks the page is generated, and
 #                 nothing about whether the measurements are current -- that
 #                 is the page's own runbook, on the target machine.
+#                 This job also carries `cargo xtask limits-check`, which is
+#                 neither codegen nor a regeneration diff and is here because
+#                 it is the other docs-honesty gate: it holds published-claim
+#                 drift across docs/book/src/limits.md, README.md and
+#                 site/index.html (a claim on one surface and missing from
+#                 another is a red build) PLUS the code evidence behind each
+#                 claim, so a page that overstates a gap fails too. If you
+#                 want the answer to "what keeps the limits page honest?",
+#                 it is that step. WS-E.4.4 / issue #224, and EXPLICITLY
+#                 TEMPORARY pending issue #172's choice of mechanism. It
+#                 holds the claims it has rows for and no others; see
+#                 crates/xtask/src/limits.rs.
 #   deny          the TCB dependency budget (plan risk R7, issue #201):
 #                 `cargo deny check` against the checked-in deny.toml --
 #                 advisories, bans (an itemised multiple-versions decision,
@@ -251,6 +263,42 @@ jobs:
         # emitted -- run in the `rust` job's `cargo test --workspace`,
         # because xtask is a workspace member.
         run: cargo xtask session-matrix --check
+
+      - name: cargo xtask limits-check
+        # WS-E.4.4 / issue #224 acceptance criterion 1: "Changing a WS-E claim
+        # on one surface and not the others FAILS SOMETHING IN CI. This is
+        # text, so CI can genuinely enforce it -- unlike most of the rest of
+        # this workstream."
+        #
+        # Two different failures, and the tool's output says which:
+        #
+        #   SURFACE  -- a claim is missing from one of docs/book/src/limits.md,
+        #               README.md or site/index.html while the others carry it.
+        #               Before this step existed, this file contained ZERO
+        #               references to limits.md and nothing anywhere kept the
+        #               three published surfaces in agreement.
+        #   EVIDENCE -- a claim no longer matches the code. This is the half
+        #               #224 needed and a pure cross-surface check does not
+        #               have: on 2026-08-12 an audit found two of #224's own
+        #               body items were false of `main` (a clipboard it said
+        #               did not exist, a lock screen it said had not shipped),
+        #               and three agreeing surfaces would have agreed on both.
+        #               A page that OVERSTATES a gap is as dishonest as one
+        #               that hides it.
+        #
+        # EXPLICITLY TEMPORARY. Issue #172 owns the choice of drift mechanism
+        # for this repository's honesty surfaces and has not made it; this is
+        # its option (b), built narrow, and crates/xtask/src/limits.rs states
+        # in its own module docs what replaces it under each of #172's three
+        # options. Do not grow it into a docs linter -- #172's scope note is
+        # that the claim set is small, known and slow-moving.
+        #
+        # It reads files and writes nothing. Its own non-vacuity tests -- a
+        # claim missing from a surface must fail, a claim the code contradicts
+        # must fail in BOTH directions, a claim with no code evidence must be
+        # refused outright -- run in the `rust` job's `cargo test --workspace`,
+        # because xtask is a workspace member.
+        run: cargo xtask limits-check
 
   deny:
     name: deny (TCB dependency budget - plan risk R7)

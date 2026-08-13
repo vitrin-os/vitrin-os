@@ -118,12 +118,43 @@ fn errno() -> i32 {
 }
 
 /// `rc < 0` becomes a [`Fail`] carrying `errno`; anything else passes through.
+///
+/// **Every failure is also written to stderr**, which is the realm's own log
+/// file, which the core tails into its own stderr when a realm dies during
+/// bring-up. The frame that goes back to the core carries a stage and an
+/// errno -- the right size for a closed `cause_class` vocabulary, and far too
+/// small to debug a twenty-entry mount table with. This is the other half,
+/// and it is why "a shim that cannot say why it failed to start is
+/// undebuggable" stays false now that diagnostics no longer share the
+/// operator's terminal.
+///
+/// It costs nothing on the success path and this process makes a few hundred
+/// syscalls in its whole life.
 fn check(rc: libc::c_int, stage: Stage) -> Result<libc::c_int, Fail> {
     if rc < 0 {
-        Err(Fail::at(stage))
-    } else {
-        Ok(rc)
+        let fail = Fail::at(stage);
+        eprintln!(
+            "vitrin-realm-init: {:?} step failed: {}",
+            fail.stage,
+            std::io::Error::from_raw_os_error(fail.errno)
+        );
+        return Err(fail);
     }
+    Ok(rc)
+}
+
+/// [`check`], with the step named -- for the calls where "a Mount step failed"
+/// would leave a reader to guess which of twenty it was.
+fn step(label: &str, rc: libc::c_int, stage: Stage) -> Result<libc::c_int, Fail> {
+    if rc < 0 {
+        let fail = Fail::at(stage);
+        eprintln!(
+            "vitrin-realm-init: {label}: {}",
+            std::io::Error::from_raw_os_error(fail.errno)
+        );
+        return Err(fail);
+    }
+    Ok(rc)
 }
 
 /// The config channel: one `SOCK_SEQPACKET` descriptor, so a frame is a
@@ -206,6 +237,26 @@ fn main() {
     if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
         unsafe { libc::_exit(PRE_EXEC_EXIT) }
     }
+    // **And fd 0 is replaced immediately, which is not tidiness.** The core
+    // learns that the shim `execve`'d by seeing EOF on this channel, and EOF
+    // requires *every* copy to be gone. The supervisor closes the duplicate
+    // above right after it sends `CHILD`; if the original were left on fd 0
+    // it would sit there for the supervisor's whole life and the core would
+    // wait out its 250 ms deadline on a realm that had started perfectly.
+    // Measured, after exactly that: the handshake reached `PROCEED` in 2 ms
+    // and then timed out.
+    //
+    // `/dev/null` rather than a bare `close`, so no later `open` in this
+    // process can land on descriptor 0 and be clobbered by K12's `dup3`.
+    // SAFETY: a NUL-terminated literal path; `dup3` onto 0 replaces whatever
+    // was there.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+        if null < 0 || libc::dup3(null, 0, 0) < 0 {
+            libc::_exit(PRE_EXEC_EXIT)
+        }
+        libc::close(null);
+    }
     let chan = Chan(cfg_fd);
 
     match run(&chan) {
@@ -230,30 +281,55 @@ fn run(chan: &Chan) -> Result<std::convert::Infallible, Fail> {
         return Err(Fail::with(Stage::Version, libc::EPROTO));
     }
 
+    // Before the `unshare`, because after it every unmapped owner reads back
+    // as `overflowuid` and the check below could not tell root from a
+    // stranger. See [`verify_stage_dir`].
+    let stage_dev = verify_stage_dir()?;
+
     // C2. One `unshare`, six flags.
     //
     // SAFETY: `unshare` mutates only this process, which is exactly what this
     // binary exists to have happen.
     check(unsafe { libc::unshare(CLONE_FLAGS) }, Stage::Unshare)?;
 
-    // C3. `setgroups(0, NULL)` -- and this is the ONLY window in which it is
-    // legal. `may_setgroups()` requires `CAP_SETGID` in the new user namespace
-    // *and* an empty `gid_map` with setgroups still allowed, so it must happen
-    // after the `unshare` and before the parent writes `deny`.
+    // C3 IS NOT HERE, AND THAT IS A MEASURED REFUTATION RATHER THAN AN
+    // OMISSION.
     //
-    // Skipping it is not a milder version of the same thing. `setgroups=deny`
-    // blocks the *call* and drops nothing, and permission checks compare
-    // kgids -- so without this line the realm keeps the operator's entire
-    // supplementary group list (`video`, `render`, `input`, `docker`) as real
-    // group memberships, and the mount table would be the only barrier left
-    // against them.
+    // The design called for `setgroups(0, NULL)` immediately after the
+    // `unshare` and before the parent writes `deny`, on the reasoning that
+    // this is the one window in which it is legal -- because `setgroups=deny`
+    // blocks the *call* and drops nothing, so without it the realm keeps the
+    // operator's whole supplementary group list (`video`, `render`, `input`,
+    // `docker`) as real kgids that permission checks still compare.
     //
-    // SAFETY: a null list with a zero count is the documented "drop them all"
-    // spelling.
-    check(
-        unsafe { libc::setgroups(0, std::ptr::null()) },
-        Stage::Setgroups,
-    )?;
+    // **The reasoning about the consequence is right. The window does not
+    // exist.** `may_setgroups()` is `ns_capable_setid(ns, CAP_SETGID) &&
+    // userns_may_setgroups(ns)`, and `userns_may_setgroups` is
+    // `ns->gid_map.nr_extents != 0 && (ns->flags & USERNS_SETGROUPS_ALLOWED)`.
+    // Those two conjuncts cannot both hold for an unprivileged realm:
+    //
+    // - **Before the maps are written** there are no gid extents, so the
+    //   first conjunct is false.
+    // - **After they are written** `USERNS_SETGROUPS_ALLOWED` is gone, so the
+    //   second is -- and it has to be gone, because `new_idmap_permitted`
+    //   admits an unprivileged single-id `gid_map` only when
+    //   `!(ns->flags & USERNS_SETGROUPS_ALLOWED)`. Writing `deny` is the
+    //   *precondition* for having a gid map at all.
+    //
+    // Measured on this kernel (7.1.8) rather than read: `setgroups(0, NULL)`
+    // returns `EPERM` in both windows, and `getgroups()` inside the finished
+    // realm reports the operator's six entries -- the five unmapped ones
+    // rendered as `overflowgid` (65534) and the mapped one as itself.
+    //
+    // **The residual is therefore published, not closed** (`limits.md`, and
+    // the `supplementary_groups_retained` field on every `realm_spawned`
+    // entry): a realm keeps the operator's supplementary group memberships as
+    // kernel group ids, and the mount table really is the only barrier
+    // against them. It is the same state every unprivileged container runtime
+    // is in, for the same kernel reason, and closing it needs D-020(3)'s
+    // provisioned per-uid tier -- a `newgidmap`-class helper can write a
+    // multi-id map without `deny`, which is the only shape in which
+    // `setgroups(0, NULL)` becomes reachable.
 
     // C4. D-020(1)'s sync pipe: the child announces and blocks, the parent
     // writes the maps. The parent writes them rather than this process, even
@@ -309,7 +385,7 @@ fn run(chan: &Chan) -> Result<std::convert::Infallible, Fail> {
         -1 => Err(Fail::at(Stage::Fork)),
         0 => {
             unsafe { libc::close(pipe_write) };
-            pid_one(chan, &config, pipe_read)
+            pid_one(chan, &config, pipe_read, stage_dev)
         }
         child => {
             unsafe { libc::close(pipe_read) };
@@ -366,11 +442,13 @@ fn verify_maps(config: &Config) -> Result<(), Fail> {
         }
     }
 
-    // SAFETY: a null list with a zero size is the documented "how many?"
-    // query form.
-    if unsafe { libc::getgroups(0, std::ptr::null_mut()) } != 0 {
-        return Err(bad(libc::EPERM));
-    }
+    // There is deliberately **no `getgroups() == 0` assertion here.** The
+    // design had one, paired with the `setgroups(0, NULL)` that C3 shows is
+    // impossible; asserting an empty group list would fail on every machine
+    // whose operator belongs to any group at all. What the realm retained is
+    // measured by the *parent* instead, from `/proc/<pid>/status`, and
+    // journaled as the residual it is.
+
     // SAFETY: pure queries with no out-parameters.
     let (uid, euid, gid, egid) = unsafe {
         (
@@ -490,6 +568,7 @@ fn pid_one(
     chan: &Chan,
     config: &Config,
     pipe_read: RawFd,
+    stage_dev: u64,
 ) -> Result<std::convert::Infallible, Fail> {
     // K1. Two mechanisms, because one of them has a window.
     //
@@ -525,7 +604,7 @@ fn pid_one(
     // that is a defined answer every program already handles.
     check(unsafe { libc::setsid() }, Stage::Internal)?;
 
-    build_mount_table(config)?;
+    build_mount_table(config, stage_dev)?;
 
     // K9. Child-asserted, and journaled as such: a substituted helper could
     // send any numbers it liked, which is precisely why the core's root-view
@@ -605,6 +684,25 @@ fn mount_raw(
             data.map_or(std::ptr::null(), |d| d.as_ptr().cast()),
         )
     };
+    if rc < 0 {
+        // **Which entry**, on stderr, before the frame goes back. The frame
+        // carries a stage and an errno, which is the right size for a closed
+        // vocabulary and far too small to debug a twenty-entry table with; the
+        // core's per-realm log is where the detail belongs, and the core tails
+        // that log into its own stderr when a realm dies during bring-up. This
+        // line is why "a shim that cannot say why it failed to start is
+        // undebuggable" stays false after diagnostics moved off the terminal.
+        eprintln!(
+            "vitrin-realm-init: mount(source={:?}, target={:?}, fstype={:?}, flags={:#x}, \
+             data={:?}) failed: {}",
+            source.map(CStr::to_string_lossy),
+            target.to_string_lossy(),
+            fstype.map(CStr::to_string_lossy),
+            flags,
+            data.map(CStr::to_string_lossy),
+            std::io::Error::last_os_error()
+        );
+    }
     check(rc, stage).map(|_| ())
 }
 
@@ -621,7 +719,7 @@ fn mkdir_rel(rel: &str) -> Result<(), Fail> {
         let c = cstr(so_far.as_os_str())?;
         // SAFETY: `c` is a live NUL-terminated relative path.
         if unsafe { libc::mkdir(c.as_ptr(), 0o755) } < 0 && errno() != libc::EEXIST {
-            return Err(Fail::at(Stage::Mount));
+            return step(&format!("mkdir {}", so_far.display()), -1, Stage::Mount).map(|_| ());
         }
     }
     Ok(())
@@ -647,7 +745,7 @@ fn touch_rel(rel: &str) -> Result<(), Fail> {
         return if errno() == libc::EEXIST {
             Ok(())
         } else {
-            Err(Fail::at(Stage::Mount))
+            step(&format!("create bind target {rel}"), -1, Stage::Mount).map(|_| ())
         };
     }
     unsafe { libc::close(fd) };
@@ -666,13 +764,24 @@ fn touch_rel(rel: &str) -> Result<(), Fail> {
 /// flags, because `copy_mnt_ns` sets `MNT_LOCK_*` on every mount whose owning
 /// user namespace differs from the new mount namespace's. Worth stating
 /// because a reader will ask.
-fn bind(source: &Path, target_rel: &str, flags: libc::c_ulong, is_file: bool) -> Result<(), Fail> {
-    if is_file {
+fn bind(source: &Source, target_rel: &str, flags: libc::c_ulong) -> Result<(), Fail> {
+    if source.is_file {
         touch_rel(target_rel)?;
     } else {
         mkdir_rel(target_rel)?;
     }
-    let src = cstr(source.as_os_str())?;
+    // The source is named by **descriptor**, through `/proc/self/fd/N`, and
+    // never by the path it was opened from. Two reasons, one of which is a
+    // correctness bug and not a hardening nicety:
+    //
+    // 1. The new root is staged on `/tmp`, so any bind source *underneath*
+    //    `/tmp` is shadowed by the time the table is built and would bind the
+    //    wrong thing or nothing at all. A descriptor opened before the
+    //    staging still names the file it named.
+    // 2. It closes the window between "the core canonicalized and audited
+    //    this path" and "this process mounted it". The audit proved something
+    //    about an inode; a second path resolution could reach a different one.
+    let src = cstr_str(&format!("/proc/self/fd/{}", source.fd))?;
     let dst = cstr_str(target_rel)?;
     mount_raw(Some(&src), &dst, None, MS_BIND, None, Stage::Mount)?;
     mount_raw(
@@ -683,6 +792,38 @@ fn bind(source: &Path, target_rel: &str, flags: libc::c_ulong, is_file: bool) ->
         None,
         Stage::Mount,
     )
+}
+
+/// A bind source, held open from **before** the new root is staged.
+///
+/// See [`bind`] for why this is a descriptor and not a path.
+struct Source {
+    fd: libc::c_int,
+    is_file: bool,
+}
+
+impl Source {
+    /// `O_PATH`, so no read permission on the source is required and a device
+    /// node is not actually opened -- only named.
+    fn open(path: &Path, is_file: bool) -> Result<Source, Fail> {
+        let c = cstr(path.as_os_str())?;
+        // SAFETY: `c` is a live NUL-terminated path.
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC | if is_file { 0 } else { libc::O_DIRECTORY },
+            )
+        };
+        step(&format!("open bind source {}", path.display()), fd, Stage::Mount)?;
+        Ok(Source { fd, is_file })
+    }
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        // SAFETY: this type is the only owner of `fd`.
+        unsafe { libc::close(self.fd) };
+    }
 }
 
 fn mount_fs(fstype: &str, target_rel: &str, flags: libc::c_ulong, data: &str) -> Result<(), Fail> {
@@ -709,13 +850,120 @@ fn symlink_rel(target: &str, link_rel: &str) -> Result<(), Fail> {
     let l = cstr_str(link_rel)?;
     // SAFETY: both are live NUL-terminated strings.
     if unsafe { libc::symlink(t.as_ptr(), l.as_ptr()) } < 0 && errno() != libc::EEXIST {
-        return Err(Fail::at(Stage::Mount));
+        return step(&format!("symlink {link_rel} -> {target}"), -1, Stage::Mount).map(|_| ());
     }
     Ok(())
 }
 
+/// Everything the table binds, opened while the host tree is still visible.
+///
+/// Collected as one struct rather than opened at each mount site because the
+/// *ordering* is the point: every one of these has to be a descriptor before
+/// [`stage_new_root`] runs, and a single construction site is what makes that
+/// checkable by reading twenty lines instead of two hundred.
+struct Sources {
+    usr: Source,
+    etc: Source,
+    /// The host's `/bin`-class compatibility shape, already resolved: a
+    /// symlink contributes its target, a real directory contributes a
+    /// descriptor. Mirrored rather than assumed, because a merged-`/usr`
+    /// distribution and a split-`/usr` one disagree and guessing either way
+    /// breaks every `#!/bin/sh` on the other kind of machine.
+    compat: Vec<(String, CompatEntry)>,
+    dev_nodes: Vec<(String, Source)>,
+    render_nodes: Vec<(String, Source)>,
+    runtime_dir: Source,
+    storage_dir: Source,
+    shim: Source,
+    app_dir: Option<(String, Source)>,
+    binds: Vec<(String, Source)>,
+}
+
+enum CompatEntry {
+    Symlink(String),
+    Directory(Source),
+}
+
+const COMPAT_NAMES: [&str; 6] = ["bin", "sbin", "lib", "lib64", "lib32", "libx32"];
+const DEV_NODES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tty"];
+
+fn open_sources(config: &Config) -> Result<Sources, Fail> {
+    let mut compat = Vec::new();
+    for name in COMPAT_NAMES {
+        let host = PathBuf::from("/").join(name);
+        let Ok(meta) = std::fs::symlink_metadata(&host) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            let Ok(target) = std::fs::read_link(&host) else {
+                continue;
+            };
+            compat.push((
+                name.to_string(),
+                CompatEntry::Symlink(target.to_string_lossy().into_owned()),
+            ));
+        } else if meta.is_dir() {
+            compat.push((
+                name.to_string(),
+                CompatEntry::Directory(Source::open(&host, false)?),
+            ));
+        }
+    }
+
+    let mut dev_nodes = Vec::new();
+    for node in DEV_NODES {
+        dev_nodes.push((
+            format!("dev/{node}"),
+            Source::open(&PathBuf::from("/dev").join(node), true)?,
+        ));
+    }
+    let mut render_nodes = Vec::new();
+    for node in &config.render_nodes {
+        let Some(name) = node.file_name() else {
+            return Err(Fail::with(Stage::Mount, libc::EINVAL));
+        };
+        render_nodes.push((
+            format!("dev/dri/{}", name.to_string_lossy()),
+            Source::open(node, true)?,
+        ));
+    }
+
+    let app_dir = match &config.app_dir {
+        Some(dir) => Some((
+            strip_leading_slash(&dir.to_string_lossy()).to_string(),
+            Source::open(dir, false)?,
+        )),
+        None => None,
+    };
+    let mut binds = Vec::new();
+    for extra in &config.binds {
+        let target = strip_leading_slash(&extra.to_string_lossy()).to_string();
+        // A file bind for a file, a directory bind for a directory: the core
+        // already established which it is when it audited the source.
+        let is_file = !extra.is_dir();
+        binds.push((target, Source::open(extra, is_file)?));
+    }
+
+    Ok(Sources {
+        usr: Source::open(Path::new("/usr"), false)?,
+        etc: Source::open(Path::new("/etc"), false)?,
+        compat,
+        dev_nodes,
+        render_nodes,
+        runtime_dir: Source::open(&config.runtime_dir, false)?,
+        storage_dir: Source::open(&config.storage_dir, false)?,
+        shim: Source::open(&config.shim_source, true)?,
+        app_dir,
+        binds,
+    })
+}
+
 /// K2-K8: everything between "we are PID 1" and "the old root is gone".
-fn build_mount_table(config: &Config) -> Result<(), Fail> {
+fn build_mount_table(config: &Config, stage_dev: u64) -> Result<(), Fail> {
+    // Before anything is mounted, while the host tree is still the tree this
+    // process sees. See [`bind`] for why every source is a descriptor.
+    let sources = open_sources(config)?;
+
     // K2. FIRST, always. `systemd` leaves `/` shared, `pivot_root` refuses a
     // shared new root, and without this every mount below would propagate
     // back onto the host's own tree.
@@ -723,20 +971,25 @@ fn build_mount_table(config: &Config) -> Result<(), Fail> {
     mount_raw(None, &slash, None, MS_REC | MS_PRIVATE, None, Stage::Mount)?;
 
     // K3. Stage the new root, and move into it.
-    stage_new_root(config)?;
+    stage_new_root(config, stage_dev)?;
 
     // K4. The table. The order is not arbitrary: `/usr` first, because the
     // compatibility symlinks a merged-`/usr` host needs point into it, and
     // `/proc` only after the fork -- already true, since this is PID 1 --
     // because a fresh procfs requires the mounter to be in a new pid
     // namespace.
-    bind(Path::new("/usr"), "usr", RO_BIND, false)?;
-    mirror_top_level_compat_shape()?;
+    bind(&sources.usr, "usr", RO_BIND)?;
+    for (name, entry) in &sources.compat {
+        match entry {
+            CompatEntry::Symlink(target) => symlink_rel(target, name)?,
+            CompatEntry::Directory(source) => bind(source, name, RO_BIND)?,
+        }
+    }
     // A read-only `/etc` is not an `/etc` without secrets: `/etc/shadow`,
     // `/etc/ssh/*_key` and NetworkManager's `system-connections` are
     // protected by mode bits, not by this bind. Stated because "read-only"
     // reads as harmless.
-    bind(Path::new("/etc"), "etc", RO_BIND, false)?;
+    bind(&sources.etc, "etc", RO_BIND)?;
 
     mount_fs("proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, "")?;
     // A **fresh** sysfs, never a bind. A bind of the host's would show
@@ -759,25 +1012,17 @@ fn build_mount_table(config: &Config) -> Result<(), Fail> {
         MS_NOSUID | MS_NOEXEC,
         &format!("mode=0755,size={}", config.caps.dev),
     )?;
-    for node in ["null", "zero", "full", "random", "urandom", "tty"] {
-        bind(
-            &PathBuf::from("/dev").join(node),
-            &format!("dev/{node}"),
-            DEV_BIND,
-            true,
-        )?;
+    for (target, source) in &sources.dev_nodes {
+        bind(source, target, DEV_BIND)?;
     }
-    for node in &config.render_nodes {
-        let Some(name) = node.file_name() else {
-            return Err(Fail::with(Stage::Mount, libc::EINVAL));
-        };
-        // Read-write, and never `card*` or `controlD*`: `MS_RDONLY` on a
-        // render node makes it unopenable for write, which disables the node
-        // rather than restricting it. The GPU ioctl surface and cross-realm
-        // GPU-memory side channels are real and unaddressed here -- published
-        // as a cost of binding the node at all, which is the price of not
-        // silently disabling every accelerated app in every realm.
-        bind(node, &format!("dev/dri/{}", name.to_string_lossy()), DEV_BIND, true)?;
+    // Read-write, and never `card*` or `controlD*`: `MS_RDONLY` on a render
+    // node makes it unopenable for write, which disables the node rather than
+    // restricting it. The GPU ioctl surface and cross-realm GPU-memory side
+    // channels it carries are real and unaddressed here -- a published cost
+    // of binding the node at all, which is the price of not silently
+    // disabling every accelerated app in every realm.
+    for (target, source) in &sources.render_nodes {
+        bind(source, target, DEV_BIND)?;
     }
     mount_fs(
         "tmpfs",
@@ -814,34 +1059,21 @@ fn build_mount_table(config: &Config) -> Result<(), Fail> {
     // is delivered by the mount namespace either way: `..` from a bind target
     // resolves to the target's parent in *this* tree.
     bind(
-        &config.runtime_dir,
+        &sources.runtime_dir,
         strip_leading_slash(IN_REALM_RUNTIME_DIR),
         RW_BIND,
-        false,
     )?;
-    bind(
-        &config.storage_dir,
-        strip_leading_slash(IN_REALM_HOME),
-        RW_BIND,
-        false,
-    )?;
+    bind(&sources.storage_dir, strip_leading_slash(IN_REALM_HOME), RW_BIND)?;
     // The shim has to be bound at all because in a development tree it lives
     // in `target/debug` under `$HOME` -- the exact tree this task exists to
     // hide from the realm. No `noexec` here, for obvious reasons.
-    bind(
-        &config.shim_source,
-        strip_leading_slash(IN_REALM_SHIM),
-        RO_BIND,
-        true,
-    )?;
+    bind(&sources.shim, strip_leading_slash(IN_REALM_SHIM), RO_BIND)?;
 
-    if let Some(dir) = &config.app_dir {
-        let target = dir.to_string_lossy().into_owned();
-        bind(dir, strip_leading_slash(&target), RO_BIND, false)?;
+    if let Some((target, source)) = &sources.app_dir {
+        bind(source, target, RO_BIND)?;
     }
-    for extra in &config.binds {
-        let target = extra.to_string_lossy().into_owned();
-        bind(extra, strip_leading_slash(&target), RO_BIND, false)?;
+    for (target, source) in &sources.binds {
+        bind(source, target, RO_BIND)?;
     }
 
     // K5. The new root becomes read-only. Without it the app owns the root
@@ -862,7 +1094,8 @@ fn build_mount_table(config: &Config) -> Result<(), Fail> {
     // K6. `uname -n` inside the realm names the realm, not the operator's
     // machine.
     let host = config.realm_id.as_bytes();
-    check(
+    step(
+        "sethostname",
         // SAFETY: a live byte slice and its length.
         unsafe { libc::sethostname(host.as_ptr().cast(), host.len()) },
         Stage::Mount,
@@ -877,21 +1110,42 @@ fn build_mount_table(config: &Config) -> Result<(), Fail> {
     pivot(&here)
 }
 
-/// K3. Mount the new root tmpfs on [`STAGE_DIR`] and move into it.
-fn stage_new_root(config: &Config) -> Result<(), Fail> {
-    // Verified before it is used: a `/tmp` that is a symlink, or that some
-    // other account owns, is a `/tmp` this process must not stage a root on.
-    // `lstat`, so a symlink is seen as a symlink rather than followed.
+/// Verify [`STAGE_DIR`] and return its device number.
+///
+/// **Called before the `unshare`, and that ordering is forced by a trap worth
+/// naming.** Inside a new user namespace with a single-id map, `stat` renders
+/// every unmapped owner as `overflowuid` (65534) -- so `/tmp`, which is owned
+/// by root, comes back owned by "nobody" and an "owned by root or by us"
+/// check refuses on a perfectly ordinary machine. Measured, after this exact
+/// mistake: the first version of this function ran after C2 and failed
+/// `EPERM` on every spawn.
+///
+/// The general rule, since the next person will hit it too: **an ownership
+/// check inside a realm's user namespace can only speak about the one id that
+/// is mapped.** Everything else is 65534, including root, including two
+/// different accounts that are then indistinguishable from each other.
+fn verify_stage_dir() -> Result<u64, Fail> {
+    // `lstat`, so a symlink at `/tmp` is seen as a symlink rather than
+    // followed to wherever somebody pointed it.
     let before = lstat_path(STAGE_DIR)?;
     if before.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        eprintln!("vitrin-realm-init: {STAGE_DIR} is not a directory");
         return Err(Fail::with(Stage::Mount, libc::ENOTDIR));
     }
-    // SAFETY: a pure query.
+    // SAFETY: pure queries.
     let euid = unsafe { libc::geteuid() };
     if before.st_uid != 0 && before.st_uid != euid {
+        eprintln!(
+            "vitrin-realm-init: {STAGE_DIR} is owned by uid {}, neither root nor {euid}",
+            before.st_uid
+        );
         return Err(Fail::with(Stage::Mount, libc::EPERM));
     }
+    Ok(before.st_dev as u64)
+}
 
+/// K3. Mount the new root tmpfs on [`STAGE_DIR`] and move into it.
+fn stage_new_root(config: &Config, stage_dev: u64) -> Result<(), Fail> {
     let stage = cstr_str(STAGE_DIR)?;
     let ty = cstr_str("tmpfs")?;
     let opts = cstr_str(&format!("mode=0755,size={}", config.caps.root))?;
@@ -914,7 +1168,11 @@ fn stage_new_root(config: &Config) -> Result<(), Fail> {
     // landed on the new mount rather than on the old directory.
     check(unsafe { libc::chdir(stage.as_ptr()) }, Stage::Mount)?;
     let after = lstat_path(".")?;
-    if after.st_dev == before.st_dev {
+    if after.st_dev as u64 == stage_dev {
+        eprintln!(
+            "vitrin-realm-init: chdir({STAGE_DIR}) landed on the shadowed host directory, not \
+             on the tmpfs just mounted"
+        );
         return Err(Fail::with(Stage::Mount, libc::EBUSY));
     }
     Ok(())
@@ -928,29 +1186,6 @@ fn lstat_path(path: &str) -> Result<libc::stat, Fail> {
         check(libc::lstat(c.as_ptr(), &mut st), Stage::Mount)?;
         Ok(st)
     }
-}
-
-/// Recreate the host's own `/bin`, `/sbin`, `/lib`, `/lib64` shape.
-///
-/// Mirrored rather than assumed: a merged-`/usr` distribution has these as
-/// symlinks into `/usr`, a split-`/usr` one has them as directories, and
-/// guessing either way breaks every `#!/bin/sh` on the other kind of machine.
-fn mirror_top_level_compat_shape() -> Result<(), Fail> {
-    for name in ["bin", "sbin", "lib", "lib64", "lib32", "libx32"] {
-        let host = PathBuf::from("/").join(name);
-        let Ok(meta) = std::fs::symlink_metadata(&host) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            let Ok(target) = std::fs::read_link(&host) else {
-                continue;
-            };
-            symlink_rel(&target.to_string_lossy(), name)?;
-        } else if meta.is_dir() {
-            bind(&host, name, RO_BIND, false)?;
-        }
-    }
-    Ok(())
 }
 
 /// K7. `SIOCSIFFLAGS` on `lo`, in the realm's own network namespace.
@@ -972,7 +1207,7 @@ fn bring_loopback_up() -> Result<(), Fail> {
 
     // SAFETY: the socket is only a handle for the ioctl; nothing is sent on it.
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    check(sock, Stage::Mount)?;
+    step("socket(AF_INET) for the loopback ioctl", sock, Stage::Mount)?;
     let mut req = IfReq {
         name: [0; 16],
         flags: 0,
@@ -985,14 +1220,15 @@ fn bring_loopback_up() -> Result<(), Fail> {
     // in the fields they touch, and `sock` is an open `AF_INET` socket.
     let outcome = unsafe {
         if libc::ioctl(sock, SIOCGIFFLAGS as _, &mut req) < 0 {
-            Err(Fail::at(Stage::Mount))
+            step("SIOCGIFFLAGS on lo", -1, Stage::Mount).map(|_| ())
         } else {
             req.flags |= IFF_UP;
-            if libc::ioctl(sock, SIOCSIFFLAGS as _, &req) < 0 {
-                Err(Fail::at(Stage::Mount))
-            } else {
-                Ok(())
-            }
+            step(
+                "SIOCSIFFLAGS on lo",
+                libc::ioctl(sock, SIOCSIFFLAGS as _, &req),
+                Stage::Mount,
+            )
+            .map(|_| ())
         }
     };
     unsafe { libc::close(sock) };

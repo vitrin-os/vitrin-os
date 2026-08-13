@@ -172,6 +172,16 @@ pub(crate) struct RuntimeSeed {
     /// `--shim` (or its default) and carried here so [`start_realm`] can build
     /// the spawn's [`SpawnPaths`] from it.
     pub shim: PathBuf,
+    /// The realm confinement inputs (P2.6.2, #186): `Some` at
+    /// `--isolation=default`, `None` at `--isolation=off`.
+    ///
+    /// Carried beside [`Self::shim`] and for the same reason -- both are
+    /// **core** inputs the realm never names -- and threaded to every place
+    /// that builds a [`SpawnPaths`], so a launch admitted over the wire is
+    /// confined on exactly the terms startup's realms are. A second source of
+    /// truth here would be a way for one of the two spawn entry points to be
+    /// quietly unconfined.
+    pub confinement: Option<spawn::Confinement>,
     /// This session's trusted consent indicator (issue #85), minted at startup
     /// before the listener accepts anyone. Carried here — the one thing
     /// `run_session` hands the backend — so a single ceremony establishes it
@@ -266,6 +276,10 @@ pub(crate) struct Runtime<H: PreemptionHook> {
     /// the seed. [`start_realm`] reads it to build the spawn's [`SpawnPaths`];
     /// tests that call [`start_realm_in`] with explicit paths never consult it.
     shim: PathBuf,
+    /// The confinement inputs from the seed, `None` at `--isolation=off`.
+    /// Read at both spawn entry points -- startup and an admitted
+    /// `realm_launch` -- so neither can be confined on different terms.
+    confinement: Option<spawn::Confinement>,
     /// Set by a latched commit, cleared by [`post_dispatch`]. The whole of
     /// the anti-amplification defence the module docs describe.
     pub dirty: bool,
@@ -968,6 +982,7 @@ impl<H: PreemptionHook> Runtime<H> {
             realms,
             recorder,
             shim,
+            confinement,
             // Presentation state, not kernel state: the backend read it out of
             // the seed (by `Copy`) into its `ConsentSurface` before handing the
             // rest here, so the runtime deliberately drops it.
@@ -994,6 +1009,7 @@ impl<H: PreemptionHook> Runtime<H> {
             realms: BTreeMap::new(),
             router,
             shim,
+            confinement,
             dirty: false,
             view_cache: BTreeMap::new(),
             capture_dump,
@@ -1231,6 +1247,23 @@ where
     Ok(())
 }
 
+/// Build the session's [`SpawnPaths`] from the two core inputs the runtime carries.
+///
+/// **One function, both spawn entry points.** Startup's `start_realm` and the
+/// chokepoint's admitted `realm_launch` each need a `SpawnPaths`, and a
+/// second construction site is exactly how one of them ends up unconfined
+/// while the other is not.
+fn spawn_paths(
+    shim: PathBuf,
+    confinement: Option<spawn::Confinement>,
+) -> Result<SpawnPaths, vitrin_ipc::PathError> {
+    let paths = SpawnPaths::from_env(shim)?;
+    Ok(match confinement {
+        Some(confinement) => paths.confined(confinement),
+        None => paths,
+    })
+}
+
 /// **Spawn every configured realm and put each on the loop.** The other half
 /// of the runtime wiring: before this, a running `vitrind` forked nothing and
 /// the whole shim half of the core was reachable only from tests.
@@ -1273,7 +1306,8 @@ pub(crate) fn start_realm<H: RuntimeHost>(host: &mut H) -> Result<(), Box<dyn Er
     // app it will exec is each realm's `command`. Clone it out before the
     // `start_realm_in` borrow, which takes `host` again.
     let shim = host.runtime().shim.clone();
-    start_realm_in(host, &SpawnPaths::from_env(shim)?)
+    let confinement = host.runtime().confinement.clone();
+    start_realm_in(host, &spawn_paths(shim, confinement)?)
 }
 
 /// [`start_realm`] against an explicit runtime tree.
@@ -2687,6 +2721,7 @@ fn dispatch_principal<H: RuntimeHost>(
                     view_cache,
                     realms,
                     shim,
+                    confinement,
                     ..
                 } = runtime;
                 // **The single fact behind every `no_surface` refusal.**
@@ -2792,10 +2827,14 @@ fn dispatch_principal<H: RuntimeHost>(
                     // rate-limited and rare while messages are not. A failure
                     // is the IDL's `internal` -- a session whose runtime tree
                     // cannot be named can create nothing.
-                    let paths = SpawnPaths::from_env(shim_bin.to_path_buf()).map_err(|err| {
-                        tracing::error!(%err, "launch could not name this session's runtime tree");
-                        LaunchRefusal::Internal
-                    })?;
+                    let paths = spawn_paths(shim_bin.to_path_buf(), confinement.clone())
+                        .map_err(|err| {
+                            tracing::error!(
+                                %err,
+                                "launch could not name this session's runtime tree"
+                            );
+                            LaunchRefusal::Internal
+                        })?;
                     launch_realm(registry, &paths, &mut launches, ask)
                 };
                 // Borrowed for this one message's dispatch and dropped with
@@ -5606,6 +5645,9 @@ mod tests {
             let socket = listener.socket_path().to_path_buf();
             let (recorder, log) = crate::recorder::tests::scratch_recorder(label);
             let seed = RuntimeSeed {
+                // The in-process runtime fixture drives `start_realm_in`
+                // with explicit paths, so it never reaches the confined arm.
+                confinement: None,
                 listener,
                 verifier: demo_verifier(),
                 petitions: PetitionRegistry::new(policy.policy, policy.config),

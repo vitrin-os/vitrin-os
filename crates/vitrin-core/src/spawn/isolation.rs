@@ -58,19 +58,38 @@
 //!    them into a boolean would produce a matrix that says "no" in two cells
 //!    that mean entirely different things.
 //!
-//! # What this module deliberately does not do yet
+//! # The floor and the tier are two vocabularies, and they may never merge
 //!
-//! It does not refuse to start anything. [`Tier::meets`] exists and is tested,
-//! but no startup path calls it, because **there is nothing to refuse *for*
-//! until P2.6.2 actually applies the namespaces.** Wiring a floor now would
-//! make `vitrind` refuse to run on machines where today's build works
-//! perfectly and confines nothing — a new failure mode bought with no new
-//! safety. The refusal lands with the confinement, in P2.6.2 (#186), against
-//! the `--isolation` flag that task introduces. This split is stated here
-//! rather than left implicit because the acceptance criteria on #185 name the
-//! floor, and a reader who finds `meets` uncalled is owed the reason.
+//! P2.6.2 (#186, D-036(6)) wired the refusal this module was written for, and
+//! it did **not** wire it to [`Tier`]. The distinction is the load-bearing one
+//! in this file:
 //!
-//! It also does not generate the per-kernel matrix. [`Report::render`] emits
+//! - **[`Tier`] measures the machine.** It is the strongest rung this kernel
+//!   and this provisioning would permit, and it may never read a build
+//!   constant.
+//! - **[`FLOOR`] is a property of the *build*.** It is the set of mechanisms
+//!   *this binary actually applies*, so it grows one entry per task: `#186
+//!   {Namespaces}`, `#187 +{Landlock}`, `#188 +{Seccomp, NoNewPrivs}`. After
+//!   #188 it coincides exactly with [`Report::tier`]'s base predicate, and
+//!   [`the_floor_is_a_subset_of_the_intra_user_predicate`] asserts
+//!   subset-until-then so the day they coincide is a checked fact rather than
+//!   a coincidence somebody notices later.
+//!
+//! Gating `--isolation=default` on `Tier::meets(Tier::IntraUser)` was
+//! available and is refused: it would make `vitrind` refuse to start on a
+//! pre-5.13 kernel while applying no Landlock at all — a new failure mode on
+//! machines where today's build runs fine, which is verbatim what this module
+//! declined to buy at #185.
+//!
+//! [`Tier::meets`] does get its first non-test caller, as the **forecast**
+//! rather than the gate ([`forecast`]): on a machine that meets this build's
+//! floor but not `Tier::IntraUser`, the core warns and starts, naming the
+//! build that will refuse there. That is the only real answer to "how does
+//! the floor move without a silent behaviour change" — every floor move is
+//! pre-announced on the machines it will break, by the build that still works
+//! on them.
+//!
+//! It does not generate the per-kernel matrix. [`Report::render`] emits
 //! the deterministic one-machine rows the matrix is *built from*; collecting
 //! rows across a ≥ 6.12, a 6.1-class LTS and a 5.15-class LTS is a separate,
 //! multi-machine job, and no amount of code here substitutes for running on
@@ -181,21 +200,358 @@ pub enum Tier {
 }
 
 impl Tier {
-    /// Whether this measured ceiling satisfies a required floor.
+    /// Whether this measured ceiling satisfies a required tier.
     ///
-    /// Uncalled by any startup path today, deliberately: the refusal lands
-    /// with the confinement it would protect, in P2.6.2 (#186), against the
-    /// `--isolation` flag that task introduces. Refusing to start now would
-    /// add a failure mode to machines where the current build runs fine and
-    /// confines nothing. The comparison is written and tested here because it
-    /// is the tier vocabulary's one load-bearing operation, and P2.6.2 should
-    /// inherit it rather than re-derive an ordering.
+    /// **This is the forecast, not the gate.** P2.6.2 gave it its first
+    /// non-test caller ([`forecast`]) and deliberately did not make it the
+    /// `--isolation=default` admission test: a tier is a claim about the
+    /// machine, and refusing to start because a machine cannot reach a tier
+    /// this build does not yet apply would add a failure mode with no
+    /// matching safety. What admits a session is [`admit`] against [`FLOOR`],
+    /// which is a property of the build.
     ///
-    /// The attribute is verified rather than assumed: deleting it warns.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The ordering it rests on is [`Tier`]'s own `Ord`, which is why
+    /// [`Isolation`] deliberately has none: a *selector* that could be
+    /// compared to a *measurement* is a selector that can be silently clamped
+    /// down to it.
     pub fn meets(self, floor: Tier) -> bool {
         self >= floor
     }
+}
+
+/// One confinement mechanism this build knows how to *apply*.
+///
+/// Distinct from a [`Report`] row on purpose: a row is a question the kernel
+/// answered, a `Mechanism` is something `vitrind` does. Every member of
+/// [`FLOOR`] must have an applier, and every applier must be in `FLOOR` --
+/// [`every_floor_mechanism_refuses_when_its_probe_fails`] asserts both
+/// directions, because a one-directional check would pass for a `FLOOR` that
+/// refused on everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mechanism {
+    /// The six-flag `unshare` `vitrin-realm-init` issues (P2.6.2, #186).
+    Namespaces,
+    /// The shim-side Landlock stack (P2.6.3, #187) -- **not applied yet**.
+    Landlock,
+    /// The seccomp filter (P2.6.4, #188) -- **not applied yet**.
+    Seccomp,
+    /// `PR_SET_NO_NEW_PRIVS`, which arrives with the filter it protects
+    /// (P2.6.4, #188).
+    NoNewPrivs,
+}
+
+impl fmt::Display for Mechanism {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Mechanism::Namespaces => write!(f, "namespaces"),
+            Mechanism::Landlock => write!(f, "landlock"),
+            Mechanism::Seccomp => write!(f, "seccomp"),
+            Mechanism::NoNewPrivs => write!(f, "no-new-privs"),
+        }
+    }
+}
+
+/// What **this build** applies at `--isolation=default`, and therefore what
+/// it refuses to start without.
+///
+/// One entry today. It grows with the tasks that add the appliers, never
+/// ahead of them: a floor naming a mechanism nothing applies would refuse
+/// sessions in exchange for nothing, which is exactly the trade this module
+/// declined at #185.
+pub const FLOOR: &[Mechanism] = &[Mechanism::Namespaces];
+
+/// The operator's **selection**: which confinement this session applies.
+///
+/// # Why this is a separate type from [`Tier`], with no bridge to it
+///
+/// `Tier` is a measurement of the machine; this is a choice about the
+/// session. They are related by exactly one function, [`admit`], which
+/// returns the request unchanged or a refusal -- never a value in between.
+///
+/// So this type has, deliberately, **no `From` to or from [`Tier`], no `Ord`
+/// or `PartialOrd`, and no `Default`**. Each absence closes one spelling of
+/// the same accident: with an ordering, `min(selected, measured)` typechecks
+/// and an operator who asked for confinement silently gets less; with a
+/// `From`, a measurement can be laundered into a selection; with a `Default`,
+/// an unconfined session becomes reachable without anybody typing the word.
+/// The rendering sets are disjoint at the bottom for the same reason --
+/// `Tier::None` is also what `tier()` returns for `Support::Unmeasured`, so a
+/// selector spelled `none` would conflate "the operator chose no confinement"
+/// with "nothing was measured".
+///
+/// The rule is *not* "no shared token". When D-020(3)'s per-uid upgrade
+/// becomes selectable, `--isolation=per-uid` may share `per-uid` with the
+/// tier, because there the relation is required equality rather than a clamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Isolation {
+    /// Namespaces (and, in later builds, more): the confinement `FLOOR`
+    /// names. Its meaning grows across upgrades on purpose -- a pinned
+    /// spelling like `namespaces+landlock` would make an upgrade
+    /// behaviourally inert and push mechanism bookkeeping onto every
+    /// operator. Between "refuses loudly after an upgrade" and "silently
+    /// confines less after an upgrade", D-020(6) picks the former.
+    Default,
+    /// No confinement at all: byte for byte the spawn path that shipped
+    /// before #186. It exists because D-020(6) needs it as the positive
+    /// control for the acceptance gate -- an absence is only evidence if the
+    /// same run proves the thing was present somewhere.
+    ///
+    /// It is **not** a rung of D-010's default/hardened/paranoid dial. It is
+    /// the dial being switched out, which has to be said in `--help` or it
+    /// reads as an oversight.
+    Off,
+}
+
+impl Isolation {
+    /// Parse the selector's value.
+    ///
+    /// `none` is rejected **by name** for at least one release rather than
+    /// falling into the generic unknown-value message: D-020(6) is an
+    /// accepted decision that quotes `--isolation=none`, so everybody who
+    /// read it will type that word, and the copy has to tell them the token
+    /// moved rather than that they mistyped. Same precedent as
+    /// `parse_consent`'s retired spelling.
+    pub fn parse(value: &str) -> Result<Isolation, String> {
+        match value {
+            "default" => Ok(Isolation::Default),
+            "off" => Ok(Isolation::Off),
+            "none" => Err(
+                "`--isolation=none` was renamed to `--isolation=off` before it shipped. \
+                 D-020(6) minted `none`, but `none` is also what the *measured tier* reports \
+                 when nothing could be measured at all (`--print-isolation`, `tier=none`), and \
+                 one token for \"the operator chose no confinement\" and \"this machine was \
+                 never measured\" is one token too few"
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "unknown `--isolation` value {other:?} (expected `default` or `off`)"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for Isolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Isolation::Default => write!(f, "default"),
+            Isolation::Off => write!(f, "off"),
+        }
+    }
+}
+
+/// The selection [`admit`] let through, together with the *honest* name for
+/// what a realm spawned under it actually gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applied(Isolation);
+
+impl Applied {
+    pub fn isolation(self) -> Isolation {
+        self.0
+    }
+
+    /// The value the flight recorder's `applied_profile` field carries.
+    ///
+    /// **It may not overclaim, and that is why it is not the tier's
+    /// spelling.** `Tier::IntraUser` is *defined* as namespaces plus Landlock
+    /// plus seccomp; #186 applies the namespace third. An entry printing
+    /// `intra-user` would assert confinement that does not exist, so at the
+    /// end of #186 the only legal value for a confined realm is
+    /// `namespaces-only`.
+    pub fn profile(self) -> &'static str {
+        match self.0 {
+            Isolation::Default => "namespaces-only",
+            Isolation::Off => "none",
+        }
+    }
+}
+
+/// Why a session may not start with the confinement it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub mechanism: Mechanism,
+    pub support: Support,
+    /// What the operator can actually do, derived from
+    /// [`read_policy_knobs`]' real readings -- never from a distro guess.
+    /// Where no known knob explains the failure, this says so and invents
+    /// nothing.
+    pub remedy: String,
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "this build's isolation floor requires `{}` and this machine reports `{}`. {}",
+            self.mechanism, self.support, self.remedy
+        )
+    }
+}
+
+/// Relate a request to a measurement. **The only function that does.**
+///
+/// It returns the request unchanged or a refusal; there is no third answer,
+/// which is what makes "the session silently confined less than it was told
+/// to" unrepresentable rather than merely unlikely.
+///
+/// `Off` is admitted on every machine -- it asks for nothing, so nothing can
+/// be missing. The caller owes it a standing warning and a journal entry;
+/// this function does not warn, because a pure relation that logged would be
+/// a relation with a side effect.
+pub fn admit(requested: Isolation, report: &Report) -> Result<Applied, Refusal> {
+    if requested == Isolation::Off {
+        return Ok(Applied(requested));
+    }
+    for mechanism in FLOOR {
+        let support = report.mechanism(*mechanism);
+        if support.is_available() {
+            continue;
+        }
+        return Err(Refusal {
+            mechanism: *mechanism,
+            support,
+            remedy: remedy_for(*mechanism, support, report),
+        });
+    }
+    Ok(Applied(requested))
+}
+
+/// The remedy paragraph, composed from what was actually read.
+///
+/// `Support::Unmeasured` **refuses** and gets its own copy: treating "unknown"
+/// as "fine" is exactly the silent degradation D-020(6) forbids, and an
+/// operator told "restricted" when the truth is "the probe could not run"
+/// would go looking for a sysctl that is not the problem.
+fn remedy_for(mechanism: Mechanism, support: Support, report: &Report) -> String {
+    if let Support::Unmeasured(why) = support {
+        return format!(
+            "The probe for `{mechanism}` could not be run at all ({why}), so this machine's \
+             support is unknown. An unknown answer is refused rather than assumed good: a \
+             session that started here would make every confinement claim downstream read as \
+             true while being unverified. Re-run `vitrind --print-isolation` from a plain \
+             shell to see the same probe outside whatever launched this core."
+        );
+    }
+    if mechanism != Mechanism::Namespaces {
+        return format!(
+            "No knob in this build's list explains a `{mechanism}` failure, so no remedy is \
+             offered rather than one being guessed at. `vitrind --print-isolation` prints \
+             every row this core measured."
+        );
+    }
+    // Only the knobs that were actually read, and only the ones whose value
+    // explains the failure. A guess here is worse than silence: an operator
+    // who follows a fabricated remedy and sees no change concludes the
+    // diagnosis is broken rather than that the cause is elsewhere.
+    let mut lines = Vec::new();
+    for (key, value) in &report.policy {
+        match (*key, value.as_deref()) {
+            ("max_user_namespaces", Some("0")) => lines.push(
+                "/proc/sys/user/max_user_namespaces is 0, which disables unprivileged user \
+                 namespaces outright; raise it (sysctl user.max_user_namespaces=15000)."
+                    .to_string(),
+            ),
+            ("unprivileged_userns_clone", Some("0")) => lines.push(
+                "/proc/sys/kernel/unprivileged_userns_clone is 0 (Debian's downstream switch); \
+                 set it to 1."
+                    .to_string(),
+            ),
+            ("apparmor_restrict_unprivileged_userns", Some("1")) => lines.push(
+                "/proc/sys/kernel/apparmor_restrict_unprivileged_userns is 1 (Ubuntu 24.04+); \
+                 either set it to 0 or ship an AppArmor profile for vitrind that grants \
+                 userns creation."
+                    .to_string(),
+            ),
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        format!(
+            "None of the three knobs this core reads \
+             (user.max_user_namespaces, kernel.unprivileged_userns_clone, \
+             kernel.apparmor_restrict_unprivileged_userns) explains it, so no remedy is \
+             offered rather than one being guessed at. The kernel answered `{support}`; \
+             `vitrind --print-isolation` prints every row behind that answer. \
+             `--isolation=off` starts an UNCONFINED session and is the wrong answer to a \
+             machine that could be fixed."
+        )
+    } else {
+        format!(
+            "{} `--isolation=off` starts an UNCONFINED session and is the wrong answer to a \
+             machine that could be fixed.",
+            lines.join(" ")
+        )
+    }
+}
+
+/// The `vitrind --print-floor` payload.
+///
+/// A **separate verb from `--print-isolation`**, and the separation is the
+/// point: a build constant among kernel facts would contradict this module's
+/// own first rule, and it would invalidate #185's four-kernel matrix over a
+/// row that is not a kernel fact.
+pub fn render_floor() -> String {
+    let mut out = String::from("vitrin-floor 1\n");
+    out.push_str(&format!("build.version={}\n", env!("CARGO_PKG_VERSION")));
+    for mechanism in FLOOR {
+        out.push_str(&format!("floor.mechanism={mechanism}\n"));
+    }
+    // Stated as rows rather than left to inference, so an operator can see
+    // which mechanisms this build knows about but does not yet apply.
+    for mechanism in [
+        Mechanism::Namespaces,
+        Mechanism::Landlock,
+        Mechanism::Seccomp,
+        Mechanism::NoNewPrivs,
+    ] {
+        let applied = FLOOR.contains(&mechanism);
+        out.push_str(&format!(
+            "applies.{mechanism}={}\n",
+            if applied { "yes" } else { "not-yet" }
+        ));
+    }
+    out
+}
+
+/// The forward warning [`Tier::meets`] exists for: this machine meets the
+/// floor, but a build that adds the next mechanism will refuse here.
+///
+/// `None` when there is nothing to forecast -- the machine already reaches
+/// `Tier::IntraUser`, so no scheduled floor move will break it.
+pub fn forecast(report: &Report) -> Option<String> {
+    if report.tier().meets(Tier::IntraUser) {
+        return None;
+    }
+    let mut missing = Vec::new();
+    for mechanism in [
+        Mechanism::Namespaces,
+        Mechanism::Landlock,
+        Mechanism::Seccomp,
+        Mechanism::NoNewPrivs,
+    ] {
+        if FLOOR.contains(&mechanism) {
+            continue;
+        }
+        let support = report.mechanism(mechanism);
+        if !support.is_available() {
+            missing.push(format!("{mechanism}={support}"));
+        }
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "this build's isolation floor is [{}] and this machine meets it; the machine does not \
+         meet the `{}` tier ({}), so a build that adds those mechanisms will REFUSE to start \
+         here. Every floor move is announced by the build that still works on the machines it \
+         will break -- this is that announcement",
+        FLOOR
+            .iter()
+            .map(|m| m.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Tier::IntraUser,
+        missing.join(", "),
+    ))
 }
 
 impl fmt::Display for Tier {
@@ -310,6 +666,28 @@ impl Report {
             policy: read_policy_knobs(),
             subuid_range: has_subuid_range(),
             newuidmap: has_newuidmap(),
+        }
+    }
+
+    /// What this machine said about one [`Mechanism`].
+    ///
+    /// The seam between "a row the kernel answered" and "a thing this build
+    /// applies", written once so [`admit`], [`forecast`] and [`Report::tier`]
+    /// cannot disagree about which row backs which mechanism. The
+    /// `Namespaces` row is [`Report::namespaces_combined`] and not any
+    /// individual namespace: six probes that each pass separately do not
+    /// prove the one six-flag call `vitrin-realm-init` issues will pass, and
+    /// it is that call the mechanism is.
+    pub fn mechanism(&self, mechanism: Mechanism) -> Support {
+        match mechanism {
+            Mechanism::Namespaces => self.namespaces_combined,
+            Mechanism::Landlock => match self.landlock_abi {
+                Ok(abi) if abi >= 1 => Support::Available,
+                Ok(_) => Support::Unmeasured("landlock returned ABI 0"),
+                Err(support) => support,
+            },
+            Mechanism::Seccomp => self.seccomp_filter,
+            Mechanism::NoNewPrivs => self.no_new_privs,
         }
     }
 
@@ -998,6 +1376,261 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
+    }
+
+    #[test]
+    fn the_selector_and_the_tier_share_no_bottom_token() {
+        // Collision 1, as a test rather than a comment. `Tier::None` is also
+        // what `tier()` returns for `Support::Unmeasured`, so a selector
+        // spelled `none` would conflate "the operator chose no confinement"
+        // with "nothing was measured".
+        //
+        // Both sets are enumerated through an exhaustive `match` with no
+        // catch-all, so a new variant on either side does not compile until
+        // somebody classifies it.
+        let tiers: Vec<String> = [Tier::None, Tier::IntraUser, Tier::PerUid]
+            .into_iter()
+            .map(|t| match t {
+                Tier::None | Tier::IntraUser | Tier::PerUid => t.to_string(),
+            })
+            .collect();
+        let selectors: Vec<String> = [Isolation::Default, Isolation::Off]
+            .into_iter()
+            .map(|i| match i {
+                Isolation::Default | Isolation::Off => i.to_string(),
+            })
+            .collect();
+        assert_eq!(tiers, ["none", "intra-user", "per-uid"]);
+        assert_eq!(selectors, ["default", "off"]);
+        assert!(
+            !selectors.contains(&Tier::None.to_string()),
+            "the tier's bottom token became a selector value"
+        );
+    }
+
+    #[test]
+    fn the_retired_none_spelling_is_refused_by_name() {
+        // Everybody who read D-020(6) will type `none`. The copy has to say
+        // the token moved, not that they mistyped.
+        let err = Isolation::parse("none").expect_err("`none` is retired");
+        assert!(err.contains("--isolation=off"), "{err}");
+        assert!(err.contains("D-020(6)"), "{err}");
+        // Non-vacuity for the arm above: the two live spellings parse, and an
+        // unrelated word gets the generic message rather than this one.
+        assert_eq!(Isolation::parse("default"), Ok(Isolation::Default));
+        assert_eq!(Isolation::parse("off"), Ok(Isolation::Off));
+        let other = Isolation::parse("hardened").expect_err("not a value");
+        assert!(!other.contains("D-020(6)"), "{other}");
+    }
+
+    #[test]
+    fn isolation_cannot_be_clamped_defaulted_or_converted() {
+        // The three accidents `Isolation`'s docs name, checked against this
+        // module's own source because the alternative -- a `trybuild` case --
+        // would put a proc-macro-adjacent dev-dependency in the TCB for one
+        // assertion. The needles are the *declarations*, so a derive added
+        // later fails here even though it compiles.
+        let source = include_str!("isolation.rs");
+        let decl = source
+            .split("pub enum Isolation {")
+            .next()
+            .expect("the enum is declared in this file");
+        let derive = decl
+            .rsplit_once("#[derive(")
+            .expect("the enum carries a derive")
+            .1;
+        let derive = derive.split(')').next().expect("a closed derive list");
+        for forbidden in ["Ord", "Default"] {
+            assert!(
+                !derive.contains(forbidden),
+                "`Isolation` derives {forbidden}: {derive:?}. An ordering lets \
+                 min(selected, measured) typecheck and an operator who asked for confinement \
+                 silently gets less; a Default makes an unconfined session reachable without \
+                 anybody typing the word"
+            );
+        }
+        // Non-vacuity: the derive list is really being read, not an empty
+        // string that trivially contains nothing.
+        assert!(derive.contains("Copy"), "read the wrong derive: {derive:?}");
+        // Assembled from fragments rather than written out, because a
+        // source-reading test whose needle is a literal in its own body finds
+        // itself and fails on the first run.
+        for (from, to) in [("Tier", "Isolation"), ("Isolation", "Tier")] {
+            let bridge = format!("impl From<{from}> for {to}");
+            assert!(
+                !source.contains(&bridge),
+                "`{bridge}` exists; a measurement must not be launderable into a selection"
+            );
+        }
+        // And the one legal relation is present, so a rename cannot make the
+        // absences above true by deleting the whole mechanism.
+        assert!(source.contains("pub fn admit(requested: Isolation, report: &Report)"));
+    }
+
+    #[test]
+    fn the_floor_is_a_subset_of_the_intra_user_predicate() {
+        // Clause 6's schedule, as a checked fact. `FLOOR` grows one entry per
+        // task (#186 namespaces, #187 landlock, #188 seccomp + nnp); at #188
+        // it coincides with `tier()`'s base predicate and the assertion below
+        // flips from subset to equality.
+        let base = [
+            Mechanism::Namespaces,
+            Mechanism::Landlock,
+            Mechanism::Seccomp,
+            Mechanism::NoNewPrivs,
+        ];
+        for mechanism in FLOOR {
+            assert!(
+                base.contains(mechanism),
+                "{mechanism} is in FLOOR but is not part of the intra-user predicate"
+            );
+        }
+        assert!(
+            FLOOR.len() <= base.len(),
+            "FLOOR has outgrown the tier predicate it must stay inside"
+        );
+
+        // A truth table over synthetic reports, one row per mechanism absent:
+        // a machine missing a mechanism the tier needs is never `IntraUser`,
+        // whether or not that mechanism is in this build's floor.
+        for mechanism in base {
+            let mut report = full_report();
+            match mechanism {
+                Mechanism::Namespaces => {
+                    report.namespaces_combined = Support::RestrictedByPolicy(libc::EPERM)
+                }
+                Mechanism::Landlock => report.landlock_abi = Err(Support::Absent(libc::ENOSYS)),
+                Mechanism::Seccomp => report.seccomp_filter = Support::Absent(libc::EINVAL),
+                Mechanism::NoNewPrivs => report.no_new_privs = Support::Absent(libc::EINVAL),
+            }
+            assert_eq!(
+                report.tier(),
+                Tier::None,
+                "a machine missing {mechanism} still reported a tier"
+            );
+            assert!(!report.mechanism(mechanism).is_available());
+        }
+    }
+
+    #[test]
+    fn every_floor_mechanism_refuses_when_its_probe_fails() {
+        // Both directions, and the second half is what makes the first
+        // non-vacuous: a `FLOOR` that refused on everything would pass a
+        // one-directional check.
+        let all = [
+            Mechanism::Namespaces,
+            Mechanism::Landlock,
+            Mechanism::Seccomp,
+            Mechanism::NoNewPrivs,
+        ];
+        for mechanism in all {
+            let mut report = full_report();
+            match mechanism {
+                Mechanism::Namespaces => {
+                    report.namespaces_combined = Support::RestrictedByPolicy(libc::EPERM)
+                }
+                Mechanism::Landlock => report.landlock_abi = Err(Support::Absent(libc::ENOSYS)),
+                Mechanism::Seccomp => report.seccomp_filter = Support::Absent(libc::EINVAL),
+                Mechanism::NoNewPrivs => report.no_new_privs = Support::Absent(libc::EINVAL),
+            }
+            let outcome = admit(Isolation::Default, &report);
+            if FLOOR.contains(&mechanism) {
+                let refusal = outcome.expect_err("a floor mechanism failed and the spawn started");
+                assert_eq!(refusal.mechanism, mechanism);
+            } else {
+                assert!(
+                    outcome.is_ok(),
+                    "{mechanism} is not in FLOOR, so this build must start without it -- \
+                     refusing here would buy a failure mode with no matching safety"
+                );
+            }
+            // `off` asks for nothing, so nothing can be missing.
+            assert!(admit(Isolation::Off, &report).is_ok());
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_floor_mechanism_refuses_with_its_own_copy() {
+        // M3: treating "unknown" as "fine" is the silent degradation D-020(6)
+        // forbids, and an operator told "restricted" would go looking for a
+        // sysctl that is not the problem.
+        let mut report = full_report();
+        report.namespaces_combined = Support::Unmeasured("fork failed");
+        let refusal = admit(Isolation::Default, &report).expect_err("unmeasured must refuse");
+        assert!(refusal.remedy.contains("could not be run"), "{refusal}");
+        assert!(refusal.remedy.contains("fork failed"), "{refusal}");
+        // Non-vacuity: the restricted case gets *different* copy.
+        report.namespaces_combined = Support::RestrictedByPolicy(libc::EPERM);
+        let other = admit(Isolation::Default, &report).expect_err("restricted must refuse");
+        assert!(!other.remedy.contains("could not be run"), "{other}");
+    }
+
+    #[test]
+    fn the_remedy_names_only_knobs_that_were_actually_read() {
+        // A fabricated remedy is worse than silence: an operator who follows
+        // one and sees no change concludes the diagnosis is broken rather
+        // than that the cause is elsewhere.
+        let mut report = full_report();
+        report.namespaces_combined = Support::RestrictedByPolicy(libc::EPERM);
+        report.policy = vec![(
+            "apparmor_restrict_unprivileged_userns",
+            Some("1".to_string()),
+        )];
+        let refusal = admit(Isolation::Default, &report).expect_err("refuses");
+        assert!(refusal.remedy.contains("apparmor_restrict"), "{refusal}");
+        assert!(
+            !refusal.remedy.contains("unprivileged_userns_clone"),
+            "a knob that was not read was named anyway: {refusal}"
+        );
+
+        // And when nothing explains it, the copy says so and invents nothing.
+        report.policy = vec![("max_user_namespaces", Some("15000".to_string()))];
+        let silent = admit(Isolation::Default, &report).expect_err("refuses");
+        assert!(silent.remedy.contains("no remedy is offered"), "{silent}");
+    }
+
+    #[test]
+    fn applied_profile_never_claims_a_tier_this_build_does_not_apply() {
+        // Clause 10: `Tier::IntraUser` is *defined* as namespaces plus
+        // Landlock plus seccomp, and #186 applies the namespace third.
+        let report = full_report();
+        let applied = admit(Isolation::Default, &report).expect("a full machine admits");
+        assert_eq!(applied.profile(), "namespaces-only");
+        assert_ne!(applied.profile(), Tier::IntraUser.to_string());
+        assert_eq!(
+            admit(Isolation::Off, &report).expect("off always admits").profile(),
+            "none"
+        );
+    }
+
+    #[test]
+    fn the_floor_is_published_by_its_own_verb_and_not_among_kernel_facts() {
+        // Putting a build constant in `--print-isolation` would invalidate
+        // #185's four-kernel matrix over a row that is not a kernel fact.
+        let floor = render_floor();
+        assert!(floor.starts_with("vitrin-floor 1\n"));
+        assert!(floor.contains("floor.mechanism=namespaces\n"));
+        assert!(floor.contains("applies.landlock=not-yet\n"));
+        let isolation = full_report().render();
+        assert!(!isolation.contains("floor"), "{isolation}");
+        assert!(!isolation.contains("applies."), "{isolation}");
+    }
+
+    #[test]
+    fn the_forecast_warns_only_where_a_later_build_will_refuse() {
+        // A machine that already reaches the tier has nothing to be warned
+        // about; one that meets today's floor and misses a scheduled one is
+        // exactly who the announcement is for.
+        let mut report = full_report();
+        assert_eq!(forecast(&report), None, "a full machine needs no forecast");
+
+        report.landlock_abi = Err(Support::Absent(libc::ENOSYS));
+        let warning = forecast(&report).expect("a machine that #187 will break");
+        assert!(warning.contains("landlock"), "{warning}");
+        assert!(warning.contains("REFUSE"), "{warning}");
+        // The mechanism this build *does* apply is not in the forecast: it is
+        // already a hard refusal, not a warning.
+        assert!(!warning.contains("namespaces="), "{warning}");
     }
 
     #[test]

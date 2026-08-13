@@ -1994,6 +1994,7 @@ dependencies = [
  "vitrin-mock-shim",
  "vitrin-png",
  "vitrin-protocol",
+ "vitrin-realm-init",
  "wayland-egl",
  "xkbcommon",
 ]

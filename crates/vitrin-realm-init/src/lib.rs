@@ -254,8 +254,15 @@ pub enum Stage {
     Version = 1,
     /// The single six-flag `unshare` failed.
     Unshare = 2,
-    /// `setgroups(0, NULL)` failed -- the one window in which dropping the
-    /// operator's supplementary groups is legal.
+    /// Reserved, and **unreachable in this build**.
+    ///
+    /// It was to be `setgroups(0, NULL)`'s refusal. That call turns out to be
+    /// impossible for an unprivileged realm in *either* window -- see
+    /// `main.rs`'s C3 comment for the two kernel predicates and the
+    /// measurement -- so nothing sends this stage. The variant is kept
+    /// rather than deleted so the wire numbering is stable and so a future
+    /// per-uid tier, where the drop does become reachable, has its label
+    /// already agreed.
     Setgroups = 3,
     /// The child's own read-back of `uid_map` / `gid_map` / `setgroups`
     /// disagreed with what the core said it wrote.

@@ -650,7 +650,20 @@ pub(crate) const MAX_REALMS: usize = 16;
 /// and the realm's private socket would simply never be consulted. A list
 /// that stopped at display *names* would let one config key undo the
 /// confinement the rest of this file exists to guarantee.
-pub(crate) const RESERVED_ENV: [(&str, &str); 5] = [
+pub(crate) const RESERVED_ENV: [(&str, &str); 6] = [
+    (
+        // The sixth name, added by P2.6.2 (#186), and the one that breaks an
+        // existing configuration -- `examples/realm.toml` allow-listed it.
+        // Unavoidable: at `--isolation=default` the realm's filesystem does
+        // not contain the operator's home directory, so a host `$HOME` passed
+        // through would name a path that is not there, and every app that
+        // reads it would fail in a way that looks like a vitrin bug. The core
+        // decides it (the realm's own private storage) exactly as it decides
+        // `XDG_RUNTIME_DIR`.
+        "HOME",
+        "it names a directory that does not exist inside a confined realm; the core injects \
+         the realm's own private storage at spawn",
+    ),
     (
         "DISPLAY",
         "it addresses the host X server, which the core scrubs at spawn",
@@ -700,6 +713,30 @@ pub(crate) struct SpawnConfig {
     /// Names passed through from the core's environment (module docs:
     /// names, not pairs; empty means an empty inherited environment).
     env_allow: Vec<String>,
+    /// Absolute host paths mounted **read-only** into the realm at the same
+    /// path, at `--isolation=default` (P2.6.2, #186). Empty by default, and
+    /// ignored entirely at `--isolation=off`, where the realm can already see
+    /// the whole filesystem.
+    ///
+    /// # Why this lives in `realm.toml` and not on the command line
+    ///
+    /// The first draft put it on the CLA beside `--shim`, on that flag's "a
+    /// core input, not a realm one" argument. The owner's call went the other
+    /// way (2026-08-13) and the reason is the stronger one: an app's runtime
+    /// closure is *per-app* information, the app is named here, and an
+    /// operator running four realms against four different `/opt` trees would
+    /// have to reconstruct which flag belonged to which realm every time.
+    ///
+    /// **The cost is that this file now carries confinement-relevant
+    /// configuration**, which it did not before. That is paid for at the
+    /// spawn, not here: every source is re-audited against the same
+    /// trusted-writer walk `command` gets, because a bind source holding a
+    /// library or an interpreter decides what the confined app *runs*, not
+    /// merely what it reads. What is deliberately still **not** here is
+    /// whether a realm is confined at all -- that is `--isolation`,
+    /// session-wide, so a copied `[[realm]]` block cannot weaken one realm
+    /// silently.
+    binds: Vec<PathBuf>,
 }
 
 impl SpawnConfig {
@@ -713,6 +750,12 @@ impl SpawnConfig {
 
     pub fn env_allow(&self) -> &[String] {
         &self.env_allow
+    }
+
+    /// Read-only host paths this realm needs inside its confinement. Audited
+    /// again at spawn (`crate::spawn`), never trusted from the file alone.
+    pub fn binds(&self) -> &[PathBuf] {
+        &self.binds
     }
 
     /// **The one program name a consent prompt may render** (WS-E.1.1).
@@ -1521,6 +1564,7 @@ struct RawRealm {
     command: Option<(String, usize)>,
     args: Option<Vec<String>>,
     env_allow: Option<(Vec<String>, usize)>,
+    binds: Option<(Vec<String>, usize)>,
     autostart: Option<bool>,
 }
 
@@ -1589,6 +1633,12 @@ fn parse_config(text: &str) -> Result<Vec<RealmSpec>, ErrorKind> {
                 }
                 realm.env_allow = Some((toml_subset::string_array(value, line_no)?, line_no));
             }
+            "binds" => {
+                if realm.binds.is_some() {
+                    return Err(parse_err(line_no, "duplicate `binds` key".into()));
+                }
+                realm.binds = Some((toml_subset::string_array(value, line_no)?, line_no));
+            }
             "autostart" => {
                 if realm.autostart.is_some() {
                     return Err(parse_err(line_no, "duplicate `autostart` key".into()));
@@ -1600,7 +1650,7 @@ fn parse_config(text: &str) -> Result<Vec<RealmSpec>, ErrorKind> {
                     line_no,
                     format!(
                         "unknown key {other:?} (this schema defines id, command, args, \
-                         env_allow, autostart)"
+                         env_allow, binds, autostart)"
                     ),
                 ));
             }
@@ -1764,12 +1814,53 @@ fn validate_realm(raw: RawRealm) -> Result<RealmSpec, ErrorKind> {
         }
     }
 
+    // `binds`: absolute, deduplicated, and never a directory whose whole
+    // point is that the realm cannot see it. Shape is checked here; whether
+    // each path exists and who can write it is re-asked at spawn, because
+    // this file was read minutes before the fork and could never say anything
+    // about the instant of the mount.
+    let mut binds: Vec<PathBuf> = Vec::new();
+    if let Some((paths, line)) = raw.binds {
+        for entry in paths {
+            let path = PathBuf::from(&entry);
+            if !path.is_absolute() {
+                return Err(parse_err(
+                    line,
+                    format!(
+                        "`binds` entry {entry:?} is not an absolute path; a relative bind \
+                         source would resolve against whatever directory the core happened to \
+                         be started from"
+                    ),
+                ));
+            }
+            // Not "unnecessary" -- actively wrong. Binding either of these
+            // hands the realm the tree the confinement exists to hide, so a
+            // configuration that asked for it would read as confined and not
+            // be.
+            if path == Path::new("/") || path == Path::new("/home") {
+                return Err(parse_err(
+                    line,
+                    format!(
+                        "`binds` entry {entry:?} would mount the operator's whole filesystem \
+                         into the realm, which is the tree confinement exists to hide. Name \
+                         the specific directory the app's runtime closure needs"
+                    ),
+                ));
+            }
+            if binds.contains(&path) {
+                return Err(parse_err(line, format!("duplicate `binds` entry {entry:?}")));
+            }
+            binds.push(path);
+        }
+    }
+
     Ok(RealmSpec {
         id,
         spawn: SpawnConfig {
             command,
             args: raw.args.unwrap_or_default(),
             env_allow,
+            binds,
         },
         // Default `true`: every configuration written before this key
         // existed means exactly what it always meant, and the surprising
@@ -1927,6 +2018,7 @@ pub(crate) mod tests {
             command: command.to_path_buf(),
             args: args.to_vec(),
             env_allow: env_allow.to_vec(),
+            binds: Vec::new(),
         }
     }
 
@@ -2124,7 +2216,7 @@ pub(crate) mod tests {
         let registry = registry_from(
             "[[realm]]\ncommand = \"/usr/bin/true\"\n\
              [[realm]]\nid = \"editor\"\ncommand = \"/usr/bin/false\"\nargs = [\"-e\"]\n\
-             [[realm]]\nid = \"browser\"\ncommand = \"/usr/bin/true\"\nenv_allow = [\"HOME\"]\n\
+             [[realm]]\nid = \"browser\"\ncommand = \"/usr/bin/true\"\nenv_allow = [\"TERM\"]\n\
              [[realm]]\nid = \"term-1\"\ncommand = \"/usr/bin/true\"\n",
         )
         .unwrap();
@@ -2146,7 +2238,7 @@ pub(crate) mod tests {
         assert_eq!(registry.get("editor").unwrap().spawn().args(), ["-e"]);
         assert_eq!(
             registry.get("browser").unwrap().spawn().env_allow(),
-            ["HOME"]
+            ["TERM"]
         );
         assert!(registry.get("term-1").unwrap().spawn().args().is_empty());
 
@@ -2272,13 +2364,13 @@ pub(crate) mod tests {
              id = \"realm-0\"\n\
              command = \"/usr/bin/foot\"\n\
              args = [\"-e\", \"bash\", \"-lc\", \"echo hi\"]\n\
-             env_allow = [\"HOME\", \"LANG\"]\n",
+             env_allow = [\"TERM\", \"LANG\"]\n",
         )
         .unwrap();
         let spawn = registry.get("realm-0").unwrap().spawn();
         assert_eq!(spawn.command(), Path::new("/usr/bin/foot"));
         assert_eq!(spawn.args(), ["-e", "bash", "-lc", "echo hi"]);
-        assert_eq!(spawn.env_allow(), ["HOME", "LANG"]);
+        assert_eq!(spawn.env_allow(), ["TERM", "LANG"]);
 
         // Omitted entirely, and explicitly empty, mean the same thing.
         for text in [
@@ -2298,12 +2390,12 @@ pub(crate) mod tests {
         // and a name the core's environment does not define is skipped
         // rather than failing the run.
         let registry = registry_from(
-            "[[realm]]\ncommand = \"/usr/bin/true\"\nenv_allow = [\"HOME\", \"LANG\", \"ABSENT\"]\n",
+            "[[realm]]\ncommand = \"/usr/bin/true\"\nenv_allow = [\"TERM\", \"LANG\", \"ABSENT\"]\n",
         )
         .unwrap();
         let spawn = registry.get(WELL_KNOWN_REALM_ID).unwrap().spawn();
         let env = spawn.inherited_env(|name| match name {
-            "HOME" => Some("/home/agent".into()),
+            "TERM" => Some("foot".into()),
             "LANG" => Some("en_US.UTF-8".into()),
             // Deliberately resolvable but never asked for: the allowlist,
             // not the lookup, decides what crosses.
@@ -2313,7 +2405,7 @@ pub(crate) mod tests {
         assert_eq!(
             env,
             vec![
-                ("HOME".to_string(), "/home/agent".to_string()),
+                ("TERM".to_string(), "foot".to_string()),
                 ("LANG".to_string(), "en_US.UTF-8".to_string()),
             ]
         );
@@ -2363,7 +2455,7 @@ pub(crate) mod tests {
         // Exact, case-sensitive matching: `getenv` finds DISPLAY, never
         // display, so refusing the latter would be theater.
         assert!(reserved_env_reason("display").is_none());
-        assert!(reserved_env_reason("HOME").is_none());
+        assert!(reserved_env_reason("TERM").is_none());
     }
 
     // -- validation strictness --------------------------------------------
@@ -2478,7 +2570,7 @@ pub(crate) mod tests {
             let err = registry_from(&text);
             assert!(err.is_err(), "must reject {entry:?}: {why}");
         }
-        let dup = "[[realm]]\ncommand = \"/a\"\nenv_allow = [\"HOME\", \"HOME\"]\n";
+        let dup = "[[realm]]\ncommand = \"/a\"\nenv_allow = [\"TERM\", \"TERM\"]\n";
         assert!(registry_from(dup).is_err(), "duplicate entries are refused");
         // Underscored and digit-bearing names are ordinary and accepted.
         let ok =

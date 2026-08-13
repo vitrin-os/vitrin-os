@@ -222,11 +222,30 @@ impl Tier {
 /// One confinement mechanism this build knows how to *apply*.
 ///
 /// Distinct from a [`Report`] row on purpose: a row is a question the kernel
-/// answered, a `Mechanism` is something `vitrind` does. Every member of
-/// [`FLOOR`] must have an applier, and every applier must be in `FLOOR` --
+/// answered, a `Mechanism` is something `vitrind` does.
+///
+/// # `FLOOR` and [`APPLIED`] are two different lists, and the difference is
+/// not bookkeeping
+///
+/// [`APPLIED`] is what this build *does* to a confined realm. [`FLOOR`] is
+/// what it *refuses to start without*, checked at startup against a probe.
+/// `FLOOR` is a subset of `APPLIED` and may be a proper one: a mechanism can
+/// be applied without being a startup gate, and `PR_SET_NO_NEW_PRIVS` is
+/// exactly that case. The helper sets it on every confined spawn (a spawn
+/// where it failed is refused), but it is not in `FLOOR`, because D-036(6)
+/// schedules it to arrive as a *gate* with the seccomp filter it protects at
+/// #188 -- and adding it early would refuse whole sessions on a probe for a
+/// mechanism whose reason for being checked does not exist yet.
+///
+/// Until an adversarial review caught it, `--print-floor` rendered its
+/// `applies.*` rows straight off `FLOOR`, so it printed
+/// `applies.no-new-privs=not-yet` for a mechanism the build applies to every
+/// realm. Understating is the safe direction and it was still a false row.
+///
+/// Every member of `FLOOR` must have an applier, and
 /// [`every_floor_mechanism_refuses_when_its_probe_fails`] asserts both
-/// directions, because a one-directional check would pass for a `FLOOR` that
-/// refused on everything.
+/// directions of the gate relation, because a one-directional check would
+/// pass for a `FLOOR` that refused on everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mechanism {
     /// The six-flag `unshare` `vitrin-realm-init` issues (P2.6.2, #186).
@@ -259,6 +278,21 @@ impl fmt::Display for Mechanism {
 /// sessions in exchange for nothing, which is exactly the trade this module
 /// declined at #185.
 pub const FLOOR: &[Mechanism] = &[Mechanism::Namespaces];
+
+/// What **this build** actually applies to a confined realm, gate or not.
+///
+/// A superset of [`FLOOR`] (asserted by
+/// [`the_floor_is_a_subset_of_what_the_build_applies`]). The two differ by
+/// `PR_SET_NO_NEW_PRIVS` today: `vitrin-realm-init` sets it before the shim's
+/// `execve` on every confined spawn -- `/proc/<shim>/status` reads
+/// `NoNewPrivs: 1`, and the confinement suite asserts it -- but it is not a
+/// startup gate until #188 brings the seccomp filter it exists to protect.
+///
+/// This list is what `--print-floor`'s `applies.*` rows are rendered from. A
+/// build that applies a mechanism and prints `not-yet` for it is a build
+/// whose own published description is wrong, which is the same class of
+/// defect as overclaiming even though it errs the safe way.
+pub const APPLIED: &[Mechanism] = &[Mechanism::Namespaces, Mechanism::NoNewPrivs];
 
 /// The operator's **selection**: which confinement this session applies.
 ///
@@ -497,13 +531,19 @@ pub fn render_floor() -> String {
     }
     // Stated as rows rather than left to inference, so an operator can see
     // which mechanisms this build knows about but does not yet apply.
+    //
+    // Rendered from [`APPLIED`] and **not** from `FLOOR`. They are not the
+    // same list: `no-new-privs` is set on every confined spawn and is not a
+    // startup gate until #188, so reading the row off `FLOOR` printed
+    // `applies.no-new-privs=not-yet` about a mechanism this build applies.
+    // `floor.mechanism=` above is the gate; these rows are the behaviour.
     for mechanism in [
         Mechanism::Namespaces,
         Mechanism::Landlock,
         Mechanism::Seccomp,
         Mechanism::NoNewPrivs,
     ] {
-        let applied = FLOOR.contains(&mechanism);
+        let applied = APPLIED.contains(&mechanism);
         out.push_str(&format!(
             "applies.{mechanism}={}\n",
             if applied { "yes" } else { "not-yet" }
@@ -1430,7 +1470,20 @@ mod tests {
         // would put a proc-macro-adjacent dev-dependency in the TCB for one
         // assertion. The needles are the *declarations*, so a derive added
         // later fails here even though it compiles.
-        let source = include_str!("isolation.rs");
+        // **The shipped half only.** A source-reading test that scans its own
+        // module finds its own prose: the needles below name the impls they
+        // forbid, and a comment explaining why is a literal occurrence of the
+        // thing being forbidden. Measured, on the first run of the
+        // hand-written-impl arm added below.
+        let whole = include_str!("isolation.rs");
+        let source = whole
+            .split("#[cfg(test)]")
+            .next()
+            .expect("this file has a test module");
+        assert!(
+            source.len() < whole.len(),
+            "the test module was not split off, so every needle below can find itself"
+        );
         let decl = source
             .split("pub enum Isolation {")
             .next()
@@ -1460,6 +1513,20 @@ mod tests {
             assert!(
                 !source.contains(&bridge),
                 "`{bridge}` exists; a measurement must not be launderable into a selection"
+            );
+        }
+        // Reading the derive list is not enough, and an adversarial review
+        // said so: a hand-written `impl Default for Isolation` or `impl
+        // PartialOrd for Isolation` compiles, does exactly the damage the
+        // derive ban exists to prevent, and appears nowhere in the derive
+        // list. Same fragment assembly, same reason.
+        for trait_name in ["Default", "PartialOrd", "Ord"] {
+            let hand_written = format!("impl {trait_name} for Isolation");
+            assert!(
+                !source.contains(&hand_written),
+                "`{hand_written}` exists. Written out by hand it does precisely what the \
+                 missing derive would: an ordering lets min(selected, measured) typecheck, and \
+                 a Default makes an unconfined session reachable without anybody typing the word"
             );
         }
         // And the one legal relation is present, so a rename cannot make the
@@ -1510,6 +1577,34 @@ mod tests {
             );
             assert!(!report.mechanism(mechanism).is_available());
         }
+    }
+
+    #[test]
+    fn the_floor_is_a_subset_of_what_the_build_applies() {
+        // The relation `--print-floor` renders two different row families
+        // from, so a build cannot describe itself wrongly in either
+        // direction. A gate for something nothing applies would refuse
+        // sessions for nothing; a mechanism applied but printed as `not-yet`
+        // is a false published row, which is what an adversarial review found
+        // when `applies.*` was rendered off `FLOOR`.
+        for mechanism in FLOOR {
+            assert!(
+                APPLIED.contains(mechanism),
+                "{mechanism} is a startup gate but nothing in this build applies it"
+            );
+        }
+        // Non-vacuous in the other direction too: the two lists are not
+        // required to be equal today and this states which entry differs, so
+        // #188 moving `no-new-privs` into `FLOOR` has to come here and say so.
+        assert!(
+            APPLIED.contains(&Mechanism::NoNewPrivs),
+            "the helper sets PR_SET_NO_NEW_PRIVS on every confined spawn"
+        );
+        assert!(
+            !FLOOR.contains(&Mechanism::NoNewPrivs),
+            "no-new-privs became a startup gate: that is #188's move, and it needs the seccomp \
+             filter it protects to arrive with it"
+        );
     }
 
     #[test]
@@ -1611,6 +1706,16 @@ mod tests {
         assert!(floor.starts_with("vitrin-floor 1\n"));
         assert!(floor.contains("floor.mechanism=namespaces\n"));
         assert!(floor.contains("applies.landlock=not-yet\n"));
+        // The gate rows and the behaviour rows are two families, and the
+        // difference is visible: `no-new-privs` is applied to every confined
+        // realm and is not a startup gate until #188. It printed `not-yet`
+        // while the helper was setting it, which is a false row about this
+        // build even though it errs the safe way.
+        assert!(floor.contains("applies.no-new-privs=yes\n"), "{floor}");
+        assert!(
+            !floor.contains("floor.mechanism=no-new-privs\n"),
+            "{floor}"
+        );
         let isolation = full_report().render();
         assert!(!isolation.contains("floor"), "{isolation}");
         assert!(!isolation.contains("applies."), "{isolation}");

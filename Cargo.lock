@@ -2045,6 +2045,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vitrin-realm-init-fixtures"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "vitrin-realm-init",
+]
+
+[[package]]
 name = "vitrin-scanner"
 version = "0.1.0"
 dependencies = [

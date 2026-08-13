@@ -3207,6 +3207,41 @@ where
     // somewhere the operator did not ask for is the failure the whole audit
     // exists to prevent, and "start anyway with the key disabled" would be a
     // session that silently does not do what its command line says.
+    // One refusal before the directory is even opened, and it is a
+    // confinement refusal rather than a screenshot one: a `--screenshot-dir`
+    // *inside* a realm's private storage would be bound READ-WRITE into that
+    // realm, so the realm could read -- and rewrite -- every screenshot this
+    // session takes of every other realm. `limits.md` narrows the screenshot
+    // residual to "same-uid processes outside every realm"; that sentence is
+    // only true if this path cannot be placed inside one.
+    if let Some((path, root)) = screenshot_dir
+        .as_ref()
+        .zip(confinement.as_ref().map(|c| &c.storage_root))
+    {
+        // Compared on the paths as given plus their canonical forms, because
+        // neither may exist yet and `canonicalize` on a missing path answers
+        // nothing. Both spellings have to miss for the path to be accepted.
+        let candidates = [
+            (path.clone(), root.clone()),
+            (
+                std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()),
+                std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()),
+            ),
+        ];
+        if candidates.iter().any(|(p, r)| p.starts_with(r)) {
+            tracing::error!(
+                "fatal: `--screenshot-dir {}` is inside the realms' private storage ({}), which \
+                 is bound read-write into the realm it belongs to. A realm would be able to \
+                 read and rewrite every screenshot of every other realm. Choose a directory \
+                 outside {}",
+                path.display(),
+                root.display(),
+                root.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     let screenshot_writer = match screenshot_dir {
         Some(path) => match screenshot::ScreenshotDir::open(&path) {
             // The descriptor is handed straight to its worker thread and this
@@ -3468,29 +3503,85 @@ fn enumerate_render_nodes() -> Vec<PathBuf> {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("renderD"))
         })
-        // Audited before it is offered: a "render node" that is a regular
-        // file somebody planted, or one this uid cannot open, must not reach
-        // the mount table as though it were a device.
-        .filter(|p| {
-            match std::fs::metadata(p) {
-                Ok(meta) => {
-                    let is_char_device = std::os::unix::fs::FileTypeExt::is_char_device(&meta.file_type());
-                    if !is_char_device {
-                        tracing::warn!(
-                            node = %p.display(),
-                            "ignoring a /dev/dri entry that is not a character device"
-                        );
-                    }
-                    is_char_device
-                }
-                Err(_) => false,
-            }
-        })
+        // Audited before it is offered, and "audited" has to mean the same
+        // thing here as it does for `command` and for a `binds` entry --
+        // otherwise the word is doing work the code is not. An adversarial
+        // review found it was: this was a file-type test through
+        // `fs::metadata`, which *follows symlinks*, with no writer check at
+        // all. Two things are fixed:
+        //
+        //   1. `symlink_metadata`, so a symlink planted at `renderD128` is
+        //      refused rather than silently followed to whatever it names.
+        //   2. The trusted-writer walk over every directory on the path.
+        //      Whoever can write `/dev` or `/dev/dri` can put a node of their
+        //      choosing where this core will find it, and the node is bound
+        //      READ-WRITE into every confined realm.
+        //
+        // What is deliberately NOT checked is the node's own mode bits. A
+        // render node is typically `crw-rw---- root:video`, i.e.
+        // group-writable by design, and refusing that would refuse every GPU
+        // on every ordinary desktop. The bits behind a device node are the
+        // distro's statement about who may talk to the driver; the path is
+        // ours to verify.
+        .filter(|p| audit_render_node(p))
         .collect();
     // Sorted, so the mount table -- and therefore the child's mountinfo
     // fingerprint -- is the same on two runs of the same machine.
     nodes.sort();
     nodes
+}
+
+/// One `/dev/dri/renderD*` entry, against the same trusted-writer rule
+/// `command` and every `binds` source get.
+///
+/// Returns `false` and says why rather than refusing the session: a machine
+/// with one odd entry under `/dev/dri` should start without a GPU in its
+/// realms, not fail to start. That asymmetry with `binds` is deliberate --
+/// a bind source is something the operator asked for by name, and a render
+/// node is something this core went looking for.
+fn audit_render_node(path: &Path) -> bool {
+    let euid = rustix::process::geteuid().as_raw();
+    // `symlink_metadata`, never `metadata`: following a symlink here would
+    // audit the target's type and then bind the link's name.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            tracing::warn!(node = %path.display(), "ignoring a /dev/dri entry: {err}");
+            return false;
+        }
+    };
+    if !std::os::unix::fs::FileTypeExt::is_char_device(&meta.file_type()) {
+        tracing::warn!(
+            node = %path.display(),
+            "ignoring a /dev/dri entry that is not a character device (a symlink or a regular \
+             file somebody planted must not reach the mount table as though it were a GPU)"
+        );
+        return false;
+    }
+    for dir in path.ancestors().skip(1) {
+        let st = match rustix::fs::stat(dir) {
+            Ok(st) => st,
+            Err(err) => {
+                tracing::warn!(
+                    node = %path.display(),
+                    "ignoring a /dev/dri entry: cannot stat {} ({err})",
+                    dir.display()
+                );
+                return false;
+            }
+        };
+        if let Some(fault) = realm::untrusted_writer(st.st_uid, st.st_mode, euid, true) {
+            tracing::warn!(
+                node = %path.display(),
+                "ignoring a /dev/dri entry: directory {} is {fault}. This node would be bound \
+                 READ-WRITE into every confined realm, so whoever can write a directory on its \
+                 path chooses what the realms talk to",
+                dir.display()
+            );
+            return false;
+        }
+    }
+    true
 }
 
 /// A `vitrin-realm-init` beside this running `vitrind`, on exactly

@@ -751,6 +751,27 @@ impl Drop for GuardedChild {
 /// [`Self::into_parts`] hands it on, which kills and reaps
 /// ([`GuardedChild`]): a realm that never came up is a refusal, and a
 /// refusal must not leave a process behind.
+/// The realm's writable set, and *how the journal came to know it*.
+///
+/// Three cases rather than a string, because "the core measured an empty-ish
+/// list", "there was nothing to measure" and "the core could not tell" are
+/// three different things and a reader auditing one entry has to be able to
+/// separate them. Collapsing them into prose is how a confinement claim comes
+/// to rest on a sentence nobody checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WritableSet {
+    /// `--isolation=off`: there is no mount namespace, so the realm's
+    /// writable set is the operator's own and there is nothing to measure.
+    Unconfined,
+    /// Mount points carrying the per-mount `rw` option in
+    /// `/proc/<shim>/mountinfo`, sorted. This is the short list P2.6.9's
+    /// measured-write-set gate will assert against.
+    Measured(Vec<String>),
+    /// The read failed, and the journal says so rather than substituting the
+    /// list the core intended to build.
+    Unreadable(String),
+}
+
 /// What the flight recorder is told about one realm's confinement, split
 /// into what the **parent read from the kernel** and what the **child said**.
 ///
@@ -765,6 +786,19 @@ impl Drop for GuardedChild {
 /// the child sent, and the journal labels it as such -- a substituted helper
 /// can put anything it likes in those two fields, which is exactly why they
 /// are not what licenses the spawn.
+///
+/// # The one number that arrives from the child and stays above the line
+///
+/// [`Self::shim_host_pid`] is *reported* by the helper in `Frame::Child`, so
+/// on its own it would belong below. It stays above because the parent does
+/// not take it on trust: [`verify_root_view`] refuses unless
+/// `/proc/<pid>/status` shows `PPid:` equal to the supervisor this core
+/// spawned **and** an `NSpid:` line of exactly two fields whose second is
+/// `1`, and the post-`execve` check refuses unless `/proc/<pid>/exe` names
+/// the in-realm shim path. A decoy pid -- a second child the helper forked
+/// into an unmounted namespace and reported instead of the real one -- fails
+/// all three. What is journaled is therefore a pid this process verified,
+/// not a pid it was told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IsolationFacts {
     // --- parent-observed -------------------------------------------------
@@ -812,13 +846,22 @@ pub(crate) struct IsolationFacts {
     /// the **supervisor**, not the shim.
     pub supervisor_pid: u32,
     /// The shim's host pid: PID 1 inside the realm, some other number here.
+    /// Reported by the helper, then **verified** by the parent -- see this
+    /// type's own docs for the three checks that make it a parent fact.
     pub shim_host_pid: Option<i32>,
     /// How long the handshake took, so the 250 ms margin is observable rather
     /// than assumed.
     pub handshake_ms: u64,
-    /// The realm's entire writable set, stated as the short sentence
-    /// P2.6.9's measured-write-set gate asserts against.
-    pub writable: &'static str,
+    /// The realm's entire writable set, **measured** from
+    /// `/proc/<shim>/mountinfo` by this process on this spawn.
+    ///
+    /// It was a hardcoded sentence until an adversarial review pointed out
+    /// what that meant: a fixed `&'static str` describing a mount table
+    /// nobody had looked at, printed under `parent_observed`. The parent has
+    /// permission for the read (the confined child is its own descendant and
+    /// the same kuid), so there is no reason for the field to be a claim
+    /// rather than a measurement.
+    pub writable: WritableSet,
     /// Where the realm's `stdout`/`stderr` went.
     pub stdio: &'static str,
     /// Whether this realm's private storage already existed from an earlier
@@ -853,7 +896,7 @@ impl IsolationFacts {
             supervisor_pid: pid,
             shim_host_pid: None,
             handshake_ms: 0,
-            writable: "everything this uid can write",
+            writable: WritableSet::Unconfined,
             stdio: "inherited",
             storage_reused: false,
             mount_count: None,
@@ -1504,7 +1547,31 @@ where
     drop(shim_side);
     let shim_raw = shim_fd.as_raw_fd();
 
-    let env = child_env(spawn, &socket_path, &runtime_dir, None, lookup);
+    // `HOME` joined `RESERVED_ENV` at #186 because a confined realm's
+    // filesystem does not contain the operator's home directory. That is a
+    // load-time rule and it cannot be conditional on a CLI flag -- a
+    // `realm.toml` whose validity depended on `--isolation` would load on one
+    // invocation and fail on the next. But the *consequence* had leaked onto
+    // this path: with the name reserved and no injection here, an
+    // `--isolation=off` realm got no `HOME` at all, where before #186 an
+    // allow-listing config gave it the operator's own. `off` is supposed to
+    // be the path that shipped before #186 and the acceptance gate's positive
+    // control; a variable that is present in one arm and missing in the other
+    // is neither.
+    //
+    // So the core decides `HOME` in **both** arms, which is what putting a
+    // name in `RESERVED_ENV` means: here it decides on the operator's own,
+    // because at `--isolation=off` that directory is exactly as reachable as
+    // it always was; on the confined path it decides on the realm's private
+    // storage.
+    let host_home = lookup("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    let env = child_env(
+        spawn,
+        &socket_path,
+        &runtime_dir,
+        host_home.as_deref(),
+        lookup,
+    );
 
     // The core execs the SHIM, never the app directly: the shim holds fd 3
     // and, in turn, execs the app. The app command (`command` + `args`)
@@ -1687,7 +1754,6 @@ fn launch_confined<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    let started = Instant::now();
     let realm_id = realm.id().as_str();
     let runtime_dir = paths.realm_dir(realm_id)?;
     let lock_path = paths.realm_lock(realm_id)?;
@@ -1910,7 +1976,16 @@ where
     // the census of who holds the descriptor**, and `Stdio` is easy to forget
     // because it never appears as a variable of its own.
     drop(cmd);
-    let deadline = started + HELPER_DEADLINE;
+    // **The clock starts here, at P11, and not at the top of this function.**
+    // Everything above -- three transitive `audit_program_at_spawn` walks, a
+    // `canonicalize` per bind source, `RuntimeDirGuard::create` (which takes
+    // an `flock` and may recursively delete a stale realm directory),
+    // `prepare_realm_storage`, the log `create`, two socketpairs and the blob
+    // encode -- is this core's own work and has nothing to do with whether
+    // the helper is answering. Charging it to the handshake budget would
+    // refuse perfectly good spawns on a cold or loaded filesystem, and would
+    // do it while the journal recorded a `handshake_ms` of 3.
+    let deadline = Instant::now() + HELPER_DEADLINE;
     // Armed immediately: from here every error path must kill and reap the
     // helper, and the guard is what makes that true on paths added later.
     let mut child = GuardedChild(Some(child));
@@ -1935,13 +2010,18 @@ where
         }
     };
 
+    // Every one of these was a literal `Some(true)` until an adversarial
+    // review deleted the checks behind them and watched the suite stay green.
+    // They now carry what the check *returned*: a boolean that cannot be
+    // produced without running the comparison is a boolean a deleted
+    // comparison cannot forge.
     let isolation = IsolationFacts {
         applied_profile: "namespaces-only",
         namespaces_verified: handshake.namespaces_verified,
-        root_dev_differs: Some(true),
-        canaries_probed: conf.canaries.len(),
-        canaries_unreachable: Some(true),
-        setgroups_denied: Some(true),
+        root_dev_differs: Some(handshake.root_view.root_dev_differs),
+        canaries_probed: handshake.root_view.canaries_probed,
+        canaries_unreachable: Some(handshake.root_view.canaries_unreachable),
+        setgroups_denied: Some(handshake.setgroups_denied),
         supplementary_groups_retained: handshake.supplementary_groups,
         uid_map: Some(handshake.uid_map),
         gid_map: Some(handshake.gid_map),
@@ -1951,8 +2031,7 @@ where
         supervisor_pid,
         shim_host_pid: Some(handshake.shim_host_pid),
         handshake_ms: handshake.elapsed.as_millis() as u64,
-        writable: "/run/vitrin, /vitrin/home, /tmp, /dev/shm (plus /proc, /dev/pts and \
-                   the borrowed device nodes, which store nothing)",
+        writable: handshake.root_view.writable,
         stdio: "per-realm log file",
         storage_reused,
         mount_count: Some(handshake.mount_count),
@@ -1992,6 +2071,7 @@ fn tail_realm_log(path: &Path, realm_id: &str, err: SpawnError) -> SpawnError {
     };
     let from = text.len().saturating_sub(REALM_LOG_TAIL as usize);
     let tail = String::from_utf8_lossy(&text[from..]);
+    let tail = sanitise_for_terminal(tail.trim_end());
     let tail = tail.trim_end();
     if tail.trim().is_empty() {
         return err;
@@ -2016,16 +2096,66 @@ fn tail_realm_log(path: &Path, realm_id: &str, err: SpawnError) -> SpawnError {
     }
 }
 
+/// Strip the control characters out of realm-written text before it reaches
+/// the operator's terminal.
+///
+/// `realm.log` lives inside the runtime directory the realm has bound
+/// read-write at `/run/vitrin`, so the confined app can truncate it and write
+/// whatever it likes -- and [`tail_realm_log`] echoes the last 4 KiB of it
+/// into `vitrind`'s stderr. Bounded and labelled untrusted was not enough on
+/// its own: an escape sequence can move the cursor, repaint earlier lines, or
+/// set the title, so a realm that failed to start could forge output
+/// attributed to the core that killed it.
+///
+/// Newlines and tabs survive, because a linker error is unreadable without
+/// them and neither can reposition a cursor. Everything else below `0x20`,
+/// plus `DEL` and the C1 range, becomes a visible escape. `\u{...}` rather
+/// than a dot so the text stays reversible: an operator debugging a genuinely
+/// binary crash dump can still see what was there.
+fn sanitise_for_terminal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' | '\t' => out.push(ch),
+            c if c.is_control() || ('\u{80}'..='\u{9f}').contains(&c) => {
+                out.push_str(&format!("\\u{{{:02x}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// What the handshake established, all of it read by this process.
 struct Handshake {
     namespaces_verified: Vec<&'static str>,
+    /// Whether `/proc/<pid>/setgroups` read back `deny`. Not a constant: it
+    /// is what the read-back comparison returned, and a spawn that did not
+    /// perform the comparison cannot produce it.
+    setgroups_denied: bool,
     supplementary_groups: Option<usize>,
     uid_map: String,
     gid_map: String,
     shim_host_pid: i32,
+    /// What P20 measured, not what P20 was hoping for.
+    root_view: RootView,
     mount_count: u32,
     mount_fingerprint: u64,
     elapsed: Duration,
+}
+
+/// What the root-view checkpoint (P20) actually observed.
+///
+/// Returned rather than reduced to `Ok(())` on purpose: the journal's
+/// `root_dev_differs` and `canaries_unreachable` used to be literal
+/// `Some(true)` beside a check whose deletion nothing noticed. A value that
+/// only this function can produce is a value the journal cannot state without
+/// the check having run.
+struct RootView {
+    root_dev_differs: bool,
+    canaries_probed: usize,
+    canaries_unreachable: bool,
+    writable: WritableSet,
 }
 
 /// The five namespace kinds the *supervisor* is checked on, plus the one the
@@ -2120,7 +2250,8 @@ fn handshake(
     // kernel renders an id map back as `%10u %10u %10u`, so a byte comparison
     // against what was written fails on every kernel.
     let setgroups = read_proc(supervisor_pid, "setgroups")?;
-    if setgroups.trim() != "deny" {
+    let setgroups_denied = setgroups.trim() == "deny";
+    if !setgroups_denied {
         return Err(refuse(
             ConfinementFault::MapVerify,
             format!("setgroups reads back {setgroups:?}, not \"deny\""),
@@ -2161,7 +2292,7 @@ fn handshake(
     // The pid is safe to address by number throughout because the core holds
     // an unreaped `Child`, which pins the supervisor's pid against reuse for
     // the whole handshake -- and PID 1 cannot outlive it.
-    verify_root_view(shim_host_pid, conf)?;
+    let root_view = verify_root_view(shim_host_pid, supervisor_pid, conf)?;
 
     // P21.
     send_frame(cfg, &encode(&Frame::Proceed)?)?;
@@ -2170,21 +2301,34 @@ fn handshake(
     // in the child, and `FD_CLOEXEC` only takes effect on a *successful*
     // `execve`, so the channel closing means the shim is running. A frame
     // instead of an EOF means it is not.
-    match recv_frame(cfg, deadline) {
-        Err(SpawnError::Confinement {
-            class: ConfinementFault::HelperDied,
-            ..
-        }) => {}
-        Err(other) => return Err(other),
-        Ok(frame) => return Err(unexpected(frame)),
+    //
+    // `Ok(None)` and not an error class: EOF-as-a-signal is only sound if
+    // EOF can be told apart from failure-to-read. This match used to accept
+    // any `HelperDied`, which `recv_frame` also returned for a `recv(2)`
+    // *error* -- so `ECONNRESET`, `ENOMEM` or `EFAULT` read as "the execve
+    // succeeded". That is the one fail-open shape this whole handshake exists
+    // to avoid, and the codec now keeps the two apart at the type level.
+    match recv_frame_or_eof(cfg, deadline)? {
+        None => {}
+        Some(frame) => return Err(unexpected(frame)),
     }
+
+    // The last thing that binds the *verified* pid to the process that
+    // actually `execve`'d. Everything above proved that `shim_host_pid` is
+    // the supervisor's child and is PID 1 of a nested namespace whose root is
+    // not the host's; this proves the program now running there is the shim
+    // the core bound into the realm, and not something else the helper
+    // arranged after the checkpoint passed.
+    verify_shim_exe(shim_host_pid)?;
 
     Ok(Handshake {
         namespaces_verified,
+        setgroups_denied,
         supplementary_groups,
         uid_map,
         gid_map,
         shim_host_pid,
+        root_view,
         mount_count,
         mount_fingerprint,
         elapsed: started.elapsed(),
@@ -2212,10 +2356,36 @@ fn send_frame(cfg: BorrowedFd<'_>, bytes: &[u8]) -> Result<(), SpawnError> {
 
 /// Receive one frame, or refuse. Never blocks past `deadline`.
 ///
+/// The EOF-expecting caller is [`recv_frame_or_eof`]; every other call site
+/// wants a frame, and an EOF there is a helper that died mid-handshake.
+fn recv_frame(cfg: BorrowedFd<'_>, deadline: Instant) -> Result<Frame, SpawnError> {
+    match recv_frame_or_eof(cfg, deadline)? {
+        Some(frame) => Ok(frame),
+        None => Err(refuse(
+            ConfinementFault::HelperDied,
+            "the confinement helper closed its channel without reporting",
+        )),
+    }
+}
+
+/// Receive one frame, `Ok(None)` for a genuine end of stream, or refuse.
+///
+/// **`Ok(None)` is exactly `recv(2)` returning zero, and nothing else.** The
+/// distinction is load bearing rather than tidy: P22 reads EOF as "the shim's
+/// `execve` succeeded, so `FD_CLOEXEC` closed the channel". While a `recv`
+/// *error* and an end of stream shared one error class, every errno the
+/// syscall can return -- `ECONNRESET`, `ENOMEM`, `EFAULT` -- was read as
+/// proof that a program started. An adversarial review found that and it was
+/// right: an inference from silence is only as good as the reader's ability
+/// to tell silence from deafness.
+///
 /// A helper `FAIL` frame is translated here, once, into this module's own
 /// vocabulary -- so the mapping from "where the child gave up" to a
 /// `cause_class` lives at one site instead of at each call.
-fn recv_frame(cfg: BorrowedFd<'_>, deadline: Instant) -> Result<Frame, SpawnError> {
+fn recv_frame_or_eof(
+    cfg: BorrowedFd<'_>,
+    deadline: Instant,
+) -> Result<Option<Frame>, SpawnError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(timed_out());
@@ -2233,7 +2403,7 @@ fn recv_frame(cfg: BorrowedFd<'_>, deadline: Instant) -> Result<Frame, SpawnErro
     if ready < 0 {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::Interrupted {
-            return recv_frame(cfg, deadline);
+            return recv_frame_or_eof(cfg, deadline);
         }
         return Err(refuse(
             ConfinementFault::HelperProtocol,
@@ -2243,17 +2413,20 @@ fn recv_frame(cfg: BorrowedFd<'_>, deadline: Instant) -> Result<Frame, SpawnErro
 
     let mut buf = vec![0u8; CONFIG_MAX];
     let read = rustix::net::recv(cfg, &mut buf, rustix::net::RecvFlags::empty()).map_err(|e| {
+        // A read that *failed* is not a read that returned nothing. This arm
+        // must never reach P22's success path.
         refuse(
-            ConfinementFault::HelperDied,
-            format!("the confinement helper's channel faulted ({e})"),
+            ConfinementFault::HelperProtocol,
+            format!(
+                "the confinement helper's channel faulted ({e}); this is a failure to read, \
+                 which is not the same fact as an end of stream and must never be mistaken \
+                 for one -- the shim's execve is reported by EOF and by nothing else"
+            ),
         )
     })?;
     let n = read.0;
     if n == 0 {
-        return Err(refuse(
-            ConfinementFault::HelperDied,
-            "the confinement helper closed its channel without reporting",
-        ));
+        return Ok(None);
     }
     let frame = Frame::decode(&buf[..n]).map_err(|e| {
         refuse(
@@ -2264,7 +2437,7 @@ fn recv_frame(cfg: BorrowedFd<'_>, deadline: Instant) -> Result<Frame, SpawnErro
     if let Frame::Fail { stage, errno } = frame {
         return Err(from_helper_stage(stage, errno));
     }
-    Ok(frame)
+    Ok(Some(frame))
 }
 
 fn timed_out() -> SpawnError {
@@ -2437,12 +2610,84 @@ fn read_map(pid: u32, name: &str, expected: u32) -> Result<String, SpawnError> {
 
 /// P20. The behavioural probe: what can the realm actually reach?
 ///
-/// Three facts, all read by this process through `/proc/<pid>/root`, which
+/// Everything here is read by this process through `/proc/<pid>/…`, which
 /// needs no `mountinfo` permission and is readable across the realm's user
 /// namespace because the core is the same kuid and an ancestor. **Fail closed
 /// on any read error**: "I could not tell" is not "it is confined".
-fn verify_root_view(shim_host_pid: i32, conf: &Confinement) -> Result<(), SpawnError> {
+///
+/// # Step 0 exists because the pid is the helper's word
+///
+/// `shim_host_pid` arrives in `Frame::Child`. Until an adversarial review
+/// pointed it out, nothing checked that the number named the supervisor's
+/// child rather than a decoy: a substituted helper could genuinely unshare
+/// six namespaces (it must -- P13 reads the *supervisor*, which is the
+/// process this core spawned), fork a decoy that pivots into an empty tmpfs
+/// and sleeps, report the decoy's pid, and then `execve` the shim in a second
+/// child that never left the host filesystem. Every check below would pass on
+/// the decoy and the journal would record a confined realm.
+///
+/// Two `/proc/<pid>/status` fields close it, and both are rendered in **this
+/// process's** pid namespace by the kernel rather than supplied by anyone:
+///
+/// - `PPid:` must be the supervisor the core spawned and holds an unreaped
+///   `Child` for. A second child of the supervisor would pass this alone,
+///   which is why the second field is not optional.
+/// - `NSpid:` must be exactly two fields ending in `1` -- this pid, then its
+///   pid *in the namespace one level down*. Exactly two means one level of
+///   nesting; ending in `1` means it is that namespace's init, which is what
+///   makes killing it take the namespace down.
+///
+/// And after the `execve`, [`verify_shim_exe`] confirms the program actually
+/// running under that pid.
+fn verify_root_view(
+    shim_host_pid: i32,
+    supervisor_pid: u32,
+    conf: &Confinement,
+) -> Result<RootView, SpawnError> {
     let root = format!("/proc/{shim_host_pid}/root");
+
+    // 0. The pid is the supervisor's child, and it is init of exactly one
+    //    nested pid namespace.
+    let status = fs::read_to_string(format!("/proc/{shim_host_pid}/status")).map_err(|e| {
+        refuse(
+            ConfinementFault::RootView,
+            format!(
+                "cannot read /proc/{shim_host_pid}/status ({e}); the pid the helper reported \
+                 cannot be verified, and an unverified pid is not evidence about anything"
+            ),
+        )
+    })?;
+    let field = |name: &str| -> Option<String> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+    };
+    let ppid = field("PPid:").and_then(|v| v.parse::<u32>().ok());
+    if ppid != Some(supervisor_pid) {
+        return Err(refuse(
+            ConfinementFault::RootView,
+            format!(
+                "the helper reported pid {shim_host_pid} as the realm's PID 1, but its parent \
+                 is {ppid:?} and not the supervisor this core spawned ({supervisor_pid}). A \
+                 helper is free to fork a decoy, confine the decoy and exec the shim somewhere \
+                 else entirely; this check is what makes the pid a fact rather than a claim"
+            ),
+        ));
+    }
+    let nspid: Vec<String> = field("NSpid:")
+        .map(|v| v.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
+    if nspid.len() != 2 || nspid[1] != "1" {
+        return Err(refuse(
+            ConfinementFault::RootView,
+            format!(
+                "pid {shim_host_pid} has NSpid {nspid:?}, not exactly two entries ending in 1. \
+                 Two entries is one level of pid-namespace nesting, and the trailing 1 is what \
+                 makes this process that namespace's init -- which is the property the whole \
+                 termination ladder rests on"
+            ),
+        ));
+    }
 
     // 1. The realm's pid namespace, proved from the child that is *in* it.
     let ours = read_ns(std::process::id() as i32, "pid")?;
@@ -2488,8 +2733,40 @@ fn verify_root_view(shim_host_pid: i32, conf: &Confinement) -> Result<(), SpawnE
 
     // 3. The canaries. This is the same property the acceptance gate asserts,
     //    run on every single spawn rather than once in CI.
+    //
+    // **The question is "can the realm reach this host inode", not "does this
+    // name exist inside the realm".** Those came apart the moment the mount
+    // table grew: `app_dir_to_bind` binds the app's containing directory at
+    // the same in-realm path, and creating that target `mkdir -p`s every
+    // ancestor onto the realm's own root tmpfs. So an app anywhere under
+    // `$HOME` -- which is every development checkout, and every realm the
+    // integration harness spawns -- materialises `$HOME` inside the realm as
+    // an empty stub, and a pure-presence test refused the spawn. Fail-closed,
+    // but refusing every spawn is not a confinement property, it is an outage.
+    //
+    // `(st_dev, st_ino)` separates the two cases exactly: the stub is a fresh
+    // inode on a tmpfs this core's helper mounted, the breach is the host's
+    // own inode reachable by its own name. The same comparison also *narrows*
+    // the check, because a mount table that shadowed a canary with a decoy of
+    // the same name no longer passes by accident.
+    let mut probed = 0usize;
     for canary in &conf.canaries {
+        // Resolved now rather than at startup: this is the identity the realm
+        // must not be able to reach *at this instant*, and the whole point of
+        // running the probe on every spawn is that startup was a while ago.
+        let host = fs::symlink_metadata(canary).map_err(|e| {
+            refuse(
+                ConfinementFault::RootView,
+                format!(
+                    "cannot stat the canary {} on the host ({e}). A canary that does not exist \
+                     out here proves nothing when it is absent in there, and a vacuous check is \
+                     worse than no check because it reads as a pass",
+                    canary.display()
+                ),
+            )
+        })?;
         let probe = format!("{root}{}", canary.display());
+        probed += 1;
         match fs::symlink_metadata(&probe) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -2502,17 +2779,108 @@ fn verify_root_view(shim_host_pid: i32, conf: &Confinement) -> Result<(), SpawnE
                     ),
                 ))
             }
-            Ok(_) => {
+            Ok(inside) if (inside.dev(), inside.ino()) == (host.dev(), host.ino()) => {
                 return Err(refuse(
                     ConfinementFault::RootView,
                     format!(
-                        "{} is REACHABLE from inside the realm. This is the check that catches \
-                         a helper which unshared its namespaces and mounted nothing",
-                        canary.display()
+                        "{} is REACHABLE from inside the realm -- same device {} and same inode \
+                         {}, so it is the host's own file and not a same-named stub. This is the \
+                         check that catches a helper which unshared its namespaces and mounted \
+                         nothing",
+                        canary.display(),
+                        host.dev(),
+                        host.ino()
                     ),
                 ))
             }
+            // Present, but a different inode: the mount table's own stub
+            // directory, which holds nothing and leads nowhere the rest of
+            // the table does not already permit.
+            Ok(_) => {}
         }
+    }
+
+    // 4. And what the realm can *write*, measured rather than asserted. Not a
+    //    gate here -- turning the write set into a refusal is P2.6.9's
+    //    measured-write-set task -- but a parent-observed fact, so the
+    //    journal stops printing a sentence about a mount table nobody read.
+    let writable = match measure_writable_set(shim_host_pid) {
+        Ok(set) => WritableSet::Measured(set),
+        Err(detail) => WritableSet::Unreadable(detail),
+    };
+
+    Ok(RootView {
+        root_dev_differs: true,
+        canaries_probed: probed,
+        canaries_unreachable: true,
+        writable,
+    })
+}
+
+/// The mount points the realm can write, from the child's own `mountinfo`.
+///
+/// mountinfo fields are `id parent dev root MOUNTPOINT OPTIONS`, then optional
+/// fields, then ` - `. The per-mount options are field 5; searching the whole
+/// line for `rw` would match the **superblock** options after the separator,
+/// which say nothing about this mount.
+fn measure_writable_set(pid: i32) -> Result<Vec<String>, String> {
+    let path = format!("/proc/{pid}/mountinfo");
+    let text = fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let mut set: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let mountpoint = f.nth(4)?;
+            let options = f.next()?;
+            options
+                .split(',')
+                .any(|o| o == "rw")
+                .then(|| mountpoint.to_string())
+        })
+        .collect();
+    set.sort();
+    set.dedup();
+    Ok(set)
+}
+
+/// The last link in the chain that makes `shim_host_pid` a parent fact: the
+/// program running under that pid is the shim the core bound into the realm.
+///
+/// Read **after** the EOF that reports the second `execve`, because before it
+/// the pid is still running `vitrin-realm-init` and the answer would be the
+/// helper's path. `/proc/<pid>/exe` is rendered by the kernel against this
+/// reader's root, so a path inside a mount namespace this core cannot reach
+/// comes back with an `(unreachable)` prefix -- hence a suffix match on the
+/// in-realm path rather than an equality against it.
+fn verify_shim_exe(shim_host_pid: i32) -> Result<(), SpawnError> {
+    let link = format!("/proc/{shim_host_pid}/exe");
+    let target = fs::read_link(&link).map_err(|e| {
+        refuse(
+            ConfinementFault::ExecShim,
+            format!(
+                "the config channel closed, which should mean the shim `execve`d, but {link} \
+                 cannot be read ({e}); fail closed rather than record a shim this core never \
+                 saw"
+            ),
+        )
+    })?;
+    // Measured on this kernel: the link reads back as exactly `/vitrin/shim`.
+    // Matched as a suffix rather than for equality anyway, because `d_path`
+    // is documented to prefix a path it cannot reach from the reader's root
+    // with `(unreachable)`, and a hardening change that started doing so here
+    // must not turn every confined spawn into a refusal.
+    let in_realm_shim = Path::new(IN_REALM_SHIM.trim_start_matches('/'));
+    if !target.ends_with(in_realm_shim) {
+        return Err(refuse(
+            ConfinementFault::ExecShim,
+            format!(
+                "the verified realm pid {shim_host_pid} is running {} and not the shim this \
+                 core bound at {IN_REALM_SHIM}. The handshake's EOF says *something* exec'd; \
+                 this says what, so a helper cannot pass the checkpoint with one child and run \
+                 the shim in another",
+                target.display()
+            ),
+        ));
     }
     Ok(())
 }
@@ -3209,6 +3577,36 @@ pub(crate) mod tests {
         );
     }
 
+    /// A binary from `crates/vitrin-realm-init-fixtures`, resolved exactly as
+    /// [`mock_shim_bin`] resolves the mock shim.
+    ///
+    /// Each fixture defeats exactly one of the core's confinement
+    /// checkpoints, so a test can prove that checkpoint fires. They exist
+    /// because an adversarial review deleted two of the checks and watched
+    /// the whole suite stay green: the tests against the *real* helper cannot
+    /// exercise a guard a correct helper never trips.
+    ///
+    /// `crates/vitrin-realm-init-fixtures/tests/binary_contract.rs` is what
+    /// makes `cargo test --workspace` build them.
+    pub(crate) fn fixture_bin(name: &str) -> PathBuf {
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        let deps = exe.parent().expect("test binary has a parent directory");
+        let mut candidates = vec![deps.join(name)];
+        if let Some(profile) = deps.parent() {
+            candidates.push(profile.join(name));
+        }
+        for candidate in &candidates {
+            if candidate.is_file() {
+                return candidate.clone();
+            }
+        }
+        panic!(
+            "{name} fixture binary not found in {candidates:?}; run \
+             `cargo build -p vitrin-realm-init-fixtures` (CI's `cargo test --workspace` builds \
+             it, via that crate's tests/binary_contract.rs)"
+        );
+    }
+
     /// Whether this machine will grant the six namespaces the confined spawn
     /// asks for.
     ///
@@ -3495,17 +3893,43 @@ pub(crate) mod tests {
 
         /// A host file that must be unreachable from inside the realm.
         ///
-        /// Deliberately **not** inside the scratch base: the realm's runtime
-        /// directory lives there and *is* bound, so a canary beside it would
-        /// be reachable and the test would fail for the wrong reason. This
-        /// one sits directly in the temp directory, which the realm's own
-        /// fresh `/tmp` tmpfs shadows.
+        /// **Never under `/tmp`, and that is the whole design of this
+        /// function.** The realm gets a fresh `/tmp` tmpfs unconditionally,
+        /// so a canary there is shadowed by one line of the mount table: a
+        /// helper that mounted *only* that one tmpfs and nothing else would
+        /// pass, which makes the canary vacuous in exactly the way D-036's
+        /// own open question warned against. It has to live somewhere the
+        /// realm's absence of it is a consequence of the pivot, not of a
+        /// tmpfs the core happens to stack on top.
+        ///
+        /// `$XDG_RUNTIME_DIR` first: it is a real host directory, no mount in
+        /// the table shadows it, and writing there is what that directory is
+        /// for. `$HOME` second, on the same terms the acceptance gate uses --
+        /// created per run and removed in the teardown. If neither is set
+        /// this **panics** rather than falling back to `/tmp`: a test that
+        /// silently substitutes a vacuous canary is worse than one that does
+        /// not run, because it reports a pass.
         fn canary(&self) -> PathBuf {
-            let path = std::env::temp_dir().join(format!(
+            let name = format!(
                 "vitrin-confinement-canary-{}-{}",
                 std::process::id(),
                 self.base.file_name().unwrap().to_string_lossy()
-            ));
+            );
+            let dir = ["XDG_RUNTIME_DIR", "HOME"]
+                .iter()
+                .filter_map(std::env::var_os)
+                .map(PathBuf::from)
+                .find(|d| d.is_dir())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "neither $XDG_RUNTIME_DIR nor $HOME names a directory, so this test has \
+                         nowhere to put a canary that the realm's own /tmp tmpfs does not \
+                         shadow. Refusing to substitute a /tmp path: it would be unreachable \
+                         inside every realm whether or not the mount table was built, and the \
+                         test would pass on a helper that did nothing"
+                    )
+                });
+            let path = dir.join(name);
             fs::write(&path, b"the realm must not be able to read this").unwrap();
             path
         }
@@ -3770,9 +4194,15 @@ pub(crate) mod tests {
         let names: BTreeSet<&str> = env.keys().map(String::as_str).collect();
         assert_eq!(
             names,
-            BTreeSet::from(["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"]),
+            BTreeSet::from(["HOME", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"]),
             "an empty allowlist inherits NOTHING"
         );
+        // `HOME` is in that set as a core INJECTION, not as inheritance --
+        // the same status `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` have. It is
+        // in `RESERVED_ENV`, so `env_allow` could not have passed it through
+        // whatever the operator wrote; the core decides it in both isolation
+        // modes and here decides on the host's own.
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/agent"));
         h.reap(spawned);
     }
 
@@ -4903,7 +5333,8 @@ pub(crate) mod tests {
         // the moment a field is added for the other arm.
         let _fd = fd_lock();
         let mut h = Harness::new("off-unchanged");
-        let (spawned, _server) = h.spawn_mock(&["--serve"], &[], &[]);
+        let host_home = "/home/operator-under-test";
+        let (spawned, _server) = h.spawn_mock(&["--serve"], &[], &[("HOME", host_home)]);
         let pid = spawned.pid();
 
         // 1. stdout and stderr are INHERITED. This is the property clause 9
@@ -4922,11 +5353,19 @@ pub(crate) mod tests {
             fs::read_link(format!("/proc/{pid}/fd/0")).expect("fd 0"),
             Path::new("/dev/null")
         );
-        // 3. No HOME. The core injects it only on the confined path, because
-        //    only there does the host $HOME stop existing.
-        assert!(
-            !child_env_of(pid).contains_key("HOME"),
-            "the unconfined path must not inject HOME: the host's one is still there and              still correct"
+        // 3. HOME is the HOST's, not a realm-private directory. `HOME` is
+        //    reserved at config-load time in both modes -- a `realm.toml`
+        //    whose validity depended on `--isolation` would load on one
+        //    invocation and fail on the next -- so the core has to decide it
+        //    here too, and at `--isolation=off` the honest decision is the
+        //    operator's own home. The two arms differ in the VALUE, never in
+        //    whether the app has one; an `off` realm with no `HOME` at all is
+        //    neither the path that shipped before #186 nor a positive control
+        //    for the confined path's `/vitrin/home`.
+        assert_eq!(
+            child_env_of(pid).get("HOME").map(String::as_str),
+            Some(host_home),
+            "at --isolation=off the realm must get the operator's own HOME"
         );
         // 4. The cwd is the realm's HOST runtime directory, not /run/vitrin.
         let cwd = fs::read_link(format!("/proc/{pid}/cwd")).expect("cwd");
@@ -4947,7 +5386,7 @@ pub(crate) mod tests {
         if !namespaces_available() {
             return;
         }
-        with_confined_realm("confined-authority", |shim, _facts| {
+        with_confined_realm("confined-authority", |shim, facts| {
             // Zero capabilities. `execve` recomputes them, and with an
             // identity map there is no valid `make_kuid(ns, 0)` -- so the
             // root special case never fires and the drop in the helper makes
@@ -5086,6 +5525,18 @@ pub(crate) mod tests {
             assert!(!writable.contains(&"/"), "the realm's root is writable");
             assert!(!writable.contains(&"/dev"), "the realm's /dev is writable");
 
+            // And what the JOURNAL will say is the same list -- because the
+            // core measured it, from this same file, on this same spawn. It
+            // was a hardcoded `&'static str` printed under `parent_observed`
+            // until an adversarial review named that for what it was: a
+            // sentence about a mount table nobody had read. Asserting the
+            // equality here is what stops it drifting back into one.
+            assert_eq!(
+                facts.writable,
+                WritableSet::Measured(writable.iter().map(|m| m.to_string()).collect()),
+                "the journal's writable set is not the one the parent can measure right now"
+            );
+
             // The device closure the limits page is about.
             for absent in ["/dev/input", "/dev/dri/card0", "/dev/kmsg"] {
                 assert!(
@@ -5182,6 +5633,278 @@ pub(crate) mod tests {
             !paths.realm_dir("realm-0").unwrap().exists(),
             "a refused spawn left its runtime directory behind"
         );
+        let _ = fs::remove_file(&canary);
+    }
+
+    // -- the two clause-4 checkpoints, proved non-vacuous -------------------
+    //
+    // Both guards below used to be deletable with the suite staying green. An
+    // adversarial review measured exactly that: replacing the canary loop
+    // with `.iter().take(0)` and the `st_dev` comparison with `if false &&
+    // ...` each left 5 passed, 0 failed. Two reasons, both now closed:
+    // the journal's booleans were literal `Some(true)` rather than the
+    // checks' results, and no test could put the core in a state where a
+    // guard had anything to catch. What follows is the state.
+
+    #[test]
+    fn the_realms_last_words_cannot_repaint_the_operators_terminal() {
+        // `realm.log` is inside the runtime directory the realm has bound
+        // read-write at `/run/vitrin`, so the confined app can truncate it and
+        // write anything; the core echoes its tail into its own stderr on a
+        // bring-up failure. Bounded and labelled untrusted was not enough: an
+        // escape sequence can clear the screen, reposition the cursor over
+        // lines the core already printed, or set the window title, so a realm
+        // that failed to start could forge output attributed to the core that
+        // refused it.
+        let hostile = "ld.so: not found\x1b[2J\x1b[1;1H\x1b]0;owned\x07vitrind: all fine\r\x07";
+        let safe = sanitise_for_terminal(hostile);
+        assert!(!safe.contains('\x1b'), "an ESC survived: {safe:?}");
+        assert!(!safe.contains('\x07'), "a BEL survived: {safe:?}");
+        assert!(!safe.contains('\r'), "a CR survived: {safe:?}");
+        // Reversible, not redacted: an operator debugging a genuinely binary
+        // crash dump can still see what the bytes were.
+        assert!(safe.contains("\\u{1b}"), "{safe:?}");
+        // And the two characters a linker error is unreadable without survive
+        // untouched -- neither can reposition a cursor.
+        assert_eq!(sanitise_for_terminal("a\nb\tc"), "a\nb\tc");
+        assert!(safe.starts_with("ld.so: not found"), "{safe:?}");
+    }
+
+    #[test]
+    fn a_helper_that_unshares_but_mounts_nothing_is_refused() {
+        // The exact hole clause 4 is written against, as a running program:
+        // `unshare-only-init` genuinely unshares all six namespaces, so every
+        // P13 inode read passes and the maps are written -- and then it
+        // mounts nothing at all. Six differing namespace inodes prove a
+        // helper unshared; they prove nothing about what it built, and this
+        // is the check that knows the difference.
+        //
+        // NON-VACUITY: the refusal must be `root_view` and not `ns_verify`.
+        // A fixture that failed to unshare would be refused too, one
+        // checkpoint earlier, and the test would pass for the wrong reason --
+        // so the class is asserted by name rather than the mere failure.
+        let _fd = fd_lock();
+        if !namespaces_available() {
+            return;
+        }
+        let mut h = Harness::new("unshare-only");
+        let mut confinement = h.confinement();
+        confinement.realm_init = fixture_bin("unshare-only-init");
+        let canary = confinement.canaries[0].clone();
+        let bin = mock_shim_bin();
+        let realm = realm_with_spawn("realm-0", &bin, &["--serve".to_string()], &[]);
+        let paths = h.paths().confined(confinement);
+        let err = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut h.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .expect_err("a helper that mounted nothing must be refused");
+        assert_eq!(
+            err.cause_class(),
+            "root_view",
+            "the refusal came from the wrong checkpoint: {err}"
+        );
+        // The message, not just the class: with the `st_dev` comparison
+        // removed this fixture is caught one step later by the canary loop,
+        // which is also a `root_view`. A needle unique to the root-device
+        // refusal is what keeps the two checkpoints' tests from covering for
+        // each other -- measured, after exactly that.
+        assert!(
+            err.to_string().contains("never pivoted onto its own tree"),
+            "the refusal came from the canary loop, not from the root-device check: {err}"
+        );
+        assert!(
+            !paths.realm_dir("realm-0").unwrap().exists(),
+            "a refused spawn left its runtime directory behind"
+        );
+        let _ = fs::remove_file(&canary);
+    }
+
+    #[test]
+    fn a_canary_the_realm_really_can_reach_is_refused() {
+        // The canary loop's own non-vacuity, and it needs no fixture: point a
+        // canary at a path the realm's mount table *does* reproduce, with the
+        // host's own inode behind it, and the core must refuse. `/usr` is
+        // bound read-only at `/usr`, so any file under it is the same
+        // (st_dev, st_ino) inside and out -- which is exactly the condition
+        // the check is looking for.
+        //
+        // NON-VACUITY: delete the loop and this spawn succeeds.
+        let _fd = fd_lock();
+        if !namespaces_available() {
+            return;
+        }
+        let reachable = PathBuf::from("/usr/bin/env");
+        if !reachable.exists() {
+            eprintln!("SKIPPED: {} is missing on this host", reachable.display());
+            return;
+        }
+        let mut h = Harness::new("reachable-canary");
+        let mut confinement = h.confinement();
+        let scratch = confinement.canaries[0].clone();
+        confinement.canaries.push(reachable.clone());
+        let bin = mock_shim_bin();
+        let realm = realm_with_spawn("realm-0", &bin, &["--serve".to_string()], &[]);
+        let paths = h.paths().confined(confinement);
+        let err = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut h.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .expect_err("a canary inside the realm's own /usr bind must refuse the spawn");
+        assert_eq!(err.cause_class(), "root_view", "{err}");
+        assert!(
+            err.to_string().contains("/usr/bin/env") && err.to_string().contains("same inode"),
+            "the refusal must name the path and the evidence: {err}"
+        );
+        let _ = fs::remove_file(&scratch);
+    }
+
+    #[test]
+    fn a_stub_the_mount_table_had_to_create_is_not_a_reachable_canary() {
+        // The other direction, and the reason the check compares inodes
+        // rather than presence. `app_dir_to_bind` binds the app's containing
+        // directory at the same in-realm path, and creating that target
+        // `mkdir -p`s every ancestor onto the realm's own root tmpfs. So an
+        // app under `$HOME` -- every development checkout, and every realm
+        // the integration harness spawns -- materialises those ancestors
+        // inside the realm as empty stubs.
+        //
+        // A pure-presence canary over any of them refused the spawn. That is
+        // fail-closed and it is still an outage: `--isolation=default` is the
+        // default, so it refused everything. The stub is a fresh inode on a
+        // tmpfs this core's own helper mounted; the breach would be the
+        // host's inode under the host's name, and `(st_dev, st_ino)` is what
+        // separates them.
+        //
+        // NON-VACUITY: the canary is asserted to actually EXIST inside the
+        // realm before the spawn is called a pass, so this cannot degrade
+        // into "the path was absent anyway".
+        let _fd = fd_lock();
+        if !namespaces_available() {
+            return;
+        }
+        let bin = mock_shim_bin();
+        let app_dir = bin.parent().expect("the mock shim has a directory");
+        let Some(stub) = app_dir.parent().filter(|p| {
+            p.parent().is_some() && !p.starts_with("/usr") && !p.starts_with("/etc")
+        }) else {
+            eprintln!("SKIPPED: the mock shim's directory has no bindable ancestor");
+            return;
+        };
+        let stub = stub.to_path_buf();
+
+        let mut h = Harness::new("stub-canary");
+        let mut confinement = h.confinement();
+        let scratch = confinement.canaries[0].clone();
+        confinement.canaries.push(stub.clone());
+        let realm = realm_with_spawn("realm-0", &bin, &["--serve".to_string()], &[]);
+        let paths = h.paths().confined(confinement);
+        let spawned = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut h.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "a stub directory the mount table itself had to create ({}) must not be read \
+                 as a reachable canary: {e}",
+                stub.display()
+            )
+        });
+        let shim = spawned.isolation().shim_host_pid.expect("the shim's host pid");
+        let inside = fs::symlink_metadata(format!("/proc/{shim}/root{}", stub.display()))
+            .expect("the stub really is present inside the realm, or this test proves nothing");
+        let outside = fs::symlink_metadata(&stub).expect("the stub exists on the host");
+        assert_ne!(
+            (inside.dev(), inside.ino()),
+            (outside.dev(), outside.ino()),
+            "the stub and the host directory are the same inode, so the realm really can reach \
+             it and the spawn should have been refused"
+        );
+        assert_eq!(spawned.isolation().canaries_probed, 2);
+        assert_eq!(spawned.isolation().canaries_unreachable, Some(true));
+        h.reap(spawned);
+        let _ = fs::remove_file(&scratch);
+    }
+
+    #[test]
+    fn a_leaked_directory_descriptor_does_not_survive_the_second_execve() {
+        // K13's own test. `close_range(4, ~0, CLOSE_RANGE_CLOEXEC)` is
+        // defence in depth only for as long as every `open` in the helper
+        // remembers `O_CLOEXEC` -- which is precisely the invariant the
+        // syscall exists so that nothing has to depend on. Deleting the call
+        // left the suite green, because nothing in the tree leaks.
+        //
+        // `leaks-a-dirfd-init` leaks one: an `O_DIRECTORY` handle on the
+        // HOST ROOT, without `O_CLOEXEC`, and then `execve`s the real,
+        // unmodified helper in its place. `fchdir` on that descriptor is a
+        // complete pivot escape, and after the `MNT_DETACH` it is the only
+        // remaining handle on the host tree.
+        //
+        // It is also the case a name-based assertion cannot catch: the
+        // descriptor reads back as `/`, and `/` exists inside the realm too.
+        // So the comparison is `(st_dev, st_ino)` against the host root --
+        // the realm's root is a tmpfs this helper mounted, so the two can
+        // never legitimately coincide.
+        //
+        // NON-VACUITY: the host root's identity is read first and the shim's
+        // fd table is asserted non-empty, so "no descriptor matched" cannot
+        // mean "there was nothing to look at".
+        let _fd = fd_lock();
+        if !namespaces_available() {
+            return;
+        }
+        let host_root = fs::metadata("/").expect("the host root stats");
+        let host_root = (host_root.dev(), host_root.ino());
+
+        let mut h = Harness::new("leaked-dirfd");
+        let mut confinement = h.confinement();
+        confinement.realm_init = fixture_bin("leaks-a-dirfd-init");
+        let canary = confinement.canaries[0].clone();
+        let bin = mock_shim_bin();
+        let realm = realm_with_spawn("realm-0", &bin, &["--serve".to_string()], &[]);
+        let paths = h.paths().confined(confinement);
+        let spawned = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut h.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .expect("the wrapper execs the real helper, so the realm must still come up");
+        let shim = spawned.isolation().shim_host_pid.expect("the shim's host pid");
+
+        let entries: Vec<PathBuf> = fs::read_dir(format!("/proc/{shim}/fd"))
+            .expect("the shim's fd table is readable")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            entries.len() >= 4,
+            "the shim's fd table is empty, so this test looked at nothing: {entries:?}"
+        );
+        for entry in &entries {
+            let Ok(st) = fs::metadata(entry) else {
+                continue;
+            };
+            assert_ne!(
+                (st.dev(), st.ino()),
+                host_root,
+                "{} is a descriptor on the HOST ROOT inside the confined shim. fchdir on it \
+                 walks straight out of the realm; K13's close_range is what is supposed to \
+                 have closed it",
+                entry.display()
+            );
+        }
+        h.reap(spawned);
         let _ = fs::remove_file(&canary);
     }
 
@@ -5393,15 +6116,39 @@ pub(crate) mod tests {
         assert_eq!(map.get("HOME").unwrap(), "/vitrin/home");
         assert_eq!(map.get("LANG").unwrap(), "en_US.UTF-8");
         assert!(map.len() < 108, "sanity: this is a map, not a path");
-        // The unconfined shape injects no HOME at all -- the two paths differ
-        // in exactly one variable, and that is checked rather than assumed.
+        // The unconfined shape injects the HOST's home, and the two paths
+        // therefore differ in the *value* of `HOME` rather than in whether
+        // the app has one. `HOME` is reserved at load time in both modes
+        // (config validity must not depend on a CLI flag), so if the
+        // unconfined arm injected nothing an `--isolation=off` realm would
+        // get no `HOME` at all -- which is not the path that shipped before
+        // #186 and not a positive control for anything.
         let unconfined = child_env(
+            &spawn_config,
+            Path::new("/run/user/1000/vitrin-0/realm-0/wayland-0"),
+            Path::new("/run/user/1000/vitrin-0/realm-0"),
+            Some(Path::new("/home/operator")),
+            |_| None,
+        );
+        let unconfined: BTreeMap<String, String> = unconfined
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(unconfined.get("HOME").unwrap(), "/home/operator");
+        // And a core with no `HOME` of its own passes none on: the injection
+        // is "whatever the core decided", never a fabricated default.
+        let homeless = child_env(
             &spawn_config,
             Path::new("/run/user/1000/vitrin-0/realm-0/wayland-0"),
             Path::new("/run/user/1000/vitrin-0/realm-0"),
             None,
             |_| None,
         );
-        assert!(unconfined.iter().all(|(k, _)| k != "HOME"));
+        assert!(homeless.iter().all(|(k, _)| k != "HOME"));
     }
 }

@@ -2237,6 +2237,20 @@ fn key(out: &mut String, k: &str) {
 /// `landlock` and `seccomp` are written as explicit `not-applied` rather than
 /// omitted, on this file's own rule: absent information is an explicit value,
 /// never a missing key.
+///
+/// # The one field above the line that the child supplied
+///
+/// `shim_host_pid` arrives in a helper frame. It is written under
+/// `parent_observed` anyway, and the reason has to be stated here because
+/// this is where a reader meets it: `vitrind` refuses the spawn unless
+/// `/proc/<pid>/status` shows that pid's parent is the supervisor it spawned
+/// and an `NSpid:` of exactly two entries ending in `1`, and unless
+/// `/proc/<pid>/exe` names the shim it bound into the realm. The number was
+/// reported; the process it names was verified. A decoy pid fails all three
+/// checks and no entry is written at all.
+///
+/// Everything else above the line is a direct read, including `writable`,
+/// which is measured from `/proc/<shim>/mountinfo` on the spawn it describes.
 fn write_isolation(out: &mut String, facts: &crate::spawn::IsolationFacts) {
     out.push_str(",\"isolation\":{");
     out.push_str("\"applied_profile\":");
@@ -2298,8 +2312,41 @@ fn write_isolation(out: &mut String, facts: &crate::spawn::IsolationFacts) {
     }
     key(out, "handshake_ms");
     out.push_str(&facts.handshake_ms.to_string());
+    // Two keys, not one string. `writable` is the list the core *measured*
+    // from `/proc/<shim>/mountinfo` on this spawn; `writable_source` says how
+    // the entry came by it, because "measured and short", "nothing to
+    // measure" and "could not read it" are three different facts and a
+    // reader auditing one entry has to be able to tell them apart. It was a
+    // hardcoded sentence under `parent_observed` until an adversarial review
+    // named that for what it was.
     key(out, "writable");
-    push_json_string(out, facts.writable);
+    match &facts.writable {
+        crate::spawn::WritableSet::Measured(mounts) => {
+            out.push('[');
+            for (i, m) in mounts.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, m);
+            }
+            out.push(']');
+        }
+        _ => out.push_str("null"),
+    }
+    key(out, "writable_source");
+    match &facts.writable {
+        crate::spawn::WritableSet::Measured(_) => {
+            push_json_string(out, "measured from /proc/<shim>/mountinfo")
+        }
+        crate::spawn::WritableSet::Unconfined => push_json_string(
+            out,
+            "not measured (--isolation=off: no mount namespace, so the realm's writable set is \
+             everything this uid can write)",
+        ),
+        crate::spawn::WritableSet::Unreadable(why) => {
+            push_json_string(out, &format!("UNREADABLE: {why}"))
+        }
+    }
     key(out, "stdio");
     push_json_string(out, facts.stdio);
     key(out, "storage_reused");
@@ -3550,7 +3597,12 @@ pub(crate) mod tests {
             supervisor_pid: 4242,
             shim_host_pid: Some(4243),
             handshake_ms: 12,
-            writable: "/run/vitrin, /vitrin/home, /tmp, /dev/shm",
+            writable: crate::spawn::WritableSet::Measured(vec![
+                "/dev/shm".to_string(),
+                "/run/vitrin".to_string(),
+                "/tmp".to_string(),
+                "/vitrin/home".to_string(),
+            ]),
             stdio: "per-realm log file",
             storage_reused: false,
             mount_count: Some(21),

@@ -778,9 +778,22 @@ fn bind(source: &Source, target_rel: &str, flags: libc::c_ulong) -> Result<(), F
     //    `/tmp` is shadowed by the time the table is built and would bind the
     //    wrong thing or nothing at all. A descriptor opened before the
     //    staging still names the file it named.
-    // 2. It closes the window between "the core canonicalized and audited
-    //    this path" and "this process mounted it". The audit proved something
-    //    about an inode; a second path resolution could reach a different one.
+    // 2. It closes the window between **this process's `open`** and this
+    //    mount, which is the window the mount table itself creates: every
+    //    source is opened once in `open_sources` and then mounted many lines
+    //    later, and re-resolving the name at each mount site would give a
+    //    racing writer that many chances instead of one.
+    //
+    // What it does **not** close, stated plainly because the honest version
+    // of this note is worth more than the flattering one: the window between
+    // the core's `canonicalize` + audit and `Source::open` here. That is a
+    // second, independent path resolution in a second process, and it is
+    // performed without `O_NOFOLLOW`. It carries exactly the residual
+    // `vitrin_core::spawn::audit_program_at_spawn` records for the program it
+    // audits -- an attacker who can replace a component of an audited path
+    // between the audit and the open wins, and the defence is the
+    // trusted-writer rule over every directory on the path, not the ordering
+    // of these two calls.
     let src = cstr_str(&format!("/proc/self/fd/{}", source.fd))?;
     let dst = cstr_str(target_rel)?;
     mount_raw(Some(&src), &dst, None, MS_BIND, None, Stage::Mount)?;

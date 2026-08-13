@@ -25,7 +25,12 @@ APACHE-2.0 (LICENSE) — explicit patent grant
   - the code generator and its driver: crates/vitrin-scanner, crates/xtask
     — a third party writing a Go, TypeScript or C++ SDK forks these;
   - the conformance and robustness instruments: crates/vitrin-golden,
-    crates/vitrin-mock-shim, fuzz/;
+    crates/vitrin-mock-shim, crates/vitrin-realm-init-fixtures, fuzz/. The
+    last of those holds deliberately broken vitrin-realm-init substitutes,
+    each defeating exactly one of the core's confinement checkpoints so a
+    test can prove that checkpoint fires; they are instruments, never
+    installed and never shipped, so they sit with the other instruments
+    rather than with the MPL-2.0 helper they stand in for;
   - crates/vitrin-png — a hand-rolled, zero-dependency, ENCODE-ONLY PNG
     writer. It was vitrin-golden/src/png.rs and stays on this side of the
     line although the MPL-2.0 core now links it (WS-E.2.4, issue #216): it

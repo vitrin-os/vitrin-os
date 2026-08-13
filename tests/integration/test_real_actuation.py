@@ -57,14 +57,18 @@ import unittest
 
 from harness import (
     IntegrationTest,
+    await_shims,
     children_of,
     comm_of,
     count_changed_pixels,
     descendant_named,
     dominant_colour,
+    exe_identity,
+    file_identity,
     has_real_content,
     locate_colour,
     require_binaries,
+    shims_of,
     whole_realm_grant,
 )
 
@@ -194,18 +198,25 @@ class RealActuationPointer(IntegrationTest):
         )
 
     def _spine(self, core):
-        deadline = time.monotonic() + 15.0
-        shim_pid = None
-        while time.monotonic() < deadline:
-            kids = children_of(core.pid)
-            if kids:
-                shim_pid = kids[0]
-                break
-            time.sleep(0.05)
+        # `shims_of`, not `children_of`: at --isolation=default (the
+        # default since P2.6.2, #186) the core's direct child is the
+        # `vitrin-realm-init` supervisor and the shim is ITS child, so a
+        # direct-children walk finds no shim at all.
+        found = await_shims(core.pid, timeout=15.0)
+        shim_pid = found[0] if found else None
         self.assertIsNotNone(shim_pid, "the core forked no shim")
-        self.assertTrue(
-            comm_of(shim_pid).startswith("vitrin-shim"),
-            f"the core's child must be the real C shim, not {comm_of(shim_pid)!r}",
+        # The mock-freeness check, by INODE rather than by name. A confined
+        # shim is bound at `/vitrin/shim`, so its `comm` is `shim` whichever
+        # binary it is (P2.6.2, #186) and a name test stopped telling the real
+        # shim from `vitrin-mock-shim`. The running image's inode does, and
+        # more sharply: a name says what a program is called, an inode says
+        # which file is executing.
+        self.assertEqual(
+            exe_identity(shim_pid),
+            file_identity(self.shim_bin),
+            f"the realm's shim (pid {shim_pid}, comm {comm_of(shim_pid)!r}) is not "
+            f"the C shim this gate named ({self.shim_bin}) -- vitrin-mock-shim must "
+            "appear nowhere in this path",
         )
         app_pid = descendant_named(core.pid, "click-target", timeout=15.0)
         self.assertIsNotNone(app_pid, "the C shim never fork/exec'd click-target")
@@ -285,7 +296,11 @@ class RealActuationPointer(IntegrationTest):
         conn.close()
         core.terminate()
 
-        out = core.output()
+        # The app's own lines, from wherever THIS run's realm wrote them: a
+        # confined realm gets its own log file rather than inheriting the
+        # core's descriptors (P2.6.2, #186), so `core.output()` no longer
+        # carries a word the app said.
+        out = core.app_output()
 
         # The app's own report of the surface-local coordinate it received. In
         # the single-maximized steady state the shim's view→surface mapping is
@@ -384,7 +399,7 @@ class RealActuationCrossRealm(IntegrationTest):
         deadline = time.monotonic() + 20.0
         shims: list[int] = []
         while time.monotonic() < deadline:
-            shims = [p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]
+            shims = shims_of(core.pid)
             if len(shims) >= 2:
                 break
             time.sleep(0.05)
@@ -515,7 +530,10 @@ class RealActuationCrossRealm(IntegrationTest):
 
         conn.close()
         core.terminate()
-        out = core.output()
+        # Both realms' logs: confinement gives each realm its own file, so
+        # counting HITs in the core's own stream would count zero and counting
+        # them in one realm's log would count one.
+        out = core.all_app_output()
 
         # (3) Each app's own receipt: two HIT lines, one per app.
         hits = [ln for ln in out.splitlines() if ln.startswith("HIT ")]
@@ -619,16 +637,24 @@ class RealActuationText(IntegrationTest):
             log_file=str(self.work / "core.log"),
         )
 
-    def _await_entry_hex(self, timeout=15.0) -> str:
-        """Wait for the probe's ENTRY_HEX line in the live core log, and return it.
+    def _await_entry_hex(self, core, timeout=15.0) -> str:
+        """Wait for the probe's ENTRY_HEX line in the live realm log, and return it.
 
-        The probe writes it to stdout (inherited down to the core's redirected
-        log file) when it is asked to dump (SIGUSR1, sent by the test once the
-        text has landed), so it appears while the core is still running — read
-        the file directly rather than via `core.output()`, which only reads
-        after the core exits.
+        The probe writes it to stdout when it is asked to dump (SIGUSR1, sent
+        by the test once the text has landed), so it appears while the core is
+        still running — read the file directly rather than via
+        `core.app_output()`, which only reads after the core exits.
+
+        **Which file changed with P2.6.2 (#186):** a confined realm's stdout
+        goes to its own `realm.log` rather than being inherited from the core,
+        so this used to poll a file the app no longer writes to. `realm_ids()`
+        rather than a hardcoded `realm-0`, so the fallback for an
+        `--isolation=off` run (where the app's lines really are in the core's
+        redirected stream) is the same code path.
         """
-        log = self.work / "core.log"
+        log = core.realm_log_path()
+        if not log.exists():
+            log = self.work / "core.log"
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             text = log.read_text(errors="replace") if log.exists() else ""
@@ -643,14 +669,12 @@ class RealActuationText(IntegrationTest):
         )
 
     def _spine(self, core):
-        deadline = time.monotonic() + 15.0
-        shim_pid = None
-        while time.monotonic() < deadline:
-            kids = children_of(core.pid)
-            if kids:
-                shim_pid = kids[0]
-                break
-            time.sleep(0.05)
+        # `shims_of`, not `children_of`: at --isolation=default (the
+        # default since P2.6.2, #186) the core's direct child is the
+        # `vitrin-realm-init` supervisor and the shim is ITS child, so a
+        # direct-children walk finds no shim at all.
+        found = await_shims(core.pid, timeout=15.0)
+        shim_pid = found[0] if found else None
         self.assertIsNotNone(shim_pid, "the core forked no shim")
         app_pid = descendant_named(core.pid, "gtk-entry-probe", timeout=20.0)
         self.assertIsNotNone(app_pid, "the C shim never fork/exec'd gtk-entry-probe")
@@ -718,7 +742,7 @@ class RealActuationText(IntegrationTest):
         # byte report is what proves intactness.
         os.kill(app_pid, signal.SIGUSR1)
         expected_hex = self.SECRET.encode("utf-8").hex()
-        entry_hex = self._await_entry_hex()
+        entry_hex = self._await_entry_hex(core)
         self.assertEqual(
             entry_hex,
             expected_hex,

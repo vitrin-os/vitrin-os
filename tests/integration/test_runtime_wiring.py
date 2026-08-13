@@ -17,11 +17,14 @@ import time
 import unittest
 
 from harness import (
+    SUPERVISOR_COMM,
     IntegrationTest,
+    await_shims,
     capture_when_ready,
     children_of,
     comm_of,
     require_binaries,
+    shims_of,
     whole_realm_grant,
 )
 
@@ -85,18 +88,36 @@ class EndToEnd(IntegrationTest):
 
 
 class ProcessTree(IntegrationTest):
-    """**AC2** — the process tree shows core → shim.
+    """**AC2** — the process tree shows core → supervisor → shim.
 
     Discharges issue #31's first acceptance criterion, which until #77 was
     met by tests only: a running `vitrind` forked nothing at all.
+
+    **Two levels since P2.6.2 (#186), and the middle one is asserted rather
+    than skipped over.** At `--isolation=default` -- which is what omitting
+    the flag means, and this core omits it -- the process the core forks is
+    `vitrin-realm-init`, which stays in the host pid namespace and forks the
+    realm's PID 1 (D-037(2): `unshare(CLONE_NEWPID)` does not move the
+    caller). Asserting only "a shim is somewhere below" would go green for a
+    core that had quietly stopped confining, since an unconfined realm also
+    has a shim below it.
     """
 
     def test_the_realm_is_a_real_forked_child(self):
         core = self.core()
-        names = {pid: comm_of(pid) for pid in children_of(core.pid)}
+        await_shims(core.pid)  # the fork is asynchronous with the socket
+        direct = {pid: comm_of(pid) for pid in children_of(core.pid)}
+        self.assertEqual(
+            sorted(direct.values()),
+            [SUPERVISOR_COMM],
+            "at --isolation=default the core's one direct child is the realm's supervisor "
+            f"(`vitrin-realm-init`, comm-truncated to {SUPERVISOR_COMM!r}); it forked "
+            f"{direct} instead",
+        )
+        shims = {pid: comm_of(pid) for pid in shims_of(core.pid)}
         self.assertTrue(
-            any("mock-shi" in name or "shim" in name for name in names.values()),
-            f"the core must fork a shim; children were {names}",
+            any("mock-shi" in name or "shim" in name for name in shims.values()),
+            f"the supervisor must fork a shim; the shims found were {shims}",
         )
 
 

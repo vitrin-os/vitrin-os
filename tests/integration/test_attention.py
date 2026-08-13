@@ -93,6 +93,7 @@ from harness import (  # noqa: E402
     children_of,
     comm_of,
     locate_colour,
+    shims_of,
 )
 
 import vitrin_os  # noqa: E402
@@ -176,7 +177,7 @@ class RealAttentionKey(IntegrationTest):
         deadline = time.monotonic() + 25.0
         shims: list[int] = []
         while time.monotonic() < deadline:
-            shims = [p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]
+            shims = shims_of(core.pid)
             if len(shims) >= 2:
                 break
             time.sleep(0.05)
@@ -432,7 +433,7 @@ class RealAttentionKey(IntegrationTest):
         )
 
         core.terminate()
-        out = core.output()
+        out = core.all_app_output()
         hits = [ln for ln in out.splitlines() if ln.startswith("HIT ")]
         self.assertEqual(
             len(hits),

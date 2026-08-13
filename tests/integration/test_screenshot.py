@@ -88,6 +88,7 @@ from harness import (  # noqa: E402
     capture_dump_path,
     children_of,
     comm_of,
+    shims_of,
 )
 
 #: Matches the rest of the real-app ladder.
@@ -196,7 +197,7 @@ class HumanScreenshotKey(IntegrationTest):
     def _one_live_app(self, core) -> None:
         deadline = time.monotonic() + 25.0
         while time.monotonic() < deadline:
-            shims = [p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]
+            shims = shims_of(core.pid)
             apps = [
                 kid
                 for shim in shims

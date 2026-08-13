@@ -18,18 +18,28 @@ issue's fifth (that it runs green headless / GPU-free and *fails* rather than
 skips on a machine that is meant to run it) is not a per-frame check but a
 property of the whole module, enforced by the Skip-or-fail policy below:
 
-1. **Ancestry.** The process spine is `vitrind -> vitrin-shim ->
-   weston-terminal`, read from procfs -- not the mock, and not a direct app
-   exec by the core.
+1. **Ancestry.** The process spine is `vitrind -> vitrin-realm-init ->
+   vitrin-shim -> weston-terminal`, read from procfs -- not the mock, and not a
+   direct app exec by the core. The middle link arrived with P2.6.2 (#186):
+   `unshare(CLONE_NEWPID)` does not move the caller, so the confinement helper
+   has to fork the realm's PID 1 and stay behind as its supervisor. The shim is
+   matched by the **inode of the file it is executing**, not by `comm`: a
+   confined shim runs from the bind target `/vitrin/shim`, so `vitrin-shim` and
+   `vitrin-mock-shim` answer the same name and only the inode still tells them
+   apart.
 2. **A real frame.** A frame `weston-terminal` actually rendered reaches the
    agent through the enforcement/capture path and is non-uniform (it carries
    the terminal's chrome), so it is neither the mock animation nor an
    all-zero buffer.
-3. **Confinement.** The app's environment names only its shim's private
-   `WAYLAND_DISPLAY` + `XDG_RUNTIME_DIR` (plus the allow-listed WLR_* render
-   selectors), no host session variable leaks in, and the shim's core-socket
-   descriptor (fd 3) is absent from the app's fd table -- checked by inode, so
-   descriptor-number reuse cannot fool it.
+3. **Confinement.** The app's environment names only the three the core
+   injects -- `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and, since P2.6.2, `HOME` --
+   at their **in-realm** paths (`/run/vitrin/wayland-0`, `/run/vitrin`,
+   `/vitrin/home`) plus the allow-listed names; each in-realm path is then
+   resolved through `/proc/<app>/root` and matched **by inode** against this
+   run's own realm tree, so three constants cannot pass for a directory nobody
+   checked. No host session variable leaks in, and the shim's core-socket
+   descriptor (fd 3) is absent from the app's fd table -- also checked by
+   inode, so descriptor-number reuse cannot fool it.
 4. **Graceful degradation (P1.5.2).** Killing the shim mid-run removes the
    surface; the core survives and the agent's next `observe()` returns
    `NoSurface`, not a stale real-app frame and not a crash.
@@ -57,14 +67,20 @@ import time
 import unittest
 
 from harness import (
+    IN_REALM_HOME,
+    IN_REALM_RUNTIME_DIR,
+    IN_REALM_WAYLAND_SOCKET,
     IntegrationTest,
+    await_shims,
     capture_when_ready,
     children_of,
     colour_bytes,
     comm_of,
     descendant_named,
     environ_of,
+    exe_identity,
     fd_targets_of,
+    file_identity,
     has_real_content as _has_real_content,
     require_binaries,
     whole_realm_grant,
@@ -178,21 +194,27 @@ class RealApp(IntegrationTest):
         fork/execs the app as *its* child, so the app is a grandchild of the
         core. Both are asserted here as the gate's first criterion.
         """
-        deadline = time.monotonic() + 15.0
-        shim_pid = None
-        while time.monotonic() < deadline:
-            kids = children_of(core.pid)
-            if kids:
-                shim_pid = kids[0]
-                break
-            time.sleep(0.05)
+        # `shims_of`, not `children_of`: at --isolation=default (the
+        # default since P2.6.2, #186) the core's direct child is the
+        # `vitrin-realm-init` supervisor and the shim is ITS child, so a
+        # direct-children walk finds no shim at all.
+        found = await_shims(core.pid, timeout=15.0)
+        shim_pid = found[0] if found else None
         self.assertIsNotNone(
             shim_pid, f"the core forked no shim; children were {children_of(core.pid)}"
         )
-        self.assertTrue(
-            comm_of(shim_pid).startswith("vitrin-shim"),
-            f"the core's child must be the real C shim, not {comm_of(shim_pid)!r} -- the mock "
-            "shim (vitrin-mock-shim) must appear nowhere in this path",
+        # The mock-freeness check, by INODE rather than by name. A confined
+        # shim is bound at `/vitrin/shim`, so its `comm` is `shim` whichever
+        # binary it is (P2.6.2, #186) and a name test stopped telling the real
+        # shim from `vitrin-mock-shim`. The running image's inode does, and
+        # more sharply: a name says what a program is called, an inode says
+        # which file is executing.
+        self.assertEqual(
+            exe_identity(shim_pid),
+            file_identity(self.shim_bin),
+            f"the realm's shim (pid {shim_pid}, comm {comm_of(shim_pid)!r}) is not "
+            f"the C shim this gate named ({self.shim_bin}) -- vitrin-mock-shim must "
+            "appear nowhere in this path",
         )
         app_pid = descendant_named(core.pid, APP_NAME, timeout=15.0)
         self.assertIsNotNone(
@@ -254,9 +276,12 @@ class RealApp(IntegrationTest):
         core = self.real_core()
         shim_pid, app_pid = self._spine(core)
         self.assertEqual(
-            {comm_of(core.pid), comm_of(shim_pid), comm_of(app_pid)},
-            {"vitrind", "vitrin-shim", APP_NAME},
-            "the spine must be exactly vitrind -> vitrin-shim -> weston-terminal",
+            (comm_of(core.pid), exe_identity(shim_pid), comm_of(app_pid)),
+            ("vitrind", file_identity(self.shim_bin), APP_NAME),
+            "the spine must be exactly vitrind -> the real C shim -> weston-terminal. "
+            "The middle link is matched by the executing file's inode, not by name: a "
+            "confined shim runs from the bind target /vitrin/shim and its comm is "
+            f"{comm_of(shim_pid)!r} for the real shim and the mock alike (P2.6.2, #186).",
         )
 
         conn = core.connect()
@@ -322,20 +347,51 @@ class RealApp(IntegrationTest):
         env = environ_of(app_pid)
         self.assertTrue(env, f"could not read /proc/{app_pid}/environ")
 
-        # The private socket the shim binds and the private runtime directory,
-        # both under this run's realm tree -- never the host session's.
+        # The private socket the shim binds, the private runtime directory and
+        # the realm's own private storage -- never the host session's.
+        #
+        # **The names changed with P2.6.2 (#186) and the claim got stronger,
+        # not weaker.** At `--isolation=default` -- the default, and what this
+        # gate runs at -- the app's filesystem is the realm's, so the core
+        # injects the IN-REALM paths: `/run/vitrin`, `/run/vitrin/wayland-0`
+        # and `/vitrin/home`. Asserting only those strings would be a weaker
+        # test than the old one, because three constants say nothing about
+        # *which* directory they name; so each is then resolved through
+        # `/proc/<app>/root` and compared BY INODE against this run's own realm
+        # tree. A realm that had somehow been given the host session's runtime
+        # directory under the in-realm name fails the second check.
         realm_dir = core.runtime / "vitrin-0" / "realm-0"
-        expected_display = str(realm_dir / "wayland-0")
         self.assertEqual(
             env.get("WAYLAND_DISPLAY"),
-            expected_display,
-            "the app's WAYLAND_DISPLAY must name its shim's private socket, not a host one",
+            IN_REALM_WAYLAND_SOCKET,
+            "the app's WAYLAND_DISPLAY must name its shim's private socket at the in-realm "
+            "path the core injects",
         )
         self.assertEqual(
             env.get("XDG_RUNTIME_DIR"),
-            str(realm_dir),
-            "the app's XDG_RUNTIME_DIR must be the realm's private directory, not the host's",
+            IN_REALM_RUNTIME_DIR,
+            "the app's XDG_RUNTIME_DIR must be the realm's private directory",
         )
+        self.assertEqual(
+            env.get("HOME"),
+            IN_REALM_HOME,
+            "a confined app's HOME must be the realm's own private storage: the operator's "
+            "home directory is not in the realm's filesystem at all, and passing it through "
+            "would name a path that does not exist (realm.rs's RESERVED_ENV)",
+        )
+        for name, in_realm in (
+            ("XDG_RUNTIME_DIR", IN_REALM_RUNTIME_DIR),
+            ("WAYLAND_DISPLAY", IN_REALM_WAYLAND_SOCKET),
+        ):
+            through_realm = f"/proc/{app_pid}/root{in_realm}"
+            host = realm_dir if name == "XDG_RUNTIME_DIR" else realm_dir / "wayland-0"
+            self.assertEqual(
+                file_identity(through_realm),
+                file_identity(host),
+                f"{in_realm} inside the realm is not this run's own {host}: the app's "
+                f"{name} names an in-realm path, and the path has to resolve to the realm's "
+                "own directory rather than to anything else mounted there",
+            )
         # No host session variable crossed the env_clear the core builds the
         # child environment from.
         for name in HOST_LEAK_NAMES:
@@ -343,12 +399,20 @@ class RealApp(IntegrationTest):
                 name, env, f"host session variable {name} leaked into the confined app"
             )
         # The environment is *only* what the core composed: the allow-listed
-        # WLR_* render selectors plus the two injected confinement names.
-        # Anything else would mean the scrub is porous.
+        # names plus the three injected confinement names. Anything else would
+        # mean the scrub is porous. `LD_LIBRARY_PATH` is in the allowlist on a
+        # machine whose C shim links a vendored wlroots -- see
+        # `harness.shim_library_dirs` for why that is a workaround for a real
+        # defect and not a fact of nature -- and absent on one whose shim links
+        # only system libraries, so the expected set is computed rather than
+        # written out.
+        allowed = set(WLR_ENV)
+        if core.shim_library_dirs:
+            allowed.add("LD_LIBRARY_PATH")
         self.assertEqual(
             set(env),
-            set(WLR_ENV) | {"WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"},
-            f"the app's environment must hold only the allow-listed WLR_* names and the two "
+            allowed | {"WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "HOME"},
+            f"the app's environment must hold only the allow-listed names and the three "
             f"injected confinement names; it held {sorted(env)}",
         )
 

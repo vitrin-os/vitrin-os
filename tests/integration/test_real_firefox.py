@@ -68,11 +68,15 @@ import time
 import unittest
 
 from harness import (
+    IN_REALM_HOME,
     IntegrationTest,
+    await_shims,
     children_of,
     comm_of,
     descendant_named,
     dominant_colour,
+    exe_identity,
+    file_identity,
     require_binaries,
     whole_realm_grant,
 )
@@ -117,15 +121,19 @@ REALM_SIZE = "1024x768"
 #:   * MOZ_*/GDK/LIBGL/GTK/NO_AT_BRIDGE -- Firefox's documented headless
 #:     software-WebRender, Wayland, no-a11y-bus configuration
 #:     (shim/docs/firefox.md; identical to firefox_bringup.sh).
-#:   * HOME -- a fresh per-run profile dir (set in setUp); a persistent profile
-#:     accumulates session state and "deterministic" then means "until someone
-#:     runs it twice".
+#:   * HOME is NOT here any more (P2.6.2, #186). `realm.rs`'s RESERVED_ENV
+#:     refuses it -- a host `$HOME` names a directory a confined realm's
+#:     filesystem does not contain -- and the core injects the realm's own
+#:     private storage instead. That storage is this run's Firefox profile, and
+#:     it is fresh per run for the reason the old comment gave: a persistent
+#:     profile accumulates session state and "deterministic" then means "until
+#:     someone runs it twice".
 #:   * VITRIN_SHIM_* -- the shim's diagnostic knobs (shim/src/main.c env
 #:     fallbacks): write the globals ledger to a file, and arm the probe
 #:     catalogue so a demand for a NON-provided interface becomes an observable
 #:     bind. The production core does not pass shim argv flags, so these travel
 #:     as environment.
-#: HOME, the ledger path and the profile are filled in setUp (per-run paths).
+#: The ledger path and the profile are filled in setUp (per-run paths).
 BASE_ENV = {
     "WLR_BACKENDS": "headless",
     "WLR_RENDERER": "pixman",
@@ -191,15 +199,38 @@ class RealFirefox(IntegrationTest):
         # ends, pass or fail.
         self.work = pathlib.Path(tempfile.mkdtemp(prefix="vitrin-ff-"))
         self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
-        self.profile = self.work / "profile"
-        self.profile.mkdir()
-        shutil.copy(PROFILE_TEMPLATE, self.profile / "user.js")
-        self.ledger = self.work / "globals.log"
         self.core_log = self.work / "core.log"
 
+        # P2.6.2 (#186): the realm is CONFINED, so every host path this fixture
+        # used to hand Firefox is a path that does not exist in there. Three
+        # moves, none of them cosmetic:
+        #
+        #  1. The runtime tree is named here rather than minted by the harness,
+        #     because the realm's private-storage path is derived from it and
+        #     has to be known before the core boots.
+        #  2. The profile IS the realm's private storage (`/vitrin/home`, which
+        #     the core injects as HOME and binds read-write). It is the only
+        #     writable, host-visible, never-purged directory a confined app
+        #     has: the realm's runtime directory is deleted on shutdown and its
+        #     `/tmp` is a private tmpfs. `user.js` is dropped in before the
+        #     core starts, which is why the tree is pre-created here.
+        #  3. `HOME` has left `env_allow` -- `realm.rs`'s RESERVED_ENV refuses
+        #     it now, and the refusal is a startup failure, not a warning. The
+        #     core decides it; this gate no longer gets a vote.
+        self.rt = self.work / "rt"
+        self.rt.mkdir()
+        self.profile = self.rt / "data" / "vitrin" / "realms" / "realm-0"
+        self.profile.mkdir(parents=True)
+        # 0700 down the whole chain: `prepare_realm_storage` audits every
+        # component it did not create itself.
+        for part in (self.rt / "data", self.rt / "data" / "vitrin", self.profile.parent):
+            part.chmod(0o700)
+        self.profile.chmod(0o700)
+        shutil.copy(PROFILE_TEMPLATE, self.profile / "user.js")
+        self.ledger = self.profile / "globals.log"
+
         self.env = dict(BASE_ENV)
-        self.env["HOME"] = str(self.profile)
-        self.env["VITRIN_SHIM_GLOBALS_LOG"] = str(self.ledger)
+        self.env["VITRIN_SHIM_GLOBALS_LOG"] = f"{IN_REALM_HOME}/globals.log"
 
     def _resolve_firefox(self) -> str:
         """The pinned Firefox binary, verified offline, or a hard failure.
@@ -240,33 +271,50 @@ class RealFirefox(IntegrationTest):
         is chatty, which would overflow the harness's after-exit stdout pipe
         and wedge the run.
         """
+        # The page is on the host and the realm's filesystem does not contain
+        # it, so it is bound READ-ONLY at its own path -- which is what
+        # `binds` is for -- and the URL is that same path. Its directory
+        # rather than the file, because a bind source that is a file needs a
+        # file target and a directory is the shape `realm.toml` documents.
         url = SOLID_PAGE.resolve().as_uri()
         return self.core(
             size=REALM_SIZE,
             shim=str(self.shim_bin),
             command=str(pathlib.Path(self.firefox_bin).resolve()),
-            args=["--profile", str(self.profile), "--no-remote", url],
+            # `--profile /vitrin/home`: the realm's own private storage, where
+            # setUp put `user.js`. A host profile path would not exist in the
+            # realm, and a read-only bind of one would not be a profile.
+            args=["--profile", IN_REALM_HOME, "--no-remote", url],
             env_allow=tuple(self.env),
             extra_env=self.env,
+            binds=(str(SOLID_PAGE.resolve().parent),),
+            runtime_dir=str(self.rt),
             log_file=str(self.core_log),
         )
 
     def _spine(self, core):
         """Wait out `vitrind -> vitrin-shim -> firefox` and return its pids."""
-        deadline = time.monotonic() + 20.0
-        shim_pid = None
-        while time.monotonic() < deadline:
-            kids = children_of(core.pid)
-            if kids:
-                shim_pid = kids[0]
-                break
-            time.sleep(0.05)
+        # `shims_of`, not `children_of`: at --isolation=default (the
+        # default since P2.6.2, #186) the core's direct child is the
+        # `vitrin-realm-init` supervisor and the shim is ITS child, so a
+        # direct-children walk finds no shim at all.
+        found = await_shims(core.pid, timeout=20.0)
+        shim_pid = found[0] if found else None
         self.assertIsNotNone(
             shim_pid, f"the core forked no shim; children were {children_of(core.pid)}"
         )
-        self.assertTrue(
-            comm_of(shim_pid).startswith("vitrin-shim"),
-            f"the core's child must be the real C shim, not {comm_of(shim_pid)!r}",
+        # The mock-freeness check, by INODE rather than by name. A confined
+        # shim is bound at `/vitrin/shim`, so its `comm` is `shim` whichever
+        # binary it is (P2.6.2, #186) and a name test stopped telling the real
+        # shim from `vitrin-mock-shim`. The running image's inode does, and
+        # more sharply: a name says what a program is called, an inode says
+        # which file is executing.
+        self.assertEqual(
+            exe_identity(shim_pid),
+            file_identity(self.shim_bin),
+            f"the realm's shim (pid {shim_pid}, comm {comm_of(shim_pid)!r}) is not "
+            f"the C shim this gate named ({self.shim_bin}) -- vitrin-mock-shim must "
+            "appear nowhere in this path",
         )
         # Firefox is a DESCENDANT of the shim (its launcher/content processes
         # sit under it), so search from the shim, not the core -- this both
@@ -372,10 +420,16 @@ class RealFirefox(IntegrationTest):
     def test_firefox_renders_a_known_colour_through_the_real_spine(self):
         core = self.real_core()
         shim_pid, ff_pid = self._spine(core)
+        self.assertEqual(comm_of(core.pid), "vitrind")
+        # The shim by inode, not by name: a confined shim runs from the bind
+        # target `/vitrin/shim`, so its comm is `shim` whichever binary it is
+        # (P2.6.2, #186).
+        self.assertEqual(exe_identity(shim_pid), file_identity(self.shim_bin))
+        self.assertTrue(comm_of(ff_pid).startswith("firefox"))
+        # Recorded while the processes are alive: the summary line at the end
+        # runs after the core has been torn down, and `comm_of` on a reaped pid
+        # is the empty string.
         spine = (comm_of(core.pid), comm_of(shim_pid), comm_of(ff_pid))
-        self.assertEqual(spine[0], "vitrind")
-        self.assertTrue(spine[1].startswith("vitrin-shim"))
-        self.assertTrue(spine[2].startswith("firefox"))
 
         conn = core.connect()
         grant = whole_realm_grant(conn)
@@ -407,7 +461,8 @@ class RealFirefox(IntegrationTest):
         )
 
         print(
-            f"\n[real-firefox] spine {spine[0]} -> {spine[1]} -> {spine[2]} "
+            f"\n[real-firefox] spine {spine[0]} -> the C shim "
+            f"(comm {spine[1]!r}, matched by inode) -> {spine[2]} "
             f"(pids {core.pid} -> {shim_pid} -> {ff_pid})\n"
             f"[real-firefox] served #{served}; captured dominant #{got[0]} at {pct}% of a "
             f"{frame.width}x{frame.height} frame\n"

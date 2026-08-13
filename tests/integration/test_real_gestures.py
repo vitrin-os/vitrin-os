@@ -82,6 +82,7 @@ from __future__ import annotations
 import os
 import pathlib
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -91,9 +92,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "sdk", "python", "src"))
 
 from harness import (  # noqa: E402
+    IN_REALM_HOME,
     IntegrationTest,
     children_of,
     comm_of,
+    shims_of,
     whole_realm_grant,
 )
 
@@ -160,8 +163,29 @@ class RealGestures(IntegrationTest):
         self.app_bin = str(pathlib.Path(app).resolve())
         self.work = pathlib.Path(tempfile.mkdtemp(prefix="vitrin-gestures-"))
         self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+        # Named here rather than minted by the harness, because `_app_log`
+        # has to name a path inside it before the core boots.
+        self.rt = self.work / "rt"
+        self.rt.mkdir()
 
     # -- fixtures ---------------------------------------------------------
+
+    #: The app's report, named INSIDE the realm (P2.6.2, #186). Two host paths
+    #: are wrong and one is right, and the wrong ones fail in different ways:
+    #:
+    #:  - the scratch `/tmp/vitrin-gestures-*` this used to pass **cannot be
+    #:    created** -- a confined realm's `/tmp` is a private tmpfs -- so the
+    #:    probe died at startup and the gate failed with "two realms must be
+    #:    two C shims: 0 != 2", which reads like a spawn bug and is not one;
+    #:  - the realm's runtime directory (`/run/vitrin`) is writable and
+    #:    host-visible, but an orderly shutdown **deletes** it
+    #:    (`lifecycle.rs::remove_runtime_dir`), and every assertion here reads
+    #:    the report after the run.
+    #:
+    #: `/vitrin/home` is the realm's persistent private storage: writable,
+    #: host-visible at `_app_log` below, and never purged.
+    def _in_realm_out(self, tag: str) -> str:
+        return f"{IN_REALM_HOME}/app-{tag}.txt"
 
     def _app_log(self, tag: str) -> pathlib.Path:
         """Where the app tagged `tag` writes its own account of the run.
@@ -182,7 +206,16 @@ class RealGestures(IntegrationTest):
         for a reason that has nothing to do with the compositor — and, worse,
         would make a real regression indistinguishable from that noise.
         """
-        return self.work / f"app-{tag}.txt"
+        return (
+            self.rt / "data" / "vitrin" / "realms" / self._realm_of(tag) / f"app-{tag}.txt"
+        )
+
+    def _realm_of(self, tag: str) -> str:
+        """The realm whose app carries `tag` -- `TAGS` read the other way."""
+        for rid, value in TAGS.items():
+            if value == tag:
+                return rid
+        raise KeyError(tag)
 
     def _app_output(self, tag: str) -> str:
         path = self._app_log(tag)
@@ -206,7 +239,7 @@ class RealGestures(IntegrationTest):
         one may be answered.
         """
         realm_args = {
-            rid: ["--run-ms", RUN_MS, "--tag", tag, "--out", str(self._app_log(tag))]
+            rid: ["--run-ms", RUN_MS, "--tag", tag, "--out", self._in_realm_out(tag)]
             + (
                 []
                 if lock_in is None
@@ -224,25 +257,46 @@ class RealGestures(IntegrationTest):
             env_allow=tuple(WLR_ENV),
             extra_env=WLR_ENV,
             physical_input=True,
+            runtime_dir=str(self.rt),
             log_file=str(self.work / "core.log"),
         )
 
-    def _await_apps_exit(self, timeout: float = 15.0) -> None:
-        """Block until both `gesture-probe`s are gone.
+    def _finish_apps_then_core(self, core, timeout: float = 15.0) -> None:
+        """Let both probes exit cleanly, THEN stop the core.
 
-        Called between `core.terminate()` and the first read of the log, and
-        load-bearing: the apps outlive the core by however long it takes them
-        to notice their Wayland connection died, and the `SUMMARY` line every
-        assertion below reads is printed in that window. Reading first would
-        make "the app received nothing" a statement about timing.
+        **The order was the other way round until P2.6.2 (#186), and it stopped
+        working the day realms got a pid namespace.** The old comment here read
+        "the apps outlive the core by however long it takes them to notice
+        their Wayland connection died, and the `SUMMARY` line every assertion
+        below reads is printed in that window". That window is now gone *by
+        design*: the realm's PID 1 is the shim, and when PID 1 exits the kernel
+        `SIGKILL`s every other process in its namespace at once -- which is
+        precisely the orphan residual D-037(2) set out to close (before it,
+        rung 3 killed the shim and left its app reparented to init). A
+        `SIGKILL`ed probe writes no summary, and the gate failed with "no
+        SUMMARY line from the 'first' app", which reads like a delivery bug and
+        is not one.
+
+        So the probes are asked to finish first. `SIGTERM` is the signal
+        `gesture_probe.c` installs a handler for; it leaves the dispatch loop
+        and prints `SUMMARY` on the way out. Sent from the host, to the host
+        pid -- a pid namespace confines what the realm can address, not what
+        its parent can.
         """
+        for pid in self.app_pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass  # already gone: it hit --run-ms, or the realm died
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if not any(os.path.exists(f"/proc/{pid}") for pid in self.app_pids):
+                core.terminate()
                 return
             time.sleep(0.05)
+        core.terminate()
         self.fail(
-            f"the probes {self.app_pids} outlived the core by more than {timeout}s; their "
+            f"the probes {self.app_pids} did not exit within {timeout}s of SIGTERM; their "
             "SUMMARY lines cannot be trusted to have been written"
         )
 
@@ -250,7 +304,7 @@ class RealGestures(IntegrationTest):
         deadline = time.monotonic() + 25.0
         shims: list[int] = []
         while time.monotonic() < deadline:
-            shims = [p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]
+            shims = shims_of(core.pid)
             if len(shims) >= 2:
                 break
             time.sleep(0.05)
@@ -374,9 +428,15 @@ class RealGestures(IntegrationTest):
         decoded, and it prints it unconditionally: `main.c` calls
         `wlr_log_init(WLR_DEBUG, NULL)` with no switch, so these lines are not
         contingent on a log level a runner might set differently.
+
+        Read from `all_app_output()` rather than `core.output()` since P2.6.2
+        (#186): a confined realm's shim writes to the realm's own log file
+        instead of inheriting the core's descriptors, so the core's own stream
+        carries none of these lines. Both realms', because which realm decoded
+        what is the point of the trace.
         """
         out = []
-        for line in core.output().splitlines():
+        for line in core.all_app_output().splitlines():
             fields = self._fields_after(line, "seat-replay:")
             if fields:
                 out.append(fields)
@@ -501,8 +561,7 @@ class RealGestures(IntegrationTest):
         )
 
         conn.close()
-        core.terminate()
-        self._await_apps_exit()
+        self._finish_apps_then_core(core)
 
         # The app's own account, which is the only one that can settle what
         # ARRIVED as opposed to what was sent.
@@ -769,8 +828,7 @@ class RealGestures(IntegrationTest):
         )
 
         conn.close()
-        core.terminate()
-        self._await_apps_exit()
+        self._finish_apps_then_core(core)
 
         summaries = self._require_summaries(core)
         first, other = summaries["first"], summaries["second"]
@@ -858,8 +916,7 @@ class RealGestures(IntegrationTest):
         # because a short one would turn a slow machine into a false failure.
         time.sleep(3.0)
         conn.close()
-        core.terminate()
-        self._await_apps_exit()
+        self._finish_apps_then_core(core)
 
         summaries = self._require_summaries(core)
         first = summaries["first"]

@@ -63,11 +63,14 @@ import unittest
 from harness import (
     GOLDEN_CMP,
     IntegrationTest,
+    await_shims,
     capture_dump_path,
     children_of,
     comm_of,
     descendant_named,
     dominant_colour,
+    exe_identity,
+    file_identity,
     golden_cmp,
     packed_xrgb,
     require_binaries,
@@ -200,20 +203,27 @@ class RealCaptureFidelity(IntegrationTest):
 
     def _spine(self, core):
         """Wait out `vitrind → vitrin-shim → solid-client` and return its pids."""
-        deadline = time.monotonic() + 15.0
-        shim_pid = None
-        while time.monotonic() < deadline:
-            kids = children_of(core.pid)
-            if kids:
-                shim_pid = kids[0]
-                break
-            time.sleep(0.05)
+        # `shims_of`, not `children_of`: at --isolation=default (the
+        # default since P2.6.2, #186) the core's direct child is the
+        # `vitrin-realm-init` supervisor and the shim is ITS child, so a
+        # direct-children walk finds no shim at all.
+        found = await_shims(core.pid, timeout=15.0)
+        shim_pid = found[0] if found else None
         self.assertIsNotNone(
             shim_pid, f"the core forked no shim; children were {children_of(core.pid)}"
         )
-        self.assertTrue(
-            comm_of(shim_pid).startswith("vitrin-shim"),
-            f"the core's child must be the real C shim, not {comm_of(shim_pid)!r}",
+        # The mock-freeness check, by INODE rather than by name. A confined
+        # shim is bound at `/vitrin/shim`, so its `comm` is `shim` whichever
+        # binary it is (P2.6.2, #186) and a name test stopped telling the real
+        # shim from `vitrin-mock-shim`. The running image's inode does, and
+        # more sharply: a name says what a program is called, an inode says
+        # which file is executing.
+        self.assertEqual(
+            exe_identity(shim_pid),
+            file_identity(self.shim_bin),
+            f"the realm's shim (pid {shim_pid}, comm {comm_of(shim_pid)!r}) is not "
+            f"the C shim this gate named ({self.shim_bin}) -- vitrin-mock-shim must "
+            "appear nowhere in this path",
         )
         app_pid = descendant_named(core.pid, APP_NAME, timeout=15.0)
         self.assertIsNotNone(

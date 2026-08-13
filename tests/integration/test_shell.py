@@ -99,6 +99,7 @@ from harness import (  # noqa: E402
     capture_dump_path,
     children_of,
     comm_of,
+    shims_of,
 )
 
 #: The shell under test. A *file*, run as its own process: the whole claim is
@@ -296,7 +297,7 @@ class _ShellGate(IntegrationTest):
         deadline = time.monotonic() + timeout
         shims: list[int] = []
         while time.monotonic() < deadline:
-            shims = [p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]
+            shims = shims_of(core.pid)
             if len(shims) >= count:
                 return shims
             time.sleep(0.05)
@@ -309,8 +310,7 @@ class _ShellGate(IntegrationTest):
         while time.monotonic() < deadline:
             apps = [
                 kid
-                for shim in children_of(core.pid)
-                if comm_of(shim).startswith("vitrin-shim")
+                for shim in shims_of(core.pid)
                 for kid in children_of(shim)
                 if comm_of(kid).startswith("click-target")
             ]

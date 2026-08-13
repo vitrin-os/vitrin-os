@@ -82,9 +82,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "sdk", "python", "src"))
 
 from harness import (  # noqa: E402
+    IN_REALM_HOME,
     IntegrationTest,
     children_of,
     comm_of,
+    shims_of,
 )
 
 import vitrin_os  # noqa: E402
@@ -153,9 +155,24 @@ class RealCrossRealmClipboard(IntegrationTest):
         self.peer_bin = str(pathlib.Path(peer).resolve())
         self.work = pathlib.Path(tempfile.mkdtemp(prefix="vitrin-clipboard-"))
         self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+        # The core's runtime tree, named by this test rather than minted by
+        # the harness, because the sink path below has to be known before the
+        # core boots.
+        self.rt = self.work / "rt"
+        self.rt.mkdir()
         #: What `second`'s app writes whatever selection it is offered into.
         #: Its ABSENCE is half this gate's evidence, so it must start absent.
-        self.sink = self.work / "sink.bin"
+        #:
+        #: **In the receiving realm's own private storage** since P2.6.2
+        #: (#186), not in a host scratch directory. Two host paths are wrong
+        #: and one is right: a confined realm's `/tmp` is a private tmpfs, so
+        #: an app handed `/tmp/vitrin-clipboard-*/sink.bin` cannot create it
+        #: and dies at startup -- which would have turned this gate's central
+        #: absence into a fact about the fixture; and the realm's runtime
+        #: directory, though writable and host-visible, is *deleted* on an
+        #: orderly shutdown. `/vitrin/home` is writable, host-visible here, and
+        #: never purged.
+        self.sink = self.rt / "data" / "vitrin" / "realms" / SECOND / "sink.bin"
         self.assertFalse(self.sink.exists())
 
     # -- fixtures ---------------------------------------------------------
@@ -172,11 +189,19 @@ class RealCrossRealmClipboard(IntegrationTest):
                 # given. Different colours so a reader of the core log can tell
                 # the two realms apart at a glance.
                 "realm-0": ["--run-ms", RUN_MS, "--colour", "0000ff", "--offer", SECRET],
-                SECOND: ["--run-ms", RUN_MS, "--colour", "00ff00", "--sink", str(self.sink)],
+                SECOND: [
+                    "--run-ms",
+                    RUN_MS,
+                    "--colour",
+                    "00ff00",
+                    "--sink",
+                    f"{IN_REALM_HOME}/sink.bin",
+                ],
             },
             env_allow=tuple(WLR_ENV),
             extra_env=WLR_ENV,
             physical_input=True,
+            runtime_dir=str(self.rt),
             log_file=str(self.work / "core.log"),
         )
 
@@ -184,7 +209,7 @@ class RealCrossRealmClipboard(IntegrationTest):
         deadline = time.monotonic() + 25.0
         shims: list[int] = []
         while time.monotonic() < deadline:
-            shims = [p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]
+            shims = shims_of(core.pid)
             if len(shims) >= 2:
                 break
             time.sleep(0.05)

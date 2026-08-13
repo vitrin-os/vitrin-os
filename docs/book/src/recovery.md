@@ -929,7 +929,9 @@ for.
              written.
   L4 ....... re-observed in passing on the L7 run: `the panel is lit again`
              present, `THE WAKE WAS NOT CONFIRMED` absent, flip_landed.
-  L7 pass 2  ATTEMPTED, and it did not exercise what it was for. See below.
+  L7 pass 2  ATTEMPTED. Caught no absence -- but see below: under the default
+             seat policy the question is already answered by pass 1 plus the
+             single shared idle clock, and 12a is the rung that is actually owed.
 ```
 
 **`L7`'s second pass is still owed, and saying so costs nothing.** A
@@ -947,17 +949,39 @@ worth keeping:
 ```
 
 So `--lock-idle` fires with the right cause, a wake works *while locked*, and
-unlock works. None of that is the question pass 2 exists to ask, which is
-whether the lock raises **on the return** from an absence longer than the
-timeout. That still rests on one by-eye observation at a 20 s timeout from
-2026-08-11 — it passed, and it has never been measured.
+unlock works.
 
-**Note for whoever runs it:** the idle lock cannot fire *during* the absence —
-losing the seat stops the idle clock under the default policy (D-030(7)), which
-is the whole of [#257](https://github.com/vitrin-os/vitrin-os/issues/257)'s fix.
-The measurement is therefore entirely about what happens *after* the seat comes
-back, and the run is only valid if the recorder shows a `seat activated` line
-inside it. Check for one before reading any result.
+**And that is enough, under the default policy — a third run would add nothing.**
+Pass 2 asks whether the lock raises on the *return* from an absence longer than
+the timeout. It cannot, and the reason is structural rather than observational:
+**the lock and the blank read one clock, not two.** `last_activity` was lifted
+out of `LockScreen` into `backend::blank::SessionActivity` behind an
+`Rc<RefCell<..>>` by WS-E.4.3 for exactly this reason — *"two fields would be two
+clocks, they would drift, and the drift would be invisible"* — and the seat's
+return restamps that single field in `set_seat_absent(false, now)`.
+
+Three facts then compose to the answer:
+
+1. **The restamp is measured.** Pass 1's 61.214 s is the blank firing 61.214 s
+   after the seat returned, which is a measurement *of the shared field being
+   restamped on return*.
+2. **The lock reads that same field.** This run shows it: the lock and the blank
+   fired 24 ms apart off one expiry.
+3. **Both runs were `on_seat_change="never"`**, under which the absence is not
+   charged at all.
+
+There is no second clock left that could have kept running, so the raise pass 2
+looks for has nothing to fire from. The by-eye pass at a 20 s timeout on
+2026-08-11 agrees, and so does the operator's observation on 2026-08-13 that no
+lock card was present.
+
+**What is genuinely untested is a different rung on a different page.**
+`set_seat_absent` has three branches and only `Never` has ever run on hardware.
+Under `Idle` the absence *is* charged, so a long absence **should** return
+locked — the opposite result, from the same call site. Under `Immediate` the
+raise happens on seat loss. Those are `docs/drm-bringup.md` step **12a**
+(issue #246), written and never executed. If you want the lock-on-return
+question exercised for real, run 12a, not another `L7`.
 
 **Two method notes, both of which cost time before they were understood.**
 
@@ -1014,10 +1038,10 @@ the only evidence for that.
 > named, and L7 timed. What remains unexecuted is named rather than implied:
 > **routes 3 and 4 are still careful predictions**, the **VKMS rung is attempted
 > on every PR and currently covers nothing** (the module loads, no card node
-> appears), **`L7`'s second pass has not yet caught a real absence** so
-> lock-on-return rests on a 20 s by-eye pass, `L5` is adjudicated closed rather
-> than re-run, and the WARN arm of L4 has never fired because no wake has ever
-> failed here.
+> appears), **only the `never` seat policy has ever run on hardware** -- step 12a's
+> `immediate` and `idle` are written and unexecuted, and `idle` is the branch that
+> would return *locked* -- `L5` is adjudicated closed rather than re-run, and the
+> WARN arm of L4 has never fired because no wake has ever failed here.
 >
 > Both runs' headline findings were defects in **this page's own recovery
 > command** — `pkill -f` in 2026-08-11

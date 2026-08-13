@@ -1888,7 +1888,8 @@ where
         supervisor_pid,
         shim_host_pid: Some(handshake.shim_host_pid),
         handshake_ms: handshake.elapsed.as_millis() as u64,
-        writable: "/run/vitrin, /vitrin/home, /tmp, /dev/shm",
+        writable: "/run/vitrin, /vitrin/home, /tmp, /dev/shm (plus /proc, /dev/pts and \
+                   the borrowed device nodes, which store nothing)",
         stdio: "per-realm log file",
         storage_reused,
         mount_count: Some(handshake.mount_count),
@@ -4781,6 +4782,196 @@ pub(crate) mod tests {
             "a build that applies namespaces only may not journal a tier that means \
              namespaces plus Landlock plus seccomp: {line}"
         );
+    }
+
+    /// Spawn one confined realm and hand it to `f`, then tear it down.
+    ///
+    /// Factored out so each property below is one assertion against a real
+    /// realm rather than forty lines of bring-up: the bring-up is the same
+    /// every time, and a copy of it per test is a copy that drifts.
+    fn with_confined_realm(label: &str, f: impl FnOnce(i32, &IsolationFacts)) {
+        let mut h = Harness::new(label);
+        let confinement = h.confinement();
+        let canary = confinement.canaries[0].clone();
+        let bin = mock_shim_bin();
+        let realm = realm_with_spawn("realm-0", &bin, &["--serve".to_string()], &[]);
+        let paths = h.paths().confined(confinement);
+        let spawned = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut h.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .expect("the confined spawn must succeed");
+        let facts = spawned.isolation().clone();
+        f(facts.shim_host_pid.expect("the shim's host pid"), &facts);
+        h.reap(spawned);
+        let _ = fs::remove_file(&canary);
+    }
+
+    /// One field of `/proc/<pid>/status`, or `None`.
+    fn proc_status(pid: i32, field: &str) -> Option<String> {
+        let text = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        text.lines()
+            .find(|l| l.starts_with(field))
+            .map(|l| l[field.len()..].trim().to_string())
+    }
+
+    #[test]
+    fn the_confined_shim_holds_no_authority_it_was_not_handed() {
+        // Everything here is read by the parent from `/proc`, which is the
+        // whole point: a confinement claim is only as good as the reads
+        // behind it, and these are the same reads the acceptance gate makes
+        // from *inside* the realm.
+        let _fd = fd_lock();
+        if !namespaces_available() {
+            return;
+        }
+        with_confined_realm("confined-authority", |shim, _facts| {
+            // Zero capabilities. `execve` recomputes them, and with an
+            // identity map there is no valid `make_kuid(ns, 0)` -- so the
+            // root special case never fires and the drop in the helper makes
+            // the property a step rather than a derivation.
+            assert_eq!(
+                proc_status(shim, "CapEff:").as_deref(),
+                Some("0000000000000000"),
+                "the confined shim holds effective capabilities"
+            );
+            assert_eq!(proc_status(shim, "CapPrm:").as_deref(), Some("0000000000000000"));
+            assert_eq!(
+                proc_status(shim, "CapBnd:").as_deref(),
+                Some("0000000000000000"),
+                "an empty bounding set is what stops a later execve regaining anything"
+            );
+            assert_eq!(proc_status(shim, "NoNewPrivs:").as_deref(), Some("1"));
+
+            // The descriptor table. fd 3 is the core connection and must be
+            // open; nothing at or above 4 may survive, because a leaked
+            // `O_DIRECTORY` handle on the old root is a complete pivot escape
+            // (`openat(fd, "../..")` still works through one).
+            let mut fds: Vec<i32> = fs::read_dir(format!("/proc/{shim}/fd"))
+                .expect("the shim's fd table is readable")
+                .flatten()
+                .filter_map(|e| e.file_name().to_str()?.parse().ok())
+                .collect();
+            fds.sort_unstable();
+            assert!(fds.contains(&3), "fd 3 (the core connection) is gone: {fds:?}");
+            assert!(
+                !fds.iter().any(|fd| *fd >= 4),
+                "a descriptor survived the second execve: {fds:?}. After the MNT_DETACH the \
+                 only remaining handle on the host tree is a leaked fd, and one is enough"
+            );
+            // And fd 0 is the realm's own /dev/null, not the config channel.
+            let stdin = fs::read_link(format!("/proc/{shim}/fd/0")).expect("fd 0");
+            assert_eq!(stdin, Path::new("/dev/null"), "fd 0 is {stdin:?}");
+
+            // The writable set, from the child's own mountinfo read by the
+            // parent -- the short sentence P2.6.9's gate will assert against.
+            // mountinfo fields: id, parent, dev, root, MOUNTPOINT, OPTIONS,
+            // then optional fields, then " - ". The per-mount options are
+            // field 5 and the mountpoint field 4; reading the whole line for
+            // the word "rw" would match the *superblock* options after the
+            // separator, which say nothing about this mount.
+            let mountinfo = fs::read_to_string(format!("/proc/{shim}/mountinfo"))
+                .expect("the shim's mountinfo is readable");
+            let mut writable: Vec<&str> = mountinfo
+                .lines()
+                .filter_map(|l| {
+                    let mut f = l.split_whitespace();
+                    let mountpoint = f.nth(4)?;
+                    let options = f.next()?;
+                    options.split(',').any(|o| o == "rw").then_some(mountpoint)
+                })
+                .collect();
+            writable.sort_unstable();
+            // The exact list, not a subset. An exhaustive assertion is what
+            // makes a *new* writable mount fail this test instead of joining
+            // it silently -- and the published claim
+            // (`{/run/vitrin, /vitrin/home, /tmp, /dev/shm}`) is only honest
+            // if the rest of this list is things that store nothing: procfs
+            // and devpts are kernel filesystems, and the six device nodes are
+            // borrowed inodes whose "writability" is `write(2)` to a driver.
+            assert_eq!(
+                writable,
+                [
+                    "/dev/full",
+                    "/dev/null",
+                    "/dev/pts",
+                    "/dev/random",
+                    "/dev/shm",
+                    "/dev/tty",
+                    "/dev/urandom",
+                    "/dev/zero",
+                    "/proc",
+                    "/run/vitrin",
+                    "/tmp",
+                    "/vitrin/home",
+                ],
+                "the realm's writable set changed:\n{mountinfo}"
+            );
+            // The two that would be quietly catastrophic, called out by name.
+            // `/` writable would let the app -- which runs as the mapped uid
+            // -- replace the shim binary's own bind target; `/dev` writable
+            // would falsify the published writable set through a mount nobody
+            // thinks of as storage.
+            assert!(!writable.contains(&"/"), "the realm's root is writable");
+            assert!(!writable.contains(&"/dev"), "the realm's /dev is writable");
+
+            // The device closure the limits page is about.
+            for absent in ["/dev/input", "/dev/dri/card0", "/dev/kmsg"] {
+                assert!(
+                    fs::symlink_metadata(format!("/proc/{shim}/root{absent}")).is_err(),
+                    "{absent} is reachable inside the realm"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn killing_the_supervisor_takes_the_realm_down_with_it() {
+        // The residual `lifecycle` used to publish, asserted closed: rung 3
+        // SIGKILLs the process the core's `Child` names, PDEATHSIG takes PID
+        // 1 with it, and the kernel's rule that a pid namespace dies with its
+        // init takes everything else. No /proc walk, no supervision policy.
+        let _fd = fd_lock();
+        if !namespaces_available() {
+            return;
+        }
+        let mut h = Harness::new("pdeathsig");
+        let confinement = h.confinement();
+        let canary = confinement.canaries[0].clone();
+        let bin = mock_shim_bin();
+        let realm = realm_with_spawn("realm-0", &bin, &["--serve".to_string()], &[]);
+        let paths = h.paths().confined(confinement);
+        let mut spawned = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut h.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .expect("the confined spawn must succeed");
+        let shim = spawned.isolation().shim_host_pid.expect("the shim's host pid");
+
+        // Non-vacuity first: the shim is alive right now, so its later
+        // absence is a death and not a process that never existed.
+        assert!(
+            fs::metadata(format!("/proc/{shim}")).is_ok(),
+            "the shim was never running, so this test proves nothing"
+        );
+
+        let _ = spawned.child_mut().kill();
+        let _ = spawned.child_mut().wait();
+
+        // PDEATHSIG is delivered asynchronously, so poll rather than assume.
+        wait_for("the shim to die with its supervisor", || {
+            // `wait_for` panics with this description on timeout, which is the
+            // assertion: a shim still present after the deadline is a shim
+            // PDEATHSIG did not reach, and the orphan residual is back.
+            (!Path::new(&format!("/proc/{shim}")).exists()).then_some(true)
+        });
+        let _ = fs::remove_file(&canary);
     }
 
     #[test]

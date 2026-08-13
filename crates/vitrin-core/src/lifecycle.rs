@@ -168,17 +168,45 @@
 //! reset every realm this core spawns would take rung 3 every time, and
 //! the ladder would be decorative.
 //!
-//! **The residual, stated rather than implied:** rung 3 kills the shim, and
-//! a shim killed with `SIGKILL` tears nothing down. Its app is reparented
-//! to init and survives the session. The core does not hunt grandchildren:
-//! finding them means scanning `/proc` for a moving target, and killing
-//! processes the core did not create is supervision policy, which is out of
-//! scope by decision. The structural fix is a per-realm pid namespace,
-//! where the shim is pid 1 and its death takes the namespace with it --
-//! which arrives with the D9 sandboxing work ([`crate::spawn`]'s security
-//! posture section), not with a `/proc` walk here. On the ordinary paths --
-//! rungs 0 through 2, and every clean crash -- the shim reaps its own app,
-//! which is what the acceptance test asserts.
+//! # The orphan residual, and its closure at `--isolation=default`
+//!
+//! This section used to publish a gap: rung 3 killed the shim, a shim killed
+//! with `SIGKILL` tore nothing down, and its app was reparented to init and
+//! survived the session. It named the structural fix -- a per-realm pid
+//! namespace, where the shim is pid 1 and its death takes the namespace with
+//! it -- and deferred it to the D9 sandboxing work. **P2.6.2 (#186) is that
+//! work, and this paragraph is rewritten rather than left standing.**
+//!
+//! At `--isolation=default` the shape underneath this ladder has one more
+//! level than it used to, and every rung reaches through it:
+//!
+//! ```text
+//!   vitrind -> supervisor -> shim (PID 1 of its own pid namespace) -> app
+//! ```
+//!
+//! - The [`Child`] this module owns is the **supervisor**, not the shim.
+//!   That is what `waitpid` reports on and what every `kill` below addresses.
+//! - Rung 2's `SIGTERM` goes to the supervisor, which forwards it to the shim
+//!   by host pid and **does not exit on it** -- exiting would collapse rung 2
+//!   into rung 3 on every single teardown.
+//! - Rung 3's `SIGKILL` kills the supervisor. The shim holds
+//!   `PR_SET_PDEATHSIG = SIGKILL`, so it dies with it; the kernel's rule that
+//!   a pid namespace dies with its init then takes the app, and every
+//!   descendant of the app, with no `/proc` walk and no supervision policy
+//!   anywhere in this file. **The app cannot be reparented to init, because
+//!   there is no init outside the namespace for it to be reparented to.**
+//! - The supervisor mirrors the shim's exit exactly -- same code, or the same
+//!   signal re-raised -- so [`ExitClass::of`] sees what it would have seen
+//!   before the extra level existed.
+//!
+//! **At `--isolation=off` the residual is unchanged and still real**: there
+//! is no pid namespace, rung 3 kills the shim, and its app survives the
+//! session. That is one of the costs of the unconfined path, alongside the
+//! standing warning the session prints every 60 seconds.
+//!
+//! On the ordinary paths -- rungs 0 through 2, and every clean crash -- the
+//! shim reaps its own app either way, which is what the acceptance test
+//! asserts.
 //!
 //! # The runtime tree: removed at the core's exit, kept across a crash
 //!

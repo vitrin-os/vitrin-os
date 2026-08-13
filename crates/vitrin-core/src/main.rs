@@ -4535,6 +4535,123 @@ mod tests {
         assert!(parse_args(["--drm", "--attention-chord", "f5"]).is_err());
     }
 
+    // -- P2.6.2 (#186): the confinement selector -------------------------
+
+    /// The selector this task's whole posture rests on: **omitting it
+    /// confines**.
+    #[test]
+    fn omitting_the_isolation_flag_selects_confinement_in_every_mode() {
+        for argv in [
+            vec!["--nested"],
+            vec!["--headless", "--consent=auto-approve"],
+        ] {
+            let action = parse_args(argv.clone()).expect("parses");
+            assert_eq!(
+                isolation_of(&action),
+                IsolationOptions::default(),
+                "{argv:?} did not default to confinement"
+            );
+        }
+        // And the default really is `default` rather than whatever `Isolation`
+        // would have defaulted to -- it has no `Default`, deliberately, so
+        // this is the only place the value is chosen.
+        assert_eq!(
+            IsolationOptions::default().isolation,
+            spawn::isolation::Isolation::Default
+        );
+        assert_eq!(IsolationOptions::default().realm_init, None);
+    }
+
+    #[test]
+    fn isolation_takes_both_spellings_refuses_a_repeat_and_names_the_retired_token() {
+        for argv in [
+            vec!["--nested", "--isolation", "off"],
+            vec!["--nested", "--isolation=off"],
+        ] {
+            let action = parse_args(argv.clone()).expect("parses");
+            assert_eq!(
+                isolation_of(&action).isolation,
+                spawn::isolation::Isolation::Off,
+                "{argv:?}"
+            );
+        }
+        // The `--shim` precedent: no value, an empty value, and a repeat.
+        assert!(parse_args(["--nested", "--isolation"]).is_err());
+        assert!(parse_args(["--nested", "--isolation="]).is_err());
+        assert!(parse_args(["--nested", "--isolation=off", "--isolation=default"])
+            .unwrap_err()
+            .contains("more than once"));
+        // `none` by name, on `parse_consent`'s copy precedent: everybody who
+        // read D-020(6) will type it, and the message has to say the token
+        // moved rather than that they mistyped.
+        let retired = parse_args(["--nested", "--isolation=none"]).unwrap_err();
+        assert!(retired.contains("--isolation=off"), "{retired}");
+        // Non-vacuity: an unrelated value gets the generic message instead.
+        let other = parse_args(["--nested", "--isolation=paranoid"]).unwrap_err();
+        assert!(!other.contains("D-020(6)"), "{other}");
+    }
+
+    #[test]
+    fn realm_init_parses_both_spellings_and_defaults_to_a_sibling() {
+        for argv in [
+            vec!["--nested", "--realm-init", "/usr/lib/vitrin/vitrin-realm-init"],
+            vec!["--nested", "--realm-init=/usr/lib/vitrin/vitrin-realm-init"],
+        ] {
+            let action = parse_args(argv.clone()).expect("parses");
+            assert_eq!(
+                isolation_of(&action).realm_init.as_deref(),
+                Some(Path::new("/usr/lib/vitrin/vitrin-realm-init")),
+                "{argv:?}"
+            );
+        }
+        assert!(parse_args(["--nested", "--realm-init"]).is_err());
+        assert!(parse_args(["--nested", "--realm-init="]).is_err());
+        assert!(parse_args(["--nested", "--realm-init=/a", "--realm-init=/b"])
+            .unwrap_err()
+            .contains("--realm-init"));
+        // The default is resolved at startup, not at parse time, exactly as
+        // `--shim`'s is.
+        assert_eq!(
+            isolation_of(&parse_args(["--nested"]).unwrap()).realm_init,
+            None
+        );
+    }
+
+    #[test]
+    fn the_floor_is_answerable_from_any_command_line_and_is_not_a_kernel_row() {
+        // `--print-isolation`'s precedent: a question about this binary must
+        // not be answerable only on a command line that would otherwise have
+        // run a session.
+        assert_eq!(parse_args(["--print-floor"]), Ok(Action::PrintFloor));
+        assert_eq!(parse_args(["--nested", "--print-floor"]), Ok(Action::PrintFloor));
+        assert_eq!(
+            parse_args(["--print-floor", "--size"]),
+            Ok(Action::PrintFloor),
+            "it must win over a later parse error, like --print-isolation does"
+        );
+        assert!(USAGE.contains("--print-floor"));
+        assert!(USAGE.contains("--isolation"));
+        assert!(USAGE.contains("--realm-init"));
+        // The cost D-036 says must be said out loud or it reads as an
+        // oversight: `off` is not a rung of the default/hardened/paranoid dial.
+        assert!(
+            USAGE.contains("paranoid"),
+            "--help must say that `off` is not a rung of D-010's dial"
+        );
+    }
+
+    /// The `isolation` field of whichever run variant an `Action` is.
+    fn isolation_of(action: &Action) -> IsolationOptions {
+        match action {
+            Action::RunNested { isolation, .. } | Action::RunHeadless { isolation, .. } => {
+                isolation.clone()
+            }
+            #[cfg(feature = "drm-backend")]
+            Action::RunDrm { isolation, .. } => isolation.clone(),
+            other => panic!("not a run action: {other:?}"),
+        }
+    }
+
     /// **The reservation does not reach the other two backends** — the control
     /// that stops the test above passing against a blanket refusal.
     ///

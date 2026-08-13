@@ -1041,6 +1041,26 @@ fn build_mount_table(config: &Config, stage_dev: u64) -> Result<(), Fail> {
     )?;
     symlink_rel("pts/ptmx", "dev/ptmx")?;
 
+    // **`/dev` becomes read-only once it is populated**, and it has to: the
+    // published writable set is `{/run/vitrin, /vitrin/home, /tmp, /dev/shm}`,
+    // and a writable `/dev` would have made that claim false the day it was
+    // written. Caught by the parent-side mountinfo assertion in
+    // `vitrin_core::spawn`'s tests, which is the point of asserting the set
+    // rather than describing it.
+    //
+    // The submounts keep their own flags -- `MS_REMOUNT` acts on one mount,
+    // not a subtree -- so `/dev/shm` stays writable, `/dev/pts` can still
+    // allocate ptys, and `/dev/null` is still openable for write.
+    let dev = cstr_str("dev")?;
+    mount_raw(
+        None,
+        &dev,
+        None,
+        MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NOEXEC,
+        None,
+        Stage::Mount,
+    )?;
+
     // `nosuid` and `nodev` but **not** `noexec`: enough real software still
     // writes a helper into `/tmp` and runs it that `noexec` here would read as
     // a vitrin bug rather than as a policy.

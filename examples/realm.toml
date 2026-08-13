@@ -180,7 +180,40 @@ command = "/usr/bin/foot"
 #   XAUTHORITY       is the credential authenticating a host X connection
 #   XDG_RUNTIME_DIR  names the host session's socket directory; the core
 #                    injects the realm's own runtime directory instead
-#env_allow = ["HOME", "LANG", "XDG_SESSION_TYPE"]
+#   HOME             names a directory that DOES NOT EXIST inside a confined
+#                    realm; the core injects the realm's own private storage
+#                    instead. Added by P2.6.2 -- a configuration that
+#                    allow-listed HOME (as this example once did) now fails
+#                    to load, which is the intended noise: a host $HOME
+#                    passed through would name a missing path and every app
+#                    that read it would fail in a way that looks like a
+#                    vitrin bug.
+#env_allow = ["LANG", "XDG_SESSION_TYPE"]
+
+# Optional (default []). Absolute host paths mounted READ-ONLY into the realm
+# at the same path, at --isolation=default. Ignored at --isolation=off, where
+# the realm can already see the whole filesystem.
+#
+# You need this when the app's runtime closure lives outside /usr, /etc and
+# its own directory -- on NixOS that means /nix; for a vendored application
+# tree it means whatever /opt subtree it unpacks into. Without it such an app
+# does not start, and the failure looks like a missing shared library.
+#
+# Two things it is not:
+#
+#   - It is not a confinement switch. WHETHER a realm is confined is
+#     `--isolation`, session-wide, so a copied [[realm]] block cannot weaken
+#     one realm quietly. This key only widens what a confined realm can READ.
+#   - It is not trusted from this file. Every source is re-audited at the
+#     spawn against the same rule `command` gets -- a regular file or
+#     directory, owned by root or by the core's uid, not group- or
+#     other-writable, and the same for every directory on its resolved path.
+#     A bind source holding a library or an interpreter decides what the
+#     confined app RUNS, not merely what it reads.
+#
+# `/` and `/home` are refused outright: binding either hands the realm the
+# tree the confinement exists to hide.
+#binds = ["/nix/store", "/opt/vendor-app"]
 
 # Optional (default true). Whether STARTUP forks this realm's app.
 #

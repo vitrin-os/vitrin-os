@@ -646,6 +646,24 @@ fn demo(headless: bool, task: &[String]) -> Result<()> {
             vitrind.display()
         );
     }
+    // The confinement helper is a **pair** with the core, not an optional
+    // extra (P2.6.2, #186). It defaults to a sibling of `vitrind`, its version
+    // must match the core's exactly, and `--isolation` defaults to `default`
+    // -- so a `vitrind` without it beside it refuses every spawn. Checked here
+    // rather than discovered at the fork, because "the demo could not launch
+    // its realm" is a much worse error message than this one, and because
+    // `cargo build --workspace` produces both binaries in one step: an absence
+    // means a partial build, never a missing dependency.
+    let realm_init = bin_dir.join("vitrin-realm-init");
+    if !realm_init.is_file() {
+        bail!(
+            "vitrin-realm-init not found at {} -- it is built alongside vitrind by \
+             `cargo build --workspace`, and at --isolation=default the core execs it for every \
+             realm it spawns. A vitrind from one build beside a helper from another is refused \
+             by the version handshake rather than run, so the two must be installed together",
+            realm_init.display()
+        );
+    }
 
     let work = make_work_dir().context("creating the demo's throwaway runtime directory")?;
     let principals = work.join("principals.toml");

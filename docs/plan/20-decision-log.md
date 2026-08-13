@@ -934,9 +934,15 @@ A VT switch must never be a way past a lock screen. `losing_the_seat_never_lower
 ---
 
 
-### D-034 — The screenshot encode moves to a worker thread that owns the directory descriptor; the encoder itself is left alone
+### D-036 — The screenshot encode moves to a worker thread that owns the directory descriptor; the encoder itself is left alone
 
 **Status:** accepted (2026-08-11) — issue [#240](https://github.com/vitrin-os/vitrin-os/issues/240), workstream [WS-E](14-workstream-session-mode.md). Found in review of WS-E.2.4 (#216), measured on hardware, decided here.
+>
+> **Renumbered from D-034 to D-036 on 2026-08-13.** It was filed as a second
+> D-034, colliding with the lock-policy entry above it. Nothing cited this one —
+> every `D-034` reference in the tree (`backend/drm.rs`, the WS-E workstream doc,
+> two anchors in this file) resolves to the lock policy — so the collision is
+> resolved by moving this entry rather than by touching any reference.
 
 **The problem, measured rather than estimated.** `ScreenshotDir::write` and the PNG encode both ran synchronously inside `route_physical_turn`'s gesture drain, so one press blocked compositing for the whole encode: **71.7 ms** in a release build for one 2560x1600 frame into a 12.3 MB PNG — about seventeen dropped frames at 240 Hz, on every press. It was never a correctness problem. It was plainly visible to the human who pressed the key.
 
@@ -992,6 +998,24 @@ A VT switch must never be a way past a lock screen. `losing_the_seat_never_lower
 
 ---
 
+
+### D-037 — The realm's namespaces are built by a helper that execs first and unshares second; the core proves the confinement from outside before it commits; and the measured ceiling and the selected policy are two vocabularies whose bottoms may never share a word
+
+**Status:** accepted (2026-08-13) — executes [D-020](#d-020--the-realm-boundary-is-a-namespace-boundary-intra-user-by-default-in-namespace-uidgid-and-a-residue-that-lives-outside-every-realm)(1)(4)(6) in P2.6.2, issue [#186](https://github.com/vitrin-os/vitrin-os/issues/186). Corrects the P2.6.2 plan row's implied ordering. Supersedes `spawn.rs`'s D9 section for the `--isolation=default` path only.
+
+**1. The helper `execve`s first and unshares itself; the core does not clone into namespaces.** The plan row's phrasing — "clone the realm child with `CLONE_NEWUSER|…` and exec a new core-owned `vitrin-realm-init`" — is not implementable while the core keeps `std::process::Command`, and the reason is a **deadlock**, not a preference: D-020(1) requires the parent to write the maps while the child blocks on a sync pipe, but std's fork path has the parent already blocked reading its exec-report pipe until EOF-on-`execve`. Parent waits for exec; child waits for maps.
+
+The inversion is the **stronger** posture, which is why it is recorded rather than treated as an implementation detail. `execve` recomputes capabilities, and the root special case fires only when the process's uid is 0 *in its own user namespace*. Unsharing before the exec would therefore force the map to be `0 <euid> 1` — handing the confined app `CAP_SYS_ADMIN` in its own namespace, from which it could bind-mount over its own confinement. Unsharing after means an **identity map and zero capabilities**. It also deletes a window in which a not-yet-`exec`'d child holds a copy-on-write image of the core's address space — grant table, principal keys — readable through `/proc/<pid>/mem` by any same-uid process.
+
+**2. A supervisor process is forced, and it closes a published residual.** `unshare(CLONE_NEWPID)` never moves the caller; it sets `pid_ns_for_children`, so the next `fork` produces PID 1. **Measured on the target machine 2026-08-13:** after the unshare the child's own `ns/pid` is byte-identical to the core's. So `vitrin-realm-init` forks — the supervisor stays in the host PID namespace and is the process the core's `Child` names, and the PID-1 child builds the mount table and `execve`s the shim. With `PR_SET_PDEATHSIG` (measured to survive that `execve`) this closes `lifecycle.rs`'s residual, where rung 3 killed the shim and left its app reparented to init.
+
+**3. Every confinement claim the journal makes is a fact the *parent* read from the kernel.** This is what licenses clause 1: the core does not trust a helper that confines itself. **Measured 2026-08-13:** the core can read `/proc/<pid>/ns/*` and `stat` `/proc/<pid>/root` for both the supervisor and the PID-1 child across the realm's user namespace. The spawn is **refused** when those cannot be read. The invariant, verbatim: *`applied` is computed from what the kernel says about the child, never from the flag that was requested.* Anything not sourceable that way is labelled `child-asserted`.
+
+**4. `--isolation=default | off`; `none` is retired before it ships.** Of the two colliding tokens, the selector's is the one no earlier decision fixed — `Tier`'s renderings carry a stability contract, because changing a string there changes every committed matrix cell. The rule is **not** "no shared token": when D-020(3)'s per-uid upgrade becomes selectable, `--isolation=per-uid` may share that word, because there the relation is required equality. The rule is that **the tier's bottom may never be a selector value**, because `Tier::None` is also what an *unmeasured* probe yields — so `none` would conflate "the operator chose no confinement" with "nothing was measurable", which is exactly the silent degradation D-020(6) forbids.
+
+**5. `setgroups(0, NULL)` is impossible here, and the consequence is published rather than mitigated.** D-020(1) is silent on supplementary groups; the design that preceded this entry assumed they could be dropped in the window after `unshare`. They cannot. `userns_may_setgroups` requires a non-empty `gid_map`, and `new_idmap_permitted` will not admit an unprivileged single-id map until `setgroups=deny` has cleared the flag it reads. **The windows are disjoint; measured `EPERM` in both orderings.** So a realm retains the invoking user's supplementary groups — `video`, `render`, `input`, `docker` — as kgids, because `setgroups=deny` blocks the *call* and drops nothing. The count is journaled per spawn as `supplementary_groups_retained`, and the mount table is consequently the **only** barrier between a realm and any device those groups would open. Published on `limits.md` and `SECURITY.md`, not left to be discovered.
+
+**What this costs, stated unmitigated.** A second trusted binary in the TCB, and two spawn paths inside one file — which is exactly how a confinement claim rots, held apart only by clause 3's verification. The GPU render node is bound read-write, carrying an ioctl surface and cross-realm GPU-memory side channels that nothing here addresses; read-only was rejected because it disables the node rather than restricting it. And **R2.9 is not retired by this entry**: the refusal path will not fire on the maintainer's machine, which measures `apparmor_restrict_unprivileged_userns=unset`, so whether "refuse to start" is the edge case or the common case is still unmeasured — tracked as issue [#281](https://github.com/vitrin-os/vitrin-os/issues/281).
 
 ## Part B — Open questions (PRD §20), with owners and decide-by gates
 

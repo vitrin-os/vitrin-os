@@ -17,6 +17,25 @@ Environment hygiene confines the well-behaved; it does not contain the
 hostile. Do not run untrusted applications, or untrusted agents, against
 this. Real sandboxing is Phase 2 (E2.6/E2.7, P13).
 
+**And when that sandboxing does arrive, it will not close this next gap, so
+the gap is published before the feature rather than after it.** Host-level
+sidecars sit outside every realm and therefore outside every realm's
+confinement — the VLM parser and the egress proxy are ordinary host processes
+with principal identities, deliberately not realm members, because the
+parser's memory-unsafety must stay irrelevant to the TCB and the proxy must
+hold a listener inside a realm's network namespace without being confined by
+it. The consequence, stated rather than left to be discovered:
+
+> The VLM sidecar has unmediated host network access. E2.7's headline claim is
+> therefore *"a realm with no egress grant emits zero outbound packets"* — a
+> statement about the realm — and is **not** a statement that realm content
+> cannot leave the machine.
+
+It can leave, through a sidecar the realm's network namespace says nothing
+about. Constraining the sidecars themselves is a decide-by-M3 item; it is not
+solved by attribution metadata and must not be described as if it were. See
+D-020(5) in `docs/plan/20-decision-log.md`.
+
 **On bare metal, a realm's app can plausibly open the real keyboard and read
 every key you type — including into other realms, and including a passphrase.**
 This is the sandbox gap above, pointed at the one device the whole architecture

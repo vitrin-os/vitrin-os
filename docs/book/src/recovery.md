@@ -36,16 +36,25 @@ that reads as tested when it is not is worse than one that admits it:
 - **[inferred]** — from the kernel's own source or documentation, or from a
   configuration that is in place but whose *behaviour* was not exercised here.
 
-**Route 2 is still the only route that has ever recovered a wedged session**, on
-2026-08-09 — and the command this page published for it until 2026-08-11 was
-wrong, so read the route itself before you rely on it. Route 1's chord is now
-confirmed to work **from a healthy session** (10 of 10 on 2026-08-11, L1 below;
-5 more on 2026-08-09), which is a different claim from *it gets you out of a
-wedge*: the one deliberate wedge this page records, L6, defeated the chord
-exactly as route 1 warns it would. **Route 3 is documented and unexecuted** and
-**route 4 has never been used.** Treat every route but 2 as a careful
-prediction, and treat route 2's published command as tested only in its `pgrep`
-half.
+**Route 2 is the only route that has ever recovered a wedged session** — on
+2026-08-09, and again on 2026-08-13. Both times the command this page published
+was **wrong for the wedge in front of it**, in two different ways, so read the
+route itself before you rely on it: the `pkill -f` form was broken three ways
+([#260](https://github.com/vitrin-os/vitrin-os/issues/260)) and the `kill -TERM`
+that replaced it is inert against a stopped process
+([#277](https://github.com/vitrin-os/vitrin-os/issues/277)). What actually
+recovered the 2026-08-13 wedge was **`kill -CONT`**, and it recovered it in the
+next logged millisecond.
+
+Route 1's chord is confirmed to work **from a healthy session** (10 of 10 on
+2026-08-11, L1 below; 5 more on 2026-08-09). That is a different claim from *it
+gets you out of a wedge*, and 2026-08-13 sharpened how it fails: against a
+`SIGSTOP`ped session the chord is **not refused and not lost — it is queued**,
+and it completes the instant the session resumes. For 163.8 s the panel showed
+the *previous* VT while the kernel already considered the target VT active.
+
+**Route 3 is documented and unexecuted** and **route 4 has never been used.**
+Treat both as careful predictions.
 
 ## Which route, by symptom
 
@@ -58,6 +67,25 @@ later ones cost you more, and the last one costs you the machine's uptime.
 | Panel dark or wrong, **you have a shell somewhere** (another VT, or the Hyprland session on tty1) | [2 — a shell and a signal](#route-2--a-shell-somewhere-else-and-a-signal) |
 | `vitrind` will not die, or it died and the machine is still stuck; **you have a shell with `sudo`** | [3 — SysRq through `/proc/sysrq-trigger`](#route-3--sysrq-through-procsysrq-trigger-sudo-only) |
 | Nothing responds at all | [4 — power cycle, then the installer USB](#route-4--the-installer-usb-and-a-chroot) |
+
+**A wedged session does not have to look dark, and on 2026-08-13 it did not.**
+The operator pressed `Ctrl-Alt-F3` to return to a `SIGSTOP`ped session and the
+panel kept showing **the previous VT's last console content** — tty2's shell,
+sitting there apparently fine. The kernel had already made tty3 active
+(`/sys/class/tty/tty0/active` read `tty3` for the whole wedge), but the stopped
+compositor never acknowledged the acquire and never set a mode, so the
+framebuffer simply retained what was last scanned out.
+
+To a human that reads as *"the VT switch did nothing"*, which is the wrong
+diagnosis and points at the wrong route. **Check `/sys/class/tty/tty0/active`
+before believing the screen**: if it names the VT you asked for and you are not
+looking at it, the session on that VT is wedged, not the switch.
+
+The switch was never refused, either. It sat **pending for the whole 163.8 s**
+and completed in the same millisecond the process resumed — the first line
+logged after `SIGCONT` was `the seat activated this session; reclaiming the
+panel`. Route 1's chord had been accepted all along and was queued behind the
+wedge.
 
 ## Route 1 — `Ctrl-Alt-F<n>`, which this core implements itself
 
@@ -109,9 +137,35 @@ freed it was a terminal in the *still-running Hyprland session on tty1*.
 #    so you can see which session you are about to end before you end it.
 pgrep -x -a vitrind
 
-# 2. Signal the number you just read. One number, typed in.
+# 2. READ ITS STATE. This decides which signal, and getting it wrong looks
+#    exactly like the signal not working.
+ps -o pid,stat,args -p <PID>
+
+# 3a. STAT contains `T` -- the process is STOPPED. `kill -TERM` is INERT here:
+#     a stopped process cannot handle SIGTERM, so it queues as pending and
+#     nothing observable happens. SIGCONT is the recovery, and it PRESERVES
+#     the session -- the compositor resumes and carries on.
+kill -CONT <PID>
+
+# 3b. STAT is `S` or `R` -- running but unresponsive. This is the case route 2
+#     was written for, and here TERM is right.
 kill -TERM <PID>
 ```
+
+**Step 3a is not a footnote; it is [#277](https://github.com/vitrin-os/vitrin-os/issues/277).**
+This page's own `L6` rung wedges the session with `SIGSTOP`, and until
+2026-08-13 the only signal it published was `TERM` — which cannot recover that
+wedge. Verified twice on that date, once against a controlled process and once
+against the real `vitrind`:
+
+```text
+14:16:46  SIGSTOP           -> state Tl+
+14:16:49  SIGTERM, 3 s wait -> STILL ALIVE, state Tl+
+14:16:52  SIGCONT           -> EXITED immediately; the pending TERM landed on resume
+```
+
+`SIGKILL` also works on a stopped process, immediately — but it discards the
+session, where `SIGCONT` gives it back.
 
 **Half of that is verified and half is not, and the difference matters here.**
 Step 1 was run read-only against a live session on 2026-08-11 and returned
@@ -476,20 +530,64 @@ is for.)
 
 Three rungs deserve their own warnings.
 
-**L2 and L3 came up short on their only run.** 2026-08-11 managed 4 of 5
-suspend/resume cycles and 2 of 5 lid cycles, and one of those two lid cycles
-never reached sleep at all. Every cycle that *suspended* came back with a
-working panel, so nothing here is a failure — but the counts this table asks for
-have not been met, and one usable lid sample establishes nothing about short lid
-closes. Do them with the escape shell open and with nothing unsaved.
+**L2 and L3 are complete as of 2026-08-13, and the second run fixed more than
+the counts.** 2026-08-11 managed 4 of 5 suspend/resume cycles and 2 of 5 lid
+cycles. 2026-08-13 added the fifth suspend and three more lid cycles that
+reached sleep, taking both to **5 of 5**.
 
-**L6's answer is easy to lose, and it was lost.** On 2026-08-11 the wedge
+It also closed a hole the first run could not have seen. The 2026-08-11 session
+carried no `--keymap`, so **nothing could be typed into the app** — and an idle
+terminal produces no frames, which makes "the app is correctly idle" and "the
+app is frozen" the same artefact. The counts were met over a client that could
+not be proven alive. On 2026-08-13, with the keymap passed, the operator typed
+after each resume and the log carries the proof directly:
+
+```text
+                    56 frames,  96 keys      before any suspend
+  === suspend / resume ===
+                     7 frames,  18 keys      typed after the systemctl suspend
+  === lid close / open ===
+                    13 frames,  24 keys      typed after the lid cycle
+```
+
+New frames after both resumes: the frame clock restarts, and the failure mode
+this rung names does not occur. **Run these with a keymap** — without one the
+rung passes on evidence it does not have.
+
+Also worth keeping: on 2026-08-13 a lid close reopened within the same second
+**never reached sleep at all**. That is correct behaviour, not a miss, and it is
+the short-lid-close case one sample could never have established.
+
+Do them with the escape shell open and with nothing unsaved.
+
+**L6's answer was lost once, and is now recovered.** On 2026-08-11 the wedge
 recovered in ~69 s and **which route did it could not be reconstructed
 afterwards** — not from the journal, not from either flight recorder, not from
-the process tree, not from two units' exit codes. The rung asks which route got
-you out, so decide *before* you wedge the session which one you will use, keep
-that note next to the keyboard, and write the time down *as* you use it.
-Reconstructing it four minutes later did not work.
+the process tree, not from two units' exit codes. The page then guessed "`fg`
+typed blind".
+
+**2026-08-13 settled it, and the guess was right in substance**: `fg` sends
+`SIGCONT`, and `SIGCONT` is what recovered the second wedge. The route is now
+named, timed, and mechanised:
+
+```text
+14:07:55.141  last log line -- session paused
+              ... SIGSTOP, 163.8 s wedged ...
+14:10:38.963  "the seat activated this session; reclaiming the panel"
+```
+
+Three things that run established which the first could not:
+
+1. **`kill -TERM` does nothing to this wedge** — verified against the real
+   binary ([#277](https://github.com/vitrin-os/vitrin-os/issues/277)). Route 2's
+   published command was the wrong signal for the page's own rung.
+2. **`kill -CONT` recovers it and keeps the session**, in the next logged
+   millisecond.
+3. **Route 1's chord was queued, not defeated.** It completed the instant the
+   process resumed, having sat pending for the whole wedge.
+
+Decide the route before you wedge anything anyway, and write the time down *as*
+you use it. Reconstructing it four minutes later did not work the first time.
 
 **L4 can produce exactly the symptom this whole page is about.** Unblanking is a
 full modeset, and a modeset that fails leaves a dark panel with the session
@@ -498,32 +596,43 @@ record, not a mishap.
 
 ### The numbers this checklist owes
 
-These were owed to issue #223 and were pasted into it on **2026-08-11**; the run
-is recorded below. Two of them are still owed at their stated counts — L2 ran 4
-of 5 cycles, and L3 ran 2 of 5 of which only one suspended, so it is **one
-usable sample** — and L6's answer was not recoverable at all. `L7` is newer than
-that run and was executed separately, later the same day, **at a 20 s timeout
-and by eye rather than by the clock** — enough to settle
-[#257](https://github.com/vitrin-os/vitrin-os/issues/257) and nothing else.
-[#258](https://github.com/vitrin-os/vitrin-os/issues/258) and
-[#259](https://github.com/vitrin-os/vitrin-os/issues/259) are still fixes with
-component tests behind them and nothing more — the log line and the recorder
-pair they add **were not looked at during the L7 run**, and **CI has no seat and
-no DRM device**, so nothing in this repository has observed either of them:
+These were owed to issue #223 and were pasted into it on **2026-08-11**. The
+second run, **2026-08-13**, discharged the rest. Both runs are recorded below.
 
-- L1: how many of 10 switches survived, and the band colour on each return.
-- L2: how many of 5 suspend/resume cycles came back with a working panel, and
-  how long the resume took.
-- L3: how many of 5 lid cycles behaved as L2 did.
-- L4: the measured blank latency and the measured wake latency.
-- L6: which route recovered the wedge, and how long it took.
-- L7: **run 2026-08-11 at a 20 s timeout — the panel stayed lit and the lock did
-  not raise on the return, so [#257](https://github.com/vitrin-os/vitrin-os/issues/257)
-  is settled.** Still owed at this rung: a *timed* figure. The pass was observed
-  by eye — "it did not blank on the way back in, and the lock came up only after
-  I sat there a while" — so the seconds the panel stayed lit were never measured
-  against the timeout, and neither was the absence. A rerun that clocks both is
-  what turns this from a symptom check into a number.
+- **L1 — 10 of 10** (19 switches, 0 stalled; chord-to-pause median 240 ms).
+  2026-08-11.
+- **L2 — 5 of 5.** Four on 2026-08-11 (resume-to-panel 24–31 ms, one 2100 ms
+  outlier), the fifth on 2026-08-13. **Liveness proven on the second run only**:
+  the app took keystrokes and produced new frames after the resume. The first
+  run had no keymap and therefore no way to tell an idle app from a frozen one.
+- **L3 — 5 of 5.** Two on 2026-08-11 (one usable), three on 2026-08-13, all
+  three reaching sleep, with the same typed-after-resume liveness proof. A
+  fourth close/open inside one second correctly never suspended.
+- **L4 — blank at 61.2 s; wake confirmed.** 2026-08-11 for the transition,
+  2026-08-12 for the log line and recorder pair
+  ([#258](https://github.com/vitrin-os/vitrin-os/issues/258),
+  [#259](https://github.com/vitrin-os/vitrin-os/issues/259)), and **observed a
+  second time on 2026-08-13's L7 run** — `the panel is lit again` present,
+  `THE WAKE WAS NOT CONFIRMED` absent, `outcome: flip_landed`. No wake has ever
+  failed on this machine, so the WARN arm remains unexercised; that is the pass
+  condition, not a gap.
+- **L6 — `SIGCONT`, 163.8 s.** The route is named at last, and the mechanism
+  with it: `kill -TERM` is inert against this wedge
+  ([#277](https://github.com/vitrin-os/vitrin-os/issues/277)), route 1's chord
+  was *queued* rather than defeated, and the panel showed the previous VT rather
+  than going dark. 2026-08-13.
+- **L7 — 61.214 s, measured.** 2026-08-13, `--blank-idle 60`. The seat returned
+  at 14:22:21.655 and `screen_blanked` was journalled at 14:23:22.869, so the
+  panel stayed lit for **61.214 s counted from the return** against a 60 s
+  timeout. The ~1.2 s over is service-loop granularity and matches L4's
+  independently measured 61.2 s.
+
+  This replaces the by-eye pass of 2026-08-11, which ran at a 20 s timeout and
+  could not distinguish "the full 20 s" from "17 s". The figure this rung asked
+  for exists now. Both instants come from `vitrind` itself — the seat-return
+  line from the log, the blank from the recorder's `wall_ms` — so no
+  cross-process clock is involved. See the note on clocks in the 2026-08-13
+  record below before computing anything of this shape yourself.
 
 ## Record the run
 
@@ -794,11 +903,63 @@ its own defect. Two runs cannot catch a disagreement between them by
 construction. Nobody believes that state is live; it simply has not been looked
 for.
 
-> **This page has now been executed once, on 2026-08-11, and it is still not a
-> clean pass.** Routes 3 and 4 remain careful predictions; L2 and L3 are short
-> of their counts; L6 recovered but by an unknown route; `L7` passed by eye at a
-> 20 s timeout with no figure recorded; `L5` is adjudicated closed rather than
-> re-run; and the run's
-> headline finding was that this page's own route-2 command was wrong. Read it that way,
-> correct it from your own eyes, and treat a failed observation as a result
-> worth recording rather than a step to retry until it passes.
+### Third run — 2026-08-13, L2/L3 completion, L6 and L7
+
+```
+  Executed: 2026-08-13, by the maintainer, on the same machine as every block
+            above. Artefacts in ~/vitrin-runs/223-{cycles,l7}-*.{log,jsonl}.
+    Binary: vitrind rebuilt 12:26 that day from a clean tree at 9b6239e,
+            --features drm-backend. Shim rebuilt 12:28 against the VENDORED
+            wlroots 0.19.3 -- a system upgrade had replaced 0.19 with 0.20 and
+            the previously built shim could not start at all.
+
+  L2 ....... 5 of 5. The fifth cycle, plus liveness (below).
+  L3 ....... 5 of 5. Three more cycles reaching sleep, plus liveness. A fourth
+             close/open inside one second correctly never suspended.
+  LIVENESS . NEW, and the reason the counts now mean something. With --keymap
+             passed, typing after each resume produced frames:
+               before any suspend .... 56 frames, 96 keys
+               after the suspend ......  7 frames, 18 keys
+               after the lid cycle .... 13 frames, 24 keys
+  L6 ....... SIGCONT, 163.8 s wedged. Route named for the first time.
+  L7 ....... 61.214 s lit, measured from the seat's return, against
+             --blank-idle 60. The figure this rung has owed since it was
+             written.
+  L4 ....... re-observed in passing on the L7 run: `the panel is lit again`
+             present, `THE WAKE WAS NOT CONFIRMED` absent, flip_landed.
+```
+
+**Two method notes, both of which cost time before they were understood.**
+
+**Never correlate the shim's clock with `vitrind`'s.** The shim's `00:00:00.000`
+starts at *shim* launch, not core launch, and the tee'd log interleaves two
+writers with different buffering, so **line order is not time order**. A defect
+was briefly read into existence this way on the same day's 13a run. Where one
+clock is needed, use the flight recorder: every entry carries both `mono_us` and
+`wall_ms`, and `wall_ms` correlates directly with the log's tracing timestamps
+because both come from the same process. L7's figure above was computed exactly
+that way.
+
+**A second `vitrind` refuses to start, and says so.** An accidental second
+launch during this session exited with `fatal: another vitrind already holds
+this runtime tree (its lock on /run/user/1000/vitrin-0/core.sock.lock…)`. It did
+not fight for DRM master. Worth knowing, because the failed attempt still writes
+its own near-empty log, and picking that file by timestamp will make a
+successful run look like it recorded nothing.
+
+> **This page has been executed twice, on 2026-08-11 and 2026-08-13, and is now
+> a pass on every rung it can reach.** L1 through L7 have all been run and all
+> have their numbers, with L2/L3 at full count and proven live, L6's route
+> named, and L7 timed. What remains unexecuted is named rather than implied:
+> **routes 3 and 4 are still careful predictions**, the **VKMS rung was never
+> attempted**, `L5` is adjudicated closed rather than re-run, and the WARN arm
+> of L4 has never fired because no wake has ever failed here.
+>
+> Both runs' headline findings were defects in **this page's own recovery
+> command** — `pkill -f` in 2026-08-11
+> ([#260](https://github.com/vitrin-os/vitrin-os/issues/260)), `kill -TERM`
+> against a stopped process in 2026-08-13
+> ([#277](https://github.com/vitrin-os/vitrin-os/issues/277)). A recovery page
+> that has been wrong twice about its own central instruction is a page to read
+> sceptically. Correct it from your own eyes, and treat a failed observation as
+> a result worth recording rather than a step to retry until it passes.

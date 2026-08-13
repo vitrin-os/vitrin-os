@@ -421,9 +421,27 @@ cd ~/projects/vitrin
 vitrind --drm --consent=interactive \
   --realm ~/.config/vitrin/realm.toml \
   --principals ~/.config/vitrin/principals.toml \
-  --recorder /tmp/vitrind-drm-$(date +%s).jsonl \
-  2>&1 | tee /tmp/vitrind-drm.log
+  --keymap ~/.config/vitrin/keymap.xkb \
+  --recorder ~/vitrin-runs/drm-$(date +%Y%m%d-%H%M%S).jsonl \
+  2>&1 | tee ~/vitrin-runs/drm-$(date +%Y%m%d-%H%M%S).log
 ```
+
+**`--keymap` is not optional, and its absence is silent in the worst way.**
+Without it the core resolves only the layout-invariant scancode table — Escape,
+Enter, Tab, Space, the arrows, the function keys, the modifiers — and **not one
+letter, digit or punctuation mark reaches any app**. Every core chord still
+fires, the panel lights, apps map and repaint, and the session looks entirely
+healthy. It is simply mute. This command line omitted the flag until
+2026-08-13, long after WS-E.3.1 (#217) settled the decision and
+`~/.config/vitrin/keymap.xkb` was generated on 2026-08-09 — so step 13 below
+would fail for a reason its own table reads as a known gap rather than as a
+missing argument. A run that cannot type also silently weakens `L2`/`L3`: an
+idle terminal nobody can type into produces no frames, and "correctly idle" is
+then indistinguishable from "frozen".
+
+**Artefacts under `~/vitrin-runs/`, not `/tmp`.** `/tmp` is tmpfs on this
+machine, so a reboot destroys them — and a bad modeset is exactly the thing that
+forces a reboot. A rung whose failure erases its own log cannot be diagnosed.
 
 `tee` is not optional. If the panel does something you cannot read, the log on
 disk is the only account of what happened.

@@ -94,6 +94,16 @@ observed, not what the child claimed:
 9. Under `off`, every parent-observed field is null/empty and
    `writable_source` says why rather than printing a hopeful default.
 
+**Two of (7)'s fields are shape assertions and are labelled as such at the
+assertion.** `root_dev_differs` and `canaries_unreachable` cannot be journaled
+`false` by any break: `verify_root_view` refuses the spawn instead, and the run
+dies at `await_report` carrying the core's own refusal. They catch an absent,
+`null` or defaulted key -- the `Some(true)`-beside-a-deleted-check shape
+`spawn.rs`'s `RootView` docs record having been fixed -- and nothing more. The
+fields with real discriminating power here are `namespaces_verified`,
+`canaries_probed`, `uid_map`/`gid_map`, `supervisor_pid`/`shim_host_pid` and
+`writable`, each of which was made to fail on its own (2026-08-13).
+
 `RealConfinementDevices` -- the published residual, measured at the app:
 
 10. The realm still holds **every one** of the operator's supplementary groups
@@ -110,11 +120,20 @@ observed, not what the child claimed:
 
 12. A substituted `--realm-init` that unshares all six namespaces and mounts
     **nothing** (`crates/vitrin-realm-init-fixtures`) is **refused**: the core
-    exits non-zero, binds no socket, and names the root-view check. Six
+    exits non-zero, binds no socket, and names the root-**device** check. Six
     differing namespace inodes prove a helper unshared; they prove nothing
     about what it mounted, and this is the assertion that knows the difference.
     Without it, the gate above would stay green if `verify_root_view`'s
     `st_dev` comparison were deleted -- a correct helper never trips it.
+
+    **The needle is `never pivoted onto its own tree`, and that is not
+    cosmetic.** `verify_root_view` has two checkpoints that catch this fixture,
+    and the canary loop's refusal reads "... same device N and same inode M" --
+    so the `same device` needle this assertion shipped with matched *both*, and
+    the assertion went green with the `st_dev` comparison deleted (measured
+    2026-08-13, by deleting exactly that). Its own text above claimed the
+    opposite. `spawn.rs`'s in-crate twin had already learned this and greps for
+    the same needle for the same reason.
 
 ## What this gate deliberately does not prove
 
@@ -493,7 +512,12 @@ class RealConfinementCanary(_RealChain):
 
         # (1, again) The canary survived both runs. A teardown that deleted it
         #     mid-test would make the second half's success meaningless.
-        self.assertEqual(file_identity(self.canary), self.canary_identity)
+        self.assertEqual(
+            file_identity(self.canary),
+            self.canary_identity,
+            "the canary was replaced or removed while the two runs were in flight, so the "
+            "second run's success is about a different file from the first run's absence",
+        )
 
 
 class RealConfinementJournal(_RealChain):
@@ -539,26 +563,89 @@ class RealConfinementJournal(_RealChain):
             "the profile must never be a tier name: `intra-user` is defined as namespaces "
             "PLUS Landlock PLUS seccomp, and this build applies the first third",
         )
-        self.assertEqual(iso["landlock"], "not-applied (P2.6.3)")
-        self.assertEqual(iso["seccomp"], "not-applied (P2.6.4)")
+        # These two are tripwires for a *future* build rather than checks on
+        # this one: the day P2.6.3 or P2.6.4 lands, this gate's "what this does
+        # not prove" section and `limits.md` both go stale, and one of these
+        # fires to say so.
+        self.assertEqual(
+            iso["landlock"],
+            "not-applied (P2.6.3)",
+            "the journal must say in as many words that no Landlock policy is applied. If "
+            "P2.6.3 has landed, this gate's module docs and docs/book/src/limits.md are now "
+            "wrong and both need editing with this line",
+        )
+        self.assertEqual(
+            iso["seccomp"],
+            "not-applied (P2.6.4)",
+            "the journal must say in as many words that no seccomp filter is applied. If "
+            "P2.6.4 has landed, this gate's module docs and docs/book/src/limits.md are now "
+            "wrong and both need editing with this line",
+        )
         self.assertEqual(
             observed["namespaces_verified"],
             SUPERVISOR_NAMESPACES,
             "the core journals the namespace kinds whose /proc/<pid>/ns inode it READ and "
             "found different from its own",
         )
-        self.assertIs(observed["root_dev_differs"], True)
-        self.assertIs(observed["canaries_unreachable"], True)
+        # **These two are shape assertions, and saying so is the honest label.**
+        # `verify_root_view` returns `Err` the moment either comparison fails,
+        # so a confined spawn that got far enough for the app to write a report
+        # cannot journal `false` here -- the run would have died at
+        # `await_report` instead, with the core's own refusal in the message.
+        # What they still catch is a refactor that made either key absent,
+        # `null`, or defaulted at `--isolation=default`, which is exactly the
+        # `Some(true)`-beside-a-deleted-check shape `spawn.rs`'s `RootView`
+        # docs record having been fixed. Measured 2026-08-13: no core or helper
+        # break makes them fail as booleans.
+        self.assertIs(
+            observed["root_dev_differs"],
+            True,
+            "a confined spawn must journal the root-device comparison as a boolean it ran, "
+            "not as an absent or null key",
+        )
+        self.assertIs(
+            observed["canaries_unreachable"],
+            True,
+            "a confined spawn must journal the canary probe's own verdict as a boolean it "
+            "ran, not as an absent or null key",
+        )
         self.assertGreaterEqual(
             observed["canaries_probed"],
             3,
             "the core probes its own socket, its recorder and the operator's $HOME on every "
             "single spawn; a shrinking list must be visible in the log",
         )
-        self.assertIs(observed["setgroups_denied"], True)
-        self.assertEqual(observed["uid_map"].split(), [str(os.geteuid()), str(os.geteuid()), "1"])
-        self.assertEqual(observed["gid_map"].split(), [str(os.getegid()), str(os.getegid()), "1"])
-        self.assertEqual(observed["stdio"], "per-realm log file")
+        self.assertIs(
+            observed["setgroups_denied"],
+            True,
+            "`/proc/<pid>/setgroups` must read back `deny`: it is the precondition for an "
+            "unprivileged single-id gid map existing at all, so a realm journaling anything "
+            "else has a map this core did not write",
+        )
+        # The single identity line, and nothing wider. `0 <euid> 1` would be
+        # namespace-root and would hand the app CAP_SYS_ADMIN inside its own
+        # user namespace; a multi-id map is not a shape an unprivileged writer
+        # can produce at all. Read from the journal, so this also catches a
+        # core that verified one string and recorded another.
+        self.assertEqual(
+            observed["uid_map"].split(),
+            [str(os.geteuid()), str(os.geteuid()), "1"],
+            "the journaled uid_map must be the single identity line this core wrote and "
+            "verified; anything else means the recorded value is not the verified one",
+        )
+        self.assertEqual(
+            observed["gid_map"].split(),
+            [str(os.getegid()), str(os.getegid()), "1"],
+            "the journaled gid_map must be the single identity line this core wrote and "
+            "verified; anything else means the recorded value is not the verified one",
+        )
+        self.assertEqual(
+            observed["stdio"],
+            "per-realm log file",
+            "a confined realm's stdout and stderr must go to its own log file. Inheriting the "
+            "core's would be the operator's tty on a real session, and no mount flag revokes "
+            "a descriptor",
+        )
 
         # (8) The journal's spine against procfs, read independently above.
         self.assertEqual(
@@ -601,7 +688,13 @@ class RealConfinementJournal(_RealChain):
         # The child-asserted half is present and labelled as such. Nothing here
         # licenses the spawn, which is exactly why the journal keeps it below
         # its own line.
-        self.assertGreater(iso["child_asserted"]["mount_count"], 0)
+        self.assertGreater(
+            iso["child_asserted"]["mount_count"],
+            0,
+            "the child's own post-pivot /proc/self/mountinfo must have counted something. "
+            "Zero would mean the helper sent a number it never read -- which is exactly why "
+            "this half of the entry is labelled `child_asserted` and licenses nothing",
+        )
         self.assertTrue(
             iso["child_asserted"]["mount_fingerprint"].startswith("fnv1a-64:"),
             "the fingerprint must name its algorithm, so a reader never mistakes it for one "
@@ -617,15 +710,45 @@ class RealConfinementJournal(_RealChain):
 
         iso = self.spawn_entry(core)["isolation"]
         observed = iso["parent_observed"]
-        self.assertEqual(iso["applied_profile"], "none")
-        self.assertEqual(observed["namespaces_verified"], [])
-        self.assertIsNone(observed["root_dev_differs"])
-        self.assertIsNone(observed["canaries_unreachable"])
-        self.assertEqual(observed["canaries_probed"], 0)
-        self.assertIsNone(observed["setgroups_denied"])
-        self.assertIsNone(observed["uid_map"])
-        self.assertIsNone(observed["shim_host_pid"])
-        self.assertIsNone(observed["writable"])
+        # Every one of these carries its own message, because a bare
+        # `assertIsNone` fails as `True is not None` and names neither the field
+        # nor the claim -- and this whole test method is *about* one claim
+        # (nothing was measured, so nothing is reported) restated over nine
+        # fields, which is precisely the case where the reader needs to be told
+        # which of the nine moved.
+        unmeasured = (
+            "at --isolation=off nothing was applied and therefore nothing was measured; a "
+            "value here is a hopeful default, and a hopeful default in a confinement journal "
+            "reads as evidence"
+        )
+        self.assertEqual(
+            iso["applied_profile"],
+            "none",
+            "an unconfined spawn must journal `none` as its profile, not the name of a "
+            "profile it did not apply",
+        )
+        self.assertEqual(
+            observed["namespaces_verified"],
+            [],
+            "an unconfined spawn unshares nothing, so the verified-namespace list must be "
+            "empty rather than carrying names nothing read",
+        )
+        self.assertIsNone(observed["root_dev_differs"], f"root_dev_differs: {unmeasured}")
+        self.assertIsNone(observed["canaries_unreachable"], f"canaries_unreachable: {unmeasured}")
+        self.assertEqual(
+            observed["canaries_probed"],
+            0,
+            "an unconfined spawn has no realm root to probe canaries through, so the count "
+            "must be 0 rather than the number the confined path would have used",
+        )
+        self.assertIsNone(observed["setgroups_denied"], f"setgroups_denied: {unmeasured}")
+        self.assertIsNone(observed["uid_map"], f"uid_map: {unmeasured}")
+        self.assertIsNone(
+            observed["shim_host_pid"],
+            "at --isolation=off there is no PID-1 child to name; the one pid this spawn has "
+            "is journaled as supervisor_pid, asserted against procfs below",
+        )
+        self.assertIsNone(observed["writable"], f"writable: {unmeasured}")
         self.assertIn(
             "--isolation=off",
             observed["writable_source"],
@@ -725,7 +848,14 @@ class RealConfinementDevices(_RealChain):
             f"the confined app reached {DEV_INPUT}. The realm holds the operator's groups, so "
             f"nothing but the mount table is stopping it; report:\n{confined.raw}",
         )
-        self.assertEqual(confined.err(DEV_INPUT), errno.ENOENT)
+        self.assertEqual(
+            confined.err(DEV_INPUT),
+            errno.ENOENT,
+            f"{DEV_INPUT} must be absent from the realm's filesystem (ENOENT), not merely "
+            f"unopenable (EACCES): the realm holds the operator's `input` group, so a "
+            f"permission refusal would be the kernel disagreeing with the group list rather "
+            f"than the mount table doing the work. Report:\n{confined.raw}",
+        )
 
 
 class RealConfinementRefusesTheUnverifiable(_RealChain):
@@ -773,12 +903,23 @@ class RealConfinementRefusesTheUnverifiable(_RealChain):
             "connected to a session with no realm in it",
         )
         output = core.output()
+        # The needle is unique to the ROOT-DEVICE refusal, and that is the whole
+        # point of it. `verify_root_view` has two checkpoints that can catch this
+        # fixture, and the canary loop's message says "... same device N and same
+        # inode M" -- so a needle of `same device` matches BOTH, and this
+        # assertion went green with `verify_root_view`'s `st_dev` comparison
+        # deleted (measured, 2026-08-13, by deleting exactly that). Its own
+        # docstring above claims the opposite, which is how a message assertion
+        # comes to be decoration. `spawn.rs`'s in-crate twin
+        # (`a_helper_that_unshares_but_mounts_nothing_is_refused`) had already
+        # learned this and greps for the same needle for the same reason.
         self.assertIn(
-            "same device",
+            "never pivoted onto its own tree",
             output,
             "the refusal must name the check that fired -- the realm's root being on the "
-            f"host's device -- so an operator can tell it from any other startup failure. "
-            f"Core said:\n{output[-3000:]}",
+            "host's device -- so an operator can tell it from any other startup failure, and "
+            "so that deleting that check cannot be covered for by the canary loop, which "
+            f"refuses this same fixture one step later. Core said:\n{output[-3000:]}",
         )
 
     def test_a_leaked_directory_descriptor_does_not_survive_into_the_shim(self):
@@ -825,7 +966,12 @@ class RealConfinementRefusesTheUnverifiable(_RealChain):
                 "have closed it",
             )
         # And the confinement it protects still holds, on the same run.
-        self.assertEqual(probe.outcome(str(self.canary)), "fail")
+        self.assertEqual(
+            probe.outcome(str(self.canary)),
+            "fail",
+            "the confinement the closed descriptor protects must still hold on this same run "
+            f"-- a leak test over an unconfined realm proves nothing. Report:\n{probe.raw}",
+        )
         core.terminate()
 
 

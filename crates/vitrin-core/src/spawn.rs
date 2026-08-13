@@ -282,69 +282,129 @@
 //! write. Auditing one inode and `exec`ing whatever the app dropped at that
 //! name is the one divergence the audit must not have.
 //!
-//! What the injected `XDG_RUNTIME_DIR` is *not*: a jail. Its value is
-//! `$XDG_RUNTIME_DIR/vitrin-0/<realm_id>`, a subdirectory of the tree that
-//! also holds the core's own principal-facing `core.sock` and this run's
-//! flight-recorder log -- so the value names the core's control plane one
-//! level up (`../core.sock`). That is worth stating plainly, but it is not
-//! worth relocating: under D9 the child runs as the core's uid and can
-//! derive `/run/user/<uid>` from `getuid()` whether or not any variable
-//! points at it, so moving the realm tree elsewhere would change what the
-//! app is *told*, not what it can reach. The variable is redirected so a
-//! well-behaved client finds its own realm's socket instead of the host
-//! session's, which is a confinement of the well-behaved -- the same
-//! qualifier the whole D9 section below carries.
+//! What the injected `XDG_RUNTIME_DIR` is, and what it stopped being
+//! (P2.6.2, #186):
 //!
-//! Stdio: **stdin is `/dev/null`**, stdout and stderr are inherited. A child
-//! sharing the operator's terminal *stdin* would be competing for the
-//! operator's keystrokes, which is precisely the ambient input authority
-//! this display server exists to mediate. Diagnostics keep their inherited
-//! path because a shim that cannot say why it failed to start is
-//! undebuggable; the residual cost is that a hostile child can write
-//! terminal escape sequences to the operator's terminal -- real, small, and
-//! part of the D9 posture stated below.
+//! - **At `--isolation=off` it is not a jail.** Its value is
+//!   `$XDG_RUNTIME_DIR/vitrin-0/<realm_id>`, a subdirectory of the tree that
+//!   also holds the core's own principal-facing `core.sock` and this run's
+//!   flight-recorder log -- so the value names the core's control plane one
+//!   level up (`../core.sock`). Relocating the tree would not help: the child
+//!   runs as the core's uid and can derive `/run/user/<uid>` from `getuid()`
+//!   whether or not any variable points at it, so moving it would change what
+//!   the app is *told*, not what it can reach. The variable is redirected so
+//!   a well-behaved client finds its own realm's socket, which is a
+//!   confinement of the well-behaved.
+//! - **At `--isolation=default` the same value becomes structural, and it
+//!   does so by a different mechanism than the one this paragraph used to
+//!   reach for.** The value is now the fixed in-realm `/run/vitrin`, a bind
+//!   of that same core-created directory -- and `..` from a bind-mount target
+//!   resolves to the target's parent *in the realm's own tree*, where there
+//!   is no `core.sock` and no recorder log. The closure is the mount
+//!   namespace's, not the path's; that is also why the private-tmpfs
+//!   alternative was refused, since it would have handed the child creation
+//!   of the directory holding its own app-facing socket. And it is checked
+//!   rather than argued: `core.sock` and the recorder path are two of the
+//!   canaries every confined spawn probes through `/proc/<shim>/root`.
 //!
-//! # SECURITY POSTURE OF THE MVP -- READ THIS BEFORE BELIEVING ANY OF THE ABOVE
+//! Stdio: **stdin is `/dev/null` in both modes.** A child sharing the
+//! operator's terminal *stdin* would be competing for the operator's
+//! keystrokes, which is precisely the ambient input authority this display
+//! server exists to mediate.
 //!
-//! ## D9 (settled): the child is NOT sandboxed in the MVP
+//! Stdout and stderr differ, and this one is not hygiene:
 //!
-//! Confinement here is **environment-structural only**: a private socket, a
-//! scrubbed environment, a private runtime directory, and a closed
-//! descriptor table. That is the complete list.
+//! - **At `off`, inherited**, with the residual that a hostile child can
+//!   write terminal escape sequences to the operator's terminal.
+//! - **At `default`, a per-realm log file** inside the realm's own runtime
+//!   directory, named in a startup log line and tailed into the core's stderr
+//!   when a realm dies during bring-up. The reason is that `close_range`
+//!   starts at 3 by construction, so descriptors 1 and 2 cross *both*
+//!   `execve`s untouched -- and on a bare-DRM session they are open
+//!   descriptors on `/dev/ttyN`. **A mount table has no say over a device
+//!   that arrived as a descriptor**, so the `/dev` closure could not be
+//!   claimed honestly with them inherited. (The same argument applies to
+//!   `/dev/tty`, which names the *controlling terminal of the opener*; the
+//!   helper's PID 1 calls `setsid` so the realm has none.) The objection this
+//!   trades against -- "a shim that cannot say why it failed to start is
+//!   undebuggable" -- is answered rather than accepted: the helper writes the
+//!   failing mount entry and its errno to that file, and a bring-up failure
+//!   puts the tail of it both in the core's log and in the refusal itself.
 //!
-//! There are **no namespaces, no seccomp filter, and no Landlock policy**.
-//! The spawned shim and its app run as the core's own uid with the core's
-//! full view of the filesystem, the network, and every socket on the
-//! machine. A confined app that *ignores* `WAYLAND_DISPLAY` and connects
-//! directly to a path it already knows is not stopped by anything in this
-//! file. PRD Doc 2 §4.1 describes the child as spawned "in an unprivileged
-//! sandbox (namespaces/seccomp)"; **this build does not do that yet**, and
-//! nothing in this module should be read as claiming otherwise. Real
-//! sandboxing arrives with the Phase-2 powerbox (E2.6/E2.7) and the
-//! network-authority pillar (PRD P13). Until then, environment hygiene is a
-//! *confinement of the well-behaved*, not a containment of the hostile.
+//! # SECURITY POSTURE -- READ THIS BEFORE BELIEVING ANY OF THE ABOVE
 //!
-//! ## The session D-Bus hole (settled, known, deliberate)
+//! ## Which of the two spawn paths ran decides everything below
 //!
-//! The session bus stays reachable in the MVP because Firefox -- the P1
-//! acceptance app -- wants it. Precisely what that means here:
+//! `--isolation` selects one of two code paths in this file, and they make
+//! genuinely different claims. **Two spawn paths inside the TCB is a real
+//! cost**, stated because it is exactly how a confinement claim rots: the
+//! only thing keeping `default` from silently degrading into `off` is that
+//! the confined arm proves its confinement from outside before it commits.
+//!
+//! ### `--isolation=off`: D9's posture, unchanged and still accurate
+//!
+//! Confinement is **environment-structural only**: a private socket, a
+//! scrubbed environment, a private runtime directory, and a closed descriptor
+//! table. That is the complete list. There are no namespaces, no seccomp
+//! filter and no Landlock policy; the shim and its app run as the core's own
+//! uid with the core's full view of the filesystem, the network and every
+//! socket on the machine. An app that *ignores* `WAYLAND_DISPLAY` and
+//! connects to a path it already knows is not stopped by anything here. This
+//! is a *confinement of the well-behaved*, not a containment of the hostile,
+//! and the session warns about it every sixty seconds for its whole life.
+//!
+//! ### `--isolation=default`: namespaces, and only namespaces
+//!
+//! The realm gets its own user, mount, PID, IPC, UTS and network namespaces,
+//! an identity uid/gid map, zero capabilities, `no_new_privs`, a read-only
+//! root whose entire writable set is `{/run/vitrin, /vitrin/home, /tmp,
+//! /dev/shm}`, and an enumerated `/dev` with no `/dev/input` in it. PRD Doc 2
+//! §4.1 describes the child as spawned "in an unprivileged sandbox
+//! (namespaces/seccomp)"; **this build does the namespace third of that.**
+//! Landlock is P2.6.3 (#187) and seccomp is P2.6.4 (#188), and the journal
+//! says `applied_profile=namespaces-only` rather than any tier name for
+//! exactly that reason.
+//!
+//! Three residuals travel with it, published rather than papered over:
+//!
+//! - **Supplementary groups survive.** `setgroups=deny` blocks the *call* and
+//!   drops nothing, and an unprivileged realm has no window in which to drop
+//!   them itself -- see [`IsolationFacts::supplementary_groups_retained`] for
+//!   the two kernel predicates that make the windows disjoint. Every
+//!   `realm_spawned` entry carries the count.
+//! - **Within one realm, the app can unlink and rebind any socket in
+//!   `/run/vitrin`**, including `wayland-0` and the reserved a11y bus path.
+//!   The shim and the app are one uid inside a single-id map, so mode bits
+//!   cannot separate them. Blast radius is that one realm; the closure is
+//!   P2.6.3's shim-side Landlock stack.
+//! - **Realm private storage has no quota**, and the GPU render node is bound
+//!   read-write with its whole ioctl surface.
+//!
+//! ## The session D-Bus hole: open at `off`, closed at `default`
+//!
+//! The session bus stayed reachable in the MVP because Firefox -- the P1
+//! acceptance app -- wants it. At `--isolation=off` that is still exactly
+//! true, and the distinction that mattered still matters:
 //!
 //! - The core injects no `DBUS_SESSION_BUS_ADDRESS` and points
 //!   `XDG_RUNTIME_DIR` at the realm's private directory, so the bus is not
-//!   *advertised* to the child, and a well-behaved client finds nothing.
+//!   *advertised*, and a well-behaved client finds nothing.
 //! - That is advertisement, not reachability. `/run/user/<uid>/bus` is still
 //!   on the filesystem and still connectable by any process of this uid, and
-//!   the abstract-socket namespace is still shared. Nothing here prevents a
-//!   child from connecting to it directly.
-//! - In practice an operator running Firefox will allow-list
-//!   `DBUS_SESSION_BUS_ADDRESS` in `realm.toml`, which turns the implicit
-//!   hole into an explicit, audited one.
+//!   the abstract-socket namespace is still shared.
 //!
-//! Session-bus reach is a lateral-escape path of exactly the shape PRD Doc 2
-//! §15 catalogues (D-Bus activation of a privileged helper), and it is
-//! closed by **P13** in Phase 2 -- own network namespace plus an empty mount
-//! namespace, so there is nothing to reach rather than nothing advertised.
-//! It is not closed by this file and cannot be.
+//! At `--isolation=default` it is **closed twice over**, and neither closure
+//! is this file's cleverness -- both are the kernel's. The mount namespace
+//! removes `/run/user/<uid>/bus` as a path (the realm's `/run` holds one
+//! entry, `vitrin`), and the network namespace removes the abstract-socket
+//! namespace the bus also listens on, because abstract sockets are scoped to
+//! a network namespace. An operator who allow-lists
+//! `DBUS_SESSION_BUS_ADDRESS` in `realm.toml` at `default` gets a variable
+//! naming something that is not there.
+//!
+//! PRD Doc 2 §15 catalogues this shape (D-Bus activation of a privileged
+//! helper) as a lateral-escape path, and P13 is where the *network* half of
+//! the answer is finished; the mount half is here.
 //!
 //! # Not in this module
 //!
@@ -356,16 +416,19 @@
 //! pid -- which is exactly the pid-reuse race a `Child` exists to avoid.
 //! Nothing here decides when a realm dies or what that means.
 
-/// The runtime isolation preflight (P2.6.1, #185): what confinement *this
-/// kernel* will grant, measured rather than assumed.
+/// The runtime isolation preflight (P2.6.1, #185) and the selector that acts
+/// on it (P2.6.2, #186): what confinement *this kernel* will grant, measured
+/// rather than assumed, and what *this build* refuses to start without.
 ///
 /// It sits under `spawn` because it measures precisely the requests the spawn
-/// path will make -- but nothing in this file calls it yet. The D9 section
-/// above still describes what a realm child actually gets today, and it stays
-/// accurate until P2.6.2 (#186) replaces the environment-only confinement.
-/// The preflight lands first because Phase 2's R2.9 -- unprivileged user
-/// namespaces restricted on major distros -- is the one risk that can
-/// invalidate two whole epics, and it retires only by measuring real kernels.
+/// path makes -- the six-flag `unshare` its `ns.all` row probes is the exact
+/// call `vitrin-realm-init` issues, one constant shared by both, so the
+/// preflight cannot measure something weaker than what runs.
+///
+/// It landed a task ahead of the confinement because Phase 2's R2.9 --
+/// unprivileged user namespaces restricted on major distros -- is the one
+/// risk that can invalidate two whole epics, and it retires only by measuring
+/// real kernels.
 pub mod isolation;
 
 use std::ffi::{OsStr, OsString};
@@ -2692,6 +2755,18 @@ fn reject_reserved_env(spawn: &SpawnConfig) -> Result<(), SpawnError> {
 /// defers -- a `fexecve` here would be the one hardened step in an otherwise
 /// unsandboxed spawn. It lands with the powerbox (E2.6/E2.7), which
 /// re-opens the exec primitive anyway.
+///
+/// **P2.6.2 narrowed it rather than closing it**, and the narrowing is worth
+/// stating precisely because it is easy to overclaim. At
+/// `--isolation=default` the shim and the app are `execve`'d from *read-only,
+/// `nosuid`, `nodev` bind mounts inside the realm*, so nothing in the realm
+/// can write over either binary after the fork. What that does not cover is
+/// the window this paragraph is about, which is on the **host** side and
+/// before the helper exists: between this audit and the helper's `open`, a
+/// same-uid process outside the realm can still swap the source. The realm's
+/// read-only view protects the realm from itself; only `fexecve` -- or the
+/// per-uid tier that makes "same uid" stop meaning "the same authority" --
+/// closes the host-side race.
 fn audit_program_at_spawn(command: &Path) -> Result<(), SpawnError> {
     // Before anything else: a relative program would be resolved by
     // `execvp` against the child's working directory, which `launch` sets
@@ -4819,6 +4894,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_two_paths_diverge_on_stdio_and_on_home_and_nowhere_else_observable() {
+        // `off` must stay the path that shipped before #186, and the *whole*
+        // reason `default` is a second path is a short list of differences.
+        // Asserting the list on the child's own `/proc` state -- rather than
+        // snapshotting a `Command` struct -- is what makes an accidental
+        // change to the unconfined arm visible: a struct snapshot goes stale
+        // the moment a field is added for the other arm.
+        let _fd = fd_lock();
+        let mut h = Harness::new("off-unchanged");
+        let (spawned, _server) = h.spawn_mock(&["--serve"], &[], &[]);
+        let pid = spawned.pid();
+
+        // 1. stdout and stderr are INHERITED. This is the property clause 9
+        //    changes, and on a bare-DRM session these are descriptors on
+        //    /dev/ttyN that no mount flag can revoke.
+        for fd in [1, 2] {
+            let child = fs::read_link(format!("/proc/{pid}/fd/{fd}")).expect("the child's fd");
+            let ours = fs::read_link(format!("/proc/self/fd/{fd}")).expect("our fd");
+            assert_eq!(
+                child, ours,
+                "at --isolation=off fd {fd} must still be the core's own; it is what                  --isolation=default replaces with a per-realm log file"
+            );
+        }
+        // 2. stdin is /dev/null in both modes.
+        assert_eq!(
+            fs::read_link(format!("/proc/{pid}/fd/0")).expect("fd 0"),
+            Path::new("/dev/null")
+        );
+        // 3. No HOME. The core injects it only on the confined path, because
+        //    only there does the host $HOME stop existing.
+        assert!(
+            !child_env_of(pid).contains_key("HOME"),
+            "the unconfined path must not inject HOME: the host's one is still there and              still correct"
+        );
+        // 4. The cwd is the realm's HOST runtime directory, not /run/vitrin.
+        let cwd = fs::read_link(format!("/proc/{pid}/cwd")).expect("cwd");
+        assert!(
+            cwd.ends_with("vitrin-0/realm-0"),
+            "the unconfined child's cwd moved: {cwd:?}"
+        );
+        h.reap(spawned);
+    }
+
+    #[test]
     fn the_confined_shim_holds_no_authority_it_was_not_handed() {
         // Everything here is read by the parent from `/proc`, which is the
         // whole point: a confinement claim is only as good as the reads
@@ -4846,22 +4965,71 @@ pub(crate) mod tests {
             );
             assert_eq!(proc_status(shim, "NoNewPrivs:").as_deref(), Some("1"));
 
-            // The descriptor table. fd 3 is the core connection and must be
-            // open; nothing at or above 4 may survive, because a leaked
-            // `O_DIRECTORY` handle on the old root is a complete pivot escape
-            // (`openat(fd, "../..")` still works through one).
-            let mut fds: Vec<i32> = fs::read_dir(format!("/proc/{shim}/fd"))
+            // The descriptor table, and the property is **not** "nothing above
+            // fd 3": a running shim opens descriptors of its own, so a count
+            // is a race rather than an assertion. What must hold is that no
+            // descriptor the shim holds names a file outside the realm --
+            // which is the actual escape, because after the `MNT_DETACH` a
+            // leaked `O_DIRECTORY` handle on the old root is a complete pivot
+            // escape (`openat(fd, "../..")` and `fchdir(fd)` both work
+            // through one) and it is the only remaining handle on the host
+            // tree.
+            let entries: Vec<PathBuf> = fs::read_dir(format!("/proc/{shim}/fd"))
                 .expect("the shim's fd table is readable")
                 .flatten()
-                .filter_map(|e| e.file_name().to_str()?.parse().ok())
+                .map(|e| e.path())
                 .collect();
-            fds.sort_unstable();
-            assert!(fds.contains(&3), "fd 3 (the core connection) is gone: {fds:?}");
             assert!(
-                !fds.iter().any(|fd| *fd >= 4),
-                "a descriptor survived the second execve: {fds:?}. After the MNT_DETACH the \
-                 only remaining handle on the host tree is a leaked fd, and one is enough"
+                entries.iter().any(|e| e.file_name() == Some(OsStr::new("3"))),
+                "fd 3 (the core connection) is gone: {entries:?}"
             );
+            // fds 1 and 2 are the realm's log file, and asserting *that* is
+            // the positive half of clause 9: on a bare-DRM session they would
+            // otherwise be open descriptors on `/dev/ttyN`, which no mount
+            // flag can revoke, and the `/dev` closure could not be claimed
+            // honestly with them inherited. They are a host-tree descriptor
+            // by design -- a regular file, so not a pivot escape -- and the
+            // loop below therefore excludes stdio rather than pretending
+            // nothing crosses.
+            for fd in [1, 2] {
+                let target = fs::read_link(format!("/proc/{shim}/fd/{fd}")).expect("the fd");
+                assert!(
+                    target.ends_with(REALM_LOG_NAME),
+                    "fd {fd} is {target:?}, not the realm's log file"
+                );
+            }
+
+            for entry in &entries {
+                // stdio is core-decided and asserted above.
+                if matches!(
+                    entry.file_name().and_then(OsStr::to_str),
+                    Some("0") | Some("1") | Some("2")
+                ) {
+                    continue;
+                }
+                let Ok(target) = fs::read_link(entry) else {
+                    continue;
+                };
+                let target = target.to_string_lossy();
+                // Anonymous descriptors name no path in the filesystem and
+                // cannot be a pivot escape:
+                //   * `socket:[N]`, `anon_inode:...`, `pipe:[N]` -- not
+                //     absolute, so the first test catches them;
+                //   * an unlinked file, which the kernel renders as
+                //     `<path> (deleted)`. A `memfd` is exactly this -- it
+                //     shows as `/memfd:wl_shm (deleted)` -- and a Wayland
+                //     shim allocates them routinely, so this arm is load
+                //     bearing rather than defensive.
+                if !target.starts_with('/') || target.ends_with(" (deleted)") {
+                    continue;
+                }
+                assert!(
+                    fs::symlink_metadata(format!("/proc/{shim}/root{target}")).is_ok(),
+                    "the shim holds {} on {target}, which does not exist inside the realm -- \
+                     that is a descriptor that survived the pivot, and one is enough",
+                    entry.display(),
+                );
+            }
             // And fd 0 is the realm's own /dev/null, not the config channel.
             let stdin = fs::read_link(format!("/proc/{shim}/fd/0")).expect("fd 0");
             assert_eq!(stdin, Path::new("/dev/null"), "fd 0 is {stdin:?}");

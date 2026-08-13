@@ -109,6 +109,26 @@ PROPERTY_GATES=(
                                 # detection, which is upstream of
                                 # `intake_physical` and needs a real touchpad --
                                 # `docs/drm-bringup.md` step 13a.
+  test_real_confinement.py      # P2.6.2 (#186): a canary file in the operator's
+                                # real $HOME is UNREACHABLE from inside a
+                                # confined realm and REACHABLE from the same app,
+                                # same argv, under `--isolation=off` -- the
+                                # positive control the plan's own criterion
+                                # demands, because an absence over a path nothing
+                                # proved reachable is satisfied by no path at
+                                # all. Reachability is decided by (st_dev,
+                                # st_ino), never by name: the mount table has to
+                                # CREATE $HOME inside the realm as a stub, so a
+                                # presence test would call a correct realm a
+                                # breach. Also: the flight recorder's
+                                # parent-observed confinement facts checked
+                                # against procfs, the supplementary-group
+                                # residual D-037(5) publishes measured at the app
+                                # with /dev/input unreachable beside it, and a
+                                # substituted helper that unshares six namespaces
+                                # and mounts NOTHING refused at startup
+                                # (crates/vitrin-realm-init-fixtures). No new CI
+                                # wiring and no cargo feature.
   test_launch.py                # a consented `realm_launch` grant makes the
                                 # TRUSTED CORE fork a process, and the journal
                                 # names who asked (#207). The one gate covering

@@ -1001,7 +1001,10 @@ jobs:
           # drifted -- it carried two of the five gates run.sh named, so the
           # guard against gate drift had silently drifted, which is the same
           # defect one level up. Edit both, and README.md's table, together.
-          for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_real_clipboard.py test_screenshot.py test_launch.py test_shell.py; do
+          # It had drifted AGAIN by P2.6.2: `test_real_gestures.py` (WS-E.4.2,
+          # #222) was in run.sh's list and never here. Both are named now, plus
+          # `test_real_confinement.py` (#186).
+          for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_real_clipboard.py test_screenshot.py test_real_gestures.py test_real_confinement.py test_launch.py test_shell.py; do
             if [ ! -f "tests/integration/$gate" ]; then
               echo "::error::named property gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with that property's evidence contributing nothing. Restore it, or retire it from run.sh's PROPERTY_GATES, this list, and tests/integration/README.md's gate table together."
               missing=1

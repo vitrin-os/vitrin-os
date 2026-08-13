@@ -654,10 +654,15 @@ revocation, the grant's rate ceiling, a cap of 16 live realms (refused
 `capacity`), and a journal entry naming the principal and grant behind every
 spawn.
 
-**And nothing bounds what a launched app then does.** A launch grant is
-authority to start an *unconfined* process with the core's own uid and
-filesystem view — the confinement limits below apply to it unchanged, one
-authority level up. Phase-2 confinement (E2.6/E2.7) is what changes that.
+**And little bounds what a launched app then does.** A launch grant is
+authority to start a process confined exactly as much as the session is — at
+`--isolation=off`, an *unconfined* one with the core's own uid and filesystem
+view; at `--isolation=default`, one that is path-confined and not
+syscall-confined. P2.6.2 narrowed this and did not close it: the launched
+process still gets a full syscall surface, the operator's supplementary groups
+and a read-write render node, so the confinement limits above apply to it
+unchanged, one authority level up. P2.6.3 and P2.6.4 are what narrow it
+further.
 
 **A launched realm cannot be closed, by anybody, ever.** This is the sharper
 half of the point below and it is worth stating on its own: there is no wire

@@ -584,7 +584,7 @@ Type `hello` into the terminal, on your real layout.
 | | Wrong letters | The scancode→keysym resolution is wrong for this layout. Record which key produced which letter |
 | | Letters appear doubled or stick | Key pairing moved from the keysym to the scancode (`input/mod.rs`); a mismatched press/release pair is the classic symptom |
 
-### 13a. The touchpad classes (WS-E.4.2, issue #222) — NOT YET RUN
+### 13a. The touchpad classes (WS-E.4.2, issue #222) — RUN 2026-08-13
 
 Steps 10 and 13 exercise the pointer and the keyboard. This rung exercises the
 three classes the seat vocabulary grew afterwards — **relative motion, swipe
@@ -604,10 +604,11 @@ that a human's three fingers produce a `gesture_begin` at all. Only fingers on
 this laptop's touchpad are, and only through the DRM backend — the nested
 backends never see a gesture, because the host compositor consumes it.
 
-Written before it is executed, on D-033's precedent and 12a's, so the thing
-that has to happen is written down rather than implied. **Leave the record
-block empty until you have actually done it**, and do not fill it in from
-reasoning.
+Written before it was executed, on D-033's precedent and 12a's, so the thing
+that had to happen was written down rather than implied. **Executed 2026-08-13**
+— the record block at the end of this rung is filled from that run's artefacts,
+and it found the defect in issue #275. The rung earned its cost: what it caught
+is unreachable from CI by construction.
 
 The witness is `gesture-probe`, the same client the integration rung uses
 (`shim/tests/gesture_probe.c`), because it is the only one that keeps pairing
@@ -618,12 +619,15 @@ stdout:
 
 ```toml
 # ~/.config/vitrin/realm-gesture.toml -- one realm, the probe as its app.
-# --run-ms is generous: you are doing this by hand.
+# --run-ms is generous: you are doing this by hand, you cannot see the probe's
+# output while vitrind owns the panel, and the clock does NOT stop while the
+# seat is away on another VT. 300000 after the 2026-08-13 run; the 180000 this
+# page carried first is not enough for five rungs plus 13a-v's VT round trip.
 [[realm]]
 id = "realm-0"
 autostart = true
 command = "/home/taha/projects/vitrin/shim/build/gesture-probe"
-args = ["--run-ms", "180000", "--tag", "touchpad"]
+args = ["--run-ms", "300000", "--tag", "touchpad"]
 ```
 
 ```bash
@@ -635,9 +639,25 @@ vitrind --drm --consent=interactive \
   2>&1 | tee /tmp/vitrind-gestures.log
 ```
 
-Then, with the pointer **over the app's surface** (move it there first — a
-gesture over the letterbox matte belongs to nobody, and the router hit-tests a
-delta against the stored pointer position):
+Then, having **moved the pointer at least once** — see the warning below, which
+cost two runs on 2026-08-13 before the rung was executed:
+
+**`gesture-probe` maps fullscreen, so there is nothing to aim at.** It fills the
+whole output (`2560x1600` on this panel) with flat slate blue (`0xff2050a0`,
+`shim/tests/gesture_probe.c:570`), so the pointer is over its surface wherever
+it is and **there is no letterbox matte in this configuration**. What still
+matters is that the pointer **moves**: `pointer_enter` is delivered on the first
+motion, not on map, and a run whose SUMMARY reads `enter=0 motion=0` tested
+nothing no matter what else you did in it. Wiggle the cursor first, and treat
+`enter=1` as the precondition for reading anything below.
+
+Do not read a flat blue panel as a failed launch. **An empty scene renders the
+deterministic test pattern** (`scene::compose`, `test_pattern::render`), never a
+flat colour — so flat blue is the app, and a test pattern is its absence.
+
+The generic warning the above replaces still holds for a *windowed* app: a
+gesture over the matte belongs to nobody, because the router hit-tests a delta
+against the stored pointer position.
 
 | # | Do, on the real touchpad | Expected [inferred] | Failure | What it means |
 |---|---|---|---|---|
@@ -660,16 +680,110 @@ therefore not available to cross-check what the kernel reported; read
 `/proc/bus/input/devices` and the log instead, and record the substitution
 rather than making it silently.
 
-**Record block — empty on purpose. Do not fill it in from reasoning.**
+**Record block — EXECUTED 2026-08-13.** Filled from the artefacts named below,
+not from reasoning. Two earlier attempts that tested nothing are recorded too,
+because what made them fail is the reusable part.
 
 ```text
-13a-i    (relative motion)      date: ____  result: ____
-13a-ii   (three-finger swipe)   date: ____  result: ____
-13a-iii  (two-finger pinch)     date: ____  result: ____
-13a-iv   (two-finger scroll)    date: ____  result: ____
-13a-v    (switch mid-gesture)   date: ____  result: ____
-13a-vi   (pointer lock)         date: ____  result: ____
+13a-i    (relative motion)      date: 2026-08-13  result: PASS
+13a-ii   (three-finger swipe)   date: 2026-08-13  result: PASS
+13a-iii  (two-finger pinch)     date: 2026-08-13  result: PASS
+13a-iv   (two-finger scroll)    date: 2026-08-13  result: PASS
+13a-v    (switch mid-gesture)   date: 2026-08-13  result: DEFECT -- issue #275
+13a-vi   (pointer lock)         date: 2026-08-13  result: PASS
 ```
+
+```
+  Executed: 2026-08-13, by the maintainer, on the target laptop, tty3, three
+            sessions. Artefacts under ~/vitrin-runs/ (NOT /tmp: this machine
+            mounts /tmp as tmpfs, and a bad modeset can force the reboot that
+            would erase the log explaining it).
+              13a-main-20260813-124108.{log,jsonl}   rungs i-iv
+              13a-v-20260813-132558.{log,jsonl}      rung v
+              13a-lock-20260813-133107.{log,jsonl}   rung vi
+    Binary: vitrind rebuilt 12:26 the same day from a clean tree at 9b6239e,
+            --features drm-backend, clippy clean, no gbm soft-fail warning.
+            Shim and gesture-probe rebuilt 12:28 -- see the wlroots note below.
+     Card: /dev/dri/card2, NOT the card1 of the 2026-08-09 record. This page
+            already warned the choice was not stable; it is now observed twice
+            with two different answers. Do not hard-code either.
+
+  13a-i .. PASS. 699 pointer_motion and 699 relative_motion, exactly 1:1, e.g.
+            dx=0.602 against udx=2.000. The unaccelerated delta is genuinely
+            minted, not the accelerated one copied. 44 of 699 samples have
+            dx==udx: the zero and sub-pixel ones, where acceleration is
+            identity. Not the failure mode -- that would be all of them.
+
+  13a-ii ... PASS, and this is the observation the rung exists for. TEN swipes,
+            every one fingers=3, every end paired=1. libinput's own gesture
+            detection classified three-finger swipes on this touchpad and the
+            finger count survived transit.
+
+  13a-iii .. PASS. 4 pinch pairs, fingers=2, scale spanning 0.219 to 4.555 --
+            crossing 1.0 in BOTH directions, so scale is absolute since begin
+            and not accumulated. This is the mistake an app cannot detect, and
+            it is not present.
+
+  13a-iv ... PASS. 361 pointer_axis events and ZERO swipe_begin with fingers=2.
+            Two-finger scroll is served as an axis event and is not
+            double-reported as a gesture.
+
+  13a-v .... DEFECT, issue #275. The gesture is not latched -- the app gets an
+            end and exits in_flight=none -- but the end says `completed` where
+            it must say `cancelled`. libinput flushes the in-flight swipe when
+            the seat revokes the devices, 95 ms after the switch was requested
+            and BEFORE session::suspend_physical_seat runs, so the core's own
+            cancel path (InputRouter::end_physical_gesture) finds nothing and
+            reports released=0. Proven on the recorder's single mono_us clock,
+            with the Ctrl/Alt chord sandwiched between gesture_begin (7.302 s)
+            and gesture_end (8.711 s), vt_switch_requested at 8.616 s.
+
+  13a-vi ... PASS on all three halves, including the one no headless test can
+            reach. The cursor sprite DISAPPEARED (observed; hides_human_sprite
+            is consulted in the DRM composite, and every backend CI run passes
+            human_cursor: None). The pointer FROZE: 536 relative_motion while
+            locked against ZERO absolute pointer_motion, and the first absolute
+            position after unlock is sx=1284.102 sy=798.551 -- dead centre of
+            2560x1600, where it locked. Held-Esc REVOKED through the lock:
+            `dead-man chord completed ... withdrawn_pointer_constraints=1`,
+            and the app received pointer_unlocked. The dead-man switch is not
+            behind the constraint.
+```
+
+**Two attempts before this tested nothing, and the reason generalises.** The
+first (`13a-v`, 12:57) recorded `enter=0 motion=0 swipe_begin=0`: the operator
+was looking for an app window to aim at, found a flat blue panel, and never
+touched the touchpad. The second failure mode was nearly wasted on advice to
+"hold three fingers still" — **wrong**, and it would have produced nothing:
+libinput classifies stationary fingers as a **hold** gesture, and the wire has
+exactly two kinds (`GestureKind::ALL` = `[Swipe, Pinch]`), so a hold is dropped
+and nothing is ever in flight. This machine's hold detector is demonstrably
+live; its timer appears in the log by name. **Keep the fingers sliding.**
+
+**A substitution, recorded rather than made silently.** `--run-ms` was raised
+from the 180000 this page prints to 300000, and a third realm file
+(`realm-gesture-v.toml`, 90 s) was added for retrying 13a-v alone. Five rungs
+share one session, 13a-v spends part of it on another VT, and the probe's clock
+does not stop while the seat is away.
+
+**The shim did not build, and the binary that existed could not run.** A system
+upgrade had replaced wlroots 0.19 with 0.20: the meson build failed on a missing
+`wlr/render/wlr_renderer.h`, and `ldd shim/build/vitrin-shim` reported
+`libwlroots-0.19.so => not found`, so no app could have run under `vitrind` at
+all. Resolved by D11's own vendored fallback rather than a port:
+`meson setup --reconfigure --force-fallback-for=wlroots-0.19 shim/build shim`,
+which builds wlroots 0.19.3 from `subprojects/wlroots.wrap`. **Check this before
+a bring-up session**, not during one.
+
+**Three environment observations, none of which stopped the run.**
+
+- `WARN Unable to become drm master, assuming unprivileged mode`, once at device
+  open, before libseat hands over. The panel lit regardless.
+- `libinput error: client bug: timer event19 hold: scheduled expiry is in the
+  past (-1013ms), your system is too slow` — once per VT return. libinput's hold
+  timer measured against a clock that did not advance across the pause.
+- `WARN Failed to destroy old mode property blob: No such file or directory` —
+  once per modeset, five times across the first session.
 
 ## 14. Measure the frame cadence
 

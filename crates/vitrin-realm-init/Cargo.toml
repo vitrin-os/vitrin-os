@@ -1,0 +1,35 @@
+[package]
+name = "vitrin-realm-init"
+version = "0.1.0"
+edition.workspace = true
+# Stated explicitly, never inherited: the workspace-wide `license` key was
+# deliberately deleted (root `Cargo.toml`, D-005 / issue #133) so a new crate
+# cannot silently pick up the wrong half of the split. This crate is original
+# implementation expression inside the TCB -- nothing here is derived from
+# `protocol/vitrin-v0.xml` -- so it takes `vitrin-core`'s licence, not
+# `vitrin-protocol`'s. The root NOTICE carries the same statement and is the
+# normative map.
+license = "MPL-2.0"
+rust-version.workspace = true
+description = "vitrin-realm-init: the per-realm namespace helper vitrind execs, and the wire shape the two sides share."
+publish = false
+
+[[bin]]
+name = "vitrin-realm-init"
+path = "src/main.rs"
+
+[dependencies]
+# **One** dependency, and that is a decision rather than an accident (plan
+# risk R7: the TCB's dependency budget). This binary is the process that
+# builds a realm's confinement, so every crate it links is a crate that can
+# weaken one -- and it is exec'd by the trusted core with the core's own
+# authority, before any namespace exists.
+#
+# `libc` covers the whole surface: `unshare`, `mount`, `umount2`,
+# `pivot_root`, `setgroups`, `prctl`, `capset`, `sethostname`, `close_range`,
+# `pivot`-adjacent `chdir`/`fchdir`, and the `SIOCSIFFLAGS` ioctl that brings
+# `lo` up. `rustix` was considered for its descriptor-bound `openat`/`fstat`
+# and declined: the mount table is built relative to a *working directory*
+# rather than to descriptors, so rustix would add a second FFI vocabulary to
+# this file without removing a single `unsafe` block.
+libc = "0.2"

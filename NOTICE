@@ -50,7 +50,9 @@ MPL-2.0 (LICENSE-MPL-2.0)
 
   - the reference implementation: crates/vitrin-core (the trusted core —
     compositor, capability kernel, grant store, realms, consent, dead-man
-    switch, flight recorder), crates/vitrin-ipc (the transport), and the
+    switch, flight recorder), crates/vitrin-ipc (the transport),
+    crates/vitrin-realm-init (the per-realm namespace helper the core execs,
+    and the frame vocabulary the two sides share), and the
     per-app Wayland shim under shim/ — its C sources, its hand-written
     headers, and its own test fixtures.
 

@@ -7,15 +7,43 @@ discover an item on it yourself.
 
 ## Do not deploy this yet
 
-**There is no sandbox.** Decision D9. No namespaces, no seccomp, no
-Landlock. A realm's app runs as the core's own uid with the core's full view
-of the filesystem and the network. An app that ignores `WAYLAND_DISPLAY` and
-connects to a path it already knows is not stopped by anything here. The
-session D-Bus remains reachable in practice.
+**The sandbox is half-built, and which half you have depends on a flag.**
+Decision D9, then D-020 and D-036. Since P2.6.2 a realm is spawned into **six
+namespaces** — user, mount, PID, IPC, UTS and network — with an identity
+uid/gid map, **zero capabilities**, and a private mount table the app cannot
+reshape. The core verifies all of that from **outside**, by reading the
+kernel's answer about the child, and refuses the spawn when it cannot.
+
+What is **not** there yet: **no Landlock ruleset** (P2.6.3) and **no seccomp
+filter** (P2.6.4). So the realm's syscall surface is the kernel's whole
+surface, restricted only by having no capabilities and no path to most of the
+filesystem.
+
+Three things survive the namespaces, and each is published rather than left
+to be found:
+
+- **The realm keeps your supplementary groups.** `video`, `render`, `input`,
+  `docker` — whatever the invoking user has. This is not an oversight: an
+  unprivileged `setgroups(0, NULL)` and an unprivileged single-id `gid_map`
+  require *disjoint* windows, so there is no moment at which the groups can be
+  dropped. Measured, both orderings return `EPERM`. The mount table is
+  therefore the only thing standing between a realm and any device those
+  groups would open, and each spawn journals the count as
+  `supplementary_groups_retained`.
+- **The GPU render node is bound read-write.** Never `card*` or `controlD*`,
+  but the render node's ioctl surface and the cross-realm GPU-memory side
+  channels it carries are real and unaddressed. Read-only was tried and
+  rejected: it disables the node rather than restricting it, which would
+  silently break every accelerated app in every realm.
+- **`--isolation=off` is exactly the old, unconfined path**, and it exists so
+  the confinement gates can run their positive controls. It has to be named
+  on the command line; nothing selects it implicitly, and a session running
+  that way says so on the panel.
 
 Environment hygiene confines the well-behaved; it does not contain the
-hostile. Do not run untrusted applications, or untrusted agents, against
-this. Real sandboxing is Phase 2 (E2.6/E2.7, P13).
+hostile. **Do not run untrusted applications, or untrusted agents, against
+this yet** — a realm that can issue any syscall it likes is not a boundary you
+should stake anything on, whatever its filesystem view.
 
 **And when that sandboxing does arrive, it will not close this next gap, so
 the gap is published before the feature rather than after it.** Host-level
@@ -36,16 +64,25 @@ about. Constraining the sidecars themselves is a decide-by-M3 item; it is not
 solved by attribution metadata and must not be described as if it were. See
 D-020(5) in `docs/plan/20-decision-log.md`.
 
-**On bare metal, a realm's app can plausibly open the real keyboard and read
-every key you type — including into other realms, and including a passphrase.**
-This is the sandbox gap above, pointed at the one device the whole architecture
-is built to mediate. `logind` ACLs `/dev/input/event*` to the user owning the
-active seat session; the confined app runs as the core's **own uid** with the
-core's full filesystem view and no namespace, no seccomp filter and no Landlock
-policy, so nothing stops it from opening those nodes directly. On this
-project's own target machine the maintainer is additionally a member of the
-`input` group, which grants that access independently of any seat — so this is
-concrete rather than theoretical.
+**On bare metal at `--isolation=off`, a realm's app can plausibly open the real
+keyboard and read every key you type — including into other realms, and
+including a passphrase.** This is the sandbox gap above, pointed at the one
+device the whole architecture is built to mediate. `logind` ACLs
+`/dev/input/event*` to the user owning the active seat session; an unconfined
+app runs as the core's **own uid** with the core's full filesystem view, so
+nothing stops it from opening those nodes directly. On this project's own
+target machine the maintainer is additionally a member of the `input` group,
+which grants that access independently of any seat — so this is concrete
+rather than theoretical.
+
+**At `--isolation=default` this is closed, and by exactly one mechanism.** The
+realm's `/dev` is built from scratch and contains six nodes — `null`, `zero`,
+`full`, `random`, `urandom`, `tty` — plus render nodes. **`/dev/input` is not
+among them**, and the realm cannot mount, so it cannot put it there. Note what
+is *not* doing the work: the `input` **group membership survives** into the
+realm (see the supplementary-groups limit above), so the app still holds the
+credential that would open those nodes. It is the mount namespace alone that
+denies it the path. That is a single point of failure, stated as one.
 
 What that bypasses is not a feature but the premise: `vitrind`'s input router,
 the origin tag that distinguishes a human from an agent, the per-realm routing,
@@ -54,14 +91,23 @@ the consent grab that makes a prompt unspoofable, and the lock screen are all
 observed by the journal, is not refused `preempted`, and does not appear in any
 capture.
 
-Two bounds, and neither is a fix. **It is not reachable today**: there is no
-DRM/KMS backend, and under `--nested` the host compositor is the only reader of
-those devices. It becomes reachable the moment a bare-metal backend lands
-(WS-E.3.2), which is why it is published here **ahead of** the code rather than
-with it. And it is the same hole `crates/vitrin-core/src/spawn/isolation.rs`
-already probes for and enforces nothing about — Phase-2 confinement (E2.6/E2.7)
-is what closes it, by giving the realm a device namespace it cannot see those
-nodes from.
+**This entry was published ahead of the code and has now been overtaken twice,
+in opposite directions.** Both corrections are recorded rather than quietly
+edited, because the pair is the honest history of the hole.
+
+First it got *worse*: the sentence "it is not reachable today — there is no
+DRM/KMS backend" was true when written and stopped being true when WS-E.3.2
+landed the bare-metal backend, which has since run on real hardware many times.
+Under `--nested` the host compositor is still the only reader of those devices,
+so the exposure was always bare metal only.
+
+Then it got *better*: P2.6.2's mount namespace closes it at
+`--isolation=default`, as described above — and the same task gave
+`spawn/isolation.rs` its first real enforcement, so the module that used to
+probe this and enforce nothing now refuses a session below the floor. What
+remains open is `--isolation=off`, where every word of the original paragraph
+still holds, and the single-mechanism caveat: the credential survives, only the
+path is gone.
 
 ## Testing gaps
 
@@ -1077,11 +1123,19 @@ falls in a handful of screenshots at 1080p.
 Four more things belong with it:
 
 - <!-- limit: screenshots-are-world-readable-to-realms -->
-  **The screenshots are readable by every app in every realm.** They are files
-  written as your uid, and there is no sandbox (above, D9). The file mode is
+  **The screenshots are readable by every app in every realm at
+  `--isolation=off`.** They are files written as your uid, and the file mode is
   `600`, which keeps them from *other users* and does nothing whatsoever about
-  the confined app. This page creates no new hole — that is D9 — but this
-  feature creates the files.
+  an unconfined app running as you. This page creates no new hole — that is D9
+  — but this feature creates the files.
+
+  **At `--isolation=default` the screenshot directory is not in the realm's
+  mount table at all**, so no app in any realm can name it. The narrowing is
+  real, and so is its shape: it is a *path* denial, not a permission one. The
+  mode is still `600` and the app still runs as your uid, so anything that ever
+  puts that directory back inside a realm — a `binds` entry in `realm.toml`,
+  a future designation — hands it over in full. Do not read the confinement as
+  having changed what the files are.
 - <!-- limit: screenshot-chord-taken -->
   **A fifth chord is taken from every app.** Ctrl-PrintScreen is consumed in
   every realm. It is a *chord* rather than a bare PrintScreen deliberately, and

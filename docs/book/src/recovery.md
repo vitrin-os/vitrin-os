@@ -929,7 +929,35 @@ for.
              written.
   L4 ....... re-observed in passing on the L7 run: `the panel is lit again`
              present, `THE WAKE WAS NOT CONFIRMED` absent, flip_landed.
+  L7 pass 2  ATTEMPTED, and it did not exercise what it was for. See below.
 ```
+
+**`L7`'s second pass is still owed, and saying so costs nothing.** A
+`--blank-idle 60 --lock-idle 60` session was run at 14:46:03. Its recorder
+carries **zero seat activations**: the first seat event of the run is the pause
+at 14:47:29, when the operator left at the end. There was no absence and no
+return inside it. What it recorded instead is the plain idle path, which is
+worth keeping:
+
+```text
+  14:47:10.060  session_locked   cause: idle      both 60 s timers, same expiry
+  14:47:10.084  screen_blanked   locked: true     24 ms after the lock
+  14:47:19.793  screen_woke      flip_landed      woken while locked
+  14:47:24.577  session_unlocked
+```
+
+So `--lock-idle` fires with the right cause, a wake works *while locked*, and
+unlock works. None of that is the question pass 2 exists to ask, which is
+whether the lock raises **on the return** from an absence longer than the
+timeout. That still rests on one by-eye observation at a 20 s timeout from
+2026-08-11 — it passed, and it has never been measured.
+
+**Note for whoever runs it:** the idle lock cannot fire *during* the absence —
+losing the seat stops the idle clock under the default policy (D-030(7)), which
+is the whole of [#257](https://github.com/vitrin-os/vitrin-os/issues/257)'s fix.
+The measurement is therefore entirely about what happens *after* the seat comes
+back, and the run is only valid if the recorder shows a `seat activated` line
+inside it. Check for one before reading any result.
 
 **Two method notes, both of which cost time before they were understood.**
 
@@ -986,8 +1014,10 @@ the only evidence for that.
 > named, and L7 timed. What remains unexecuted is named rather than implied:
 > **routes 3 and 4 are still careful predictions**, the **VKMS rung is attempted
 > on every PR and currently covers nothing** (the module loads, no card node
-> appears), `L5` is adjudicated closed rather than re-run, and the WARN arm of
-> L4 has never fired because no wake has ever failed here.
+> appears), **`L7`'s second pass has not yet caught a real absence** so
+> lock-on-return rests on a 20 s by-eye pass, `L5` is adjudicated closed rather
+> than re-run, and the WARN arm of L4 has never fired because no wake has ever
+> failed here.
 >
 > Both runs' headline findings were defects in **this page's own recovery
 > command** — `pkill -f` in 2026-08-11

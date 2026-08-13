@@ -778,7 +778,9 @@ the finding**, and it is why L6 now tells you to choose the route first.
 
 **Not done, and not quietly dropped:**
 
-- **The VKMS rung was not attempted.** It remains a named, unclaimed rung.
+- **The VKMS rung was not attempted by hand during this run.** It is, however,
+  attempted by CI on every pull request, and on 2026-08-13 that attempt was read
+  rather than assumed. See the VKMS note below the third run's record.
 - **`/proc/sysrq-trigger` route 3 was not exercised.** Still documented and
   unexecuted.
 - L2 and L3 are short of their stated counts, as recorded above.
@@ -947,13 +949,45 @@ not fight for DRM master. Worth knowing, because the failed attempt still writes
 its own near-empty log, and picking that file by timestamp will make a
 successful run look like it recorded nothing.
 
+### The VKMS rung: attempted every PR, and what it actually returns
+
+`.github/vkms/run-advisory.sh` runs on every pull request, and **the green check
+means nothing** — the script exits 0 on a declared skip exactly as it does on a
+real probe, deliberately, so the rung can never start gating merges. The
+evidence is in the job log, not the checkmark. Read on 2026-08-13:
+
+```text
+-- module state: loaded
+-- no vkms card node appeared; skipping the GBM/EGL probe
+-- probe summary: no-vkms-card-node
+```
+
+So the honest state is a **third** outcome, and not the one the rung's own
+acceptance criterion anticipated. The module is not unavailable — it loads. But
+no `/dev/dri/card*` node appears behind it on the hosted runner, so nothing
+downstream runs: no connector enumeration, no mode set, no atomic commit, no
+page flip, and no GBM/EGL probe. **The rung is attempted continuously and
+currently covers nothing.**
+
+That is worth stating plainly rather than leaving as "not attempted", because
+the two are different claims and only one of them is true. What would change it
+is a host where the card node does appear — a local machine with udev and root,
+rather than a container. That has **not** been done here, and the reason is
+recorded rather than skipped: loading a new DRM device on a machine running a
+live compositor risks that compositor enumerating it and attaching an output to
+it. On the maintainer's one laptop that is a live-session risk taken for a rung
+which, by its own header, **can never prove the thing that matters** — that the
+backend lights a real panel. `docs/drm-bringup.md`, executed by a human, remains
+the only evidence for that.
+
 > **This page has been executed twice, on 2026-08-11 and 2026-08-13, and is now
 > a pass on every rung it can reach.** L1 through L7 have all been run and all
 > have their numbers, with L2/L3 at full count and proven live, L6's route
 > named, and L7 timed. What remains unexecuted is named rather than implied:
-> **routes 3 and 4 are still careful predictions**, the **VKMS rung was never
-> attempted**, `L5` is adjudicated closed rather than re-run, and the WARN arm
-> of L4 has never fired because no wake has ever failed here.
+> **routes 3 and 4 are still careful predictions**, the **VKMS rung is attempted
+> on every PR and currently covers nothing** (the module loads, no card node
+> appears), `L5` is adjudicated closed rather than re-run, and the WARN arm of
+> L4 has never fired because no wake has ever failed here.
 >
 > Both runs' headline findings were defects in **this page's own recovery
 > command** — `pkill -f` in 2026-08-11

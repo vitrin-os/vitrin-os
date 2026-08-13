@@ -343,10 +343,14 @@ grant.pointer.click(640, 84)</pre>
     </div>
 
     <div class="warn">
-      <p><strong>There is no sandbox yet.</strong> No namespaces, no seccomp,
-      no Landlock. A realm's app runs as the core's own uid with the core's
-      full view of the filesystem and network. Environment hygiene confines
-      the well-behaved; it does not contain the hostile.</p>
+      <p><strong>The sandbox is half-built.</strong> A realm now gets six
+      namespaces, an identity uid/gid map, zero capabilities and a private
+      mount table, all verified by the core from outside. There is still no
+      seccomp filter and no Landlock ruleset, so a realm is path-confined but
+      not syscall-confined &mdash; and it keeps the invoking user's
+      supplementary groups, which the kernel gives no window to drop.
+      Environment hygiene confines the well-behaved; it does not contain the
+      hostile.</p>
       <p>Do not run untrusted applications, or untrusted agents, against this.
       <a href="docs/limits.html">Every other known gap is listed here</a> —
       the 24-hour fuzz soak that has never been run, wlcs conformance at

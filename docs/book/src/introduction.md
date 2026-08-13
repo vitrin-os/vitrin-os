@@ -50,10 +50,13 @@ Phase 1 is complete — every milestone closed on a named integration test
 that runs against the shipped binaries with no mock on any seam it claims.
 That is a real bar, and it is also a narrow one.
 
-**There is no sandbox yet.** No namespaces, no seccomp, no Landlock. An app
-in a realm runs as the core's own uid with the core's full view of the
-filesystem and network. Environment hygiene confines the well-behaved; it
-does not contain the hostile.
+**The sandbox is half-built.** Since P2.6.2 an app in a realm runs in six
+namespaces with an identity uid/gid map, zero capabilities and a private mount
+table it cannot reshape — verified by the core from outside, and the spawn
+refused when it cannot be. But there is still **no seccomp filter and no
+Landlock ruleset**, so the realm is path-confined and not syscall-confined, and
+it keeps the invoking user's supplementary groups. Environment hygiene confines
+the well-behaved; it does not contain the hostile.
 
 Do not deploy this against untrusted applications or untrusted agents.
 [Where this is honest about its limits](limits.md) is the full list, and it

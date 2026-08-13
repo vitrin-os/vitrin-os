@@ -95,9 +95,11 @@ conclusions from it.
 
 ## What does *not* confine a realm
 
-> **There is no sandbox.** Decision D9. No namespaces, no seccomp, no
-> Landlock. The shim and its app run as the core's own uid, with the core's
-> full view of the filesystem and the network.
+> **The sandbox is half-built.** Decisions D9, D-020, D-036. The shim and its
+> app run in six namespaces with an identity uid/gid map, zero capabilities and
+> a private mount table — but with **no seccomp filter and no Landlock
+> ruleset**, so the realm is path-confined and not syscall-confined. At
+> `--isolation=off` none of it applies and the paragraph below holds in full.
 
 An application that ignores `WAYLAND_DISPLAY` and connects directly to a
 path it already knows is not stopped by anything in this MVP.

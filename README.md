@@ -178,12 +178,16 @@ Phase 1 being complete is a statement about a defined slice, not about
 readiness for anything real. Read this list before the pitch above
 convinces you of more than it should.
 
-- **No sandbox (decision D9, closes in Phase 2).** No namespaces, no
-  [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html), no
-  [Landlock](https://landlock.io/). A realm's app runs as the core's own uid
-  with the core's full view of the filesystem and network, and the session
-  D-Bus remains reachable. Environment hygiene confines the well-behaved; it
-  does not contain the hostile. This is the big one — see
+- **Half a sandbox (decisions D9, D-020, D-036).** Since P2.6.2 a realm gets
+  six namespaces, an identity uid/gid map, zero capabilities and a private
+  mount table it cannot reshape — all verified by the core from outside. But
+  there is still no
+  [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html) filter
+  (P2.6.4) and no [Landlock](https://landlock.io/) ruleset (P2.6.3), so the
+  realm's syscall surface is the kernel's whole surface. The realm also keeps
+  the invoking user's supplementary groups, which the kernel gives no window to
+  drop. Environment hygiene confines the well-behaved; it does not contain the
+  hostile. This is still the big one — see
   [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine).
 - **The 24-hour fuzz soak has not been run.** `fuzz/` ships two cargo-fuzz
   targets (protocol decode, `vitrin-ipc` framing) with a checked-in corpus
@@ -494,14 +498,23 @@ and `execve`), not by every other module remembering to be careful.
 
 That is the complete list of what confines a realm right now.
 
-- **No sandbox (decision D9, closes in Phase 2).** There are **no
-  namespaces, no seccomp filter, and no Landlock policy**. The shim and its
-  app run as the core's own uid with the core's full view of the filesystem
-  and the network. An app that ignores `WAYLAND_DISPLAY` and connects
-  directly to a path it already knows is not stopped by anything in the
-  MVP. Real sandboxing arrives with the Phase-2 powerbox (E2.6/E2.7).
-  Environment hygiene confines the well-behaved; it does not contain the
-  hostile.
+- **Half a sandbox (decisions D9, D-020, D-036).** At the default
+  `--isolation=default`, P2.6.2 spawns the realm into **six namespaces** —
+  user, mount, PID, IPC, UTS, network — with an identity uid/gid map, **zero
+  capabilities**, and a private mount table the app cannot reshape because it
+  holds no capability to mount. The core reads the kernel's answer about the
+  child to confirm all of it and **refuses the spawn** when it cannot.
+
+  Still absent: **no seccomp filter** (P2.6.4) and **no Landlock ruleset**
+  (P2.6.3). A realm can therefore issue any syscall it likes; it simply has
+  few paths to reach. Three things also survive the namespaces: the invoking
+  user's **supplementary groups** (the kernel offers no window in which an
+  unprivileged process can both drop them and write a single-id `gid_map`), a
+  **read-write GPU render node** with its ioctl surface and cross-realm
+  GPU-memory side channels, and whatever a `binds` entry in `realm.toml`
+  hands over. `--isolation=off` restores the old unconfined path and must be
+  named explicitly. Environment hygiene confines the well-behaved; it does not
+  contain the hostile.
 - **The session [D-Bus](https://www.freedesktop.org/wiki/Software/dbus/) is reachable (known hole, closes with P13 in Phase
   2).** The core advertises no `DBUS_SESSION_BUS_ADDRESS` and points
   `XDG_RUNTIME_DIR` at the realm's private directory, so a well-behaved

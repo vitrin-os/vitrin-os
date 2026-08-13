@@ -133,14 +133,23 @@ the spawn fork it should not.
 These are documented, decided, and tracked. They are listed so a reporter
 does not spend a weekend on something the project already says out loud:
 
-- **There is no sandbox at all** (plan decision D9,
-  [`docs/plan/01-phase-1-mvp.md`](docs/plan/01-phase-1-mvp.md)). No
-  namespaces, no seccomp filter, no Landlock policy. The shim and its app
-  run as the core's own uid with the core's full view of the filesystem
-  and the network. An app that reads `$HOME`, opens a socket, or ignores
-  `WAYLAND_DISPLAY` and connects to a path it already knows is not stopped
-  by anything in the MVP. Real sandboxing arrives with the Phase-2
-  powerbox (E2.6/E2.7).
+- **The sandbox is half-built** (plan decisions D9,
+  [`docs/plan/01-phase-1-mvp.md`](docs/plan/01-phase-1-mvp.md); D-020 and
+  D-036, [`docs/plan/20-decision-log.md`](docs/plan/20-decision-log.md)).
+  Since P2.6.2 the shim and its app run in **six namespaces** with an identity
+  uid/gid map, **zero capabilities** and a private mount table, verified by the
+  core from outside; a realm that cannot be verified is not spawned. An app can
+  no longer read `$HOME` or reach a socket by a path it already knows, because
+  neither is in its mount table.
+
+  **What is still missing is the syscall boundary**: no seccomp filter
+  (P2.6.4), no Landlock ruleset (P2.6.3). Treat a realm as *path-confined but
+  not syscall-confined*. Three residues are published in full on the
+  [limits page](docs/book/src/limits.md): the invoking user's supplementary
+  groups survive into the realm because the kernel gives no window to drop
+  them, the GPU render node is bound read-write with its ioctl surface intact,
+  and `--isolation=off` restores the fully unconfined path for anyone who names
+  it. **Do not treat a realm as a security boundary against hostile code yet.**
 - **The session D-Bus is reachable.** The core advertises no
   `DBUS_SESSION_BUS_ADDRESS`, but `/run/user/<uid>/bus` is still on the
   filesystem and still connectable, and the abstract-socket namespace is

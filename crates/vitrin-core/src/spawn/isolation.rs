@@ -477,6 +477,23 @@ fn remedy_for(mechanism: Mechanism, support: Support, report: &Report) -> String
     // who follows a fabricated remedy and sees no change concludes the
     // diagnosis is broken rather than that the cause is elsewhere.
     let mut lines = Vec::new();
+    // Which half failed changes what the operator should go looking at, so it
+    // is said before the knobs. Without this, a machine that grants the
+    // namespace and denies the mount gets handed three userns sysctls that all
+    // already read fine -- a remedy that sends someone to verify the one thing
+    // that is not broken.
+    if report.namespaces_combined.is_available() && !report.mount_in_userns.is_available() {
+        lines.push(format!(
+            "The user and mount namespaces were granted; what failed is the first mount \
+             *inside* them (`mount(NULL, \"/\", NULL, MS_REC|MS_PRIVATE, NULL)` answered \
+             {}). That combination means something stripped the capabilities the new user \
+             namespace was supposed to confer -- on Ubuntu 24.04+ the usual cause is \
+             AppArmor's unprivileged-userns restriction, which permits the unshare and then \
+             confines the process to a profile that denies CAP_SYS_ADMIN inside it. Check \
+             `cat /proc/self/attr/current` from the same context as this core.",
+            report.mount_in_userns
+        ));
+    }
     for (key, value) in &report.policy {
         match (*key, value.as_deref()) {
             ("max_user_namespaces", Some("0")) => lines.push(
@@ -624,8 +641,15 @@ pub struct Report {
     pub kernel_release: String,
     /// Per-namespace results, each measured as `CLONE_NEWUSER | <flag>`.
     pub namespaces: Vec<NamespaceProbe>,
-    /// The full set in one call — the request P2.6.2 actually issues.
+    /// The full set in one call — the first half of the request P2.6.2 issues.
     pub namespaces_combined: Support,
+    /// Whether a mount succeeds inside a fresh user+mount namespace — the
+    /// second half. Separate from [`Report::namespaces_combined`] because the
+    /// two answers differ on real machines (see [`probe_mount_in_userns`]) and
+    /// the operator's remedy differs with them: a denied `unshare` is a
+    /// namespace policy, a denied mount inside a granted namespace is an LSM
+    /// stripping capabilities the namespace was supposed to confer.
+    pub mount_in_userns: Support,
     /// The integer `landlock_create_ruleset(NULL, 0,
     /// LANDLOCK_CREATE_RULESET_VERSION)` returned. Reported as the ABI number
     /// rather than a boolean because P2.6.3's degradation ladder consumes the
@@ -700,6 +724,7 @@ impl Report {
             kernel_release: kernel_release(),
             namespaces,
             namespaces_combined: combined,
+            mount_in_userns: probe_mount_in_userns(),
             landlock_abi: probe_landlock_abi(),
             seccomp_filter: probe_seccomp_filter(),
             no_new_privs: probe_no_new_privs(),
@@ -720,7 +745,18 @@ impl Report {
     /// it is that call the mechanism is.
     pub fn mechanism(&self, mechanism: Mechanism) -> Support {
         match mechanism {
-            Mechanism::Namespaces => self.namespaces_combined,
+            // Both halves of the spawn's request, and the *failing* half is
+            // what gets reported: an operator handed "restricted-by-policy"
+            // needs the errno of the call that actually said no. The unshare
+            // is checked first because a mount row measured after a failed
+            // unshare says nothing about mounting.
+            Mechanism::Namespaces => {
+                if self.namespaces_combined.is_available() {
+                    self.mount_in_userns
+                } else {
+                    self.namespaces_combined
+                }
+            }
             Mechanism::Landlock => match self.landlock_abi {
                 Ok(abi) if abi >= 1 => Support::Available,
                 Ok(_) => Support::Unmeasured("landlock returned ABI 0"),
@@ -733,11 +769,15 @@ impl Report {
 
     /// The measured ceiling.
     ///
-    /// Keyed on [`Report::namespaces_combined`], not on the individual rows:
-    /// six probes that each pass separately do not prove the one call P2.6.2
-    /// makes will pass, and it is that call whose success the tier claims.
+    /// Keyed on [`Report::mechanism`] for the namespace rung, not on the
+    /// individual rows: six probes that each pass separately do not prove the
+    /// one call P2.6.2 makes will pass, and that call passing does not prove
+    /// the mount after it will — which is why this reads the mechanism rather
+    /// than [`Report::namespaces_combined`] directly. A tier that counted the
+    /// unshare alone called a GitHub runner `IntraUser` on a machine where no
+    /// realm could start.
     pub fn tier(&self) -> Tier {
-        let base = self.namespaces_combined.is_available()
+        let base = self.mechanism(Mechanism::Namespaces).is_available()
             && matches!(self.landlock_abi, Ok(abi) if abi >= 1)
             && self.seccomp_filter.is_available()
             && self.no_new_privs.is_available();
@@ -762,13 +802,18 @@ impl Report {
     pub fn render(&self) -> String {
         let mut out = String::new();
         // A schema version, so a matrix committed against an older row set is
-        // recognizable as stale rather than merely different.
-        out.push_str("vitrin-isolation 1\n");
+        // recognizable as stale rather than merely different. Bumped to 2 when
+        // `mount.in_userns` was added: a version-1 matrix is not merely
+        // missing a row, its `tier` cell was computed without that row and can
+        // read a rung too high, so it has to be recollected rather than
+        // patched. That is the whole reason this number is here.
+        out.push_str("vitrin-isolation 2\n");
         out.push_str(&format!("kernel.release={}\n", self.kernel_release));
         for probe in &self.namespaces {
             out.push_str(&format!("{}={}\n", probe.key, probe.support));
         }
         out.push_str(&format!("ns.all={}\n", self.namespaces_combined));
+        out.push_str(&format!("mount.in_userns={}\n", self.mount_in_userns));
         match self.landlock_abi {
             Ok(abi) => out.push_str(&format!("landlock.abi={abi}\n")),
             Err(support) => out.push_str(&format!("landlock.abi={support}\n")),
@@ -869,6 +914,67 @@ fn probe_unshare(flags: libc::c_int) -> Support {
     probe_unshare_reporting_pid(flags).1
 }
 
+/// Measure whether a mount actually succeeds *inside* a fresh user+mount
+/// namespace — the question [`probe_unshare`] does not ask.
+///
+/// # Why this row exists, and what it cost to learn
+///
+/// Rule 1 of this module is *attempt, never infer*, and it is stated as
+/// "every row is the kernel's own answer to the exact request the spawn path
+/// will later make". The namespace rows honored the letter of that and missed
+/// its point: `vitrin-realm-init`'s request is not `unshare` alone, it is
+/// `unshare` **and then** `mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)`,
+/// the propagation change every later bind depends on. Probing only the first
+/// half infers the second, which is precisely what rule 1 forbids.
+///
+/// P2.6.2's first CI run is what exposed the gap. On a GitHub `ubuntu-latest`
+/// runner the `unshare` returned 0, this preflight therefore reported the
+/// machine fit, `vitrind` booted — and then every realm spawn was refused
+/// because that first mount returned `EPERM`. The refusal was correct and came
+/// from #186's own post-spawn verification; the point is that **this gate,
+/// written to catch exactly that machine, passed it**. A preflight that
+/// certifies a box which cannot confine is worse than no preflight, because
+/// the tier it prints is then read as evidence.
+///
+/// # Why the fork is still enough isolation
+///
+/// Rule 3 says a probe may not change the process that runs it, which is what
+/// kept the earlier probes to a bare `unshare`. It does not forbid this: by
+/// the time the child mounts, it is already in a mount namespace of its own
+/// that nothing else shares, so the mount is unobservable outside the child
+/// and dies with its `_exit`. `mount` is a plain syscall, so the child stays
+/// async-signal-safe, and the path argument is a `static` NUL-terminated
+/// literal — no allocation is reachable after the fork.
+fn probe_mount_in_userns() -> Support {
+    // A `static` rather than a `CString`: this pointer is dereferenced in a
+    // forked child, where an allocation would be a deadlock waiting for a
+    // malloc lock the child can never see released.
+    static ROOT: &[u8] = b"/\0";
+    probe_in_forked_child(|| {
+        let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
+        if rc != 0 {
+            // Reported rather than masked. The row then reads the same as
+            // `ns.mount`, which is the honest answer: the mount was never
+            // reached, so nothing was learned about it.
+            return unsafe { *libc::__errno_location() };
+        }
+        let rc = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                ROOT.as_ptr().cast(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            return unsafe { *libc::__errno_location() };
+        }
+        0
+    })
+    .1
+}
+
 /// [`probe_unshare`], additionally reporting the pid it forked and reaped
 /// (`-1` when the fork itself failed).
 ///
@@ -879,27 +985,48 @@ fn probe_unshare(flags: libc::c_int) -> Support {
 /// `waitpid(-1, WNOHANG)` would be answering a question about whichever test
 /// happened to be mid-spawn.
 fn probe_unshare_reporting_pid(flags: libc::c_int) -> (libc::pid_t, Support) {
+    probe_in_forked_child(move || {
+        let rc = unsafe { libc::unshare(flags) };
+        if rc == 0 {
+            0
+        } else {
+            unsafe { *libc::__errno_location() }
+        }
+    })
+}
+
+/// The fork / measure / reap harness every probe in this module shares.
+///
+/// `body` runs in the child and returns `0` for success or an errno for
+/// failure; the harness encodes that as the exit status and decodes it back
+/// into a [`Support`]. Written once rather than per probe because the
+/// interesting part is not the fork, it is the `waitpid` accounting below —
+/// two copies of that would mean a fix to one silently not reaching the other.
+///
+/// # Contract on `body`
+///
+/// It runs **after `fork` in a possibly multi-threaded process**, so it may
+/// call nothing but async-signal-safe functions: no allocation, no locking, no
+/// `std` I/O, no Rust destructor in scope. Every current caller is syscalls
+/// and `__errno_location` (a thread-local address, read directly so that no
+/// `std` machinery sits between the fork and the exit at all). `Fn` rather
+/// than `FnOnce` so no closure state needs dropping in the child.
+fn probe_in_forked_child<F>(body: F) -> (libc::pid_t, Support)
+where
+    F: Fn() -> libc::c_int,
+{
     // SAFETY: `fork` in a multi-threaded process is safe as long as the child
-    // reaches `_exit` through async-signal-safe calls only. The child below
-    // calls exactly three things: `unshare`, `__errno_location` (a
-    // thread-local address, read directly rather than through
-    // `io::Error::last_os_error` so that no `std` machinery sits between the
-    // fork and the exit at all), and `_exit`. No allocation, no locks, no
-    // Rust destructor in scope.
+    // reaches `_exit` through async-signal-safe calls only, which is the
+    // contract `body` carries above.
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => (-1, Support::Unmeasured("fork failed")),
         0 => {
             // Child. Nothing here may allocate or unwind.
-            let rc = unsafe { libc::unshare(flags) };
-            let code = if rc == 0 {
-                0
-            } else {
-                let errno = unsafe { *libc::__errno_location() };
-                // Errnos are small positive integers; clamp defensively rather
-                // than truncating silently into a different errno.
-                errno.clamp(1, 255)
-            };
+            let errno = body();
+            // Errnos are small positive integers; clamp defensively rather
+            // than truncating silently into a different errno.
+            let code = if errno == 0 { 0 } else { errno.clamp(1, 255) };
             unsafe { libc::_exit(code as libc::c_int) };
         }
         _ => {
@@ -1188,6 +1315,7 @@ mod tests {
                 support: Support::Available,
             }],
             namespaces_combined: Support::Available,
+            mount_in_userns: Support::Available,
             landlock_abi: Ok(6),
             seccomp_filter: Support::Available,
             no_new_privs: Support::Available,
@@ -1214,6 +1342,111 @@ mod tests {
         ];
         report.namespaces_combined = Support::RestrictedByPolicy(libc::EPERM);
         assert_eq!(report.tier(), Tier::None);
+    }
+
+    /// The machine P2.6.2's first CI run actually met: every namespace granted,
+    /// and the first mount inside them denied.
+    ///
+    /// Before `mount.in_userns` existed this report was `Tier::IntraUser` and
+    /// [`admit`] returned `Ok`, so `vitrind` booted and every realm spawn was
+    /// then refused by the post-spawn verification instead. The preflight is
+    /// the thing that is supposed to catch this, so the assertion is on the
+    /// preflight.
+    #[test]
+    fn a_granted_namespace_whose_mount_is_denied_is_not_a_tier() {
+        let mut report = full_report();
+        report.mount_in_userns = Support::RestrictedByPolicy(libc::EPERM);
+
+        assert_eq!(
+            report.tier(),
+            Tier::None,
+            "an unshare that succeeds does not license a tier when the mount after it fails"
+        );
+        assert!(
+            !report.mechanism(Mechanism::Namespaces).is_available(),
+            "the Namespaces mechanism is both halves of the call, not the unshare alone"
+        );
+        let refusal = admit(Isolation::Default, &report)
+            .expect_err("a machine that cannot mount must be refused, not admitted");
+        assert_eq!(refusal.mechanism, Mechanism::Namespaces);
+    }
+
+    /// The failing half is reported, not the passing one. An operator handed
+    /// `available` for a mechanism that just refused the spawn cannot act.
+    #[test]
+    fn the_mechanism_reports_whichever_half_said_no() {
+        let mut report = full_report();
+
+        report.mount_in_userns = Support::RestrictedByPolicy(libc::EACCES);
+        assert_eq!(
+            report.mechanism(Mechanism::Namespaces),
+            Support::RestrictedByPolicy(libc::EACCES),
+            "the mount's errno reaches the operator"
+        );
+
+        // When the unshare itself failed, the mount row is meaningless — it was
+        // measured after a namespace that was never granted — so the unshare is
+        // what gets reported.
+        report.namespaces_combined = Support::RestrictedByPolicy(libc::EPERM);
+        assert_eq!(
+            report.mechanism(Mechanism::Namespaces),
+            Support::RestrictedByPolicy(libc::EPERM),
+            "a failed unshare outranks a mount row that could not mean anything"
+        );
+    }
+
+    /// The remedy for a denied mount must not be three userns sysctls that all
+    /// already read fine.
+    #[test]
+    fn a_denied_mount_gets_a_remedy_about_the_mount() {
+        let mut report = full_report();
+        report.mount_in_userns = Support::RestrictedByPolicy(libc::EPERM);
+        // Exactly the knob set a GitHub runner presents: nothing here explains
+        // the failure, which is the case the old remedy path had no answer for.
+        report.policy = vec![
+            ("max_user_namespaces", Some("15000".to_string())),
+            (
+                "apparmor_restrict_unprivileged_userns",
+                Some("0".to_string()),
+            ),
+        ];
+
+        let refusal = admit(Isolation::Default, &report).expect_err("must refuse");
+        assert!(
+            refusal.remedy.contains("inside"),
+            "the remedy must say the mount inside the namespace is what failed: {}",
+            refusal.remedy
+        );
+        assert!(
+            refusal.remedy.contains("attr/current"),
+            "and must point at the LSM context, the only thing left that explains it: {}",
+            refusal.remedy
+        );
+    }
+
+    /// The row is measured on this machine, whatever the answer is. A probe
+    /// that silently reports `Unmeasured` everywhere would make every assertion
+    /// above vacuous in production while passing in this module.
+    #[test]
+    fn the_mount_probe_actually_runs_here() {
+        let _sigchld = SigchldDefault::install();
+        let support = probe_mount_in_userns();
+        assert!(
+            !matches!(support, Support::Unmeasured(_)),
+            "the mount probe must reach a real answer on the test machine, got {support}"
+        );
+    }
+
+    /// The rendered matrix carries the new row, since a matrix collected
+    /// without it cannot be told apart from one where the mount passed.
+    #[test]
+    fn the_matrix_carries_the_mount_row() {
+        let report = full_report();
+        assert!(
+            report.render().contains("mount.in_userns=available\n"),
+            "{}",
+            report.render()
+        );
     }
 
     #[test]
@@ -1272,7 +1505,7 @@ mod tests {
         let first = report.render();
         let second = report.render();
         assert_eq!(first, second);
-        assert!(first.starts_with("vitrin-isolation 1\n"));
+        assert!(first.starts_with("vitrin-isolation 2\n"));
         assert!(first.contains("tier=intra-user\n"));
         assert!(first.contains("landlock.abi=6\n"));
         assert!(first.contains("policy.max_user_namespaces=1000\n"));

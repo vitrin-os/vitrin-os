@@ -1161,6 +1161,34 @@ jobs:
           fi
           exit 0
 
+      - name: Grant unprivileged user namespaces, and say what that costs
+        # The step above measures a stock `ubuntu-latest`, and the measurement
+        # is: `apparmor_restrict_unprivileged_userns=1`, so the unshare is
+        # permitted, the capabilities it should confer are stripped, and the
+        # first mount inside the namespace answers EACCES. `vitrind` therefore
+        # refuses to start -- correctly, with a remedy naming this sysctl.
+        #
+        # Taking that remedy is what lets this job exercise the confinement
+        # path at all. The alternative, `--isolation=off`, would keep the suite
+        # green while testing an unconfined session, which is the one outcome
+        # worth less than a red check.
+        #
+        # What it costs, said here because a sysctl in CI is exactly the kind
+        # of thing that quietly becomes a lie: **after this step, this runner
+        # is no longer a stock Ubuntu 24.04 machine.** Nothing downstream of it
+        # may be cited as evidence about how vitrind behaves on a default
+        # desktop install, and in particular issue #281's multi-kernel matrix
+        # must be collected from the diagnostic step ABOVE this one, never
+        # below it. The ordering is the whole point: the log carries the
+        # untouched machine first and the modified one second.
+        if: hashFiles('tests/integration/run.sh') != ''
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          echo "=== vitrind --print-isolation, on the machine as now modified ==="
+          if [ -x target/debug/vitrind ]; then
+            target/debug/vitrind --print-isolation || echo "(exited $?)"
+          fi
+
       - name: Run headless integration suite
         if: hashFiles('tests/integration/run.sh') != ''
         # The P1.9.1 acceptance criterion, machine-enforced: the suite

@@ -1693,7 +1693,9 @@ mod tests {
         assert_eq!(applied.profile(), "namespaces-only");
         assert_ne!(applied.profile(), Tier::IntraUser.to_string());
         assert_eq!(
-            admit(Isolation::Off, &report).expect("off always admits").profile(),
+            admit(Isolation::Off, &report)
+                .expect("off always admits")
+                .profile(),
             "none"
         );
     }
@@ -1712,10 +1714,7 @@ mod tests {
         // while the helper was setting it, which is a false row about this
         // build even though it errs the safe way.
         assert!(floor.contains("applies.no-new-privs=yes\n"), "{floor}");
-        assert!(
-            !floor.contains("floor.mechanism=no-new-privs\n"),
-            "{floor}"
-        );
+        assert!(!floor.contains("floor.mechanism=no-new-privs\n"), "{floor}");
         let isolation = full_report().render();
         assert!(!isolation.contains("floor"), "{isolation}");
         assert!(!isolation.contains("applies."), "{isolation}");

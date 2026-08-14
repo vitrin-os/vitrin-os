@@ -1349,7 +1349,10 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 let value = args
                     .next()
                     .ok_or("`--isolation` requires a mode (`default` or `off`)")?;
-                set_isolation(&mut isolation_mode, spawn::isolation::Isolation::parse(value)?)?;
+                set_isolation(
+                    &mut isolation_mode,
+                    spawn::isolation::Isolation::parse(value)?,
+                )?;
             }
             "--realm-init" => {
                 let value = args.next().ok_or(
@@ -2952,8 +2955,7 @@ where
     // what they say and when they stop). Held for the session's whole life:
     // a one-line startup notice scrolls off, and a session whose realms are
     // not confined at all should keep saying so.
-    let _unconfined_banner = (isolation_applied.isolation()
-        == spawn::isolation::Isolation::Off)
+    let _unconfined_banner = (isolation_applied.isolation() == spawn::isolation::Isolation::Off)
         .then(|| UnconfinedBanner::start(UNCONFINED_BANNER_INTERVAL));
 
     // The R6 guard runs before anything at all, including the realm: a
@@ -3594,8 +3596,8 @@ fn audit_render_node(path: &Path) -> bool {
 /// exactly, so "cannot find it" and "found the wrong one" would otherwise be
 /// hard to tell apart at the point of failure.
 fn default_realm_init_path() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("cannot locate the running vitrind: {e}"))?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("cannot locate the running vitrind: {e}"))?;
     if exe.as_os_str().to_string_lossy().ends_with(" (deleted)") {
         return Err(format!(
             "the running vitrind ({}) has been unlinked, so no sibling path can be derived \
@@ -4669,9 +4671,11 @@ mod tests {
         // The `--shim` precedent: no value, an empty value, and a repeat.
         assert!(parse_args(["--nested", "--isolation"]).is_err());
         assert!(parse_args(["--nested", "--isolation="]).is_err());
-        assert!(parse_args(["--nested", "--isolation=off", "--isolation=default"])
-            .unwrap_err()
-            .contains("more than once"));
+        assert!(
+            parse_args(["--nested", "--isolation=off", "--isolation=default"])
+                .unwrap_err()
+                .contains("more than once")
+        );
         // `none` by name, on `parse_consent`'s copy precedent: everybody who
         // read D-020(6) will type it, and the message has to say the token
         // moved rather than that they mistyped.
@@ -4685,7 +4689,11 @@ mod tests {
     #[test]
     fn realm_init_parses_both_spellings_and_defaults_to_a_sibling() {
         for argv in [
-            vec!["--nested", "--realm-init", "/usr/lib/vitrin/vitrin-realm-init"],
+            vec![
+                "--nested",
+                "--realm-init",
+                "/usr/lib/vitrin/vitrin-realm-init",
+            ],
             vec!["--nested", "--realm-init=/usr/lib/vitrin/vitrin-realm-init"],
         ] {
             let action = parse_args(argv.clone()).expect("parses");
@@ -4697,9 +4705,11 @@ mod tests {
         }
         assert!(parse_args(["--nested", "--realm-init"]).is_err());
         assert!(parse_args(["--nested", "--realm-init="]).is_err());
-        assert!(parse_args(["--nested", "--realm-init=/a", "--realm-init=/b"])
-            .unwrap_err()
-            .contains("--realm-init"));
+        assert!(
+            parse_args(["--nested", "--realm-init=/a", "--realm-init=/b"])
+                .unwrap_err()
+                .contains("--realm-init")
+        );
         // The default is resolved at startup, not at parse time, exactly as
         // `--shim`'s is.
         assert_eq!(
@@ -4714,7 +4724,10 @@ mod tests {
         // not be answerable only on a command line that would otherwise have
         // run a session.
         assert_eq!(parse_args(["--print-floor"]), Ok(Action::PrintFloor));
-        assert_eq!(parse_args(["--nested", "--print-floor"]), Ok(Action::PrintFloor));
+        assert_eq!(
+            parse_args(["--nested", "--print-floor"]),
+            Ok(Action::PrintFloor)
+        );
         assert_eq!(
             parse_args(["--print-floor", "--size"]),
             Ok(Action::PrintFloor),

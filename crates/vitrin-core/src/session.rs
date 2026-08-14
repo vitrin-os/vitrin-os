@@ -2827,14 +2827,15 @@ fn dispatch_principal<H: RuntimeHost>(
                     // rate-limited and rare while messages are not. A failure
                     // is the IDL's `internal` -- a session whose runtime tree
                     // cannot be named can create nothing.
-                    let paths = spawn_paths(shim_bin.to_path_buf(), confinement.clone())
-                        .map_err(|err| {
+                    let paths = spawn_paths(shim_bin.to_path_buf(), confinement.clone()).map_err(
+                        |err| {
                             tracing::error!(
                                 %err,
                                 "launch could not name this session's runtime tree"
                             );
                             LaunchRefusal::Internal
-                        })?;
+                        },
+                    )?;
                     launch_realm(registry, &paths, &mut launches, ask)
                 };
                 // Borrowed for this one message's dispatch and dropped with

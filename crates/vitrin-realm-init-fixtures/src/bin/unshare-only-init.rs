@@ -121,14 +121,7 @@ fn send(fd: RawFd, frame: &Frame) -> bool {
     let Ok(bytes) = frame.encode() else {
         return false;
     };
-    let rc = unsafe {
-        libc::send(
-            fd,
-            bytes.as_ptr().cast(),
-            bytes.len(),
-            libc::MSG_NOSIGNAL,
-        )
-    };
+    let rc = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_NOSIGNAL) };
     rc >= 0
 }
 

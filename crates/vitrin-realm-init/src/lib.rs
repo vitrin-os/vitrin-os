@@ -436,9 +436,7 @@ impl Frame {
             Frame::Mounted { count, fingerprint } => {
                 fixed(TAG_MOUNTED, i64::from(*count), *fingerprint, 0)
             }
-            Frame::Fail { stage, errno } => {
-                fixed(TAG_FAIL, i64::from(*errno), 0, *stage as u8)
-            }
+            Frame::Fail { stage, errno } => fixed(TAG_FAIL, i64::from(*errno), 0, *stage as u8),
         })
     }
 

@@ -827,7 +827,11 @@ impl Source {
                 libc::O_PATH | libc::O_CLOEXEC | if is_file { 0 } else { libc::O_DIRECTORY },
             )
         };
-        step(&format!("open bind source {}", path.display()), fd, Stage::Mount)?;
+        step(
+            &format!("open bind source {}", path.display()),
+            fd,
+            Stage::Mount,
+        )?;
         Ok(Source { fd, is_file })
     }
 }
@@ -1096,7 +1100,11 @@ fn build_mount_table(config: &Config, stage_dev: u64) -> Result<(), Fail> {
         strip_leading_slash(IN_REALM_RUNTIME_DIR),
         RW_BIND,
     )?;
-    bind(&sources.storage_dir, strip_leading_slash(IN_REALM_HOME), RW_BIND)?;
+    bind(
+        &sources.storage_dir,
+        strip_leading_slash(IN_REALM_HOME),
+        RW_BIND,
+    )?;
     // The shim has to be bound at all because in a development tree it lives
     // in `target/debug` under `$HOME` -- the exact tree this task exists to
     // hide from the realm. No `noexec` here, for obvious reasons.
@@ -1448,13 +1456,7 @@ fn drop_all_capabilities() -> Result<(), Fail> {
     let data = [CapData::default(); 2];
     // SAFETY: both structs match the kernel's `__user_cap_header_struct` and a
     // two-element `__user_cap_data_struct` for capability version 3.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_capset,
-            &header as *const CapHeader,
-            data.as_ptr(),
-        )
-    };
+    let rc = unsafe { libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr()) };
     if rc < 0 {
         return Err(Fail::at(Stage::Internal));
     }

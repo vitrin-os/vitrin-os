@@ -2228,7 +2228,12 @@ fn handshake(
     //
     // `uid_map` before `gid_map` is **ours**. There is no kernel edge; it is
     // fixed so the code has one shape.
-    write_proc(supervisor_pid, "setgroups", "deny", ConfinementFault::SetgroupsWrite)?;
+    write_proc(
+        supervisor_pid,
+        "setgroups",
+        "deny",
+        ConfinementFault::SetgroupsWrite,
+    )?;
     write_proc(
         supervisor_pid,
         "uid_map",
@@ -2382,10 +2387,7 @@ fn recv_frame(cfg: BorrowedFd<'_>, deadline: Instant) -> Result<Frame, SpawnErro
 /// A helper `FAIL` frame is translated here, once, into this module's own
 /// vocabulary -- so the mapping from "where the child gave up" to a
 /// `cause_class` lives at one site instead of at each call.
-fn recv_frame_or_eof(
-    cfg: BorrowedFd<'_>,
-    deadline: Instant,
-) -> Result<Option<Frame>, SpawnError> {
+fn recv_frame_or_eof(cfg: BorrowedFd<'_>, deadline: Instant) -> Result<Option<Frame>, SpawnError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(timed_out());
@@ -2490,10 +2492,7 @@ fn from_helper_stage(stage: Stage, errno: i32) -> SpawnError {
             } else {
                 " This kernel does not implement the request at all; no sysctl will change it."
             };
-            refuse(
-                class,
-                format!("the six-flag unshare failed ({os}).{hint}"),
-            )
+            refuse(class, format!("the six-flag unshare failed ({os}).{hint}"))
         }
         // Unreachable in this build: the helper no longer attempts the drop,
         // because the kernel leaves no window in which an unprivileged realm
@@ -2574,12 +2573,8 @@ fn write_proc(
     class: ConfinementFault,
 ) -> Result<(), SpawnError> {
     let path = format!("/proc/{pid}/{name}");
-    fs::write(&path, contents).map_err(|e| {
-        refuse(
-            class,
-            format!("cannot write {contents:?} to {path} ({e})"),
-        )
-    })
+    fs::write(&path, contents)
+        .map_err(|e| refuse(class, format!("cannot write {contents:?} to {path} ({e})")))
 }
 
 /// Read an id map back and prove it is the single identity line that was
@@ -2588,7 +2583,10 @@ fn read_map(pid: u32, name: &str, expected: u32) -> Result<String, SpawnError> {
     let text = read_proc(pid, name)?;
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let fields: Vec<u32> = match lines.as_slice() {
-        [only] => only.split_whitespace().filter_map(|f| f.parse().ok()).collect(),
+        [only] => only
+            .split_whitespace()
+            .filter_map(|f| f.parse().ok())
+            .collect(),
         // Multi-line is not a shape an unprivileged writer can produce, so it
         // means something other than this core wrote the map.
         _ => Vec::new(),
@@ -2712,12 +2710,8 @@ fn verify_root_view(
             format!("cannot stat {root} ({e}); the realm's filesystem view cannot be verified"),
         )
     })?;
-    let host_root = fs::metadata("/").map_err(|e| {
-        refuse(
-            ConfinementFault::RootView,
-            format!("cannot stat / ({e})"),
-        )
-    })?;
+    let host_root = fs::metadata("/")
+        .map_err(|e| refuse(ConfinementFault::RootView, format!("cannot stat / ({e})")))?;
     if realm_root.dev() == host_root.dev() {
         return Err(refuse(
             ConfinementFault::RootView,
@@ -3617,7 +3611,9 @@ pub(crate) mod tests {
     /// added for.
     pub(crate) fn namespaces_available() -> bool {
         let report = isolation::Report::probe();
-        let ok = report.mechanism(isolation::Mechanism::Namespaces).is_available();
+        let ok = report
+            .mechanism(isolation::Mechanism::Namespaces)
+            .is_available();
         if !ok {
             eprintln!(
                 "SKIPPED: this kernel reports ns.all={} -- the confinement tests below cannot \
@@ -5206,8 +5202,7 @@ pub(crate) mod tests {
         assert!(facts.mount_count.unwrap_or(0) > 5, "{facts:?}");
         let shim_pid = facts.shim_host_pid.expect("the shim's host pid");
         assert_ne!(
-            shim_pid as u32,
-            facts.supervisor_pid,
+            shim_pid as u32, facts.supervisor_pid,
             "the supervisor and the shim must be two processes: unshare(CLONE_NEWPID) does not \
              move the caller, so something has to fork to produce PID 1"
         );
@@ -5396,7 +5391,10 @@ pub(crate) mod tests {
                 Some("0000000000000000"),
                 "the confined shim holds effective capabilities"
             );
-            assert_eq!(proc_status(shim, "CapPrm:").as_deref(), Some("0000000000000000"));
+            assert_eq!(
+                proc_status(shim, "CapPrm:").as_deref(),
+                Some("0000000000000000")
+            );
             assert_eq!(
                 proc_status(shim, "CapBnd:").as_deref(),
                 Some("0000000000000000"),
@@ -5419,7 +5417,9 @@ pub(crate) mod tests {
                 .map(|e| e.path())
                 .collect();
             assert!(
-                entries.iter().any(|e| e.file_name() == Some(OsStr::new("3"))),
+                entries
+                    .iter()
+                    .any(|e| e.file_name() == Some(OsStr::new("3"))),
                 "fd 3 (the core connection) is gone: {entries:?}"
             );
             // fds 1 and 2 are the realm's log file, and asserting *that* is
@@ -5571,7 +5571,10 @@ pub(crate) mod tests {
             |_| None,
         )
         .expect("the confined spawn must succeed");
-        let shim = spawned.isolation().shim_host_pid.expect("the shim's host pid");
+        let shim = spawned
+            .isolation()
+            .shim_host_pid
+            .expect("the shim's host pid");
 
         // Non-vacuity first: the shim is alive right now, so its later
         // absence is a death and not a process that never existed.
@@ -5791,9 +5794,10 @@ pub(crate) mod tests {
         }
         let bin = mock_shim_bin();
         let app_dir = bin.parent().expect("the mock shim has a directory");
-        let Some(stub) = app_dir.parent().filter(|p| {
-            p.parent().is_some() && !p.starts_with("/usr") && !p.starts_with("/etc")
-        }) else {
+        let Some(stub) = app_dir
+            .parent()
+            .filter(|p| p.parent().is_some() && !p.starts_with("/usr") && !p.starts_with("/etc"))
+        else {
             eprintln!("SKIPPED: the mock shim's directory has no bindable ancestor");
             return;
         };
@@ -5819,7 +5823,10 @@ pub(crate) mod tests {
                 stub.display()
             )
         });
-        let shim = spawned.isolation().shim_host_pid.expect("the shim's host pid");
+        let shim = spawned
+            .isolation()
+            .shim_host_pid
+            .expect("the shim's host pid");
         let inside = fs::symlink_metadata(format!("/proc/{shim}/root{}", stub.display()))
             .expect("the stub really is present inside the realm, or this test proves nothing");
         let outside = fs::symlink_metadata(&stub).expect("the stub exists on the host");
@@ -5880,7 +5887,10 @@ pub(crate) mod tests {
             |_| None,
         )
         .expect("the wrapper execs the real helper, so the realm must still come up");
-        let shim = spawned.isolation().shim_host_pid.expect("the shim's host pid");
+        let shim = spawned
+            .isolation()
+            .shim_host_pid
+            .expect("the shim's host pid");
 
         let entries: Vec<PathBuf> = fs::read_dir(format!("/proc/{shim}/fd"))
             .expect("the shim's fd table is readable")

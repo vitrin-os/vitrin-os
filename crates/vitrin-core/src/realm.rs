@@ -1848,7 +1848,10 @@ fn validate_realm(raw: RawRealm) -> Result<RealmSpec, ErrorKind> {
                 ));
             }
             if binds.contains(&path) {
-                return Err(parse_err(line, format!("duplicate `binds` entry {entry:?}")));
+                return Err(parse_err(
+                    line,
+                    format!("duplicate `binds` entry {entry:?}"),
+                ));
             }
             binds.push(path);
         }

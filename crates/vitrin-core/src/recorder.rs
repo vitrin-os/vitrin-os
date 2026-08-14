@@ -2350,7 +2350,11 @@ fn write_isolation(out: &mut String, facts: &crate::spawn::IsolationFacts) {
     key(out, "stdio");
     push_json_string(out, facts.stdio);
     key(out, "storage_reused");
-    out.push_str(if facts.storage_reused { "true" } else { "false" });
+    out.push_str(if facts.storage_reused {
+        "true"
+    } else {
+        "false"
+    });
     out.push('}');
 
     out.push_str(",\"child_asserted\":{");

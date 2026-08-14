@@ -68,9 +68,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 from harness import (  # noqa: E402
     IntegrationTest,
     children_of,
-    comm_of,
     descendant_named,
     has_real_content,
+    shims_of,
     whole_realm_grant,
 )
 
@@ -158,7 +158,7 @@ class RealLaunch(IntegrationTest):
         deadline = time.monotonic() + 25.0
         shims: list[int] = []
         while time.monotonic() < deadline:
-            shims = [p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]
+            shims = shims_of(core.pid)
             if len(shims) >= expected:
                 break
             time.sleep(0.05)
@@ -265,7 +265,7 @@ class RealLaunch(IntegrationTest):
             # Nothing forked.
             time.sleep(0.5)
             self.assertEqual(
-                len([p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]),
+                len(shims_of(core.pid)),
                 1,
                 "a refused launch must create no process",
             )
@@ -323,7 +323,7 @@ class RealLaunch(IntegrationTest):
 
             time.sleep(0.5)
             self.assertEqual(
-                len([p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]),
+                len(shims_of(core.pid)),
                 1,
                 "a denied petition must create no process",
             )
@@ -360,7 +360,7 @@ class RealLaunch(IntegrationTest):
             self._await_startup(core, expected=2)
             time.sleep(0.5)
             self.assertEqual(
-                len([p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]),
+                len(shims_of(core.pid)),
                 2,
                 "a rate-limited launch must create no second process",
             )

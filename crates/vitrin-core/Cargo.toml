@@ -57,6 +57,12 @@ vitrin-protocol = { path = "../vitrin-protocol" }
 # = the `server` slice (calloop event-source glue), which is exactly the side
 # the trusted core is.
 vitrin-ipc = { path = "../vitrin-ipc" }
+# The realm confinement helper (P2.6.2, #186). The core depends on it for the
+# CONFIG/frame vocabulary the two sides share -- one definition, so a
+# hand-transcribed second copy of the wire shape cannot exist -- and execs its
+# binary at every confined spawn. Pure data plus libc on this side; no new
+# transitive surface.
+vitrin-realm-init = { path = "../vitrin-realm-init" }
 # memfd_create + F_ADD_SEALS for the capture path (P1.3.6): every capture is
 # a fresh memfd sealed SHRINK|GROW|WRITE|SEAL before sending (the wire
 # contract's always-a-copy proof). Same crate and posture as vitrin-ipc

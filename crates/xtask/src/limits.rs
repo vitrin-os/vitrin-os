@@ -371,9 +371,9 @@ pub const CLAIMS: &[Claim] = &[
             // below gets right, and false against the same file: `spawn.rs`
             // says the session bus is unadvertised and NOT unreachable, and
             // `org.a11y.Bus` is activated ON the session bus. `RESERVED_ENV`
-            // holds five names and neither DBUS_SESSION_BUS_ADDRESS nor
-            // AT_SPI_BUS_ADDRESS is among them, so both are allow-listable in
-            // `realm.toml`. Pinning the same sentence here as `no-portals` does
+            // holds six names (P2.6.2 added HOME) and neither
+            // DBUS_SESSION_BUS_ADDRESS nor AT_SPI_BUS_ADDRESS is among them,
+            // so both are allow-listable in `realm.toml`. Pinning the same sentence here as `no-portals` does
             // means the accessibility claim cannot silently re-acquire the
             // stronger word: if `spawn.rs` ever earns it, this evidence row
             // fails and the page has to be re-read before the wording moves.
@@ -387,11 +387,14 @@ pub const CLAIMS: &[Claim] = &[
             },
             Evidence::Contains {
                 path: "crates/vitrin-core/src/realm.rs",
-                needle: "pub(crate) const RESERVED_ENV: [(&str, &str); 5]",
-                means: "RESERVED_ENV still holds exactly five names, none of them a bus \
+                needle: "pub(crate) const RESERVED_ENV: [(&str, &str); 6]",
+                means: "RESERVED_ENV still holds exactly six names, none of them a bus \
                         address, so DBUS_SESSION_BUS_ADDRESS and AT_SPI_BUS_ADDRESS remain \
                         allow-listable in realm.toml. This is why the claim is a missing \
-                        service and never a confinement.",
+                        service and never a confinement. The count moved from five to six at \
+                        P2.6.2 (#186), which reserved HOME because a confined realm's \
+                        filesystem does not contain the operator's home directory -- a name \
+                        the core decides, not a bus address, so the claim above is unchanged.",
             },
         ],
     },

@@ -1994,6 +1994,7 @@ dependencies = [
  "vitrin-mock-shim",
  "vitrin-png",
  "vitrin-protocol",
+ "vitrin-realm-init",
  "wayland-egl",
  "xkbcommon",
 ]
@@ -2034,6 +2035,21 @@ name = "vitrin-protocol"
 version = "0.1.0"
 dependencies = [
  "proptest",
+]
+
+[[package]]
+name = "vitrin-realm-init"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "vitrin-realm-init-fixtures"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "vitrin-realm-init",
 ]
 
 [[package]]

@@ -85,6 +85,7 @@ from harness import (  # noqa: E402
     dominant_colour,
     golden_cmp,
     packed_xrgb,
+    shims_of,
     whole_realm_grant,
 )
 
@@ -188,7 +189,7 @@ class _TwoRealmBase(IntegrationTest):
         deadline = time.monotonic() + 25.0
         shims: list[int] = []
         while time.monotonic() < deadline:
-            shims = [p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]
+            shims = shims_of(core.pid)
             if len(shims) >= 2:
                 break
             time.sleep(0.05)

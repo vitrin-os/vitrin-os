@@ -180,7 +180,40 @@ command = "/usr/bin/foot"
 #   XAUTHORITY       is the credential authenticating a host X connection
 #   XDG_RUNTIME_DIR  names the host session's socket directory; the core
 #                    injects the realm's own runtime directory instead
-#env_allow = ["HOME", "LANG", "XDG_SESSION_TYPE"]
+#   HOME             names a directory that DOES NOT EXIST inside a confined
+#                    realm; the core injects the realm's own private storage
+#                    instead. Added by P2.6.2 -- a configuration that
+#                    allow-listed HOME (as this example once did) now fails
+#                    to load, which is the intended noise: a host $HOME
+#                    passed through would name a missing path and every app
+#                    that read it would fail in a way that looks like a
+#                    vitrin bug.
+#env_allow = ["LANG", "XDG_SESSION_TYPE"]
+
+# Optional (default []). Absolute host paths mounted READ-ONLY into the realm
+# at the same path, at --isolation=default. Ignored at --isolation=off, where
+# the realm can already see the whole filesystem.
+#
+# You need this when the app's runtime closure lives outside /usr, /etc and
+# its own directory -- on NixOS that means /nix; for a vendored application
+# tree it means whatever /opt subtree it unpacks into. Without it such an app
+# does not start, and the failure looks like a missing shared library.
+#
+# Two things it is not:
+#
+#   - It is not a confinement switch. WHETHER a realm is confined is
+#     `--isolation`, session-wide, so a copied [[realm]] block cannot weaken
+#     one realm quietly. This key only widens what a confined realm can READ.
+#   - It is not trusted from this file. Every source is re-audited at the
+#     spawn against the same rule `command` gets -- a regular file or
+#     directory, owned by root or by the core's uid, not group- or
+#     other-writable, and the same for every directory on its resolved path.
+#     A bind source holding a library or an interpreter decides what the
+#     confined app RUNS, not merely what it reads.
+#
+# `/` and `/home` are refused outright: binding either hands the realm the
+# tree the confinement exists to hide.
+#binds = ["/nix/store", "/opt/vendor-app"]
 
 # Optional (default true). Whether STARTUP forks this realm's app.
 #
@@ -227,25 +260,44 @@ command = "/usr/bin/foot"
 # WHAT THIS FILE CANNOT PROMISE YOU (read before trusting the list above)
 # ---------------------------------------------------------------------------
 #
-# Everything above is ENVIRONMENT hygiene, and in this MVP that is the ONLY
-# confinement a realm gets. There are no namespaces, no seccomp, and no
-# Landlock (decision D9): the shim and the app run as the same uid as
-# vitrind, with vitrind's full view of the filesystem and the network. An app
-# that ignores WAYLAND_DISPLAY and connects to a socket path it already knows
-# is not stopped by anything here. Real sandboxing arrives with the Phase-2
-# powerbox (E2.6/E2.7).
+# Everything above is ENVIRONMENT hygiene. Since P2.6.2 it is no longer the
+# only confinement a realm gets -- but which confinement you get depends on a
+# flag, so read both halves.
 #
-# EVERY TABLE YOU ADD MULTIPLIES THAT. N realms means N shims means N
-# processes with the core's own uid and filesystem view, so the exposure
-# above grows linearly with the number of tables in this file and there is
-# no compensating control until E2.6/E2.7 land. The MAX_REALMS cap bounds
-# memory, not this.
+# At `--isolation=default`: six namespaces (user, mount, PID, IPC, UTS,
+# network), an identity uid/gid map, ZERO capabilities, and a private mount
+# table the app cannot reshape because it holds no capability to mount. The
+# core verifies every one of those by reading the kernel's answer about the
+# child, and REFUSES the spawn when it cannot. An app that ignores
+# WAYLAND_DISPLAY and connects to a socket path it already knows now fails,
+# because the path is not in its mount table.
+#
+# Still absent, and this is the half that matters most: NO seccomp filter
+# (P2.6.4) and NO Landlock ruleset (P2.6.3). A realm can issue any syscall it
+# likes; it simply has few paths to reach. Treat it as PATH-confined and not
+# SYSCALL-confined. Three things also survive: the invoking user's
+# supplementary groups (the kernel gives no window to drop them -- see
+# D-037(5)), a read-write GPU render node, and anything a `binds` key below
+# hands over.
+#
+# At `--isolation=off`: every word of the pre-P2.6.2 warning holds unchanged.
+# The shim and the app run as vitrind's uid with vitrind's full view of the
+# filesystem and the network. It must be named on the command line.
+#
+# EVERY TABLE YOU ADD STILL MULTIPLIES THE RESIDUE. N realms means N shims,
+# and at `--isolation=off` that is N processes with the core's own uid and
+# filesystem view. At `default` the multiplication is smaller but not gone:
+# N realms is N syscall surfaces, N retained group sets, and N render-node
+# handles. The MAX_REALMS cap bounds memory, not this.
 #
 # AND SINCE WS-E.1.1, N IS NO LONGER YOURS ALONE TO SET. A principal holding
 # `realm_launch` over a template can add processes at run time, up to the cap
 # and up to its grant's rate ceiling. Every word above applies unchanged to
-# what it starts: a launch grant is authority to start an UNCONFINED process
-# with the core's own uid and filesystem view. What bounds it is who holds the
+# what it starts: a launch grant is authority to start a process confined
+# exactly as much as this session is -- which at `--isolation=off` means an
+# UNCONFINED one with the core's own uid and filesystem view, and at `default`
+# means one that is path-confined and not syscall-confined. What bounds it is
+# who holds the
 # grant (a human approved it, naming this template's program on the card), how
 # long (expiry, revocation), how often (max_event_rate) and how many
 # (MAX_REALMS) -- not what the launched program may then do.

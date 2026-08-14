@@ -658,6 +658,15 @@ pub(crate) enum Event<'a> {
         /// `interactive` or `auto-approve` -- the loudly-flagged policy
         /// (plan risk R6) belongs in the reconstruction.
         consent_policy: &'a str,
+        /// What the operator selected: `default` or `off` (P2.6.2, #186).
+        isolation: &'a str,
+        /// The confinement mechanisms **this build** applies, and therefore
+        /// refuses to start without. A build constant, so it varies between
+        /// two logs from two versions and not between two runs of one.
+        isolation_floor: &'a str,
+        /// The strongest tier **this machine** measured. A kernel fact, so it
+        /// varies between two machines and not between two runs on one.
+        isolation_ceiling: &'a str,
     },
     /// The run's footer line, written on a clean shutdown.
     RunEnded {
@@ -968,8 +977,14 @@ pub(crate) enum Event<'a> {
     /// security-relevant act of a session.
     RealmSpawned {
         realm: &'a RealmId,
-        /// The shim's pid: the process holding the other end of the
-        /// identity socketpair.
+        /// The realm's pid.
+        ///
+        /// **Corrected by P2.6.2 (#186):** at `--isolation=default` this is
+        /// the *supervisor*, not the shim. The shim's own host pid is
+        /// `isolation.shim_host_pid`, and the two differ because
+        /// `unshare(CLONE_NEWPID)` does not move the caller -- something has
+        /// to fork to produce PID 1, and the process the core's `Child` names
+        /// is the forker. At `--isolation=off` it is still the shim.
         pid: u32,
         /// **Who asked** (WS-E.1.1, issue #207): startup, or a named
         /// principal exercising a named grant.
@@ -997,6 +1012,14 @@ pub(crate) enum Event<'a> {
         /// generously-configured allowlist) and the log's secrecy contract
         /// applies to it exactly as it does to credential bytes.
         env_allow: &'a [String],
+        /// **What confined this realm, split into what the core read from
+        /// the kernel and what the child said** (P2.6.2, #186, D-036(10)).
+        ///
+        /// Extending this entry rather than adding a second event, because
+        /// `SpawnRecord`'s `#[must_use]` plus its aborting `Drop` is the
+        /// machinery that makes the entry inescapable, and a second event
+        /// would be a second obligation with none of it.
+        isolation: &'a crate::spawn::IsolationFacts,
     },
     /// A realm's app could not be launched. Recorded because a refusal is
     /// the *fail-closed* outcome: nothing was created, so nothing else in
@@ -1397,10 +1420,27 @@ impl Event<'_> {
                 pid,
                 core_version,
                 consent_policy,
+                isolation,
+                isolation_floor,
+                isolation_ceiling,
             } => {
                 field_u64(out, "pid", u64::from(pid));
                 field_str(out, "core_version", core_version);
                 field_str(out, "consent_policy", consent_policy);
+                // Fixed fields with build-varying string values, on the rule
+                // this file already states: a reader must never have to tell
+                // "this version could not say" from "the writer forgot", so
+                // the keys are always present and the *values* carry what
+                // this build and this machine happen to be.
+                //
+                // Three of them, because they answer three different
+                // questions and collapsing any two would lose one:
+                // `isolation` is what the operator selected, `isolation_floor`
+                // is what this build requires, `isolation_ceiling` is what
+                // this machine measured.
+                field_str(out, "isolation", isolation);
+                field_str(out, "isolation_floor", isolation_floor);
+                field_str(out, "isolation_ceiling", isolation_ceiling);
                 // Stated once per run so a reader knows the digest
                 // vocabulary before it meets the first capture.
                 field_str(out, "digest_alg", DIGEST_ALG);
@@ -1680,6 +1720,7 @@ impl Event<'_> {
                 command,
                 runtime_dir,
                 env_allow,
+                isolation,
             } => {
                 field_display(out, "realm", realm);
                 field_u64(out, "pid", u64::from(pid));
@@ -1698,6 +1739,7 @@ impl Event<'_> {
                 // `runtime_dir` itself.
                 write_string_array(out, "env_allow", env_allow);
                 field_bool(out, "env_cleared", true);
+                write_isolation(out, isolation);
             }
             Event::RealmSpawnFailed {
                 realm,
@@ -2180,6 +2222,169 @@ fn key(out: &mut String, k: &str) {
     }
     push_json_string(out, k);
     out.push(':');
+}
+
+/// The `realm_spawned` entry's confinement object (P2.6.2, #186, D-036(4)
+/// and (10)).
+///
+/// **The nesting is the claim.** Everything under `parent_observed` is a
+/// value `vitrind` itself read out of `/proc` after the child existed;
+/// everything under `child_asserted` is a number the child sent. A
+/// substituted helper can put anything it likes in the second group, which is
+/// exactly why nothing in it is what licensed the spawn -- and why a reader
+/// must be able to tell the two apart without knowing this code.
+///
+/// `landlock` and `seccomp` are written as explicit `not-applied` rather than
+/// omitted, on this file's own rule: absent information is an explicit value,
+/// never a missing key.
+///
+/// # The one field above the line that the child supplied
+///
+/// `shim_host_pid` arrives in a helper frame. It is written under
+/// `parent_observed` anyway, and the reason has to be stated here because
+/// this is where a reader meets it: `vitrind` refuses the spawn unless
+/// `/proc/<pid>/status` shows that pid's parent is the supervisor it spawned
+/// and an `NSpid:` of exactly two entries ending in `1`, and unless
+/// `/proc/<pid>/exe` names the shim it bound into the realm. The number was
+/// reported; the process it names was verified. A decoy pid fails all three
+/// checks and no entry is written at all.
+///
+/// Everything else above the line is a direct read, including `writable`,
+/// which is measured from `/proc/<shim>/mountinfo` on the spawn it describes.
+fn write_isolation(out: &mut String, facts: &crate::spawn::IsolationFacts) {
+    out.push_str(",\"isolation\":{");
+    out.push_str("\"applied_profile\":");
+    push_json_string(out, facts.applied_profile);
+    out.push_str(",\"landlock\":\"not-applied (P2.6.3)\"");
+    out.push_str(",\"seccomp\":\"not-applied (P2.6.4)\"");
+
+    out.push_str(",\"parent_observed\":{");
+    let mut first = true;
+    let mut key = |out: &mut String, k: &str| {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        push_json_string(out, k);
+        out.push(':');
+    };
+    key(out, "namespaces_verified");
+    out.push('[');
+    for (i, ns) in facts.namespaces_verified.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(out, ns);
+    }
+    out.push(']');
+    key(out, "root_dev_differs");
+    push_json_bool_or_null(out, facts.root_dev_differs);
+    key(out, "canaries_probed");
+    out.push_str(&facts.canaries_probed.to_string());
+    key(out, "canaries_unreachable");
+    push_json_bool_or_null(out, facts.canaries_unreachable);
+    key(out, "setgroups_denied");
+    push_json_bool_or_null(out, facts.setgroups_denied);
+    // Not a guarantee -- a residual, measured. `deny` blocks the setgroups
+    // *call*; it drops nothing, and an unprivileged realm has no window in
+    // which to drop them itself. This is what it kept.
+    key(out, "supplementary_groups_retained");
+    match facts.supplementary_groups_retained {
+        Some(n) => out.push_str(&n.to_string()),
+        None => out.push_str("null"),
+    }
+    key(out, "uid_map");
+    push_json_str_or_null(out, facts.uid_map.as_deref());
+    key(out, "gid_map");
+    push_json_str_or_null(out, facts.gid_map.as_deref());
+    key(out, "realm_uid");
+    out.push_str(&facts.realm_uid.to_string());
+    key(out, "realm_gid");
+    out.push_str(&facts.realm_gid.to_string());
+    key(out, "host_uid");
+    out.push_str(&facts.host_uid.to_string());
+    key(out, "supervisor_pid");
+    out.push_str(&facts.supervisor_pid.to_string());
+    key(out, "shim_host_pid");
+    match facts.shim_host_pid {
+        Some(pid) => out.push_str(&pid.to_string()),
+        None => out.push_str("null"),
+    }
+    key(out, "handshake_ms");
+    out.push_str(&facts.handshake_ms.to_string());
+    // Two keys, not one string. `writable` is the list the core *measured*
+    // from `/proc/<shim>/mountinfo` on this spawn; `writable_source` says how
+    // the entry came by it, because "measured and short", "nothing to
+    // measure" and "could not read it" are three different facts and a
+    // reader auditing one entry has to be able to tell them apart. It was a
+    // hardcoded sentence under `parent_observed` until an adversarial review
+    // named that for what it was.
+    key(out, "writable");
+    match &facts.writable {
+        crate::spawn::WritableSet::Measured(mounts) => {
+            out.push('[');
+            for (i, m) in mounts.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, m);
+            }
+            out.push(']');
+        }
+        _ => out.push_str("null"),
+    }
+    key(out, "writable_source");
+    match &facts.writable {
+        crate::spawn::WritableSet::Measured(_) => {
+            push_json_string(out, "measured from /proc/<shim>/mountinfo")
+        }
+        crate::spawn::WritableSet::Unconfined => push_json_string(
+            out,
+            "not measured (--isolation=off: no mount namespace, so the realm's writable set is \
+             everything this uid can write)",
+        ),
+        crate::spawn::WritableSet::Unreadable(why) => {
+            push_json_string(out, &format!("UNREADABLE: {why}"))
+        }
+    }
+    key(out, "stdio");
+    push_json_string(out, facts.stdio);
+    key(out, "storage_reused");
+    out.push_str(if facts.storage_reused {
+        "true"
+    } else {
+        "false"
+    });
+    out.push('}');
+
+    out.push_str(",\"child_asserted\":{");
+    out.push_str("\"mount_count\":");
+    match facts.mount_count {
+        Some(n) => out.push_str(&n.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"mount_fingerprint\":");
+    match facts.mount_fingerprint {
+        Some(f) => push_json_string(out, &format!("{}:{f:016x}", facts.fingerprint_alg())),
+        None => out.push_str("null"),
+    }
+    out.push('}');
+    out.push('}');
+}
+
+fn push_json_bool_or_null(out: &mut String, value: Option<bool>) {
+    match value {
+        Some(true) => out.push_str("true"),
+        Some(false) => out.push_str("false"),
+        None => out.push_str("null"),
+    }
+}
+
+fn push_json_str_or_null(out: &mut String, value: Option<&str>) {
+    match value {
+        Some(v) => push_json_string(out, v),
+        None => out.push_str("null"),
+    }
 }
 
 fn field_str(out: &mut String, k: &str, v: &str) {
@@ -3297,6 +3502,9 @@ pub(crate) mod tests {
             pid: 7,
             core_version: "0.1.0",
             consent_policy: "auto-approve",
+            isolation: "default",
+            isolation_floor: "namespaces",
+            isolation_ceiling: "intra-user",
         });
         rec.record(Event::GrantExpired {
             grant_id: GrantId::from_u64_for_test(3),
@@ -3371,6 +3579,41 @@ pub(crate) mod tests {
     /// required field of the entry rather than something a caller may pass
     /// (`spawn::SpawnOrigin`), so a spawn with no stated origin is
     /// unwritable rather than merely discouraged.
+    /// A confined realm's facts, as the parent would have read them.
+    ///
+    /// Every parent-observed field is `Some`, because that is what a confined
+    /// spawn looks like: the core does not journal `null` where it did the
+    /// reading, only where it did not.
+    fn confined_facts() -> crate::spawn::IsolationFacts {
+        crate::spawn::IsolationFacts {
+            applied_profile: "namespaces-only",
+            namespaces_verified: vec!["user", "mnt", "ipc", "uts", "net"],
+            root_dev_differs: Some(true),
+            canaries_probed: 3,
+            canaries_unreachable: Some(true),
+            setgroups_denied: Some(true),
+            supplementary_groups_retained: Some(6),
+            uid_map: Some("      1000       1000          1".to_string()),
+            gid_map: Some("      1000       1000          1".to_string()),
+            realm_uid: 1000,
+            realm_gid: 1000,
+            host_uid: 1000,
+            supervisor_pid: 4242,
+            shim_host_pid: Some(4243),
+            handshake_ms: 12,
+            writable: crate::spawn::WritableSet::Measured(vec![
+                "/dev/shm".to_string(),
+                "/run/vitrin".to_string(),
+                "/tmp".to_string(),
+                "/vitrin/home".to_string(),
+            ]),
+            stdio: "per-realm log file",
+            storage_reused: false,
+            mount_count: Some(21),
+            mount_fingerprint: Some(0xdead_beef_cafe_f00d),
+        }
+    }
+
     #[test]
     fn a_spawn_entry_names_who_asked_for_it() {
         let _fd = crate::capture::tests::fd_lock();
@@ -3388,6 +3631,7 @@ pub(crate) mod tests {
             command: Path::new("/usr/bin/kiosk-browser"),
             runtime_dir: Path::new("/run/user/1000/vitrin-0/kiosk.1"),
             env_allow: &[],
+            isolation: &confined_facts(),
         });
         rec.record(Event::RealmSpawned {
             realm: &crate::grants::RealmId::new("realm-0"),
@@ -3396,6 +3640,7 @@ pub(crate) mod tests {
             command: Path::new("/usr/bin/foot"),
             runtime_dir: Path::new("/run/user/1000/vitrin-0/realm-0"),
             env_allow: &[],
+            isolation: &confined_facts(),
         });
         rec.record(Event::RealmSpawnFailed {
             realm: &realm,

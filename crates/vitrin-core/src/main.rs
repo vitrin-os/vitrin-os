@@ -674,8 +674,40 @@ USAGE:
                                 --screenshot-dir was not given (a configured
                                 gesture with nowhere to write is a key that
                                 silently does nothing).
+    vitrind [--isolation MODE]  How much confinement every realm this session
+                                spawns gets. `default` (the default) puts each
+                                realm in its own user, mount, PID, IPC, UTS and
+                                network namespaces with an identity uid/gid map
+                                and zero capabilities, and REFUSES TO START if
+                                this kernel will not grant them -- run
+                                `--print-isolation` to see why, and
+                                `--print-floor` to see what this build requires.
+                                `off` runs the pre-2.6.2 spawn path: no
+                                namespaces at all, the realm sees the whole
+                                filesystem and every socket on the machine, and
+                                the session warns about it every 60 seconds.
+                                `off` is NOT a rung of the default/hardened/
+                                paranoid dial -- it is the dial being switched
+                                out. `none` is refused by name: it was renamed
+                                to `off` before it shipped.
+    vitrind [--realm-init PATH] The helper binary the core execs to build a
+                                realm's namespaces at --isolation=default.
+                                Default: a sibling `vitrin-realm-init` beside
+                                this `vitrind`. Audited transitively at spawn
+                                exactly like --shim and `command`, and its
+                                version must match this core's exactly -- a
+                                helper from one install beside a vitrind from
+                                another is refused, never run.
     vitrind --help              Show this help.
     vitrind --version           Show the version.
+    vitrind --print-floor       Print the confinement mechanisms THIS BUILD
+                                applies, and therefore refuses to start
+                                without, then exit. A separate verb from
+                                --print-isolation on purpose: that one reports
+                                kernel facts and feeds a checked-in per-kernel
+                                matrix, and a build constant among them would
+                                invalidate the matrix over a row that is not a
+                                kernel fact.
     vitrind --print-isolation   Probe this kernel's confinement facilities --
                                 namespaces, the Landlock ABI, seccomp filter
                                 mode, no_new_privs, the distro sysctls that
@@ -771,6 +803,10 @@ enum Action {
         recorder: Option<PathBuf>,
         realm: Option<PathBuf>,
         shim: Option<PathBuf>,
+        /// The session's confinement selection (P2.6.2, #186). Accepted on
+        /// every run mode, because the namespaces a realm gets are a
+        /// property of the spawn and not of how pixels reach a screen.
+        isolation: IsolationOptions,
         capture_dump: Option<PathBuf>,
         dead_man: DeadManConfig,
         /// The `--attention-chord` key (WS-E.1.7): the core's second physical
@@ -828,6 +864,10 @@ enum Action {
         recorder: Option<PathBuf>,
         realm: Option<PathBuf>,
         shim: Option<PathBuf>,
+        /// The session's confinement selection (P2.6.2, #186). Accepted on
+        /// every run mode, because the namespaces a realm gets are a
+        /// property of the spawn and not of how pixels reach a screen.
+        isolation: IsolationOptions,
         /// The `--capture-dump PATH` diagnostic target (P1.8.5, issue #107):
         /// mirror each live realm's composited realm-view readback to
         /// `PATH.<realm-id>`, the core-internal capture the fidelity gate
@@ -925,6 +965,10 @@ enum Action {
         recorder: Option<PathBuf>,
         realm: Option<PathBuf>,
         shim: Option<PathBuf>,
+        /// The session's confinement selection (P2.6.2, #186). Accepted on
+        /// every run mode, because the namespaces a realm gets are a
+        /// property of the spawn and not of how pixels reach a screen.
+        isolation: IsolationOptions,
         capture_dump: Option<PathBuf>,
         dead_man: DeadManConfig,
         attention: attention::AttentionChord,
@@ -995,6 +1039,55 @@ enum Action {
     /// fields and takes no companion refusal -- there is no configuration for
     /// it to disagree with.
     PrintIsolation,
+    /// Print the confinement mechanisms *this build* applies and exit
+    /// (P2.6.2, #186, D-036(6)).
+    ///
+    /// A **separate verb from [`Action::PrintIsolation`]**, and the
+    /// separation is load-bearing rather than tidy. A tier is a measurement
+    /// of the machine; a floor is a property of the binary. Printing the
+    /// floor among the kernel rows would contradict the isolation module's
+    /// own first rule and would invalidate #185's four-kernel matrix over a
+    /// row that is not a kernel fact.
+    PrintFloor,
+}
+
+/// The session's confinement selection and the helper that implements it
+/// (P2.6.2, #186).
+///
+/// Bundled rather than two loose fields on three variants, matching how
+/// `lock`, `screenshot` and `status` are already carried: the two values are
+/// only meaningful together, since `--realm-init` names the binary
+/// `--isolation=default` execs and is inert at `off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IsolationOptions {
+    isolation: spawn::isolation::Isolation,
+    /// `None` means "a sibling `vitrin-realm-init` beside this `vitrind`",
+    /// resolved at startup exactly like `--shim`'s default.
+    realm_init: Option<PathBuf>,
+}
+
+impl Default for IsolationOptions {
+    /// **Omitting `--isolation` confines.**
+    ///
+    /// This is a hand-written `Default` on the *options struct* and
+    /// deliberately not a `Default` on
+    /// [`spawn::isolation::Isolation`] itself, which has none: the point of
+    /// that absence is that an unconfined session must be unreachable
+    /// without an operator typing the word, and a `Default` on the enum would
+    /// make `Isolation::default()` a spelling anybody could reach for. Here
+    /// the value is named in full, once, in the safe direction.
+    ///
+    /// The cost is real and is the decided one (D-020(6)): on a machine whose
+    /// kernel will not grant namespaces, a `vitrind` that used to start now
+    /// refuses. Between "refuses loudly" and "silently confines nothing",
+    /// this project picks the former, and `--isolation=off` is the one-word
+    /// answer for an operator who means it.
+    fn default() -> Self {
+        IsolationOptions {
+            isolation: spawn::isolation::Isolation::Default,
+            realm_init: None,
+        }
+    }
 }
 
 /// The presentation mode selected on the command line, before it is paired
@@ -1039,6 +1132,11 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     let mut recorder: Option<PathBuf> = None;
     let mut realm: Option<PathBuf> = None;
     let mut shim: Option<PathBuf> = None;
+    // `Option` rather than the selector itself, so "not given" and "given
+    // `default`" stay distinguishable -- which is what lets a repeated flag be
+    // refused, on `set_consent`'s precedent.
+    let mut isolation_mode: Option<spawn::isolation::Isolation> = None;
+    let mut realm_init: Option<PathBuf> = None;
     let mut capture_dump: Option<PathBuf> = None;
     let mut chord: Option<deadman::Chord> = None;
     let mut hold_ms: Option<u64> = None;
@@ -1247,6 +1345,22 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 )?;
                 set_injector_fd(&mut physical_input_fd, "--physical-input-fd", value)?;
             }
+            "--isolation" => {
+                let value = args
+                    .next()
+                    .ok_or("`--isolation` requires a mode (`default` or `off`)")?;
+                set_isolation(
+                    &mut isolation_mode,
+                    spawn::isolation::Isolation::parse(value)?,
+                )?;
+            }
+            "--realm-init" => {
+                let value = args.next().ok_or(
+                    "`--realm-init` requires a helper binary path \
+                     (e.g. `--realm-init /usr/lib/vitrin/vitrin-realm-init`)",
+                )?;
+                set_path(&mut realm_init, "--realm-init", "realm-init path", value)?;
+            }
             "--help" | "-h" => return Ok(Action::Help),
             "--version" | "-V" => return Ok(Action::Version),
             // Returns immediately, on the `--help`/`--version` precedent, so
@@ -1254,6 +1368,10 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             // probe of what this kernel offers must not be answerable only on
             // a command line that would otherwise have run.
             "--print-isolation" => return Ok(Action::PrintIsolation),
+            // Same precedent again: it answers a question about this binary,
+            // so it must not depend on a command line that would otherwise
+            // have run.
+            "--print-floor" => return Ok(Action::PrintFloor),
             // Returns immediately, on the `--print-isolation` precedent above:
             // it answers a question about a file format rather than about a
             // session, so it must not depend on a command line that would
@@ -1278,6 +1396,13 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_path(&mut recorder, "--recorder", "log path", value)?;
                 } else if let Some(value) = other.strip_prefix("--realm=") {
                     set_path(&mut realm, "--realm", "config path", value)?;
+                } else if let Some(value) = other.strip_prefix("--isolation=") {
+                    set_isolation(
+                        &mut isolation_mode,
+                        spawn::isolation::Isolation::parse(value)?,
+                    )?;
+                } else if let Some(value) = other.strip_prefix("--realm-init=") {
+                    set_path(&mut realm_init, "--realm-init", "realm-init path", value)?;
                 } else if let Some(value) = other.strip_prefix("--shim=") {
                     set_path(&mut shim, "--shim", "shim path", value)?;
                 } else if let Some(value) = other.strip_prefix("--capture-dump=") {
@@ -1811,6 +1936,14 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         utc_offset: status_offset.unwrap_or(status::UtcOffset::UTC),
     };
 
+    let isolation = IsolationOptions {
+        // The one place the CLI default is applied. `unwrap_or` and not
+        // `unwrap_or_default`, so the safe value is spelled out at the site
+        // that chooses it rather than hidden behind a trait.
+        isolation: isolation_mode.unwrap_or(spawn::isolation::Isolation::Default),
+        realm_init,
+    };
+
     // `--help`/`--version` already returned above, so only the run modes
     // remain to resolve; `--size` is meaningless without `--headless`.
     match (mode, size) {
@@ -1820,6 +1953,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             recorder,
             realm,
             shim,
+            isolation,
             capture_dump,
             dead_man,
             attention,
@@ -1854,6 +1988,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             recorder,
             realm,
             shim,
+            isolation,
             capture_dump,
             dead_man,
             attention,
@@ -1909,6 +2044,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             recorder,
             realm,
             shim,
+            isolation,
             capture_dump,
             dead_man,
             attention,
@@ -2265,6 +2401,25 @@ fn set_consent(slot: &mut Option<ConsentPolicy>, policy: ConsentPolicy) -> Resul
     }
 }
 
+/// Record the selected confinement, rejecting a repeat flag.
+///
+/// [`set_consent`]'s shape, for the same reason: a command line that names a
+/// security-relevant mode twice is a command line whose author disagrees with
+/// themselves, and quietly taking the last one is how a session ends up
+/// confining less than the operator believes.
+fn set_isolation(
+    slot: &mut Option<spawn::isolation::Isolation>,
+    isolation: spawn::isolation::Isolation,
+) -> Result<(), String> {
+    match slot {
+        None => {
+            *slot = Some(isolation);
+            Ok(())
+        }
+        Some(_) => Err("`--isolation` given more than once".into()),
+    }
+}
+
 /// Record the selected [`Mode`], rejecting a second (or conflicting) mode flag.
 /// The mode flags this build accepts, named in one place so the
 /// "more than one mode" and "no mode given" messages cannot disagree with each
@@ -2364,12 +2519,21 @@ fn main() -> ExitCode {
             print!("{}", spawn::isolation::Report::probe().render());
             ExitCode::SUCCESS
         }
+        Action::PrintFloor => {
+            // Upstream of `init_tracing` on the same reasoning, and printed
+            // by its own verb rather than as extra rows of
+            // `--print-isolation`: that output is a kernel measurement and
+            // this one is a build constant.
+            print!("{}", spawn::isolation::render_floor());
+            ExitCode::SUCCESS
+        }
         Action::RunNested {
             consent,
             principals,
             recorder,
             realm,
             shim,
+            isolation,
             capture_dump,
             dead_man,
             attention,
@@ -2388,6 +2552,7 @@ fn main() -> ExitCode {
                 shim,
                 capture_dump,
                 screenshot.dir,
+                isolation,
                 // `--consent-injector-fd` is refused with `--nested` at parse
                 // time (issue #138), so a nested run is never instrumented.
                 false,
@@ -2411,6 +2576,7 @@ fn main() -> ExitCode {
             recorder,
             realm,
             shim,
+            isolation,
             capture_dump,
             dead_man,
             attention,
@@ -2440,6 +2606,7 @@ fn main() -> ExitCode {
                 shim,
                 capture_dump,
                 screenshot.dir,
+                isolation,
                 // Both injector channels are refused with `--drm` at parse
                 // time, so a bare-metal run is never instrumented.
                 false,
@@ -2465,6 +2632,7 @@ fn main() -> ExitCode {
             recorder,
             realm,
             shim,
+            isolation,
             capture_dump,
             // Validated at parse time so both modes accept the same command
             // line. Headless has no physical input device to hold a chord
@@ -2497,6 +2665,7 @@ fn main() -> ExitCode {
                 shim,
                 capture_dump,
                 screenshot.dir,
+                isolation,
                 instrumented,
                 move |seed| {
                     backend::headless::run(
@@ -2754,12 +2923,41 @@ fn run_session<R>(
     shim_path: Option<PathBuf>,
     capture_dump: Option<PathBuf>,
     screenshot_dir: Option<PathBuf>,
+    isolation: IsolationOptions,
     consent_injector: bool,
     backend: R,
 ) -> ExitCode
 where
     R: FnOnce(session::RuntimeSeed) -> (Recorder, Result<(), Box<dyn std::error::Error>>),
 {
+    // ---------------------------------------------------------------------
+    // The isolation floor (P2.6.2, #186, D-036(6)). THE FIRST STATEMENT.
+    // ---------------------------------------------------------------------
+    //
+    // Before `block_loop_signals`, before the consent banner (which spawns a
+    // thread), and before the listener binds. Two reasons, both hard:
+    // `Report::probe` forks and requires a single-threaded caller, and a
+    // refusal must leave no stray artifact behind -- which is the same rule
+    // the listener already follows by binding before the recorder opens.
+    //
+    // **Accepted cost, stated rather than discovered: a floor refusal is not
+    // journaled.** The recorder does not exist yet and must not, because
+    // creating it would be exactly the artifact this ordering exists to
+    // avoid. That is consistent with every other pre-recorder refusal in this
+    // function.
+    let (isolation_applied, isolation_report) = match admit_isolation(&isolation) {
+        Ok(pair) => pair,
+        Err(()) => return ExitCode::FAILURE,
+    };
+    // The standing warning for an unconfined session -- a third instance of
+    // the `AutoApproveBanner`/`InjectorBanner` shape, still not generalised
+    // (three is where a pattern becomes a refactor, and the three differ in
+    // what they say and when they stop). Held for the session's whole life:
+    // a one-line startup notice scrolls off, and a session whose realms are
+    // not confined at all should keep saying so.
+    let _unconfined_banner = (isolation_applied.isolation() == spawn::isolation::Isolation::Off)
+        .then(|| UnconfinedBanner::start(UNCONFINED_BANNER_INTERVAL));
+
     // The R6 guard runs before anything at all, including the realm: a
     // session that must not start should abort at the earliest point where
     // that is knowable, leaving nothing behind and doing nothing first.
@@ -2855,6 +3053,13 @@ where
     #[cfg(feature = "consent-injector")]
     let _injector_banner =
         consent_injector.then(|| InjectorBanner::start(INJECTOR_BANNER_INTERVAL));
+    // The floor as one line, composed here so the recorder never has to know
+    // what a `Mechanism` is.
+    let isolation_floor = spawn::isolation::FLOOR
+        .iter()
+        .map(|m| m.to_string())
+        .collect::<Vec<_>>()
+        .join("+");
     recorder.record(Event::RunStarted {
         pid: std::process::id(),
         core_version: env!("CARGO_PKG_VERSION"),
@@ -2868,6 +3073,14 @@ where
             (ConsentPolicy::Interactive, true) => "interactive+consent-injector",
             (ConsentPolicy::AutoApprove, _) => "auto-approve",
         },
+        // Three separate answers on purpose (P2.6.2, #186): what was chosen,
+        // what this build requires, what this machine can do. A log that
+        // carried only the first could not tell a reader whether a session
+        // ran unconfined because the operator asked or because the machine
+        // could not do better.
+        isolation: &isolation_applied.isolation().to_string(),
+        isolation_floor: &isolation_floor,
+        isolation_ceiling: &isolation_report.tier().to_string(),
     });
 
     // Mint this session's trusted consent indicator (issue #85) before the
@@ -2920,6 +3133,72 @@ where
     };
     tracing::info!(shim = %shim.display(), "realm shim binary (execs the realm's app; audited at spawn)");
 
+    // The confinement inputs, resolved here for the same reason the shim is:
+    // a core with no usable helper should learn it up front rather than at
+    // the fork. Everything in here is a **core** input -- the realm names its
+    // app, the core decides what confines it.
+    let confinement = match isolation_applied.isolation() {
+        spawn::isolation::Isolation::Off => None,
+        spawn::isolation::Isolation::Default => {
+            let realm_init = match isolation.realm_init.clone() {
+                Some(path) => path,
+                None => match default_realm_init_path() {
+                    Ok(path) => path,
+                    Err(err) => {
+                        tracing::error!(
+                            "fatal: cannot locate the default realm confinement helper: {err}; \
+                             pass an explicit `--realm-init PATH`"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                },
+            };
+            let storage_root = match realm_storage_root() {
+                Ok(root) => root,
+                Err(err) => {
+                    tracing::error!("fatal: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            // The canary set: absolute host paths that must be unreachable
+            // from inside every realm, checked on every single spawn rather
+            // than once in CI. Two of them are this core's own artifacts --
+            // the socket that *is* the control plane and the log that records
+            // every decision -- and the third is the operator's home, which
+            // is what "confined" means to a human.
+            let mut canaries = vec![
+                match vitrin_ipc::paths::core_socket_path() {
+                    Ok(sock) => sock,
+                    Err(err) => {
+                        tracing::error!("fatal: cannot name this session's core socket: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                path.clone(),
+            ];
+            if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+                canaries.push(PathBuf::from(home));
+            }
+            let render_nodes = enumerate_render_nodes();
+            tracing::info!(
+                realm_init = %realm_init.display(),
+                storage = %storage_root.display(),
+                canaries = canaries.len(),
+                render_nodes = render_nodes.len(),
+                "realm confinement helper (audited at spawn; its version must match this \
+                 core's exactly). Realms' private storage lives under `storage` and has NO \
+                 QUOTA -- it is disk-backed, realm-writable and unbounded"
+            );
+            Some(spawn::Confinement {
+                realm_init,
+                storage_root,
+                canaries,
+                render_nodes,
+                tmpfs: vitrin_realm_init::TmpfsCaps::DEFAULT,
+            })
+        }
+    };
+
     // The screenshot directory (WS-E.2.4, issue #216): opened and audited
     // ONCE, here, before the listener below accepts anyone -- so no client is
     // running when the path is resolved, and every later write is an `openat`
@@ -2930,6 +3209,41 @@ where
     // somewhere the operator did not ask for is the failure the whole audit
     // exists to prevent, and "start anyway with the key disabled" would be a
     // session that silently does not do what its command line says.
+    // One refusal before the directory is even opened, and it is a
+    // confinement refusal rather than a screenshot one: a `--screenshot-dir`
+    // *inside* a realm's private storage would be bound READ-WRITE into that
+    // realm, so the realm could read -- and rewrite -- every screenshot this
+    // session takes of every other realm. `limits.md` narrows the screenshot
+    // residual to "same-uid processes outside every realm"; that sentence is
+    // only true if this path cannot be placed inside one.
+    if let Some((path, root)) = screenshot_dir
+        .as_ref()
+        .zip(confinement.as_ref().map(|c| &c.storage_root))
+    {
+        // Compared on the paths as given plus their canonical forms, because
+        // neither may exist yet and `canonicalize` on a missing path answers
+        // nothing. Both spellings have to miss for the path to be accepted.
+        let candidates = [
+            (path.clone(), root.clone()),
+            (
+                std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()),
+                std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()),
+            ),
+        ];
+        if candidates.iter().any(|(p, r)| p.starts_with(r)) {
+            tracing::error!(
+                "fatal: `--screenshot-dir {}` is inside the realms' private storage ({}), which \
+                 is bound read-write into the realm it belongs to. A realm would be able to \
+                 read and rewrite every screenshot of every other realm. Choose a directory \
+                 outside {}",
+                path.display(),
+                root.display(),
+                root.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     let screenshot_writer = match screenshot_dir {
         Some(path) => match screenshot::ScreenshotDir::open(&path) {
             // The descriptor is handed straight to its worker thread and this
@@ -2975,6 +3289,7 @@ where
         realms,
         recorder,
         shim,
+        confinement,
         indicator,
         capture_dump,
         screenshot_writer,
@@ -3113,6 +3428,210 @@ fn default_recorder_path() -> Result<PathBuf, vitrin_ipc::PathError> {
 /// guessing one. Only its *location* is decided here; whether it exists and
 /// is safe to exec is the spawn-time audit's question (`crate::spawn`), which
 /// refuses a missing or untrusted-writable shim exactly as it does an app.
+/// Measure this kernel, relate it to what this build applies, and either
+/// return the admitted selection or emit the refusal (D-036(6)).
+///
+/// Four branches, and the copy differs on all four because the operator's
+/// next move does:
+///
+/// - **A, `off`.** Accepted on every machine, in every mode. It asks for
+///   nothing, so nothing can be missing. Warned about loudly, here and every
+///   60 seconds after.
+/// - **B, `default` admitted.** The floor is met. If the machine will not
+///   reach `Tier::IntraUser`, this is also where the *forecast* is emitted --
+///   the build that still works announcing the build that will not.
+/// - **C, a mechanism could not be measured.** Refused. Treating "unknown" as
+///   "fine" is the silent degradation D-020(6) forbids.
+/// - **D, a mechanism was measured and is missing.** Refused, with the remedy
+///   derived from the sysctls actually read.
+fn admit_isolation(
+    options: &IsolationOptions,
+) -> Result<(spawn::isolation::Applied, spawn::isolation::Report), ()> {
+    let report = spawn::isolation::Report::probe();
+    match spawn::isolation::admit(options.isolation, &report) {
+        Ok(applied) if applied.isolation() == spawn::isolation::Isolation::Off => {
+            warn_unconfined();
+            Ok((applied, report))
+        }
+        Ok(applied) => {
+            tracing::info!(
+                isolation = %applied.isolation(),
+                profile = applied.profile(),
+                kernel = %report.kernel_release,
+                "realms will be confined: each gets its own user, mount, PID, IPC, UTS and \
+                 network namespace, an identity uid/gid map, and zero capabilities. \
+                 `applied_profile` is `namespaces-only` and not a tier name, because Landlock \
+                 (P2.6.3) and seccomp (P2.6.4) are not applied by this build"
+            );
+            if let Some(forecast) = spawn::isolation::forecast(&report) {
+                tracing::warn!("{forecast}");
+            }
+            Ok((applied, report))
+        }
+        Err(refusal) => {
+            tracing::error!(
+                "fatal: {refusal} Pass `--isolation=off` to start an UNCONFINED session \
+                 anyway, or `vitrind --print-isolation` to see every row behind this answer \
+                 and `vitrind --print-floor` to see what this build requires."
+            );
+            Err(())
+        }
+    }
+}
+
+/// The realm's GPU access, enumerated and audited **once, at startup**,
+/// before any client is running -- the same posture `--screenshot-dir` takes.
+///
+/// Render nodes only, never `card*` or `controlD*`: a render node grants
+/// rendering and buffer allocation, a primary node grants mode setting and
+/// therefore the display itself.
+///
+/// **The cost is real and is taken deliberately.** Omitting the node
+/// altogether gives the smallest mount table and the strongest claim -- and
+/// silently disables the dmabuf zero-copy path plus every bit of GPU
+/// acceleration inside every confined realm, which is an unadvertised
+/// regression that hardware dogfooding would attribute to the wrong change.
+/// So the node is bound, and the GPU ioctl surface and cross-realm
+/// GPU-memory side channels it carries are real and unaddressed here.
+fn enumerate_render_nodes() -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir("/dev/dri") else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("renderD"))
+        })
+        // Audited before it is offered, and "audited" has to mean the same
+        // thing here as it does for `command` and for a `binds` entry --
+        // otherwise the word is doing work the code is not. An adversarial
+        // review found it was: this was a file-type test through
+        // `fs::metadata`, which *follows symlinks*, with no writer check at
+        // all. Two things are fixed:
+        //
+        //   1. `symlink_metadata`, so a symlink planted at `renderD128` is
+        //      refused rather than silently followed to whatever it names.
+        //   2. The trusted-writer walk over every directory on the path.
+        //      Whoever can write `/dev` or `/dev/dri` can put a node of their
+        //      choosing where this core will find it, and the node is bound
+        //      READ-WRITE into every confined realm.
+        //
+        // What is deliberately NOT checked is the node's own mode bits. A
+        // render node is typically `crw-rw---- root:video`, i.e.
+        // group-writable by design, and refusing that would refuse every GPU
+        // on every ordinary desktop. The bits behind a device node are the
+        // distro's statement about who may talk to the driver; the path is
+        // ours to verify.
+        .filter(|p| audit_render_node(p))
+        .collect();
+    // Sorted, so the mount table -- and therefore the child's mountinfo
+    // fingerprint -- is the same on two runs of the same machine.
+    nodes.sort();
+    nodes
+}
+
+/// One `/dev/dri/renderD*` entry, against the same trusted-writer rule
+/// `command` and every `binds` source get.
+///
+/// Returns `false` and says why rather than refusing the session: a machine
+/// with one odd entry under `/dev/dri` should start without a GPU in its
+/// realms, not fail to start. That asymmetry with `binds` is deliberate --
+/// a bind source is something the operator asked for by name, and a render
+/// node is something this core went looking for.
+fn audit_render_node(path: &Path) -> bool {
+    let euid = rustix::process::geteuid().as_raw();
+    // `symlink_metadata`, never `metadata`: following a symlink here would
+    // audit the target's type and then bind the link's name.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            tracing::warn!(node = %path.display(), "ignoring a /dev/dri entry: {err}");
+            return false;
+        }
+    };
+    if !std::os::unix::fs::FileTypeExt::is_char_device(&meta.file_type()) {
+        tracing::warn!(
+            node = %path.display(),
+            "ignoring a /dev/dri entry that is not a character device (a symlink or a regular \
+             file somebody planted must not reach the mount table as though it were a GPU)"
+        );
+        return false;
+    }
+    for dir in path.ancestors().skip(1) {
+        let st = match rustix::fs::stat(dir) {
+            Ok(st) => st,
+            Err(err) => {
+                tracing::warn!(
+                    node = %path.display(),
+                    "ignoring a /dev/dri entry: cannot stat {} ({err})",
+                    dir.display()
+                );
+                return false;
+            }
+        };
+        if let Some(fault) = realm::untrusted_writer(st.st_uid, st.st_mode, euid, true) {
+            tracing::warn!(
+                node = %path.display(),
+                "ignoring a /dev/dri entry: directory {} is {fault}. This node would be bound \
+                 READ-WRITE into every confined realm, so whoever can write a directory on its \
+                 path chooses what the realms talk to",
+                dir.display()
+            );
+            return false;
+        }
+    }
+    true
+}
+
+/// A `vitrin-realm-init` beside this running `vitrind`, on exactly
+/// [`default_shim_path`]'s reasoning and with one extra refusal.
+///
+/// The extra refusal is `current_exe`'s `" (deleted)"` spelling: on Linux the
+/// kernel appends it when the running binary has been unlinked, and a path
+/// built from that names a file that does not exist. It matters more here
+/// than for the shim because the helper's version must match this core's
+/// exactly, so "cannot find it" and "found the wrong one" would otherwise be
+/// hard to tell apart at the point of failure.
+fn default_realm_init_path() -> Result<PathBuf, String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("cannot locate the running vitrind: {e}"))?;
+    if exe.as_os_str().to_string_lossy().ends_with(" (deleted)") {
+        return Err(format!(
+            "the running vitrind ({}) has been unlinked, so no sibling path can be derived \
+             from it; pass an explicit `--realm-init PATH`",
+            exe.display()
+        ));
+    }
+    let dir = exe
+        .parent()
+        .ok_or_else(|| format!("vitrind {} has no parent directory", exe.display()))?;
+    Ok(dir.join("vitrin-realm-init"))
+}
+
+/// `$XDG_DATA_HOME/vitrin/realms`, the parent of every realm's private
+/// storage.
+///
+/// Deliberately **not** under `$XDG_RUNTIME_DIR`: that tree is a tmpfs the
+/// session manager clears at logout, and a realm's `HOME` that vanished
+/// between sessions would be a home directory in name only.
+fn realm_storage_root() -> Result<PathBuf, String> {
+    let base = match std::env::var_os("XDG_DATA_HOME") {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => {
+            let home = std::env::var_os("HOME").ok_or_else(|| {
+                "neither $XDG_DATA_HOME nor $HOME is set, so this core cannot name a place for \
+                 realms' private storage"
+                    .to_string()
+            })?;
+            PathBuf::from(home).join(".local/share")
+        }
+    };
+    Ok(base.join("vitrin/realms"))
+}
+
 fn default_shim_path() -> Result<PathBuf, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("cannot locate the running vitrind: {e}"))?;
@@ -3500,6 +4019,86 @@ fn warn_consent_injector() {
     );
 }
 
+/// How often an unconfined session repeats its warning.
+const UNCONFINED_BANNER_INTERVAL: Duration = AUTO_APPROVE_BANNER_INTERVAL;
+
+/// The `--isolation=off` session's standing warning (P2.6.2, #186, D-036(6)).
+///
+/// A **third instance** of [`AutoApproveBanner`]'s repeating-warning shape,
+/// and still deliberately not a generalisation of it. Three is usually where
+/// a pattern earns a refactor; here the three differ in what they say, when
+/// they stop, and -- for the injector -- whether they exist in the build at
+/// all, so the shared part is thirty lines of thread plumbing and the
+/// unshared part is the security claim. Rewriting the one mechanism in the
+/// core that prints a standing security warning is not something to buy
+/// inside a confinement change.
+///
+/// Unlike the injector's, this one ships in every build: `--isolation=off` is
+/// a deployment flag, not a test hook.
+struct UnconfinedBanner {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl UnconfinedBanner {
+    fn start(interval: Duration) -> Self {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("unconfined-banner".into())
+            .spawn(move || {
+                let (lock, cvar) = &*worker;
+                let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while !*stopped {
+                    let (guard, _timeout) = cvar
+                        .wait_timeout(stopped, interval)
+                        .unwrap_or_else(|e| e.into_inner());
+                    stopped = guard;
+                    if !*stopped {
+                        warn_unconfined();
+                    }
+                }
+            })
+            .inspect_err(|err| {
+                tracing::error!(
+                    "this session is UNCONFINED but its repeating warning could not be started \
+                     ({err}); the startup banner is the only warning this run will emit"
+                );
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for UnconfinedBanner {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.stop;
+        {
+            let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *stopped = true;
+        }
+        cvar.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The unconfined-session warning text, in one place so the startup emission
+/// and every repeat are literally the same message.
+fn warn_unconfined() {
+    tracing::warn!(
+        "ISOLATION IS OFF (--isolation=off): every realm this session spawns runs with THIS \
+         CORE'S OWN AUTHORITY -- no user, mount, PID, IPC, UTS or network namespace, the whole \
+         filesystem visible, every socket on the machine reachable, and the operator's \
+         supplementary groups (video, render, input, docker) intact. A realm's app can read \
+         this core's socket, this run's flight-recorder log, and the operator's home \
+         directory. This is the pre-2.6.2 spawn path, kept because the confinement gate needs \
+         a positive control; it is not a rung of the default/hardened/paranoid dial and it is \
+         never a deployed session."
+    );
+}
+
 /// The auto-approve warning text, in one place so the startup emission and
 /// every repeat are literally the same message.
 fn warn_auto_approve(registry: &Path) {
@@ -3625,6 +4224,7 @@ mod tests {
         assert_eq!(
             parse_args(["--nested"]),
             Ok(Action::RunNested {
+                isolation: IsolationOptions::default(),
                 consent: ConsentPolicy::Interactive,
                 principals: None,
                 recorder: None,
@@ -3649,6 +4249,7 @@ mod tests {
         assert_eq!(
             parse_args(["--headless", "--consent=auto-approve"]),
             Ok(Action::RunHeadless {
+                isolation: IsolationOptions::default(),
                 size: (1280, 800),
                 agent_cursor: false,
                 consent: ConsentPolicy::AutoApprove,
@@ -3678,6 +4279,7 @@ mod tests {
         assert_eq!(
             parse_args(["--headless", "--consent=auto-approve", "--size", "1280x800"]),
             Ok(Action::RunHeadless {
+                isolation: IsolationOptions::default(),
                 size: (1280, 800),
                 agent_cursor: false,
                 consent: ConsentPolicy::AutoApprove,
@@ -3700,6 +4302,7 @@ mod tests {
         assert_eq!(
             parse_args(["--headless", "--consent=auto-approve", "--size", "640x480"]),
             Ok(Action::RunHeadless {
+                isolation: IsolationOptions::default(),
                 size: (640, 480),
                 agent_cursor: false,
                 consent: ConsentPolicy::AutoApprove,
@@ -3732,6 +4335,7 @@ mod tests {
             assert_eq!(
                 parse_args(args),
                 Ok(Action::RunHeadless {
+                    isolation: IsolationOptions::default(),
                     size: (1280, 800),
                     agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
@@ -3755,6 +4359,7 @@ mod tests {
         assert_eq!(
             parse_args(["--nested", "--consent=interactive"]),
             Ok(Action::RunNested {
+                isolation: IsolationOptions::default(),
                 consent: ConsentPolicy::Interactive,
                 principals: None,
                 recorder: None,
@@ -4023,6 +4628,134 @@ mod tests {
         assert!(parse_args(["--drm", "--attention-chord", "f5"]).is_err());
     }
 
+    // -- P2.6.2 (#186): the confinement selector -------------------------
+
+    /// The selector this task's whole posture rests on: **omitting it
+    /// confines**.
+    #[test]
+    fn omitting_the_isolation_flag_selects_confinement_in_every_mode() {
+        for argv in [
+            vec!["--nested"],
+            vec!["--headless", "--consent=auto-approve"],
+        ] {
+            let action = parse_args(argv.clone()).expect("parses");
+            assert_eq!(
+                isolation_of(&action),
+                IsolationOptions::default(),
+                "{argv:?} did not default to confinement"
+            );
+        }
+        // And the default really is `default` rather than whatever `Isolation`
+        // would have defaulted to -- it has no `Default`, deliberately, so
+        // this is the only place the value is chosen.
+        assert_eq!(
+            IsolationOptions::default().isolation,
+            spawn::isolation::Isolation::Default
+        );
+        assert_eq!(IsolationOptions::default().realm_init, None);
+    }
+
+    #[test]
+    fn isolation_takes_both_spellings_refuses_a_repeat_and_names_the_retired_token() {
+        for argv in [
+            vec!["--nested", "--isolation", "off"],
+            vec!["--nested", "--isolation=off"],
+        ] {
+            let action = parse_args(argv.clone()).expect("parses");
+            assert_eq!(
+                isolation_of(&action).isolation,
+                spawn::isolation::Isolation::Off,
+                "{argv:?}"
+            );
+        }
+        // The `--shim` precedent: no value, an empty value, and a repeat.
+        assert!(parse_args(["--nested", "--isolation"]).is_err());
+        assert!(parse_args(["--nested", "--isolation="]).is_err());
+        assert!(
+            parse_args(["--nested", "--isolation=off", "--isolation=default"])
+                .unwrap_err()
+                .contains("more than once")
+        );
+        // `none` by name, on `parse_consent`'s copy precedent: everybody who
+        // read D-020(6) will type it, and the message has to say the token
+        // moved rather than that they mistyped.
+        let retired = parse_args(["--nested", "--isolation=none"]).unwrap_err();
+        assert!(retired.contains("--isolation=off"), "{retired}");
+        // Non-vacuity: an unrelated value gets the generic message instead.
+        let other = parse_args(["--nested", "--isolation=paranoid"]).unwrap_err();
+        assert!(!other.contains("D-020(6)"), "{other}");
+    }
+
+    #[test]
+    fn realm_init_parses_both_spellings_and_defaults_to_a_sibling() {
+        for argv in [
+            vec![
+                "--nested",
+                "--realm-init",
+                "/usr/lib/vitrin/vitrin-realm-init",
+            ],
+            vec!["--nested", "--realm-init=/usr/lib/vitrin/vitrin-realm-init"],
+        ] {
+            let action = parse_args(argv.clone()).expect("parses");
+            assert_eq!(
+                isolation_of(&action).realm_init.as_deref(),
+                Some(Path::new("/usr/lib/vitrin/vitrin-realm-init")),
+                "{argv:?}"
+            );
+        }
+        assert!(parse_args(["--nested", "--realm-init"]).is_err());
+        assert!(parse_args(["--nested", "--realm-init="]).is_err());
+        assert!(
+            parse_args(["--nested", "--realm-init=/a", "--realm-init=/b"])
+                .unwrap_err()
+                .contains("--realm-init")
+        );
+        // The default is resolved at startup, not at parse time, exactly as
+        // `--shim`'s is.
+        assert_eq!(
+            isolation_of(&parse_args(["--nested"]).unwrap()).realm_init,
+            None
+        );
+    }
+
+    #[test]
+    fn the_floor_is_answerable_from_any_command_line_and_is_not_a_kernel_row() {
+        // `--print-isolation`'s precedent: a question about this binary must
+        // not be answerable only on a command line that would otherwise have
+        // run a session.
+        assert_eq!(parse_args(["--print-floor"]), Ok(Action::PrintFloor));
+        assert_eq!(
+            parse_args(["--nested", "--print-floor"]),
+            Ok(Action::PrintFloor)
+        );
+        assert_eq!(
+            parse_args(["--print-floor", "--size"]),
+            Ok(Action::PrintFloor),
+            "it must win over a later parse error, like --print-isolation does"
+        );
+        assert!(USAGE.contains("--print-floor"));
+        assert!(USAGE.contains("--isolation"));
+        assert!(USAGE.contains("--realm-init"));
+        // The cost D-036 says must be said out loud or it reads as an
+        // oversight: `off` is not a rung of the default/hardened/paranoid dial.
+        assert!(
+            USAGE.contains("paranoid"),
+            "--help must say that `off` is not a rung of D-010's dial"
+        );
+    }
+
+    /// The `isolation` field of whichever run variant an `Action` is.
+    fn isolation_of(action: &Action) -> IsolationOptions {
+        match action {
+            Action::RunNested { isolation, .. } | Action::RunHeadless { isolation, .. } => {
+                isolation.clone()
+            }
+            #[cfg(feature = "drm-backend")]
+            Action::RunDrm { isolation, .. } => isolation.clone(),
+            other => panic!("not a run action: {other:?}"),
+        }
+    }
+
     /// **The reservation does not reach the other two backends** — the control
     /// that stops the test above passing against a blanket refusal.
     ///
@@ -4248,6 +4981,7 @@ mod tests {
         ] {
             match parse_args(args.clone()) {
                 Ok(Action::RunHeadless {
+                    isolation: IsolationOptions::default(),
                     consent,
                     consent_injector_fd,
                     ..
@@ -4313,6 +5047,7 @@ mod tests {
         assert_eq!(
             parse_args(["--headless", "--consent=auto-approve"]),
             Ok(Action::RunHeadless {
+                isolation: IsolationOptions::default(),
                 size: (1280, 800),
                 agent_cursor: false,
                 consent: ConsentPolicy::AutoApprove,
@@ -4348,6 +5083,7 @@ mod tests {
             assert_eq!(
                 parse_args(args),
                 Ok(Action::RunHeadless {
+                    isolation: IsolationOptions::default(),
                     size: (1280, 800),
                     agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
@@ -4376,6 +5112,7 @@ mod tests {
                 "--recorder=/tmp/n.jsonl"
             ]),
             Ok(Action::RunNested {
+                isolation: IsolationOptions::default(),
                 consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: Some(PathBuf::from("/tmp/n.jsonl")),
@@ -4413,6 +5150,7 @@ mod tests {
             assert_eq!(
                 parse_args(args),
                 Ok(Action::RunHeadless {
+                    isolation: IsolationOptions::default(),
                     size: (1280, 800),
                     agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
@@ -4442,6 +5180,7 @@ mod tests {
                 "--realm=/tmp/realm.toml"
             ]),
             Ok(Action::RunNested {
+                isolation: IsolationOptions::default(),
                 consent: ConsentPolicy::AutoApprove,
                 principals: None,
                 recorder: Some(PathBuf::from("/tmp/n.jsonl")),
@@ -4494,6 +5233,7 @@ mod tests {
             assert_eq!(
                 parse_args(args),
                 Ok(Action::RunHeadless {
+                    isolation: IsolationOptions::default(),
                     size: (1280, 800),
                     agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
@@ -4518,6 +5258,7 @@ mod tests {
         assert_eq!(
             parse_args(["--nested", "--shim=/opt/vitrin/vitrin-shim"]),
             Ok(Action::RunNested {
+                isolation: IsolationOptions::default(),
                 consent: ConsentPolicy::Interactive,
                 principals: None,
                 recorder: None,
@@ -4568,6 +5309,7 @@ mod tests {
             assert_eq!(
                 parse_args(args),
                 Ok(Action::RunHeadless {
+                    isolation: IsolationOptions::default(),
                     size: (1280, 800),
                     agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
@@ -4592,6 +5334,7 @@ mod tests {
         assert_eq!(
             parse_args(["--nested", "--capture-dump=/tmp/x.rgba"]),
             Ok(Action::RunNested {
+                isolation: IsolationOptions::default(),
                 consent: ConsentPolicy::Interactive,
                 principals: None,
                 recorder: None,
@@ -4873,6 +5616,14 @@ mod tests {
             // guard, and a screenshot directory would be a second thing that
             // could fail the startup it is measuring.
             None,
+            // The confinement selector this fixture runs under. `off`
+            // deliberately: the assertion is about the auto-approve refusal,
+            // and a machine whose kernel refuses namespaces would otherwise
+            // fail this test for an unrelated reason.
+            IsolationOptions {
+                isolation: spawn::isolation::Isolation::Off,
+                realm_init: None,
+            },
             // Not an instrumented run: `--consent-injector-fd` is a headless
             // flag and this fixture drives `run_session` directly.
             false,
@@ -4913,6 +5664,12 @@ mod tests {
             None,
             None,
             None,
+            // `off`, for the same reason as the fixture above: this test is
+            // about auto-approve's admission, not about the kernel's.
+            IsolationOptions {
+                isolation: spawn::isolation::Isolation::Off,
+                realm_init: None,
+            },
             false,
             |seed| {
                 ran.set(true);
@@ -5083,6 +5840,7 @@ mod tests {
             assert_eq!(
                 parse_args(args),
                 Ok(Action::RunHeadless {
+                    isolation: IsolationOptions::default(),
                     size: (1280, 800),
                     agent_cursor: false,
                     consent: ConsentPolicy::AutoApprove,
@@ -5153,6 +5911,7 @@ mod tests {
                 "2147483647x1"
             ]),
             Ok(Action::RunHeadless {
+                isolation: IsolationOptions::default(),
                 size: (2147483647, 1),
                 agent_cursor: false,
                 consent: ConsentPolicy::AutoApprove,

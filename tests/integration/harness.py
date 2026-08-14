@@ -56,6 +56,33 @@ BOOT_TIMEOUT_S = 30.0
 #: used 100_000 and pinned a core for the whole suite.
 ANIMATE_FRAMES = 1200
 
+#: What `comm` a realm's **supervisor** reports (P2.6.2, issue #186). At
+#: `--isolation=default` the core's direct child is `vitrin-realm-init`, which
+#: stays in the host pid namespace and forks the realm's PID 1; the shim is
+#: therefore a grand child of the core rather than a child. The kernel
+#: truncates `comm` to 15 bytes, so `vitrin-realm-init` reads back clipped --
+#: spelled out here once rather than re-derived at each call site.
+SUPERVISOR_COMM = "vitrin-realm-in"
+
+#: `comm` prefixes a realm's fd-3 peer can have. Both, because `shims_of`
+#: answers "what did this core fork as a realm", and a component test's realm
+#: is the mock. It is deliberately NOT the mock-freeness check: every named
+#: gate asserts `comm_of(shim).startswith("vitrin-shim")` on the pid it gets
+#: back, which `vitrin-mock-shim` (comm-truncated to `vitrin-mock-shi`) fails.
+SHIM_COMMS = ("vitrin-shim", "vitrin-mock-shi")
+
+#: The paths a **confined** realm sees, mirroring the constants in
+#: `crates/vitrin-realm-init/src/lib.rs` (P2.6.2, #186). At
+#: `--isolation=default` the core injects these rather than the host paths, so
+#: a gate asserting on the app's environment has to name them -- and a gate
+#: that wants the older claim ("this is the realm's OWN socket, not a host
+#: one") gets it by comparing inodes through `/proc/<pid>/root`, which is
+#: strictly stronger than comparing the path string ever was.
+IN_REALM_RUNTIME_DIR = "/run/vitrin"
+IN_REALM_WAYLAND_SOCKET = "/run/vitrin/wayland-0"
+IN_REALM_HOME = "/vitrin/home"
+IN_REALM_SHIM = "/vitrin/shim"
+
 #: Hard per-test ceiling. The failure this exists for is issue #77's trap T1:
 #: a regression that registers the shim socketpair's source after the fork
 #: leaves the shim blocked on `configure` forever, and `observe()` then never
@@ -79,6 +106,67 @@ def _toml_string(value: str) -> str:
 def _toml_string_array(values: list[str]) -> str:
     """A TOML inline array of basic strings (`[]` when empty)."""
     return "[" + ", ".join(_toml_string(v) for v in values) + "]"
+
+
+#: Directory prefixes a confined realm can already see: `/usr` and `/etc` are
+#: in every realm's mount table at their own paths, and `/lib`, `/lib64`,
+#: `/bin`, `/sbin` are the compatibility shape `vitrin-realm-init` mirrors
+#: (symlink or bind) beside `/usr`.
+_SYSTEM_LIB_PREFIXES = ("/usr/", "/lib/", "/lib64/", "/etc/")
+
+_shim_libs_cache: dict[str, tuple[str, ...]] = {}
+
+
+def shim_library_dirs(shim_bin: str | os.PathLike[str]) -> tuple[str, ...]:
+    """Directories holding shared libraries `shim_bin` needs from **outside**
+    the realm's stock mount table.
+
+    Why this exists, stated plainly because it is a **workaround for a real
+    defect and not a fact of nature** (P2.6.2, #186): `vitrin-realm-init` binds
+    the shim as a single file at `/vitrin/shim`, and Meson gives a build-tree
+    binary the RUNPATH `$ORIGIN/subprojects/wlroots`. Inside the realm
+    `$ORIGIN` is `/vitrin`, so the loader looks in `/vitrin/subprojects/wlroots`
+    -- which the table never creates -- and the shim dies before `main` with
+    `error while loading shared libraries: libwlroots-0.19.so`. The core sees
+    only the config channel's EOF and reports `Broken pipe`.
+
+    That is exactly how CI builds the shim (`shim/ci/install-deps.sh` installs
+    wlroots' *build* deps because Ubuntu ships 0.17.1, so the vendored
+    subproject is always used), so this is not a local-tree quirk.
+
+    Returns the parent directory of every `ldd` dependency that resolves
+    outside :data:`_SYSTEM_LIB_PREFIXES`. Empty on a machine whose shim links
+    only system libraries, which is what makes the workaround self-cancelling
+    rather than permanent scaffolding.
+    """
+    key = os.fspath(shim_bin)
+    cached = _shim_libs_cache.get(key)
+    if cached is not None:
+        return cached
+    dirs: list[str] = []
+    try:
+        report = subprocess.run(
+            ["ldd", key], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        report = None
+    if report is not None and report.returncode == 0:
+        for line in report.stdout.splitlines():
+            _, sep, rest = line.partition("=> ")
+            if not sep:
+                continue
+            path = rest.split(" (")[0].strip()
+            if not path.startswith("/"):
+                continue
+            resolved = os.path.realpath(path)
+            if resolved.startswith(_SYSTEM_LIB_PREFIXES):
+                continue
+            parent = os.path.dirname(resolved)
+            if parent not in dirs:
+                dirs.append(parent)
+    found = tuple(sorted(dirs))
+    _shim_libs_cache[key] = found
+    return found
 
 
 class CoreFailed(Exception):
@@ -656,6 +744,9 @@ class Core:
         consent_injector: bool = False,
         physical_input: bool = False,
         screenshot_dir: str | os.PathLike[str] | None = None,
+        isolation: str | None = None,
+        binds: tuple[str, ...] = (),
+        realm_init: str | os.PathLike[str] | None = None,
     ) -> None:
         self.runtime = pathlib.Path(runtime_dir or tempfile.mkdtemp(prefix="vitrin-it-"))
         self._owns_runtime = runtime_dir is None
@@ -665,6 +756,9 @@ class Core:
         self.proc: subprocess.Popen[str] | None = None
         self._output = ""
         self._entries: list[dict] | None = None
+        # Per-realm logs, cached at teardown for the same reason `_entries`
+        # is: the files live inside the tree this object deletes.
+        self._realm_logs: dict[str, str] = {}
         # A verbose realm (a probing shim under Firefox emits thousands of
         # DEBUG lines; the browser is chatty on its own) can write more to the
         # core's inherited stdout/stderr than a pipe holds -- and this harness
@@ -681,6 +775,29 @@ class Core:
         # gate (test_real_app.py) overrides it with the built C shim, whose
         # `command` names a genuine Wayland app the C shim fork/execs.
         shim_bin = pathlib.Path(shim) if shim is not None else MOCK_SHIM
+
+        # The realm's read-only bind list (P2.6.2, #186). Two contributions,
+        # and they are different in kind:
+        #
+        #  - what the caller asked for, and
+        #  - what the SHIM's own shared-library closure needs, computed rather
+        #    than hardcoded (:func:`shim_library_dirs`). A Meson build-tree
+        #    shim carries the RUNPATH `$ORIGIN/subprojects/wlroots`, and
+        #    `$ORIGIN` inside the realm is `/vitrin` -- so without this the
+        #    dynamic loader kills every real-app realm before `main` and the
+        #    core reports `Broken pipe`. `LD_LIBRARY_PATH` is what makes the
+        #    bound directory findable, since a bind lands at its HOST path and
+        #    no configuration can move `$ORIGIN`.
+        #
+        # Both are inert at `--isolation=off` (the realm can already see the
+        # whole filesystem), and `shim_library_dirs` is empty for a shim that
+        # links only system libraries -- including `vitrin-mock-shim`, so the
+        # component tests' argv and environment are unchanged.
+        self.shim_library_dirs = shim_library_dirs(shim_bin)
+        realm_binds = tuple(binds) + self.shim_library_dirs
+        env_allow = tuple(env_allow)
+        if self.shim_library_dirs and "LD_LIBRARY_PATH" not in env_allow:
+            env_allow = env_allow + ("LD_LIBRARY_PATH",)
 
         # `write_config=False` reuses whatever config is already in the tree.
         # The R6 test needs it: it deliberately relaxes the registry's mode
@@ -724,6 +841,7 @@ class Core:
                     f'id = "{rid}"\n'
                     f'command = "{MOCK_SHIM}"\n'
                     f'args = ["--serve"{seat_arg}, "--animate", "{animate}"]\n'
+                    f"binds = {_toml_string_array(list(realm_binds))}\n"
                     + ("autostart = false\n" if rid in templates else "")
                     for rid in ("realm-0", *realms, *templates)
                 )
@@ -761,6 +879,7 @@ class Core:
                         f"{_toml_string(os.fspath(per_command.get(rid, command)))}\n"
                         f"args = {_toml_string_array(per_args.get(rid, args or []))}\n"
                         f"env_allow = {_toml_string_array(list(env_allow))}\n"
+                        f"binds = {_toml_string_array(list(realm_binds))}\n"
                         + ("autostart = false\n" if rid in templates else "")
                         for rid in ("realm-0", *realms, *templates)
                     )
@@ -785,6 +904,18 @@ class Core:
             "--shim",
             str(shim_bin),
         ]
+        # `--isolation` (P2.6.2, #186, D-037(4)). Deliberately NOT passed
+        # unless a caller names it: the flag's whole point is that omitting it
+        # confines, so a harness that always spelled it out would stop testing
+        # the path every deployment takes. `test_real_confinement.py` is the
+        # one module that names both settings, and it names them in the same
+        # run.
+        if isolation is not None:
+            argv += [f"--isolation={isolation}"]
+        # A substituted confinement helper, for the gate that proves a realm
+        # the core cannot verify is REFUSED (`crates/vitrin-realm-init-fixtures`).
+        if realm_init is not None:
+            argv += ["--realm-init", str(realm_init)]
         # The P1.8.5 core-internal capture (issue #107): when set, the core
         # mirrors every live realm's composited realm-view readback to
         # `PATH.<realm-id>` as raw RGBA, the frame the fidelity gate compares
@@ -836,9 +967,28 @@ class Core:
             self.physical: PhysicalInputInjector | None = PhysicalInputInjector(phys_ours)
         else:
             self.physical = None
-        env = {**os.environ, "XDG_RUNTIME_DIR": str(self.runtime), "RUST_LOG": "info"}
+        env = {
+            **os.environ,
+            "XDG_RUNTIME_DIR": str(self.runtime),
+            # Every confined realm gets private storage under
+            # `$XDG_DATA_HOME/vitrin/realms/<id>`, injected as the app's `HOME`
+            # (P2.6.2, #186). Pointed at this instance's throwaway tree, or the
+            # suite would write into the developer's real
+            # `~/.local/share/vitrin/realms`, carry one realm's files into the
+            # next test that happens to use the same realm id, and journal
+            # `storage_reused: true` on the second run of anything -- state
+            # shared between tests through the operator's home directory is
+            # exactly the kind of hidden coupling this suite exists to notice.
+            "XDG_DATA_HOME": str(self.runtime / "data"),
+            "RUST_LOG": "info",
+        }
         # The core's own environment is the source `env_allow` copies from,
         # so the real-app gate seeds WLR_* here for the allowlist to forward.
+        # `LD_LIBRARY_PATH` travels the same route, for the reason
+        # `shim_library_dirs` states: it is the shim's own runtime closure, not
+        # the app's, but the realm's environment is composed once for both.
+        if self.shim_library_dirs:
+            env["LD_LIBRARY_PATH"] = ":".join(self.shim_library_dirs)
         if extra_env:
             env.update(extra_env)
         self.proc = subprocess.Popen(
@@ -903,6 +1053,9 @@ class Core:
         ladder writes to the log.
         """
         assert self.proc is not None
+        # Before the signal, never after: an orderly shutdown deletes each
+        # realm's runtime tree, and the realm's log lives in it.
+        self._snapshot_realm_logs()
         if self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
@@ -942,6 +1095,128 @@ class Core:
             elif self.proc.stdout is not None:
                 self._output = self.proc.stdout.read() or ""
         return self._output
+
+    def realm_dir(self, realm: str = "realm-0") -> pathlib.Path:
+        """A realm's private runtime directory, **on the host**.
+
+        The same directory the realm sees at :data:`IN_REALM_RUNTIME_DIR` --
+        it is bound there read-write -- so it is the one place a confined app
+        can write a file this suite can then read. A gate that used to hand its
+        app a path in a scratch `/tmp` directory now hands it
+        `/run/vitrin/<name>` and reads `realm_dir(...)/<name>`: the realm's
+        `/tmp` is a private tmpfs and a host scratch path simply does not
+        exist in there.
+
+        The core **purges** this directory at spawn, so a file a test wrote
+        here beforehand is gone by the time the app runs -- which is what makes
+        "the sink file is absent" evidence about the run rather than about the
+        fixture.
+        """
+        return self.runtime / "vitrin-0" / realm
+
+    def storage_dir(self, realm: str = "realm-0") -> pathlib.Path:
+        """A realm's **persistent** private storage, on the host.
+
+        The directory bound at :data:`IN_REALM_HOME` and injected as the app's
+        `HOME` (P2.6.2, #186). Unlike :meth:`realm_dir`, it is *never purged*:
+        the core removes the runtime tree on an orderly shutdown, so a file an
+        app wrote in there is gone by the time a test that terminated the core
+        goes looking for it. An app artefact a gate reads **after** the run
+        belongs here; one it reads **during** the run may live in either.
+        """
+        return self.runtime / "data" / "vitrin" / "realms" / realm
+
+    def realm_log_path(self, realm: str = "realm-0") -> pathlib.Path:
+        """Where a **confined** realm's stdout and stderr go.
+
+        At `--isolation=default` (P2.6.2, #186) the core gives each realm its
+        own log file instead of letting the shim and the app inherit its
+        descriptors: on a real session those would be the operator's tty, and
+        no mount flag can revoke a descriptor. So an app's own diagnostics stop
+        appearing in :meth:`output` the moment a realm is confined.
+        """
+        return self.realm_dir(realm) / "realm.log"
+
+    def realm_output(self, realm: str = "realm-0") -> str:
+        """A confined realm's own log, cached the way :meth:`output` is.
+
+        Cached because the file lives *inside* the runtime tree this object
+        deletes on cleanup, and the natural way to write these tests is to
+        assert on an app's output after the core has been terminated.
+
+        Empty string when there is no such file -- which is the
+        `--isolation=off` case, where the realm inherits the core's stream and
+        :meth:`output` is where its lines are.
+        """
+        cached = self._realm_logs.get(realm)
+        if cached is not None:
+            return cached
+        try:
+            # A fresh handle, never a seek on a descriptor the writers share:
+            # the same lesson `output()` records at length.
+            return self.realm_log_path(realm).read_text(errors="replace")
+        except OSError:
+            return ""
+
+    def _snapshot_realm_logs(self) -> None:
+        """Copy every realm's log into memory **before** the core stops.
+
+        Not an optimisation -- the file will not be there afterwards. An
+        orderly shutdown removes each realm's runtime tree
+        (`lifecycle.rs::remove_runtime_dir`), which was invisible while a
+        realm's diagnostics went to the core's inherited stdout and is not
+        invisible now that they go to a file inside that tree. Called from
+        :meth:`terminate`, so any caller that stops the core the ordinary way
+        keeps its apps' lines whatever it reads them for.
+        """
+        tree = self.runtime / "vitrin-0"
+        if not tree.is_dir():
+            return
+        for child in sorted(tree.iterdir()):
+            if not child.is_dir() or child.name in self._realm_logs:
+                continue
+            try:
+                self._realm_logs[child.name] = (child / "realm.log").read_text(errors="replace")
+            except OSError:
+                continue
+
+    def app_output(self, realm: str = "realm-0") -> str:
+        """Wherever **this** run's realm wrote its diagnostics.
+
+        The per-realm log when the realm is confined, the core's own inherited
+        stream when it is not. A gate reading an app's own lines wants this
+        rather than :meth:`output`, and wants it rather than choosing for
+        itself, because which of the two carries the app is a function of
+        `--isolation` and a gate that hardcoded one would silently read an
+        empty string at the other setting.
+
+        Deliberately **not** folded into `output()`: a gate that greps the
+        core's log for a string the realm must never have leaked (the
+        clipboard canary, `test_real_clipboard.py`) would then be grepping the
+        app's own log for the string the app itself was given, and would fail
+        for the opposite of the reason it exists.
+        """
+        return self.realm_output(realm) or self.output()
+
+    def realm_ids(self) -> list[str]:
+        """Every realm id this run's runtime tree holds a directory for."""
+        if self._realm_logs:
+            return sorted(self._realm_logs)
+        tree = self.runtime / "vitrin-0"
+        if not tree.is_dir():
+            return []
+        return sorted(child.name for child in tree.iterdir() if child.is_dir())
+
+    def all_app_output(self) -> str:
+        """:meth:`app_output` over **every** realm, concatenated.
+
+        What a multi-realm gate counting "one HIT per app" wants. Confinement
+        split one stream into several files, and a gate that kept reading the
+        core's own stream would count zero -- while a gate that read only
+        `realm-0`'s would count one and call it two-realm evidence.
+        """
+        joined = "".join(self.realm_output(realm) for realm in self.realm_ids())
+        return joined or self.output()
 
     # -- observation -------------------------------------------------------
 
@@ -1001,6 +1276,11 @@ class Core:
         # after the `with` block see the run rather than an empty list.
         self.entries()
         self.output()
+        # Belt and braces: `terminate()` above already snapshotted, and this
+        # catches a core that was never terminated at all. Skipping realms
+        # already cached, so it can never overwrite a real log with the empty
+        # string a deleted tree reads back as.
+        self._snapshot_realm_logs()
         if self._logf is not None:
             self._logf.close()
             self._logf = None
@@ -1072,6 +1352,106 @@ def comm_of(pid: int) -> str:
         return pathlib.Path(f"/proc/{pid}/comm").read_text().strip()
     except OSError:
         return ""
+
+
+def shims_of(pid: int) -> list[int]:
+    """Every realm shim the core `pid` owns, at **either** isolation setting.
+
+    Until P2.6.2 (#186) this was one comprehension over `children_of(core.pid)`,
+    written out at sixteen call sites, and every one of them silently returned
+    `[]` the day `--isolation` began defaulting to `default`: the core's direct
+    child became `vitrin-realm-init`, the host-pid-namespace supervisor, and
+    the shim moved one level down as that supervisor's child (D-037(2) --
+    `unshare(CLONE_NEWPID)` never moves the caller, so a fork is forced and the
+    forker has to stay somewhere).
+
+    Two levels, never a recursive walk. A realm's app is the shim's child and
+    an app may fork children of its own; a DFS for "anything called
+    vitrin-shim" would be no more correct and would stop distinguishing
+    "the core forked a shim" from "something under the realm did".
+
+    **A confined shim is matched by position, not by name, and that is not a
+    shortcut.** `vitrin-realm-init` binds the shim at `/vitrin/shim`, so the
+    kernel derives its `comm` from that path and every confined shim -- real C
+    shim and `vitrin-mock-shim` alike -- reads back as `shim`. A name test
+    there would either miss both or match anything; a supervisor has exactly
+    one child and that child is the realm's PID 1, so its identity is
+    unambiguous. What the *program* is stays checkable, and more sharply than
+    a name ever was: :func:`exe_identity` compares the running image's inode
+    against the shim binary the gate named.
+
+    Returns host pids, in `children_of` order, so a caller that wants "one
+    shim per realm, in realm order" must still sort or match by realm rather
+    than by position -- exactly as before.
+    """
+    found: list[int] = []
+    for kid in children_of(pid):
+        name = comm_of(kid)
+        if name.startswith(SHIM_COMMS):
+            found.append(kid)  # --isolation=off: the core's own direct child
+        elif name.startswith(SUPERVISOR_COMM):
+            # The supervisor's one child, **once it has exec'd**. Between the
+            # fork and the second `execve` that child is still running
+            # `vitrin-realm-init` itself -- it is building the mount table --
+            # and returning it then hands the caller a pid whose
+            # `/proc/<pid>/exe` is the helper, not the shim. That race is not
+            # theoretical: it turned up as `test_real_deadman.py` failing its
+            # inode check with `comm 'vitrin-realm-in'` on one run in a
+            # hundred. Filtering on the name the child sheds at `execve` makes
+            # `await_shims` wait for the exec instead of racing it.
+            found.extend(
+                grandkid
+                for grandkid in children_of(kid)
+                if not comm_of(grandkid).startswith(SUPERVISOR_COMM)
+            )
+    return found
+
+
+def exe_identity(pid: int) -> tuple[int, int] | None:
+    """`(st_dev, st_ino)` of the program `pid` is running, or `None`.
+
+    `/proc/<pid>/exe` is a magic link the kernel resolves from the process's
+    own `mm->exe_file`, so a `stat` through it names the real inode even when
+    the process lives in a mount namespace this reader cannot walk -- which is
+    what makes it usable on a confined realm's shim, where `readlink` answers
+    the in-realm path `/vitrin/shim` and the *name* has stopped being evidence
+    of anything.
+
+    Comparing inodes is strictly stronger than the `comm` prefix test it
+    replaced: a name says what a program is called, an inode says which file
+    is executing. `vitrin-mock-shim` bound at the same in-realm path answers
+    the same `comm` and a different inode.
+    """
+    try:
+        st = os.stat(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def file_identity(path: str | os.PathLike[str]) -> tuple[int, int] | None:
+    """`(st_dev, st_ino)` of `path`, or `None` if it cannot be stat'ed."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def await_shims(pid: int, count: int = 1, timeout: float = 15.0) -> list[int]:
+    """Block until `pid` owns at least `count` shims; return what it owns.
+
+    The spawn is asynchronous with respect to the socket appearing, so every
+    gate that reads the spine used to open-code this poll. Returns whatever it
+    has when the deadline passes, so the caller's own assertion produces the
+    failure message rather than this helper inventing one.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        found = shims_of(pid)
+        if len(found) >= count or time.monotonic() >= deadline:
+            return found
+        time.sleep(0.05)
 
 
 def descendant_named(pid: int, name: str, timeout: float = 15.0) -> int | None:

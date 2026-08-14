@@ -50,6 +50,8 @@ vitrin-os/
 | [`vitrin-scanner`](../crates/vitrin-scanner) | Doc 2 §17 (codegen, checked-in generated code) | The codegen: parses `protocol/vitrin-v0.xml`, emits the Rust types in `vitrin-protocol` and the C header `shim/include/vitrin-protocol.h`. Driven by `cargo xtask codegen`/`--check` (never run by hand). |
 | [`vitrin-ipc`](../crates/vitrin-ipc) | Doc 2 §3.2–3.4; PRD plan E2 (P1.2) | The Unix-socket transport: length-prefixed framing, `SCM_RIGHTS` fd passing, `SO_PEERCRED` capture at accept, backpressure/misbehavior policy (kill a slow-reading or fd-bombing connection, never block the compositor loop — Doc 2 §9's "budgeted dependency" posture applied to the wire). Feature-split `server` (calloop glue, what the core links) vs. `client` (what a Rust client would link, with no compositor dependency pulled in). |
 | [`vitrin-core`](../crates/vitrin-core) | Doc 2 §2 (trusted core & TCB boundary); the whole of Doc 2 §3–5, §8–9 | `vitrind` — the entire Trusted Computing Base. See §2.1 below for its internal module map. |
+| [`vitrin-realm-init`](../crates/vitrin-realm-init) | Doc 2 §4.5 (realm boundary); PRD plan E2.6 (P2.6.2, issue [#186](https://github.com/vitrin-os/vitrin-os/issues/186)); decisions D-020, D-036 | **The confinement helper, and a second trusted binary.** The core `execve`s it, and it then unshares six namespaces, forks the PID-1 process of the realm, builds the mount table, `pivot_root`s, and `execve`s the shim. It execs *first* and unshares *second* on purpose: the reverse order deadlocks against `std::process::Command`, and it would force a `0 <euid> 1` map that hands the app `CAP_SYS_ADMIN` in its own user namespace. **MPL-2.0**, `libc` only. The core does not trust its word — it reads the kernel's answer about the child and refuses the spawn when it cannot. |
+| [`vitrin-realm-init-fixtures`](../crates/vitrin-realm-init-fixtures) | PRD plan E2.6 (P2.6.2) | **Deliberately broken helpers, so the verification can be proven non-vacuous.** `noop-init`, `unshare-only-init`, `hang-init`, `stale-version-init`, `leaks-a-dirfd-init` — each violates one clause the core checks, so a test can demonstrate the refusal firing rather than assert it from the success path. Apache-2.0, never installed. Exists because a checkpoint nothing has ever seen fail is a checkpoint nobody knows works. |
 | [`vitrin-mock-shim`](../crates/vitrin-mock-shim) | PRD plan E3 (P1.3.4 acceptance: "a mock shim drives an animated surface") | A **fixture only** — a Rust test binary that speaks the shim-facing protocol without wlroots, used to exercise the core's shim server before/alongside the real C shim, and by `cargo xtask demo` today (see the root [README](../README.md#status) for the tracked gap this implies). Never the demo's real-app proof; that is `shim/` (§3) exercised by `tests/integration/`. |
 | [`vitrin-golden`](../crates/vitrin-golden) | PRD plan E9 (P1.9.2, golden-frame harness) | Per-pixel + SSIM frame comparison (`vitrin-golden-cmp` binary), used by the golden tests and the real-app capture-fidelity integration gate. Its PNG artifact encoder moved to `vitrin-png` at WS-E.2.4; the crate still has **no external dependencies**. |
 | [`vitrin-png`](../crates/vitrin-png) | PRD plan E9 (P1.9.2) + WS-E.2.4 (issue [#216](https://github.com/vitrin-os/vitrin-os/issues/216)) | A hand-rolled, zero-dependency, **encode-only** PNG writer (8-bit truecolor, stored-block DEFLATE), shared by the golden harness and the trusted core. It exists as its own crate so the core's screenshot key can write an image without an image codec entering the tree in any dependency class — a rule `crates/vitrin-core/Cargo.toml` states twice — and without a second copy of the same arithmetic living inside the TCB. **There is no decoder here, in any form**, and that absence is the reviewable property: everything it takes is a buffer its caller composited, so it never parses attacker bytes. |
@@ -137,7 +139,14 @@ implementation of the wire protocol, not a binding to the Rust one).
 
 Phase 2+ concepts named in the PRD (semantic trees/epochs, the powerbox,
 the credential wallet, network sessions, the X11 shim, the mission-control
-shell) have **no corresponding code yet** and so have no row above. See
+shell) have **no corresponding code yet** and so have no row above.
+
+**Two exceptions, because this paragraph had already gone stale once.**
+`crates/vitrin-core/src/spawn/isolation.rs` landed with P2.6.1 and
+`crates/vitrin-realm-init` with P2.6.2, so Phase-2 *confinement* is no longer a
+concept without code — both are in the table. The sentence is kept rather than
+softened because the rule it states is the right one; what it needed was a row,
+not a hedge. See
 [`docs/plan/02-phase-2-semantic-epochs.md`](plan/02-phase-2-semantic-epochs.md)
 onward for where they are planned, and the root README's roadmap section
 for the phase-level summary. Do not read their absence from this table as

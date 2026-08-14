@@ -1001,7 +1001,10 @@ jobs:
           # drifted -- it carried two of the five gates run.sh named, so the
           # guard against gate drift had silently drifted, which is the same
           # defect one level up. Edit both, and README.md's table, together.
-          for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_real_clipboard.py test_screenshot.py test_launch.py test_shell.py; do
+          # It had drifted AGAIN by P2.6.2: `test_real_gestures.py` (WS-E.4.2,
+          # #222) was in run.sh's list and never here. Both are named now, plus
+          # `test_real_confinement.py` (#186).
+          for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_real_clipboard.py test_screenshot.py test_real_gestures.py test_real_confinement.py test_launch.py test_shell.py; do
             if [ ! -f "tests/integration/$gate" ]; then
               echo "::error::named property gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with that property's evidence contributing nothing. Restore it, or retire it from run.sh's PROPERTY_GATES, this list, and tests/integration/README.md's gate table together."
               missing=1
@@ -1099,6 +1102,92 @@ jobs:
         run: |
           meson setup "${RUNNER_TEMP}/shim-build" shim
           meson compile -C "${RUNNER_TEMP}/shim-build"
+
+      - name: What confinement this runner actually grants (diagnostic, never fails)
+        # Why this exists, and why it prints rather than asserts.
+        #
+        # P2.6.2's first CI run died with every realm spawn refused: the
+        # helper's first mount, `mount(NULL, "/", NULL, MS_REC|MS_PRIVATE,
+        # NULL)`, returned EPERM on this runner while returning 0 on the
+        # maintainer's Arch box (AppArmor compiled out). The isolation
+        # preflight cleared the machine anyway, because it measured that a
+        # user namespace could be *created* and never that a mount *inside*
+        # one succeeds -- the two answers differ here.
+        #
+        # The preflight now probes the mount too, so a runner like this one
+        # gets a named refusal with a remedy instead of a raw errno. That
+        # makes this step diagnostic rather than load-bearing: it records
+        # WHICH knob explains the answer, which the refusal text needs and
+        # which issue #281's multi-kernel matrix wants collected from every
+        # kernel CI touches. `--print-isolation` is the preflight's own
+        # matrix, so the log carries the measurement and the raw evidence for
+        # it side by side and either can falsify the other.
+        #
+        # It must never fail the job: a diagnostic that can turn a PR red
+        # stops being a diagnostic and becomes a second gate nobody declared.
+        if: hashFiles('tests/integration/run.sh') != ''
+        continue-on-error: true
+        run: |
+          set +e
+          echo "=== kernel ==="
+          uname -srvm
+          echo "=== the three knobs the preflight reads for its remedy text ==="
+          for k in /proc/sys/user/max_user_namespaces \
+                   /proc/sys/kernel/unprivileged_userns_clone \
+                   /proc/sys/kernel/apparmor_restrict_unprivileged_userns; do
+            printf '%s = %s\n' "$k" "$(cat "$k" 2>/dev/null || echo '<absent>')"
+          done
+          echo "=== AppArmor ==="
+          printf 'module enabled = %s\n' \
+            "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo '<absent>')"
+          printf 'this process    = %s\n' \
+            "$(cat /proc/self/attr/current 2>/dev/null || echo '<absent>')"
+          echo "=== the minimal repro: create a userns+mountns, then mount in it ==="
+          # Two separable questions, deliberately asked as two commands: does
+          # the unshare succeed, and does a mount inside it succeed? The CI
+          # failure was "yes, then no", which is exactly the pair the old
+          # preflight could not distinguish.
+          unshare --user --map-root-user --mount true \
+            && echo "unshare(CLONE_NEWUSER|CLONE_NEWNS): OK" \
+            || echo "unshare(CLONE_NEWUSER|CLONE_NEWNS): FAILED rc=$?"
+          unshare --user --map-root-user --mount \
+            sh -c 'mount --make-rprivate / && echo "mount MS_REC|MS_PRIVATE /: OK"' \
+            || echo "mount MS_REC|MS_PRIVATE /: FAILED rc=$?"
+          echo "=== vitrind --print-isolation (the preflight's own matrix) ==="
+          if [ -x target/debug/vitrind ]; then
+            target/debug/vitrind --print-isolation || echo "(exited $?)"
+          else
+            echo "(target/debug/vitrind not built at this point in the job)"
+          fi
+          exit 0
+
+      - name: Grant unprivileged user namespaces, and say what that costs
+        # The step above measures a stock `ubuntu-latest`, and the measurement
+        # is: `apparmor_restrict_unprivileged_userns=1`, so the unshare is
+        # permitted, the capabilities it should confer are stripped, and the
+        # first mount inside the namespace answers EACCES. `vitrind` therefore
+        # refuses to start -- correctly, with a remedy naming this sysctl.
+        #
+        # Taking that remedy is what lets this job exercise the confinement
+        # path at all. The alternative, `--isolation=off`, would keep the suite
+        # green while testing an unconfined session, which is the one outcome
+        # worth less than a red check.
+        #
+        # What it costs, said here because a sysctl in CI is exactly the kind
+        # of thing that quietly becomes a lie: **after this step, this runner
+        # is no longer a stock Ubuntu 24.04 machine.** Nothing downstream of it
+        # may be cited as evidence about how vitrind behaves on a default
+        # desktop install, and in particular issue #281's multi-kernel matrix
+        # must be collected from the diagnostic step ABOVE this one, never
+        # below it. The ordering is the whole point: the log carries the
+        # untouched machine first and the modified one second.
+        if: hashFiles('tests/integration/run.sh') != ''
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          echo "=== vitrind --print-isolation, on the machine as now modified ==="
+          if [ -x target/debug/vitrind ]; then
+            target/debug/vitrind --print-isolation || echo "(exited $?)"
+          fi
 
       - name: Run headless integration suite
         if: hashFiles('tests/integration/run.sh') != ''

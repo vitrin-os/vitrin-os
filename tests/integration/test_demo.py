@@ -129,10 +129,13 @@ import unittest
 
 from harness import (
     IntegrationTest,
+    await_shims,
     capture_when_ready,
     children_of,
     comm_of,
     descendant_named,
+    exe_identity,
+    file_identity,
     require_binaries,
     whole_realm_grant,
 )
@@ -287,21 +290,27 @@ class _RealChainTest(IntegrationTest):
         grandchild of the core, parented by the shim -- proving the core
         never execs the app directly.
         """
-        deadline = time.monotonic() + 15.0
-        shim_pid = None
-        while time.monotonic() < deadline:
-            kids = children_of(core.pid)
-            if kids:
-                shim_pid = kids[0]
-                break
-            time.sleep(0.05)
+        # `shims_of`, not `children_of`: at --isolation=default (the
+        # default since P2.6.2, #186) the core's direct child is the
+        # `vitrin-realm-init` supervisor and the shim is ITS child, so a
+        # direct-children walk finds no shim at all.
+        found = await_shims(core.pid, timeout=15.0)
+        shim_pid = found[0] if found else None
         self.assertIsNotNone(
             shim_pid, f"the core forked no shim; children were {children_of(core.pid)}"
         )
-        self.assertTrue(
-            comm_of(shim_pid).startswith("vitrin-shim"),
-            f"the core's child must be the real C shim, not {comm_of(shim_pid)!r} -- "
-            "vitrin-mock-shim must appear in no demo venue (issue #110)",
+        # The mock-freeness check, by INODE rather than by name. A confined
+        # shim is bound at `/vitrin/shim`, so its `comm` is `shim` whichever
+        # binary it is (P2.6.2, #186) and a name test stopped telling the real
+        # shim from `vitrin-mock-shim`. The running image's inode does, and
+        # more sharply: a name says what a program is called, an inode says
+        # which file is executing.
+        self.assertEqual(
+            exe_identity(shim_pid),
+            file_identity(self.shim_bin),
+            f"the realm's shim (pid {shim_pid}, comm {comm_of(shim_pid)!r}) is not "
+            f"the C shim this gate named ({self.shim_bin}) -- vitrin-mock-shim must "
+            "appear nowhere in this path",
         )
         app_pid = descendant_named(core.pid, APP_NAME, timeout=15.0)
         self.assertIsNotNone(
@@ -344,10 +353,12 @@ class DemoHeadless(_RealChainTest):
         core = self.real_core()
         shim_pid, app_pid = self._spine(core)
         self.assertEqual(
-            {comm_of(core.pid), comm_of(shim_pid), comm_of(app_pid)},
-            {"vitrind", "vitrin-shim", APP_NAME},
-            "the demo's process spine must be exactly vitrind -> vitrin-shim -> "
-            f"{APP_NAME}, with vitrin-mock-shim nowhere on it (issue #110)",
+            (comm_of(core.pid), exe_identity(shim_pid), comm_of(app_pid)),
+            ("vitrind", file_identity(self.shim_bin), APP_NAME),
+            "the demo's process spine must be exactly vitrind -> the real C shim -> "
+            f"{APP_NAME}, with vitrin-mock-shim nowhere on it (issue #110). The shim is "
+            "matched by the executing file's inode: a confined shim runs from the bind "
+            "target /vitrin/shim and answers the same comm as the mock (P2.6.2, #186)",
         )
 
         out_dir = self.work / "frames"
@@ -410,7 +421,10 @@ class DemoHeadless(_RealChainTest):
         # --- 3) OUT-OF-BAND, BYTE-EXACT GROUND TRUTH ------------------------
         # The app's own report of what it received, independent of pixels.
         core.terminate()
-        out = core.output()
+        # A confined realm writes to its own log rather than inheriting the
+        # core's descriptors (P2.6.2, #186), so the app's SUBMIT line is no
+        # longer in `core.output()`.
+        out = core.app_output()
         submit_line = next(
             (ln for ln in out.splitlines() if ln.startswith("SUBMIT ")), None
         )
@@ -637,7 +651,10 @@ class DemoHeadlessHoldEsc(_RealChainTest):
 
         # 5. The app never saw the revoked submit: it printed no SUBMIT line,
         #    because the click that would have produced one was refused.
-        out = core.output()
+        # A confined realm writes to its own log rather than inheriting the
+        # core's descriptors (P2.6.2, #186), so the app's SUBMIT line is no
+        # longer in `core.output()`.
+        out = core.app_output()
         self.assertNotIn(
             "SUBMIT ", out,
             f"{APP_NAME} reported a submission after the chord fired; the refused click "

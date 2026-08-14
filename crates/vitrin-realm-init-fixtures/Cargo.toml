@@ -1,0 +1,31 @@
+[package]
+name = "vitrin-realm-init-fixtures"
+version = "0.1.0"
+edition.workspace = true
+# Stated explicitly, never inherited: the workspace-wide `license` key was
+# deliberately deleted (root `Cargo.toml`, D-005 / issue #133). These are
+# conformance instruments -- the same class as `crates/vitrin-mock-shim` and
+# `crates/vitrin-golden` -- so they take the permissive half, not the TCB's.
+# The root NOTICE carries the same statement and is the normative map.
+license = "Apache-2.0"
+rust-version.workspace = true
+description = "Deliberately broken vitrin-realm-init substitutes. Each one defeats exactly one of the core's confinement checkpoints, so a test can prove that checkpoint fires. Never installed, never shipped."
+publish = false
+
+# Two binaries, one job each. Neither is a *variant* of the real helper: they
+# are the smallest programs that get far enough into the handshake to reach
+# the checkpoint they are aimed at, and no further.
+[[bin]]
+name = "unshare-only-init"
+path = "src/bin/unshare-only-init.rs"
+
+[[bin]]
+name = "leaks-a-dirfd-init"
+path = "src/bin/leaks-a-dirfd-init.rs"
+
+[dependencies]
+# The **shared** frame vocabulary, never a hand-transcribed second copy: a
+# fixture that spoke its own dialect would drift from the protocol it is
+# supposed to be probing, and the divergence would read as a passing test.
+vitrin-realm-init = { path = "../vitrin-realm-init" }
+libc = "0.2"

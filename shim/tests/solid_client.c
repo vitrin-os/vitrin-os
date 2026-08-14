@@ -30,10 +30,43 @@
  * they speak to the shim; the only thing new here is "paint one colour".
  *
  *   CLIENT colour=RRGGBB size=WxH   printed on exit
+ *
+ * THE CONFINEMENT PROBE (--probe / --probe-out), added by P2.6.2 (issue #186).
+ * Opt-in and inert without the flags, so every gate that already runs this app
+ * is unchanged. With them, the client `open()`s each named path BEFORE it
+ * touches Wayland and writes what the kernel said into a report file.
+ *
+ * Why it lives here rather than in a fourth Wayland client: the *Wayland*
+ * behaviour a confinement gate needs is exactly this file's -- attach, paint
+ * one colour, stay alive -- and the repo already carries three copies of that
+ * boilerplate whose only stated justification is that they speak to the shim
+ * DIFFERENTLY. A fourth copy differing in nothing would be the drift those
+ * files' headers warn about. What is new is twelve lines of `open` + `fstat`.
+ *
+ * Why it reports (st_dev, st_ino) and not just success: "the canary is
+ * absent" and "a same-named empty stub is present" are different facts, and
+ * the mount table *creates* stubs -- `vitrin-realm-init` binds the app's own
+ * directory at its host path, which `mkdir -p`s every ancestor onto the
+ * realm's root tmpfs, so `$HOME` itself exists inside the realm as an empty
+ * directory. Only inode identity separates "reachable" from "same name".
+ * `crates/vitrin-core/src/spawn.rs`'s parent-side canary check learned this
+ * the hard way and says so in its own comment.
+ *
+ * Why BEFORE the Wayland connection: so a report exists even when the
+ * compositor never comes up, which is what stops "the probe never ran" from
+ * being indistinguishable from "the probe ran and found nothing".
+ *
+ *   PROBE-VERSION 1
+ *   PROBE-GROUPS n=<count> gids=<g,g,...>
+ *   PROBE path=<abs> open=<ok|fail> errno=<n> dev=<u> ino=<u>   (one per --probe)
+ *   PROBE-END
  */
 #define _GNU_SOURCE
 
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -41,6 +74,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -49,6 +84,11 @@
 #include "xdg-shell-client-protocol.h"
 
 #define BUFFER_COUNT 2
+
+/* Enough for every path a gate has reason to probe in one run; a request for
+ * more is refused rather than silently truncated, because a probe list that
+ * quietly lost an entry would read as an absence that was never tested. */
+#define MAX_PROBES 8
 
 /* Default colour: pure blue. Each channel is a multiple of 0x11 (00, 00, ff),
  * so the capture's top-nibble dominant-colour histogram reads it back exactly
@@ -286,9 +326,106 @@ static bool parse_colour(const char *s, uint32_t *out) {
 	return true;
 }
 
+/* One line of the confinement report for `path`, appended to `out`.
+ *
+ * `O_RDONLY` on a directory is legal and is what makes one probe verb serve
+ * both a canary FILE in $HOME and a canary DIRECTORY like /dev/input. The
+ * `fstat` is on the descriptor the `open` returned, never a second lookup by
+ * name -- so what is reported is the identity of the object this process
+ * actually opened. `O_NOCTTY` because one of the interesting probes is a tty
+ * device and a client that acquired a controlling terminal by probing for one
+ * would be reporting on a state it created. */
+static void probe_one(FILE *out, const char *path) {
+	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOCTTY);
+	if (fd < 0) {
+		fprintf(out, "PROBE path=%s open=fail errno=%d dev=0 ino=0\n", path, errno);
+		return;
+	}
+	struct stat st;
+	if (fstat(fd, &st) != 0) {
+		int e = errno;
+		close(fd);
+		/* Opened but not stattable: reported as its own outcome rather than
+		 * folded into either side, because a reader must not take it for
+		 * "unreachable". */
+		fprintf(out, "PROBE path=%s open=nostat errno=%d dev=0 ino=0\n", path, e);
+		return;
+	}
+	close(fd);
+	fprintf(out, "PROBE path=%s open=ok errno=0 dev=%" PRIu64 " ino=%" PRIu64 "\n", path,
+			(uint64_t)st.st_dev, (uint64_t)st.st_ino);
+}
+
+/* Write the whole report, and return false if anything about writing it
+ * failed. A probe whose report never landed must not be mistaken for a probe
+ * that ran, so the caller exits non-zero. */
+static bool write_probe_report(const char *out_name, char *const *paths, int count) {
+	char resolved[4096];
+	if (out_name[0] == '/') {
+		if ((size_t)snprintf(resolved, sizeof(resolved), "%s", out_name) >= sizeof(resolved)) {
+			fprintf(stderr, "--probe-out path too long\n");
+			return false;
+		}
+	} else {
+		/* Relative names resolve against XDG_RUNTIME_DIR, which is the realm's
+		 * own directory at both isolation settings and is bound read-WRITE
+		 * into a confined realm. That is what lets one argv, byte for byte,
+		 * serve a `--isolation=default` run and an `--isolation=off` run: the
+		 * variable's VALUE differs (`/run/vitrin` vs the host path) and the
+		 * host file it lands in is the same one either way. */
+		const char *dir = getenv("XDG_RUNTIME_DIR");
+		if (dir == NULL || dir[0] == '\0') {
+			fprintf(stderr, "--probe-out is relative and XDG_RUNTIME_DIR is unset\n");
+			return false;
+		}
+		if ((size_t)snprintf(resolved, sizeof(resolved), "%s/%s", dir, out_name) >=
+				sizeof(resolved)) {
+			fprintf(stderr, "--probe-out path too long\n");
+			return false;
+		}
+	}
+	int fd = open(resolved, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		fprintf(stderr, "cannot write the probe report %s: %s\n", resolved, strerror(errno));
+		return false;
+	}
+	FILE *out = fdopen(fd, "w");
+	if (out == NULL) {
+		close(fd);
+		return false;
+	}
+	fprintf(out, "PROBE-VERSION 1\n");
+	/* The supplementary groups this process still holds. D-037(5): they cannot
+	 * be dropped -- `setgroups=deny` blocks the CALL and drops nothing -- so
+	 * the realm keeps `video`, `render`, `input` and the rest as kgids, and
+	 * the mount table is the only thing between it and the devices they open.
+	 * Reported from inside so that residual is measured at the app rather than
+	 * described in a document. */
+	gid_t gids[NGROUPS_MAX];
+	int n = getgroups(NGROUPS_MAX, gids);
+	fprintf(out, "PROBE-GROUPS n=%d gids=", n);
+	for (int i = 0; i < n; i++) {
+		fprintf(out, "%s%u", i ? "," : "", (unsigned)gids[i]);
+	}
+	fprintf(out, "\n");
+	for (int i = 0; i < count; i++) {
+		probe_one(out, paths[i]);
+	}
+	/* Last, so a truncated report is detectable rather than readable. */
+	fprintf(out, "PROBE-END\n");
+	if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
+		fclose(out);
+		return false;
+	}
+	return fclose(out) == 0;
+}
+
 int main(int argc, char **argv) {
 	int run_ms = 3000;
 	uint32_t rgb = DEFAULT_COLOUR;
+	char *probes[MAX_PROBES];
+	int probe_count = 0;
+	const char *probe_out = NULL;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--run-ms") == 0 && i + 1 < argc) {
 			run_ms = atoi(argv[++i]);
@@ -298,10 +435,32 @@ int main(int argc, char **argv) {
 				fprintf(stderr, "bad colour '%s' (expected six hex digits, e.g. 0000ff)\n", argv[i]);
 				return 2;
 			}
+		} else if (strcmp(argv[i], "--probe") == 0 && i + 1 < argc) {
+			if (probe_count == MAX_PROBES) {
+				fprintf(stderr, "at most %d --probe paths\n", MAX_PROBES);
+				return 2;
+			}
+			probes[probe_count++] = argv[++i];
+		} else if (strcmp(argv[i], "--probe-out") == 0 && i + 1 < argc) {
+			probe_out = argv[++i];
 		} else {
-			fprintf(stderr, "usage: %s [--run-ms MS] [--colour RRGGBB]\n", argv[0]);
+			fprintf(stderr,
+					"usage: %s [--run-ms MS] [--colour RRGGBB] "
+					"[--probe PATH]... [--probe-out FILE]\n",
+					argv[0]);
 			return 2;
 		}
+	}
+	if ((probe_count > 0) != (probe_out != NULL)) {
+		/* Refused rather than defaulted: a `--probe` with nowhere to report is
+		 * a gate that would read an absent file as an absent canary, and a
+		 * `--probe-out` with nothing to probe writes a report whose emptiness
+		 * means nothing. */
+		fprintf(stderr, "--probe and --probe-out are used together or not at all\n");
+		return 2;
+	}
+	if (probe_count > 0 && !write_probe_report(probe_out, probes, probe_count)) {
+		return 3;
 	}
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);

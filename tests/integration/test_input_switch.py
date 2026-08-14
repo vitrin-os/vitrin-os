@@ -73,6 +73,7 @@ from harness import (  # noqa: E402
     comm_of,
     dominant_colour,
     locate_colour,
+    shims_of,
     whole_realm_grant,
 )
 
@@ -154,7 +155,7 @@ class RealInputSwitch(IntegrationTest):
         deadline = time.monotonic() + 25.0
         shims: list[int] = []
         while time.monotonic() < deadline:
-            shims = [p for p in children_of(core.pid) if comm_of(p).startswith("vitrin-shim")]
+            shims = shims_of(core.pid)
             if len(shims) >= 2:
                 break
             time.sleep(0.05)
@@ -308,7 +309,7 @@ class RealInputSwitch(IntegrationTest):
         )
 
         core.terminate()
-        out = core.output()
+        out = core.all_app_output()
         hits = [ln for ln in out.splitlines() if ln.startswith("HIT ")]
         self.assertEqual(
             len(hits),

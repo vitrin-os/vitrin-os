@@ -96,6 +96,22 @@ name: CI
 #                 a real hostile peer against a live vitrind, auto-picked
 #                 up by run.sh's `test_*.py` discovery with no extra
 #                 wiring here.
+#   apparmor-profile
+#                 the ONLY job here that runs on a runner it does not
+#                 modify (issue #286). Every other job that needs a user
+#                 namespace takes the
+#                 `kernel.apparmor_restrict_unprivileged_userns=0` sysctl
+#                 vitrind's own preflight prints; this one refuses to start
+#                 unless that knob still reads 1, then installs
+#                 packaging/apparmor/vitrind, loads it, spawns a real realm,
+#                 runs the real-app confinement gate under it, and finally
+#                 REMOVES the profile and requires the spawn to fail again.
+#                 That last half is the whole job: without it, every green
+#                 result is equally explained by a runner whose policy
+#                 drifted. The profile has never been loaded by anyone who
+#                 wrote it, so this job is the deliverable and the profile is
+#                 what it measures -- do not read a green check here as
+#                 anything broader than one runner, one kernel, one image.
 #   fuzz-smoke    P1.9.3 (#46)'s other half: short cargo-fuzz (libFuzzer)
 #                 runs of fuzz/'s two targets (vitrin-protocol decode,
 #                 vitrin-ipc framing) on every PR, seeded from the
@@ -368,7 +384,7 @@ jobs:
         # test here; what a second itemised census would add is a block
         # readers learn to scroll past.
         #
-        # The FOUR steps in this workflow that DO name a filter each carry
+        # The FIVE steps in this workflow that DO name a filter each carry
         # their own floor, because for them "matched nothing" and "passed"
         # print the same exit code:
         #
@@ -382,7 +398,10 @@ jobs:
         #     asserts `Ran N tests` with N >= 1 in the shell -- there is no
         #     `--min-tests` for unittest, and an earlier version of this list
         #     said "three steps" because that fourth one was missed, which is
-        #     the same class of miscount as everything else on this page.
+        #     the same class of miscount as everything else on this page;
+        #   * `apparmor-profile`'s real-app confinement gate, which filters
+        #     `unittest discover` to `test_real_confinement.py` and asserts
+        #     `Ran N` with N >= 1 the same way, for the same reason.
         #
         # The `vitrin-ipc` and `session-keymap` slices below name no filter
         # and are unbounded for the same reason this step is.
@@ -1758,6 +1777,674 @@ jobs:
             echo "vacuous for now. Do not add it to branch protection until it activates."
             echo "Entry-point contract: \`tests/integration/README.md\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # =====================================================================
+  # The AppArmor profile job (issue #286).
+  #
+  # THIS JOB IS THE DELIVERABLE; packaging/apparmor/vitrind is the thing it
+  # measures. The profile was written on a machine with AppArmor compiled out
+  # (`/sys/module/apparmor/parameters/enabled` = N), so it has never been
+  # parsed, loaded, attached or observed by anyone who wrote it. Nothing in
+  # this repository other than this job can say whether it works.
+  #
+  # WHAT MAKES IT DIFFERENT FROM EVERY OTHER JOB HERE, and the one rule that
+  # must survive every future edit: **it does not touch
+  # `kernel.apparmor_restrict_unprivileged_userns`.** The `rust` job's "Grant
+  # unprivileged user namespaces" step and the `integration` job's step of the
+  # same name both set it to 0, because
+  # otherwise their suites could not exercise confinement at all. That is the
+  # right trade there and the wrong one here: this job's entire value is being
+  # the one place in this workflow that runs on a machine CI has not modified.
+  # A future edit that adds the sysctl to this job does not weaken it, it
+  # DELETES it -- every result below would then be measured on the same
+  # already-granting machine the other two jobs measure, and the profile would
+  # be unexercised while this job stayed green. The precondition step is
+  # written to make that edit fail loudly rather than pass quietly.
+  #
+  # DESIGN RULE: exactly THREE steps may fail the job -- the precondition, the
+  # real-app gate, and the final verdict. Everything between them runs under
+  # `set +e` and exits 0 no matter what it finds, so one run yields every
+  # answer instead of dying at the first surprise. That would ordinarily be a
+  # silent-no-op hazard (issue #288), so it is closed the other way round: each
+  # step appends `RESULT <key>=<value>` to a file, and the verdict step FAILS
+  # if any expected key is missing. A step that quietly did nothing is
+  # therefore a red job, not a green one.
+  # =====================================================================
+  apparmor-profile:
+    name: apparmor profile (stock ubuntu-latest -- NO sysctl)
+    runs-on: ubuntu-latest
+    # Wider than the integration job's suite budget because this job builds
+    # the workspace AND the wlroots subproject cold on its first run, and then
+    # boots a core repeatedly: a baseline spawn, a profiled spawn, the
+    # real-app gate's own two, and the lever's two.
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "PRECONDITION: this runner must still restrict unprivileged userns"
+        # The first of the three steps allowed to fail, and it fails BEFORE
+        # anything is built, because everything after it is worthless if this
+        # is not true.
+        #
+        # `kernel.apparmor_restrict_unprivileged_userns=1` is the state issue
+        # #286 measured on a stock `ubuntu-latest` on 2026-08-14, and it is the
+        # state the profile exists to work under. If it reads 0 or is absent,
+        # this runner grants unprivileged user namespaces to everyone and every
+        # later step here would pass whether the profile did anything or not --
+        # a green job proving nothing, which is the exact shape this repository
+        # has been bitten by three times (#229, #186, #288). So it is a hard
+        # failure and not a skip: a skip would be indistinguishable, in this
+        # job's check mark, from a run that measured the profile working.
+        #
+        # Two ways it can go red, and the error text separates them, because
+        # the remedies are opposite: a runner image that stopped shipping the
+        # restriction is news about Ubuntu and means this job (and #286) need
+        # re-deriving; a step added above this one that flipped the sysctl is a
+        # bug in this file.
+        run: |
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          value="$(cat "$knob" 2>/dev/null || echo '<absent>')"
+          echo "$knob = $value"
+          if [ "$value" != "1" ]; then
+            echo "::error title=this job measured nothing::${knob} reads '${value}', not '1'. This job exists to run on a STOCK ubuntu-latest, where that knob is 1 and vitrind therefore cannot start without an AppArmor profile (issue #286). At any other value this runner already grants unprivileged user namespaces, so loading packaging/apparmor/vitrind would change nothing and every step below would pass without the profile doing any work. Either (a) some step in THIS job now sets the sysctl -- delete it, the rust and integration jobs are where that belongs -- or (b) the runner image genuinely stopped restricting, which is news: re-measure, and re-derive issue #286 and every sentence in docs/book/src/limits.md that rests on it."
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}"
+          printf 'RESULT precondition_sysctl=%s\n' "$value" >> "${RUNNER_TEMP}/apparmor-results"
+
+      - name: "Record the unmodified machine (never fails)"
+        # #281's multi-kernel matrix wants a row from every kernel CI touches,
+        # and this is the only row collected from a runner nothing has
+        # modified -- the integration job's equivalent step is also
+        # pre-sysctl, but this one has no sysctl anywhere after it at all.
+        #
+        # It also answers a question the research for #286 could not: whether
+        # `apparmor_parser` is even present on a stock image. The runner-images
+        # package manifest does not enumerate base-system packages, so this is
+        # MEASURED here rather than assumed.
+        #
+        # If it is missing the job installs it -- and the install is NOT a
+        # userspace-only change, which an earlier version of this comment
+        # claimed. Installing the `apparmor` package runs its maintainer
+        # scripts and its systemd unit, and those load every profile under
+        # /etc/apparmor.d into the KERNEL. On Ubuntu that set includes
+        # `unprivileged_userns`, which is directly relevant to what this job
+        # measures. So the honest statement is: after an install, this runner
+        # carries kernel policy it did not boot with.
+        #
+        # Two things keep that from silently invalidating the job rather than
+        # merely being disclosed. The sysctl this job's entire claim rests on
+        # is RE-READ after the install and the job dies if it moved, and the
+        # unprofiled repro is re-run so the log carries a post-install control
+        # as well as a pre-install one. `parser_present` records which path
+        # was taken, and the VERDICT step reads it -- a run on an image that
+        # already had the parser is a stronger result than one that did not,
+        # and the two must not be indistinguishable in the summary.
+        run: |
+          set +e
+          results="${RUNNER_TEMP}/apparmor-results"
+          echo "=== kernel and image ==="
+          uname -srvm
+          cat /etc/os-release
+          echo "=== the four knobs (the fourth sizes what the profile COSTS) ==="
+          for k in /proc/sys/user/max_user_namespaces \
+                   /proc/sys/kernel/unprivileged_userns_clone \
+                   /proc/sys/kernel/apparmor_restrict_unprivileged_userns \
+                   /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined; do
+            printf '%s = %s\n' "$k" "$(cat "$k" 2>/dev/null || echo '<absent>')"
+          done
+          printf 'RESULT unconfined_knob=%s\n' \
+            "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined 2>/dev/null || echo absent)" \
+            >> "$results"
+          echo "=== AppArmor, as the kernel reports it ==="
+          module="$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo '<absent>')"
+          printf 'module enabled  = %s\n' "$module"
+          printf 'this shell      = %s\n' \
+            "$(cat /proc/self/attr/apparmor/current 2>/dev/null \
+               || cat /proc/self/attr/current 2>/dev/null || echo '<absent>')"
+          printf 'RESULT apparmor_module=%s\n' "$module" >> "$results"
+          echo "--- securityfs feature set (does this kernel know the userns rule class?) ---"
+          ls /sys/kernel/security/apparmor/features/ 2>&1
+          cat /sys/kernel/security/apparmor/features/policy/versions 2>&1
+          ls /sys/kernel/security/apparmor/features/policy/ 2>&1
+          echo "=== userspace tooling ==="
+          command -v apparmor_parser aa-status aa-exec
+          if command -v apparmor_parser >/dev/null 2>&1; then
+            printf 'RESULT parser_present=stock\n' >> "$results"
+          else
+            echo "::warning title=image modified::apparmor_parser is NOT on the stock image; installing the apparmor package. This LOADS KERNEL POLICY -- the package's maintainer scripts and unit load every profile under /etc/apparmor.d, which on Ubuntu includes unprivileged_userns. Everything measured after this point is measured on a runner carrying policy it did not boot with. The sysctl this job rests on is re-read below and the job dies if it moved."
+            sudo apt-get update -qq && sudo apt-get install -y -qq apparmor
+            if command -v apparmor_parser >/dev/null 2>&1; then
+              printf 'RESULT parser_present=installed\n' >> "$results"
+            else
+              printf 'RESULT parser_present=no\n' >> "$results"
+            fi
+          fi
+          apparmor_parser --version 2>&1
+          echo "=== what policy is already loaded (BEFORE this job loads anything) ==="
+          # Two things are being looked for: a profile already named `vitrind`
+          # (a name collision would make the load below ambiguous), and any
+          # loaded profile whose attachment could catch the shim or the app and
+          # turn their execve into a denied no_new_privs transition.
+          sudo aa-status 2>&1 | head -80
+          echo "=== the minimal repro, unprofiled ==="
+          unshare --user --map-root-user --mount true \
+            && echo "unshare(CLONE_NEWUSER|CLONE_NEWNS): OK" \
+            || echo "unshare(CLONE_NEWUSER|CLONE_NEWNS): FAILED rc=$?"
+          unshare --user --map-root-user --mount \
+            sh -c 'mount --make-rprivate / && echo "mount MS_REC|MS_PRIVATE /: OK"' \
+            || echo "mount MS_REC|MS_PRIVATE /: FAILED rc=$?"
+          # ---- the premise, re-measured after anything this step did -------
+          #
+          # The precondition step read this knob BEFORE the branch above could
+          # install a package that loads kernel policy. Re-read it here so the
+          # claim "this job ran on a machine that still restricts unprivileged
+          # user namespaces" is measured at the point it starts mattering,
+          # rather than inherited from a reading taken before the only step
+          # that could have invalidated it.
+          #
+          # Recorded on BOTH paths, not just the install path, so the VERDICT
+          # can require the key: a value that only exists sometimes cannot be
+          # used to catch a step that silently did nothing. On the stock path
+          # it is simply the same reading twice, which is the cheapest possible
+          # way to make the pair comparable in the summary table.
+          #
+          # This is a hard exit inside an otherwise never-fails step, and that
+          # exception is deliberate: every other failure here costs the run one
+          # answer, whereas this one makes every answer below meaningless.
+          after="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo '<absent>')"
+          printf 'RESULT sysctl_after_setup=%s\n' "$after" >> "$results"
+          if [ "$after" != "1" ]; then
+            echo "::error title=the premise changed inside this step::kernel.apparmor_restrict_unprivileged_userns read 1 at the precondition and reads '${after}' now. The only thing this step does that could move it is installing the apparmor package, whose maintainer scripts and unit load every profile under /etc/apparmor.d into the kernel. This runner now grants unprivileged user namespaces, so every step below would pass without the profile doing any work. Do not weaken this check: the remedy is a runner image that already ships apparmor_parser, or a job that stops installing it."
+            exit 1
+          fi
+          exit 0
+
+      - name: Install Rust (pinned toolchain + components from rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Same reasoning as the integration job: a red first run must still
+          # bank the build, or every retry is equally cold.
+          cache-on-failure: true
+
+      - name: Install native build deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxkbcommon-dev libpixman-1-dev
+
+      - name: Install Meson + wlroots subproject build dependencies
+        # Same script, from the same file, as `conformance`, `shim` and
+        # `integration`, so no fourth build of the shim can drift in its
+        # dependency set.
+        run: sudo bash shim/ci/install-deps.sh
+
+      - name: Warm build (workspace)
+        # The feature list is copied from the `integration` job deliberately,
+        # and for exactly one reason:
+        # `tests/integration/test_real_confinement.py` runs in both jobs and a
+        # difference in features would mean the two runs measured two
+        # different binaries while reporting the same gate's name.
+        #
+        # It does NOT make the two jobs share a cache entry, which an earlier
+        # version of this comment claimed. `Swatinem/rust-cache` puts the job
+        # name in its key unless a `shared-key` is set, and neither job sets
+        # one, so this job has its own entry and pays its own cold first
+        # build. That is left as it is rather than "fixed": a shared key
+        # couples two jobs' cache lifetimes, and the compile cost is paid once
+        # per key, not per run.
+        run: cargo build --workspace --features vitrin-core/dead-man-injector,vitrin-core/consent-injector,vitrin-core/physical-input-injector
+
+      - name: Build the C shim
+        run: |
+          meson setup "${RUNNER_TEMP}/shim-build" shim
+          meson compile -C "${RUNNER_TEMP}/shim-build"
+
+      - name: "Install vitrind and its helper where the profile attaches"
+        # AppArmor attaches to a binary's RESOLVED ABSOLUTE PATHNAME, so a
+        # profile written for an installed vitrind cannot be exercised against
+        # `target/debug/vitrind`. Three ways to close that gap were available
+        # and two are refused:
+        #
+        #  * glob the build tree in the profile -- makes the profile a CI-only
+        #    template, so the run would measure a construct rather than the
+        #    shipped artefact, and Chromium's own documentation warns that a
+        #    build-directory glob lets anyone who can write an executable of
+        #    the right name there borrow the grant;
+        #  * `aa-exec -p vitrind -- ./target/debug/vitrind` -- measures a
+        #    DIFFERENT entry path than production, and is itself the documented
+        #    bypass vector, so making it the tested path would normalise the
+        #    wrong thing.
+        #
+        # So: install the real binaries at the real path the shipped profile
+        # names. `install` COPIES; it must never become `ln -s`, because both
+        # AppArmor's attachment and vitrind's own `current_exe()` helper lookup
+        # resolve symlinks, and a symlink here would attach the profile to
+        # nothing at all with no symptom but the original EACCES. `readlink -f`
+        # below is what makes that a checked fact rather than a hope.
+        run: |
+          sudo install -d -m 0755 /usr/lib/vitrin
+          sudo install -m 0755 target/debug/vitrind target/debug/vitrin-realm-init /usr/lib/vitrin/
+          results="${RUNNER_TEMP}/apparmor-results"
+          real_core="$(readlink -f /usr/lib/vitrin/vitrind)"
+          real_helper="$(readlink -f /usr/lib/vitrin/vitrin-realm-init)"
+          echo "vitrind          -> $real_core"
+          echo "vitrin-realm-init -> $real_helper"
+          ls -l /usr/lib/vitrin/
+          if [ "$real_core" = "/usr/lib/vitrin/vitrind" ] \
+             && [ "$real_helper" = "/usr/lib/vitrin/vitrin-realm-init" ]; then
+            printf 'RESULT install_real=yes\n' >> "$results"
+          else
+            echo "::warning::/usr/lib/vitrin holds symlinks, not files. The profile will attach to nothing."
+            printf 'RESULT install_real=no\n' >> "$results"
+          fi
+
+      - name: "BASELINE: the machine before any profile exists (never fails)"
+        # The control the whole job rests on. A later success means nothing
+        # without this: if the runner already granted the namespace, every
+        # measurement after the load would look like the profile working.
+        #
+        # `apparmor.label` is read as well as the tier, and that row is why
+        # `crates/vitrin-core/src/spawn/isolation.rs` grew it. Three of this
+        # job's four possible outcomes produce `mount.in_userns=
+        # restricted-by-policy(errno=13)`; only the label separates "no profile
+        # attached" from "a profile attached and granted nothing".
+        run: |
+          set +e
+          results="${RUNNER_TEMP}/apparmor-results"
+          echo "=== /usr/lib/vitrin/vitrind --print-isolation, NO profile loaded ==="
+          out="$(/usr/lib/vitrin/vitrind --print-isolation 2>&1)"
+          echo "$out"
+          for key in tier apparmor.label mount.in_userns; do
+            value="$(printf '%s\n' "$out" | sed -n "s/^${key}=//p" | tail -1)"
+            printf 'RESULT baseline_%s=%s\n' \
+              "$(printf '%s' "$key" | tr '.' '_')" "${value:-<unread>}" >> "$results"
+          done
+          exit 0
+
+      - name: "BASELINE: a realm spawn, before any profile exists (never fails)"
+        # The core's own preflight refusing is NOT the claim this job is about.
+        # The claim is that a REALM spawns, and the process that issues the
+        # `unshare` is `vitrin-realm-init`, which vitrind reaches by execve --
+        # so only a real spawn can answer whether a grant survives that exec.
+        #
+        # Expected here: `refusal`, with issue #286's signature. If this
+        # reports `spawned-anyway`, the precondition step's assumption is false
+        # in some way the sysctl did not reveal and the verdict step says so.
+        env:
+          VITRIN_CORE_BIN: /usr/lib/vitrin/vitrind
+        run: |
+          set +e
+          results="${RUNNER_TEMP}/apparmor-results"
+          PYTHONPATH="$PWD/sdk/python/src" VITRIN_REPO="$PWD" \
+            python3 tests/integration/apparmor-realm-probe.py --expect refusal
+          rc=$?
+          printf 'RESULT baseline_spawn=%s\n' \
+            "$([ "$rc" -eq 0 ] && echo refused-as-expected || echo unexpected)" >> "$results"
+          exit 0
+
+      - name: "Does the profile COMPILE? (parser only, kernel untouched)"
+        # `-Q/--skip-kernel-load` performs every action except loading, which
+        # separates two failures that otherwise look the same from the outside:
+        # "this is not valid policy for this parser" and "the kernel refused
+        # the compiled policy". They have different remedies and the first one
+        # is entirely the profile author's fault.
+        run: |
+          set +e
+          results="${RUNNER_TEMP}/apparmor-results"
+          sudo install -m 0644 packaging/apparmor/vitrind /etc/apparmor.d/vitrind
+          echo "=== the profile as installed ==="
+          grep -v '^#' /etc/apparmor.d/vitrind | grep -v '^[[:space:]]*$'
+          echo "=== apparmor_parser -Q --warn=all ==="
+          sudo apparmor_parser -Q --warn=all -r /etc/apparmor.d/vitrind
+          rc=$?
+          printf 'RESULT compiles=%s\n' "$([ "$rc" -eq 0 ] && echo yes || echo no)" >> "$results"
+          exit 0
+
+      - name: "Does the profile LOAD? (never fails)"
+        # Two independent facts, because either can be true without the other:
+        # the parser's exit code, and the profile appearing in the KERNEL's own
+        # list. `apparmor_parser -r` replaces live policy; no reboot is
+        # involved, which is what Ubuntu's own instructions for its shipped
+        # bwrap profile do.
+        run: |
+          set +e
+          results="${RUNNER_TEMP}/apparmor-results"
+          sudo apparmor_parser -r /etc/apparmor.d/vitrind
+          rc=$?
+          echo "apparmor_parser -r exit=$rc"
+          echo "=== the kernel's own list ==="
+          sudo aa-status 2>&1 | grep -F vitrind
+          listed=$?
+          if [ "$rc" -eq 0 ] && [ "$listed" -eq 0 ]; then
+            printf 'RESULT loaded=yes\n' >> "$results"
+          else
+            printf 'RESULT loaded=no\n' >> "$results"
+          fi
+          exit 0
+
+      - name: "Did it ATTACH to vitrind? (never fails)"
+        # The step that separates "loaded but did not apply" from "applied".
+        # A label still reading `unconfined` means the attachment path in the
+        # profile does not match where the binary actually is; a label reading
+        # `vitrind` with the mount row still at errno=13 means it attached and
+        # granted nothing, which is the `unprivileged_userns` fallback
+        # signature and is byte-identical, in errno, to the baseline.
+        run: |
+          set +e
+          results="${RUNNER_TEMP}/apparmor-results"
+          echo "=== /usr/lib/vitrin/vitrind --print-isolation, profile LOADED ==="
+          out="$(/usr/lib/vitrin/vitrind --print-isolation 2>&1)"
+          echo "$out"
+          for key in tier apparmor.label mount.in_userns; do
+            value="$(printf '%s\n' "$out" | sed -n "s/^${key}=//p" | tail -1)"
+            printf 'RESULT profiled_%s=%s\n' \
+              "$(printf '%s' "$key" | tr '.' '_')" "${value:-<unread>}" >> "$results"
+          done
+          exit 0
+
+      - name: "Did the grant reach the HELPER? A real realm spawn (never fails)"
+        # THE CENTRAL QUESTION, and the reason this job exists rather than a
+        # step that just runs `--print-isolation` twice.
+        #
+        # `vitrind` forks (never execs) for its own preflight probe, so the
+        # preflight clearing proves only that vitrind's own label carries the
+        # grant. The six-flag `unshare` and the `MS_REC|MS_PRIVATE` remount
+        # that fails on an unprofiled Ubuntu host both happen in
+        # `vitrin-realm-init`, one execve away. If the grant does not survive
+        # that exec, this profile fixes the core's startup and NOT the realm's
+        # spawn -- which is worse than shipping nothing, because the refusal
+        # moves somewhere less legible.
+        #
+        # The probe prints the label of every process in the spine, so the log
+        # answers the exec-transition question directly rather than by
+        # inference.
+        env:
+          VITRIN_CORE_BIN: /usr/lib/vitrin/vitrind
+        run: |
+          set +e
+          results="${RUNNER_TEMP}/apparmor-results"
+          PYTHONPATH="$PWD/sdk/python/src" VITRIN_REPO="$PWD" \
+            python3 tests/integration/apparmor-realm-probe.py --expect spawn
+          rc=$?
+          printf 'RESULT spawn=%s\n' "$([ "$rc" -eq 0 ] && echo ok || echo failed)" >> "$results"
+          exit 0
+
+      - name: "The real-app confinement gate, under the profile"
+        # The second of the three steps allowed to fail. The step above proves
+        # a realm spawns; this proves a realm WORKS -- the real C shim, a real
+        # Wayland client that paints, and the canary assertions that make the
+        # confinement claim mean something. It is the repository's own
+        # mock-free confinement gate (issue #186), run for the first time
+        # against an installed vitrind under an AppArmor profile.
+        #
+        # BOUNDED TWICE, and the second bound is the one that matters. This is
+        # the FIFTH filtered step in this workflow; the list in the `rust`
+        # job's `cargo test --release` comment names them all.
+        #
+        #  1. `-p 'test_real_confinement.py'` is a NAME FILTER, and a filter
+        #     that matches nothing prints `Ran 0 tests` followed by `OK` and
+        #     exits 0. So the run is teed and `Ran N` is read back with N >= 1
+        #     required -- the shell's `--min-tests`, unittest having none.
+        #
+        #  2. **`Ran N` COUNTS SKIPPED TESTS**, which makes bound 1 alone the
+        #     re-creation of issue #229 in a new job. Every module in the
+        #     real-app ladder skips itself when `VITRIN_C_SHIM_BIN` is unset or
+        #     unusable; a skipped gate prints `Ran 1 test ... OK (skipped=1)`
+        #     and exits 0, which is byte-identical in everything this step
+        #     looked at to a gate that actually confined something. That is the
+        #     exact shape #229 and #288 each closed once, and a job that
+        #     re-opens it is worse than one that never had the check, because
+        #     the check reads like protection.
+        #
+        # So this step reproduces `tests/integration/run.sh`'s census posture
+        # rather than paraphrasing it -- it cannot CALL run.sh, which runs the
+        # whole suite, so it applies run.sh's three rules to a filtered run:
+        #
+        #   * ITEMISE every skip by name (run.sh: "skips are itemised rather
+        #     than counted"), so the log says what did not run;
+        #   * FAIL on the skip classes that are always a misconfiguration here
+        #     -- the shim variables. This job sets `VITRIN_C_SHIM_BIN` and
+        #     builds the shim itself, so a shim skip means the build step
+        #     broke, which is run.sh's `VITRIN_REQUIRE_REAL_APPS=1` rule;
+        #   * require at least one test to have EXECUTED, i.e. `ran - skipped
+        #     >= 1`. This is the generic form of the rule and it is what stops
+        #     a future skip class nobody anticipated from emptying the gate
+        #     silently.
+        #
+        # What it deliberately does NOT do is fail on every skip, for run.sh's
+        # stated reason: `test_real_confinement.py` legitimately skips its
+        # `/dev/input` assertion on a runner with no input devices, and that is
+        # an honest machine state rather than a misconfiguration. Turning it
+        # red would make the gate unrunnable on the only machine it runs on.
+        env:
+          VITRIN_CORE_BIN: /usr/lib/vitrin/vitrind
+          VITRIN_C_SHIM_BIN: ${{ runner.temp }}/shim-build/vitrin-shim
+        run: |
+          log="${RUNNER_TEMP}/confinement-under-profile.log"
+          results="${RUNNER_TEMP}/apparmor-results"
+          set +e
+          PYTHONPATH="$PWD/sdk/python/src" VITRIN_REPO="$PWD" \
+            python3 -m unittest discover -s tests/integration -p 'test_real_confinement.py' -v \
+            2>&1 | tee "$log"
+          status="${PIPESTATUS[0]}"
+          set -e
+
+          ran="$(sed -n 's/^Ran \([0-9][0-9]*\) test.*/\1/p' "$log" | tail -1)"
+          if [ -z "$ran" ] || [ "$ran" -lt 1 ]; then
+            printf 'RESULT realapp=collected-nothing\n' >> "$results"
+            echo "::error::the real-app confinement gate collected ${ran:-no} test(s). \`unittest discover -p 'test_real_confinement.py'\` is a NAME FILTER, and a filter that matches nothing exits 0 having proved nothing. Restore tests/integration/test_real_confinement.py under that name, or retire this step in the same commit."
+            exit 1
+          fi
+
+          # The census. `grep -c` exits 1 on zero matches, hence the `|| true`
+          # -- the same spelling run.sh uses, for the same reason.
+          skipped=$(grep -c '\.\.\. skipped' "$log" || true)
+          executed=$(( ran - skipped ))
+          # Recorded HERE, before any of the three gates below can exit, so the
+          # VERDICT step gets the number even on a red run. A required key that
+          # only exists on the happy path turns every real failure into a
+          # "missing key" verdict and buries the actual diagnosis.
+          printf 'RESULT realapp_executed=%s\n' "$executed" >> "$results"
+          if [ "$skipped" -ne 0 ]; then
+            echo "==> $skipped of $ran test(s) SKIPPED under the profile. This step did not exercise:"
+            grep '\.\.\. skipped' "$log" | sed 's/^/      /'
+          fi
+
+          # Matched on the gate's own two spellings rather than on the bare
+          # variable name, which also appears inside unrelated assertion
+          # messages: `'VITRIN_C_SHIM_BIN is unset'` is run.sh's own needle for
+          # the skip, and the second is the module's set-but-unusable failure.
+          shim_skips=$(grep -cE 'VITRIN_C_SHIM_BIN is unset|VITRIN_C_SHIM_BIN=.* does not name an executable' "$log" || true)
+          if [ "$shim_skips" -ne 0 ]; then
+            printf 'RESULT realapp=shim-skipped\n' >> "$results"
+            echo "::error::the real-app confinement gate skipped for want of a usable VITRIN_C_SHIM_BIN, and this job both sets that variable and builds the shim itself -- so the shim build step produced nothing at ${VITRIN_C_SHIM_BIN}. This is issue #229's exact shape: a green step, a gate that never ran, and an AppArmor profile with no real-app evidence behind it. Fix the shim build; do not relax this check."
+            exit 1
+          fi
+
+          if [ "$executed" -lt 1 ]; then
+            printf 'RESULT realapp=all-skipped\n' >> "$results"
+            echo "::error::the real-app confinement gate collected ${ran} test(s) and skipped all ${skipped} of them, so it EXECUTED nothing. \`Ran N\` counts skips, which is why N >= 1 is not on its own a bound. Read the itemised skip list above: whatever it names is what has to be provided on this runner before this step can be cited as evidence about the profile."
+            exit 1
+          fi
+
+          if [ "$status" -eq 0 ]; then
+            printf 'RESULT realapp=pass\n' >> "$results"
+          else
+            printf 'RESULT realapp=fail\n' >> "$results"
+          fi
+          echo "real-app confinement gate: ${ran} collected, ${skipped} skipped, ${executed} executed, exit ${status}"
+          exit "$status"
+
+      - name: "The kernel's own account of what it denied (never fails)"
+        # Runs unconditionally, pass or fail, because a denial record names the
+        # profile, the operation and the requested mask -- which is the fastest
+        # way to read any of the failures above, and useless if it is only
+        # collected when things went well.
+        if: always()
+        run: |
+          set +e
+          echo "=== dmesg ==="
+          sudo dmesg 2>&1 | grep -i apparmor | tail -60
+          echo "=== journalctl -k ==="
+          sudo journalctl -k --no-pager 2>&1 | grep -i 'apparmor=' | tail -60
+          echo "=== audit log, if there is one ==="
+          sudo cat /var/log/audit/audit.log 2>/dev/null | grep -i apparmor | tail -40
+          exit 0
+
+      - name: "THE LEVER: break it, confirm FAIL, restore"
+        # Non-vacuity, and the whole job is worth nothing without it. Every
+        # green result above is also what a runner whose policy had drifted
+        # would produce -- the profile is not the only thing on this machine
+        # that could be granting a user namespace, and a job that cannot tell
+        # those apart is a job that measured the runner rather than the
+        # profile.
+        #
+        # So: REMOVE the profile from the kernel, spawn again, and require the
+        # spawn to fail with issue #286's exact signature. Then put it back and
+        # require the spawn to work again. Two directions, because only the
+        # pair rules out "it was always going to spawn" and "it was never going
+        # to spawn".
+        #
+        # This is distinct from the BASELINE steps near the top, which measured
+        # the machine before the profile ever existed. That establishes what
+        # the untouched runner does; this establishes that the profile is what
+        # changed it. A run can pass the first and fail this one -- for
+        # instance if loading the profile permanently altered something else --
+        # and the two names in the summary keep that legible.
+        if: always()
+        env:
+          VITRIN_CORE_BIN: /usr/lib/vitrin/vitrind
+        run: |
+          set +e
+          results="${RUNNER_TEMP}/apparmor-results"
+          echo "=== removing the profile from the kernel ==="
+          sudo apparmor_parser -R /etc/apparmor.d/vitrind
+          echo "apparmor_parser -R exit=$?"
+          sudo aa-status 2>&1 | grep -F vitrind || echo "(no vitrind profile listed -- removed)"
+          PYTHONPATH="$PWD/sdk/python/src" VITRIN_REPO="$PWD" \
+            python3 tests/integration/apparmor-realm-probe.py --expect refusal
+          without=$?
+          printf 'RESULT lever_without=%s\n' \
+            "$([ "$without" -eq 0 ] && echo refused || echo still-spawned)" >> "$results"
+          echo "=== restoring the profile ==="
+          sudo apparmor_parser -r /etc/apparmor.d/vitrind
+          echo "apparmor_parser -r exit=$?"
+          PYTHONPATH="$PWD/sdk/python/src" VITRIN_REPO="$PWD" \
+            python3 tests/integration/apparmor-realm-probe.py --expect spawn
+          restored=$?
+          printf 'RESULT lever_restored=%s\n' \
+            "$([ "$restored" -eq 0 ] && echo ok || echo failed)" >> "$results"
+          exit 0
+
+      - name: "VERDICT"
+        # The last of the three steps allowed to fail, and the only one that
+        # reads the whole run. It does two things nothing else can:
+        #
+        #  1. It requires every expected RESULT key to be PRESENT. Every step
+        #     above exits 0 by construction, which would otherwise mean a step
+        #     that silently did nothing left the job green -- issue #288's
+        #     defect, rebuilt by accident. A missing key is a red job.
+        #  2. It prints the decision table, so a failing run names WHICH of the
+        #     four possible failures happened instead of leaving a reader to
+        #     reconstruct it from six step logs.
+        if: always()
+        run: |
+          set +e
+          results="${RUNNER_TEMP}/apparmor-results"
+          echo "=== every result this run recorded ==="
+          cat "$results" 2>/dev/null || echo "(no results file at all)"
+
+          get() { sed -n "s/^RESULT $1=//p" "$results" 2>/dev/null | tail -1; }
+          # `unconfined_knob` and `sysctl_after_setup` are in this list on
+          # purpose, and neither feeds the ladder below. The list is not "keys
+          # the verdict consults" -- it is "measurements this run promised to
+          # take", and the whole point of requiring them is that a step which
+          # exited 0 having recorded nothing must be red. A key the ladder
+          # ignores is exactly the key most likely to be quietly dropped.
+          # `unconfined_knob` in particular SIZES THE PUBLISHED SECURITY COST
+          # of this profile (docs/book/src/limits.md, SECURITY.md): if it stops
+          # being collected, the pages keep asserting a cost that CI no longer
+          # measures anywhere.
+          missing=""
+          for key in precondition_sysctl sysctl_after_setup unconfined_knob \
+                     apparmor_module parser_present install_real \
+                     baseline_tier baseline_apparmor_label baseline_mount_in_userns \
+                     baseline_spawn compiles loaded profiled_tier profiled_apparmor_label \
+                     profiled_mount_in_userns spawn realapp realapp_executed \
+                     lever_without lever_restored; do
+            [ -n "$(get "$key")" ] || missing="$missing $key"
+          done
+
+          {
+            echo "## AppArmor profile (issue #286)"
+            echo ""
+            echo "| key | value |"
+            echo "|---|---|"
+            sed -n 's/^RESULT \([^=]*\)=\(.*\)$/| `\1` | `\2` |/p' "$results" 2>/dev/null
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$missing" ]; then
+            echo "::error title=a step recorded nothing::these results are missing:${missing}. Either an earlier step failed outright -- check its own red mark first -- or a step ran, exited 0 and recorded nothing. Every step in this job exits 0 by construction so that one run answers every question; the price of that is that a step which silently did nothing looks exactly like a step that ran, and this check is what makes it not look like that."
+            exit 1
+          fi
+
+          label="$(get profiled_apparmor_label)"
+          verdict=""
+          # The FIRST rung is the tool, not the policy, and it has to be:
+          # `apparmor_parser` is what produces `compiles` and `loaded`, so on a
+          # runner without it both read `no` and every rung below would
+          # diagnose a missing tool as a defect in the profile. "This is not
+          # valid policy for this parser" is the wrong sentence to print when
+          # there was no parser, and it is the sentence that would send
+          # somebody to rewrite a file that is fine.
+          if [ "$(get parser_present)" = "no" ]; then
+            verdict="THIS RUN MEASURED NOTHING ABOUT THE PROFILE: there is no apparmor_parser on this runner and installing the apparmor package did not provide one. Nothing here is a statement about packaging/apparmor/vitrind -- it compiled nowhere, loaded nowhere and attached to nothing, because the tool that does all three is absent. Fix the runner or the install; do not read the rungs below."
+          elif [ "$(get compiles)" != "yes" ]; then
+            verdict="the profile is NOT VALID POLICY for this parser. Read the parser's stderr in the compile step; nothing after it means anything."
+          elif [ "$(get loaded)" != "yes" ]; then
+            verdict="the profile COMPILED BUT DID NOT LOAD -- the kernel refused it, or apparmor_parser -r failed. This is a kernel/policy-version problem, not a syntax one."
+          elif [ "$label" = "<unread>" ]; then
+            verdict="the profile loaded, and this run CANNOT SAY whether it attached: \`--print-isolation\` printed no \`apparmor.label\` row. Either the installed binary predates that row (crates/vitrin-core/src/spawn/isolation.rs, issue #286) or the row was renamed without this job following. Everything below this line in the decision table is unreachable until that is fixed, because 'attached and granted nothing' and 'never attached' are the same errno without the label."
+          # Matched by NAME, not by equality. A label is a profile name plus an
+          # optional ` (mode)` suffix, and under `flags=(unconfined)` the
+          # kernel is expected to render `vitrind (unconfined)` -- the exact
+          # string crates/vitrin-core/src/spawn/isolation.rs pins in its own
+          # unit test. An `= "vitrind"` test here would therefore call a
+          # working attachment a failure. The `case` also catches the
+          # third outcome the old test could not: a label that is neither
+          # `unconfined` nor `vitrind`, which means some OTHER profile on this
+          # runner claimed the binary and this job is measuring that instead.
+          elif [ "$label" = "unconfined" ] || [ "$label" = "absent" ]; then
+            verdict="the profile LOADED BUT DID NOT ATTACH: vitrind's own label is '${label}'. The attachment path in packaging/apparmor/vitrind does not match where the binary actually is. Check the install step's readlink output -- a symlink at /usr/lib/vitrin/vitrind produces exactly this."
+          elif case "$label" in vitrind|vitrind\ *) false ;; *) true ;; esac; then
+            verdict="SOMETHING ELSE ATTACHED: vitrind's label is '${label}', which is neither 'unconfined' nor this profile's name. Another profile on this runner matches /usr/lib/vitrin/vitrind, so whatever the rungs below would say, they would be saying it about that profile and not about packaging/apparmor/vitrind. Read the 'what policy is already loaded' step, which exists to catch exactly this."
+          elif [ "$(get spawn)" != "ok" ]; then
+            verdict="the profile ATTACHED (label '${label}') and the realm still did not spawn. Read the spawn step: a failure at the helper's unshare means the grant did not survive the execve into vitrin-realm-init; a mount EACCES means it survived and conferred no capabilities (the profile needs more than 'userns,'); a failure at the shim's execve is the no_new_privs transition regression -- something on this machine attaches a profile to the shim's path."
+          elif [ "$(get lever_without)" != "refused" ]; then
+            verdict="THE LEVER DID NOT HOLD: with the profile REMOVED, a realm still spawned. Everything above may be true and none of it is attributable to the profile -- something else on this runner is granting the namespace, so this run cannot be cited as evidence that the profile works."
+          elif [ "$(get lever_restored)" != "ok" ]; then
+            verdict="THE LEVER DID NOT RESTORE: reloading the profile did not bring the spawn back. The run is internally inconsistent and must not be cited either way."
+          elif [ "$(get realapp)" != "pass" ]; then
+            verdict="a realm spawns under the profile and the real-app confinement gate did not pass ('$(get realapp)', $(get realapp_executed) test(s) executed). The grant works; something else does not."
+          else
+            verdict="IT WORKED: the profile compiled, loaded, attached (label '${label}'), a realm spawned, the real-app confinement gate EXECUTED $(get realapp_executed) test(s) and passed, and removing the profile brought the failure back. Cost measured alongside it: kernel.apparmor_restrict_unprivileged_unconfined = $(get unconfined_knob), which is what decides whether this profile is borrowable by any local user via aa-exec."
+          fi
+
+          echo "VERDICT: ${verdict}"
+          {
+            echo "**VERDICT:** ${verdict}"
+            echo ""
+            echo "One runner, one kernel, one image, one AppArmor version. This says"
+            echo "nothing about an operator's machine -- see docs/book/src/limits.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          case "$verdict" in
+            "IT WORKED"*) exit 0 ;;
+            *) echo "::error title=AppArmor profile::${verdict}"; exit 1 ;;
+          esac
 
   fuzz-smoke:
     # Quoted: the ": " inside the parenthetical would otherwise open a

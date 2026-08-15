@@ -1,0 +1,24 @@
+[package]
+name = "vitrin-skip"
+version = "0.1.0"
+edition.workspace = true
+# Stated explicitly, never inherited: the workspace-wide `license` key was
+# deliberately deleted (root `Cargo.toml`, D-005 / issue #133) so a new crate
+# cannot silently pick up the wrong half of the split. This is a conformance
+# INSTRUMENT -- it measures whether a suite ran, it is never linked into
+# `vitrind` and never installed -- so it sits with vitrin-golden,
+# vitrin-mock-shim and vitrin-realm-init-fixtures on the Apache-2.0 side. The
+# licence also has to be this half for a mechanical reason: `crates/xtask`
+# (Apache-2.0) imports the marker constant so the emitter and the census
+# cannot desynchronise, and an Apache-2.0 crate must not depend on an
+# MPL-2.0 one for that. The root NOTICE carries the same statement and is the
+# normative map.
+license = "Apache-2.0"
+rust-version.workspace = true
+description = "The sanctioned test skip (issue #288): one machine-readable marker line every skip site emits, and a per-class require-variable that turns that skip into a failure on a machine that declared it could run."
+publish = false
+
+# Deliberately zero dependencies, and it must stay that way. This crate is a
+# dev-dependency of the trusted core; anything it links is something a
+# `cargo test` of the TCB links (plan risk R7).
+[dependencies]

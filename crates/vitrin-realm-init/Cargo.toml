@@ -33,3 +33,12 @@ path = "src/main.rs"
 # rather than to descriptors, so rustix would add a second FFI vocabulary to
 # this file without removing a single `unsafe` block.
 libc = "0.2"
+
+[dev-dependencies]
+# The sanctioned test skip (issue #288). Five tests in `src/main.rs` measure a
+# Landlock rung the running kernel may not have, and before this crate they
+# announced that with `eprintln!` -- which `cargo test` captures for a test
+# that passes, so the announcement reached no CI log. Test-only: it is never
+# linked into the helper the trusted core execs, so the "one dependency"
+# statement above stays true of the shipped binary.
+vitrin-skip = { path = "../vitrin-skip" }

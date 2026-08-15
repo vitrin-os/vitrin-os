@@ -1995,6 +1995,7 @@ dependencies = [
  "vitrin-png",
  "vitrin-protocol",
  "vitrin-realm-init",
+ "vitrin-skip",
  "wayland-egl",
  "xkbcommon",
 ]
@@ -2042,6 +2043,7 @@ name = "vitrin-realm-init"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "vitrin-skip",
 ]
 
 [[package]]
@@ -2060,6 +2062,10 @@ dependencies = [
  "regex",
  "roxmltree",
 ]
+
+[[package]]
+name = "vitrin-skip"
+version = "0.1.0"
 
 [[package]]
 name = "wait-timeout"
@@ -2602,6 +2608,7 @@ dependencies = [
  "anyhow",
  "rustix 1.1.4",
  "vitrin-scanner",
+ "vitrin-skip",
 ]
 
 [[package]]

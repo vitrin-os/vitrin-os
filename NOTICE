@@ -25,7 +25,13 @@ APACHE-2.0 (LICENSE) — explicit patent grant
   - the code generator and its driver: crates/vitrin-scanner, crates/xtask
     — a third party writing a Go, TypeScript or C++ SDK forks these;
   - the conformance and robustness instruments: crates/vitrin-golden,
-    crates/vitrin-mock-shim, crates/vitrin-realm-init-fixtures, fuzz/. The
+    crates/vitrin-mock-shim, crates/vitrin-realm-init-fixtures,
+    crates/vitrin-skip, fuzz/. crates/vitrin-skip is the sanctioned test
+    skip (issue #288): it measures whether a suite actually ran, is never
+    linked into vitrind or installed, and had to sit on this side of the
+    split for a second reason as well -- crates/xtask imports its marker
+    constant so the emitters and the census cannot desynchronise, and
+    Apache-2.0 xtask must not take that from an MPL-2.0 crate. The
     last of those holds deliberately broken vitrin-realm-init substitutes,
     each defeating exactly one of the core's confinement checkpoints so a
     test can prove that checkpoint fires; they are instruments, never

@@ -69,17 +69,22 @@
 //!   constant.
 //! - **[`FLOOR`] is a property of the *build*.** It is the set of mechanisms
 //!   *this binary actually applies*, so it grows one entry per task: `#186
-//!   {Namespaces}`, `#187 +{Landlock}`, `#188 +{Seccomp, NoNewPrivs}`. After
-//!   #188 it coincides exactly with [`Report::tier`]'s base predicate, and
+//!   {Namespaces}`, `#187 +{Landlock}` (**landed**), `#188 +{Seccomp,
+//!   NoNewPrivs}`. After #188 it coincides exactly with [`Report::tier`]'s
+//!   base predicate, and
 //!   [`the_floor_is_a_subset_of_the_intra_user_predicate`] asserts
 //!   subset-until-then so the day they coincide is a checked fact rather than
 //!   a coincidence somebody notices later.
 //!
 //! Gating `--isolation=default` on `Tier::meets(Tier::IntraUser)` was
-//! available and is refused: it would make `vitrind` refuse to start on a
-//! pre-5.13 kernel while applying no Landlock at all — a new failure mode on
-//! machines where today's build runs fine, which is verbatim what this module
-//! declined to buy at #185.
+//! available and is refused, and #187 is exactly why the distinction earns
+//! its keep. At #186 that gate would have refused a pre-5.13 kernel while
+//! applying no Landlock at all — a new failure mode bought for nothing.
+//! At #187 the *same machine* is refused, and now the refusal is honest:
+//! the build applies a ruleset there, so a kernel that cannot supply one is
+//! a kernel this build cannot confine as its own documentation says. The
+//! floor moved when the applier landed, not before it, and that ordering is
+//! the whole rule.
 //!
 //! [`Tier::meets`] does get its first non-test caller, as the **forecast**
 //! rather than the gate ([`forecast`]): on a machine that meets this build's
@@ -98,6 +103,8 @@
 use std::fmt;
 use std::fs;
 use std::path::Path;
+
+use vitrin_realm_init::LandlockRequest;
 
 /// `landlock_create_ruleset(2)`.
 ///
@@ -134,6 +141,18 @@ pub enum Support {
     /// The probe itself could not be run, so nothing was learned. Never
     /// reported as either success or failure, because it is neither.
     Unmeasured(&'static str),
+    /// The kernel implements the feature, at a version **below this build's
+    /// declared floor** (owner's decision, 2026-08-15).
+    ///
+    /// Distinct from every variant above it, and the distinction is the whole
+    /// point: nothing is wrong with the machine, no sysctl will change the
+    /// answer, and the remedy is a newer kernel. Telling such an operator
+    /// `absent` or `restricted-by-policy` would send them looking for a
+    /// configuration problem that is not there.
+    ///
+    /// Carries what was found and what was required, in that order, because a
+    /// refusal that names only one of the two cannot be acted on.
+    BelowFloor { found: u32, required: u32 },
 }
 
 impl Support {
@@ -171,6 +190,9 @@ impl fmt::Display for Support {
             Support::RestrictedByPolicy(e) => write!(f, "restricted-by-policy(errno={e})"),
             Support::Absent(e) => write!(f, "absent(errno={e})"),
             Support::Unmeasured(why) => write!(f, "unmeasured({why})"),
+            Support::BelowFloor { found, required } => {
+                write!(f, "below-floor(abi={found},required={required})")
+            }
         }
     }
 }
@@ -250,7 +272,14 @@ impl Tier {
 pub enum Mechanism {
     /// The six-flag `unshare` `vitrin-realm-init` issues (P2.6.2, #186).
     Namespaces,
-    /// The shim-side Landlock stack (P2.6.3, #187) -- **not applied yet**.
+    /// The Landlock ruleset `vitrin-realm-init` enforces immediately before
+    /// the shim's `execve` (P2.6.3, #187).
+    ///
+    /// In [`FLOOR`] since #187, which is a **startup behaviour change by
+    /// design**: a kernel with no Landlock now refuses `--isolation=default`
+    /// rather than starting a session whose realms are path-confined by the
+    /// mount table alone. Every machine this breaks was warned by
+    /// [`forecast`] in the build before it.
     Landlock,
     /// The seccomp filter (P2.6.4, #188) -- **not applied yet**.
     Seccomp,
@@ -273,11 +302,18 @@ impl fmt::Display for Mechanism {
 /// What **this build** applies at `--isolation=default`, and therefore what
 /// it refuses to start without.
 ///
-/// One entry today. It grows with the tasks that add the appliers, never
-/// ahead of them: a floor naming a mechanism nothing applies would refuse
-/// sessions in exchange for nothing, which is exactly the trade this module
-/// declined at #185.
-pub const FLOOR: &[Mechanism] = &[Mechanism::Namespaces];
+/// Two entries. It grows with the tasks that add the appliers, never ahead
+/// of them: a floor naming a mechanism nothing applies would refuse sessions
+/// in exchange for nothing, which is exactly the trade this module declined
+/// at #185.
+///
+/// `Landlock` joined at #187, on the schedule this module's docs published at
+/// #186 and that [`forecast`] has been pre-announcing on every machine the
+/// move would break. **It changes startup behaviour**: a kernel that answers
+/// the ABI query with `ENOSYS` used to start and now refuses. That is the
+/// trade D-020(6) makes explicitly -- the alternative is a session whose
+/// realms are confined one mechanism less than its own documentation says.
+pub const FLOOR: &[Mechanism] = &[Mechanism::Namespaces, Mechanism::Landlock];
 
 /// What **this build** actually applies to a confined realm, gate or not.
 ///
@@ -292,7 +328,11 @@ pub const FLOOR: &[Mechanism] = &[Mechanism::Namespaces];
 /// build that applies a mechanism and prints `not-yet` for it is a build
 /// whose own published description is wrong, which is the same class of
 /// defect as overclaiming even though it errs the safe way.
-pub const APPLIED: &[Mechanism] = &[Mechanism::Namespaces, Mechanism::NoNewPrivs];
+pub const APPLIED: &[Mechanism] = &[
+    Mechanism::Namespaces,
+    Mechanism::Landlock,
+    Mechanism::NoNewPrivs,
+];
 
 /// The operator's **selection**: which confinement this session applies.
 ///
@@ -373,29 +413,77 @@ impl fmt::Display for Isolation {
     }
 }
 
-/// The selection [`admit`] let through, together with the *honest* name for
-/// what a realm spawned under it actually gets.
+/// The selections [`admit`] let through.
+///
+/// **It carries no profile string**, and the absence is deliberate. A
+/// profile names what a realm *got*, and at admission time no realm exists:
+/// the kernel's ABI is known, the ladder's landing is not. [`profile_for`]
+/// is therefore called from the spawn path, once per realm, with the rung
+/// that realm's PID 1 reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Applied(Isolation);
+pub struct Applied {
+    isolation: Isolation,
+    /// The session's `--landlock` selection, carried here because the spawn
+    /// path has to send it to the helper and the journal has to record it
+    /// beside the obtained rung: "asked for the highest and got rung 1" and
+    /// "asked for rung 1" are different sessions.
+    landlock: LandlockRequest,
+}
 
 impl Applied {
     pub fn isolation(self) -> Isolation {
-        self.0
+        self.isolation
     }
 
-    /// The value the flight recorder's `applied_profile` field carries.
-    ///
-    /// **It may not overclaim, and that is why it is not the tier's
-    /// spelling.** `Tier::IntraUser` is *defined* as namespaces plus Landlock
-    /// plus seccomp; #186 applies the namespace third. An entry printing
-    /// `intra-user` would assert confinement that does not exist, so at the
-    /// end of #186 the only legal value for a confined realm is
-    /// `namespaces-only`.
-    pub fn profile(self) -> &'static str {
-        match self.0 {
-            Isolation::Default => "namespaces-only",
-            Isolation::Off => "none",
-        }
+    /// The session's Landlock selection, for the spawn path that has to send
+    /// it to the helper.
+    pub fn landlock(self) -> LandlockRequest {
+        self.landlock
+    }
+}
+
+/// The value the flight recorder's `applied_profile` field carries, as a
+/// function of the session's isolation selection and **the rung the realm
+/// actually obtained**.
+///
+/// # The second argument is the obtained rung, and that is the whole point
+///
+/// The first version of this function took the session's *request*, which is
+/// the one thing that cannot describe what happened. `--landlock=abi:9` on an
+/// ABI-3 kernel rendered `namespaces+landlock-abi9`; `--landlock=highest`
+/// rendered the same string whether the ladder settled on rung 9 or fell all
+/// the way to rung 1. The field is named `applied_profile`, so it reports
+/// what was applied: `0` (no ruleset) renders `namespaces-only`, and every
+/// other rung renders itself. A session's *request* is journaled beside it as
+/// `landlock.requested`, because the request and the grant are two facts and
+/// neither is derivable from the other.
+///
+/// **It may not overclaim upward either**, which is why it is still not the
+/// tier's spelling: `Tier::IntraUser` is *defined* as namespaces plus
+/// Landlock plus seccomp, #187 applies two of the three, and #188 owns the
+/// filter. An entry printing `intra-user` would assert confinement that does
+/// not exist.
+pub fn profile_for(isolation: Isolation, obtained_rung: u32) -> &'static str {
+    match (isolation, obtained_rung) {
+        (Isolation::Off, _) => "none",
+        // No ruleset at all: `--landlock=off`, and the one word the pre-#187
+        // build used for exactly this state.
+        (Isolation::Default, 0) => "namespaces-only",
+        (Isolation::Default, 1) => "namespaces+landlock-abi1",
+        (Isolation::Default, 2) => "namespaces+landlock-abi2",
+        (Isolation::Default, 3) => "namespaces+landlock-abi3",
+        (Isolation::Default, 4) => "namespaces+landlock-abi4",
+        (Isolation::Default, 5) => "namespaces+landlock-abi5",
+        (Isolation::Default, 6) => "namespaces+landlock-abi6",
+        (Isolation::Default, 7) => "namespaces+landlock-abi7",
+        (Isolation::Default, 8) => "namespaces+landlock-abi8",
+        (Isolation::Default, 9) => "namespaces+landlock-abi9",
+        // Unreachable: the helper's ladder cannot climb above
+        // `LANDLOCK_BUILD_MAX_RUNG`, so a rung above it means the helper is
+        // not this build. Spelled as a refusal to name a rung rather than as
+        // a rung, because a profile string that guessed would be the one
+        // field in the journal nobody could check.
+        (Isolation::Default, _) => "namespaces+landlock-unknown-rung",
     }
 }
 
@@ -431,11 +519,29 @@ impl fmt::Display for Refusal {
 /// be missing. The caller owes it a standing warning and a journal entry;
 /// this function does not warn, because a pure relation that logged would be
 /// a relation with a side effect.
-pub fn admit(requested: Isolation, report: &Report) -> Result<Applied, Refusal> {
+pub fn admit(
+    requested: Isolation,
+    landlock: LandlockRequest,
+    report: &Report,
+) -> Result<Applied, Refusal> {
+    let applied = Applied {
+        isolation: requested,
+        landlock,
+    };
     if requested == Isolation::Off {
-        return Ok(Applied(requested));
+        return Ok(applied);
     }
     for mechanism in FLOOR {
+        // `--landlock=off` is the operator switching one floor mechanism off
+        // by name, exactly as `--isolation=off` switches all of them off. It
+        // does **not** license skipping the probe silently: the caller owes
+        // the session a standing warning, the same way `Isolation::Off` does,
+        // and every realm it spawns reports rung 0, which [`profile_for`]
+        // renders `namespaces-only` -- so no journal entry from such a
+        // session can read as a confined one.
+        if *mechanism == Mechanism::Landlock && landlock == LandlockRequest::Off {
+            continue;
+        }
         let support = report.mechanism(*mechanism);
         if support.is_available() {
             continue;
@@ -446,7 +552,7 @@ pub fn admit(requested: Isolation, report: &Report) -> Result<Applied, Refusal> 
             remedy: remedy_for(*mechanism, support, report),
         });
     }
-    Ok(Applied(requested))
+    Ok(applied)
 }
 
 /// The remedy paragraph, composed from what was actually read.
@@ -463,6 +569,50 @@ fn remedy_for(mechanism: Mechanism, support: Support, report: &Report) -> String
              session that started here would make every confinement claim downstream read as \
              true while being unverified. Re-run `vitrind --print-isolation` from a plain \
              shell to see the same probe outside whatever launched this core."
+        );
+    }
+    // A real remedy, because there is one: unlike seccomp, a missing Landlock
+    // has exactly three causes and an operator can check all three. It is
+    // stated as three things to *look at* rather than one thing to do,
+    // because two of them need a reboot and the module's own rule is that a
+    // fabricated remedy is worse than silence.
+    // A kernel that HAS Landlock, below this build's declared floor. Its own
+    // paragraph, because none of the three causes below applies: the LSM is
+    // present, enabled and answering, and the only thing that moves the number
+    // is a newer kernel. Handing this operator the `lsm=` boot parameter would
+    // send them to reconfigure something that is already correct.
+    if let Support::BelowFloor { found, required } = support {
+        return format!(
+            "This kernel has Landlock and reports ABI {found}; this build's floor is ABI \
+             {required} (owner's decision, 2026-08-15: target recent kernels rather than \
+             publish a multi-rung ladder nothing measures). Nothing is misconfigured here and \
+             no sysctl, LSM list or boot parameter will change the number -- the remedy is a \
+             newer kernel. `uname -r` says {release}, and `vitrind --print-floor` prints the \
+             required number as `build.landlock_min_abi`. This build will not fall back to a \
+             lower rung: a realm confined by a weaker domain than the session's own journal \
+             names is the silent degradation D-020(6) exists to forbid. `--landlock=off` \
+             starts a session whose realms get NO ruleset at all -- it is the positive control \
+             this repository's confinement gates run against, not a way to run on an older \
+             kernel.",
+            release = report.kernel_release,
+        );
+    }
+    if mechanism == Mechanism::Landlock {
+        return format!(
+            "Landlock is a startup requirement since P2.6.3 (#187): the realm's filesystem \
+             confinement is a ruleset `vitrin-realm-init` enforces before the shim's execve, \
+             and a session that could not build one would confine realms by mount table alone \
+             while its own journal said otherwise. This kernel answered `{support}`. Three \
+             things produce that, in the order worth checking: (1) the kernel predates 5.13, \
+             which is where Landlock arrived -- `uname -r` says {release}; (2) it was built \
+             without `CONFIG_SECURITY_LANDLOCK` (check `zgrep CONFIG_SECURITY_LANDLOCK \
+             /proc/config.gz`, or the matching file under /boot); (3) it has the code but \
+             `landlock` is missing from the active LSM list, which several distributions do \
+             by default -- read `/sys/kernel/security/lsm`, and add `landlock` to the `lsm=` \
+             boot parameter (keeping every name already there) if it is absent. \
+             `--landlock=off` starts a session whose realms get NO ruleset and is the wrong \
+             answer to a kernel that could be configured; `--isolation=off` is weaker still.",
+            release = report.kernel_release,
         );
     }
     if mechanism != Mechanism::Namespaces {
@@ -566,6 +716,31 @@ pub fn render_floor() -> String {
             if applied { "yes" } else { "not-yet" }
         ));
     }
+    // The highest Landlock ABI rung this build knows how to ask for, and the
+    // number a kernel newer than this build gets clamped down to (P2.6.3,
+    // #187). A **build** constant, so this verb and not `--print-isolation`
+    // is its home -- the kernel's own ABI is a measured row over there, and
+    // the two are only interesting side by side.
+    //
+    // Printed rather than left implicit because the clamp is otherwise
+    // invisible in advance: an operator on an ABI-10 kernel gets a rung-9
+    // ruleset, which is correct and is also one rung narrower than their
+    // kernel would allow. The per-realm journal reports the clamp after the
+    // fact (`isolation.landlock.clamped_by_build`); this row is how it can be
+    // seen before a realm exists.
+    out.push_str(&format!(
+        "build.landlock_max_rung={}\n",
+        vitrin_realm_init::LANDLOCK_BUILD_MAX_RUNG
+    ));
+    // The **floor**, and the row that tells an operator on an older kernel why
+    // a session with a working Landlock refused to start (owner's decision,
+    // 2026-08-15). It is a build constant like the row above it, so it lives
+    // here and not in `--print-isolation`, which prints the kernel's own
+    // `landlock.abi=` -- the two are only interesting side by side.
+    out.push_str(&format!(
+        "build.landlock_min_abi={}\n",
+        vitrin_realm_init::LANDLOCK_MIN_ABI
+    ));
     out
 }
 
@@ -757,8 +932,17 @@ impl Report {
                     self.namespaces_combined
                 }
             }
+            // **The floor is an ABI number, not a boolean** (owner's decision,
+            // 2026-08-15). A kernel that has Landlock at a rung below
+            // `LANDLOCK_MIN_ABI` cannot supply the domain this build applies,
+            // so it is refused here rather than degraded at spawn -- the same
+            // D-020(6) trade the mechanism itself was added under.
             Mechanism::Landlock => match self.landlock_abi {
-                Ok(abi) if abi >= 1 => Support::Available,
+                Ok(abi) if abi >= vitrin_realm_init::LANDLOCK_MIN_ABI => Support::Available,
+                Ok(abi) if abi >= 1 => Support::BelowFloor {
+                    found: abi,
+                    required: vitrin_realm_init::LANDLOCK_MIN_ABI,
+                },
                 Ok(_) => Support::Unmeasured("landlock returned ABI 0"),
                 Err(support) => support,
             },
@@ -776,6 +960,22 @@ impl Report {
     /// than [`Report::namespaces_combined`] directly. A tier that counted the
     /// unshare alone called a GitHub runner `IntraUser` on a machine where no
     /// realm could start.
+    ///
+    /// # The Landlock rung here is `>= 1`, and it deliberately is **not** the
+    /// build's ABI floor
+    ///
+    /// Since 2026-08-15 this build refuses to start below
+    /// [`vitrin_realm_init::LANDLOCK_MIN_ABI`], which is a **build** decision.
+    /// A kernel at ABI 4 has Landlock, would carry an intra-user tier for a
+    /// build that asked for a rung it can supply, and is refused by *this* one.
+    /// Both statements are true at once, and this module's first rule is that
+    /// the floor and the tier are separate vocabularies -- so `tier` keeps
+    /// answering the machine question and [`Report::mechanism`] answers the
+    /// build question. The consequence, stated because it looks like a
+    /// contradiction in a terminal: on such a machine `--print-isolation` can
+    /// print `tier=intra-user` while `vitrind` refuses to start, and the two
+    /// rows that explain it are `landlock.abi=` here and
+    /// `build.landlock_min_abi=` under `--print-floor`.
     pub fn tier(&self) -> Tier {
         let base = self.mechanism(Mechanism::Namespaces).is_available()
             && matches!(self.landlock_abi, Ok(abi) if abi >= 1)
@@ -1307,6 +1507,12 @@ mod tests {
     }
 
     /// A report with everything available, as the base for the tier tests.
+    ///
+    /// Its `landlock_abi` is **this build's floor**, not a literal: the number
+    /// stopped being arbitrary when the floor landed (2026-08-15), and a
+    /// hard-coded 6 quietly turned every `admit(...).is_ok()` in this module
+    /// into a refusal. Spelled from the constant so raising the floor moves
+    /// this with it rather than reddening a dozen unrelated tests.
     fn full_report() -> Report {
         Report {
             kernel_release: "0.0.0-test".to_string(),
@@ -1316,7 +1522,7 @@ mod tests {
             }],
             namespaces_combined: Support::Available,
             mount_in_userns: Support::Available,
-            landlock_abi: Ok(6),
+            landlock_abi: Ok(vitrin_realm_init::LANDLOCK_MIN_ABI),
             seccomp_filter: Support::Available,
             no_new_privs: Support::Available,
             policy: vec![("max_user_namespaces", Some("1000".to_string()))],
@@ -1366,7 +1572,7 @@ mod tests {
             !report.mechanism(Mechanism::Namespaces).is_available(),
             "the Namespaces mechanism is both halves of the call, not the unshare alone"
         );
-        let refusal = admit(Isolation::Default, &report)
+        let refusal = admit(Isolation::Default, LandlockRequest::Highest, &report)
             .expect_err("a machine that cannot mount must be refused, not admitted");
         assert_eq!(refusal.mechanism, Mechanism::Namespaces);
     }
@@ -1411,7 +1617,8 @@ mod tests {
             ),
         ];
 
-        let refusal = admit(Isolation::Default, &report).expect_err("must refuse");
+        let refusal =
+            admit(Isolation::Default, LandlockRequest::Highest, &report).expect_err("must refuse");
         assert!(
             refusal.remedy.contains("inside"),
             "the remedy must say the mount inside the namespace is what failed: {}",
@@ -1507,7 +1714,10 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.starts_with("vitrin-isolation 2\n"));
         assert!(first.contains("tier=intra-user\n"));
-        assert!(first.contains("landlock.abi=6\n"));
+        assert!(first.contains(&format!(
+            "landlock.abi={}\n",
+            vitrin_realm_init::LANDLOCK_MIN_ABI
+        )));
         assert!(first.contains("policy.max_user_namespaces=1000\n"));
         assert!(first.contains("provisioning.subuid=absent\n"));
     }
@@ -1764,7 +1974,7 @@ mod tests {
         }
         // And the one legal relation is present, so a rename cannot make the
         // absences above true by deleting the whole mechanism.
-        assert!(source.contains("pub fn admit(requested: Isolation, report: &Report)"));
+        assert!(source.contains("pub fn admit(\n    requested: Isolation,"));
     }
 
     #[test]
@@ -1772,7 +1982,9 @@ mod tests {
         // Clause 6's schedule, as a checked fact. `FLOOR` grows one entry per
         // task (#186 namespaces, #187 landlock, #188 seccomp + nnp); at #188
         // it coincides with `tier()`'s base predicate and the assertion below
-        // flips from subset to equality.
+        // flips from subset to equality. Two of the four are in it now, so
+        // the subset is still proper -- and the two that are missing are
+        // named below rather than left to be inferred from a length.
         let base = [
             Mechanism::Namespaces,
             Mechanism::Landlock,
@@ -1788,6 +2000,15 @@ mod tests {
         assert!(
             FLOOR.len() <= base.len(),
             "FLOOR has outgrown the tier predicate it must stay inside"
+        );
+        // The two entries #187 leaves for #188, named. A `len()` comparison
+        // alone would pass for a `FLOOR` that had picked up the wrong two.
+        assert!(FLOOR.contains(&Mechanism::Namespaces), "#186's entry");
+        assert!(FLOOR.contains(&Mechanism::Landlock), "#187's entry");
+        assert!(
+            !FLOOR.contains(&Mechanism::Seccomp) && !FLOOR.contains(&Mechanism::NoNewPrivs),
+            "seccomp and no-new-privs are #188's move: the filter has to arrive with the gate \
+             that requires it, or whole sessions are refused for a mechanism nothing applies"
         );
 
         // A truth table over synthetic reports, one row per mechanism absent:
@@ -1838,6 +2059,20 @@ mod tests {
             "no-new-privs became a startup gate: that is #188's move, and it needs the seccomp \
              filter it protects to arrive with it"
         );
+        // #187's entry is in BOTH, which is what makes it a floor rather than
+        // a behaviour: the helper enforces a ruleset before every shim's
+        // execve, and a kernel that cannot supply one refuses the session.
+        assert!(
+            APPLIED.contains(&Mechanism::Landlock) && FLOOR.contains(&Mechanism::Landlock),
+            "Landlock is applied by the helper and gated at startup; a build with one and not \
+             the other either refuses for nothing or applies something it does not require"
+        );
+        // And the one this build still does not apply, so `--print-floor`
+        // cannot print `applies.seccomp=yes` before #188 writes the filter.
+        assert!(
+            !APPLIED.contains(&Mechanism::Seccomp),
+            "nothing in this build installs a seccomp filter"
+        );
     }
 
     #[test]
@@ -1861,7 +2096,7 @@ mod tests {
                 Mechanism::Seccomp => report.seccomp_filter = Support::Absent(libc::EINVAL),
                 Mechanism::NoNewPrivs => report.no_new_privs = Support::Absent(libc::EINVAL),
             }
-            let outcome = admit(Isolation::Default, &report);
+            let outcome = admit(Isolation::Default, LandlockRequest::Highest, &report);
             if FLOOR.contains(&mechanism) {
                 let refusal = outcome.expect_err("a floor mechanism failed and the spawn started");
                 assert_eq!(refusal.mechanism, mechanism);
@@ -1873,7 +2108,38 @@ mod tests {
                 );
             }
             // `off` asks for nothing, so nothing can be missing.
-            assert!(admit(Isolation::Off, &report).is_ok());
+            assert!(admit(Isolation::Off, LandlockRequest::Highest, &report).is_ok());
+            // `--landlock=off` switches ONE floor mechanism off by name, so a
+            // machine missing only Landlock starts under it -- and a machine
+            // missing anything else still refuses. Without the second half
+            // this would pass for a `--landlock=off` that skipped the whole
+            // floor check.
+            let with_landlock_off = admit(Isolation::Default, LandlockRequest::Off, &report);
+            if mechanism == Mechanism::Landlock {
+                assert!(
+                    with_landlock_off.is_ok(),
+                    "`--landlock=off` names the one mechanism it turns off; a machine missing \
+                     only that one must start, or the flag is unusable on the machines it is \
+                     for"
+                );
+                assert_eq!(
+                    with_landlock_off.expect("admitted").landlock(),
+                    LandlockRequest::Off
+                );
+                // And the realms such a session spawns report rung 0, which
+                // is the one profile that says no ruleset was applied.
+                assert_eq!(
+                    profile_for(Isolation::Default, 0),
+                    "namespaces-only",
+                    "the session may not journal a Landlock it does not apply"
+                );
+            } else if FLOOR.contains(&mechanism) {
+                assert!(
+                    with_landlock_off.is_err(),
+                    "`--landlock=off` waived {mechanism}, which it does not name -- one flag \
+                     turning off a mechanism it was not asked about is a silent degradation"
+                );
+            }
         }
     }
 
@@ -1884,12 +2150,14 @@ mod tests {
         // sysctl that is not the problem.
         let mut report = full_report();
         report.namespaces_combined = Support::Unmeasured("fork failed");
-        let refusal = admit(Isolation::Default, &report).expect_err("unmeasured must refuse");
+        let refusal = admit(Isolation::Default, LandlockRequest::Highest, &report)
+            .expect_err("unmeasured must refuse");
         assert!(refusal.remedy.contains("could not be run"), "{refusal}");
         assert!(refusal.remedy.contains("fork failed"), "{refusal}");
         // Non-vacuity: the restricted case gets *different* copy.
         report.namespaces_combined = Support::RestrictedByPolicy(libc::EPERM);
-        let other = admit(Isolation::Default, &report).expect_err("restricted must refuse");
+        let other = admit(Isolation::Default, LandlockRequest::Highest, &report)
+            .expect_err("restricted must refuse");
         assert!(!other.remedy.contains("could not be run"), "{other}");
     }
 
@@ -1904,7 +2172,8 @@ mod tests {
             "apparmor_restrict_unprivileged_userns",
             Some("1".to_string()),
         )];
-        let refusal = admit(Isolation::Default, &report).expect_err("refuses");
+        let refusal =
+            admit(Isolation::Default, LandlockRequest::Highest, &report).expect_err("refuses");
         assert!(refusal.remedy.contains("apparmor_restrict"), "{refusal}");
         assert!(
             !refusal.remedy.contains("unprivileged_userns_clone"),
@@ -1913,23 +2182,221 @@ mod tests {
 
         // And when nothing explains it, the copy says so and invents nothing.
         report.policy = vec![("max_user_namespaces", Some("15000".to_string()))];
-        let silent = admit(Isolation::Default, &report).expect_err("refuses");
+        let silent =
+            admit(Isolation::Default, LandlockRequest::Highest, &report).expect_err("refuses");
         assert!(silent.remedy.contains("no remedy is offered"), "{silent}");
     }
 
     #[test]
     fn applied_profile_never_claims_a_tier_this_build_does_not_apply() {
         // Clause 10: `Tier::IntraUser` is *defined* as namespaces plus
-        // Landlock plus seccomp, and #186 applies the namespace third.
-        let report = full_report();
-        let applied = admit(Isolation::Default, &report).expect("a full machine admits");
-        assert_eq!(applied.profile(), "namespaces-only");
-        assert_ne!(applied.profile(), Tier::IntraUser.to_string());
+        // Landlock plus seccomp. #187 applies two thirds, so the profile
+        // names the two and is still not the tier.
+        let full = profile_for(
+            Isolation::Default,
+            vitrin_realm_init::LANDLOCK_BUILD_MAX_RUNG,
+        );
+        assert_eq!(full, "namespaces+landlock-abi9");
+        assert_ne!(full, Tier::IntraUser.to_string());
+        assert!(
+            !full.contains("seccomp"),
+            "the filter is #188's; a profile naming it would be this build describing itself \
+             wrongly in the dangerous direction"
+        );
+        assert_eq!(profile_for(Isolation::Off, 0), "none");
         assert_eq!(
-            admit(Isolation::Off, &report)
-                .expect("off always admits")
-                .profile(),
-            "none"
+            profile_for(Isolation::Off, 9),
+            "none",
+            "at --isolation=off no helper runs, so no rung can qualify the profile"
+        );
+    }
+
+    #[test]
+    fn the_profile_names_the_rung_obtained_and_not_the_one_requested() {
+        // **The defect this pins.** `applied_profile` was derived from the
+        // session's `--landlock` flag, so `--landlock=abi:9` on an ABI-3
+        // kernel journaled `namespaces+landlock-abi9`, and `--landlock=
+        // highest` journaled one string whether the ladder settled on rung 9
+        // or fell to rung 1. The field is named `applied`, and it now takes
+        // the number the realm's PID 1 reported.
+        //
+        // The signature is the assertion: `profile_for` takes a rung, so
+        // there is no request to pass it by mistake.
+        let mut seen = std::collections::HashSet::new();
+        for rung in 0..=vitrin_realm_init::LANDLOCK_BUILD_MAX_RUNG {
+            let profile = profile_for(Isolation::Default, rung);
+            assert!(
+                seen.insert(profile),
+                "rung {rung} renders exactly like a rung already seen: {profile}. A ladder \
+                 fallback from 9 to 1 would then be invisible in the field named for what was \
+                 applied"
+            );
+            if rung == 0 {
+                assert_eq!(
+                    profile, "namespaces-only",
+                    "rung 0 is `--landlock=off`, and it may not read as a Landlocked session"
+                );
+            } else {
+                assert!(
+                    profile.ends_with(&format!("abi{rung}")),
+                    "the rung must be IN the profile string, because that string is what a \
+                     human greps a journal for: {profile}"
+                );
+            }
+        }
+        // A rung above the build's ladder cannot come from this build's
+        // helper, and the profile refuses to name one rather than guessing.
+        let impossible = profile_for(
+            Isolation::Default,
+            vitrin_realm_init::LANDLOCK_BUILD_MAX_RUNG + 1,
+        );
+        assert_eq!(impossible, "namespaces+landlock-unknown-rung");
+        assert!(!impossible.contains("abi10"));
+    }
+
+    #[test]
+    fn a_landlock_refusal_names_the_three_things_that_cause_it() {
+        // The remedy path had one real arm (namespaces) and a generic "no
+        // knob explains this" for everything else. A missing Landlock has
+        // exactly three causes and an operator can check all three, so
+        // offering silence here would have been the module's own rule
+        // (a fabricated remedy is worse than none) applied where a real one
+        // exists.
+        let mut report = full_report();
+        report.landlock_abi = Err(Support::Absent(libc::ENOSYS));
+        let refusal = admit(Isolation::Default, LandlockRequest::Highest, &report)
+            .expect_err("a kernel with no Landlock must refuse since #187");
+        assert_eq!(refusal.mechanism, Mechanism::Landlock);
+        for needle in ["5.13", "CONFIG_SECURITY_LANDLOCK", "lsm=", "--landlock=off"] {
+            assert!(
+                refusal.remedy.contains(needle),
+                "the Landlock remedy must name {needle}: {}",
+                refusal.remedy
+            );
+        }
+        // It names the kernel it was measured against, so an operator reading
+        // a log does not have to correlate two lines to know which machine
+        // answered.
+        assert!(
+            refusal.remedy.contains(&report.kernel_release),
+            "the remedy must quote the release it measured: {}",
+            refusal.remedy
+        );
+        // **Non-vacuity, and it has to call `remedy_for` to be one.** The
+        // comment here once claimed this control while the assertion below it
+        // only called `admit` -- which, for a mechanism outside `FLOOR`,
+        // returns `Ok` without ever reaching `remedy_for`. That asserted
+        // nothing about the copy at all. So the generic arm is exercised
+        // directly: `remedy_for` must still produce the "no knob explains
+        // this" paragraph for an un-remedied mechanism, and must NOT leak any
+        // of the Landlock needles into it. Were the Landlock branch ever to
+        // swallow the whole function, the loop above would keep passing and
+        // this is what would go red.
+        let generic = remedy_for(
+            Mechanism::Seccomp,
+            Support::Absent(libc::EINVAL),
+            &full_report(),
+        );
+        assert!(
+            generic.contains("No knob in this build's list"),
+            "an un-remedied mechanism must get the generic copy: {generic}"
+        );
+        for needle in ["5.13", "CONFIG_SECURITY_LANDLOCK", "lsm="] {
+            assert!(
+                !generic.contains(needle),
+                "the Landlock remedy is one branch, not the whole function; {needle} must not \
+                 appear in another mechanism's copy: {generic}"
+            );
+        }
+        // And the separate fact the assertion below actually holds, stated as
+        // what it is: seccomp is not in `FLOOR`, so its absence does not
+        // refuse a session. This is about `admit`'s membership test, not
+        // about the remedy text.
+        let mut seccomp_gone = full_report();
+        seccomp_gone.seccomp_filter = Support::Absent(libc::EINVAL);
+        assert!(
+            admit(Isolation::Default, LandlockRequest::Highest, &seccomp_gone).is_ok(),
+            "seccomp is not in FLOOR yet, so its absence may not refuse a session"
+        );
+    }
+
+    /// The **ABI floor** (owner's decision, 2026-08-15): a kernel that has
+    /// Landlock, below the number this build declares, is refused -- and the
+    /// refusal says which number it found, which one it needed, and that no
+    /// knob will change either.
+    ///
+    /// Three arms, and the middle one is what stops this being vacuous: at the
+    /// floor exactly, `admit` returns `Ok`. Without it every assertion here
+    /// would still pass for a build that refused every kernel.
+    #[test]
+    fn a_kernel_below_the_abi_floor_is_refused_and_the_remedy_names_the_number() {
+        let floor = vitrin_realm_init::LANDLOCK_MIN_ABI;
+        assert!(
+            floor >= 1,
+            "a floor of 0 is not a rung: Landlock ABI versions start at 1"
+        );
+
+        // Below the floor, with Landlock present and working.
+        let mut low = full_report();
+        low.landlock_abi = Ok(floor - 1);
+        let refusal = admit(Isolation::Default, LandlockRequest::Highest, &low)
+            .expect_err("a kernel below this build's Landlock floor must not start a session");
+        assert_eq!(refusal.mechanism, Mechanism::Landlock);
+        assert_eq!(
+            refusal.support,
+            Support::BelowFloor {
+                found: floor - 1,
+                required: floor,
+            },
+            "a kernel that HAS Landlock, one rung too low, is neither `absent` nor \
+             `restricted-by-policy`: nothing is misconfigured and no sysctl moves it"
+        );
+        // The rendering is what an operator reads, and it must carry both
+        // numbers -- a refusal naming only what it wanted cannot be acted on.
+        let rendered = refusal.to_string();
+        for needle in [
+            format!("abi={}", floor - 1),
+            format!("required={floor}"),
+            "below-floor".to_string(),
+        ] {
+            assert!(
+                rendered.contains(&needle),
+                "the refusal must carry {needle}: {rendered}"
+            );
+        }
+        // And the remedy must be the newer-kernel one, NOT the three-causes
+        // paragraph: `lsm=` and `CONFIG_SECURITY_LANDLOCK` are already correct
+        // on this machine, and sending an operator to check them is sending
+        // them to verify the one thing that is not broken.
+        assert!(
+            refusal.remedy.contains("the remedy is a newer kernel"),
+            "{}",
+            refusal.remedy
+        );
+        for needle in ["CONFIG_SECURITY_LANDLOCK", "lsm="] {
+            assert!(
+                !refusal.remedy.contains(needle),
+                "a below-floor kernel must not be handed {needle}, which is already correct \
+                 there: {}",
+                refusal.remedy
+            );
+        }
+
+        // At the floor exactly: admitted. The non-vacuity control.
+        let mut at = full_report();
+        at.landlock_abi = Ok(floor);
+        assert!(
+            admit(Isolation::Default, LandlockRequest::Highest, &at).is_ok(),
+            "the floor is a floor, not a strict inequality: a kernel reporting exactly the \
+             declared number must start"
+        );
+
+        // And `--landlock=off` still waives it, on the same rule that waives
+        // every floor mechanism the operator switched off by name.
+        assert!(
+            admit(Isolation::Default, LandlockRequest::Off, &low).is_ok(),
+            "`--landlock=off` asks for no ruleset, so a kernel that cannot supply one is not a \
+             reason to refuse the session"
         );
     }
 
@@ -1940,7 +2407,37 @@ mod tests {
         let floor = render_floor();
         assert!(floor.starts_with("vitrin-floor 1\n"));
         assert!(floor.contains("floor.mechanism=namespaces\n"));
-        assert!(floor.contains("applies.landlock=not-yet\n"));
+        // #187's move, in both row families: Landlock is a gate AND a
+        // behaviour. It printed `not-yet` for the whole of #186, and the day
+        // it stopped being true is the day this line had to change.
+        assert!(floor.contains("floor.mechanism=landlock\n"), "{floor}");
+        assert!(floor.contains("applies.landlock=yes\n"), "{floor}");
+        // The one still owed, so the verb cannot start claiming #188 early.
+        assert!(floor.contains("applies.seccomp=not-yet\n"), "{floor}");
+        assert!(!floor.contains("floor.mechanism=seccomp\n"), "{floor}");
+        // #187's build constant. It is the number a kernel newer than this
+        // build gets clamped down to, and until it was printed the clamp was
+        // computed for every realm and read by nobody -- so an operator on an
+        // ABI-10 kernel had no way to see, in advance, that their realms
+        // would be confined one rung below what their kernel offers.
+        assert!(
+            floor.contains(&format!(
+                "build.landlock_max_rung={}\n",
+                vitrin_realm_init::LANDLOCK_BUILD_MAX_RUNG
+            )),
+            "{floor}"
+        );
+        // The floor's own number (owner's decision, 2026-08-15). Without this
+        // row an operator whose kernel has a working Landlock, one rung too
+        // low, has no way to find out in advance which number this build
+        // wanted -- only a refusal after the fact.
+        assert!(
+            floor.contains(&format!(
+                "build.landlock_min_abi={}\n",
+                vitrin_realm_init::LANDLOCK_MIN_ABI
+            )),
+            "{floor}"
+        );
         // The gate rows and the behaviour rows are two families, and the
         // difference is visible: `no-new-privs` is applied to every confined
         // realm and is not a startup gate until #188. It printed `not-yet`
@@ -1961,13 +2458,31 @@ mod tests {
         let mut report = full_report();
         assert_eq!(forecast(&report), None, "a full machine needs no forecast");
 
+        // The forecast is now #188's, because #187 promoted Landlock out of
+        // it: a machine with no Landlock is refused outright by `admit`, so
+        // warning about it would be describing a session that cannot exist.
+        // This is what "every floor move is announced by the build that still
+        // works on the machines it will break" looks like on the far side of
+        // a move -- the announcement retires when the refusal lands.
         report.landlock_abi = Err(Support::Absent(libc::ENOSYS));
-        let warning = forecast(&report).expect("a machine that #187 will break");
-        assert!(warning.contains("landlock"), "{warning}");
+        assert!(
+            admit(Isolation::Default, LandlockRequest::Highest, &report).is_err(),
+            "a machine with no Landlock is refused since #187, not warned"
+        );
+        assert!(
+            forecast(&report).is_none_or(|w| !w.contains("landlock=")),
+            "a mechanism in FLOOR must not also be forecast; it is already a hard refusal"
+        );
+
+        let mut report = full_report();
+        report.seccomp_filter = Support::Absent(libc::EINVAL);
+        let warning = forecast(&report).expect("a machine that #188 will break");
+        assert!(warning.contains("seccomp"), "{warning}");
         assert!(warning.contains("REFUSE"), "{warning}");
-        // The mechanism this build *does* apply is not in the forecast: it is
-        // already a hard refusal, not a warning.
+        // The mechanisms this build *does* gate are not in the forecast: they
+        // are already hard refusals, not warnings.
         assert!(!warning.contains("namespaces="), "{warning}");
+        assert!(!warning.contains("landlock="), "{warning}");
     }
 
     #[test]

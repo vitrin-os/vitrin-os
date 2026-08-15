@@ -86,6 +86,7 @@
 //! `/proc/<pid>/root` and the canary set -- see `vitrin_core::spawn`.
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -157,6 +158,274 @@ pub const IN_REALM_SHIM: &str = "/vitrin/shim";
 /// and is out of scope), and it is keyed on realm id and never purged, so a
 /// realm whose `command` changes inherits the old app's `HOME`.
 pub const IN_REALM_HOME: &str = "/vitrin/home";
+
+/// The highest Landlock ABI rung **this build knows how to request**
+/// (P2.6.3, issue #187).
+///
+/// Not the highest rung that exists: ABI 10 is in mainline and this build
+/// does not request it, because a build must not name a constant its own
+/// headers do not define. A kernel reporting a higher number than this is
+/// **clamped down to it and reported as clamped** -- see [`plan_rung`], which
+/// is asserted against a constructed probe value rather than left waiting for
+/// such a kernel to exist.
+///
+/// It lives here rather than in the helper's `landlock` module because three
+/// sides need it: the helper to clamp, the core to refuse an
+/// `--landlock=abi:N` above the ladder it could possibly walk, and
+/// `vitrind --print-floor` to print it -- a build constant nothing prints is
+/// a clamp an operator cannot see coming.
+pub const LANDLOCK_BUILD_MAX_RUNG: u32 = 9;
+
+/// The lowest Landlock ABI this build will **start** on (owner's decision,
+/// 2026-08-15). A kernel below it is refused, not degraded.
+///
+/// # What this replaces, and what it gives up
+///
+/// P2.6.3 (#187) was written around a *degradation ladder*: ask for the highest
+/// rung, fall back a rung at a time, publish a generated per-ABI table so each
+/// rung's absence is a measured row rather than a sentence. The ladder's
+/// mechanism is still here -- it is what makes `--landlock=abi:N` a measurement
+/// instrument -- but it is no longer how a **shipped session** meets a kernel.
+/// A session either gets a domain at ABI 7 or above, or it does not start.
+///
+/// **This narrows #187 rather than completing it.** PRD §20's "coverage is
+/// kernel-dependent" caveat is *deferred*, not answered: this build now targets
+/// recent kernels and says so, instead of claiming a spectrum it never measured.
+///
+/// A generated multi-rung table with a CI staleness gate now exists at the
+/// narrowed scope -- `docs/book/src/isolation-matrix.md`, emitted by `cargo
+/// xtask isolation-matrix`, which **reads this constant out of this file** and
+/// goes red when the checked-in page no longer prints the number declared here.
+/// Re-tuning it is therefore a regeneration, not an edit. What that table is
+/// not is a per-kernel measurement: it probes nothing, and the per-ABI row set
+/// the original criteria ask for is still undone. See
+/// `docs/plan/02-phase-2-semantic-epochs.md` (P2.6.3, Corrections 4 and 5) and
+/// `docs/book/src/limits.md`.
+///
+/// # Why 7 and not 9
+///
+/// It is the **highest floor that can be tested**, which is the only defensible
+/// way to pick one. Two machines were measured, and they are the only two this
+/// number rests on: this repository's development box (Arch, kernel
+/// `7.1.8-arch1-3`) reports ABI 9, and the runner this repository's CI uses
+/// reports ABI 7. A floor of 8 or 9 would be a floor no CI job could exercise,
+/// which is a rule held by nothing.
+///
+/// **Which kernel releases that excludes is not stated here, because it was not
+/// measured here.** The mapping from ABI rung to kernel version is a fact about
+/// mainline, not about this repository, and no third machine was asked. What is
+/// stated is the rule itself: below this number `vitrind` refuses to start and
+/// names the requirement. `--landlock=off` starts a session whose realms get no
+/// ruleset at all, and is not a remedy for a kernel that could be upgraded.
+pub const LANDLOCK_MIN_ABI: u32 = 7;
+
+/// The **diagnostic** that asks the kernel to keep logging a realm's Landlock
+/// denials **after** the shim's `execve` (P2.6.3 follow-up).
+///
+/// Landlock ABI 7 added a `flags` word to `landlock_restrict_self`, and its
+/// default is the confinement-correct one and the observability-hostile one:
+/// denials are audited for the *current* execution and go silent across
+/// `execve`. Every denial worth measuring in this project happens on the far
+/// side of that `execve` -- it is the app's denials that decide whether the
+/// enumerated read set is complete -- so with the default flags word the one
+/// question P2.6.9 has to answer is unanswerable from the kernel's own record.
+/// `LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON` turns it back on.
+///
+/// # Why an environment variable, and why it is not a `vitrind` flag
+///
+/// A `--landlock-audit` flag would be a *shipped* switch over what the kernel
+/// records about a realm, on a binary whose whole argument is that confinement
+/// does not have modes an operator can be talked into. This is an instrument
+/// for the person measuring the read set, and it is spelled like one: the core
+/// forwards it into the helper's environment **only** when its own environment
+/// carries it (see `vitrin_core::spawn`), and the helper acts on it only for
+/// the exact value [`landlock_audit_requested`] accepts. Nothing in
+/// `realm.toml`, no command line and no default can reach it.
+///
+/// What it does **not** change: the ruleset. `handled_access_fs`, `scoped` and
+/// every rule are identical whether or not it is set -- the flag decides what
+/// the kernel *writes down*, never what it permits.
+pub const LANDLOCK_AUDIT_ENV: &str = "VITRIN_LANDLOCK_AUDIT";
+
+/// Is the [`LANDLOCK_AUDIT_ENV`] diagnostic asked for?
+///
+/// **Exactly `"1"`, and nothing else.** Not "non-empty", not "anything but
+/// 0", not a case-insensitive `true`: a diagnostic that changes what the
+/// kernel logs about a confined process must be impossible to switch on by
+/// accident, and a permissive parse is how an inherited `...AUDIT=false` ends
+/// up meaning yes. One predicate, used by both the core (deciding whether to
+/// forward it) and the helper (deciding whether to set the flag), so the two
+/// cannot drift into disagreeing about what "on" is.
+pub fn landlock_audit_requested(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Which Landlock rung this session asks the helper to apply, and the
+/// **only** knob that can weaken it (P2.6.3, issue #187).
+///
+/// # Why a shipped flag rather than a cargo feature
+///
+/// The rungs above the floor are the ones whose absence has to be
+/// *measured*: a rung whose weakening can only be described in prose is a
+/// rung nobody can check. Simulating an older kernel is exactly what a cap on
+/// `handled_access_fs` does -- a Landlock rung *is* which bits are legal in
+/// that mask -- so capping the requested mask to rung N reproduces an ABI-N
+/// kernel on a newer one.
+///
+/// A cargo feature was available and is refused: CI's helper would then not
+/// be the shipped helper, and this repo's acceptance rule says a milestone
+/// closes on the shipped binaries. So the knob ships, and pays for itself by
+/// being the thing the per-rung tests drive.
+///
+/// **The cap is never a floor.** A bit above the kernel's own ABI is refused
+/// `EINVAL` at ruleset creation, so [`LandlockRequest::CappedAt`] above what
+/// the kernel grants cannot raise anything -- the helper still walks down to
+/// what the kernel accepts and journals what it obtained.
+///
+/// # It is a dial, not a one-way weakening, and the difference is measured
+///
+/// An earlier draft of this doc claimed "the cap can only ever weaken". That
+/// is **false**, and the counterexample is `REFER` (rung 2): a Landlock
+/// domain denies reparenting -- `rename(2)`/`link(2)` across directories --
+/// whenever the ruleset does not *handle* `REFER`, so a rung-1 domain forbids
+/// it even inside the realm's own writable storage while rungs 2 and above
+/// permit it. Measured on this repo's own box (kernel `7.1.8-arch1-3`,
+/// Landlock ABI 9, 2026-08-14), granting the realm's whole writable set on
+/// one hierarchy and renaming a file from one subdirectory to another:
+/// **rung 1 answers `EXDEV`; rungs 2 through 9 succeed**. A same-directory
+/// rename succeeds at every rung, so the denial is reparenting specifically.
+/// `crates/vitrin-realm-init/src/main.rs`'s
+/// `rung_one_forbids_reparenting_that_the_rung_above_permits` re-measures
+/// exactly that.
+///
+/// So `--landlock=abi:1` is **stricter** than `--landlock=highest` for
+/// reparenting and weaker for everything else (no `TRUNCATE`, no `IOCTL_DEV`,
+/// no scoping, no `RESOLVE_UNIX`). What the flag guarantees is narrower than
+/// "weaker" and is what the rest of this type is built on: the rung requested
+/// is the rung whose `handled_access_fs` mask is used, which reproduces an
+/// ABI-N kernel exactly -- including its stricter reparenting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandlockRequest {
+    /// The highest rung this build knows that this kernel will accept.
+    Highest,
+    /// No higher than this ABI rung. A **cap**, never a floor.
+    CappedAt(u32),
+    /// Apply no ruleset at all.
+    ///
+    /// Strictly weaker than [`LandlockRequest::Highest`] and named on the
+    /// command line, on the `--isolation=off` precedent: the binary already
+    /// ships a switch that turns *all* confinement off, so a switch that
+    /// turns one mechanism off adds no new worst case. It exists so the
+    /// per-rung gates have their positive control -- an absence is only
+    /// evidence if the same run proves the thing was present somewhere.
+    Off,
+}
+
+impl LandlockRequest {
+    /// Parse the `--landlock` value.
+    pub fn parse(value: &str) -> Result<LandlockRequest, String> {
+        if value == "off" {
+            return Ok(LandlockRequest::Off);
+        }
+        if value == "highest" {
+            return Ok(LandlockRequest::Highest);
+        }
+        if let Some(n) = value.strip_prefix("abi:") {
+            let rung: u32 = n
+                .parse()
+                .map_err(|_| format!("`--landlock=abi:{n}` is not a number"))?;
+            if rung == 0 {
+                return Err(
+                    "`--landlock=abi:0` names no rung: Landlock ABI versions start at 1, and \
+                     `--landlock=off` is how a session asks for no ruleset at all"
+                        .to_string(),
+                );
+            }
+            if rung > LANDLOCK_BUILD_MAX_RUNG {
+                return Err(format!(
+                    "`--landlock=abi:{rung}` is above the highest rung this build knows how to \
+                     request ({LANDLOCK_BUILD_MAX_RUNG}). The flag is a CAP, so a number above \
+                     the build's own ladder could only ever be a no-op wearing the look of an \
+                     upgrade"
+                ));
+            }
+            return Ok(LandlockRequest::CappedAt(rung));
+        }
+        Err(format!(
+            "unknown `--landlock` value {value:?} (expected `highest`, `off`, or `abi:N` for \
+             N in 1..={LANDLOCK_BUILD_MAX_RUNG})"
+        ))
+    }
+
+    /// The cap, if there is one. `None` means "as high as this build and this
+    /// kernel agree on".
+    pub fn cap(self) -> Option<u32> {
+        match self {
+            LandlockRequest::CappedAt(n) => Some(n),
+            LandlockRequest::Highest | LandlockRequest::Off => None,
+        }
+    }
+}
+
+impl fmt::Display for LandlockRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LandlockRequest::Highest => write!(f, "highest"),
+            LandlockRequest::CappedAt(n) => write!(f, "abi:{n}"),
+            LandlockRequest::Off => write!(f, "off"),
+        }
+    }
+}
+
+/// Which rung the helper asks for **first**, and whether the answer was cut
+/// down by this **build** rather than by the kernel or the operator.
+///
+/// Pure, so the clamp is asserted against a *constructed* kernel ABI rather
+/// than by waiting for a kernel that reports one. A kernel newer than this
+/// build is not a hypothetical -- rung 10 is already in mainline and absent
+/// from this build's headers.
+///
+/// # Why it lives in the shared library rather than in the helper
+///
+/// Two processes need the same answer and must not compute it twice. The
+/// **helper** needs [`Plan::rung`] to open the ladder at. The **core** needs
+/// the same number to decide whether the rung the helper came back with is
+/// *below what this session asked for* -- which is the difference between a
+/// ladder fallback and a working request, and is the thing #187 forbids
+/// masking. A second hand-kept copy of this arithmetic in the core would be a
+/// second opinion about one session.
+pub fn plan_rung(kernel_abi: u32, request: LandlockRequest) -> Plan {
+    let clamped_by_build = kernel_abi > LANDLOCK_BUILD_MAX_RUNG;
+    let mut rung = kernel_abi.min(LANDLOCK_BUILD_MAX_RUNG);
+    if let Some(cap) = request.cap() {
+        // `min`, never assignment: the flag is a cap, so asking for a rung
+        // above what the kernel grants is a no-op and not a floor.
+        rung = rung.min(cap);
+    }
+    Plan {
+        rung,
+        clamped_by_build,
+    }
+}
+
+/// The opening rung, and why it is not simply the kernel's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Plan {
+    /// The rung to request first. The ladder may still walk below it, and the
+    /// core warns when it did.
+    pub rung: u32,
+    /// The kernel reported an ABI above this build's highest known rung, so
+    /// the request was cut down to [`LANDLOCK_BUILD_MAX_RUNG`].
+    ///
+    /// **Reported, not merely computed.** The core reads this field for every
+    /// confined spawn and writes it into the realm's journal entry as
+    /// `isolation.landlock.clamped_by_build`, and `vitrind --print-floor`
+    /// prints the constant it is measured against. A build confining a newer
+    /// kernel at an older rung is a build whose confinement claim is one rung
+    /// narrower than its kernel would allow, and nobody should have to diff
+    /// two numbers to notice.
+    pub clamped_by_build: bool,
+}
 
 /// Fixed `size=` caps for the four tmpfs mounts a realm gets.
 ///
@@ -239,6 +508,7 @@ const TAG_UNSHARED: u8 = 0x20;
 const TAG_CHILD: u8 = 0x21;
 const TAG_MOUNTED: u8 = 0x22;
 const TAG_FAIL: u8 = 0x23;
+const TAG_LANDLOCKED: u8 = 0x24;
 
 /// Where in the sequence the helper gave up.
 ///
@@ -278,6 +548,16 @@ pub enum Stage {
     Exec = 8,
     /// Anything else this binary refuses to continue past.
     Internal = 9,
+    /// The Landlock ruleset could not be built, granted or enforced
+    /// (P2.6.3, issue #187).
+    ///
+    /// Its own stage rather than [`Stage::Internal`], because the operator's
+    /// remedy is specific and different: a kernel without
+    /// `CONFIG_SECURITY_LANDLOCK`, or with `landlock` missing from the `lsm=`
+    /// boot parameter, answers here and at no other step. **Reaching it is a
+    /// refusal, never a downgrade** -- the helper does not fall back to "no
+    /// ruleset" when it cannot build the one it was asked for.
+    Landlock = 10,
 }
 
 impl Stage {
@@ -292,6 +572,7 @@ impl Stage {
             7 => Stage::PivotRoot,
             8 => Stage::Exec,
             9 => Stage::Internal,
+            10 => Stage::Landlock,
             _ => return None,
         })
     }
@@ -327,6 +608,31 @@ pub enum Frame {
     /// as evidence: a substituted helper could send anything, which is why the
     /// core's own root-view check exists.
     Mounted { count: u32, fingerprint: u64 },
+    /// helper -> core, **child-asserted**, sent by PID 1 after the ruleset is
+    /// enforced and before the shim's `execve` (P2.6.3, issue #187).
+    ///
+    /// Two numbers, because one of them cannot be read off the other. `rung`
+    /// is the ABI rung the ruleset was actually built at -- `0` when the
+    /// session asked for none -- and `kernel_abi` is what
+    /// `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`
+    /// reported inside the realm. A session pinned low is then visible as
+    /// `rung < kernel_abi` in one journal entry, which is the whole point of
+    /// sending the second number: without it a capped session reads exactly
+    /// like a session on a weak kernel.
+    ///
+    /// `kernel_abi == 0` means **not measured**, and there is exactly one
+    /// such path: `--landlock=off`, where the helper returns before issuing
+    /// any syscall so that a kernel with no Landlock at all can still run a
+    /// session that asked for no ruleset. Zero is not an ABI version -- they
+    /// start at 1 -- and the core journals it as `null`.
+    ///
+    /// Asserted by the child and journaled as such, on the same terms as
+    /// [`Frame::Mounted`]. There is no `/proc` file that reports a process's
+    /// Landlock domain, so the parent cannot corroborate it; what a
+    /// substituted helper cannot forge is the *behaviour*, which is what
+    /// `tests/integration/test_real_confinement.py` measures from inside the
+    /// realm.
+    Landlocked { rung: u32, kernel_abi: u32 },
     /// helper -> core. A refusal, at a named stage, with the kernel's errno.
     Fail { stage: Stage, errno: i32 },
 }
@@ -342,6 +648,9 @@ pub enum CodecError {
     Truncated,
     /// A `Fail` frame named a stage this build does not know.
     Stage(u8),
+    /// The config blob's Landlock selection is not one this build has a
+    /// reading for. Refused rather than defaulted: see the decoder.
+    Landlock { tag: u32, value: u32 },
     /// The blob is larger than [`CONFIG_MAX`].
     TooLarge(usize),
 }
@@ -353,6 +662,9 @@ impl std::fmt::Display for CodecError {
             CodecError::Tag(t) => write!(f, "unknown frame tag {t:#04x} for this direction"),
             CodecError::Truncated => write!(f, "a length-prefixed field ran past the end"),
             CodecError::Stage(s) => write!(f, "unknown failure stage {s}"),
+            CodecError::Landlock { tag, value } => {
+                write!(f, "no Landlock selection has tag {tag} and value {value}")
+            }
             CodecError::TooLarge(n) => write!(f, "config blob is {n} bytes, over {CONFIG_MAX}"),
         }
     }
@@ -406,6 +718,15 @@ pub struct Config {
     /// shim's own leading arguments, `--`, then the app command and its args.
     pub argv: Vec<OsString>,
     pub caps: TmpfsCaps,
+    /// Which Landlock rung the helper may build (P2.6.3, issue #187), from
+    /// the session's `--landlock` flag.
+    ///
+    /// A **session** input like every other field here: the helper decides
+    /// nothing, it walks the ladder down from this cap to what the kernel
+    /// accepts and reports what it got. This channel is a private codec
+    /// between two halves of one build, not the wire protocol, so carrying it
+    /// here owes no IDL edit.
+    pub landlock: LandlockRequest,
 }
 
 impl Frame {
@@ -436,6 +757,9 @@ impl Frame {
             Frame::Mounted { count, fingerprint } => {
                 fixed(TAG_MOUNTED, i64::from(*count), *fingerprint, 0)
             }
+            Frame::Landlocked { rung, kernel_abi } => {
+                fixed(TAG_LANDLOCKED, i64::from(*rung), u64::from(*kernel_abi), 0)
+            }
             Frame::Fail { stage, errno } => fixed(TAG_FAIL, i64::from(*errno), 0, *stage as u8),
         })
     }
@@ -462,6 +786,10 @@ impl Frame {
             TAG_MOUNTED => Frame::Mounted {
                 count: a as u32,
                 fingerprint: b,
+            },
+            TAG_LANDLOCKED => Frame::Landlocked {
+                rung: a as u32,
+                kernel_abi: b as u32,
             },
             TAG_FAIL => Frame::Fail {
                 stage: Stage::from_u8(bytes[1]).ok_or(CodecError::Stage(bytes[1]))?,
@@ -576,6 +904,15 @@ impl Config {
         put_u64(out, self.caps.dev);
         put_u64(out, self.caps.shm);
         put_u64(out, self.caps.tmp);
+        // Tag plus value rather than one number with reserved sentinels: a
+        // sentinel is a value somebody eventually types.
+        let (tag, value) = match self.landlock {
+            LandlockRequest::Highest => (0u32, 0u32),
+            LandlockRequest::CappedAt(n) => (1, n),
+            LandlockRequest::Off => (2, 0),
+        };
+        put_u32(out, tag);
+        put_u32(out, value);
     }
 
     fn decode(bytes: &[u8]) -> Result<Config, CodecError> {
@@ -604,6 +941,17 @@ impl Config {
             shm: c.u64()?,
             tmp: c.u64()?,
         };
+        // An unknown tag is a refusal and never a default. The default this
+        // arm would otherwise pick is `Highest`, which is the *safe*
+        // direction and still wrong: a helper that silently reinterprets a
+        // confinement request it did not understand is a helper whose journal
+        // entry describes a session nobody selected.
+        let landlock = match (c.u32()?, c.u32()?) {
+            (0, _) => LandlockRequest::Highest,
+            (1, n) if (1..=LANDLOCK_BUILD_MAX_RUNG).contains(&n) => LandlockRequest::CappedAt(n),
+            (2, _) => LandlockRequest::Off,
+            (tag, value) => return Err(CodecError::Landlock { tag, value }),
+        };
         Ok(Config {
             schema_version,
             realm_id,
@@ -617,6 +965,7 @@ impl Config {
             binds,
             argv,
             caps,
+            landlock,
         })
     }
 }
@@ -666,6 +1015,7 @@ mod tests {
                 OsString::from("--flag"),
             ],
             caps: TmpfsCaps::DEFAULT,
+            landlock: LandlockRequest::Highest,
         }
     }
 
@@ -703,6 +1053,10 @@ mod tests {
                 count: 21,
                 fingerprint: 0xdead_beef_cafe_f00d,
             },
+            Frame::Landlocked {
+                rung: 3,
+                kernel_abi: 9,
+            },
             Frame::Fail {
                 stage: Stage::Unshare,
                 errno: libc::EPERM,
@@ -729,6 +1083,7 @@ mod tests {
             Stage::PivotRoot,
             Stage::Exec,
             Stage::Internal,
+            Stage::Landlock,
         ] {
             let frame = Frame::Fail { stage, errno: 13 };
             let bytes = frame.encode().expect("encodes");
@@ -810,6 +1165,120 @@ mod tests {
         assert!(IN_REALM_A11Y_BUS.starts_with(IN_REALM_RUNTIME_DIR));
         assert!(IN_REALM_WAYLAND_SOCKET.starts_with(IN_REALM_RUNTIME_DIR));
         assert_ne!(IN_REALM_A11Y_BUS, IN_REALM_WAYLAND_SOCKET);
+    }
+
+    #[test]
+    fn every_landlock_selection_survives_the_config_blob() {
+        // The field the *confinement* is negotiated over. A selection that
+        // decoded to a different rung than the one the operator typed would
+        // be the exact divergence this shared type exists to make impossible.
+        for request in [
+            LandlockRequest::Highest,
+            LandlockRequest::Off,
+            LandlockRequest::CappedAt(1),
+            LandlockRequest::CappedAt(LANDLOCK_BUILD_MAX_RUNG),
+        ] {
+            let mut cfg = sample_config();
+            cfg.landlock = request;
+            let frame = Frame::Config(Box::new(cfg));
+            let bytes = frame.encode().expect("encodes");
+            assert_eq!(Frame::decode(&bytes).expect("decodes"), frame, "{request}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_landlock_tag_is_refused_rather_than_defaulted() {
+        // Non-vacuity for the arm above: the decoder really is reading those
+        // two trailing words, and it refuses rather than picking the safe
+        // default. A helper that silently reinterprets a confinement request
+        // journals a session nobody selected.
+        let mut bytes = Frame::Config(Box::new(sample_config()))
+            .encode()
+            .expect("encodes");
+        let len = bytes.len();
+        bytes[len - 8..len - 4].copy_from_slice(&7u32.to_le_bytes());
+        assert!(matches!(
+            Frame::decode(&bytes),
+            Err(CodecError::Landlock { tag: 7, .. })
+        ));
+        // And a cap outside the build's ladder is refused too, so a blob from
+        // a build with a longer ladder cannot ask for a rung this one would
+        // silently round down.
+        let mut bytes = Frame::Config(Box::new(sample_config()))
+            .encode()
+            .expect("encodes");
+        let len = bytes.len();
+        bytes[len - 8..len - 4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[len - 4..].copy_from_slice(&(LANDLOCK_BUILD_MAX_RUNG + 1).to_le_bytes());
+        assert!(matches!(
+            Frame::decode(&bytes),
+            Err(CodecError::Landlock { tag: 1, .. })
+        ));
+    }
+
+    /// The audit diagnostic answers to **one** spelling.
+    ///
+    /// This is the whole of "it cannot be on by default": the switch has no
+    /// default-on path because there is no value but `"1"` it says yes to, and
+    /// the two sides that read it -- the core, deciding whether to forward the
+    /// name into the helper's environment, and the helper, deciding whether to
+    /// set the flag -- ask this one function rather than each parsing a string.
+    /// The values enumerated below are the ones an inherited environment
+    /// actually carries in the wild; every one of them means no.
+    #[test]
+    fn the_landlock_audit_diagnostic_answers_to_exactly_one_value() {
+        assert!(landlock_audit_requested(Some("1")));
+        for no in [
+            "", "0", "true", "TRUE", "True", "yes", "on", "1 ", " 1", "01", "2", "-1", "false",
+        ] {
+            assert!(
+                !landlock_audit_requested(Some(no)),
+                "{no:?} switched the Landlock audit diagnostic on. It must answer to \"1\" and \
+                 nothing else -- a permissive parse is how an inherited `...=false` comes to \
+                 mean yes"
+            );
+        }
+        assert!(
+            !landlock_audit_requested(None),
+            "an unset variable is the shipped path and must never be on"
+        );
+        // The name is part of the contract: the core forwards it and the
+        // helper reads it, in two different processes with no shared parse.
+        assert_eq!(LANDLOCK_AUDIT_ENV, "VITRIN_LANDLOCK_AUDIT");
+    }
+
+    #[test]
+    fn the_landlock_flag_parses_exactly_the_values_it_documents() {
+        assert_eq!(
+            LandlockRequest::parse("highest"),
+            Ok(LandlockRequest::Highest)
+        );
+        assert_eq!(LandlockRequest::parse("off"), Ok(LandlockRequest::Off));
+        assert_eq!(
+            LandlockRequest::parse("abi:3"),
+            Ok(LandlockRequest::CappedAt(3))
+        );
+        // `abi:0` names no rung -- ABI versions start at 1 -- and the message
+        // has to point at `off` rather than read as a typo, because somebody
+        // who means "no ruleset" will type it.
+        let zero = LandlockRequest::parse("abi:0").expect_err("abi:0 is not a rung");
+        assert!(zero.contains("--landlock=off"), "{zero}");
+        // A cap above this build's ladder is refused rather than clamped: a
+        // silent clamp would read as an upgrade that did nothing.
+        let high = LandlockRequest::parse(&format!("abi:{}", LANDLOCK_BUILD_MAX_RUNG + 1))
+            .expect_err("above the build's ladder");
+        assert!(high.contains("CAP"), "{high}");
+        assert!(LandlockRequest::parse("abi:x").is_err());
+        assert!(LandlockRequest::parse("on").is_err());
+        // Round-trips through its own rendering, which is what the journal
+        // and `--print-floor` both print.
+        for request in [
+            LandlockRequest::Highest,
+            LandlockRequest::Off,
+            LandlockRequest::CappedAt(4),
+        ] {
+            assert_eq!(LandlockRequest::parse(&request.to_string()), Ok(request));
+        }
     }
 
     #[test]

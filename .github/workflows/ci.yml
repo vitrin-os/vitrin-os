@@ -160,6 +160,27 @@ jobs:
         # link here.
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libxkbcommon-dev libpixman-1-dev
 
+      - name: Grant unprivileged user namespaces, so the confinement tests RUN
+        # Ten tests in crates/vitrin-core/src/spawn.rs spawn a REAL confined
+        # realm, and each is guarded by `namespaces_available()` so a host that
+        # cannot confine skips rather than fails. On a stock `ubuntu-latest`
+        # that guard is always false: `apparmor_restrict_unprivileged_userns=1`
+        # permits the unshare and denies the capabilities it should confer, so
+        # the realm's first mount answers EACCES.
+        #
+        # Without this step those ten skip -- and they skip SILENTLY, because
+        # the guard reports itself with `eprintln!` and `cargo test` captures
+        # stderr for tests that pass. The job then prints `993 passed` while
+        # having exercised none of the confinement it was extended to cover.
+        # That is issue #229's failure mode exactly: a green number standing in
+        # for absent evidence.
+        #
+        # Same remedy the integration job takes, and the same caveat: after
+        # this step the runner is NOT a stock Ubuntu machine, so nothing here
+        # may be cited as evidence about default-distribution behaviour.
+        # #281's matrix is collected in the integration job, before its sysctl.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: cargo fmt --check
         run: cargo fmt --all --check
 

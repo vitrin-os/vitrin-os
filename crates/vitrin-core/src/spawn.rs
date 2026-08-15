@@ -5976,6 +5976,14 @@ pub(crate) mod tests {
     /// capped domain without confining this test binary for good.
     #[test]
     fn a_capped_session_enforces_the_rung_it_asked_for_and_journals_both_numbers() {
+        // This one spawns a REAL confined realm, so it needs the same guard the
+        // other nine confinement tests carry: a host that refuses the mount
+        // inside a user namespace (Ubuntu 24.04+'s AppArmor default, and the
+        // GitHub runner) cannot run it at all. CI takes the sysctl remedy in
+        // the `rust` job so this runs there rather than skipping.
+        if !namespaces_available() {
+            return;
+        }
         let mut h = Harness::new("landlock-cap");
         let mut confinement = h.confinement();
         confinement.landlock = LandlockRequest::CappedAt(2);

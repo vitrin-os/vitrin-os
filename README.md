@@ -642,15 +642,25 @@ That is the complete list of what confines a realm right now.
   LSM list** (`cat /sys/kernel/security/lsm`; if absent, add it to the `lsm=`
   boot parameter, keeping every name already there). `vitrind
   --print-isolation` answers all three as `landlock.abi=N`. **A fourth
-  requirement arrived with the ABI floor** (owner's decision, 2026-08-15): the
+  requirement arrived with the ABI floor** (owner's decision, 2026-08-15,
+  lowered a rung on 2026-08-16): the
   reported ABI must be at or above `build.landlock_min_abi` from `vitrind
-  --print-floor` — **7** here — and a kernel below it is refused rather than
+  --print-floor` — **6** here — and a kernel below it is refused rather than
   confined at a weaker rung. That one is a *build* requirement, not a
   misconfiguration: nothing on such a machine is wrong, no knob moves the
-  number, and the remedy is a newer kernel. It also narrows P2.6.3 rather than
-  completing it; the [limits page](docs/book/src/limits.md) says which two
-  machines the number rests on and what is still not built. Which distributions
-  ship the third unset, or a kernel below the fourth, has **not** been surveyed
+  number, and the remedy is a newer kernel. 6 rather than 7 because 6 is the
+  *lowest* rung at which the domain this build enforces is unchanged — rungs 7
+  and 8 buy `landlock_restrict_self` flags rather than mask bits, and every
+  shipped run passes flags = 0 — so lowering it refuses fewer machines and
+  weakens none. It still narrows P2.6.3 rather than
+  completing it; the [limits page](docs/book/src/limits.md) says what is not
+  built. **Which kernels the floor admits is measured**: five distribution
+  kernels were booted with the shipped binary, and Debian 13 (ABI 6) and the
+  `6.17.0-1020-azure` kernel CI runs (ABI 7) start, while Ubuntu 22.04 (ABI 1),
+  Debian 12 (ABI 2) and Ubuntu 24.04's GA kernel (ABI 4) are refused — see
+  [the kernel page](docs/book/src/isolation-kernels.md), which also explains why
+  those are kernel rows and not distribution rows. Which distributions
+  ship the third requirement unset has **not** been surveyed
   here — that is #281 — and
   `--landlock=off` is not the remedy for a configurable kernel: it builds no
   ruleset, so every claim above about the read set, the write set and the rung

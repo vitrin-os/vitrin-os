@@ -236,11 +236,14 @@ does not spend a weekend on something the project already says out loud:
   --print-isolation` answers all three as `landlock.abi=N`. Since 2026-08-15
   there is a **fourth** requirement and it is not a host misconfiguration: the
   reported ABI must be at or above this build's declared floor
-  (`build.landlock_min_abi` from `vitrind --print-floor`, **7** here). A working
+  (`build.landlock_min_abi` from `vitrind --print-floor`, **6** here — it was 7
+  until 2026-08-16, when it was lowered to the lowest rung at which this build's
+  enforced domain is unchanged). A working
   Landlock on an older kernel is refused with `below-floor(abi=N,required=M)`
   rather than confined at a weaker rung; the remedy is a newer kernel and no
-  knob substitutes. A refusal on any of the four is designed behaviour, not a
-  finding.
+  knob substitutes. Which kernels that admits is measured on five of them —
+  see [the kernel page](docs/book/src/isolation-kernels.md). A refusal on any of
+  the four is designed behaviour, not a finding.
   **The two refusals must not be confused, because their remedies are
   disjoint**: the message names the mechanism it could not get, `namespaces`
   for the bullet above and `landlock` for this one. No userns sysctl makes a

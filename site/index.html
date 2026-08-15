@@ -428,10 +428,18 @@ grant.pointer.click(640, 84)</pre>
       is the one a correctly configured kernel can still fail: the reported
       Landlock ABI must be at or above this build&rsquo;s declared floor
       (<code>build.landlock_min_abi</code> from
-      <code>vitrind --print-floor</code>, <strong>7</strong> in this build).
+      <code>vitrind --print-floor</code>, <strong>6</strong> in this build).
       Nothing is misconfigured on a machine that fails it &mdash; the remedy is
       a newer kernel, and the refusal says so instead of handing you the three
-      checks above. <strong>Do not cross the two remedies</strong>: the
+      checks above. Which kernels that admits is
+      <strong>measured</strong>, on five of them: Debian 13 (ABI 6) and the
+      <code>6.17.0-1020-azure</code> kernel this project&rsquo;s CI runs (ABI 7)
+      start; Ubuntu 22.04 (ABI 1), Debian 12 (ABI 2) and Ubuntu 24.04&rsquo;s GA
+      kernel (ABI 4) are refused. Those are <em>kernel</em> rows, taken with no
+      distribution policy loaded, and they are not distribution rows &mdash;
+      <a href="docs/isolation-kernels.html">the kernel page</a> has the rows and
+      says why the difference matters. <strong>Do not cross the two
+      remedies</strong>: the
       refusal names the mechanism it could not get &mdash;
       <code>namespaces</code> for the paragraph above, <code>landlock</code>
       for this one &mdash; and no userns sysctl makes a kernel report a

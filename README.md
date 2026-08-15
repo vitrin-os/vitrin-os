@@ -617,14 +617,17 @@ That is the complete list of what confines a realm right now.
   It was authored on a machine with AppArmor compiled out, so it has not been
   parsed, loaded, attached or observed to grant anything; **do not install it
   expecting it to work.** The `apparmor-profile` CI job is what will say: it
-  runs on a runner it does not modify (the only job in that workflow that never
-  touches the sysctl above), loads the profile, spawns a real realm, and then
+  runs on a runner whose userns sysctl it never touches (the only job in that
+  workflow that does not; installing the `apparmor` package does load the
+  distro's own profiles, so "unmodified" is about that knob, not the machine),
+  loads the profile, spawns a real realm, and then
   removes the profile and requires the spawn to fail again. It also has a cost
   worth knowing before you install it — the profile's *name* is borrowable via
   `aa-exec`, and whether that borrow actually yields a user namespace turns on
-  `kernel.apparmor_restrict_unprivileged_unconfined`, which Ubuntu 24.04 ships
-  set to `1` (at which value AppArmor stacks rather than transitions, and the
-  restriction survives). The [limits page](docs/book/src/limits.md) states both
+  `kernel.apparmor_restrict_unprivileged_unconfined` — at `1` AppArmor stacks
+  rather than transitions and the restriction survives, at `0` it does not, and
+  **which value Ubuntu 24.04 ships is unverified here**, so the cost is
+  published as unmitigated. The [limits page](docs/book/src/limits.md) states both
   in full, with the citations. **This is
   not the only host requirement** — the bullet below is a second one with a
   completely different remedy, and the refusal names which mechanism it could

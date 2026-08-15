@@ -2106,8 +2106,11 @@ jobs:
         # Two independent facts, because either can be true without the other:
         # the parser's exit code, and the profile appearing in the KERNEL's own
         # list. `apparmor_parser -r` replaces live policy; no reboot is
-        # involved, which is what Ubuntu's own instructions for its shipped
-        # bwrap profile do.
+        # involved. (An earlier draft cited Ubuntu's shipped `bwrap` profile
+        # here. That attribution was wrong -- `bwrap-userns-restrict` is not in
+        # 24.04's `apparmor` package at all -- and `packaging/apparmor/vitrind`
+        # records the correction. The `-r` behaviour is from apparmor_parser's
+        # own manual, not from any distro's instructions.)
         run: |
           set +e
           results="${RUNNER_TEMP}/apparmor-results"

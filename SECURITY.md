@@ -214,10 +214,10 @@ does not spend a weekend on something the project already says out loud:
   local user may try to borrow** with `aa-exec -p vitrind`. Whether that borrow
   yields an unrestricted user namespace depends on
   `kernel.apparmor_restrict_unprivileged_unconfined`: at `0` it does, and at
-  `1` — which is what Ubuntu 24.04's `apparmor` package sets in
-  `/usr/lib/sysctl.d/10-apparmor.conf` — AppArmor stacks the borrowed profile
-  with `unconfined` instead of transitioning to it, and the restriction is
-  retained. Either way it is a known, published property of the mechanism
+  `1` AppArmor stacks the borrowed profile with `unconfined` instead of
+  transitioning to it, so the restriction is retained. **Which value Ubuntu
+  24.04 ships is unverified here** — it has been asserted both ways on these
+  pages and neither was measured — so treat the cost as unmitigated. Either way it is a known, published property of the mechanism
   Ubuntu ships, shared with the `chrome`, `firefox` and `flatpak` profiles, and
   is not a vulnerability in this project. **Do send us a report if you can show
   the borrow succeeding on a host where that knob reads `1`** — that would

@@ -614,19 +614,29 @@ for. It is the same cost Ubuntu already accepted for `chrome`, `firefox` and
 `flatpak`, which is company rather than a justification.
 
 Whether the ask *succeeds* depends on a second knob,
-`kernel.apparmor_restrict_unprivileged_unconfined`. This page previously said
-that knob is `0` by default and the borrow therefore just works. That is wrong
-on Ubuntu 24.04: the `apparmor` package ships
-`/usr/lib/sysctl.d/10-apparmor.conf`, which the AppArmor project's own
-[userns-restriction wiki page][aa-userns] quotes as setting **both**
-`kernel.apparmor_restrict_unprivileged_userns = 1` and
-`kernel.apparmor_restrict_unprivileged_unconfined = 1`. With the second at `1`,
-the [unconfined-restriction page][aa-unconf] describes `change_profile` — which
-is what `aa-exec -p` performs — as stacking rather than transitioning:
-"instead of transitioning to the specified profile it will stack the specified
-profile with unconfined", so "the system restrictions are retained by the
-stacked unconfined profile". The borrow is permitted and does not shed the
-restriction it was trying to shed.
+`kernel.apparmor_restrict_unprivileged_unconfined`, **and this page does not
+know that knob's value on Ubuntu 24.04.** It has now been asserted here twice
+and wrongly in opposite directions — first as `0` by default, so the borrow
+just works; then as `1`, shipped by the `apparmor` package's
+`/usr/lib/sysctl.d/10-apparmor.conf`, so it does not. Neither was measured.
+The second reading came from the AppArmor project's own
+[userns-restriction wiki page][aa-userns], which describes what upstream
+intends that file to contain; nobody here has read the file as Ubuntu 24.04
+actually ships it.
+
+So the honest statement is conditional, and both branches are real:
+
+* If the knob is **`0`**, `aa-exec -p vitrind` borrows this profile and the
+  borrower is genuinely unconfined. That is the security cost, unmitigated.
+* If the knob is **`1`**, the [unconfined-restriction page][aa-unconf]
+  describes `change_profile` — which is what `aa-exec -p` performs — as
+  stacking rather than transitioning: "instead of transitioning to the
+  specified profile it will stack the specified profile with unconfined", so
+  "the system restrictions are retained by the stacked unconfined profile".
+  The borrow is permitted but sheds nothing.
+
+Treat the cost as unmitigated until a run says otherwise. Assuming the
+favourable branch is how this paragraph was wrong the second time.
 
 So: the cost is real where an operator has set that knob to `0`, and is
 mitigated by the stacking behaviour where Ubuntu's shipped `1` is in force.

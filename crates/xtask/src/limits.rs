@@ -61,17 +61,17 @@
 //!
 //! # And a third thing, which is a set and not a string
 //!
-//! [`cross_check_limit_set`] holds #224's acceptance criterion 5 -- *"the WS-E
+//! [`cross_check_limit_sets`] holds #224's acceptance criterion 5 -- *"the WS-E
 //! plan document's honesty section and `limits.md` are cross-checked
 //! **mechanically, not by reading**"* -- and it is deliberately a different
 //! instrument from the two above.
 //!
-//! **What it compares is the SET of limits, never their wording.**
-//! `docs/plan/14-workstream-session-mode.md` §6 and `docs/book/src/limits.md`
-//! are written in two registers that must not be forced to converge: §6 is a
-//! workstream's internal enumeration, addressed to whoever maintains this
-//! project, and says things like *"TCB growth for zero differentiator, exactly
-//! as #223 predicted"*. The limits page is addressed to a stranger deciding
+//! **What it compares is the SET of limits, never their wording.** A plan
+//! document's enumeration and `docs/book/src/limits.md` are written in two
+//! registers that must not be forced to converge: the plan side is a body of
+//! work's internal enumeration, addressed to whoever maintains this project, and
+//! says things like *"TCB growth for zero differentiator, exactly as #223
+//! predicted"*. The limits page is addressed to a stranger deciding
 //! whether to run this, and says *"anyone who walks up to your dark laptop and
 //! touches a key is inside your session."* Those are the same project being
 //! honest twice, not one sentence duplicated. Anchoring a phrase across them --
@@ -137,10 +137,23 @@
 //!    cautionary example of the other choice in `.github/vkms/run-advisory.sh`,
 //!    which exits 0 on a declared skip exactly as on a real probe.
 //!
-//! Each region delimiter must also appear exactly once, which is a rule this
-//! check earned the hard way: §6's own prose describing the mechanism spelled
-//! the delimiters out in full, which moved where the region began and reported
-//! all 39 published ids as missing. See [`limit_set_region`].
+//! Each region delimiter must also appear exactly once **in its own document**,
+//! which is a rule this check earned the hard way: §6's own prose describing the
+//! mechanism spelled the delimiters out in full, which moved where the region
+//! began and reported all 39 published ids as missing. See [`limit_set_region`].
+//!
+//! # More than one enumerating document, and why that is not a hole
+//!
+//! The comparison runs against the **union** of every region in [`ENUMERATORS`],
+//! because a limit's enumerating home is the plan document that owns the work
+//! which created it -- WS-E's §6 for WS-E's limits, the Phase-2 plan's §7 for
+//! Phase-2 confinement's. Writing one workstream's limit into another's
+//! enumeration would send the next sweep to the wrong document's surface table,
+//! which is the failure the enumeration exists to prevent. [`ENUMERATORS`]
+//! carries the full argument, including what would have been a carve-out here
+//! and is not, and the three rules the multi-home shape adds: a home must
+//! enumerate something, an id is declared by exactly one home, and rule 2 runs
+//! over every home.
 //!
 //! # What the set cross-check deliberately does NOT hold
 //!
@@ -286,6 +299,10 @@ pub struct Claim {
 const LIMITS: &str = "docs/book/src/limits.md";
 const README: &str = "README.md";
 const SITE: &str = "site/index.html";
+/// The reporter-facing surface. It carries a limit only where a reader could
+/// otherwise spend a weekend proving something this project already publishes
+/// -- a refusal to start being designed behaviour is exactly that shape.
+const SECURITY: &str = "SECURITY.md";
 
 /// Directories whose contents are third-party and must never satisfy or break
 /// an [`Evidence::AbsentFrom`] check. `shim/subprojects/` is vendored wlroots,
@@ -932,6 +949,214 @@ pub const CLAIMS: &[Claim] = &[
             },
         ],
     },
+    Claim {
+        id: "host-must-permit-unprivileged-userns",
+        says: "`vitrind --isolation=default` refuses to start on a host that permits an \
+               unprivileged user namespace and then strips the capabilities it should confer; \
+               the evidence is ONE measured runner, not a distribution survey.",
+        issue: "#286 owns the packaging that makes the host grant routine; #281 owns the \
+                cross-kernel matrix that would turn one data point into a survey.",
+        // TWO anchors per surface, and the second one is the load-bearing one.
+        // The first pins the measured CAUSE; the second pins the BOUND on the
+        // evidence, which is the half a later editor is most likely to drop
+        // while tightening the prose -- and dropping it turns one CI runner
+        // into an implied survey, which is the overclaim this row exists to
+        // stop. `--isolation=off` is deliberately NOT anchored: it is one of
+        // two remedies and the page must not have to be rewritten when the
+        // AppArmor profile #286 attempts lands.
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "apparmor_restrict_unprivileged_userns",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "not a distribution survey",
+            },
+            Anchor {
+                path: README,
+                needle: "apparmor_restrict_unprivileged_userns",
+            },
+            Anchor {
+                path: README,
+                needle: "not a distribution survey",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "apparmor_restrict_unprivileged_userns",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "not a distribution survey",
+            },
+            Anchor {
+                path: SITE,
+                needle: "apparmor_restrict_unprivileged_userns",
+            },
+            Anchor {
+                path: SITE,
+                needle: "not a distribution survey",
+            },
+        ],
+        evidence: &[
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/spawn/isolation.rs",
+                needle: "apparmor_restrict_unprivileged_userns is 1 (Ubuntu 24.04+)",
+                means: "the refusal still names this sysctl AND offers shipping an AppArmor \
+                        profile beside it. If this text goes, either the diagnosis moved or the \
+                        remedy became a single blessed one -- and the published pages, which \
+                        deliberately describe the REQUIREMENT rather than a remedy, need \
+                        re-reading before that ships.",
+            },
+            Evidence::Contains {
+                path: ".github/workflows/ci.yml",
+                needle: "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+                means: "CI still modifies the runner before it exercises a single confinement \
+                        gate, which is exactly why the published measurement is read from the \
+                        diagnostic step BEFORE it and why every page bounds the evidence at one \
+                        runner. When #286's packaging removes this step, the machine CI measures \
+                        changes and every one of those sentences has to be re-derived rather \
+                        than inherited.",
+            },
+        ],
+    },
+    Claim {
+        id: "host-must-have-landlock",
+        says: "`vitrind --isolation=default` refuses to start on a host whose kernel has no \
+               usable Landlock -- pre-5.13, `CONFIG_SECURITY_LANDLOCK=n`, or `landlock` absent \
+               from the active LSM list -- because the ruleset is in the confinement FLOOR and \
+               not an optimisation on top of it. It is a SECOND host requirement, independent \
+               of the userns one above, and the two remedies do not substitute for each other. \
+               Since 2026-08-15 it carries a FOURTH condition with a fourth remedy: the \
+               reported ABI must be at or above this build's declared floor \
+               (`build.landlock_min_abi`), and a working Landlock on an older kernel is \
+               refused rather than confined at a weaker rung.",
+        issue: "No issue: the refusal is the intended behaviour, and unlike the userns \
+                requirement there is nothing to package -- a kernel build is not something this \
+                project can arrange for an operator. #281 owns the survey of which \
+                distributions ship the LSM list without `landlock`, and has not run.",
+        // TWO anchors per surface, and the second is the load-bearing one for
+        // the same reason as the claim above: the requirement itself is the
+        // easy half to keep, and the half an editor drops while tightening is
+        // the warning that these are TWO requirements whose remedies must not
+        // be crossed. Dropping that turns a page that tells an operator which
+        // knob to reach for into one that hands them both.
+        //
+        // `CONFIG_SECURITY_LANDLOCK` is the requirement anchor rather than the
+        // word "Landlock", which every one of these surfaces already said many
+        // times over before this requirement existed -- an anchor a surface
+        // satisfies by accident is a check that cannot fail.
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "CONFIG_SECURITY_LANDLOCK",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "their remedies must not be",
+            },
+            Anchor {
+                path: README,
+                needle: "CONFIG_SECURITY_LANDLOCK",
+            },
+            Anchor {
+                path: README,
+                needle: "Do not cross the two remedies",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "CONFIG_SECURITY_LANDLOCK",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "The two refusals must not be confused",
+            },
+            Anchor {
+                path: SITE,
+                needle: "CONFIG_SECURITY_LANDLOCK",
+            },
+            Anchor {
+                path: SITE,
+                needle: "Do not cross the two remedies",
+            },
+            // The ABI floor, on every surface. A THIRD anchor per surface,
+            // added when the floor landed (2026-08-15), because it is a
+            // condition none of the other two anchors covers: a host can
+            // satisfy every word of them and still be refused. `landlock_min_abi`
+            // is the needle rather than the word "floor", which these pages
+            // already used for `Mechanism::Landlock`'s membership in `FLOOR` --
+            // an anchor a surface satisfies by accident is a check that cannot
+            // fail.
+            Anchor {
+                path: LIMITS,
+                needle: "build.landlock_min_abi",
+            },
+            Anchor {
+                path: README,
+                needle: "build.landlock_min_abi",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "build.landlock_min_abi",
+            },
+            Anchor {
+                path: SITE,
+                needle: "build.landlock_min_abi",
+            },
+        ],
+        evidence: &[
+            Evidence::Contains {
+                path: "crates/vitrin-realm-init/src/lib.rs",
+                needle: "pub const LANDLOCK_MIN_ABI: u32 = 7;",
+                means: "the floor is still 7, which is the number every surface above prints. \
+                        Raising or lowering it changes which hosts this build refuses, so it \
+                        may not move without the four pages moving with it -- and the constant \
+                        is pinned as a whole line, value included, precisely so a silent \
+                        re-tune cannot leave four published numbers stale.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/spawn/isolation.rs",
+                needle: "Ok(abi) if abi >= vitrin_realm_init::LANDLOCK_MIN_ABI => \
+                         Support::Available,",
+                means: "the floor is still a STARTUP GATE and not merely a printed constant. \
+                        Relax this comparison back to `abi >= 1` and every page above describes \
+                        a refusal that no longer happens, while `--print-floor` keeps printing \
+                        the number -- the overclaiming direction, and the one a reader cannot \
+                        detect from the output alone.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/spawn/isolation.rs",
+                needle: "pub const FLOOR: &[Mechanism] = &[Mechanism::Namespaces, \
+                         Mechanism::Landlock];",
+                means: "Landlock is still a STARTUP GATE and not merely applied. This is the \
+                        one row that decides whether the published requirement is true at all: \
+                        take `Mechanism::Landlock` back out of `FLOOR` and every page above \
+                        describes a refusal that no longer happens, which is the overclaiming \
+                        direction. It is pinned as the whole line rather than as \
+                        `Mechanism::Landlock`, which also appears in `APPLIED` -- a mechanism \
+                        can be applied without gating startup, and that distinction is exactly \
+                        what this claim is about.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/spawn/isolation.rs",
+                needle: "Landlock is a startup requirement since P2.6.3 (#187)",
+                means: "the refusal still explains itself in the operator's own terms. The \
+                        published pages deliberately state the REQUIREMENT rather than transcribe \
+                        this text, so they do not go stale when it is reworded -- but if the \
+                        remedy paragraph disappears entirely, an operator meets a bare errno and \
+                        every page's `--print-isolation` advice is the only thing left.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/spawn/isolation.rs",
+                needle: "add `landlock` to the `lsm=`",
+                means: "the third condition -- a kernel that HAS Landlock and does not enable \
+                        it -- is still diagnosed. It is the one of the three an operator cannot \
+                        guess at from an ENOSYS, it is the reason the published requirement is \
+                        three items rather than one, and it is the half of the diagnosis that a \
+                        simplification of this remedy would drop first.",
+            },
+        ],
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -941,13 +1166,23 @@ pub const CLAIMS: &[Claim] = &[
 /// Entry point for `cargo xtask limits-check`.
 pub fn limits_check(root: &Path) -> Result<()> {
     let mut failures = run_claims(root, CLAIMS)?;
-    let (cross, limit_count) = cross_check_files(root)?;
+    let (cross, limit_counts) = cross_check_files(root)?;
     let cross_len = cross.len();
     failures.extend(cross);
     if failures.is_empty() {
+        // Per home, never only the total: a total is what a home going empty
+        // hides behind, and the whole reason this line prints a number is so a
+        // human reading a CI log sees a set shrink.
+        let total: usize = limit_counts.iter().map(|(_, n)| n).sum();
+        let breakdown = limit_counts
+            .iter()
+            .map(|(path, n)| format!("{n} from {path}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         println!(
-            "limits-check: {} claims hold across their surfaces and their code evidence, and \
-             §6 of {PLAN} enumerates the same {limit_count} published limits as {LIMITS}.",
+            "limits-check: {} claims hold across their surfaces and their code evidence, and the \
+             enumerating plan documents ({breakdown}) enumerate the same {total} published limits \
+             as {LIMITS}.",
             CLAIMS.len()
         );
         return Ok(());
@@ -961,11 +1196,12 @@ pub fn limits_check(root: &Path) -> Result<()> {
          published surfaces now disagree.\n  \
          * EVIDENCE -- the claim no longer matches the code, so what is published is false \
          of `main` in one direction or the other.\n  \
-         * SET      -- §6 of the WS-E plan document and docs/book/src/limits.md no longer \
+         * SET      -- the enumerating plan documents and docs/book/src/limits.md no longer \
          enumerate the same limits. This one is about the SET, never the wording: reword either \
          document freely, but a limit present in one and absent from the other is drift.\n  \
-         * BULLET / MARKER / ID / REGION -- a §6 limit carries no marker, a marker is malformed, \
-         or the region delimiters are gone, so the set comparison above cannot see it.\n\n\
+         * BULLET / MARKER / ID / REGION -- an enumerated limit carries no marker, a marker is \
+         malformed, or the region delimiters are gone, so the set comparison above cannot see \
+         it.\n\n\
          Fix the page or fix the table in crates/xtask/src/limits.rs -- but do not weaken an \
          anchor or delete a marker to make this pass. Issue #224 exists because two of its own \
          body items had gone false this way.\n",
@@ -1086,6 +1322,68 @@ pub fn run_claims(root: &Path, claims: &[Claim]) -> Result<Vec<String>> {
 /// The workstream plan document whose §6 enumerates the limits WS-E creates.
 const PLAN: &str = "docs/plan/14-workstream-session-mode.md";
 
+/// The Phase-2 plan document, whose §7 enumerates the limits Phase 2's
+/// confinement work creates.
+const PHASE_2: &str = "docs/plan/02-phase-2-semantic-epochs.md";
+
+/// One document that enumerates limits, paired with its text.
+///
+/// `path` is carried rather than inferred so every failure message can name
+/// **which** document is out of step; with one enumerating document that was a
+/// constant, and a constant in a message is how a multi-document check starts
+/// reporting the wrong file.
+pub struct Enumeration<'a> {
+    pub path: &'a str,
+    pub text: &'a str,
+}
+
+/// Every document that may enumerate a published limit.
+///
+/// # Why a second region is not a carve-out
+///
+/// The property this gate holds has never been *"one document lists every
+/// limit"*. It is **"every limit published to a reader is enumerated by the
+/// plan document that owns the work which created it, and by exactly one"** --
+/// because that enumeration is where `CLAUDE.md`'s `known-limit` rule sends
+/// whoever later closes the limit to find every surface it touches. One
+/// document was enough only for as long as one workstream had created every
+/// marked limit, which was true on the day the gate was written and is a fact
+/// about the tree rather than a property of the check.
+///
+/// Phase-2 confinement (E2.6/E2.7, D-020, D-037) creates limits of its own, and
+/// they have no honest home in `docs/plan/14-workstream-session-mode.md`: that
+/// section is titled *"Limits this workstream creates"* and its opening
+/// sentence scopes every entry to a limit *"this workstream owns, not
+/// inherits"*. Filing a Phase-2 confinement limit under it would make both
+/// false in exactly the way §6 exists to prevent, and would send the next sweep
+/// that closes it to the wrong document's surface table. So Phase 2 gets its
+/// own region, in the document that schedules the work.
+///
+/// **What would have been a carve-out, and is not what this is.** Exempting the
+/// page's new marker from the comparison; making a region optional; letting an
+/// id be published with no enumerating home; or special-casing an id prefix.
+/// None of those happens: both directions still hold, over the **union** of the
+/// homes, and a published id with no home is the same red build it was before.
+///
+/// **The change is a net strengthening in three places**, each of which is a
+/// hole the single-document version did not have to think about:
+///
+/// 1. **A registered home must enumerate at least one limit.** A home that
+///    contributes nothing is a region somebody added to make a marker legal,
+///    which is precisely the carve-out this comment says this is not. It fails.
+/// 2. **An id is declared by exactly one home.** Two homes claiming one limit
+///    would let a sweep close it in one document and leave the other standing --
+///    a stale gap claim surviving in the file the next reader is sent to, which
+///    is the failure #282 exists to prevent.
+/// 3. **Rule 2 runs over every home.** A bullet added to the new region carries
+///    the same "marked or explicitly off-page" obligation §6's bullets carry, so
+///    the new region cannot become a place where limits go unrecorded.
+///
+/// Adding a third home is a deliberate act: it means a third body of work owns
+/// limits of its own, and it costs a region, a surface table in that document,
+/// and an entry here.
+pub const ENUMERATORS: &[&str] = &[PLAN, PHASE_2];
+
 /// The two comments that bound §6's limit set.
 ///
 /// The region is delimited explicitly rather than by finding the `## 6.`
@@ -1154,34 +1452,35 @@ fn markers(normalized: &str, prefix: &str) -> Vec<Marker> {
 /// failure was loud, and it named the wrong cause. So a second delimiter is now
 /// its own error, and the prose spells the delimiters without their comment
 /// brackets.
-fn limit_set_region(normalized_plan: &str) -> Result<&str, String> {
+fn limit_set_region<'a>(normalized_plan: &'a str, source: &str) -> Result<&'a str, String> {
     for delimiter in [REGION_BEGIN, REGION_END] {
         let count = normalized_plan.matches(delimiter).count();
         if count > 1 {
             return Err(format!(
-                "[limit-set] REGION -- {PLAN} carries {delimiter:?} {count} times. It must appear \
-                 exactly once: with two of them the region is whatever lies between the first of \
-                 each, and every limit outside that accidental window is reported as missing from \
-                 §6. If prose needs to name a delimiter, write it without its comment brackets."
+                "[limit-set] REGION -- {source} carries {delimiter:?} {count} times. It must \
+                 appear exactly once: with two of them the region is whatever lies between the \
+                 first of each, and every limit outside that accidental window is reported as \
+                 missing from the document. If prose needs to name a delimiter, write it without \
+                 its comment brackets."
             ));
         }
     }
     let Some(begin) = normalized_plan.find(REGION_BEGIN) else {
         return Err(format!(
-            "[limit-set] REGION -- {PLAN} carries no {REGION_BEGIN:?}. That comment is what \
-             tells this gate where §6's limit set starts; without it there is no set to compare \
-             and the cross-check would silently hold nothing."
+            "[limit-set] REGION -- {source} carries no {REGION_BEGIN:?}. That comment is what \
+             tells this gate where the document's limit set starts; without it there is no set to \
+             compare and the cross-check would silently hold nothing."
         ));
     };
     let Some(end) = normalized_plan.find(REGION_END) else {
         return Err(format!(
-            "[limit-set] REGION -- {PLAN} carries no {REGION_END:?}, so the limit set has no end \
-             and the measurements and safety sections after it would be read as limits."
+            "[limit-set] REGION -- {source} carries no {REGION_END:?}, so the limit set has no \
+             end and whatever follows it would be read as limits."
         ));
     };
     if end < begin {
         return Err(format!(
-            "[limit-set] REGION -- {PLAN} carries {REGION_END:?} before {REGION_BEGIN:?}."
+            "[limit-set] REGION -- {source} carries {REGION_END:?} before {REGION_BEGIN:?}."
         ));
     }
     Ok(&normalized_plan[begin + REGION_BEGIN.len()..end])
@@ -1221,7 +1520,7 @@ fn is_top_level_item(line: &str) -> bool {
 /// with any trailing text left `inside` false for the whole document, the set
 /// comparison went on working (it runs on normalised text and never looks at
 /// lines), and an unmarked limit added underneath passed green.
-fn unmarked_bullets(raw_plan: &str) -> Vec<String> {
+fn unmarked_bullets(raw_plan: &str, source: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut inside = false;
     let mut saw_region = false;
@@ -1231,13 +1530,13 @@ fn unmarked_bullets(raw_plan: &str) -> Vec<String> {
         if let Some((line, text)) = open.take() {
             if !marked {
                 out.push(format!(
-                    "[limit-set] BULLET -- {PLAN}:{line} is a limit in §6's set and carries no \
-                     marker:\n      {text}\n    Every top-level list item between {REGION_BEGIN} \
-                     and {REGION_END} must carry either `{PUBLISHED} <id> -->` (it is on \
-                     docs/book/src/limits.md under that id) or `{OFF_PAGE} <id> -- why -->` (it \
-                     is deliberately not, and here is the reason). An unmarked bullet is a limit \
-                     this project has enumerated for itself and told nobody about, which is the \
-                     failure §6 already records itself having committed once."
+                    "[limit-set] BULLET -- {source}:{line} is a limit in that document's set and \
+                     carries no marker:\n      {text}\n    Every top-level list item between \
+                     {REGION_BEGIN} and {REGION_END} must carry either `{PUBLISHED} <id> -->` (it \
+                     is on docs/book/src/limits.md under that id) or `{OFF_PAGE} <id> -- why -->` \
+                     (it is deliberately not, and here is the reason). An unmarked bullet is a \
+                     limit this project has enumerated for itself and told nobody about, which is \
+                     the failure §6 of {PLAN} already records itself having committed once."
                 ));
             }
         }
@@ -1268,11 +1567,11 @@ fn unmarked_bullets(raw_plan: &str) -> Vec<String> {
     close(&mut open, marked, &mut out);
     if !saw_region {
         out.push(format!(
-            "[limit-set] REGION -- the set comparison found §6's limit set, and this line-based \
-             scan did not: no line of {PLAN} contains {REGION_BEGIN}. Rule 2 -- every limit in §6 \
-             carries a marker -- therefore held nothing, and an unmarked limit added to the region \
-             would have passed green. Do not silence this by deleting the rule; put the delimiter \
-             back on a line this scan can find."
+            "[limit-set] REGION -- the set comparison found the limit set, and this line-based \
+             scan did not: no line of {source} contains {REGION_BEGIN}. Rule 2 -- every limit in \
+             the region carries a marker -- therefore held nothing, and an unmarked limit added to \
+             the region would have passed green. Do not silence this by deleting the rule; put the \
+             delimiter back on a line this scan can find."
         ));
     }
     out
@@ -1286,48 +1585,126 @@ fn truncate(line: &str) -> String {
     }
 }
 
-/// Cross-check §6's limit set against the limits page's, as sets of ids.
+/// Cross-check one enumerating document against the limits page.
 ///
-/// Pure over the two documents' text so the tests can drive both directions
-/// without writing to the tree. See the module docs for the four rules and for
-/// what this deliberately does not hold.
+/// The single-document form, and it exists **only** for the non-vacuity tests
+/// below: one document, one page, one divergence at a time, so a test that
+/// expects exactly one failure is reading a check and not an accident of how
+/// many homes are registered. Production goes through
+/// [`cross_check_limit_sets`] over [`ENUMERATORS`].
+#[cfg(test)]
 pub fn cross_check_limit_set(plan: &str, page: &str) -> Vec<String> {
-    let mut failures = Vec::new();
-    let normalized_plan = normalize(plan);
-    let region = match limit_set_region(&normalized_plan) {
-        Ok(region) => region,
-        Err(err) => return vec![err],
-    };
+    cross_check_limit_sets(
+        &[Enumeration {
+            path: PLAN,
+            text: plan,
+        }],
+        page,
+    )
+}
 
-    let published = markers(region, PUBLISHED);
-    let off_page = markers(region, OFF_PAGE);
+/// Cross-check the enumerating documents' limit sets against the limits page's,
+/// as sets of ids.
+///
+/// Pure over the documents' text so the tests can drive every direction without
+/// writing to the tree. See the module docs for the rules and for what this
+/// deliberately does not hold, and [`ENUMERATORS`] for why there is more than
+/// one enumerating document and why that is not a weakening.
+pub fn cross_check_limit_sets(sources: &[Enumeration<'_>], page: &str) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    // A gate handed no enumerating document compares the page against nothing
+    // and every rule below holds vacuously. Same refusal as rule 5, one level
+    // up: the empty *list of homes* is as much a nothing-to-compare as the
+    // empty set of limits.
+    if sources.is_empty() {
+        return vec![format!(
+            "[limit-set] REGION -- no enumerating document was named at all, so {LIMITS} would be \
+             compared against nothing and every rule below would hold vacuously. At least one \
+             document must own the limit set."
+        )];
+    }
+
+    // Regions first, and a failure here stops everything. A document whose
+    // region cannot be found contributes no ids, and going on would report
+    // every limit it owns as "published with no enumerating home" -- a pile of
+    // derived failures whose one real cause is already in this list.
+    let normalized: Vec<(&str, String)> = sources
+        .iter()
+        .map(|s| (s.path, normalize(s.text)))
+        .collect();
+    let mut regions: Vec<(&str, &str)> = Vec::new();
+    for (path, text) in &normalized {
+        match limit_set_region(text, path) {
+            Ok(region) => regions.push((path, region)),
+            Err(err) => failures.push(err),
+        }
+    }
+    if !failures.is_empty() {
+        return failures;
+    }
+
+    // Every plan-side declaration, tagged with the document that made it. The
+    // tag is what makes a multi-home failure actionable and is what rules the
+    // one-home version never needed are built on.
+    let mut published: Vec<(&str, Marker)> = Vec::new();
+    let mut off_page: Vec<(&str, Marker)> = Vec::new();
+    for (path, region) in &regions {
+        let pubs = markers(region, PUBLISHED);
+        let offs = markers(region, OFF_PAGE);
+        // **A registered home must enumerate something.** A home that declares
+        // no limit at all is a region added to make some marker legal rather
+        // than a document that owns limits -- exactly the carve-out
+        // [`ENUMERATORS`] says this mechanism is not. It is refused here rather
+        // than passing as one more empty set that agrees with everything.
+        if pubs.is_empty() && offs.is_empty() {
+            failures.push(format!(
+                "[limit-set] SET -- {path} is registered as a home for the limit set and its \
+                 region declares no limit at all, neither `{PUBLISHED} <id> -->` nor `{OFF_PAGE} \
+                 <id> -- why -->`.\n    A home that enumerates nothing holds nothing: it adds an \
+                 empty set to the union, which agrees with every other set, and it makes the \
+                 published count read as coverage it does not have.\n    Either the document's \
+                 limits moved out from between the region delimiters, or this document should \
+                 stop being registered in crates/xtask/src/limits.rs."
+            ));
+        }
+        published.extend(pubs.into_iter().map(|m| (*path, m)));
+        off_page.extend(offs.into_iter().map(|m| (*path, m)));
+    }
     let on_page = markers(&normalize(page), PUBLISHED);
 
-    // **Rule 5, the vacuity guard, and it goes first because everything below it
-    // is a comparison.** Two empty sets are equal, so with no published marker
-    // in §6 and no marker on the limits page every rule after this one holds and
-    // the gate prints "enumerates the same limit set" having compared nothing.
-    // That is the shape of `.github/vkms/run-advisory.sh` exiting 0 on a
-    // declared skip, and a gate that certifies divergence as agreement is worse
-    // than no gate. Both halves must be empty for this to fire: §6 emptied on
-    // its own is caught below, once per surviving page marker.
+    // **Rule 5, the vacuity guard.** Two empty sets are equal, so with no
+    // published marker in any home and no marker on the limits page every rule
+    // after this one holds and the gate prints "enumerate the same limit set"
+    // having compared nothing. That is the shape of
+    // `.github/vkms/run-advisory.sh` exiting 0 on a declared skip, and a gate
+    // that certifies divergence as agreement is worse than no gate. Both halves
+    // must be empty for this to fire: the homes emptied on their own are caught
+    // below, once per surviving page marker. It is not subsumed by the
+    // per-home rule above -- homes that declare only off-page limits satisfy
+    // that rule and still leave nothing to compare.
     if published.is_empty() && on_page.is_empty() {
         failures.push(format!(
-            "[limit-set] SET -- there is nothing to compare. §6 of {PLAN} declares no limit \
-             published (it has {} off-page marker(s)) and {LIMITS} carries no `{PUBLISHED} <id> \
-             -->` marker at all, so set equality holds between two empty sets and this check \
-             would certify agreement having read nothing.\n    Something structural moved: the \
-             limit bullets are outside the region delimiters, or the marker spelling changed, or \
-             the page's markers were stripped. Restore them -- an empty set is refused here \
-             precisely so it cannot pass as a green build.",
+            "[limit-set] SET -- there is nothing to compare. No enumerating document ({}) \
+             declares a limit published (there are {} off-page marker(s)) and {LIMITS} carries no \
+             `{PUBLISHED} <id> -->` marker at all, so set equality holds between two empty sets \
+             and this check would certify agreement having read nothing.\n    Something \
+             structural moved: the limit bullets are outside the region delimiters, or the marker \
+             spelling changed, or the page's markers were stripped. Restore them -- an empty set \
+             is refused here precisely so it cannot pass as a green build.",
+            sources
+                .iter()
+                .map(|s| s.path)
+                .collect::<Vec<_>>()
+                .join(", "),
             off_page.len()
         ));
     }
 
     for (marker, source, kind) in published
         .iter()
-        .map(|m| (m, PLAN, "published"))
-        .chain(off_page.iter().map(|m| (m, PLAN, "off-page")))
+        .map(|(path, m)| (m, *path, "published"))
+        .chain(off_page.iter().map(|(path, m)| (m, *path, "off-page")))
         .chain(on_page.iter().map(|m| (m, LIMITS, "page")))
     {
         if marker.id.is_empty()
@@ -1344,7 +1721,7 @@ pub fn cross_check_limit_set(plan: &str, page: &str) -> Vec<String> {
             ));
         }
     }
-    for marker in &published {
+    for (_, marker) in &published {
         if !marker.tail.is_empty() {
             failures.push(format!(
                 "[limit-set] MARKER -- the published marker for {:?} carries trailing text {:?}. \
@@ -1354,7 +1731,7 @@ pub fn cross_check_limit_set(plan: &str, page: &str) -> Vec<String> {
             ));
         }
     }
-    for marker in &off_page {
+    for (_, marker) in &off_page {
         let reason = marker.tail.strip_prefix("--").unwrap_or("").trim();
         if reason.is_empty() {
             failures.push(format!(
@@ -1367,48 +1744,73 @@ pub fn cross_check_limit_set(plan: &str, page: &str) -> Vec<String> {
         }
     }
 
-    failures.extend(duplicates(&published, PLAN, "published in §6"));
-    failures.extend(duplicates(&off_page, PLAN, "off-page in §6"));
+    // **One id, one home, one verdict.** Every plan-side declaration goes into
+    // one scan rather than one per kind, because with several homes the
+    // interesting collisions are the cross-document and cross-kind ones: two
+    // documents claiming the same limit, or one publishing what another
+    // declares off-page. A sweep that closes such a limit edits the home it
+    // found and leaves the other standing, which is a stale gap claim surviving
+    // in the file `CLAUDE.md` sends the next reader to.
+    let declarations: Vec<(&str, &str, &str)> = published
+        .iter()
+        .map(|(path, m)| (m.id.as_str(), *path, "published"))
+        .chain(
+            off_page
+                .iter()
+                .map(|(path, m)| (m.id.as_str(), *path, "off-page")),
+        )
+        .collect();
+    failures.extend(duplicate_declarations(&declarations));
     failures.extend(duplicates(&on_page, LIMITS, "on the limits page"));
 
-    let published_ids: Vec<&str> = published.iter().map(|m| m.id.as_str()).collect();
     let page_ids: Vec<&str> = on_page.iter().map(|m| m.id.as_str()).collect();
 
-    for id in &published_ids {
-        if !page_ids.contains(id) {
+    for (source, marker) in &published {
+        let id = marker.id.as_str();
+        if !page_ids.contains(&id) {
             failures.push(format!(
-                "[limit-set] SET -- §6 of {PLAN} carries the limit {id:?} and says it is \
-                 published, and {LIMITS} does not carry it.\n    Either the limits page dropped \
-                 it -- a gap this project knows about and no longer tells anyone about, which is \
-                 the direction #224 exists for -- or the limit stopped being published on purpose \
-                 and its marker should now read `{OFF_PAGE} {id} -- why -->`.\n    Do not close \
-                 this by deleting the §6 marker."
+                "[limit-set] SET -- {source} carries the limit {id:?} and says it is published, \
+                 and {LIMITS} does not carry it.\n    Either the limits page dropped it -- a gap \
+                 this project knows about and no longer tells anyone about, which is the \
+                 direction #224 exists for -- or the limit stopped being published on purpose and \
+                 its marker should now read `{OFF_PAGE} {id} -- why -->`.\n    Do not close this \
+                 by deleting the marker in {source}."
             ));
         }
     }
     for id in &page_ids {
-        if !published_ids.contains(id) {
-            let known_off_page = off_page.iter().any(|m| m.id == *id);
-            let why = if known_off_page {
-                format!(
-                    "§6 declares {id:?} deliberately NOT on the limits page, and the limits page \
-                     carries it anyway. One of the two is stale: either the limit really is \
-                     published now and the marker should become `{PUBLISHED} {id} -->`, or the \
-                     page is publishing something §6's own reason says it does not."
-                )
-            } else {
-                format!(
-                    "{LIMITS} publishes the limit {id:?} and §6 of {PLAN} does not enumerate it \
-                     at all. §6 is where `CLAUDE.md`'s `known-limit` rule sends whoever closes a \
-                     limit to find every surface it touches, so a limit missing from it is a \
-                     limit the next sweep will not know exists."
-                )
-            };
-            failures.push(format!("[limit-set] SET -- {why}"));
+        if published.iter().any(|(_, m)| m.id == *id) {
+            continue;
         }
+        let declared_off_page = off_page.iter().find(|(_, m)| m.id == *id);
+        let why = if let Some((source, _)) = declared_off_page {
+            format!(
+                "{source} declares {id:?} deliberately NOT on the limits page, and the limits \
+                 page carries it anyway. One of the two is stale: either the limit really is \
+                 published now and the marker should become `{PUBLISHED} {id} -->`, or the page \
+                 is publishing something that document's own reason says it does not."
+            )
+        } else {
+            format!(
+                "{LIMITS} publishes the limit {id:?} and the plan document that owns it does not \
+                 enumerate it at all -- searched: {}. Those documents are where `CLAUDE.md`'s \
+                 `known-limit` rule sends whoever closes a limit to find every surface it touches, \
+                 so a limit missing from all of them is a limit the next sweep will not know \
+                 exists.\n    Add it to the plan document that owns the work which created it -- \
+                 not to whichever one is nearest.",
+                sources
+                    .iter()
+                    .map(|s| s.path)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        failures.push(format!("[limit-set] SET -- {why}"));
     }
 
-    failures.extend(unmarked_bullets(plan));
+    for source in sources {
+        failures.extend(unmarked_bullets(source.text, source.path));
+    }
     failures
 }
 
@@ -1429,30 +1831,75 @@ fn duplicates(marks: &[Marker], source: &str, where_: &str) -> Vec<String> {
     out
 }
 
-/// How many limits §6 declares published, for the success line.
+/// One id may be declared once, by one enumerating document, with one verdict.
+///
+/// `decls` is `(id, document, kind)` in source order; the first declaration
+/// wins and every later one is reported against it, so the message names both
+/// sides of the collision rather than only the newcomer.
+fn duplicate_declarations(decls: &[(&str, &str, &str)]) -> Vec<String> {
+    let mut seen: Vec<(&str, &str, &str)> = Vec::new();
+    let mut out = Vec::new();
+    for (id, source, kind) in decls {
+        if let Some((_, first_source, first_kind)) = seen.iter().find(|(other, _, _)| other == id) {
+            out.push(format!(
+                "[limit-set] ID -- {id:?} is declared more than once by the enumerating \
+                 documents: {first_source} declares it {first_kind}, and {source} declares it \
+                 {kind}.\n    An id is one limit's identity and exactly one document owns it. Two \
+                 declarations make the set comparison ambiguous, and a sweep that closes the limit \
+                 in the document it happened to find leaves the other one standing -- a stale gap \
+                 claim in the file the next reader is sent to."
+            ));
+        }
+        seen.push((id, source, kind));
+    }
+    out
+}
+
+/// `(document path, how many limits it declares published)`, one per home.
+type LimitCounts = Vec<(String, usize)>;
+
+/// How many limits each home declares published, for the success line.
 ///
 /// A green build that does not say how many limits it compared cannot be told
 /// apart from one that found none, and the vacuity guard in
-/// [`cross_check_limit_set`] only refuses the fully empty case. Printing the
-/// number puts a shrinking set in front of a human reading a CI log, which is
-/// the same refusal addressed to the only reader who can act on a set that is
-/// still non-empty but has quietly lost half its members.
-fn published_limit_count(plan: &str) -> usize {
-    let normalized = normalize(plan);
-    limit_set_region(&normalized).map_or(0, |region| markers(region, PUBLISHED).len())
+/// [`cross_check_limit_sets`] only refuses the fully empty case. Printing the
+/// numbers **per home** puts a shrinking set in front of a human reading a CI
+/// log, which is the same refusal addressed to the only reader who can act on a
+/// set that is still non-empty but has quietly lost half its members.
+fn published_limit_counts(sources: &[Enumeration<'_>]) -> LimitCounts {
+    sources
+        .iter()
+        .map(|s| {
+            let normalized = normalize(s.text);
+            let count = limit_set_region(&normalized, s.path)
+                .map_or(0, |region| markers(region, PUBLISHED).len());
+            (s.path.to_string(), count)
+        })
+        .collect()
 }
 
-/// Read both documents and cross-check them. Split from
-/// [`cross_check_limit_set`] so the check itself stays pure. Returns the
-/// failures and the size of the set that was compared.
-fn cross_check_files(root: &Path) -> Result<(Vec<String>, usize)> {
-    let plan = fs::read_to_string(root.join(PLAN))
-        .map_err(|err| anyhow::anyhow!("limits-check: cannot read {PLAN}: {err}"))?;
+/// Read every enumerating document and the page, and cross-check them. Split
+/// from [`cross_check_limit_sets`] so the check itself stays pure. Returns the
+/// failures and the size of the set each home contributed.
+fn cross_check_files(root: &Path) -> Result<(Vec<String>, LimitCounts)> {
+    let mut texts = Vec::new();
+    for path in ENUMERATORS {
+        let text = fs::read_to_string(root.join(path))
+            .map_err(|err| anyhow::anyhow!("limits-check: cannot read {path}: {err}"))?;
+        texts.push((*path, text));
+    }
+    let sources: Vec<Enumeration<'_>> = texts
+        .iter()
+        .map(|(path, text)| Enumeration {
+            path,
+            text: text.as_str(),
+        })
+        .collect();
     let page = fs::read_to_string(root.join(LIMITS))
         .map_err(|err| anyhow::anyhow!("limits-check: cannot read {LIMITS}: {err}"))?;
     Ok((
-        cross_check_limit_set(&plan, &page),
-        published_limit_count(&plan),
+        cross_check_limit_sets(&sources, &page),
+        published_limit_counts(&sources),
     ))
 }
 
@@ -1664,19 +2111,58 @@ mod tests {
     // cannot tell a working gate from one that matches nothing.
     // -----------------------------------------------------------------------
 
-    /// The two shipped documents enumerate the same limit set. If this fails,
-    /// one of them gained or lost a limit and the other did not.
+    /// The shipped documents enumerate the same limit set. If this fails, one
+    /// of them gained or lost a limit and the others did not.
     #[test]
     fn the_shipped_documents_enumerate_the_same_limit_set() {
         let root = root();
-        let plan = fs::read_to_string(root.join(PLAN)).expect("plan document exists");
+        let texts: Vec<(&str, String)> = ENUMERATORS
+            .iter()
+            .map(|path| {
+                (
+                    *path,
+                    fs::read_to_string(root.join(path)).expect("enumerating document exists"),
+                )
+            })
+            .collect();
+        let sources: Vec<Enumeration<'_>> = texts
+            .iter()
+            .map(|(path, text)| Enumeration {
+                path,
+                text: text.as_str(),
+            })
+            .collect();
         let page = fs::read_to_string(root.join(LIMITS)).expect("limits page exists");
-        let failures = cross_check_limit_set(&plan, &page);
+        let failures = cross_check_limit_sets(&sources, &page);
         assert!(
             failures.is_empty(),
             "limit set drifted:\n{}",
             failures.join("\n")
         );
+    }
+
+    /// **Every registered home actually contributes.** `ENUMERATORS` is a
+    /// hand-written list, and a path added to it that enumerates nothing would
+    /// make the gate's success line read like coverage it does not have. The
+    /// per-home rule inside the check refuses that at run time; this refuses it
+    /// against the tree that ships, which is where a stub region would sit.
+    #[test]
+    fn every_registered_home_enumerates_at_least_one_limit() {
+        let root = root();
+        assert!(
+            !ENUMERATORS.is_empty(),
+            "no enumerating document registered"
+        );
+        for path in ENUMERATORS {
+            let text = fs::read_to_string(root.join(path)).expect("enumerating document exists");
+            let normalized = normalize(&text);
+            let region = limit_set_region(&normalized, path).expect("region delimited");
+            let declared = markers(region, PUBLISHED).len() + markers(region, OFF_PAGE).len();
+            assert!(
+                declared > 0,
+                "{path} is registered as a home for the limit set and declares no limit"
+            );
+        }
     }
 
     /// A minimal pair of documents that agree, so each test below can introduce
@@ -1851,11 +2337,21 @@ mod tests {
     fn a_comparison_between_two_empty_sets_is_refused_rather_than_passing() {
         let plan = format!("{REGION_BEGIN}\n\n{REGION_END}\n");
         let failures = cross_check_limit_set(&plan, "# limits\n\nNo markers anywhere.\n");
-        assert_eq!(failures.len(), 1, "{failures:#?}");
+        // Two failures, and they are different refusals rather than one
+        // reported twice: the home declares nothing (so it is a region, not an
+        // enumeration), AND the union has nothing to compare against the page.
+        // The second is the one that survives when several homes each declare
+        // only off-page limits, which is why both exist.
+        assert_eq!(failures.len(), 2, "{failures:#?}");
         assert!(
-            failures[0].contains("nothing to compare"),
-            "{}",
-            failures[0]
+            failures.iter().any(|f| f.contains("nothing to compare")),
+            "{failures:#?}"
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("declares no limit at all")),
+            "{failures:#?}"
         );
     }
 
@@ -1949,6 +2445,178 @@ mod tests {
         for line in ["- a", "* a", "+ a", "1. a", "12) a"] {
             assert!(is_top_level_item(line), "{line:?} is a list item");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // More than one enumerating home. Every test here exists because the
+    // single-document version did not have to answer the question, and a rule
+    // nobody has seen fail is the thing this module refuses to ship.
+    // -----------------------------------------------------------------------
+
+    /// Two homes, each owning its own limits, and a page carrying both. This is
+    /// the shape the tree actually ships, and the tests below each break it in
+    /// exactly one place.
+    fn two_homes() -> (String, String, String) {
+        let ws_e = format!(
+            "{REGION_BEGIN}\n\n\
+             - <!-- limit: no-key-repeat-on-drm -->\n  **A held key does not repeat.**\n\n\
+             {REGION_END}\n"
+        );
+        let phase_2 = format!(
+            "{REGION_BEGIN}\n\n\
+             - <!-- limit: host-must-permit-userns -->\n  **The host must permit it.**\n\n\
+             {REGION_END}\n"
+        );
+        let page = "# limits\n\n<!-- limit: no-key-repeat-on-drm -->\n**One character.**\n\n\
+                    <!-- limit: host-must-permit-userns -->\n**It refuses to start.**\n"
+            .to_string();
+        (ws_e, phase_2, page)
+    }
+
+    fn homes<'a>(ws_e: &'a str, phase_2: &'a str) -> Vec<Enumeration<'a>> {
+        vec![
+            Enumeration {
+                path: PLAN,
+                text: ws_e,
+            },
+            Enumeration {
+                path: PHASE_2,
+                text: phase_2,
+            },
+        ]
+    }
+
+    #[test]
+    fn the_two_home_pair_is_clean_so_the_tests_below_isolate_one_change() {
+        let (ws_e, phase_2, page) = two_homes();
+        assert!(cross_check_limit_sets(&homes(&ws_e, &phase_2), &page).is_empty());
+    }
+
+    /// **The direction #286 walked into.** A limit published on the page with no
+    /// enumerating home at all is the state the gate was in before Phase 2 got
+    /// a region, and it must stay red -- a home is what the next sweep is sent
+    /// to, so a limit with none is one nobody will find.
+    #[test]
+    fn a_published_limit_no_home_enumerates_still_fails() {
+        let (ws_e, phase_2, page) = two_homes();
+        let page = format!("{page}\n<!-- limit: nobody-owns-this -->\n**Orphaned.**\n");
+        let failures = cross_check_limit_sets(&homes(&ws_e, &phase_2), &page);
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(
+            failures[0].contains("does not enumerate it"),
+            "{}",
+            failures[0]
+        );
+        // The message must name every home it searched, or the reader cannot
+        // tell a missing entry from a home that was never consulted.
+        assert!(
+            failures[0].contains(PLAN) && failures[0].contains(PHASE_2),
+            "{}",
+            failures[0]
+        );
+    }
+
+    /// **A registered home that enumerates nothing is refused.** This is the
+    /// carve-out the multi-home shape would otherwise be: register a document,
+    /// leave its region empty, and the page's markers all pass against the other
+    /// home's set while the new document holds nothing at all.
+    #[test]
+    fn a_home_that_enumerates_nothing_fails() {
+        let (ws_e, _, page) = two_homes();
+        let empty = format!("{REGION_BEGIN}\n\nProse, and no limits.\n\n{REGION_END}\n");
+        let page = page.replace(
+            "<!-- limit: host-must-permit-userns -->\n**It refuses to start.**\n",
+            "",
+        );
+        let failures = cross_check_limit_sets(&homes(&ws_e, &empty), &page);
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(
+            failures[0].contains("declares no limit at all"),
+            "{}",
+            failures[0]
+        );
+        assert!(failures[0].contains(PHASE_2), "{}", failures[0]);
+    }
+
+    /// **One id, one home.** Two documents claiming the same limit is how a
+    /// sweep closes it in the one it found and leaves the other standing.
+    #[test]
+    fn an_id_claimed_by_two_homes_fails() {
+        let (ws_e, phase_2, page) = two_homes();
+        let phase_2 = phase_2.replace("host-must-permit-userns", "no-key-repeat-on-drm");
+        let page = page.replace(
+            "<!-- limit: host-must-permit-userns -->\n**It refuses to start.**\n",
+            "",
+        );
+        let failures = cross_check_limit_sets(&homes(&ws_e, &phase_2), &page);
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(failures[0].contains("more than once"), "{}", failures[0]);
+        assert!(
+            failures[0].contains(PLAN) && failures[0].contains(PHASE_2),
+            "{}",
+            failures[0]
+        );
+    }
+
+    /// The same collision across *kinds*: one home publishes what another
+    /// declares deliberately unpublished. Neither direction of the set
+    /// comparison sees it -- the id is published somewhere and it is on the
+    /// page -- so only the one-declaration rule can.
+    #[test]
+    fn an_id_one_home_publishes_and_another_declares_off_page_fails() {
+        let (ws_e, _, page) = two_homes();
+        let phase_2 = format!(
+            "{REGION_BEGIN}\n\n\
+             - <!-- limit-not-on-page: no-key-repeat-on-drm -- a reason somebody wrote -->\n  \
+             **The same limit, declared unpublished.**\n\n{REGION_END}\n"
+        );
+        let page = page.replace(
+            "<!-- limit: host-must-permit-userns -->\n**It refuses to start.**\n",
+            "",
+        );
+        let failures = cross_check_limit_sets(&homes(&ws_e, &phase_2), &page);
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(failures[0].contains("more than once"), "{}", failures[0]);
+        assert!(failures[0].contains("off-page"), "{}", failures[0]);
+    }
+
+    /// **Rule 2 runs over every home**, not only the first. Without this, the
+    /// new region would be the one place a limit could be written down and told
+    /// to nobody -- which is the exact failure rule 2 exists for.
+    #[test]
+    fn an_unmarked_bullet_in_the_second_home_fails() {
+        let (ws_e, phase_2, page) = two_homes();
+        let phase_2 = phase_2.replace(
+            REGION_END,
+            &format!("- **A limit added to the new region with no marker.**\n\n{REGION_END}"),
+        );
+        let failures = cross_check_limit_sets(&homes(&ws_e, &phase_2), &page);
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(failures[0].contains("BULLET"), "{}", failures[0]);
+        assert!(failures[0].contains(PHASE_2), "{}", failures[0]);
+    }
+
+    /// A home whose region is gone stops the comparison rather than turning
+    /// every limit it owns into a "published with no home" report. The real
+    /// cause is one line; a pile of derived failures buries it.
+    #[test]
+    fn a_home_with_no_region_stops_the_comparison() {
+        let (ws_e, phase_2, page) = two_homes();
+        let phase_2 = phase_2.replace(REGION_BEGIN, "");
+        let failures = cross_check_limit_sets(&homes(&ws_e, &phase_2), &page);
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(failures[0].contains("REGION"), "{}", failures[0]);
+        assert!(failures[0].contains(PHASE_2), "{}", failures[0]);
+    }
+
+    /// No home at all compares the page against nothing, which every rule
+    /// satisfies. Rule 5, one level up.
+    #[test]
+    fn no_enumerating_home_at_all_is_refused() {
+        let (_, _, page) = two_homes();
+        let failures = cross_check_limit_sets(&[], &page);
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(failures[0].contains("REGION"), "{}", failures[0]);
     }
 
     /// Vendored third-party trees never satisfy or break an absence check.

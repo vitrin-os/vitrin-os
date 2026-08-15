@@ -65,6 +65,40 @@
 //!                                device, no seat and no GPU and therefore
 //!                                cannot run a GUI application at all.
 //!
+//! cargo xtask isolation-matrix   Regenerate docs/book/src/isolation-matrix.md
+//!                                (P2.6.3, issue #187): the Landlock ABI
+//!                                matrix -- what this build REQUIRES of a
+//!                                kernel's Landlock, one row per ABI rung,
+//!                                each row naming the right it buys, what it
+//!                                does NOT buy, and the published claim it
+//!                                carries.
+//!
+//!                                Like session-matrix and unlike a probe, it
+//!                                reads the repository and never the machine:
+//!                                the ladder is PARSED out of
+//!                                crates/vitrin-realm-init/src/landlock.rs and
+//!                                the floor/ceiling out of that crate's
+//!                                lib.rs, so the page is byte-identical on a
+//!                                development box reporting Landlock ABI 9 and
+//!                                on a CI runner reporting ABI 7. A probing
+//!                                generator could not be, and `--check` would
+//!                                then be red on every pull request. The
+//!                                machine half stays `vitrind
+//!                                --print-isolation`, which the page tells the
+//!                                reader how to read against it.
+//!
+//! cargo xtask isolation-matrix --check
+//!                                Verify the checked-in page is byte-identical
+//!                                to what the generator emits. Reads only.
+//!                                This is what CI runs, and it goes red for
+//!                                the reasons the page's own runbook lists:
+//!                                a hand edit, a right moved to another rung,
+//!                                a re-tuned ABI floor, a row with no
+//!                                published claim, a published claim with no
+//!                                row, or a cited sentence deleted from
+//!                                docs/book/src/limits.md, README.md or
+//!                                SECURITY.md.
+//!
 //! cargo xtask limits-check       Verify every published claim in the table in
 //!                                src/limits.rs is (a) present on every surface
 //!                                that must carry it and (b) still true of the
@@ -96,6 +130,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+mod isolation_matrix;
 mod limits;
 mod session_matrix;
 
@@ -115,7 +150,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask limits-check"
+    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask limits-check"
 }
 
 fn run() -> Result<()> {
@@ -203,6 +238,23 @@ fn run() -> Result<()> {
                 }
             }
             session_matrix::session_matrix(&workspace_root()?, check)
+        }
+        "isolation-matrix" => {
+            let mut check = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--check" => check = true,
+                    "-h" | "--help" => {
+                        println!("{}", usage());
+                        return Ok(());
+                    }
+                    other => bail!(
+                        "unknown flag '{other}' for 'isolation-matrix'\n\n{}",
+                        usage()
+                    ),
+                }
+            }
+            isolation_matrix::isolation_matrix(&workspace_root()?, check)
         }
         "limits-check" => {
             // No flags: the check has exactly one mode. A `--check` spelling

@@ -140,8 +140,16 @@ inferred from the word "Landlock":
   runner its CI uses answered `landlock.abi=7` on 2026-08-14, so a floor of 8
   or 9 would be a rule no CI job could exercise. **That second number lives
   only in a job log** — it was read out of CI's own diagnostic step, and no
-  checked-in artefact here carries it; the `host-must-have-landlock` entry
-  below states that bound and what it costs. **Which kernel
+  checked-in artefact here carries the *measurement*; the
+  `host-must-have-landlock` entry below states that bound and what it costs.
+  What a checked-in file does carry, since issue
+  [#288](https://github.com/vitrin-os/vitrin-os/issues/288), is the *claim*:
+  `.github/workflows/ci.yml`'s `rust` job sets `VITRIN_REQUIRE_LANDLOCK_ABI:
+  "7"`, which turns every Landlock rung measurement at or below 7 from a test
+  that may skip into a test that must run. That does not re-take the
+  measurement and must not be read as one — it asserts it, so a runner image
+  that dropped below 7 would turn the job red instead of skipping five
+  measurements quietly, which is what those five did before. **Which kernel
   releases that excludes is not stated here, because it was not measured here**
   — the ABI-to-release mapping is a fact about mainline, and no third machine
   was asked. **This narrows P2.6.3 rather than completing it**: PRD §20's
@@ -757,6 +765,53 @@ implemented and wired on the nested backend. The zero-memcpy assertion needs
 a real GPU (EGL + a DRM render node) and runs only under
 `VITRIN_GPU_TESTS=1 cargo test -p vitrin-core --features gpu-tests --
 --ignored dmabuf`. CI is GPU-free and exercises the shm path exclusively.
+
+**Four `#[test]` functions in this repository run in no CI job at all, and
+here they are by name.** Issue
+[#288](https://github.com/vitrin-os/vitrin-os/issues/288) made this a checked
+number rather than a sentence: `cargo xtask skip-scan` parses every `#[test]`
+in the tree, works out which CI step compiles *and* selects it, and fails
+until each one that no step runs is listed in `UNRUN_TESTS`
+(`crates/xtask/src/test_census.rs`) with a reason and either a pointer to
+this page or the name of a test that executes it as a child process. **The
+sentence you have just read is generated from that table and matched against
+this page**, so adding a fifth gap is a red build until somebody writes both
+the fifth bullet *and* the word "Five" above it — the first version of this
+paragraph checked the names and left the number to prose, which is the exact
+shape of overclaim this page exists to refuse. Twenty-four tests were selected
+by no CI run when that check first ran, and the arithmetic is meant to be
+checkable: nineteen were wired into a job instead — which is what the check
+pushes toward — four are the bullets below, and the twenty-fourth is the
+two-process case described after them, which does execute. (Those historical
+numbers are prose; nothing re-derives them.)
+
+- `dmabuf::gpu_tests::real_gpu_dmabuf_frames_are_zero_copy_end_to_end` — needs
+  a real GPU whose renderer imports XRGB8888+LINEAR dmabufs.
+- `dmabuf::gpu_tests::real_gpu_probe_accepts_dmabuf_and_kills_memfd_lie` —
+  needs an EGL device and a DRM render node; a GitHub runner has neither.
+- `dmabuf::gpu_tests::real_gpu_oversized_dmabuf_center_crops_the_full_view` —
+  the same GPU, plus the same per-driver import reality (plan risk R3).
+- `screenshot::tests::measure_encode_cost_at_a_real_panel_size` — not a
+  hardware gap at all: it is a *measurement*, timing a 2560×1600 PNG encode
+  and printing the number. There is no assertion in it for CI to fail, and a
+  shared runner's timing would not be a number anybody could act on. It is
+  listed here so the count stays honest, not because a machine is missing.
+
+What this list does **not** claim is that everything absent from it is
+well-tested. It measures whether a test runs, never whether it asserts
+anything — and it covers Rust `#[test]` functions only. The C shim's Meson
+suites, the Python integration ladder and the SDK's pytest suite each carry
+their own collection floors (`tests/integration/run.sh`,
+`sdk/python/tests/conftest.py`), and those are separate machinery with
+separate bounds.
+
+One further test — `spawn::isolation::tests::probe_under_ignored_sigchld` —
+is selected by no CI run either, and is deliberately **not** on the list
+above, because it does execute: it is the child half of a two-process test,
+re-executed by name under an ignored `SIGCHLD` by
+`a_launcher_that_ignores_sigchld_still_measures`, which CI does run. The
+check holds that claim to the source, so a rename that broke the chain would
+be red rather than quiet.
 
 <!-- limit: drm-has-no-ci-gate -->
 **The DRM/KMS backend will never have a green gate behind it, and that is the

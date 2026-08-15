@@ -393,6 +393,28 @@ grant.pointer.click(640, 84)</pre>
       your machine; packaging that makes the grant routine is tracked as
       <a href="https://github.com/vitrin-os/vitrin-os/issues/286">issue
       #286</a>.</p>
+      <p><strong>There is now an AppArmor profile for exactly this, at
+      <code>packaging/apparmor/vitrind</code>, and it has never been loaded by
+      anyone who wrote it.</strong> It is the per-binary grant Ubuntu ships a
+      mechanism for &mdash; the shape Chromium, Firefox and flatpak already use
+      &mdash; taken instead of asking operators to weaken a system-wide
+      default. It was written on a machine with AppArmor compiled out, so it
+      has not been parsed, loaded, attached or observed to grant anything.
+      <strong>Do not install it expecting it to work.</strong> A CI job that
+      runs on a runner whose userns sysctl it never touches (installing the
+      <code>apparmor</code> package does load the distro's own profiles) is what
+      will say: it loads the
+      profile, spawns a real realm, then removes the profile and requires the
+      spawn to fail again. Installing it also has a published cost &mdash; the
+      profile's name can be borrowed by any local user through
+      <code>aa-exec</code>, though whether that borrow yields a user namespace
+      turns on <code>kernel.apparmor_restrict_unprivileged_unconfined</code>,
+      at which value AppArmor stacks the borrowed profile with
+      <code>unconfined</code> rather than transitioning to it. Measured
+      <code>0</code> on a stock runner, so the borrow works and the cost is
+      real. Both are stated in full, with citations, on the
+      <a href="https://github.com/vitrin-os/vitrin-os/blob/main/docs/book/src/limits.md">limits
+      page</a>.</p>
       <p><strong>And since P2.6.3 there is a second host requirement, with a
       different remedy.</strong> The Landlock ruleset is part of the
       confinement floor, so the kernel must actually have Landlock: a kernel

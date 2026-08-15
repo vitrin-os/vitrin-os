@@ -555,10 +555,104 @@ to look. What nothing published said, until this entry, was that a host may
 need to be granted something *at all* before the default isolation will run —
 so an operator met a stop rather than a prerequisite. Making that grant
 routine, so that installing this project satisfies it, is
-[#286](https://github.com/vitrin-os/vitrin-os/issues/286). Until it lands, an
-operator on such a machine has to arrange the grant themselves.
+[#286](https://github.com/vitrin-os/vitrin-os/issues/286).
 `--isolation=off` is **not** that arrangement: it starts an unconfined session,
 and every confinement claim on this page stops applying to it.
+
+**There is now an AppArmor profile in the tree, and it has never been loaded by
+anyone who wrote it.** `packaging/apparmor/vitrind` is the per-binary grant
+Ubuntu ships a mechanism for — the same shape the `chrome`, `firefox` and
+`flatpak` profiles in Ubuntu 24.04's own `apparmor` package already use, chosen
+over telling operators to weaken a system-wide default. It was written on a
+machine with AppArmor **compiled out**
+(`/sys/module/apparmor/parameters/enabled` reads `N`), so it has not been
+parsed, not loaded, not attached, and not observed to grant anything. That is
+not modesty about a thing that probably works; it is the entire state of the
+evidence. **Do not install it expecting it to work, and do not cite it as
+closing anything.**
+
+Two different kinds of claim are in play in that paragraph and this page keeps
+them apart, because an earlier draft did not. The profile's **behaviour** is
+unmeasured — that is the sentence above. The profile's **form** is cited: every
+structural choice in it is copied from a profile Ubuntu actually ships, and the
+file's own header carries a provenance block naming the URL each one was
+fetched from and the date. An earlier draft named `bubblewrap` in that list
+from memory; the `bwrap-userns-restrict` profile is not in 24.04's `apparmor`
+package at all, and the claim is gone rather than softened. If you are checking
+this page against reality, check the header's URLs — that is what they are
+there for.
+
+What exists instead of a result is an instrument. The `apparmor-profile` job in
+`.github/workflows/ci.yml` runs on a `ubuntu-latest` runner it does **not**
+modify — it is the only job in that workflow that never touches
+`kernel.apparmor_restrict_unprivileged_userns`, and it refuses to run at all if
+that knob is not `1` when it starts. It installs the profile, loads it, spawns
+a real realm, runs the real-app confinement gate, then **removes the profile
+and requires the spawn to fail again**. When that job has run green, this
+paragraph gets rewritten against what it reported. Until then the honest
+statement is the one above: a profile is written, and a job exists that will
+say.
+
+One question decides whether the profile is worth anything, and it is the
+question the job is built around. `vitrind` does not create the user namespace
+itself — it `execve`s `vitrin-realm-init`, which does. If an AppArmor grant does
+not survive that exec, the profile fixes the core's startup and **not** the
+realm's spawn, which is worse than shipping nothing because the refusal moves
+somewhere less legible. The profile is written to make that question moot (one
+attachment glob covering both binaries, so the exec is same-label and performs
+no transition at all) rather than to bet on an answer nobody could find
+documented. Whether that works is unmeasured.
+
+**And the profile has a security cost, which is published here rather than
+buried in the file — but it is conditional, and an earlier draft of this page
+stated the condition backwards.** A profile of this shape —
+`flags=(unconfined)` carrying a `userns` rule — is a name any local user may
+try to borrow: `aa-exec -p vitrind -- <anything>` asks to run an arbitrary
+program under a profile that grants a user namespace and restricts nothing
+else. Installing this file adds one entry to the set of names that can be asked
+for. It is the same cost Ubuntu already accepted for `chrome`, `firefox` and
+`flatpak`, which is company rather than a justification.
+
+Whether the ask *succeeds* depends on a second knob,
+`kernel.apparmor_restrict_unprivileged_unconfined`, and **it has now been
+measured: `0`.** Recorded by the `apparmor profile` CI job as
+`RESULT unconfined_knob=0` on a stock `ubuntu-latest` (kernel
+`6.17.0-1020-azure`, 2026-08-15), on the same machine and in the same run that
+`apparmor_restrict_unprivileged_userns` read `1`.
+
+**So the cost is real and unmitigated.** At `0`, `aa-exec -p vitrind` borrows
+this profile's name and the borrower is genuinely unconfined — any local user
+can obtain an unprivileged user namespace by naming a profile they do not own.
+That is the price of installing this file, and it does not depend on vitrin
+being installed or running.
+
+This page asserted that knob twice before measuring it, wrongly in both
+directions — first `0` for the wrong reason, then `1` on the strength of the
+AppArmor project's [userns-restriction wiki page][aa-userns] describing what
+upstream intends `/usr/lib/sysctl.d/10-apparmor.conf` to contain, which is not
+the same as reading what Ubuntu ships. The measurement happens to agree with
+the first guess. It was still a guess, and the second correction was confidently
+wrong, which is why the job now records this knob on every run rather than
+leaving it to prose.
+
+Had it read `1`, the [unconfined-restriction page][aa-unconf] describes
+`change_profile` — what `aa-exec -p` performs — as stacking rather than
+transitioning, so the borrow would shed nothing. That is the branch this page
+does **not** get to claim, on this runner.
+
+So: the cost is real where an operator has set that knob to `0`, and is
+mitigated by the stacking behaviour where Ubuntu's shipped `1` is in force.
+Neither half has been measured by this project — the correction above is a
+citation, not an experiment — which is why the `apparmor-profile` CI job
+records the knob's value on its runner and refuses to report a verdict without
+it. `vitrind --print-isolation` reports the same knob as
+`policy.apparmor_restrict_unprivileged_unconfined`, so you can read your own
+machine's answer, and its own AppArmor label as `apparmor.label` — the row that
+tells "no profile attached" apart from "a profile attached and granted
+nothing", which are otherwise the same errno.
+
+[aa-userns]: https://gitlab.com/apparmor/apparmor/-/wikis/unprivileged_userns_restriction
+[aa-unconf]: https://gitlab.com/apparmor/apparmor/-/wikis/unprivileged_unconfined_restriction
 
 **This is not the only host requirement, and the two are easy to confuse.** The
 entry immediately below is a second one — the kernel must actually have

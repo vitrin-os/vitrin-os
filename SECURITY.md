@@ -205,6 +205,26 @@ does not spend a weekend on something the project already says out loud:
   cross-kernel matrix. Report a *silent* degradation here; a loud refusal is
   the feature. Note that anything reproduced under `--isolation=off` is a
   finding about an explicitly unconfined session and is triaged as such.
+  **`packaging/apparmor/vitrind` is the per-binary grant for such a host, and
+  it has never been loaded by anyone who wrote it** — authored on a machine
+  with AppArmor compiled out, so unparsed, unloaded and unobserved; the
+  `apparmor-profile` CI job is the instrument that will say. Two things about
+  it are worth a reporter's attention rather than a report. First, a profile of
+  that shape (`flags=(unconfined)` carrying a `userns` rule) is a **name any
+  local user may try to borrow** with `aa-exec -p vitrind`. Whether that borrow
+  yields an unrestricted user namespace depends on
+  `kernel.apparmor_restrict_unprivileged_unconfined`: at `0` it does, and at
+  `1` AppArmor stacks the borrowed profile with `unconfined` instead of
+  transitioning to it, so the restriction is retained. **Measured `0` on a
+  stock `ubuntu-latest` (2026-08-15), so on that machine the borrow works and
+  the cost is real and unmitigated.** Either way it is a known, published property of the mechanism
+  Ubuntu ships, shared with the `chrome`, `firefox` and `flatpak` profiles, and
+  is not a vulnerability in this project. **Do send us a report if you can show
+  the borrow succeeding on a host where that knob reads `1`** — that would
+  contradict the cited behaviour rather than restate it, and the limits page
+  spells out exactly which sentence it would falsify. Second, a session that
+  came up **only** because that profile was borrowed is not a confined session
+  this project claims anything about.
 - **A missing Landlock also refuses the session, and that is designed
   behaviour too.** Since P2.6.3 the ruleset is in this build's confinement
   *floor*, so a kernel that answers the ABI query with `ENOSYS` no longer

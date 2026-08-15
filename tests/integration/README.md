@@ -404,6 +404,45 @@ predates K9b** (2026-08-15), after which `bwrap` is refused at
 kept as the measurement that located the cause, not as a description of a
 current run.
 
+### `apparmor-realm-probe.py` — which AppArmor label each process ended up in
+
+```bash
+PYTHONPATH=sdk/python/src VITRIN_REPO="$PWD" \
+  python3 tests/integration/apparmor-realm-probe.py --expect spawn
+```
+
+Boots one core with `--isolation=default`, waits for a realm's shim to appear
+two levels down, and prints `comm` plus AppArmor label for the core, the helper
+and the shim. `--expect refusal` inverts it: the core must *fail* to start with
+issue [#286](https://github.com/vitrin-os/vitrin-os/issues/286)'s signature, so
+one script serves as both directions of a lever.
+
+The second instrument in this directory that is **not** a test module, and the
+hyphen in its name is what keeps it that way — `unittest discover` cannot
+collect an unimportable filename, so `run.sh`'s three lists have nothing to say
+about it and no suite's coverage claim includes it. Same posture as
+`landlock-denials.sh` above: it asserts a verdict for its one caller and is
+evidence for no milestone.
+
+Its one caller is the `apparmor-profile` job in `.github/workflows/ci.yml`,
+which runs on a `ubuntu-latest` runner it does not modify. The question that
+job exists for cannot be answered by starting the core: `vitrind` does not
+create the user namespace, it `execve`s `vitrin-realm-init`, which does. So an
+AppArmor grant that does not survive that exec would fix the core's startup and
+not the realm's spawn — and only a real spawn distinguishes those. Hence a
+realm, not a `--print-isolation`.
+
+`VITRIN_CORE_BIN` (read by `harness.py`, and nothing in this repository sets it
+except that job) points the whole harness at a `vitrind` outside the build
+tree, because AppArmor attaches to a binary's resolved absolute pathname and a
+profile written for an installed core cannot be exercised against
+`target/debug/vitrind`. Set-but-wrong is a hard error, not a fallback, on the
+same rule as `VITRIN_C_SHIM_BIN`: a silent fallback would pass while testing
+the binary the caller was specifically trying not to test. It also refuses a
+`vitrind` with no `vitrin-realm-init` beside it, since the core resolves its
+helper as a sibling and the resulting spawn failure reads like a confinement
+bug.
+
 ## Entry-point contract
 
 The job's steps are gated on this exact path via `hashFiles()`; a guard step

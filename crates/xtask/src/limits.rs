@@ -1021,6 +1021,151 @@ pub const CLAIMS: &[Claim] = &[
         ],
     },
     Claim {
+        id: "apparmor-profile-is-unproven",
+        says: "an AppArmor profile for the requirement above EXISTS in the tree \
+               (`packaging/apparmor/vitrind`) and has NEVER BEEN LOADED by anyone who wrote it. \
+               Every surface says both halves: that the profile is there, and that its state of \
+               evidence is zero. A CI job is what will settle it, and it has not reported yet.",
+        issue: "#286 -- and this row exists precisely because #286 is NOT closed by the profile \
+                landing. The profile is the artefact; the `apparmor-profile` job is the \
+                deliverable that can say anything about it.",
+        // TWO anchors per surface, and the second one is again the
+        // load-bearing half. The first pins the ARTEFACT (a page that stopped
+        // naming the profile's path has stopped telling a reader where to
+        // look). The second pins the BOUND -- and this is the anchor a later
+        // editor is most likely to delete, because "has never been loaded" is
+        // exactly the sentence that reads like it needs tidying once the job
+        // has run once. Deleting it without a measurement turns four pages
+        // into a claim that a profile works, which is the single overclaim
+        // this whole task was shaped to avoid. When the job HAS run green,
+        // rewrite the pages against what it reported and change this row's
+        // anchors deliberately, in the same commit.
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "packaging/apparmor/vitrind",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "has never been loaded",
+            },
+            Anchor {
+                path: README,
+                needle: "packaging/apparmor/vitrind",
+            },
+            Anchor {
+                path: README,
+                needle: "has never been loaded",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "packaging/apparmor/vitrind",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "has never been loaded",
+            },
+            Anchor {
+                path: SITE,
+                needle: "packaging/apparmor/vitrind",
+            },
+            Anchor {
+                path: SITE,
+                needle: "has never been loaded",
+            },
+        ],
+        evidence: &[
+            // This row was VACUOUS when first written, and the fix is worth
+            // recording because the same trap is available to every future
+            // row here. The needle was `userns,`; commenting the rule out of
+            // the profile left the gate GREEN, because the profile's own
+            // header comment quoted the rule while explaining it and
+            // `normalize` collapses whitespace, so no amount of surrounding
+            // indentation could separate the rule from its documentation.
+            // The check was being satisfied by the PROSE ABOUT the grant.
+            //
+            // The first fix added the opening brace of the profile body to the
+            // needle -- `{ userns,` -- on the theory that a structural feature
+            // of the rule's POSITION is something prose has no occasion to
+            // write. That theory was wrong within one edit. The profile's
+            // header was rewritten to document the anchor, the new paragraph
+            // named the needle verbatim, and the gate went green again with
+            // the rule commented out. Prose about an anchor is prose that
+            // contains the anchor.
+            //
+            // So the needle is now the whole of the declaration's last line
+            // PLUS the rule: attachment glob, flags, brace and grant, as one
+            // contiguous string. A comment cannot reproduce it by accident,
+            // because reproducing a multi-line construct in a comment puts a
+            // `#` between the lines and `#` survives `normalize`. Verified the
+            // only way this can be verified -- comment the rule out, watch
+            // this row go RED, restore -- and the profile's own header now
+            // instructs the next editor to re-run that lever after touching
+            // the HEADER, not only after touching the rule, because the header
+            // is what broke it last time.
+            // ONE needle where there were two, and the merge is the point
+            // rather than tidying. The old pair was `{ userns,` for the grant
+            // and `vitrin-realm-init} flags=(unconfined)` for the attachment;
+            // the second is a substring of what the first should always have
+            // been, so it constrained nothing the first did not, while reading
+            // like a second independent check. Anchoring the declaration and
+            // the rule as ONE contiguous string is strictly stronger than
+            // either: it fails if the grant goes, if the helper leaves the
+            // glob, if the install path moves, if the flag changes, or if
+            // anything is inserted between the brace and the rule.
+            //
+            // The install path is inside the needle for a reason worth
+            // stating: AppArmor attaches to a resolved absolute pathname, so
+            // the path in this line is not a detail of the profile, it IS the
+            // profile's binding to the binaries. The `apparmor-profile` CI job
+            // installs to exactly this path, and a change here that the job
+            // does not follow produces a profile that loads, attaches to
+            // nothing, and fails with the errno it was written to remove.
+            Evidence::Contains {
+                path: "packaging/apparmor/vitrind",
+                needle: "profile vitrind /usr/lib/vitrin/{vitrind,vitrin-realm-init} \
+                         flags=(unconfined) { userns,",
+                means: "the profile still carries the one rule that makes it more than a name, \
+                        still attaches at the path CI installs to, and still covers the HELPER \
+                        and not only the core. Each half fails silently and differently. Lose \
+                        the rule and the profile loads, attaches, and confers nothing -- the \
+                        SAME errno as having no profile at all, so nothing downstream notices. \
+                        Narrow the glob to `vitrind` alone and the core still starts and \
+                        `--print-isolation` still clears, while every realm spawn fails one \
+                        execve later at `vitrin-realm-init`, which is the process that actually \
+                        issues the `unshare`. That second outcome is WORSE than shipping no \
+                        profile, because the refusal moves somewhere less legible, and it is \
+                        invisible to every check that only starts the core.",
+            },
+            Evidence::Contains {
+                path: "packaging/apparmor/vitrind",
+                needle: "THIS PROFILE HAS NEVER BEEN LOADED",
+                means: "the profile's own header still states its evidence as zero. This is the \
+                        forcing function for the four pages above: the day somebody has a \
+                        measurement, this sentence is what they have to delete, and deleting it \
+                        fails this gate until the pages are rewritten too. A file that quietly \
+                        became authoritative while every page still called it unproven is drift \
+                        in the direction nobody notices.",
+            },
+            Evidence::Contains {
+                path: ".github/workflows/ci.yml",
+                needle: "apparmor-profile:",
+                means: "the job the pages point at still exists. Every one of those four \
+                        surfaces says 'a job exists that will say', and a page promising an \
+                        instrument that was deleted is worse than a page promising nothing.",
+            },
+            Evidence::Contains {
+                path: ".github/workflows/ci.yml",
+                needle: "THE LEVER: break it, confirm FAIL, restore",
+                means: "the job still removes the profile and requires the failure to come back. \
+                        Without that step every green result it produces is equally explained by \
+                        a runner whose policy drifted, and the job would be measuring the image \
+                        rather than the profile. This is the one step that makes the whole job \
+                        non-vacuous, so it is anchored rather than trusted.",
+            },
+        ],
+    },
+    Claim {
         id: "host-must-have-landlock",
         says: "`vitrind --isolation=default` refuses to start on a host whose kernel has no \
                usable Landlock -- pre-5.13, `CONFIG_SECURITY_LANDLOCK=n`, or `landlock` absent \

@@ -639,8 +639,11 @@ fn remedy_for(mechanism: Mechanism, support: Support, report: &Report) -> String
              {}). That combination means something stripped the capabilities the new user \
              namespace was supposed to confer -- on Ubuntu 24.04+ the usual cause is \
              AppArmor's unprivileged-userns restriction, which permits the unshare and then \
-             confines the process to a profile that denies CAP_SYS_ADMIN inside it. Check \
-             `cat /proc/self/attr/current` from the same context as this core.",
+             confines the process to a profile that denies CAP_SYS_ADMIN inside it. This \
+             core's own label is the `apparmor.label` row of `vitrind --print-isolation`, \
+             and it is what separates `unconfined` (nothing attached) from a named profile \
+             that attached and conferred nothing -- those two are indistinguishable in this \
+             errno alone.",
             report.mount_in_userns
         ));
     }
@@ -659,7 +662,10 @@ fn remedy_for(mechanism: Mechanism, support: Support, report: &Report) -> String
             ("apparmor_restrict_unprivileged_userns", Some("1")) => lines.push(
                 "/proc/sys/kernel/apparmor_restrict_unprivileged_userns is 1 (Ubuntu 24.04+); \
                  either set it to 0 or ship an AppArmor profile for vitrind that grants \
-                 userns creation."
+                 userns creation. This repository carries one at \
+                 `packaging/apparmor/vitrind` -- read its header before installing it: it \
+                 has not been verified to work anywhere, and it names the path the binaries \
+                 have to be installed at for it to attach at all."
                     .to_string(),
             ),
             _ => {}
@@ -667,10 +673,14 @@ fn remedy_for(mechanism: Mechanism, support: Support, report: &Report) -> String
     }
     if lines.is_empty() {
         format!(
-            "None of the three knobs this core reads \
+            "None of the three knobs that could explain this \
              (user.max_user_namespaces, kernel.unprivileged_userns_clone, \
-             kernel.apparmor_restrict_unprivileged_userns) explains it, so no remedy is \
-             offered rather than one being guessed at. The kernel answered `{support}`; \
+             kernel.apparmor_restrict_unprivileged_userns) does, so no remedy is \
+             offered rather than one being guessed at. (This core reads a fourth, \
+             kernel.apparmor_restrict_unprivileged_unconfined, and it is deliberately not in \
+             that list: it sizes what an AppArmor profile for vitrind would COST, and \
+             explains no denial. A knob in a remedy that cannot move the failure is a \
+             fabricated remedy.) The kernel answered `{support}`; \
              `vitrind --print-isolation` prints every row behind that answer. \
              `--isolation=off` starts an UNCONFINED session and is the wrong answer to a \
              machine that could be fixed."
@@ -837,6 +847,23 @@ pub struct Report {
     /// *explanatory*, never authoritative: the namespace probes above already
     /// hold the answer, and these say why.
     pub policy: Vec<(&'static str, Option<String>)>,
+    /// This process's own AppArmor label, or `absent` where AppArmor is not
+    /// the LSM answering (see [`read_apparmor_label`]).
+    ///
+    /// **The one row here that describes the PROCESS rather than the
+    /// machine**, and it is here because on an Ubuntu 24.04+ host it is the
+    /// only thing that separates two outcomes with identical errnos. Where
+    /// `apparmor_restrict_unprivileged_userns=1`, a task labelled
+    /// `unconfined` gets its `unshare` permitted and the capabilities inside
+    /// stripped, so [`Report::mount_in_userns`] answers
+    /// `restricted-by-policy(errno=13)`. A task under a profile that grants
+    /// `userns` should get both — but a profile that loaded and did NOT
+    /// attach, and a profile that attached and did not grant, produce *the
+    /// same* `errno=13`. Only the label tells them apart, and the refusal
+    /// text this module already prints sends operators to read exactly this
+    /// file. Carrying it in the matrix means the diagnosis and its evidence
+    /// arrive together instead of one command apart.
+    pub apparmor_label: Option<String>,
     /// Whether the per-uid upgrade is provisioned on this machine.
     pub subuid_range: bool,
     pub newuidmap: bool,
@@ -904,6 +931,7 @@ impl Report {
             seccomp_filter: probe_seccomp_filter(),
             no_new_privs: probe_no_new_privs(),
             policy: read_policy_knobs(),
+            apparmor_label: read_apparmor_label(),
             subuid_range: has_subuid_range(),
             newuidmap: has_newuidmap(),
         }
@@ -1007,7 +1035,16 @@ impl Report {
         // missing a row, its `tier` cell was computed without that row and can
         // read a rung too high, so it has to be recollected rather than
         // patched. That is the whole reason this number is here.
-        out.push_str("vitrin-isolation 2\n");
+        //
+        // Bumped to 3 for `apparmor.label` and
+        // `policy.apparmor_restrict_unprivileged_unconfined` (issue #286), and
+        // the *reason* differs from the 1 -> 2 bump in a way worth stating:
+        // neither new row feeds [`Report::tier`], so a version-2 matrix's
+        // `tier` cell is still correct. It is missing explanation, not
+        // measurement. A version-2 row set is therefore readable as-is and
+        // only needs recollecting if you want to know *why* its
+        // `mount.in_userns` cell says what it says.
+        out.push_str("vitrin-isolation 3\n");
         out.push_str(&format!("kernel.release={}\n", self.kernel_release));
         for probe in &self.namespaces {
             out.push_str(&format!("{}={}\n", probe.key, probe.support));
@@ -1026,6 +1063,14 @@ impl Report {
                 None => out.push_str(&format!("policy.{key}=unset\n")),
             }
         }
+        // Rendered beside the policy knobs because it explains the same cell
+        // they do, and after them because it is the narrower answer: the knobs
+        // say what the machine's policy is, this says what it decided about
+        // *this* process.
+        out.push_str(&format!(
+            "apparmor.label={}\n",
+            self.apparmor_label.as_deref().unwrap_or("absent")
+        ));
         out.push_str(&format!(
             "provisioning.subuid={}\n",
             if self.subuid_range {
@@ -1359,6 +1404,28 @@ fn read_policy_knobs() -> Vec<(&'static str, Option<String>)> {
             "apparmor_restrict_unprivileged_userns",
             "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
         ),
+        // The knob that decides what the remedy for the one above COSTS
+        // (issue #286). The supported remedy is a per-binary AppArmor profile
+        // -- `packaging/apparmor/vitrind` -- and such a profile is borrowable:
+        // where this is 0, any local unprivileged user can `aa-exec -p
+        // vitrind` into it and obtain the user namespace it grants. Where it
+        // is 1 -- which is what Ubuntu 24.04's `apparmor` package sets, via
+        // /usr/lib/sysctl.d/10-apparmor.conf -- they cannot: AppArmor stacks
+        // the borrowed profile with `unconfined` rather than transitioning to
+        // it, so the restriction is retained. Borrowing the chrome, firefox or
+        // flatpak profiles fails the same way, for the same reason.
+        //
+        // It explains nothing about whether a realm can spawn; it sizes what
+        // shipping the profile hands over, which is a published cost and
+        // therefore worth measuring rather than assuming. That is not a
+        // rhetorical preference: the published version of this cost was once
+        // stated with this knob's default inverted, and it was measuring it
+        // here -- and recording it in CI -- that made the contradiction
+        // findable.
+        (
+            "apparmor_restrict_unprivileged_unconfined",
+            "/proc/sys/kernel/apparmor_restrict_unprivileged_unconfined",
+        ),
     ];
     KNOBS
         .iter()
@@ -1370,6 +1437,62 @@ fn read_policy_knobs() -> Vec<(&'static str, Option<String>)> {
             (*key, value)
         })
         .collect()
+}
+
+/// This process's AppArmor label, or `None` where AppArmor is not the LSM
+/// answering.
+///
+/// # Why this reads two paths in a fixed order, and why the order matters
+///
+/// `/proc/self/attr/current` is **not** an AppArmor file. It is the *active
+/// LSM's* file, and on a SELinux machine it returns an SELinux context. A
+/// reader that took it unconditionally would render an SELinux context under
+/// an `apparmor.` key on every Fedora and RHEL box — a row that is not merely
+/// unhelpful but affirmatively wrong, and wrong in the direction that invents
+/// an AppArmor confinement nobody has.
+///
+/// So the LSM-qualified path is tried first: `/proc/self/attr/apparmor/current`
+/// exists only where AppArmor is stacked in, and its answer is unambiguous.
+/// The unqualified path is consulted **only** as a fallback and **only** when
+/// `/sys/module/apparmor/parameters/enabled` says `Y`, which is the same file
+/// the refusal text and this repository's CI diagnostics already read.
+///
+/// Absence is reported as absence. On the machine this was written on
+/// (AppArmor compiled out) every one of these reads fails and the row renders
+/// `apparmor.label=absent`, which is the truthful answer and is distinguishable
+/// from `apparmor.label=unconfined` — a machine that *has* AppArmor and left
+/// this process unlabelled. Those are different situations with different
+/// remedies, and collapsing them would repeat the mistake this module's own
+/// rule 4 was written about.
+fn read_apparmor_label() -> Option<String> {
+    fn clean(raw: String) -> Option<String> {
+        // The kernel writes a trailing newline, and older kernels a trailing
+        // NUL. A label is a profile name plus an optional ` (mode)` suffix, so
+        // anything else non-printable would be a kernel this code does not
+        // understand; drop such a read rather than render it.
+        let trimmed = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+        if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
+
+    if let Some(label) = fs::read_to_string("/proc/self/attr/apparmor/current")
+        .ok()
+        .and_then(clean)
+    {
+        return Some(label);
+    }
+
+    let enabled = fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+        .map(|s| s.trim() == "Y")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    fs::read_to_string("/proc/self/attr/current")
+        .ok()
+        .and_then(clean)
 }
 
 fn kernel_release() -> String {
@@ -1526,6 +1649,7 @@ mod tests {
             seccomp_filter: Support::Available,
             no_new_privs: Support::Available,
             policy: vec![("max_user_namespaces", Some("1000".to_string()))],
+            apparmor_label: None,
             subuid_range: false,
             newuidmap: false,
         }
@@ -1624,8 +1748,15 @@ mod tests {
             "the remedy must say the mount inside the namespace is what failed: {}",
             refusal.remedy
         );
+        // The pointer to the LSM context, which is the only thing left that
+        // explains this state. It used to be `cat /proc/self/attr/current`,
+        // and moved to the matrix row when `apparmor.label` landed (issue
+        // #286): a shell's label is not necessarily this core's, and the row
+        // is measured by the process that hit the denial. What the assertion
+        // holds is unchanged -- the remedy must send the operator to a label
+        // and not leave them with an errno.
         assert!(
-            refusal.remedy.contains("attr/current"),
+            refusal.remedy.contains("apparmor.label"),
             "and must point at the LSM context, the only thing left that explains it: {}",
             refusal.remedy
         );
@@ -1712,7 +1843,7 @@ mod tests {
         let first = report.render();
         let second = report.render();
         assert_eq!(first, second);
-        assert!(first.starts_with("vitrin-isolation 2\n"));
+        assert!(first.starts_with("vitrin-isolation 3\n"));
         assert!(first.contains("tier=intra-user\n"));
         assert!(first.contains(&format!(
             "landlock.abi={}\n",
@@ -1729,6 +1860,67 @@ mod tests {
         let rendered = report.render();
         assert!(rendered.contains(&format!("landlock.abi=absent(errno={})\n", libc::ENOSYS)));
         assert!(rendered.contains("tier=none\n"));
+    }
+
+    /// `absent` and `unconfined` are different answers, and the row has to
+    /// keep them different.
+    ///
+    /// This is the module's rule 4 applied to issue #286's row. "AppArmor is
+    /// not here" and "AppArmor is here and gave this process the label
+    /// `unconfined`" have opposite remedies: the first machine needs nothing,
+    /// the second needs `packaging/apparmor/vitrind` loaded and attached. A
+    /// row that printed one token for both would send an operator on the wrong
+    /// errand from a matrix that looked complete.
+    #[test]
+    fn an_absent_apparmor_is_not_rendered_as_an_unconfined_one() {
+        let mut report = full_report();
+
+        report.apparmor_label = None;
+        assert!(report.render().contains("apparmor.label=absent\n"));
+
+        report.apparmor_label = Some("unconfined".to_string());
+        assert!(report.render().contains("apparmor.label=unconfined\n"));
+
+        // The value this file exists to make observable: the profile attached.
+        report.apparmor_label = Some("vitrind (unconfined)".to_string());
+        let rendered = report.render();
+        assert!(rendered.contains("apparmor.label=vitrind (unconfined)\n"));
+        // ...and it must not be confusable with the row above by a `grep`
+        // that reads the whole line, which is how the CI job reads it.
+        assert!(!rendered.contains("apparmor.label=unconfined\n"));
+    }
+
+    /// What this machine actually answered, asserted as a SHAPE and never as a
+    /// value.
+    ///
+    /// The two states this repository can reach are a development box with
+    /// AppArmor compiled out (`absent`) and a GitHub runner with AppArmor
+    /// enforcing (`unconfined`, or `vitrind` once #286's profile is loaded).
+    /// Demanding either would be asserting a machine's configuration. What
+    /// *is* assertable everywhere: the row exists, is non-empty, and — the
+    /// part that matters — reports `absent` rather than some other LSM's
+    /// context when AppArmor is not the LSM answering.
+    #[test]
+    fn the_apparmor_label_row_never_reports_another_lsms_context() {
+        let apparmor_enabled = fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+            .map(|s| s.trim() == "Y")
+            .unwrap_or(false);
+        let qualified = Path::new("/proc/self/attr/apparmor/current").exists();
+        let label = read_apparmor_label();
+
+        if !apparmor_enabled && !qualified {
+            assert_eq!(
+                label, None,
+                "AppArmor is not the LSM here, so no label may be reported; \
+                 /proc/self/attr/current on such a machine belongs to whatever LSM IS active"
+            );
+        }
+        // The other direction is not assertable: a machine with AppArmor may
+        // legitimately answer anything, including nothing.
+        if let Some(label) = label {
+            assert!(!label.is_empty());
+            assert!(!label.chars().any(|c| c.is_control()));
+        }
     }
 
     #[test]
@@ -1757,6 +1949,8 @@ mod tests {
             "landlock.abi",
             "seccomp.filter",
             "no_new_privs",
+            "apparmor.label",
+            "policy.apparmor_restrict_unprivileged_unconfined",
             "tier",
         ] {
             assert!(rendered.contains(&format!("{key}=")), "missing row {key}");

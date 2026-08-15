@@ -1785,6 +1785,24 @@ Reword either document however its register needs — the ids do not move.
 Matching runs over whitespace-normalised text, so a reflow, and a wrapped
 reason, change nothing.
 
+**This section is no longer the only enumerating home, and that is a
+correction to a sentence written here rather than a weakening of the gate.**
+The check now compares the limits page against the **union** of the regions in
+every registered plan document, because a limit's home is the document that
+owns the work which created it — and §6's own opening scopes it to *"limits
+**this workstream** creates ... not inherits"*. Phase-2 confinement (#286) is
+the first limit outside WS-E to need one, and it went into
+[`02-phase-2-semantic-epochs.md`](02-phase-2-semantic-epochs.md) §7 rather
+than here: writing it into this section would have made that opening sentence
+false and sent the next sweep to this document's surface table for a limit
+this workstream does not own. Nothing was exempted to make that work — both
+directions still hold over the union, and the multi-home shape cost three
+further rules, each of which is a hole one home never had to think about: a
+registered document must enumerate at least one limit, an id is declared by
+exactly one document, and the every-bullet rule runs over each region. The
+argument is in `crates/xtask/src/limits.rs`'s `ENUMERATORS`, including what a
+carve-out would have looked like.
+
 **The fifth rule and two others were added by an adversarial pass over the
 first version of the gate, which found three ways to pass it while holding
 nothing.** Emptying this region and stripping the page's markers was green.

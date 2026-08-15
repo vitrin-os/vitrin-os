@@ -142,14 +142,97 @@ does not spend a weekend on something the project already says out loud:
   no longer read `$HOME` or reach a socket by a path it already knows, because
   neither is in its mount table.
 
+  Since P2.6.3 the helper also enforces a **Landlock ruleset** before the
+  shim's `execve`, so a path the mount table happened to leave reachable is not
+  therefore readable. State its grants precisely, because the short version
+  understates them: full write authority (create, delete, rename, truncate) on
+  the four hierarchies the mount table publishes as writable; `WRITE_FILE`
+  alone on `/proc`, `/dev`, `/dev/pts` and each render node, which makes it
+  **eight** hierarchies carrying a write right, not four — eight with one
+  render node bound, one more for each additional one; an enumerated read
+  set whose execute half is narrower still (`/etc` and `/sys` get no
+  `EXECUTE`); and nothing else. Size "nothing else" from the measurement rather
+  than from the phrase before reporting a read as a breach: probing 31 in-realm
+  paths at the default and at `--landlock=off` found eight refused, all of them
+  empty directories the realm's own mount table minted to hold a bind target
+  beneath them, and **no path carrying data**. The rung is journaled per realm and is
+  **child-asserted**: no `/proc` file names a process's Landlock domain, so the
+  core cannot corroborate it the way it corroborates the namespace inodes. Note
+  also that P2.6.3 is **not finished**: the ruleset landed, and so did a
+  generated ladder table with a CI staleness gate — the
+  [Landlock ABI matrix](docs/book/src/isolation-matrix.md), which states what
+  this build requires of a kernel — but it measures **no** kernel, the
+  per-kernel table the task's criteria ask for does not exist, and exactly two
+  machines have ever been asked for their Landlock ABI.
+
+  One consequence is worth knowing before you report it as a bug: a Landlock
+  domain denies **every mount-topology change** to the process and its
+  descendants, unconditionally, so an app that decodes images in a *nested*
+  sandbox (`bwrap`, as GTK's `glycin` loaders do) cannot have one and decodes
+  **unsandboxed** instead — a real loss of defence in depth, published rather
+  than worked around, and widening the ruleset was measured not to repair it.
+  A realm additionally refuses nested user namespaces
+  (`/proc/sys/user/max_user_namespaces = 0`, written inside the realm's own
+  namespace), which takes no capability away — a nested namespace could not
+  have mounted anything either — and makes such a sandbox fail at
+  `unshare(CLONE_NEWUSER)`, the refusal sandbox libraries already handle,
+  rather than at a `mount(2)` they do not expect to fail. See the
+  [limits page](docs/book/src/limits.md).
+
   **What is still missing is the syscall boundary**: no seccomp filter
-  (P2.6.4), no Landlock ruleset (P2.6.3). Treat a realm as *path-confined but
-  not syscall-confined*. Three residues are published in full on the
+  (P2.6.4). Landlock gates filesystem operations, not `syscall(2)` in general,
+  so treat a realm as *path-confined and filesystem-rights-confined, but not
+  syscall-confined*. Three residues are published in full on the
   [limits page](docs/book/src/limits.md): the invoking user's supplementary
   groups survive into the realm because the kernel gives no window to drop
-  them, the GPU render node is bound read-write with its ioctl surface intact,
-  and `--isolation=off` restores the fully unconfined path for anyone who names
-  it. **Do not treat a realm as a security boundary against hostile code yet.**
+  them, the GPU render node is bound read-write with its ioctl surface intact
+  (Landlock's `IOCTL_DEV` right is one bit per hierarchy and the app needs the
+  node, so the ruleset grants it there), and `--isolation=off` -- or
+  `--landlock=off`, which turns off the ruleset alone -- restores a weaker path
+  for anyone who names it. **Do not treat a realm as a security boundary against hostile code yet.**
+- **`--isolation=default` refusing to start is designed behaviour, not a
+  vulnerability** ([#286](https://github.com/vitrin-os/vitrin-os/issues/286)).
+  The confinement above needs a host that lets an unprivileged user namespace
+  carry its capabilities. Where a host permits the `unshare` and then strips
+  them, the first mount inside the namespace fails, and the startup preflight
+  **refuses the session** rather than starting a weaker one — D-020(6) forbids
+  silent degradation. Measured on a GitHub `ubuntu-latest` runner (kernel
+  `6.17.0-1020-azure`, 2026-08-14), where
+  `kernel.apparmor_restrict_unprivileged_userns` is `1` on that stock image —
+  read from the runner's own sysctl before CI granted itself the remedy — and
+  no realm can start. **That is one CI image, not a distribution
+  survey** — [#281](https://github.com/vitrin-os/vitrin-os/issues/281) owns the
+  cross-kernel matrix. Report a *silent* degradation here; a loud refusal is
+  the feature. Note that anything reproduced under `--isolation=off` is a
+  finding about an explicitly unconfined session and is triaged as such.
+- **A missing Landlock also refuses the session, and that is designed
+  behaviour too.** Since P2.6.3 the ruleset is in this build's confinement
+  *floor*, so a kernel that answers the ABI query with `ENOSYS` no longer
+  starts a session confined by mount table alone — it stops, on the same
+  D-020(6) reasoning as the bullet above. Stated positively, the host must
+  provide all three of: a **kernel ≥ 5.13**, **`CONFIG_SECURITY_LANDLOCK=y`**,
+  and **`landlock` in the active LSM list** (`/sys/kernel/security/lsm` — a
+  kernel can carry the code and leave it out of `lsm=`). `vitrind
+  --print-isolation` answers all three as `landlock.abi=N`. Since 2026-08-15
+  there is a **fourth** requirement and it is not a host misconfiguration: the
+  reported ABI must be at or above this build's declared floor
+  (`build.landlock_min_abi` from `vitrind --print-floor`, **7** here). A working
+  Landlock on an older kernel is refused with `below-floor(abi=N,required=M)`
+  rather than confined at a weaker rung; the remedy is a newer kernel and no
+  knob substitutes. A refusal on any of the four is designed behaviour, not a
+  finding.
+  **The two refusals must not be confused, because their remedies are
+  disjoint**: the message names the mechanism it could not get, `namespaces`
+  for the bullet above and `landlock` for this one. No userns sysctl makes a
+  kernel report a Landlock ABI, and adding `landlock` to `lsm=` restores no
+  capability a user namespace was stripped of. The conditions are independent:
+  the runner where the namespace refusal was measured ran a 6.17 kernel, four
+  years past Landlock's 5.13. Which distributions ship the third requirement
+  unset has **not been surveyed here** — that is
+  [#281](https://github.com/vitrin-os/vitrin-os/issues/281). `--landlock=off`
+  is not a remedy for a kernel that could be configured; it starts realms with
+  no ruleset at all, and every grant described above stops applying to that
+  session.
 - **The session D-Bus is reachable.** The core advertises no
   `DBUS_SESSION_BUS_ADDRESS`, but `/run/user/<uid>/bus` is still on the
   filesystem and still connectable, and the abstract-socket namespace is

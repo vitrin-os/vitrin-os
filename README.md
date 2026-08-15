@@ -181,10 +181,14 @@ convinces you of more than it should.
 - **Half a sandbox (decisions D9, D-020, D-036).** Since P2.6.2 a realm gets
   six namespaces, an identity uid/gid map, zero capabilities and a private
   mount table it cannot reshape — all verified by the core from outside. But
-  there is still no
+  since P2.6.3 it also gets a [Landlock](https://landlock.io/) ruleset with an
+  enumerated read set, enforced before the shim's `execve`, and a generated
+  [ABI matrix](docs/book/src/isolation-matrix.md) of what this build requires
+  of a kernel — but not the *per-kernel* table that task's criteria ask for,
+  and no third kernel has been measured. There is still no
   [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html) filter
-  (P2.6.4) and no [Landlock](https://landlock.io/) ruleset (P2.6.3), so the
-  realm's syscall surface is the kernel's whole surface. The realm also keeps
+  (P2.6.4), so the realm's syscall surface is the kernel's whole surface —
+  Landlock gates filesystem operations, not syscalls in general. The realm also keeps
   the invoking user's supplementary groups, which the kernel gives no window to
   drop. Environment hygiene confines the well-behaved; it does not contain the
   hostile. This is still the big one — see
@@ -505,16 +509,139 @@ That is the complete list of what confines a realm right now.
   holds no capability to mount. The core reads the kernel's answer about the
   child to confirm all of it and **refuses the spawn** when it cannot.
 
-  Still absent: **no seccomp filter** (P2.6.4) and **no Landlock ruleset**
-  (P2.6.3). A realm can therefore issue any syscall it likes; it simply has
-  few paths to reach. Three things also survive the namespaces: the invoking
+  P2.6.3 landed the helper's **Landlock ruleset**, enforced before the shim's
+  `execve` and inherited by every
+  descendant. Full write authority — create, delete, rename, truncate — on the
+  four hierarchies the mount table publishes as writable (`/run/vitrin`,
+  `/vitrin/home`, `/tmp`, `/dev/shm`); `WRITE_FILE` alone on four more
+  (`/proc`, `/dev`, `/dev/pts` and each render node — writing *through* a node,
+  never creating one), so eight hierarchies carry a write right rather than
+  four — eight on a one-GPU host, one more per additional render node; an **enumerated** read set, with a narrower execute half inside it
+  (`/etc` and `/sys` are read with no execute); and nothing else. **"Nothing
+  else" is a measured set, and it is small**: probing 31 in-realm paths at the
+  default and again at `--landlock=off` found **eight** refused, and every one
+  of the eight is an empty directory the realm's own mount table minted to hold
+  a bind target beneath it — the realm root, `/run`, `/vitrin`, and this build
+  tree's `/home` chain. It denies **no path that carries data**, because the
+  mount table puts host content nowhere but at a bind target and every bind
+  target is granted. The table, and why that is still worth having, are on the
+  [limits page](docs/book/src/limits.md). The task's other deliverable — a
+  **generated** ladder table with a CI staleness gate — now exists as
+  [the Landlock ABI matrix](docs/book/src/isolation-matrix.md), emitted by
+  `cargo xtask isolation-matrix` and held byte-for-byte by CI: one row per ABI
+  rung, each naming the right it buys, what it does **not** buy, and the
+  published claim it carries. **It is a table about this build, not about
+  kernels.** It probes nothing — the rung ladder is parsed out of the helper's
+  own source and the ABI floor out of the crate that declares it, because a
+  page carrying the ABI of the machine that generated it could not be
+  byte-identical on this project's two machines. The per-kernel row set the
+  task's restated criteria ask for still does not exist, and no third kernel
+  has been measured. Do not read P2.6.3 as a finished task.
+
+  The rung the ruleset was **obtained** at is what the realm's
+  `applied_profile` names, with the rung the session asked for and the ABI the
+  kernel reported beside it — a ladder that fell to a lower rung is warned
+  about at spawn rather than rendered like a full-strength one. All three
+  numbers are **child-asserted**: no `/proc` file names a process's Landlock
+  domain, so unlike the namespace inodes the core cannot corroborate them; what
+  it *can* measure, and does in `tests/integration/test_real_confinement.py`,
+  is a path the mount table leaves reachable and the ruleset denies, against
+  `--landlock=off` in the same run. `--landlock=abi:N` pins a session to a rung
+  so each rung's absence can be measured rather than described — for the rungs
+  that move the mask. Three do not: ABI 4 buys network scoping and ABI 7 and 8
+  buy `landlock_restrict_self` flags, none of which a shipped session requests,
+  so the enforced domain is byte-identical at rungs 3 and 4 and again at rungs
+  6, 7 and 8 while `applied_profile` still spells all nine differently. (One
+  diagnostic, `VITRIN_LANDLOCK_AUDIT=1` in vitrind's environment, sets ABI 7's
+  log flag so the kernel keeps recording a realm's denials past the shim's
+  `execve`. It changes what is logged, never what is permitted, and cannot be
+  reached from `realm.toml` or a command line.) It is a
+  **dial, not a one-way tightening**: rung 1 cannot handle `REFER`, and a
+  domain that does not handle `REFER` forbids `rename(2)` across directories
+  even inside the realm's own storage — so `abi:1` is stricter there and breaks
+  apps that write by rename-into-place. The measurement is on the
+  [limits page](docs/book/src/limits.md).
+
+  **What that ruleset costs, on some hosts, is a sandbox your app was
+  building for itself.** A Landlock domain denies *every* mount-topology
+  change to the process and its descendants unconditionally — it is not an
+  access right, so no rule grants it and widening cannot restore it. So an app
+  that decodes images inside a **nested** sandbox (GTK 3.24 → `glycin` →
+  `bwrap`) cannot have one, and decodes **unsandboxed** instead. To make that
+  a degradation rather than a crash, a realm also refuses nested user
+  namespaces outright (`/proc/sys/user/max_user_namespaces = 0`, written inside
+  the realm's own namespace), so such a sandbox fails at
+  `unshare(CLONE_NEWUSER)` — the conventional refusal every sandbox library
+  already handles — instead of at a `mount(2)` it never expected to fail. That
+  removes no capability: a nested namespace could not have mounted anything
+  anyway. Until 2026-08-15 this cost three of this repo's own real-app gates,
+  one of them a **named M1.4 milestone gate**; all three now pass at the
+  shipped default, and the measurement — including the proof that granting
+  every right on `/` does *not* repair the mount denial — is on the
+  [limits page](docs/book/src/limits.md).
+
+  Still absent: **no seccomp filter** (P2.6.4). A realm can therefore issue any
+  syscall it likes; it simply has few paths to reach and, now, few rights on
+  what is left. Three things also survive the namespaces: the invoking
   user's **supplementary groups** (the kernel offers no window in which an
   unprivileged process can both drop them and write a single-id `gid_map`), a
   **read-write GPU render node** with its ioctl surface and cross-realm
-  GPU-memory side channels, and whatever a `binds` entry in `realm.toml`
-  hands over. `--isolation=off` restores the old unconfined path and must be
+  GPU-memory side channels (Landlock's ABI-5 `IOCTL_DEV` right is one
+  all-or-nothing bit per hierarchy and the app needs the node's ioctls, so the
+  ruleset grants it there and this cost is unchanged), and whatever a `binds`
+  entry in `realm.toml` hands over. `--isolation=off` restores the old unconfined path and must be
   named explicitly. Environment hygiene confines the well-behaved; it does not
   contain the hostile.
+- **A host must permit an unprivileged user namespace to actually carry its
+  capabilities, or `--isolation=default` refuses to start
+  ([#286](https://github.com/vitrin-os/vitrin-os/issues/286)).** The
+  namespaces above are built on an unprivileged `unshare`; a host that permits
+  it and then strips the capabilities it should confer fails the first
+  `mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)` inside it, and the startup
+  preflight refuses the session rather than degrading silently (D-020(6)).
+  Measured once: a GitHub `ubuntu-latest` runner, kernel `6.17.0-1020-azure`,
+  2026-08-14 — `kernel.apparmor_restrict_unprivileged_userns` is `1` on that
+  stock image, read from the runner's own sysctl before CI changed anything
+  (calling it *the distribution's* default is one step past that: one image is
+  not a distribution), AppArmor permits the unshare and denies the
+  capabilities inside it, and the matrix reads `tier=none` with no realm able
+  to start. **That is one CI image, not a distribution survey**; the
+  cross-kernel matrix is
+  [#281](https://github.com/vitrin-os/vitrin-os/issues/281). `vitrind
+  --print-isolation` answers for the machine in front of you; packaging that
+  makes the grant routine is #286, and `--isolation=off` is not it. **This is
+  not the only host requirement** — the bullet below is a second one with a
+  completely different remedy, and the refusal names which mechanism it could
+  not get (`namespaces` here, `landlock` there). Read that word first.
+- **A host must actually have Landlock, or `--isolation=default` refuses to
+  start.** Since P2.6.3 the ruleset is part of this build's confinement
+  *floor*, so a kernel with no Landlock no longer starts a session confined by
+  mount table alone — it stops, for the same D-020(6) reason as above. Three
+  facts are required, and the refusal names all three: **kernel ≥ 5.13**
+  (`uname -r`), **`CONFIG_SECURITY_LANDLOCK=y`** (`zgrep
+  CONFIG_SECURITY_LANDLOCK /proc/config.gz`), and **`landlock` in the active
+  LSM list** (`cat /sys/kernel/security/lsm`; if absent, add it to the `lsm=`
+  boot parameter, keeping every name already there). `vitrind
+  --print-isolation` answers all three as `landlock.abi=N`. **A fourth
+  requirement arrived with the ABI floor** (owner's decision, 2026-08-15): the
+  reported ABI must be at or above `build.landlock_min_abi` from `vitrind
+  --print-floor` — **7** here — and a kernel below it is refused rather than
+  confined at a weaker rung. That one is a *build* requirement, not a
+  misconfiguration: nothing on such a machine is wrong, no knob moves the
+  number, and the remedy is a newer kernel. It also narrows P2.6.3 rather than
+  completing it; the [limits page](docs/book/src/limits.md) says which two
+  machines the number rests on and what is still not built. Which distributions
+  ship the third unset, or a kernel below the fourth, has **not** been surveyed
+  here — that is #281 — and
+  `--landlock=off` is not the remedy for a configurable kernel: it builds no
+  ruleset, so every claim above about the read set, the write set and the rung
+  ladder stops applying to that session. **Do not cross the two remedies**: no
+  userns sysctl makes a kernel report a Landlock ABI, and adding `landlock` to
+  `lsm=` restores no capability a user namespace was stripped of. The two
+  conditions are independent — the machine where the bullet above was measured
+  ran a 6.17 kernel, four years past Landlock's 5.13 — and the
+  [limits page](docs/book/src/limits.md) carries the table that tells them
+  apart, plus the bound on what has actually been measured about either.
 - **The session [D-Bus](https://www.freedesktop.org/wiki/Software/dbus/) is reachable (known hole, closes with P13 in Phase
   2).** The core advertises no `DBUS_SESSION_BUS_ADDRESS` and points
   `XDG_RUNTIME_DIR` at the realm's private directory, so a well-behaved

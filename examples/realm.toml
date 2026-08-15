@@ -272,9 +272,62 @@ command = "/usr/bin/foot"
 # WAYLAND_DISPLAY and connects to a socket path it already knows now fails,
 # because the path is not in its mount table.
 #
+# Since P2.6.3 the helper also enforces a Landlock ruleset before the shim's
+# execve. Its grants are ENUMERATED rather than rooted at the realm root, and
+# they are four tiers rather than two -- the earlier version of this comment
+# collapsed them and got two paths' rights wrong, so they are spelled out:
+#
+#   full write (create/delete/rename/truncate)  /run/vitrin, /vitrin/home,
+#                                               /tmp, /dev/shm  -- exactly the
+#                                               four writable mounts above
+#   WRITE_FILE only (write THROUGH an existing  /proc, /dev, /dev/pts, and each
+#   file or node; no create, delete, rename or  bound render node. /dev/pts and
+#   truncate)                                   the render nodes also get
+#                                               IOCTL_DEV; nothing else does.
+#   read + execute                              /usr, the /bin-class compat
+#                                               names, the shim, the app's own
+#                                               directory, every `binds` entry
+#                                               below, and /tmp
+#   read, NO execute                            /etc and /sys
+#
+# A `binds` entry naming a FILE gets read + execute WITHOUT the directory-list
+# right, because Landlock refuses a rule that names LANDLOCK_ACCESS_FS_READ_DIR
+# on a regular file -- the rule is rejected, not merely unused, so granting it
+# would take the whole realm down. Same predicate as the mount above: a file
+# source is bound onto a file target and a directory onto a directory.
+#
+# So a write right reaches EIGHT hierarchies, not four -- eight on a host that
+# binds ONE render node, and one more for every additional node, since each is
+# its own rule; /etc gets no EXECUTE;
+# and /proc is read+write rather than read+execute. A `binds` entry is granted
+# twice over -- once as a mount, once as a Landlock rule -- and removing it
+# removes both.
+#
+# A REALM ALSO REFUSES NESTED USER NAMESPACES. The helper writes 0 to the
+# realm's own /proc/sys/user/max_user_namespaces, so an app's
+# unshare(CLONE_NEWUSER) fails ENOSPC. That removes nothing an app could
+# otherwise do: a Landlock domain denies EVERY mount-topology change to the
+# process and its descendants unconditionally -- it is not an access right, so
+# no rule below grants it and no `binds` entry restores it -- and a nested
+# namespace that cannot mount is useless. What it changes is WHICH error
+# arrives: the conventional userns refusal a sandbox library already handles,
+# instead of an unexpected EPERM from a mount deep inside its own setup. The
+# cost is real and is published on the limits page: an app that decodes images
+# inside a nested sandbox (GTK -> glycin -> bwrap) cannot have one and decodes
+# UNSANDBOXED instead.
+#
+# P2.6.3 is NOT COMPLETE, and what is missing is narrower than it was. The
+# ruleset landed, and so did the generated ladder table and its CI staleness
+# gate -- `cargo xtask isolation-matrix` emits docs/book/src/isolation-matrix.md
+# and `--check` turns CI red on a stale copy. What did NOT land, and is
+# DEFERRED to issue #281, is the PER-KERNEL half: one row per ABI actually
+# reported, on each kernel in a CI matrix. The table that exists probes no
+# kernel -- it states what THIS BUILD requires -- so treat every per-rung
+# BEHAVIOURAL claim about this ruleset as prose measured once on one box.
+#
 # Still absent, and this is the half that matters most: NO seccomp filter
-# (P2.6.4) and NO Landlock ruleset (P2.6.3). A realm can issue any syscall it
-# likes; it simply has few paths to reach. Treat it as PATH-confined and not
+# (P2.6.4). A realm can issue any syscall it likes; Landlock gates filesystem
+# operations, not syscalls in general. Treat it as FILESYSTEM-confined and not
 # SYSCALL-confined. Three things also survive: the invoking user's
 # supplementary groups (the kernel gives no window to drop them -- see
 # D-037(5)), a read-write GPU render node, and anything a `binds` key below

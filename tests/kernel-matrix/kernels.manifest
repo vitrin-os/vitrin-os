@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The kernels the per-kernel isolation matrix is measured on (issue #281).
+#
+# One record per line, fields separated by whitespace, `#` comments ignored.
+# No field may contain a space, which is what lets both `collect.sh` (bash
+# `read`) and `crates/xtask/src/kernel_matrix.rs` (`split_whitespace`) parse
+# the same file without a parser.
+#
+#   1 id             the row's name; `rows/<id>.row` is its measurement
+#   2 class          which release class of `docs/plan/02-phase-2-semantic-epochs.md:153`
+#                    this row covers
+#
+# There is deliberately NO policy-variant record here. Every boot below runs the
+# same bare initramfs with no distribution policy loaded, which is what makes
+# each row a statement about a KERNEL. A record that varied an AppArmor sysctl
+# would produce a row that looks like a distribution row and is not one -- the
+# distribution row has to come from the distribution, which for this repository
+# means the CI runner's own `--print-isolation` output. See the "these are
+# kernel rows" section of docs/book/src/isolation-kernels.md for the
+# cross-validation that settles it.
+#   3 release        the `kernel.release` the booted kernel must report; a boot
+#                    that reports anything else is a hard failure, never a row
+#   4 url            where the .deb was fetched from on the collection date
+#   5 deb_sha256     the .deb's identity. THIS, not the URL, is what a row is
+#                    pinned to: distribution pools prune superseded kernels, so
+#                    a dead URL is expected eventually and the remedy is another
+#                    mirror serving these bytes -- not a re-measurement against
+#                    whatever the pool holds now.
+#   6 vmlinuz        the member of the .deb's data archive that is the kernel
+#   7 vmlinuz_sha256 that member's identity, so an extraction bug cannot pass
+#   8 append_extra   extra kernel command line, or `-` for none. The base line
+#                    is in collect.sh and is identical for every row.
+#
+# Adding a kernel is this file plus a `KERNELS` entry in
+# crates/xtask/src/kernel_matrix.rs (which says what the row is FOR) plus a
+# collection run. All three, or the generator refuses to render.
+
+ubuntu-22.04-5.15 5.15-lts 5.15.0-191-generic http://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-image-unsigned-5.15.0-191-generic_5.15.0-191.201_amd64.deb 240e407cd863d86dc2eefcf3a085b232849afae7a8c911461369e8c0a02e3f67 ./boot/vmlinuz-5.15.0-191-generic e14e87b3c53124b655207647f695908cafc942cd28871c913ffa4aab712eba93 -
+debian-12-6.1 6.1-lts 6.1.0-50-amd64 https://deb.debian.org/debian/pool/main/l/linux/linux-image-6.1.0-50-amd64-unsigned_6.1.176-1_amd64.deb 439422e41d2dbb840b60b81e3bf5e5955bfa56b7a8c268aec83c9ff882d421e6 ./boot/vmlinuz-6.1.0-50-amd64 653421d9774c0de27502ca010d572323b52a5d7141d067b9b04214bd24baca3a -
+ubuntu-24.04-6.8 6.8-lts 6.8.0-139-generic http://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-image-unsigned-6.8.0-139-generic_6.8.0-139.139_amd64.deb 6c5e6049c195ac7f8b4cbd2dd96dca4f8cfdd2c0627250c5688fe1ba9caf930f ./boot/vmlinuz-6.8.0-139-generic b500ae87509c77cde64aa9867804e901b410efa3eea41f62d3c766f8c0ee9ab6 -
+debian-13-6.12 6.12-stable 6.12.101+deb13-amd64 https://deb.debian.org/debian/pool/main/l/linux/linux-image-6.12.101+deb13-amd64-unsigned_6.12.101-1_amd64.deb 56ae4e2dbf5f07214ef5d07f515698f36c62fb63eee97831333f32b659afab66 ./boot/vmlinuz-6.12.101+deb13-amd64 8f6144580ef6e34459ea0c0819919c292dc605acbd6eac074d8bfef84505a055 -
+ubuntu-azure-6.17 ci-runner-kernel 6.17.0-1020-azure http://archive.ubuntu.com/ubuntu/pool/main/l/linux-azure/linux-image-unsigned-6.17.0-1020-azure_6.17.0-1020.20_amd64.deb 0b6fc9fd94bf375fad1f83fe0672ab72152def473d1fd93c50b07b7452942faa ./boot/vmlinuz-6.17.0-1020-azure 04d18f600df726d196e6dffd22338657f6702f25a4b3512b400b77640d148c59 -

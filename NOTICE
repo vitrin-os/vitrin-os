@@ -46,8 +46,12 @@ APACHE-2.0 (LICENSE) — explicit patent grant
     a decoder; see the crate's own docs for why that absence is the
     reviewable property;
   - the client SDKs: sdk/python/ and any future SDK;
-  - the integration harness and the shipped examples: tests/integration/,
-    examples/;
+  - the integration harness, the per-kernel isolation harness and the shipped
+    examples: tests/integration/, tests/kernel-matrix/, examples/. The
+    kernel-matrix directory holds a shell collector, a static C init that is
+    PID 1 in a throwaway QEMU guest, and the boot rows they produce; none of
+    it links into any shipped binary and all of it is a measurement
+    instrument, so it sits with the other conformance instruments;
   - packaging/ -- the artifacts a distributor installs on a host rather than
     links into a binary. Today that is packaging/apparmor/vitrind, the
     AppArmor profile issue #286 needs on Ubuntu 24.04+. It is named here

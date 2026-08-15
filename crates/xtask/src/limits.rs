@@ -1252,12 +1252,18 @@ pub const CLAIMS: &[Claim] = &[
         evidence: &[
             Evidence::Contains {
                 path: "crates/vitrin-realm-init/src/lib.rs",
-                needle: "pub const LANDLOCK_MIN_ABI: u32 = 7;",
-                means: "the floor is still 7, which is the number every surface above prints. \
-                        Raising or lowering it changes which hosts this build refuses, so it \
-                        may not move without the four pages moving with it -- and the constant \
-                        is pinned as a whole line, value included, precisely so a silent \
-                        re-tune cannot leave four published numbers stale.",
+                needle: "pub const LANDLOCK_MIN_ABI: u32 = 6;",
+                means: "the floor is still 6, which is the number every surface above prints. \
+                        It was 7 until 2026-08-16, when the owner lowered it a rung so a \
+                        Debian 13 machine measured at ABI 6 stops being refused; that move cost \
+                        no enforcement, because rungs 7 and 8 buy `landlock_restrict_self` \
+                        flags rather than mask bits and this build passes flags = 0 (pinned by \
+                        `the_floor_costs_nothing_because_the_domain_is_flat_from_six_to_eight` \
+                        in crates/vitrin-realm-init/src/main.rs). Raising or lowering it \
+                        changes which hosts this build refuses, so it may not move without the \
+                        four pages moving with it -- and the constant is pinned as a whole \
+                        line, value included, precisely so a silent re-tune cannot leave four \
+                        published numbers stale.",
             },
             Evidence::Contains {
                 path: "crates/vitrin-core/src/spawn/isolation.rs",

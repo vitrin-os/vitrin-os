@@ -186,7 +186,8 @@ pub const LANDLOCK_BUILD_MAX_RUNG: u32 = 9;
 /// rung's absence is a measured row rather than a sentence. The ladder's
 /// mechanism is still here -- it is what makes `--landlock=abi:N` a measurement
 /// instrument -- but it is no longer how a **shipped session** meets a kernel.
-/// A session either gets a domain at ABI 7 or above, or it does not start.
+/// A session either gets a domain at this number or above, or it does not
+/// start.
 ///
 /// **This narrows #187 rather than completing it.** PRD §20's "coverage is
 /// kernel-dependent" caveat is *deferred*, not answered: this build now targets
@@ -202,22 +203,59 @@ pub const LANDLOCK_BUILD_MAX_RUNG: u32 = 9;
 /// `docs/plan/02-phase-2-semantic-epochs.md` (P2.6.3, Corrections 4 and 5) and
 /// `docs/book/src/limits.md`.
 ///
-/// # Why 7 and not 9
+/// # Why 6 and not 7, and why lowering it took no enforcement away
 ///
-/// It is the **highest floor that can be tested**, which is the only defensible
-/// way to pick one. Two machines were measured, and they are the only two this
-/// number rests on: this repository's development box (Arch, kernel
-/// `7.1.8-arch1-3`) reports ABI 9, and the runner this repository's CI uses
-/// reports ABI 7. A floor of 8 or 9 would be a floor no CI job could exercise,
-/// which is a rule held by nothing.
+/// The floor was **7** from 2026-08-15 until it was lowered to **6** on
+/// 2026-08-16 (owner's decision, taken for a VPS running Debian 13). The
+/// lowering is not a relaxation of what a realm gets, and the reason is
+/// mechanical rather than a judgement call: **the two rungs between 6 and 8 buy
+/// `landlock_restrict_self` FLAGS, not `handled_access_fs` mask bits, and this
+/// build passes flags = 0 in every shipped run.** See `landlock.rs`'s module
+/// docs ("What a 'rung' is, mechanically", point 2) and
+/// `landlock::restrict_self_flags`'s own documentation: rung 7 buys the
+/// audit-log flags and rung 8 buys `LANDLOCK_RESTRICT_SELF_TSYNC`. The enforced
+/// domain -- `handled_access_fs`, `scoped` and the flags word together -- is
+/// therefore **byte-identical at rungs 6, 7 and 8**.
 ///
-/// **Which kernel releases that excludes is not stated here, because it was not
-/// measured here.** The mapping from ABI rung to kernel version is a fact about
-/// mainline, not about this repository, and no third machine was asked. What is
-/// stated is the rule itself: below this number `vitrind` refuses to start and
-/// names the requirement. `--landlock=off` starts a session whose realms get no
-/// ruleset at all, and is not a remedy for a kernel that could be upgraded.
-pub const LANDLOCK_MIN_ABI: u32 = 7;
+/// **Rung 9 is NOT in that identity, and the distinction has to be kept.** Rung
+/// 9 adds `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` to `handled_access_fs`, so its
+/// domain really is a superset. Lowering the floor still costs nothing, because
+/// **the floor decides admission, not which rung is applied**: the rung a realm
+/// gets is `min(kernel ABI, LANDLOCK_BUILD_MAX_RUNG)` either way, so a machine
+/// that could supply rung 9 still gets rung 9, and every machine that started
+/// under the old floor gets the identical domain under the new one. What
+/// changed is only which machines are refused. The identity, and its
+/// non-vacuity -- rung 5's domain differs, which is why 6 and not 5 is the
+/// lowest floor that costs nothing -- are asserted in
+/// `crates/vitrin-realm-init/src/main.rs`'s
+/// `the_floor_costs_nothing_because_the_domain_is_flat_from_six_to_eight`.
+///
+/// # Which kernels that admits and refuses, measured
+///
+/// Since 2026-08-16 this is a **measurement** rather than a bound this
+/// repository declined to state. Five distribution kernels were booted under
+/// QEMU with the shipped `vitrind` in a minimal initramfs
+/// (`tests/kernel-matrix/`, rows in `tests/kernel-matrix/rows/`, published as
+/// `docs/book/src/isolation-kernels.md`):
+///
+/// | kernel | `landlock.abi` | at this floor |
+/// |---|---|---|
+/// | 5.15.0-191-generic (Ubuntu 22.04) | 1 | refused |
+/// | 6.1.0-50-amd64 (Debian 12) | 2 | refused |
+/// | 6.8.0-139-generic (Ubuntu 24.04 GA) | 4 | refused |
+/// | 6.12.101+deb13-amd64 (Debian 13) | 6 | **admitted** |
+/// | 6.17.0-1020-azure (the CI runner's kernel) | 7 | **admitted** |
+///
+/// Debian 13 is the row the decision was taken for. Those are **kernel** rows
+/// and not distribution rows -- the same vmlinuz under a distribution's own
+/// policy answers differently on the policy cells, which is why the page keeps
+/// the two vocabularies apart.
+///
+/// What is stated is the rule itself: below this number `vitrind` refuses to
+/// start and names the requirement. `--landlock=off` starts a session whose
+/// realms get no ruleset at all, and is not a remedy for a kernel that could be
+/// upgraded.
+pub const LANDLOCK_MIN_ABI: u32 = 6;
 
 /// The **diagnostic** that asks the kernel to keep logging a realm's Landlock
 /// denials **after** the shim's `execve` (P2.6.3 follow-up).

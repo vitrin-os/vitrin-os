@@ -271,22 +271,36 @@ owner chose the second.
 
 What that means concretely:
 
-- `vitrin_realm_init::LANDLOCK_MIN_ABI` is **7**, and a kernel reporting less is
+- `vitrin_realm_init::LANDLOCK_MIN_ABI` is **6** — it was 7 for one day, and the
+  owner lowered it on 2026-08-16 — and a kernel reporting less is
   **refused at startup** — by `spawn::isolation::admit`, which reports
   `below-floor(abi=N,required=M)`, and again by the helper's `landlock::apply`
   if the two ever disagree. `vitrind --print-floor` prints the number as
   `build.landlock_min_abi`.
-- **Why 7, and the honest bound on it:** it is the highest floor this repository
-  can test. Two machines were measured and they are the only two the number
-  rests on — the development box (Arch, kernel `7.1.8-arch1-3`) answered
-  `landlock.abi=9` on 2026-08-15, and the GitHub `ubuntu-latest` runner CI uses
-  answered `landlock.abi=7` on 2026-08-14. A floor of 8 or 9 would be a rule no
-  CI job could exercise. **The runner's number was read out of a CI job log and
-  is written down in no artefact here** — the diagnostic step that printed it
-  archives nothing, GitHub expires job logs, and no test asserts it — so the
-  floor rests on one transcription plus one command a reader can re-run on
-  their own machine. **Which kernel releases the floor excludes is not stated
-  anywhere in this repository, because it was not measured here.**
+- **Why 6, and why the move down cost nothing:** 6 is the *lowest* rung at which
+  the domain this build enforces is unchanged. The enforced triple —
+  `handled_access_fs`, `scoped`, and the `landlock_restrict_self` flags word —
+  is identical at rungs 6, 7 and 8, because rungs 7 and 8 buy only
+  `landlock_restrict_self` *flags* (audit logging, `TSYNC`) and every shipped
+  run passes flags = 0. Rung 5 differs (`scoped` arrives at 6) and rung 9
+  differs (it adds `RESOLVE_UNIX`), so **no page says the domain is identical
+  from 6 to 9**; the floor decides *admission* and never which rung is applied,
+  which stays `min(kernel ABI, build ceiling)`. All three facts are asserted by
+  `the_floor_costs_nothing_because_the_domain_is_flat_from_six_to_eight` in
+  `crates/vitrin-realm-init/src/main.rs`. The immediate reason for the move was a
+  measured row: Debian 13 (`6.12.101+deb13-amd64`) reports ABI 6 and was being
+  refused for nothing.
+- **Which kernel releases the floor excludes is now measured** (2026-08-16,
+  issue #281). Five distribution kernels booted under QEMU with the shipped
+  binary: `5.15.0-191-generic` (ABI 1), `6.1.0-50-amd64` (ABI 2) and
+  `6.8.0-139-generic` (ABI 4) are refused; `6.12.101+deb13-amd64` (ABI 6) and
+  `6.17.0-1020-azure` (ABI 7) start. The rows are checked in under
+  `tests/kernel-matrix/rows/` and published as
+  `docs/book/src/isolation-kernels.md`. They are **kernel** rows, not
+  distribution rows — the same `6.17.0-1020-azure` under Ubuntu userspace
+  reports different policy cells — so the *distribution* half of the runner
+  measurement is still a transcription from a CI job log that archives nothing,
+  and the page says so.
 - The one-rung descent still exists in `create_ruleset` — a kernel may report
   ABI N and refuse rung N's mask — and now bottoms out at the floor instead of
   at rung 1.
@@ -355,14 +369,59 @@ What was built instead, and what it is honestly worth:
   adjudicate a paraphrase.
 
 **What it does not do, stated plainly:** it probes nothing. It is not evidence
-about any kernel, it does not close PRD §20's caveat, and the first clause of
-the restated criterion — a row per ABI a CI matrix reported — remains undone.
-The machine half stays `vitrind --print-isolation`, which the page tells a
+about any kernel and it does not close PRD §20's caveat. The
+machine half stays `vitrind --print-isolation`, which the page tells a
 reader how to read against the table. **Nothing may read this correction as
 P2.6.3 closing either.** The two behavioural per-rung tests the criterion asks
 for do exist (`the_truncate_rung_is_measured_and_its_absence_is_measured_with_it`,
 `rung_one_forbids_reparenting_that_the_rung_above_permits`) and were measured on
-one box on one date.
+one box on one date. The first clause of the restated criterion — a row per ABI
+a kernel actually reported — was taken up separately; see Correction 6.
+
+**Correction 6 — the per-kernel rows exist, they are taken under QEMU rather
+than in the CI matrix, and the staleness gate splits in two** (2026-08-16,
+landed with `tests/kernel-matrix/` and `cargo xtask kernel-matrix`).
+
+Correction 5's tension was real and its resolution was to build the *build*
+table. What it did not consider is that the tension dissolves if the machine is
+not the runner: a kernel booted deliberately, under a userspace this repository
+controls, produces an answer that is the same on every machine that boots it —
+so a page rendered from those answers **is** byte-stable and **can** be the
+thing CI holds.
+
+What landed:
+
+- **`tests/kernel-matrix/collect.sh`** boots each kernel in
+  `tests/kernel-matrix/kernels.manifest` under QEMU with the **shipped**
+  `vitrind` in a minimal initramfs (`tests/kernel-matrix/init.c`, a static PID
+  1), and writes one checked-in row per kernel holding `--print-isolation` and
+  `--print-floor` verbatim plus the startup verdict. Each row carries its
+  provenance: package URL and sha256, vmlinuz member and sha256, the QEMU
+  command line, the userspace, the `vitrind` version, the schema version and a
+  collection date.
+- **Five kernels**, chosen as machines somebody might be refused on rather than
+  to fill rungs: ABI 1, 2, 4, 6 and 7. Four of the nine rungs are reported by
+  none of them, and the page says so — this is not the ABI sweep the criterion's
+  first clause imagined, and it does not pretend to be.
+- **`cargo xtask kernel-matrix [--check]`** renders
+  `docs/book/src/isolation-kernels.md` from those rows and is wired into
+  `codegen-diff` beside the other three regeneration diffs.
+- **The staleness gate is two gates, and which is which is published.** `cargo
+  xtask kernel-matrix --check` (every PR, no QEMU) holds the PAGE to the ROWS.
+  `collect.sh --check` (`.github/workflows/kernel-matrix.yml`, scheduled and on
+  demand) holds the ROWS to the KERNELS by re-booting all five, and goes red on
+  a row older than its age limit. A green pull request proves the first and
+  nothing about the second, which is why the rows carry dates.
+
+**What this still is not.** It is a **kernel** measurement and never a
+distribution one, and the cross-validation that proves the distinction is
+published: booting the CI runner's own `6.17.0-1020-azure` in a bare initramfs
+reproduces its `landlock.abi=7` exactly and *disagrees* with it on every policy
+cell (`apparmor_restrict_unprivileged_userns` 0 vs 1, `mount.in_userns`
+available vs `restricted-by-policy`, `tier` intra-user vs none). So the
+distribution row still has to come from the distribution, the runner's own
+reading remains a transcription from an expiring job log, and PRD §20's caveat
+is still not closed.
 
 ### E2.7 — Network authority v0
 

@@ -1,0 +1,131 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Re-take the per-kernel isolation measurement (issue #281).
+#
+# WHY THIS IS NOT IN ci.yml
+# -------------------------
+# It boots five distribution kernels under QEMU with the shipped `vitrind` in a
+# minimal initramfs, which needs qemu on the runner and ~220 MiB of downloaded
+# kernel packages. Per pull request that would be a slow gate on something that
+# does not change when this repository changes: a checked-in row goes stale when
+# a DISTRIBUTION ships a kernel, or when this build's own confinement floor
+# moves -- and the second of those is already caught cheaply, because
+# `cargo xtask kernel-matrix --check` in ci.yml refuses a row collected against
+# a different `LANDLOCK_MIN_ABI` than the tree declares.
+#
+# So the split is deliberate and both halves are named on the published page:
+#
+#   * every pull request runs `cargo xtask kernel-matrix --check` (ci.yml,
+#     codegen-diff job), which holds the PAGE to the ROWS. No qemu, no network.
+#   * this workflow runs `tests/kernel-matrix/collect.sh --check`, which holds
+#     the ROWS to the KERNELS by re-booting all five.
+#
+# A green pull request therefore proves the page matches the measurement and
+# says nothing about whether the measurement is current. Every row carries a
+# `#~ collected:` date, the page prints it, and `collect.sh --check` goes red on
+# a row older than MAX_ROW_AGE_DAYS -- so staleness is visible on the page and
+# enforced here rather than being nobody's job.
+#
+# WHAT A FAILURE HERE MEANS
+# -------------------------
+# Not "CI is broken". One of:
+#
+#   * a kernel now answers differently (a distribution respun the package under
+#     the same version -- but the sha256 pin would have caught that first, so
+#     more likely the shipped binary's behaviour changed);
+#   * a row is older than this repository's staleness limit and wants re-taking;
+#   * a pinned URL died. Distribution pools prune superseded kernels, so this is
+#     EXPECTED eventually. The remedy is another mirror serving the same
+#     sha256 -- the checksum is the identity, the URL is only where those bytes
+#     were found. It is NOT to re-measure against whatever the pool holds now
+#     and quietly republish that as the same row.
+name: kernel-matrix
+
+on:
+  # On demand: the button a person presses after re-tuning the floor, adding a
+  # kernel to tests/kernel-matrix/kernels.manifest, or doubting a published row.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check (diff against the checked-in rows) or collect (rewrite them and upload for review)"
+        type: choice
+        options: [check, collect]
+        default: check
+        required: false
+  # Monthly, so a row that nobody has looked at in half a year cannot quietly
+  # keep being published as a current measurement. Deliberately not nightly:
+  # this measures other people's kernels, and they do not change nightly.
+  schedule:
+    - cron: "17 4 1 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: boot five kernels and hold the rows to them
+    runs-on: ubuntu-latest
+    # Five TCG boots took ~14s on the development box; the download dominates.
+    # The bound is here so a hung guest fails the job instead of burning an
+    # hour -- collect.sh has its own per-boot timeout inside it as well.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install qemu
+        # No KVM on a hosted runner, so every boot is TCG. That is a schedule
+        # difference and not a result difference: the rows are the guest's own
+        # output and carry which accelerator produced them in a `#~ accel:`
+        # line, which `--check` ignores for exactly this reason.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 cpio zstd
+
+      - name: build the binary under test
+        # RELEASE, and it matters: the rows are the SHIPPED binary's answers.
+        # A debug build would produce a different `profile=` in the startup line
+        # and would not be the thing this project ships.
+        run: cargo build --release --bin vitrind
+
+      - name: tests/kernel-matrix/collect.sh --check
+        if: inputs.mode != 'collect'
+        # Re-boots every kernel in the manifest and diffs against the
+        # checked-in rows. Writes nothing. A failed boot is a hard failure and
+        # never an empty row: the script requires its init's sentinels, a zero
+        # exit from each probe, a schema-tagged and complete reading, exactly
+        # one startup verdict, and a `kernel.release` equal to the pinned one.
+        run: tests/kernel-matrix/collect.sh --check
+
+      - name: tests/kernel-matrix/collect.sh (rewrite the rows)
+        if: inputs.mode == 'collect'
+        # The re-collection path, for a deliberate re-take. It rewrites
+        # tests/kernel-matrix/rows/ in the workspace; nothing here commits or
+        # pushes. The rows are uploaded below for a human to review and land
+        # through a pull request like any other change to a published number.
+        run: tests/kernel-matrix/collect.sh
+
+      - name: cargo xtask kernel-matrix
+        if: inputs.mode == 'collect'
+        # Re-render the page from the rows just taken, so the artefact holds a
+        # coherent pair rather than new rows beside an old page.
+        run: cargo xtask kernel-matrix
+
+      - name: upload the rows and the page for review
+        if: inputs.mode == 'collect'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-matrix-rows
+          path: |
+            tests/kernel-matrix/rows/
+            docs/book/src/isolation-kernels.md
+          if-no-files-found: error
+
+      - name: upload the boot logs
+        # Always, including on failure: the boot log IS the evidence, and a
+        # failure with no log is a failure nobody can diagnose from here.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-matrix-boot-logs
+          path: target/kernel-matrix/logs/
+          if-no-files-found: warn

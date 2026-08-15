@@ -13,9 +13,10 @@
 //!
 //! The owner's decision of 2026-08-15 narrowed the target before this was
 //! written: there is a **declared ABI floor**
-//! ([`vitrin_realm_init::LANDLOCK_MIN_ABI`], 7) rather than a degradation
-//! ladder, so a kernel below it is refused instead of confined at a weaker
-//! rung. That makes this **not** a 1..9 degradation ladder. It is a matrix of
+//! ([`vitrin_realm_init::LANDLOCK_MIN_ABI`], lowered from 7 to 6 on 2026-08-16)
+//! rather than a degradation ladder, so a kernel below it is refused instead of
+//! confined at a weaker rung. That makes this **not** a 1..9 degradation ladder.
+//! It is a matrix of
 //! two things:
 //!
 //! 1. **what this build requires** -- the floor, the ceiling, and what each
@@ -686,20 +687,29 @@ const MEASURED_DEV_BOX_ABI: u32 = 9;
 
 /// The Landlock ABI the runner this repository's CI uses reported, 2026-08-14.
 ///
-/// Also a **measurement**, and deliberately not [`Constants::min_abi`]. The
-/// floor was *chosen* to equal this number -- rendering the two from one
-/// constant would turn a choice into a tautology, and a later re-tune of the
-/// floor would silently rewrite what a runner was observed to report.
+/// Also a **measurement**, and deliberately not [`Constants::min_abi`]. Until
+/// 2026-08-16 the floor was *chosen* to equal this number; it is now 6, one
+/// rung below it, so the two are no longer even numerically related -- and
+/// rendering them from one constant would still be wrong for the original
+/// reason, that it would turn a choice into a tautology.
 ///
-/// **This line is the only place in the repository the number is written
-/// down, and it is a transcription rather than an artefact.** It was read out
-/// of a CI job log -- the `What confinement this runner actually grants`
-/// diagnostic step, which runs `--print-isolation` on an unmodified runner and
-/// archives nothing. GitHub expires job logs, so nothing here can be
-/// re-derived from the tree if this constant is doubted; re-running the job is
-/// the only way to re-take the measurement. `docs/book/src/limits.md`'s
-/// `host-must-have-landlock` entry publishes that bound, and issue #281 owns
-/// turning it into something a reader can check.
+/// **This line is the only place in the repository the number is written down
+/// as a fact about the RUNNER, and that part is a transcription rather than an
+/// artefact.** It was read out of a CI job log -- the `What confinement this
+/// runner actually grants` diagnostic step, which runs `--print-isolation` on
+/// an unmodified runner and archives nothing. GitHub expires job logs, so the
+/// runner half cannot be re-derived from the tree; re-running the job is the
+/// only way to re-take it.
+///
+/// What #281 *did* close, on 2026-08-16: the runner's own kernel
+/// (`6.17.0-1020-azure`) is now booted here under QEMU, and
+/// `tests/kernel-matrix/rows/ubuntu-azure-6.17.row` is a checked-in artefact
+/// reporting `landlock.abi=7` from the shipped binary. That corroborates the
+/// number without replacing this constant, because it is a fact about the
+/// *kernel*: the same boot reads `apparmor_restrict_unprivileged_userns=0`
+/// where the runner reads `1`, so the two rows agree on the ABI and disagree
+/// on policy. `docs/book/src/isolation-kernels.md` states that distinction as
+/// the reason it is a kernel page and not a distribution page.
 const MEASURED_CI_RUNNER_ABI: u32 = 7;
 
 /// The flags word every shipped session passes to `landlock_restrict_self`.
@@ -1295,21 +1305,26 @@ fn render_not_here(p: &mut String, c: &Constants) {
          that was left half-taken: a table carrying the ABI of the machine that\n  \
          generated it cannot be byte-stable across two machines, so it cannot be the\n  \
          thing CI holds. The plan carries that as Correction 5.\n\
-         - **Which kernels clear the floor.** Two machines have been measured — this\n  \
-         repository's development box at Landlock ABI {dev} on 2026-08-15, and the runner\n  \
-         its CI uses at ABI {ci} on 2026-08-14. Those two numbers are *measurements*; the\n  \
-         floor of {min} is a *choice* made to equal the lower of them, because it is the\n  \
-         highest floor this repository can actually exercise. **The runner's number was\n  \
-         read out of a CI job log and is recorded in no artefact here** — the diagnostic\n  \
-         step that printed it archives nothing and GitHub expires job logs, so the floor\n  \
-         rests on a transcription that cannot be re-read from the tree;\n  \
-         [the limits page](limits.md) publishes that bound. The ABI-to-release mapping\n  \
-         is a fact about mainline that was not measured here, and no page in this\n  \
-         repository states which kernel releases the floor excludes.\n\
+         - **Which kernels clear the floor — measured elsewhere, not here.** This page\n  \
+         still probes nothing. Since 2026-08-16 the per-kernel measurement exists as its\n  \
+         own artefact: [the kernel page](isolation-kernels.md), generated from boot logs\n  \
+         checked in under `tests/kernel-matrix/rows/`. Read the two together and do not\n  \
+         confuse them — this page says what the *build* requires, that one says what five\n  \
+         *kernels* answered and which of them the floor of {min} admits. Two live machines\n  \
+         are also on record: this repository's\n  \
+         development box at Landlock ABI {dev} on 2026-08-15, and the runner its CI uses\n  \
+         at ABI {ci} on 2026-08-14. The runner's number was read out of a CI job log that\n  \
+         archives nothing, and it is corroborated but **not** replaced by the kernel page:\n  \
+         booting the runner's own `6.17.0-1020-azure` in a bare initramfs answers ABI {ci}\n  \
+         too, which is a fact about that kernel and not about that runner.\n\
          - **Any statement that P2.6.3 is finished.** What landed with this page is a\n  \
-         generated ladder of what this build requires, held by CI. The per-kernel row\n  \
-         set did not land, and the behavioural per-rung tests this page's numbers rest\n  \
-         on live in `vitrin-realm-init`'s own suite, on one box.\n\
+         generated ladder of what this build requires, held by CI. A per-kernel row set\n  \
+         landed separately on 2026-08-16 — five kernels, on [the kernel\n  \
+         page](isolation-kernels.md) — and it is a row per *kernel*, not the \"one row per\n  \
+         ABI actually reported\" the criteria ask for: five kernels answered five ABIs, and\n  \
+         four of the nine rungs are reported by none of them. The behavioural per-rung\n  \
+         tests this page's numbers rest on still live in `vitrin-realm-init`'s own suite,\n  \
+         on one box.\n\
          - **The realm's grant table.** Which hierarchies get which rights is\n  \
          [the limits page](limits.md)'s two-tier grant list, not a per-rung fact. The\n  \
          only grant-table row here is the one denial the mount table does not carry.\n\n",
@@ -2035,8 +2050,13 @@ mod tests {
         assert!(c.min_abi >= 1 && c.min_abi <= c.max_rung);
 
         let bumped = src.realm_init_lib_rs.replace(
-            "pub const LANDLOCK_MIN_ABI: u32 = 7;",
+            "pub const LANDLOCK_MIN_ABI: u32 = 6;",
             "pub const LANDLOCK_MIN_ABI: u32 = 8;",
+        );
+        assert_ne!(
+            bumped, src.realm_init_lib_rs,
+            "the replacement matched nothing, so the assertion below would be testing the \
+             unmodified source against itself"
         );
         let moved = Constants::from_source(&bumped).expect("a bumped floor must still parse");
         assert_eq!(

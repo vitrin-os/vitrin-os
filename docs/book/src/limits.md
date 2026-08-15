@@ -125,23 +125,46 @@ What that ruleset is, and what it is not, stated rather than left to be
 inferred from the word "Landlock":
 
 - **There is a declared ABI floor, and it is not a ladder** (owner's decision,
-  2026-08-15). This build targets recent kernels: a kernel reporting a Landlock
+  2026-08-15; the number lowered a rung on 2026-08-16). This build targets
+  recent kernels: a kernel reporting a Landlock
   ABI below `build.landlock_min_abi` — printed by `vitrind --print-floor`, and
-  **7** in this build — is **refused at startup**, with a refusal that names the
+  **6** in this build — is **refused at startup**, with a refusal that names the
   number it found, the number it needed, and the fact that no sysctl, LSM list
   or boot parameter changes either. It does not fall back to a lower rung: a
   realm confined by a weaker domain than the session's own journal names is the
   silent degradation D-020(6) exists to forbid. That is the fourth host
   requirement in the `host-must-have-landlock` entry below.
-  **Why 7 — and the number rests on exactly two measurements, one of which is
-  written down nowhere in this repository.** It is the highest floor this
-  repository can actually test: its development box (Arch, kernel
-  `7.1.8-arch1-3`) answers `landlock.abi=9`, and the GitHub `ubuntu-latest`
-  runner its CI uses answered `landlock.abi=7` on 2026-08-14, so a floor of 8
-  or 9 would be a rule no CI job could exercise. **That second number lives
-  only in a job log** — it was read out of CI's own diagnostic step, and no
-  checked-in artefact here carries the *measurement*; the
-  `host-must-have-landlock` entry below states that bound and what it costs.
+  **Why 6, and why moving it down from 7 gave up no enforcement.** The floor was
+  7 for one day. It is 6 because 6 is the *lowest* rung at which the domain this
+  build actually enforces is unchanged: the enforced triple —
+  `handled_access_fs`, `scoped`, and the `landlock_restrict_self` flags word —
+  is **identical at rungs 6, 7 and 8**, because the only thing rungs 7 and 8 buy
+  is flags (audit logging, `TSYNC`) and every shipped run passes flags = 0.
+  Rung 5 differs (it is below where `scoped` arrives), which is why the floor
+  cannot go lower without giving something up, and rung 9 differs too (it adds
+  `RESOLVE_UNIX`) — so *no page here says the domain is identical from 6 to 9*.
+  The floor decides **admission**, never which rung is applied: the rung a realm
+  gets is still `min(kernel ABI, build ceiling)`, so a machine that supplied
+  rung 9 before supplies rung 9 now. All three facts are asserted, not narrated,
+  by `the_floor_costs_nothing_because_the_domain_is_flat_from_six_to_eight` in
+  `crates/vitrin-realm-init/src/main.rs`.
+  **Which kernel releases the floor excludes IS measured now**, and it is
+  measured on kernels rather than inferred from mainline changelogs. Five
+  distribution kernels were booted under QEMU with the shipped binary and their
+  answers are checked in: Ubuntu 22.04's `5.15.0-191-generic` at ABI 1, Debian
+  12's `6.1.0-50-amd64` at ABI 2 and Ubuntu 24.04's GA `6.8.0-139-generic` at
+  ABI 4 are **refused**; Debian 13's `6.12.101+deb13-amd64` at ABI 6 and the
+  `6.17.0-1020-azure` kernel this repository's CI runners boot at ABI 7 **start**.
+  See [the kernel page](isolation-kernels.md) for the rows, their provenance,
+  and why they are kernel rows and not distribution rows. Two live machines are
+  also on record and are a different kind of evidence: this repository's
+  development box (Arch, `7.1.8-arch1-3`) answers `landlock.abi=9`, and the
+  GitHub runner its CI uses answered `landlock.abi=7` on 2026-08-14 —
+  **that second number lives only in a job log**, read out of CI's own
+  diagnostic step, and no checked-in artefact carries that *runner* measurement;
+  the `host-must-have-landlock` entry below states the bound. (The kernel page
+  boots the same kernel release and also reads 7, which corroborates the number
+  without making it a fact about that runner — the policy cells differ.)
   What a checked-in file does carry, since issue
   [#288](https://github.com/vitrin-os/vitrin-os/issues/288), is the *claim*:
   `.github/workflows/ci.yml`'s `rust` job sets `VITRIN_REQUIRE_LANDLOCK_ABI:
@@ -149,13 +172,16 @@ inferred from the word "Landlock":
   that may skip into a test that must run. That does not re-take the
   measurement and must not be read as one — it asserts it, so a runner image
   that dropped below 7 would turn the job red instead of skipping five
-  measurements quietly, which is what those five did before. **Which kernel
-  releases that excludes is not stated here, because it was not measured here**
-  — the ABI-to-release mapping is a fact about mainline, and no third machine
-  was asked. **This narrows P2.6.3 rather than completing it**: PRD §20's
-  "coverage is kernel-dependent" caveat is *deferred*, not answered, and the
-  multi-rung table the task asks for is not being built. The plan document
-  carries that correction in as many words.
+  measurements quietly, which is what those five did before. Note the two
+  numbers are now deliberately different: the *build* floor is 6 and the *CI
+  require-variable* is 7, because the second is a statement about the runner's
+  kernel and not about what this build needs.
+  **This narrows P2.6.3 rather than completing it**: PRD §20's
+  "coverage is kernel-dependent" caveat is *deferred*, not answered. Five
+  kernels reported five ABIs and four of this build's nine rungs are reported by
+  none of them, so the per-rung table the task asks for is still generated from
+  source rather than measured on machines. The plan document carries that
+  correction in as many words.
 - **The rung matters, and the rung *obtained* is what is published.** A
   Landlock ABI rung is which access rights the kernel will police at all. The
   helper asks for the highest rung this build knows that the kernel accepts,
@@ -681,32 +707,33 @@ Stated as a requirement on the host, in the order an operator should check it:
 >    absent, add `landlock` to the `lsm=` boot parameter, **keeping every name
 >    already there**.
 > 4. **The reported ABI must be at or above this build's floor**, which is
->    `build.landlock_min_abi` from `vitrind --print-floor` — **7** in this
+>    `build.landlock_min_abi` from `vitrind --print-floor` — **6** in this
 >    build. This is a *build* requirement rather than a kernel-configuration
 >    one, and it is the only one of the four that a correctly configured,
->    working Landlock can still fail.
+>    working Landlock can still fail. [The kernel
+>    page](isolation-kernels.md) lists five measured kernels and which side of
+>    this line each falls on.
 >
 > `vitrind --print-isolation` answers (1)–(3) for the machine in front of you,
 > as `landlock.abi=N`, without spawning anything; hold that number against
 > `--print-floor`'s for (4).
 
-**Requirement (4) is new, is an owner's decision (2026-08-15), and its remedy is
-different from the other three.** Nothing is misconfigured on such a machine —
-Landlock is present, enabled and answering — so no sysctl, LSM list or boot
-parameter moves the number and the refusal says so rather than handing the
-operator the three checks above. The remedy is a newer kernel. The refusal
-carries both numbers, as `below-floor(abi=N,required=M)`. The reasoning, and the
-two machines the number rests on, are in the ladder bullet above; the short form
-is that 7 is the highest floor this repository can test, because the box it is
-developed on answered `landlock.abi=9` and the runner its CI uses answered
-`landlock.abi=7` on 2026-08-14. **Further down, this entry says where that
-second number is written down — and it is written down nowhere in this
-repository.** Read the number as evidence of exactly that size.
+**Requirement (4) is an owner's decision (2026-08-15, re-tuned 2026-08-16), and
+its remedy is different from the other three.** Nothing is misconfigured on such
+a machine — Landlock is present, enabled and answering — so no sysctl, LSM list
+or boot parameter moves the number and the refusal says so rather than handing
+the operator the three checks above. The remedy is a newer kernel. The refusal
+carries both numbers, as `below-floor(abi=N,required=M)`. The reasoning is in the
+ladder bullet above; the short form is that 6 is the *lowest* rung at which this
+build's enforced domain is unchanged, so the floor sits at the point where
+refusing fewer machines costs no confinement.
 
 Two things this entry does **not** say. It does not say which distributions
-ship (3) unset, nor which ship a kernel below (4) — nobody here has surveyed
-either, and the same #281 that owns the
-namespace survey owns this one. And `--landlock=off` is not the remedy for a
+ship (3) unset — nobody here has surveyed that, and
+[#281](https://github.com/vitrin-os/vitrin-os/issues/281) owns it alongside the
+namespace survey. (Which kernels fall below (4) **is** now measured, on five of
+them; see [the kernel page](isolation-kernels.md).) And `--landlock=off` is not
+the remedy for a
 kernel that could be configured: it starts realms with **no ruleset at all**,
 so every sentence on this page about the enumerated read set, the write set and
 the rung ladder stops applying to that session. It exists for a machine that
@@ -730,38 +757,53 @@ so the word in the message is the diagnosis, not a heading.
 it.** The namespace refusal was measured on a kernel `6.17.0-1020-azure`
 runner — four years past the 5.13 where Landlock arrived — so that machine
 failed the first requirement while being nowhere near failing the second. That
-same runner answered `landlock.abi=7`, which is where requirement (4)'s number
-comes from: it clears the second requirement exactly, and a floor of 8 or 9
-would have been a rule this repository could not exercise anywhere.
+same runner answered `landlock.abi=7`, which clears requirement (4) with a rung
+to spare.
 
-**And that number is a transient observation, which is a real weakness in a
-floor.** It was printed by CI's own `What confinement this runner actually
-grants (diagnostic, never fails)` step — `--print-isolation` on an
-unmodified runner — and read out of the job log for run
+**That runner reading is still a transient observation, and it is worth being
+precise about what has and has not changed.** It was printed by CI's own `What
+confinement this runner actually grants (diagnostic, never fails)` step —
+`--print-isolation` on an unmodified runner — and read out of the job log for run
 [31776579437](https://github.com/vitrin-os/vitrin-os/actions/runs/31776579437),
-integration job, 2026-08-14. **No file in this repository records it.** The
-`--print-isolation` output is not archived as a CI artefact, is not asserted by
-any test, and GitHub expires job logs, so the one measurement that decided
-between a floor of 7 and a floor of 8 survives only as long as that log does
-and cannot be re-read from the tree. Re-running the job re-takes the
-measurement; nothing here preserves it. Turning it into an artefact a reader
-can check is part of what
-[#281](https://github.com/vitrin-os/vitrin-os/issues/281)'s cross-kernel matrix
-is for, and until that lands, requirement (4)'s number should be read as one
-dated observation of one runner plus one development box — not as a surveyed
-property of anything. For the distribution people will ask about: Ubuntu
-24.04's own kernel is the 6.8 series, which is well past 5.13, and by
-Landlock's mainline ABI history a 6.8 kernel with Landlock enabled reports
-**ABI 4** — which is **below requirement (4)** and would be refused by this
-build. **That last sentence is arithmetic over mainline release notes, not a
-measurement**: no machine running that kernel has been asked here, and
-requirements (2), (3) and (4) are facts no kernel version by itself implies.
-The runner measured above does **not** settle it either, in either direction —
-`ubuntu-latest` carries an Azure kernel (`6.17.0-1020-azure`), which is nine
-releases newer than 24.04's own and is the kernel that answered 7. The
-arithmetic is offered only to make the point that the two refusals do not
-overlap — do not read it as a claim about whether Ubuntu 24.04 runs this
-project.
+integration job, 2026-08-14. **No file in this repository records that
+runner's own output.** It is not archived as a CI artefact, is not asserted by
+any test, and GitHub expires job logs, so the *distribution* half of it — the
+policy rows, the `tier`, the `mount.in_userns` refusal — survives only as long
+as that log does. What [#281](https://github.com/vitrin-os/vitrin-os/issues/281)
+**did** close, on 2026-08-16, is the kernel half: the same kernel release
+(`6.17.0-1020-azure`) is now booted under QEMU with the shipped binary and its
+answer is a checked-in artefact reporting `landlock.abi=7`. That corroborates
+the ABI without turning it into a fact about the runner, because the same boot
+reads `apparmor_restrict_unprivileged_userns=0` where the runner reads `1`. See
+[the kernel page](isolation-kernels.md), which states that distinction as the
+reason it is a kernel page and not a distribution page.
+
+For the distribution people will ask about: Ubuntu 24.04's own GA kernel is the
+6.8 series, and **this is now measured rather than inferred** —
+`6.8.0-139-generic`, booted with the shipped binary, reports `landlock.abi=4`,
+which is below requirement (4) and is refused with
+`below-floor(abi=4,required=6)`. An earlier version of this page reached the
+same number by arithmetic over mainline release notes and labelled it as
+arithmetic; it is a row now. What that row still does not settle is
+requirements (2) and (3) on an arbitrary 24.04 install, or anything about that
+distribution's *userspace* — see the next entry, and the kernel page's section
+on why these are kernel rows. Note also that `ubuntu-latest` carries an Azure
+kernel nine releases newer than 24.04's own, so the runner above says nothing
+about a stock 24.04 in either direction.
+
+**One interaction that is easy to miss, because it spans two refusals.** PR #290
+shipped an AppArmor profile aimed at the *namespace* requirement on Ubuntu
+24.04 (issue #286). Whether that profile works is **not measured** — see the
+entry above, which records that it has never been loaded by anyone who wrote it
+— and this paragraph does not assume it does. The point is what the measurement
+adds regardless: 24.04's GA kernel is the ABI-4 row above, so on a **stock**
+24.04 the Landlock floor refuses the session at the next gate even if the
+profile grants everything it is meant to grant. The two remedies are disjoint —
+no AppArmor policy changes the number a kernel reports for its Landlock ABI — so
+a working profile there would change which refusal you get, not whether you get
+one, and the remedy for the second is a newer kernel. Only a 24.04 running a
+newer HWE or cloud kernel — `6.17.0-1020-azure` is one — is a machine where the
+profile is the only thing standing between it and a session.
 
 **One note on this repository's own CI, because it is easy to over-read.** The
 integration job takes the printed remedy and modifies the runner before it runs

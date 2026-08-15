@@ -1330,7 +1330,7 @@ fn copy_in(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::os::fd::{AsFd, OwnedFd};
@@ -2859,6 +2859,39 @@ mod tests {
     /// which is the only way an unwired cross-track check cannot masquerade
     /// as a passing one.
     ///
+    /// Whether a C shim was built and pointed at by `VITRIN_C_SHIM_BIN`.
+    ///
+    /// A [`vitrin_skip::Verdict`], not an `Option<OsString>`, and that is
+    /// the whole point (#288): a guard that hands back the path is a guard
+    /// whose answer the test has observed, and observing it is what lets a
+    /// future edit wrap the body in `if let Some(..)` and skip in silence.
+    /// The path is re-read by [`c_shim_bin`] after the guard instead.
+    pub(crate) fn c_shim_built() -> vitrin_skip::Verdict {
+        vitrin_skip::Verdict::capable_if(
+            std::env::var_os("VITRIN_C_SHIM_BIN").is_some(),
+            "VITRIN_C_SHIM_BIN is unset, so the C shim was never built and this cross-track \
+             check proved nothing. Build the shim and point the variable at it (see the \
+             `conformance` job in .github/workflows/ci.yml), or set \
+             VITRIN_C_SHIM_CONFORMANCE_SKIP=1 in a job that cannot build C.",
+        )
+    }
+
+    /// The built C shim [`c_shim_built`] just vouched for.
+    ///
+    /// Panics rather than skips if it is gone: between the guard and here
+    /// nothing may quietly stop being true.
+    pub(crate) fn c_shim_bin() -> std::path::PathBuf {
+        let bin = std::path::PathBuf::from(
+            std::env::var_os("VITRIN_C_SHIM_BIN").expect("the guard above said it is set"),
+        );
+        assert!(
+            bin.is_file(),
+            "VITRIN_C_SHIM_BIN does not name a file: {}",
+            bin.display()
+        );
+        bin
+    }
+
     /// What passing proves, none of which the C-side harness can establish
     /// on its own: the C shim's frames survive THIS server's validation --
     /// the `F_GET_SEALS` shmem probe, the 128-bit geometry-versus-fd-size
@@ -2866,24 +2899,15 @@ mod tests {
     /// `bad_order` razor, and the copy-in that actually reads its memfd.
     #[test]
     fn c_shim_conforms_to_the_real_core() {
-        let Some(shim_bin) = std::env::var_os("VITRIN_C_SHIM_BIN") else {
-            assert!(
-                std::env::var_os("CI").is_none()
-                    || std::env::var_os("VITRIN_C_SHIM_CONFORMANCE_SKIP").is_some(),
-                "VITRIN_C_SHIM_BIN is unset in CI, so the C shim was never built and this \
-                 cross-track check proved nothing. Build the shim and point the variable at \
-                 it (see the `conformance` job in .github/workflows/ci.yml), or set \
-                 VITRIN_C_SHIM_CONFORMANCE_SKIP=1 in a job that cannot build C."
-            );
-            eprintln!("skipping: set VITRIN_C_SHIM_BIN to the built shim/build/vitrin-shim");
-            return;
-        };
-        let shim_bin = std::path::PathBuf::from(shim_bin);
-        assert!(
-            shim_bin.is_file(),
-            "VITRIN_C_SHIM_BIN does not name a file: {}",
-            shim_bin.display()
-        );
+        // The `assert!` this replaced was the one skip in the repository that
+        // already had the right idea -- an UNDECLARED skip under CI was red --
+        // and `vitrin_skip::C_SHIM` is that idea generalised
+        // (`Require::UnderCiUnlessDeclared`), so the behaviour is unchanged.
+        // What is new is the marker line: the DECLARED skip used to print
+        // through `eprintln!`, which `cargo test` captures for a passing
+        // test, so the `rust` job's log said `ok` and named nothing (#288).
+        vitrin_skip::skip_unless!(vitrin_skip::C_SHIM, c_shim_built());
+        let shim_bin = c_shim_bin();
 
         let _fd = crate::capture::tests::fd_lock();
         let base = crate::spawn::tests::scratch();

@@ -4,8 +4,31 @@ name: CI
 # each acceptance criterion is a visible check on every PR:
 #
 #   rust          fmt + clippy + workspace tests (debug AND release), plus
-#                 two feature slices: gpu-tests (compile-check only) and
-#                 session-keymap (clippy + tests, WS-E.3.1/D-028)
+#                 three feature slices: gpu-tests (compile-check only),
+#                 session-keymap (clippy + tests, WS-E.3.1/D-028) and the
+#                 consent-injector/physical-input-injector pair (seven tests
+#                 that, until #288, were compiled by no job at all).
+#                 It also carries the two CI-side halves of issue #288's
+#                 skip mechanism -- the primary half is a type, in
+#                 crates/vitrin-skip, and does its work at compile time.
+#                 `cargo xtask skip-scan` is the second line of defence: a
+#                 source scan holding every `#[test]` body to the sanctioned
+#                 skip macro, holding each named job's own env block to the
+#                 require-variables it is claimed to declare (the check is
+#                 job-scoped, so MOVING a declaration to a job that enforces
+#                 nothing is red, not green, and so is assigning one as a
+#                 shell prefix on a single command), and holding every
+#                 `#[test]` in the tree to a CI step that compiles AND runs
+#                 it -- including one `#[cfg_attr(<cond>, ignore)]` would
+#                 ignore everywhere. `cargo
+#                 xtask skip-census` wraps the debug test run, fails on a skip
+#                 nobody has justified, and refuses to claim anything at all
+#                 over a run that executed fewer tests than its declared
+#                 floor. This job's `env:` block is where the runner DECLARES
+#                 what it can do (namespaces, host tooling, a Landlock ABI
+#                 floor); a skip in a declared class is a red test rather
+#                 than a quiet pass. What none of it closes is enumerated in
+#                 crates/vitrin-skip/src/lib.rs, "What this does NOT close".
 #   codegen-diff  IDL schema validation + regeneration honesty (the P1.1.2
 #                 contract: checked-in generated code matches vitrin-v0.xml),
 #                 plus the same contract for the generated session app matrix
@@ -125,12 +148,55 @@ jobs:
     # job -- and, on main, the concurrency queue -- for hours.
     timeout-minutes: 30
     env:
+      # ---- what this runner is DECLARED able to do (issue #288) -----------
+      #
+      # `crates/vitrin-skip` turns a skip into a PANIC for any class this
+      # machine claims it can satisfy. That is the asymmetry the mechanism is
+      # built on: a developer whose kernel cannot confine still gets a skip,
+      # and CI -- which can, after the sysctl step below -- gets a red test
+      # instead of a green job that measured nothing. Every variable here is
+      # a claim about THIS runner, so each one is a thing that must be true
+      # for the job to be honest, not a knob to quieten a failure.
+      #
+      # They belong in THIS block and nowhere else. `cargo xtask skip-scan`
+      # reads the env blocks and holds them, per job, to CI_DECLARATIONS in
+      # crates/xtask/src/skip_census.rs -- and it also fails on any of these
+      # names assigned in shell (`run: VITRIN_REQUIRE_CONFINEMENT=0 cargo
+      # test ...`), because that spelling would apply to one command, leave
+      # this block reading "1", and switch the enforcement off for exactly
+      # the step that needed it.
+      #
+      # The six namespaces a confined realm spawn asks for. True only AFTER
+      # the `Grant unprivileged user namespaces` step below takes the remedy
+      # vitrind's own preflight prints -- which is exactly the dependency
+      # this is meant to expose: a runner image that stops permitting that
+      # sysctl must turn this job RED rather than green-and-empty.
+      VITRIN_REQUIRE_CONFINEMENT: "1"
+      # /usr/bin/env, and a build directory with a bindable ancestor. Both
+      # hold on this image; both would otherwise start skipping after an
+      # unrelated change (a slimmer image, a CARGO_TARGET_DIR move) with no
+      # other symptom at all.
+      VITRIN_REQUIRE_HOST_TOOLING: "1"
+      # The Landlock ABI this runner was MEASURED at: `landlock.abi=7` on
+      # 2026-08-14, kernel 6.17.0-1020-azure, recorded in
+      # docs/book/src/limits.md. A floor, not a flag: every rung at or below
+      # 7 must run, and a measurement needing a rung above 7 is an honest
+      # kernel limit and still skips. Seven is also this build's own startup
+      # floor (`LANDLOCK_MIN_ABI` in crates/vitrin-realm-init/src/lib.rs), so
+      # a runner that dropped below it could not start vitrind at all and the
+      # integration job would be red for the same reason. **Change this
+      # number when the runner image changes, and only against a fresh
+      # measurement** -- it is a claim about a machine, not about this code.
+      VITRIN_REQUIRE_LANDLOCK_ABI: "7"
       # This job has no C toolchain and never builds shim/, so
       # `c_shim_conforms_to_the_real_core` cannot run here. The test refuses
       # to skip itself silently under CI (see its doc comment), so the skip
       # is DECLARED rather than assumed -- which is what makes the
       # `conformance` job below the only place that check is satisfied, and
       # makes its removal a red build rather than a quiet loss of coverage.
+      # This is the one variable here that EXCUSES rather than requires
+      # (`vitrin_skip::Require::UnderCiUnlessDeclared`), and the skip it
+      # excuses still prints its marker line into the census below.
       VITRIN_C_SHIM_CONFORMANCE_SKIP: "1"
     steps:
       - name: Checkout
@@ -161,19 +227,22 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libxkbcommon-dev libpixman-1-dev
 
       - name: Grant unprivileged user namespaces, so the confinement tests RUN
-        # Ten tests in crates/vitrin-core/src/spawn.rs spawn a REAL confined
-        # realm, and each is guarded by `namespaces_available()` so a host that
-        # cannot confine skips rather than fails. On a stock `ubuntu-latest`
-        # that guard is always false: `apparmor_restrict_unprivileged_userns=1`
-        # permits the unshare and denies the capabilities it should confer, so
-        # the realm's first mount answers EACCES.
+        # Nine tests in crates/vitrin-core/src/spawn.rs spawn a REAL confined
+        # realm, and each is guarded so a host that cannot confine skips rather
+        # than fails. On a stock `ubuntu-latest` that guard always fires:
+        # `apparmor_restrict_unprivileged_userns=1` permits the unshare and
+        # denies the capabilities it should confer, so the realm's first mount
+        # answers EACCES.
         #
-        # Without this step those ten skip -- and they skip SILENTLY, because
-        # the guard reports itself with `eprintln!` and `cargo test` captures
-        # stderr for tests that pass. The job then prints `993 passed` while
-        # having exercised none of the confinement it was extended to cover.
-        # That is issue #229's failure mode exactly: a green number standing in
-        # for absent evidence.
+        # Without this step those nine skip. Until #288 they skipped SILENTLY,
+        # because the guard reported itself with `eprintln!` and `cargo test`
+        # captures stdout AND stderr for tests that pass: the job printed
+        # `993 passed` while having exercised none of the confinement it was
+        # extended to cover -- issue #229's failure mode exactly, a green
+        # number standing in for absent evidence. `VITRIN_REQUIRE_CONFINEMENT`
+        # in this job's env block is what makes the pairing enforceable: this
+        # step is now load-bearing, and dropping it turns the job red instead
+        # of quietly empty.
         #
         # Same remedy the integration job takes, and the same caveat: after
         # this step the runner is NOT a stock Ubuntu machine, so nothing here
@@ -191,14 +260,132 @@ jobs:
         # RUSTFLAGS env ever changes.
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
+      - name: Skip scan (no unsanctioned skip anywhere in the tree)
+        # The DISCOVERY half of issue #288, and the only part that covers a
+        # skip site written by somebody who never read the issue. Reads
+        # sources, runs nothing: it walks every `#[test]` body under crates/
+        # and fuzz/ and fails on an early `return` that did not go through
+        # `vitrin_skip::skip_unless!`, and it holds the census inventory to the
+        # sources in BOTH directions -- a new sanctioned skip is red until it
+        # is written down and justified, a deleted one is red until its entry
+        # goes.
+        #
+        # It runs here, before the suites, because it is seconds long and its
+        # failure is about the tree rather than about this machine. Its
+        # coverage is the whole workspace including `fuzz/`, which is a
+        # separate workspace no `cargo test --workspace` reaches.
+        #
+        # It is the SECOND line of defence, not the first. The shapes it
+        # cannot see -- a guard inverted around a whole test body, a guard
+        # inside the closure that is the measurement -- stopped compiling
+        # when `vitrin_skip::Verdict` and `vitrin_skip::Measured` were
+        # sealed; this step covers the bare-`return` shape, the stale
+        # inventory, and (added with them) two things nothing previously
+        # asserted at all:
+        #
+        #   * the require-variables, PER JOB. CI_DECLARATIONS in
+        #     crates/xtask/src/skip_census.rs names the job each variable must
+        #     be set in and the value, and both directions are checked -- so
+        #     deleting one is red, and so is moving one to a job where it
+        #     enforces nothing, which a workflow-wide check could not tell
+        #     apart from the real thing. So is assigning one in shell inside a
+        #     `run:` block, where it would cover a single command and be
+        #     invisible to a table whose scope is the job.
+        #   * every `#[test]` in the tree against the CI step that compiles
+        #     AND runs it (CI_TEST_RUNS + UNRUN_TESTS). A `#[cfg(feature)]`
+        #     test no job builds, one every job's name filter excludes, or one
+        #     `#[cfg_attr(<cond>, ignore)]` ignores in every build made here,
+        #     emits no output at all, so no census over test output can see
+        #     it -- 24 were in that state when the check first ran. Nineteen
+        #     are now wired into a step (the injector slice in this job, the
+        #     widened filter in `drm-compile-check`); the rest are counted and
+        #     named, four of them published as gaps in docs/book/src/limits.md
+        #     -- with the COUNT in that page generated and matched, so a fifth
+        #     gap cannot be added under a paragraph that still says four --
+        #     and one recorded as executed by another test rather than by a
+        #     libtest selection. What the check does NOT read is `if:`
+        #     conditions -- a step made conditional would keep it green; that
+        #     bound is stated in crates/xtask/src/test_census.rs.
+        run: cargo xtask skip-scan
+
+      - name: cargo test --workspace (through the skip census)
+        # The REPORTING half. The wrapper runs the suite with
+        # `--show-output`, filters the marker lines out of the passing tests'
+        # captured output (which is otherwise thousands of lines of
+        # measurements), itemises every skip to the log and to
+        # $GITHUB_STEP_SUMMARY, and FAILS on a skip whose (class, test) pair
+        # is not in the inventory in crates/xtask/src/skip_census.rs.
+        #
+        # `--show-output` rather than `--nocapture`: it keeps capture on and
+        # prints each test's output under its own `---- <test path> stdout
+        # ----` heading, so markers stay attributed and a parallel run stays
+        # legible. `--nocapture` prints the same bytes unattributed and
+        # interleaved.
+        #
+        # This does not replace the env block's require-variables. Those are
+        # the enforcement and they apply to every step in this job; this is
+        # what makes the log say what a green run did NOT prove.
+        #
+        # `--min-tests 1200` is the floor this invocation must EXECUTE before
+        # its census is allowed to say anything affirmative. Measured on
+        # 2026-08-15: 1259 tests, on a development box where one pre-existing
+        # xtask test fails because the shim was meson-built there and is not
+        # on a runner. (An earlier measurement said 1260, and five of those
+        # were not tests at all: they were fixture lines printed by xtask's
+        # own census wrapper tests, which used to reach fd 1 past libtest's
+        # capture and be counted here. The wrapper now writes to a sink its
+        # caller owns, which is why the number went DOWN while tests were
+        # added.) It is a floor and not a count -- there is no
+        # number here to bump on every added test -- and its job is to make
+        # "the harness collapsed and the step exited 0" impossible, which is
+        # what a filtered run that matches nothing looks like from outside.
+        # Zero is not a legal value for it, here or anywhere: a floor of zero
+        # is met by a run that executed nothing.
+        #
+        # `--expect-self-marker` is the census's own non-vacuity check:
+        # `crates/vitrin-skip`'s unit tests call `decide` and therefore print
+        # real marker lines on purpose, so a run of the workspace suite that
+        # produced NO marker means the parser, the shared `MARKER` constant
+        # or `--show-output` has broken and every clean census after it would
+        # be meaningless. Those planted markers are reported separately and
+        # are never counted as skips.
+        run: |
+          cargo xtask skip-census --min-tests 1200 --expect-self-marker \
+            -- cargo test --workspace -- --show-output
 
       - name: cargo test --workspace --release
         # Not redundant with the debug run: assertion-related bugs are
         # release-only by nature (this crate's first shipped bug was a
         # debug_assert! compiled out in release), so the suite must pass in
         # exactly the mode where such a regression would hide.
+        #
+        # Deliberately NOT wrapped in the skip census, and therefore carrying
+        # no `--min-tests` floor either. Both are the same reason: it names no
+        # filter, so the way a filtered step comes to run nothing -- a name
+        # that stopped matching -- has no analogue here, and it runs the same
+        # set the censused debug step above already floored at 1200 under the
+        # same env block. The require-variables still turn any skip into a red
+        # test here; what a second itemised census would add is a block
+        # readers learn to scroll past.
+        #
+        # The FOUR steps in this workflow that DO name a filter each carry
+        # their own floor, because for them "matched nothing" and "passed"
+        # print the same exit code:
+        #
+        #   * the injector slice below (`--min-tests 6`, against 7);
+        #   * `drm-compile-check`'s device-free unit tests (`--min-tests 34`,
+        #     against 35);
+        #   * `conformance`'s `c_shim` run (`--min-tests 2`, which IS the
+        #     whole set: `c_shim` matches exactly two tests by name);
+        #   * `integration`'s Firefox real-core gate, which filters
+        #     `unittest discover` down to one module by filename and so
+        #     asserts `Ran N tests` with N >= 1 in the shell -- there is no
+        #     `--min-tests` for unittest, and an earlier version of this list
+        #     said "three steps" because that fourth one was missed, which is
+        #     the same class of miscount as everything else on this page.
+        #
+        # The `vitrin-ipc` and `session-keymap` slices below name no filter
+        # and are unbounded for the same reason this step is.
         run: cargo test --workspace --release
 
       - name: vitrin-ipc dependency-light client slice
@@ -240,6 +427,51 @@ jobs:
         run: |
           cargo clippy -p vitrin-core --all-targets --features session-keymap -- -D warnings
           cargo test -p vitrin-core --features session-keymap
+
+      - name: vitrin-core injector slices (the seven tests that ran NOWHERE)
+        # Found while wiring issue #288: everything behind `consent-injector`
+        # and `physical-input-injector` is `#[cfg(feature = ...)]`-gated, and
+        # vitrin-core declares no default feature list -- so `cargo test
+        # --workspace`, `cargo clippy --workspace --all-targets` and the
+        # integration job's `cargo build` all missed the lot. They had never
+        # been compiled, let alone run, and one of them did not compile at
+        # all: it carried `isolation: IsolationOptions::default()` in PATTERN
+        # position, which is not Rust. That is #288's failure class one level
+        # below a skip -- a test that exists, is cited, and never executes --
+        # and no census over test output could ever have seen it, because
+        # there was no output.
+        #
+        # SEVEN, not two. The first version of this step named two tests with
+        # `--exact`, which compiled the other five and ran none of them: the
+        # `consent::injector::live::tests::*` socket tests were still in
+        # exactly the state the step was added to fix, one line lower down.
+        # The filters below are substrings and one of them covers the whole
+        # module, so a test added beside those five is picked up rather than
+        # silently excluded.
+        #
+        # Still filtered rather than unfiltered on purpose: an unfiltered run
+        # rebuilds and re-runs the whole vitrind suite a third time in this
+        # job. The compile is what the rest of the feature gets, and it is
+        # what would have caught the pattern above.
+        #
+        # ...and BOUNDED, because a name filter is exactly how a step comes to
+        # run nothing: three names that no longer match print `0 passed; 0
+        # failed; 1001 filtered out` and exit 0. `--min-tests 6` against 7
+        # measured on 2026-08-15. Say what that does and does not catch: a
+        # floor one under the set catches the filter collapsing, and does NOT
+        # catch losing exactly one test while another is added. It is a floor
+        # rather than the exact count so that adding a socket test beside the
+        # five is not a red build for a good change, and `cargo xtask
+        # skip-scan` is what covers the single-rename case -- it holds each
+        # filter here to the table in crates/xtask/src/test_census.rs and
+        # every `#[test]` in the tree to a step that selects it.
+        run: |
+          cargo xtask skip-census --min-tests 6 -- \
+            cargo test -p vitrin-core --features consent-injector,physical-input-injector \
+            --bin vitrind -- --show-output \
+            tests::the_injector_flag_and_the_feature_are_both_required \
+            tests::the_physical_input_flag_parses_once_and_fails_closed \
+            consent::injector::live::tests::
 
   codegen-diff:
     name: codegen-diff (IDL schema + regeneration honesty)
@@ -541,9 +773,46 @@ jobs:
         # display controller. That is the `rust` and `conformance` jobs' work
         # and they already do it. Unfiltered, 89 of them fail here for reasons
         # that would read as "the DRM backend is broken".
+        #
+        # WIDENED for issue #288, twice. libtest's filter arguments are an OR
+        # over substrings, and everything `drm-backend` gates that no listed
+        # substring matched ran nowhere at all -- silently counted in this
+        # step's `N filtered out`, which is why that number is not evidence of
+        # anything. Three names were added:
+        #
+        #   * `the_vt_escape_reserves_the_function_keys_on_bare_metal`
+        #     (crates/vitrin-core/src/main.rs) and
+        #     `a_raised_consent_prompt_does_not_swallow_the_vt_escape`
+        #     (crates/vitrin-core/src/consent/grab.rs);
+        #   * `vt::tests::` -- FOURTEEN more, the whole VT-escape module in
+        #     crates/vitrin-core/src/vt.rs, which the first widening missed
+        #     because it was written by reading the two names somebody had
+        #     already noticed rather than by asking what the feature gates.
+        #     `cargo xtask skip-scan` now asks that question mechanically, and
+        #     these are what it answered with.
+        #
+        # All device-free: chord parsing, modifier bookkeeping, and the rule
+        # that an agent's synthetic Ctrl-Alt can never arm the human's next
+        # F-key. None opens a card or a seat.
+        #
+        # BOUNDED for the same reason the filter is the point. This step
+        # diagnosed that "the number of filtered-out tests is not evidence of
+        # anything" and then had no lower bound of its own, which is the same
+        # defect one line further on: rename `backend::drm::` and the step
+        # prints `0 passed; 1047 filtered out` and exits 0. `--min-tests 34`
+        # against 35 measured on 2026-08-15 -- a floor, so adding a device-
+        # free unit test does not require editing this line, while losing a
+        # module does. It does NOT catch losing exactly one test; that case is
+        # `cargo xtask skip-scan`'s, which holds every `#[test]` in the tree
+        # to a step that selects it and each filter here to the table in
+        # crates/xtask/src/test_census.rs.
         run: |
-          cargo test -p vitrin-core --features drm-backend --bin vitrind \
-            -- backend::drm:: the_drm_refusal_table
+          cargo xtask skip-census --min-tests 34 -- \
+            cargo test -p vitrin-core --features drm-backend --bin vitrind \
+            -- --show-output backend::drm:: the_drm_refusal_table \
+            the_vt_escape_reserves_the_function_keys_on_bare_metal \
+            a_raised_consent_prompt_does_not_swallow_the_vt_escape \
+            vt::tests::
 
   shim:
     name: shim (C header, golden frames, Meson; no Rust)
@@ -600,10 +869,31 @@ jobs:
         # If shim sources land without shim/meson.build, the Meson steps
         # below would skip silently and this job would stay green while
         # never building the shim. Fail loudly instead.
+        #
+        # And the same, one level down, for the four acceptance scripts each
+        # of whose steps carries its own `hashFiles(...) != ''` guard (issue
+        # #288): delete or rename any one of them and its step silently
+        # no-ops, the job stays green, and the only trace is a grey step in
+        # the GitHub UI that nobody diffs. That is #138's shape one directory
+        # over. Naming them here makes a deletion a red build, and the
+        # `hashFiles` guards keep their historical job -- letting the steps
+        # sit dormant before a script lands -- only now the dormancy has to
+        # be deliberate.
         run: |
           if [ -d shim/src ] && [ ! -f shim/meson.build ]; then
             echo "::error::shim/src exists but shim/meson.build does not -- the Meson CI steps are gated on shim/meson.build and would silently skip. Land meson.build with the sources (P1.6.1)."
             exit 1
+          fi
+          if [ -f shim/meson.build ]; then
+            missing=0
+            for script in upstream_frame_path seat_input_replay firefox_bringup app_spawn; do
+              if [ ! -f "shim/tests/acceptance/${script}.sh" ]; then
+                echo "::error::shim/tests/acceptance/${script}.sh is gone, and its CI step is gated on hashFiles() -- the step would skip silently and this job would stay green having run one acceptance script fewer. Restore it, or delete its step in .github/workflows/ci.yml in the same commit."
+                missing=1
+              fi
+            done
+            [ "$missing" -eq 0 ] || exit 1
+            echo "OK: all four gated acceptance scripts are present"
           fi
 
       - name: Install Meson + wlroots subproject build dependencies
@@ -958,9 +1248,27 @@ jobs:
         # to what comes back, and latches a commit into a real Scene. The
         # test's own env allowlist passes the software-rendering WLR_* names
         # through to the shim -- the runners have no GPU.
+        #
+        # Run through the skip census (issue #288) and with `--show-output`
+        # rather than `--nocapture`: this is the ONE job where the two
+        # `c_shim` tests are satisfied for real, so "did they actually run"
+        # is the whole question the job answers. It sets no
+        # VITRIN_C_SHIM_CONFORMANCE_SKIP, so `vitrin_skip::C_SHIM` is
+        # required here by `Require::UnderCiUnlessDeclared` and a skip is a
+        # red test rather than a line nobody reads. `--show-output` keeps
+        # capture on and attributes each test's output to its own heading;
+        # `--nocapture` interleaved it unattributed.
+        #
+        # `--min-tests 2` is the whole expected set, not a margin: `c_shim` is
+        # a substring filter over a 996-test binary, and renaming either test
+        # would leave this job green having run neither. That is the failure
+        # this job exists to prevent one directory over, so it may not commit
+        # it itself.
         env:
           VITRIN_C_SHIM_BIN: ${{ runner.temp }}/shim-build/vitrin-shim
-        run: cargo test -p vitrin-core c_shim -- --nocapture
+        run: |
+          cargo xtask skip-census --min-tests 2 -- \
+            cargo test -p vitrin-core c_shim -- --show-output
 
   sdk:
     name: sdk (Python ${{ matrix.python }} wire-client unit tests)
@@ -991,12 +1299,50 @@ jobs:
         # stdlib). One matrix leg gets the real decoder so the
         # test_to_png_decodes_with_pillow round-trip runs; the other leg
         # stays Pillow-less and proves the dependency-free path end to end
-        # (that one test skips itself there).
+        # (that one test skips itself there, and declares so below).
         if: matrix.python == '3.13'
         run: python -m pip install pillow
 
       - name: pytest
-        run: python -m pytest sdk/python/tests -q
+        # ENFORCED, not just reported (issue #288). An earlier draft of this
+        # step added `-rs` -- which itemises each skip instead of printing a
+        # number nobody diffs -- and left the expected skip set in a prose
+        # comment right here. A comment is not a gate: it cannot fail, and
+        # nothing compared it to the run. `sdk/python/tests/conftest.py` is
+        # the gate, and it mirrors the Rust design rather than inventing a
+        # second one:
+        #
+        #   * every skip must carry `@pytest.mark.capability("<class>")`
+        #     naming the machine state it describes -- an unclassified skip
+        #     fails the run, the way an un-inventoried marker fails
+        #     `cargo xtask skip-census`;
+        #   * the require-variables below EXCUSE rather than require, so a
+        #     skip under CI is a failure unless a job says otherwise. That
+        #     polarity is deliberate: a typo in a variable name here makes a
+        #     job RED rather than quietly switching the enforcement off;
+        #   * VITRIN_MIN_TESTS is the collection floor, the pytest side of
+        #     `--min-tests`, and it is held to the same two rules: a value
+        #     that is not a non-negative integer is REJECTED at
+        #     `pytest_configure` rather than crashing inside a hook at the end
+        #     of a run, and zero -- or leaving it unset -- is refused under
+        #     CI, because a floor of zero is met by a run that collected
+        #     nothing. Measured on 2026-08-15: 84 collected.
+        #
+        # So the two legs differ by exactly one declared fact -- the
+        # Pillow-less leg says it cannot decode PNGs independently -- and
+        # every other skip on either leg is a red build.
+        env:
+          # `0` on the leg that deliberately has no Pillow, `1` on the leg
+          # that installed it above; unset would ALSO mean required under CI,
+          # and saying it out loud is what makes the pairing with the install
+          # step above visible in one screen.
+          VITRIN_REQUIRE_PILLOW: ${{ matrix.python == '3.13' && '1' || '0' }}
+          # `test_verb_parity.py` skips the whole module when
+          # protocol/vitrin-v0.xml is absent, which never happens in a
+          # checkout; if it ever does here, the checkout is what is wrong.
+          VITRIN_REQUIRE_IDL: "1"
+          VITRIN_MIN_TESTS: "80"
+        run: python -m pytest sdk/python/tests -q -rs
 
   integration:
     name: integration (vitrind --headless + SDK tests)
@@ -1080,6 +1426,29 @@ jobs:
           for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_real_clipboard.py test_screenshot.py test_real_gestures.py test_real_confinement.py test_launch.py test_shell.py; do
             if [ ! -f "tests/integration/$gate" ]; then
               echo "::error::named property gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with that property's evidence contributing nothing. Restore it, or retire it from run.sh's PROPERTY_GATES, this list, and tests/integration/README.md's gate table together."
+              missing=1
+            fi
+          done
+          # And the other direction, added for issue #288: a module ON DISK
+          # that run.sh names in NONE of its three lists. Seven were in that
+          # state -- test_real_firefox.py, test_real_gtk.py,
+          # test_runtime_wiring.py, test_hostile_client.py,
+          # test_multi_realm.py, test_actuation.py, test_consent_injector.py
+          # -- so deleting one made `unittest discover` simply collect fewer
+          # tests, with nothing comparing the collected set to an expectation
+          # and the suite exiting 0.
+          #
+          # Written as a grep of run.sh rather than as a fourth copy of the
+          # names, deliberately: the two lists above are duplicated here for
+          # independence and have drifted TWICE (see the notes on each), and a
+          # third copy would be a third thing to drift. What this asserts is
+          # the property, not the membership -- every module is classified
+          # somewhere -- and run.sh's own SUPPORTING_MODULES list is what
+          # catches a deletion.
+          for path in tests/integration/test_*.py; do
+            name="$(basename "$path")"
+            if ! grep -q "^  ${name}\b" tests/integration/run.sh; then
+              echo "::error::tests/integration/${name} is named in none of run.sh's MILESTONE_GATES / PROPERTY_GATES / SUPPORTING_MODULES lists. unittest discover collects it, this job is cited for it, and nothing here would notice its deletion. Classify it in run.sh (and in tests/integration/README.md's gate table)."
               missing=1
             fi
           done
@@ -1348,14 +1717,34 @@ jobs:
         # runtime libraries beyond the libgtk-3 the shim deps already install;
         # if a future ESR needs more, this step fails loudly naming the missing
         # library, which is the gap-closing procedure, not a silent skip.
+        #
+        # BOUNDED, added for issue #288. `-p 'test_real_firefox.py'` is a name
+        # filter, and this is the FOURTH filtered test step in this workflow --
+        # the one the `rust` job's note about floors originally missed. Rename
+        # or move the module and `unittest discover` collects nothing, prints
+        # `Ran 0 tests in 0.000s` followed by `OK`, and exits 0: the browser
+        # was fetched, the shim was built, and the render gate this job is
+        # cited for proved nothing. So the run is teed and `Ran N` is read back
+        # with N >= 1 required -- the shell's `--min-tests`, unittest having no
+        # equivalent of its own.
         if: hashFiles('tests/integration/run.sh') != ''
         env:
           VITRIN_C_SHIM_BIN: ${{ runner.temp }}/shim-build/vitrin-shim
         run: |
           sudo apt-get install -y -qq libasound2t64 libdbus-glib-1-2 libseccomp2
           bash shim/tests/firefox/fetch-esr.sh
+          log="${RUNNER_TEMP}/firefox-gate.log"
           PYTHONPATH="$PWD/sdk/python/src" VITRIN_REPO="$PWD" \
-            python3 -m unittest discover -s tests/integration -p 'test_real_firefox.py' -v
+            python3 -m unittest discover -s tests/integration -p 'test_real_firefox.py' -v \
+            2>&1 | tee "$log"
+          status="${PIPESTATUS[0]}"
+          [ "$status" -eq 0 ] || exit "$status"
+          ran="$(sed -n 's/^Ran \([0-9][0-9]*\) test.*/\1/p' "$log" | tail -1)"
+          if [ -z "$ran" ] || [ "$ran" -lt 1 ]; then
+            echo "::error::the Firefox real-core gate collected ${ran:-no} test(s). \`unittest discover -p 'test_real_firefox.py'\` is a NAME FILTER, and a filter that matches nothing prints 'OK' and exits 0 -- this step would be green having rendered nothing. Restore tests/integration/test_real_firefox.py under that name, or retire this step in the same commit."
+            exit 1
+          fi
+          echo "Firefox real-core gate: ${ran} test(s) actually ran"
 
       - name: Integration suite DORMANT
         if: hashFiles('tests/integration/run.sh') == ''

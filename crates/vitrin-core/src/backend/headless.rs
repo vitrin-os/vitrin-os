@@ -3353,24 +3353,15 @@ mod tests {
         use crate::consent::tests::prompt_fixture;
         use crate::shim::{ShimConfig, ShimServer};
 
-        let Some(shim_bin) = std::env::var_os("VITRIN_C_SHIM_BIN") else {
-            assert!(
-                std::env::var_os("CI").is_none()
-                    || std::env::var_os("VITRIN_C_SHIM_CONFORMANCE_SKIP").is_some(),
-                "VITRIN_C_SHIM_BIN is unset in CI, so the C shim was never built and this \
-                 real-app occlusion check proved nothing. Build the shim and point the variable \
-                 at it (see the `conformance` job in .github/workflows/ci.yml), or set \
-                 VITRIN_C_SHIM_CONFORMANCE_SKIP=1 in a job that cannot build C."
-            );
-            eprintln!("skipping: set VITRIN_C_SHIM_BIN to the built shim/build/vitrin-shim");
-            return;
-        };
-        let shim_bin = std::path::PathBuf::from(shim_bin);
-        assert!(
-            shim_bin.is_file(),
-            "VITRIN_C_SHIM_BIN does not name a file: {}",
-            shim_bin.display()
-        );
+        // The same probe as `crate::shim::tests::c_shim_conforms_to_the_real_core`,
+        // called rather than copied (#288): the assert's behaviour is
+        // preserved by `Require::UnderCiUnlessDeclared`, the declared skip
+        // prints a marker line the census can itemise instead of an
+        // `eprintln!` that `cargo test` swallowed on the passing path, and
+        // the answer arrives as an opaque `Verdict` this test cannot inspect
+        // -- so the guard cannot be inverted around the body below.
+        vitrin_skip::skip_unless!(vitrin_skip::C_SHIM, crate::shim::tests::c_shim_built());
+        let shim_bin = crate::shim::tests::c_shim_bin();
 
         // `click-target` is co-built beside the shim unconditionally (a bare
         // wl_shm client, no optional dep -- `shim/meson.build`), resolved the

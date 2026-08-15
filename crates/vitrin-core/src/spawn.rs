@@ -4150,27 +4150,93 @@ pub(crate) mod tests {
         );
     }
 
-    /// Whether this machine will grant the six namespaces the confined spawn
+    /// Whether this machine grants the six namespaces the confined spawn
     /// asks for.
     ///
     /// Measured with the same probe the startup floor uses, never inferred
-    /// from a kernel version -- and a test that finds it unavailable **says
-    /// so loudly and skips** rather than passing. A silent skip is how a
-    /// confinement suite comes to mean nothing on the one machine it was
-    /// added for.
-    pub(crate) fn namespaces_available() -> bool {
+    /// from a kernel version. What changed in issue #288 is the **type**:
+    /// the answer is a [`vitrin_skip::Verdict`], which is opaque. A caller
+    /// cannot test it, match it, print it or destructure it -- the only
+    /// thing it can do is hand it to
+    /// [`skip_unless!`](vitrin_skip::skip_unless), and that prints one
+    /// machine-readable marker line and, under
+    /// `VITRIN_REQUIRE_CONFINEMENT=1` (which CI sets), **panics instead of
+    /// returning**.
+    ///
+    /// That is deliberate, and it is what a `bool` could not do. With a
+    /// `bool` (or an `Option<String>`, which this briefly was) the guard
+    /// can be inverted and the whole body wrapped in `if
+    /// namespaces_available() { ... }`, or moved inside the closure that
+    /// *is* the measurement -- two silent skips that no source scan sees
+    /// and that were both demonstrated against the first version of this
+    /// mechanism. Neither compiles now.
+    ///
+    /// This function used to `eprintln!` the reason itself and the doc
+    /// comment here used to call that "loudly". It was not loud: `cargo
+    /// test` captures stdout AND stderr for tests that PASS and prints them
+    /// only for failures, so the announcement was visible on a terminal
+    /// somebody was watching and invisible in every CI log. The `rust` job
+    /// printed `993 passed` while exercising none of the confinement below
+    /// from the merge of #186 until #287.
+    pub(crate) fn namespaces() -> vitrin_skip::Verdict {
         let report = isolation::Report::probe();
-        let ok = report
-            .mechanism(isolation::Mechanism::Namespaces)
-            .is_available();
-        if !ok {
-            eprintln!(
-                "SKIPPED: this kernel reports ns.all={} -- the confinement tests below cannot \
-                 run here. This is a real gap in this run's coverage, not a pass.",
+        vitrin_skip::Verdict::capable_if(
+            report
+                .mechanism(isolation::Mechanism::Namespaces)
+                .is_available(),
+            format!(
+                "this kernel reports ns.all={} -- the confinement tests cannot run here. This is \
+                 a real gap in this run's coverage, not a pass.",
                 report.namespaces_combined
-            );
-        }
-        ok
+            ),
+        )
+    }
+
+    /// Whether this host has the `/usr/bin/env` the reachable-canary
+    /// measurement binds.
+    ///
+    /// A [`vitrin_skip::Verdict`] rather than a `bool` for the same reason
+    /// as [`namespaces`]: the caller must not be able to ask, only to hand
+    /// the answer over. The path is re-derived after the guard by
+    /// [`reachable_canary`], which is a constant either way.
+    pub(crate) fn reachable_canary_present() -> vitrin_skip::Verdict {
+        let path = reachable_canary();
+        vitrin_skip::Verdict::capable_if(
+            path.exists(),
+            format!(
+                "{} is missing on this host, so there is no canary the realm really can reach",
+                path.display()
+            ),
+        )
+    }
+
+    /// The canary the reachable-canary measurement binds into the realm.
+    pub(crate) fn reachable_canary() -> PathBuf {
+        PathBuf::from("/usr/bin/env")
+    }
+
+    /// The first ancestor of `dir` the mount table may bind, if any.
+    ///
+    /// Split out of the test so the same expression answers the guard and
+    /// the measurement: the guard turns it into a [`vitrin_skip::Verdict`]
+    /// and the measurement re-derives it, rather than the guard handing a
+    /// value the test could have got by branching on the probe itself.
+    pub(crate) fn bindable_ancestor(dir: &Path) -> Option<PathBuf> {
+        dir.parent()
+            .filter(|p| p.parent().is_some() && !p.starts_with("/usr") && !p.starts_with("/etc"))
+            .map(Path::to_path_buf)
+    }
+
+    /// Whether the build directory has an ancestor the mount table can bind.
+    pub(crate) fn bindable_ancestor_present(dir: &Path) -> vitrin_skip::Verdict {
+        vitrin_skip::Verdict::capable_if(
+            bindable_ancestor(dir).is_some(),
+            format!(
+                "the mock shim's directory ({}) has no bindable ancestor, so there is no stub \
+                 the mount table would have had to create",
+                dir.display()
+            ),
+        )
     }
 
     /// Poll until `f` returns `Some`, or fail with `what` after [`DEADLINE`].
@@ -5757,9 +5823,7 @@ pub(crate) mod tests {
     #[test]
     fn a_confined_realm_cannot_reach_the_canary_and_the_core_proves_it_from_outside() {
         let _fd = fd_lock();
-        if !namespaces_available() {
-            return;
-        }
+        vitrin_skip::skip_unless!(vitrin_skip::CONFINEMENT, namespaces());
         let mut h = Harness::new("confined-spawn");
         let confinement = h.confinement();
         let canary = confinement.canaries[0].clone();
@@ -5874,9 +5938,7 @@ pub(crate) mod tests {
     #[test]
     fn a_confined_spawn_journals_the_split_between_what_it_read_and_what_it_was_told() {
         let _fd = fd_lock();
-        if !namespaces_available() {
-            return;
-        }
+        vitrin_skip::skip_unless!(vitrin_skip::CONFINEMENT, namespaces());
         let mut h = Harness::new("confined-journal");
         let confinement = h.confinement();
         let canary = confinement.canaries[0].clone();
@@ -5942,7 +6004,18 @@ pub(crate) mod tests {
     /// Factored out so each property below is one assertion against a real
     /// realm rather than forty lines of bring-up: the bring-up is the same
     /// every time, and a copy of it per test is a copy that drifts.
-    fn with_confined_realm(label: &str, f: impl FnOnce(i32, &IsolationFacts)) {
+    ///
+    /// **The closure returns [`vitrin_skip::Measured`]** (#288). A bare
+    /// `return;` inside it would leave the closure rather than the test, so
+    /// this helper would complete, the test would report `ok`, and nothing
+    /// would have been asserted -- a silent skip that `cargo xtask
+    /// skip-scan` cannot see, because it deliberately does not count
+    /// returns inside closures. Requiring the token makes `return;` a type
+    /// error; the closure has to end by saying `vitrin_skip::measured()`.
+    fn with_confined_realm(
+        label: &str,
+        f: impl FnOnce(i32, &IsolationFacts) -> vitrin_skip::Measured,
+    ) {
         let mut h = Harness::new(label);
         let confinement = h.confinement();
         let canary = confinement.canaries[0].clone();
@@ -5958,7 +6031,8 @@ pub(crate) mod tests {
         )
         .expect("the confined spawn must succeed");
         let facts = spawned.isolation().clone();
-        f(facts.shim_host_pid.expect("the shim's host pid"), &facts);
+        let _measured: vitrin_skip::Measured =
+            f(facts.shim_host_pid.expect("the shim's host pid"), &facts);
         h.reap(spawned);
         let _ = fs::remove_file(&canary);
     }
@@ -5981,9 +6055,7 @@ pub(crate) mod tests {
         // inside a user namespace (Ubuntu 24.04+'s AppArmor default, and the
         // GitHub runner) cannot run it at all. CI takes the sysctl remedy in
         // the `rust` job so this runs there rather than skipping.
-        if !namespaces_available() {
-            return;
-        }
+        vitrin_skip::skip_unless!(vitrin_skip::CONFINEMENT, namespaces());
         let mut h = Harness::new("landlock-cap");
         let mut confinement = h.confinement();
         confinement.landlock = LandlockRequest::CappedAt(2);
@@ -6004,13 +6076,22 @@ pub(crate) mod tests {
         let _ = fs::remove_file(&canary);
 
         let kernel = facts.landlock_kernel_abi.expect("the realm read the ABI");
-        if kernel < 2 {
-            eprintln!(
-                "SKIP the cap assertion: this kernel reports Landlock ABI {kernel}, so rung 2 \
-                 is not below it and the cap could not have weakened anything."
-            );
-            return;
-        }
+        // Worse than a guard at the top of a test: this one fires AFTER the
+        // spawn, so before #288 the test reported `ok` having asserted
+        // nothing at all about the cap. The rung travels inside the verdict,
+        // so the number the require-floor is compared against and the number
+        // this compared against are one number rather than two.
+        vitrin_skip::skip_unless!(
+            vitrin_skip::LANDLOCK_ABI,
+            vitrin_skip::Verdict::capable_if_at_rung(
+                kernel >= 2,
+                2,
+                format!(
+                    "the cap assertion: this kernel reports Landlock ABI {kernel}, so rung 2 is \
+                     not below it and the cap could not have weakened anything."
+                )
+            )
+        );
         assert_eq!(
             facts.landlock_rung,
             Some(2),
@@ -6126,9 +6207,7 @@ pub(crate) mod tests {
         // behind it, and these are the same reads the acceptance gate makes
         // from *inside* the realm.
         let _fd = fd_lock();
-        if !namespaces_available() {
-            return;
-        }
+        vitrin_skip::skip_unless!(vitrin_skip::CONFINEMENT, namespaces());
         with_confined_realm("confined-authority", |shim, facts| {
             // Zero capabilities. `execve` recomputes them, and with an
             // identity map there is no valid `make_kuid(ns, 0)` -- so the
@@ -6292,6 +6371,10 @@ pub(crate) mod tests {
                     "{absent} is reachable inside the realm"
                 );
             }
+            // Says "this closure reached its end". Nothing else can be
+            // returned from here, so an early `return;` -- the silent skip
+            // shape a closure hides from `skip-scan` -- is a type error.
+            vitrin_skip::measured()
         });
     }
 
@@ -6302,9 +6385,7 @@ pub(crate) mod tests {
         // 1 with it, and the kernel's rule that a pid namespace dies with its
         // init takes everything else. No /proc walk, no supervision policy.
         let _fd = fd_lock();
-        if !namespaces_available() {
-            return;
-        }
+        vitrin_skip::skip_unless!(vitrin_skip::CONFINEMENT, namespaces());
         let mut h = Harness::new("pdeathsig");
         let confinement = h.confinement();
         let canary = confinement.canaries[0].clone();
@@ -6435,9 +6516,7 @@ pub(crate) mod tests {
         // checkpoint earlier, and the test would pass for the wrong reason --
         // so the class is asserted by name rather than the mere failure.
         let _fd = fd_lock();
-        if !namespaces_available() {
-            return;
-        }
+        vitrin_skip::skip_unless!(vitrin_skip::CONFINEMENT, namespaces());
         let mut h = Harness::new("unshare-only");
         let mut confinement = h.confinement();
         confinement.realm_init = fixture_bin("unshare-only-init");
@@ -6485,14 +6564,9 @@ pub(crate) mod tests {
         //
         // NON-VACUITY: delete the loop and this spawn succeeds.
         let _fd = fd_lock();
-        if !namespaces_available() {
-            return;
-        }
-        let reachable = PathBuf::from("/usr/bin/env");
-        if !reachable.exists() {
-            eprintln!("SKIPPED: {} is missing on this host", reachable.display());
-            return;
-        }
+        vitrin_skip::skip_unless!(vitrin_skip::CONFINEMENT, namespaces());
+        vitrin_skip::skip_unless!(vitrin_skip::HOST_TOOLING, reachable_canary_present());
+        let reachable = reachable_canary();
         let mut h = Harness::new("reachable-canary");
         let mut confinement = h.confinement();
         let scratch = confinement.canaries[0].clone();
@@ -6537,19 +6611,17 @@ pub(crate) mod tests {
         // realm before the spawn is called a pass, so this cannot degrade
         // into "the path was absent anyway".
         let _fd = fd_lock();
-        if !namespaces_available() {
-            return;
-        }
+        vitrin_skip::skip_unless!(vitrin_skip::CONFINEMENT, namespaces());
         let bin = mock_shim_bin();
         let app_dir = bin.parent().expect("the mock shim has a directory");
-        let Some(stub) = app_dir
-            .parent()
-            .filter(|p| p.parent().is_some() && !p.starts_with("/usr") && !p.starts_with("/etc"))
-        else {
-            eprintln!("SKIPPED: the mock shim's directory has no bindable ancestor");
-            return;
-        };
-        let stub = stub.to_path_buf();
+        vitrin_skip::skip_unless!(
+            vitrin_skip::HOST_TOOLING,
+            bindable_ancestor_present(app_dir)
+        );
+        // Re-derived rather than carried out of the guard: a guard that hands
+        // back a value is a guard whose answer the test has observed, which
+        // is the shape #288 closed.
+        let stub = bindable_ancestor(app_dir).expect("the guard above said there is one");
 
         let mut h = Harness::new("stub-canary");
         let mut confinement = h.confinement();
@@ -6614,9 +6686,7 @@ pub(crate) mod tests {
         // fd table is asserted non-empty, so "no descriptor matched" cannot
         // mean "there was nothing to look at".
         let _fd = fd_lock();
-        if !namespaces_available() {
-            return;
-        }
+        vitrin_skip::skip_unless!(vitrin_skip::CONFINEMENT, namespaces());
         let host_root = fs::metadata("/").expect("the host root stats");
         let host_root = (host_root.dev(), host_root.ino());
 

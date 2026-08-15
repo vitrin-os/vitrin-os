@@ -20,3 +20,9 @@ vitrin-scanner = { path = "../vitrin-scanner" }
 # is already the workspace's kill(2) path (vitrin-core, vitrin-ipc), so no new
 # crate enters the tree.
 rustix = { version = "1", features = ["process"] }
+# The sanctioned test skip (issue #288). `skip-census` imports `MARKER` and
+# `CLASSES` from the same crate the emitters use, so renaming the marker or
+# adding a class cannot silently desynchronise the emitter from the census --
+# there is one definition, not two. Dependency-free, and Apache-2.0 like this
+# crate, which is why it had to sit on that half of the split.
+vitrin-skip = { path = "../vitrin-skip" }

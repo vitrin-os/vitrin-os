@@ -841,3 +841,11 @@ vitrin-mock-shim = { path = "../vitrin-mock-shim" }
 # artifact encoder are hand-rolled, so this adds no image codec to the tree
 # (plan risk R7), same posture as the mock shim above.
 vitrin-golden = { path = "../vitrin-golden" }
+# The sanctioned test skip (issue #288): the marker line every runtime skip in
+# this crate emits, and the per-class require-variable that turns one into a
+# panic on a machine that declared it could run. Test-only and dependency-free
+# — it must never enter the vitrind runtime tree, same posture as the two
+# instruments above. `cargo xtask skip-census` imports the same crate's
+# `MARKER` constant, which is what keeps the emitter and the census from
+# desynchronising on a rename.
+vitrin-skip = { path = "../vitrin-skip" }

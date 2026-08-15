@@ -133,6 +133,8 @@ use anyhow::{bail, Context, Result};
 mod isolation_matrix;
 mod limits;
 mod session_matrix;
+mod skip_census;
+mod test_census;
 
 /// Paths this task operates on, relative to the workspace root.
 const XML_PATH: &str = "protocol/vitrin-v0.xml";
@@ -150,7 +152,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask limits-check"
+    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask limits-check\n       cargo xtask skip-scan\n       cargo xtask skip-census --min-tests N [--expect-self-marker] -- CMD [ARG...]"
 }
 
 fn run() -> Result<()> {
@@ -267,6 +269,30 @@ fn run() -> Result<()> {
                 bail!("unknown flag '{arg}' for 'limits-check'\n\n{}", usage());
             }
             limits::limits_check(&workspace_root()?)
+        }
+        "skip-scan" => {
+            // Reads sources, writes nothing -- one mode, like limits-check.
+            if let Some(arg) = args.get(1) {
+                if arg == "-h" || arg == "--help" {
+                    println!("{}", usage());
+                    return Ok(());
+                }
+                bail!("unknown flag '{arg}' for 'skip-scan'\n\n{}", usage());
+            }
+            skip_census::skip_scan(&workspace_root()?)
+        }
+        "skip-census" => {
+            // The census's own flags come first and everything after the
+            // `--` is the suite to run, verbatim: the jobs that use this run
+            // different commands, and the wrapper must not normalise one into
+            // the other. `--min-tests` is REQUIRED and parsed inside
+            // `skip_census` so the refusal message can explain itself.
+            let rest = &args[1..];
+            if rest.first().is_some_and(|a| a == "-h" || a == "--help") {
+                println!("{}", usage());
+                return Ok(());
+            }
+            skip_census::skip_census(rest)
         }
         "-h" | "--help" => {
             println!("{}", usage());

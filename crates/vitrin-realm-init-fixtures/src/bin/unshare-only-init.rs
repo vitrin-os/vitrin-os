@@ -71,7 +71,7 @@ fn main() {
     // C2. Real, and that is the whole point of the fixture.
     if unsafe { libc::unshare(CLONE_FLAGS) } < 0 {
         // This machine cannot grant the namespaces. The core's own
-        // `namespaces_available()` gate should already have skipped the test;
+        // `tests::namespaces()` verdict should already have skipped the test;
         // exiting quietly is better than sending a frame that would be read
         // as a different refusal than the one that happened.
         unsafe { libc::_exit(PRE_EXEC_EXIT) }

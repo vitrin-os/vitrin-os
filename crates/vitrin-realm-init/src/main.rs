@@ -1712,25 +1712,47 @@ mod tests {
         }
     }
 
-    fn kernel_abi_or_skip(minimum: u32, what: &str) -> Option<u32> {
+    /// Whether this kernel can run a measurement that needs Landlock ABI
+    /// `minimum`.
+    ///
+    /// The answer is a [`vitrin_skip::Verdict`], which is **opaque**: the
+    /// caller cannot test it, match it or destructure it, only hand it to
+    /// [`skip_unless!`](vitrin_skip::skip_unless). That prints one
+    /// machine-readable marker line and, under a
+    /// `VITRIN_REQUIRE_LANDLOCK_ABI` floor at or above `minimum`, **panics
+    /// instead of returning**. The floor is what makes the two cases
+    /// separable: a runner measured at ABI 7 must run every rung up to 7 and
+    /// is honestly excused above it.
+    ///
+    /// The `minimum` travels *inside* the verdict, so the rung this compared
+    /// against and the rung the floor is compared against are one number.
+    /// The shape it replaced returned `Option<u32>`, which a caller could --
+    /// and, in one of the bypasses that motivated this, did -- match on
+    /// itself with a bare `return` in the `else` arm.
+    ///
+    /// This used to `eprintln!` and call itself loud. It was not: `cargo
+    /// test` captures stderr for tests that pass, so the five call sites in
+    /// this file were the most likely LIVE silent skip in CI (issue #288),
+    /// with no machine anywhere that would have revealed one.
+    fn landlock_abi_at_least(minimum: u32, what: &str) -> vitrin_skip::Verdict {
         match landlock::kernel_abi() {
-            Ok(abi) if abi >= minimum => Some(abi),
-            Ok(abi) => {
-                eprintln!(
-                    "SKIP {what}: this kernel reports Landlock ABI {abi}, and the measurement \
-                     needs {minimum}. A skip, loudly, rather than a pass: a test that cannot \
-                     run has measured nothing."
-                );
-                None
-            }
-            Err(fail) => {
-                eprintln!(
-                    "SKIP {what}: this kernel answered errno {} to the Landlock ABI query, so \
-                     no ruleset can be built here at all.",
+            Ok(abi) if abi >= minimum => vitrin_skip::Verdict::capable(),
+            Ok(abi) => vitrin_skip::Verdict::incapable_below_rung(
+                minimum,
+                format!(
+                    "{what}: this kernel reports Landlock ABI {abi}, and the measurement needs \
+                     {minimum}. A skip rather than a pass: a test that cannot run has measured \
+                     nothing."
+                ),
+            ),
+            Err(fail) => vitrin_skip::Verdict::incapable_below_rung(
+                minimum,
+                format!(
+                    "{what}: this kernel answered errno {} to the Landlock ABI query, so no \
+                     ruleset can be built here at all.",
                     fail.errno
-                );
-                None
-            }
+                ),
+            ),
         }
     }
 
@@ -1810,9 +1832,10 @@ mod tests {
     /// loosens the domain here; the cap is a dial, not a one-way weakening.
     #[test]
     fn rung_one_forbids_reparenting_that_the_rung_above_permits() {
-        let Some(_abi) = kernel_abi_or_skip(2, "the REFER rung") else {
-            return;
-        };
+        vitrin_skip::skip_unless!(
+            vitrin_skip::LANDLOCK_ABI,
+            landlock_abi_at_least(2, "the REFER rung")
+        );
         let scratch = Scratch::new("refer");
         let from_dir = scratch.dir.join("a");
         let to_dir = scratch.dir.join("b");
@@ -2022,9 +2045,10 @@ mod tests {
     /// nothing. Only `restrict_self` does, and this test never calls it.
     #[test]
     fn a_bind_naming_a_file_gets_rights_the_kernel_accepts() {
-        let Some(_abi) = kernel_abi_or_skip(1, "the file-bind grant") else {
-            return;
-        };
+        vitrin_skip::skip_unless!(
+            vitrin_skip::LANDLOCK_ABI,
+            landlock_abi_at_least(1, "the file-bind grant")
+        );
         let scratch = Scratch::new("file-bind");
         let dir_bind = scratch.dir.join("vendor-tree");
         std::fs::create_dir_all(&dir_bind).expect("the directory bind source");
@@ -2204,9 +2228,10 @@ mod tests {
             );
         }
 
-        let Some(_abi) = kernel_abi_or_skip(7, "the Landlock audit-log flag") else {
-            return;
-        };
+        vitrin_skip::skip_unless!(
+            vitrin_skip::LANDLOCK_ABI,
+            landlock_abi_at_least(7, "the Landlock audit-log flag")
+        );
         // The kernel's verdict. `restrict_self` is irreversible, so this is
         // the one thing here that has to fork.
         let measure = |flags: libc::c_uint| -> i32 {
@@ -2247,9 +2272,10 @@ mod tests {
         // and outside the designated set fails EACCES". Rung 1 is enough --
         // this is the primitive the whole ladder stands on -- so it runs on
         // every kernel that has Landlock at all.
-        let Some(_abi) = kernel_abi_or_skip(1, "the write-set floor") else {
-            return;
-        };
+        vitrin_skip::skip_unless!(
+            vitrin_skip::LANDLOCK_ABI,
+            landlock_abi_at_least(1, "the write-set floor")
+        );
         let scratch = Scratch::new("write-set");
         let granted = scratch.dir.join("granted");
         let ungranted = scratch.dir.join("ungranted");
@@ -2314,9 +2340,10 @@ mod tests {
         // the rung closes it; the third is the positive control that keeps the
         // second honest, because "EACCES" could otherwise mean "Landlock is
         // simply on" rather than "this right was withheld".
-        let Some(_abi) = kernel_abi_or_skip(3, "the TRUNCATE rung") else {
-            return;
-        };
+        vitrin_skip::skip_unless!(
+            vitrin_skip::LANDLOCK_ABI,
+            landlock_abi_at_least(3, "the TRUNCATE rung")
+        );
         let scratch = Scratch::new("truncate");
         let victim = scratch.file("victim", 100);
         let dir_c = Scratch::c(&scratch.dir);

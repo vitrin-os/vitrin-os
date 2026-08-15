@@ -500,18 +500,42 @@ cannot silently drift.
   ```bash
   bash tests/integration/run.sh > /tmp/integ.log 2>&1; echo "EXIT=$?"
   ```
-- **The named gates must exist.** `run.sh` carries two lists —
-  `MILESTONE_GATES` and `PROPERTY_GATES` — and fails before any test runs if
-  one of those modules is absent; CI's "Guard against milestone-gate drift"
-  step asserts the same two lists plus the `INJECTORS=` feature line in
-  seconds. `unittest discover` cannot tell a gate that was never written from a
-  green suite — nothing collected, nothing failed, exit 0 — which is the exact
-  shape issue #138 was filed on. Editing the gate table above means editing the
-  matching list in the same commit. The split into two lists is not
-  bookkeeping: a milestone gate's absence is a claim about that milestone's
-  definition of done, and `test_real_trust_band.py` is deliberately not one —
-  plan §5 adjudicated its property out of M1.4's criteria, so it is named,
-  guarded, and never cited as milestone evidence.
+- **The named gates must exist.** `run.sh` carries three lists —
+  `MILESTONE_GATES`, `PROPERTY_GATES` and `SUPPORTING_MODULES` — and fails
+  before any test runs if one of those modules is absent; CI's "Guard against
+  milestone-gate drift" step asserts the first two lists plus the `INJECTORS=`
+  feature line in seconds.
+
+  The third list exists because of issue #288: seven modules here were in
+  **no** list at all (`test_real_firefox.py`, `test_real_gtk.py`,
+  `test_runtime_wiring.py`, `test_hostile_client.py`, `test_multi_realm.py`,
+  `test_actuation.py`, `test_consent_injector.py`), so deleting one made
+  `unittest discover` collect fewer tests and the suite exit 0 with nothing
+  comparing the collected set to an expectation. The three lists are now a
+  **partition**: `run.sh` also fails if a `test_*.py` on disk appears in none
+  of them, so a newly added module has to be classified rather than joining
+  the unwatched set, and CI asserts the same property before the build.
+
+  And the lists are held to the *run*, not only to the filesystem: after the
+  suite, `run.sh` requires every named module to appear at least once in the
+  verbose log. A module that exists, imports, and collects zero tests would
+  otherwise pass the presence check and contribute nothing — by name, never by
+  count, because a count is a number somebody bumps.
+
+  All of it exists because `unittest discover` cannot tell a gate that was
+  never written from a green suite — nothing collected, nothing failed, exit 0
+  — which is the exact shape issue #138 was filed on. Editing the gate table
+  above means editing the matching list in the same commit. The split into
+  three lists is not bookkeeping: a milestone gate's absence is a claim about
+  that milestone's definition of done, and `test_real_trust_band.py` is
+  deliberately not one — plan §5 adjudicated its property out of M1.4's
+  criteria, so it is named, guarded, and never cited as milestone evidence.
+
+  What none of this covers is a test that runs and asserts nothing, and one
+  filtered CI step sits outside `run.sh` entirely: the Firefox real-core gate
+  runs `unittest discover -p 'test_real_firefox.py'` in its own step, so that
+  step carries its own `Ran N` floor in the shell rather than relying on the
+  lists here.
 - **Later occupants:** this job also hosts the rest of the M1.5 gates —
   golden frames (P1.9.2), hostile-client tests (P1.9.3) — behind the same
   entry point. The demo gate (P1.8.4/P1.8.7, `test_demo.py`) has landed; it

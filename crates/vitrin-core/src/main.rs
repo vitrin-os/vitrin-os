@@ -5154,8 +5154,15 @@ mod tests {
             vec!["--headless", "--consent-injector-fd=7"],
         ] {
             match parse_args(args.clone()) {
+                // `..` covers `isolation`, which this row says nothing about.
+                // It briefly read `isolation: IsolationOptions::default()`,
+                // which is a function call in pattern position and does not
+                // compile at all -- landing green because NO CI job builds
+                // the `consent-injector` feature, so this test had never once
+                // been compiled, let alone run. That is issue #288's failure
+                // class one level below a skip, and the job step added
+                // alongside this fix is what makes it visible.
                 Ok(Action::RunHeadless {
-                    isolation: IsolationOptions::default(),
                     consent,
                     consent_injector_fd,
                     ..

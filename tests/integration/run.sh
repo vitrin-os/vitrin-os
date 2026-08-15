@@ -127,8 +127,16 @@ PROPERTY_GATES=(
                                 # with /dev/input unreachable beside it, and a
                                 # substituted helper that unshares six namespaces
                                 # and mounts NOTHING refused at startup
-                                # (crates/vitrin-realm-init-fixtures). No new CI
-                                # wiring and no cargo feature.
+                                # (crates/vitrin-realm-init-fixtures). And since
+                                # P2.6.3's K9b, the one property here that is
+                                # about a SYSCALL rather than a path: a realm's
+                                # app cannot create a user namespace inside the
+                                # realm (ENOSPC at the shipped default AND at
+                                # --landlock=off, so it is the realm's own
+                                # max_user_namespaces and not the ruleset),
+                                # against an --isolation=off positive control in
+                                # the same run. No new CI wiring and no cargo
+                                # feature.
   test_launch.py                # a consented `realm_launch` grant makes the
                                 # TRUSTED CORE fork a process, and the journal
                                 # names who asked (#207). The one gate covering
@@ -282,6 +290,30 @@ else
   echo "    For the full suite:  meson setup shim/build shim && meson compile -C shim/build"
 fi
 
+# ---- A CONTROL run is not an ordinary run, and must not read like one -----
+#
+# `VITRIN_LANDLOCK` hands every gate that does not name its own Landlock
+# setting one (harness.LANDLOCK_OVERRIDE). It exists so the `--landlock=off`
+# half of a published measurement can be re-run from this repository -- until
+# it landed, `docs/book/src/limits.md` cited a Landlock-off result for gates
+# that had no way to be run Landlock-off at all.
+#
+# Announced here, loudly, because the whole hazard of such a knob is a run that
+# proved something weaker than the log implies. Note what it does NOT do: it
+# does not exempt the confinement gate, which names `highest` for its confined
+# half and therefore goes RED under `VITRIN_LANDLOCK=off`. That is correct --
+# a control run is not a pass -- and it is stated here so the red is read as
+# the knob working rather than as a regression.
+if [ -n "${VITRIN_LANDLOCK:-}" ]; then
+  echo ""
+  echo "==> CONTROL RUN: VITRIN_LANDLOCK=${VITRIN_LANDLOCK} -- every gate that does not"
+  echo "    name its own Landlock setting runs with --landlock=${VITRIN_LANDLOCK}."
+  echo "    This run is NOT evidence for any milestone and NOT the shipped default."
+  echo "    test_real_confinement.py is EXPECTED to fail here: its confined half"
+  echo "    asserts the session requested \`highest\`."
+  echo ""
+fi
+
 # `python3` on the runner is 3.12, clearing the SDK's >= 3.11 floor (D8).
 PY="${PYTHON:-python3}"
 "$PY" - <<'EOF'
@@ -343,7 +375,36 @@ if [ "$shim_skips" -ne 0 ] && [ "${VITRIN_REQUIRE_REAL_APPS:-0}" = "1" ]; then
   exit 1
 fi
 
-if [ "$status" -eq 0 ] && [ "$skipped" -eq 0 ]; then
+# ---- A red run must END red, and it did not ------------------------------
+#
+# The census above prints only when something skipped, and the success line
+# below prints only when nothing skipped AND the status was 0. A run with
+# failures and zero skips therefore printed NEITHER, so the last thing on the
+# operator's terminal was whatever the final gate happened to log -- routinely
+# a success line from a test unrelated to the failure. `tee` interleaving makes
+# that worse: unittest's own `FAILED (failures=N)` goes to stderr and can land
+# hundreds of lines above the last stdout line of the run.
+#
+# So the summary is stated here, unconditionally on the red path, in the two
+# terms a reader needs: which gates failed, and that nothing in this run is
+# evidence for anything. The count is read from unittest's own summary block
+# (`FAIL:` / `ERROR:` at the start of a line, one per failing test) rather than
+# from the inline `... FAIL` markers, which repeat under `-v` and would
+# double-count. A nonzero status with zero such lines is a suite that died
+# before reporting -- also red, also named, and the count says 0 rather than
+# being suppressed.
+if [ "$status" -ne 0 ]; then
+  failing=$(grep -cE '^(FAIL|ERROR): ' "$LOG" || true)
+  echo ""
+  echo "==> SUITE RED: exit status $status, $failing test(s) reported FAIL/ERROR," \
+       "$skipped skipped."
+  if [ "$failing" -ne 0 ]; then
+    grep -E '^(FAIL|ERROR): ' "$LOG" | sed 's/^/      /'
+  else
+    echo "      No test reported FAIL or ERROR, so the suite died before it could."
+  fi
+  echo "    NOTHING in this run may be cited as evidence for any milestone."
+elif [ "$skipped" -eq 0 ]; then
   echo "==> full suite: no skips, every named gate ran."
 fi
 exit "$status"

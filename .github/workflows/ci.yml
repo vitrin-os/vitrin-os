@@ -17,6 +17,18 @@ name: CI
 #                 cell of that matrix. It checks the page is generated, and
 #                 nothing about whether the measurements are current -- that
 #                 is the page's own runbook, on the target machine.
+#                 It carries a THIRD regeneration diff since P2.6.3 (#187):
+#                 `cargo xtask isolation-matrix --check`, holding
+#                 docs/book/src/isolation-matrix.md -- the Landlock ABI matrix
+#                 of what this build REQUIRES of a kernel. That generator
+#                 derives rather than transcribes: it parses the rung ladder
+#                 out of crates/vitrin-realm-init/src/landlock.rs and the ABI
+#                 floor out of that crate's lib.rs, so moving a right to
+#                 another rung or re-tuning the floor without regenerating is
+#                 red -- and so is deleting a published sentence the table
+#                 cites. It measures no kernel and cannot: the page has to be
+#                 byte-identical on a runner reporting Landlock ABI 7 and on
+#                 the development box reporting 9.
 #                 This job also carries `cargo xtask limits-check`, which is
 #                 neither codegen nor a regeneration diff and is here because
 #                 it is the other docs-honesty gate: it holds published-claim
@@ -264,19 +276,59 @@ jobs:
         # because xtask is a workspace member.
         run: cargo xtask session-matrix --check
 
+      - name: cargo xtask isolation-matrix --check
+        # P2.6.3 / issue #187's second deliverable, at the scope the ABI-floor
+        # decision narrowed it to. Re-renders docs/book/src/isolation-matrix.md
+        # in memory and compares byte-for-byte against the checked-in page.
+        #
+        # Unlike session-matrix, this one is red for reasons beyond a hand
+        # edit, because the generator DERIVES the page instead of transcribing
+        # it: the Landlock rung ladder is parsed out of
+        # crates/vitrin-realm-init/src/landlock.rs and the ABI floor and
+        # ceiling out of that crate's lib.rs. So moving a right to another
+        # rung, or re-tuning LANDLOCK_MIN_ABI, without regenerating is a red
+        # build -- which is the point: four published surfaces print that
+        # number.
+        #
+        # It also fails when a published sentence the table cites is deleted or
+        # reworded on docs/book/src/limits.md, README.md or SECURITY.md, and
+        # when a rung row names no claim or a claim is named by no row (issue
+        # #187: "a row with a right and no claim, or a claim with no row, fails
+        # the generator").
+        #
+        # THIS DOES NOT MEASURE A KERNEL, and the page says so in its own
+        # words. The generator probes nothing -- it could not, and still emit
+        # the same bytes on a runner reporting Landlock ABI 7 as on the
+        # development box reporting 9. The per-kernel row set the plan's
+        # restated criteria ask for is NOT delivered by this step; the plan
+        # carries that as Correction 5.
+        #
+        # The generator's own gates -- including the two non-vacuity tests that
+        # feed it a rung with no claim and a claim with no rung -- run in the
+        # `rust` job's `cargo test --workspace`, because xtask is a workspace
+        # member.
+        run: cargo xtask isolation-matrix --check
+
       - name: cargo xtask limits-check
         # WS-E.4.4 / issue #224 acceptance criterion 1: "Changing a WS-E claim
         # on one surface and not the others FAILS SOMETHING IN CI. This is
         # text, so CI can genuinely enforce it -- unlike most of the rest of
         # this workstream."
         #
-        # Two different failures, and the tool's output says which:
+        # Three different failures, and the tool's output says which:
         #
         #   SURFACE  -- a claim is missing from one of docs/book/src/limits.md,
-        #               README.md or site/index.html while the others carry it.
-        #               Before this step existed, this file contained ZERO
-        #               references to limits.md and nothing anywhere kept the
-        #               three published surfaces in agreement.
+        #               README.md, SECURITY.md or site/index.html while the
+        #               others carry it. Before this step existed, this file
+        #               contained ZERO references to limits.md and nothing
+        #               anywhere kept the published surfaces in agreement.
+        #               (SECURITY.md joined them with #286, whose limit belongs
+        #               on a reporter's triage list as much as on a reader's.)
+        #   SET      -- a limit is published on the limits page that no plan
+        #               document enumerates, or vice versa. The enumerating
+        #               documents are a LIST (see `ENUMERATORS`): a limit's
+        #               home is the plan document that owns the work which
+        #               created it, and the comparison runs over their union.
         #   EVIDENCE -- a claim no longer matches the code. This is the half
         #               #224 needed and a pure cross-surface check does not
         #               have: on 2026-08-12 an audit found two of #224's own
@@ -1175,7 +1227,11 @@ jobs:
         #
         # What it costs, said here because a sysctl in CI is exactly the kind
         # of thing that quietly becomes a lie: **after this step, this runner
-        # is no longer a stock Ubuntu 24.04 machine.** Nothing downstream of it
+        # is no longer a stock `ubuntu-latest` image.** (Named by its runner
+        # label, not by a distribution release: the diagnostic above reads
+        # `uname`, three sysctls and AppArmor's state, and never opens
+        # /etc/os-release, so no release number here would be a measurement.)
+        # Nothing downstream of it
         # may be cited as evidence about how vitrind behaves on a default
         # desktop install, and in particular issue #281's multi-kernel matrix
         # must be collected from the diagnostic step ABOVE this one, never

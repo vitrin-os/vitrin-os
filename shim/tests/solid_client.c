@@ -56,10 +56,18 @@
  * compositor never comes up, which is what stops "the probe never ran" from
  * being indistinguishable from "the probe ran and found nothing".
  *
- *   PROBE-VERSION 1
+ *   PROBE-VERSION 2
  *   PROBE-GROUPS n=<count> gids=<g,g,...>
+ *   PROBE-USERNS created=<yes|no|error> errno=<n>
  *   PROBE path=<abs> open=<ok|fail> errno=<n> dev=<u> ino=<u>   (one per --probe)
  *   PROBE-END
+ *
+ * PROBE-USERNS arrived with version 2 (P2.6.3): a realm refuses to create user
+ * namespaces inside itself (`vitrin-realm-init`'s K9b), and that is a property
+ * about a SYSCALL rather than about a path, so no number of `--probe` entries
+ * could have measured it. It is reported unconditionally alongside
+ * PROBE-GROUPS because it costs one fork and because a report that carried it
+ * only on request would let the interesting run be the one nobody asked for.
  */
 #define _GNU_SOURCE
 
@@ -67,6 +75,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <inttypes.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -76,6 +85,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -356,6 +366,62 @@ static void probe_one(FILE *out, const char *path) {
 			(uint64_t)st.st_dev, (uint64_t)st.st_ino);
 }
 
+/* Can this process create a NESTED user namespace?
+ *
+ * The one thing on this page that is a fact about a syscall rather than about a
+ * path, and it has to be here because `vitrin-realm-init`'s K9b writes 0 to the
+ * realm's own `/proc/sys/user/max_user_namespaces` -- so a realm's app is
+ * refused at `unshare(CLONE_NEWUSER)` instead of much later, at the first
+ * `mount(2)` its nested sandbox attempts.
+ *
+ * IN A FORKED CHILD, and that is not tidiness. A successful
+ * `unshare(CLONE_NEWUSER)` replaces the caller's credentials with an unmapped
+ * uid: this process would come out of it as `overflowuid`, unable to write its
+ * own report or to open the Wayland socket, so the control run -- the one that
+ * must SUCCEED -- would destroy the evidence it exists to produce. The child
+ * reports through a pipe rather than through its exit status, because an exit
+ * status is 8 bits and an errno deserves the whole int.
+ *
+ * `created=error` is its own outcome, distinct from `no`: a `fork` or `pipe`
+ * that failed says nothing about user namespaces, and a reader must not take it
+ * for a refusal. */
+static void probe_userns(FILE *out) {
+	int pipefd[2];
+	if (pipe2(pipefd, O_CLOEXEC) != 0) {
+		fprintf(out, "PROBE-USERNS created=error errno=%d\n", errno);
+		return;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		int e = errno;
+		close(pipefd[0]);
+		close(pipefd[1]);
+		fprintf(out, "PROBE-USERNS created=error errno=%d\n", e);
+		return;
+	}
+	if (pid == 0) {
+		close(pipefd[0]);
+		int result = (unshare(CLONE_NEWUSER) == 0) ? 0 : errno;
+		ssize_t ignored = write(pipefd[1], &result, sizeof(result));
+		(void)ignored;
+		_exit(0);
+	}
+	close(pipefd[1]);
+	int result = 0;
+	ssize_t got = read(pipefd[0], &result, sizeof(result));
+	close(pipefd[0]);
+	int status = 0;
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+		/* retry */
+	}
+	if (got != (ssize_t)sizeof(result)) {
+		/* The child died before it could say anything: not a refusal. */
+		fprintf(out, "PROBE-USERNS created=error errno=0\n");
+		return;
+	}
+	fprintf(out, "PROBE-USERNS created=%s errno=%d\n", result == 0 ? "yes" : "no", result);
+}
+
 /* Write the whole report, and return false if anything about writing it
  * failed. A probe whose report never landed must not be mistaken for a probe
  * that ran, so the caller exits non-zero. */
@@ -394,7 +460,7 @@ static bool write_probe_report(const char *out_name, char *const *paths, int cou
 		close(fd);
 		return false;
 	}
-	fprintf(out, "PROBE-VERSION 1\n");
+	fprintf(out, "PROBE-VERSION 2\n");
 	/* The supplementary groups this process still holds. D-037(5): they cannot
 	 * be dropped -- `setgroups=deny` blocks the CALL and drops nothing -- so
 	 * the realm keeps `video`, `render`, `input` and the rest as kgids, and
@@ -408,6 +474,7 @@ static bool write_probe_report(const char *out_name, char *const *paths, int cou
 		fprintf(out, "%s%u", i ? "," : "", (unsigned)gids[i]);
 	}
 	fprintf(out, "\n");
+	probe_userns(out);
 	for (int i = 0; i < count; i++) {
 		probe_one(out, paths[i]);
 	}

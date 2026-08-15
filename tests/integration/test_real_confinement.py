@@ -72,22 +72,56 @@ negative assertion here. That is the same class of vacuity the README's own
 2. Under `--isolation=default` the app's `open()` on it fails **ENOENT**.
 3. Under `--isolation=off` the same `open()` succeeds and the descriptor's
    `(st_dev, st_ino)` is the host file's.
-4. `$HOME` itself: present-but-a-different-inode or absent under `default`
-   (either is confinement; the stub is what the mount table had to create),
-   and the host's own inode under `off`.
+4. `$HOME` itself, under `default`, fails with **exactly one** errno, chosen
+   from the mount table rather than from a menu: **EACCES** when the app lives
+   under `$HOME` (the mount table had to create the stub, and no Landlock rule
+   covers it), **ENOENT** when it does not (the path was never created). The
+   host's own inode under `off`.
 5. `/dev/null` opens in both.
 6. The two runs' `realm.toml` are byte-identical.
+
+`RealConfinementLandlockDenial` -- the ruleset, measured rather than read off
+the journal:
+
+6b. `/vitrin` is created by the mount table and granted by no Landlock rule.
+    Under the shipped default the app's `open()` on it fails **EACCES**; under
+    `--isolation=default --landlock=off`, same core and byte-identical
+    `realm.toml`, it succeeds. `/vitrin/home` -- a hierarchy the ruleset *does*
+    grant -- opens in the confined run, so the denial is the enumerated read
+    set refusing a path outside it rather than a domain refusing everything.
+
+`RealConfinementNestedUserns` -- the one property here that is about a
+**syscall** rather than a path (P2.6.3, `vitrin-realm-init`'s K9b):
+
+6c. A realm's app cannot create a user namespace inside the realm. Three runs,
+    byte-identical argv: `unshare(CLONE_NEWUSER)` in a forked child fails
+    **ENOSPC** at the shipped default **and** at `--isolation=default
+    --landlock=off` -- so the refusal is the realm's own
+    `/proc/sys/user/max_user_namespaces`, not the Landlock domain, which has no
+    hook there -- and **succeeds** at `--isolation=off`, the positive control
+    without which both negatives would be satisfied by a host that forbids
+    unprivileged user namespaces outright. It is a *hardening* and the gate's
+    docstring says so: a Landlock domain forbids `mount(2)` unconditionally, so
+    a nested namespace inside a realm could never mount anything; what changes
+    is that the refusal arrives at the namespace instead of at the mount, which
+    is the difference between an app that degrades and an app that aborts.
 
 `RealConfinementJournal` -- the flight recorder carries what the **parent**
 observed, not what the child claimed:
 
 7. `realm_spawned.isolation` under `default`: `applied_profile` is
-   `namespaces-only` (never a tier name -- `intra-user` means namespaces *plus*
-   Landlock *plus* seccomp and this build applies the first third),
+   `namespaces+landlock-abiN` for the rung the realm **obtained** (never a tier
+   name -- `intra-user` means namespaces *plus* Landlock *plus* seccomp and
+   this build applies the first two),
    `parent_observed.namespaces_verified` is the five the supervisor is checked
    on, `root_dev_differs` and `canaries_unreachable` are true, `writable` is a
-   measured list, and `landlock`/`seccomp` are the explicit `not-applied`
-   strings rather than absent keys.
+   measured list, `landlock` is an object whose obtained rung is **at least
+   this build's declared ABI floor** (`harness.LANDLOCK_MIN_ABI`, owner's
+   decision 2026-08-15 — a kernel below it is refused, so a spawn that got far
+   enough to journal cannot be under it) and at most the kernel's own ABI,
+   which labels both numbers child-asserted and
+   carries `clamped_by_build`, and `seccomp` is the explicit `not-applied`
+   string rather than an absent key.
 8. `shim_host_pid` and `supervisor_pid` agree with what **this process** read
    out of procfs -- the journal's account of the spine checked against an
    independent one.
@@ -137,15 +171,34 @@ fields with real discriminating power here are `namespaces_verified`,
 
 ## What this gate deliberately does not prove
 
-* **Landlock and seccomp.** Neither is applied by this build (P2.6.3, P2.6.4),
-  and the journal says `not-applied` in as many words. Nothing here should be
-  read as evidence of a filesystem or syscall policy.
+* **Which rung's rights a real realm has.** P2.6.3 (#187) applies a ruleset,
+  and `RealConfinementLandlockDenial` above measures that it denies a reachable
+  path -- so this gate does prove a denial, from inside a real realm, against a
+  `--landlock=off` control in the same suite. What it does **not** prove is any
+  particular rung's rights: the *number* in the journal is child-asserted and
+  the parent cannot corroborate it, and no assertion here distinguishes a
+  rung-9 domain from a rung-1 one. Per-rung behaviour (`TRUNCATE` at rung 3,
+  `REFER` at rung 2) is measured in `vitrin-realm-init`'s own suite, where a
+  forked child can enforce a capped domain and then try the syscall.
+* **Seccomp.** Not applied by this build (P2.6.4), and the journal says
+  `not-applied` in as many words. Nothing here should be read as evidence of a
+  syscall policy. `RealConfinementNestedUserns` is **not** an exception: it
+  measures one ucount limit, which the kernel enforces inside `create_user_ns`,
+  and says nothing about any other syscall.
+* **That a nested sandbox works.** It does not, and 6c does not claim it does.
+  Mounting is denied to any process in a Landlock domain, so a realm's app
+  cannot build a second boundary inside the first one -- what 6c measures is
+  that the refusal is now *legible* to the libraries that ask for one.
 * **That the realm cannot reach the network.** `CLONE_NEWNET` is verified by
   inode above, and a loopback interface is brought up inside; whether anything
   routable remains is a separate measurement this gate does not make.
 * **The GPU render node.** It is bound read-write, with its ioctl surface and
   cross-realm GPU-memory side channels intact -- a published, unmitigated cost
-  of binding it at all (D-037). This gate asserts nothing about it.
+  of binding it at all (D-037). P2.6.3 does **not** change that: Landlock's
+  `IOCTL_DEV` is one all-or-nothing bit per hierarchy and the app needs the
+  node's ioctls to render, so the ruleset grants it there. What that rung
+  narrows is every other device node in the realm. This gate asserts nothing
+  about either.
 * **That a realm cannot reach the session bus by other means.** `/run/user/N`
   is not in the mount table, which is a different and stronger statement than
   "the address is not advertised", but a full escape survey is not this.
@@ -165,6 +218,8 @@ import time
 from harness import (
     IN_REALM_HOME,
     IN_REALM_RUNTIME_DIR,
+    LANDLOCK_BUILD_MAX_RUNG,
+    LANDLOCK_MIN_ABI,
     SUPERVISOR_COMM,
     VITRIND,
     IntegrationTest,
@@ -215,6 +270,17 @@ DEV_PRESENT = "/dev/null"
 #: holds the group that opens it (D-037(5)).
 DEV_INPUT = "/dev/input"
 
+#: **The one path on this page that separates the mount table from the
+#: ruleset.** `/vitrin` is created by `vitrin-realm-init` because it has to
+#: hold `/vitrin/shim` (the shim binary) and `/vitrin/home` (the realm's
+#: private storage), and both of *those* are Landlock grants. The parent
+#: directory is not, because the read set is enumerated rather than granted at
+#: a root. So it is reachable by the mount table and denied by the ruleset --
+#: which is what `RealConfinementLandlockDenial` needs and what no other probe
+#: here provides: every other negative on this page is satisfied by the mount
+#: table alone and would stay green with Landlock deleted.
+IN_REALM_PREFIX = "/vitrin"
+
 #: The five namespace kinds the core verifies on the **supervisor**
 #: (`SUPERVISOR_NAMESPACES` in `crates/vitrin-core/src/spawn.rs`). `pid` is
 #: absent on purpose and is not an omission: `unshare(CLONE_NEWPID)` does not
@@ -250,6 +316,12 @@ class _Probe:
         self.rows: dict[str, dict[str, str]] = {}
         self.groups: set[int] = set()
         self.group_count: int | None = None
+        #: `PROBE-USERNS` (report version 2, P2.6.3): `"yes"`, `"no"`,
+        #: `"error"`, or `None` when the line is absent altogether -- which is
+        #: what a stale `solid-client` beside a new gate looks like, and is
+        #: asserted on rather than defaulted to either verdict.
+        self.userns_created: str | None = None
+        self.userns_errno: int | None = None
         self.complete = False
         for line in text.splitlines():
             fields = line.split()
@@ -257,6 +329,10 @@ class _Probe:
                 continue
             if fields[0] == "PROBE-END":
                 self.complete = True
+            elif fields[0] == "PROBE-USERNS":
+                kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
+                self.userns_created = kv.get("created")
+                self.userns_errno = int(kv.get("errno", "0"))
             elif fields[0] == "PROBE-GROUPS":
                 kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
                 self.group_count = int(kv.get("n", "0"))
@@ -351,11 +427,15 @@ class _RealChain(IntegrationTest):
             DEV_PRESENT,
             "--probe",
             DEV_INPUT,
+            "--probe",
+            IN_REALM_PREFIX,
+            "--probe",
+            IN_REALM_HOME,
             "--probe-out",
             PROBE_OUT,
         ]
 
-    def real_core(self, isolation: str):
+    def real_core(self, isolation: str, landlock: str | None = None):
         return self.core(
             size=REALM_SIZE,
             shim=str(self.shim_bin),
@@ -364,6 +444,7 @@ class _RealChain(IntegrationTest):
             env_allow=tuple(WLR_ENV),
             extra_env=WLR_ENV,
             isolation=isolation,
+            landlock=landlock,
         )
 
     def report_path(self, core, realm: str = "realm-0") -> pathlib.Path:
@@ -397,6 +478,23 @@ class _RealChain(IntegrationTest):
             f"What was there: {last!r}. The realm's log: "
             f"{(core.runtime / 'vitrin-0' / 'realm-0' / 'realm.log').read_text()[-2000:]!r}"
         )
+
+    def _is_under_home(self, path: str) -> bool:
+        """Does `path` resolve inside the operator's `$HOME`?
+
+        It decides which errno `$HOME` itself must answer with inside a
+        confined realm, because it decides whether the mount table had to
+        create that path at all: `vitrin-realm-init` binds the app's own
+        directory at its host path, and making that target `mkdir -p`s every
+        ancestor onto the realm's root tmpfs. Read rather than assumed, so the
+        assertion stays exact on a machine where the built shim lives outside
+        the operator's home.
+        """
+        try:
+            pathlib.Path(path).resolve().relative_to(self.home.resolve())
+        except ValueError:
+            return False
+        return True
 
     def spawn_entry(self, core, realm: str = "realm-0") -> dict:
         for entry in core.entries():
@@ -483,24 +581,58 @@ class RealConfinementCanary(_RealChain):
             f"{self.canary_identity}",
         )
 
-        # (4) $HOME itself. Absent, or present as the mount table's own stub --
-        #     never the host's inode. This is the assertion a name-based check
-        #     could not state: the stub is real, and it is not a breach.
+        # (4) $HOME itself, and **exactly one errno is accepted**, chosen from
+        #     the mount table rather than from a menu.
+        #
+        #     Which one is decided by one fact this test can read: whether the
+        #     app's own directory lives under $HOME. If it does, the mount
+        #     table has to CREATE the operator's home path inside the realm to
+        #     bind the app's directory at its host path, so the stub exists and
+        #     the open is a Landlock question -- no rule covers it, because the
+        #     read set is enumerated and $HOME is not in the enumeration, so
+        #     EACCES. If it does not, the path was never created at all and the
+        #     answer is ENOENT.
+        #
+        #     **An `assertIn((ENOENT, EACCES))` was here and has been removed.**
+        #     It passed identically whether or not the ruleset denied anything:
+        #     ENOENT is what the mount table alone produces, so a build with
+        #     Landlock deleted satisfied it. Under an app that lives beneath
+        #     $HOME -- which is every checkout-relative run, including CI's --
+        #     the branch below is now a real Landlock denial, and the
+        #     `--landlock=off` control in `RealConfinementLandlockDenial`
+        #     proves the same path is reachable without the ruleset.
         home = str(self.home)
         host_home = file_identity(self.home)
-        if confined.outcome(home) == "ok":
-            self.assertNotEqual(
-                confined.identity(home),
-                host_home,
-                "the confined app opened the operator's OWN $HOME inode. A same-named stub "
-                "directory is expected (the mount table has to create it to bind the app's "
-                "own directory at its host path); the host's inode is a breach",
+        app_under_home = self._is_under_home(self.app_bin)
+        if app_under_home:
+            self.assertEqual(
+                confined.outcome(home),
+                "fail",
+                f"the app lives under $HOME, so the mount table created $HOME inside the "
+                f"realm as a stub -- and NO Landlock rule covers it, so the open must be "
+                f"refused. It succeeded, which means the ruleset granted a path outside its "
+                f"enumerated read set; report:\n{confined.raw}",
+            )
+            self.assertEqual(
+                confined.err(home),
+                errno.EACCES,
+                f"$HOME exists inside the realm (the mount table had to create it) and the "
+                f"open must therefore fail EACCES ({errno.EACCES}) -- the Landlock ruleset "
+                f"refusing a path it never granted. ENOENT here would mean the stub was not "
+                f"created and this assertion is measuring the mount table instead; "
+                f"report:\n{confined.raw}",
             )
         else:
             self.assertEqual(
+                confined.outcome(home),
+                "fail",
+                f"$HOME was openable from inside the realm; report:\n{confined.raw}",
+            )
+            self.assertEqual(
                 confined.err(home),
                 errno.ENOENT,
-                f"$HOME was unopenable from inside the realm for a reason other than absence; "
+                f"the app does not live under $HOME, so nothing created that path inside the "
+                f"realm and the open must fail ENOENT ({errno.ENOENT}); "
                 f"report:\n{confined.raw}",
             )
         self.assertEqual(
@@ -517,6 +649,271 @@ class RealConfinementCanary(_RealChain):
             self.canary_identity,
             "the canary was replaced or removed while the two runs were in flight, so the "
             "second run's success is about a different file from the first run's absence",
+        )
+
+
+class RealConfinementLandlockDenial(_RealChain):
+    """**The Landlock ruleset, measured** (P2.6.3, issue #187).
+
+    Every other negative on this page is satisfied by the mount table alone: a
+    path that is not in the realm's mount table answers `ENOENT` whether or not
+    a ruleset exists, so those assertions stay green with Landlock deleted.
+    This one does not. It opens a path the mount table **creates** and the
+    ruleset **does not grant**, so the only thing that can refuse it is the
+    domain.
+
+    Two runs, identical in everything but one flag:
+
+    * `--isolation=default` (the shipped default, `--landlock=highest`): the
+      open must fail `EACCES`.
+    * `--isolation=default --landlock=off`: the **same** core, the **same**
+      mount table, byte-identical argv and `realm.toml` -- and the open must
+      succeed.
+
+    The control is not a nicety. Without it, `EACCES` could mean the mount
+    table put something unreadable there, or the app crashed before it looked,
+    or the path never existed; with it, the same path in the same realm shape
+    is reachable exactly when the ruleset is absent. `/dev/null` is probed in
+    both runs as the second control, so a report written by a process that
+    could open nothing cannot satisfy the negative.
+
+    And the pairing is checked in the other direction too: `/vitrin/home` --
+    a hierarchy the ruleset **does** grant -- is reachable in the confined run.
+    So the denial is the *enumeration* refusing a path outside it, not a domain
+    that refuses everything.
+    """
+
+    def test_a_path_the_mount_table_leaves_reachable_is_denied_by_the_ruleset(self):
+        confined_core = self.real_core("default")
+        confined = self.await_report(confined_core)
+        confined_realm_toml = confined_core.realm.read_text()
+        confined_entry = self.spawn_entry(confined_core)
+        confined_core.terminate()
+
+        unruled_core = self.real_core("default", landlock="off")
+        unruled = self.await_report(unruled_core)
+        unruled_realm_toml = unruled_core.realm.read_text()
+        unruled_entry = self.spawn_entry(unruled_core)
+        unruled_core.terminate()
+
+        # The two runs differ in `--landlock` and in nothing else, asserted
+        # from the files the harness wrote rather than assumed.
+        self.assertEqual(
+            confined_realm_toml,
+            unruled_realm_toml,
+            "the two runs must differ ONLY in --landlock; their realm configurations differ, "
+            "so the comparison below is between two different experiments",
+        )
+
+        # The inside-the-realm positive control, before any negative is read
+        # out of the same report.
+        for label, probe in (("default", confined), ("--landlock=off", unruled)):
+            self.assertEqual(
+                probe.outcome(DEV_PRESENT),
+                "ok",
+                f"the {label} app could not open {DEV_PRESENT} (errno "
+                f"{probe.err(DEV_PRESENT)}); every 'denied' below would then be satisfied by "
+                f"an app that can open nothing. Report:\n{probe.raw}",
+            )
+
+        # The control: with no ruleset, the mount table leaves this reachable.
+        self.assertEqual(
+            unruled.outcome(IN_REALM_PREFIX),
+            "ok",
+            f"at --landlock=off the realm must be able to open {IN_REALM_PREFIX} -- the mount "
+            f"table creates it, and nothing else was changed. If it cannot, the denial in the "
+            f"other run is about the mount table and proves nothing about Landlock. "
+            f"Report:\n{unruled.raw}",
+        )
+
+        # The measurement: with the ruleset, the same path is refused, and
+        # refused with the errno a Landlock denial produces rather than the
+        # one an absent path produces.
+        self.assertEqual(
+            confined.outcome(IN_REALM_PREFIX),
+            "fail",
+            f"the confined realm opened {IN_REALM_PREFIX}, which no Landlock rule grants -- "
+            f"the read set is enumerated and this directory is not in the enumeration. "
+            f"Report:\n{confined.raw}",
+        )
+        self.assertEqual(
+            confined.err(IN_REALM_PREFIX),
+            errno.EACCES,
+            f"{IN_REALM_PREFIX} must be refused EACCES ({errno.EACCES}) -- present in the "
+            f"realm's mount table and denied by its Landlock domain. ENOENT here would mean "
+            f"the mount table never created it, and this gate would be measuring the mount "
+            f"table again. Report:\n{confined.raw}",
+        )
+
+        # The other direction, in the same run: a hierarchy the ruleset DOES
+        # grant is reachable. Without this the assertion above would also pass
+        # for a domain that granted nothing at all.
+        self.assertEqual(
+            confined.outcome(IN_REALM_HOME),
+            "ok",
+            f"the confined realm could not open its OWN granted storage {IN_REALM_HOME} "
+            f"(errno {confined.err(IN_REALM_HOME)}); the denial above is then a blanket one "
+            f"rather than the enumerated read set refusing a path outside it. "
+            f"Report:\n{confined.raw}",
+        )
+
+        # And the journals say which run was which, so a future change that
+        # made `--landlock=off` a no-op cannot leave this gate comparing one
+        # configuration against itself.
+        confined_landlock = confined_entry["isolation"]["landlock"]
+        unruled_landlock = unruled_entry["isolation"]["landlock"]
+        self.assertEqual(confined_landlock["requested"], "highest")
+        self.assertEqual(unruled_landlock["requested"], "off")
+        self.assertGreaterEqual(
+            confined_landlock["obtained_rung"],
+            1,
+            "the run that denied the path reports no ruleset, so something other than "
+            "Landlock refused it",
+        )
+        self.assertEqual(
+            unruled_landlock["obtained_rung"],
+            0,
+            "the control run reports a ruleset, so it is not a control",
+        )
+        self.assertEqual(
+            unruled_entry["isolation"]["applied_profile"],
+            "namespaces-only",
+            "a session with no ruleset must not journal a profile that names Landlock",
+        )
+        self.assertEqual(
+            confined_entry["isolation"]["applied_profile"],
+            f"namespaces+landlock-abi{confined_landlock['obtained_rung']}",
+            "the profile must name the rung the realm OBTAINED, so a ladder fallback is "
+            "visible in the field named for what was applied",
+        )
+
+
+class RealConfinementNestedUserns(_RealChain):
+    """**A realm's app cannot create a user namespace inside the realm**
+    (P2.6.3, `vitrin-realm-init`'s K9b).
+
+    Three runs, one app, byte-identical argv:
+
+    * `--isolation=default` (the shipped default): `unshare(CLONE_NEWUSER)` in
+      a forked child must fail, with `ENOSPC` -- the errno a ucount limit
+      produces, and the one thing here that names the *mechanism* rather than
+      merely an absence.
+    * `--isolation=default --landlock=off`: the same refusal. This arm is what
+      stops the gate from crediting Landlock for a denial Landlock does not
+      make: the ruleset has no hook on namespace creation, and the realm's own
+      `max_user_namespaces` is what refuses.
+    * `--isolation=off`: the **positive control**. The same probe, the same
+      binary, on the same host, must SUCCEED -- or "cannot create one" is a
+      statement about this machine's `kernel.unprivileged_userns_clone` rather
+      than about the realm, and the two negatives above prove nothing.
+
+    `/dev/null` is probed in every run as the second control, on the same terms
+    as the rest of this module: a report written by a process that could do
+    nothing at all would satisfy both negatives.
+
+    **What this does not claim.** It does not claim a nested sandbox used to
+    work and now does not: a Landlock filesystem domain forbids `mount(2)`
+    unconditionally, so a nested user namespace inside a realm could never
+    create a mount and was already useless. What it measures is that the
+    refusal now arrives at the namespace instead of at the mount -- which is
+    the difference between an app that degrades and an app that aborts, and is
+    why `docs/book/src/limits.md`'s `landlock-breaks-nested-image-sandboxes`
+    reads the way it now does.
+    """
+
+    def test_a_realms_app_cannot_create_a_nested_user_namespace(self):
+        confined_core = self.real_core("default")
+        confined = self.await_report(confined_core)
+        confined_realm_toml = confined_core.realm.read_text()
+        confined_core.terminate()
+
+        unruled_core = self.real_core("default", landlock="off")
+        unruled = self.await_report(unruled_core)
+        unruled_realm_toml = unruled_core.realm.read_text()
+        unruled_core.terminate()
+
+        unconfined_core = self.real_core("off")
+        unconfined = self.await_report(unconfined_core)
+        unconfined_realm_toml = unconfined_core.realm.read_text()
+        unconfined_core.terminate()
+
+        # The three runs differ in the flags and in nothing else, asserted from
+        # the files the harness wrote.
+        self.assertEqual(confined_realm_toml, unruled_realm_toml)
+        self.assertEqual(
+            confined_realm_toml,
+            unconfined_realm_toml,
+            "the three runs must differ ONLY in --isolation/--landlock; their realm "
+            "configurations differ, so the comparison below is between different experiments",
+        )
+
+        # The inside-the-app positive control, before any negative is read out
+        # of the same report.
+        for label, probe in (
+            ("default", confined),
+            ("--landlock=off", unruled),
+            ("--isolation=off", unconfined),
+        ):
+            self.assertEqual(
+                probe.outcome(DEV_PRESENT),
+                "ok",
+                f"the {label} app could not open {DEV_PRESENT} (errno "
+                f"{probe.err(DEV_PRESENT)}); every verdict below would then be about a "
+                f"process that could do nothing. Report:\n{probe.raw}",
+            )
+            self.assertIsNotNone(
+                probe.userns_created,
+                f"the {label} report carries no PROBE-USERNS line at all, so the probe never "
+                f"ran. That is a STALE solid-client beside a new gate (report version 2 added "
+                f"the line); rebuild the shim tree. Report:\n{probe.raw}",
+            )
+
+        # The positive control. Stated first, because both negatives are empty
+        # without it: on a host that forbids unprivileged user namespaces
+        # outright, a realm's app would fail this probe with no help from the
+        # realm at all.
+        self.assertEqual(
+            unconfined.userns_created,
+            "yes",
+            "at --isolation=off the app must be ABLE to create a user namespace (errno "
+            f"{unconfined.userns_errno}). If it cannot, this host forbids unprivileged user "
+            "namespaces generally and the two refusals below are facts about the host, not "
+            f"about the realm. Report:\n{unconfined.raw}",
+        )
+
+        # The measurement.
+        self.assertEqual(
+            confined.userns_created,
+            "no",
+            "the confined realm's app created a user namespace INSIDE the realm. K9b writes 0 "
+            "to the realm's own /proc/sys/user/max_user_namespaces precisely so that a nested "
+            f"sandbox is refused at the namespace rather than at its first mount. "
+            f"Report:\n{confined.raw}",
+        )
+        self.assertEqual(
+            confined.userns_errno,
+            errno.ENOSPC,
+            f"the refusal must be ENOSPC ({errno.ENOSPC}) -- what create_user_ns returns when "
+            f"the ucount limit is exceeded, and therefore the errno that names K9b as the "
+            f"cause. EPERM here would mean something else refused (a host policy, a seccomp "
+            f"filter) and this gate would be measuring that instead. Report:\n{confined.raw}",
+        )
+
+        # The third arm: the same refusal with no Landlock domain at all, so
+        # the denial cannot be credited to the ruleset.
+        self.assertEqual(
+            unruled.userns_created,
+            "no",
+            "at --isolation=default --landlock=off the refusal must still hold: it comes from "
+            "the realm's own ucount limit, not from the Landlock domain, and a gate that let "
+            f"this arm pass would be attributing K9b's work to the ruleset. "
+            f"Report:\n{unruled.raw}",
+        )
+        self.assertEqual(
+            unruled.userns_errno,
+            errno.ENOSPC,
+            f"the same mechanism must produce the same errno with no ruleset in the picture; "
+            f"report:\n{unruled.raw}",
         )
 
 
@@ -556,24 +953,82 @@ class RealConfinementJournal(_RealChain):
         iso = self.spawn_entry(core)["isolation"]
         observed = iso["parent_observed"]
 
-        # (7) The shape of a confined spawn.
+        # P2.6.3 (#187) LANDED, and this block is what its tripwire became.
+        # The journal's `landlock` key stopped being the fixed string
+        # "not-applied (P2.6.3)" and became an object, because one string
+        # cannot carry the numbers a reader needs.
+        landlock = iso["landlock"]
+        self.assertIsInstance(
+            landlock,
+            dict,
+            "since P2.6.3 the journal's `landlock` key is an object carrying what the session "
+            "REQUESTED and what the realm's PID 1 reported it OBTAINED; a bare string here "
+            "means the entry lost half the pair",
+        )
+        self.assertEqual(
+            landlock["requested"],
+            "highest",
+            "this gate runs the shipped default, which asks for the highest rung this build "
+            "knows that the kernel accepts",
+        )
+        self.assertGreaterEqual(
+            landlock["obtained_rung"],
+            LANDLOCK_MIN_ABI,
+            f"a confined spawn at the shipped default must obtain at least this build's "
+            f"declared ABI floor ({LANDLOCK_MIN_ABI}); anything lower means the session "
+            f"started somewhere it should have been refused, or the helper degraded to a rung "
+            f"the core's own preflight ruled out. Rung 0 specifically is what "
+            f"`--landlock=off` journals",
+        )
+        self.assertLessEqual(
+            landlock["obtained_rung"],
+            landlock["kernel_abi"],
+            "the rung obtained cannot exceed the ABI the same child read from the same kernel",
+        )
+        self.assertEqual(
+            landlock["rung_evidence"],
+            "child-asserted",
+            "both numbers come from the child, and the entry has to say so: there is no "
+            "/proc file naming a process's Landlock domain, so the parent cannot corroborate "
+            "them the way it corroborates the namespace inodes",
+        )
+        # Whether this BUILD's ladder is what held the rung down -- a parent
+        # conclusion about the child's number, and a boolean rather than a
+        # missing key, so an operator on a kernel newer than this build sees
+        # the clamp instead of inferring it from two numbers.
+        self.assertIn(
+            landlock["clamped_by_build"],
+            (True, False),
+            "the clamp must be reported as a boolean, not omitted or null: it is computed "
+            "for every confined spawn, and until it was journaled it was computed and thrown "
+            "away",
+        )
+        self.assertEqual(
+            landlock["clamped_by_build"],
+            landlock["kernel_abi"] > LANDLOCK_BUILD_MAX_RUNG,
+            f"the clamp must agree with the numbers beside it: it is true exactly when this "
+            f"kernel's ABI ({landlock['kernel_abi']}) is above the highest rung this build "
+            f"knows ({LANDLOCK_BUILD_MAX_RUNG}), and is independent of what the session "
+            f"asked for",
+        )
+        # (7) The shape of a confined spawn: the profile names the rung the
+        # realm OBTAINED, not the one the session asked for. A profile derived
+        # from the request would read the same at rung 9 and at rung 1.
         self.assertEqual(
             iso["applied_profile"],
-            "namespaces-only",
-            "the profile must never be a tier name: `intra-user` is defined as namespaces "
-            "PLUS Landlock PLUS seccomp, and this build applies the first third",
+            f"namespaces+landlock-abi{landlock['obtained_rung']}",
+            "the profile must name the obtained rung, and must never be a tier name: "
+            "`intra-user` is defined as namespaces PLUS Landlock PLUS seccomp, and this "
+            "build applies the first two",
         )
-        # These two are tripwires for a *future* build rather than checks on
-        # this one: the day P2.6.3 or P2.6.4 lands, this gate's "what this does
-        # not prove" section and `limits.md` both go stale, and one of these
-        # fires to say so.
-        self.assertEqual(
-            iso["landlock"],
-            "not-applied (P2.6.3)",
-            "the journal must say in as many words that no Landlock policy is applied. If "
-            "P2.6.3 has landed, this gate's module docs and docs/book/src/limits.md are now "
-            "wrong and both need editing with this line",
+        self.assertNotIn(
+            "intra-user",
+            iso["applied_profile"],
+            "a build with no seccomp filter may not journal a tier that means one",
         )
+        # Still a tripwire for a future build: the day P2.6.4 lands, this
+        # gate's "what this does not prove" section and `limits.md` both go
+        # stale, and this fires to say so.
         self.assertEqual(
             iso["seccomp"],
             "not-applied (P2.6.4)",
@@ -733,6 +1188,25 @@ class RealConfinementJournal(_RealChain):
             "an unconfined spawn unshares nothing, so the verified-namespace list must be "
             "empty rather than carrying names nothing read",
         )
+        # The Landlock object, present with every field null rather than
+        # omitted -- the recorder's rule that absent information is an explicit
+        # value. At `--isolation=off` no helper runs, so nothing was asked for
+        # and nothing was obtained.
+        #
+        # `rung_evidence` is in this list since #187's adversarial pass, and it
+        # is the one field here that used to carry a value: the recorder wrote
+        # `"child-asserted"` unconditionally, so the object labelled four nulls
+        # with the provenance of a number no child had sent. The key is still
+        # written -- `iso["landlock"]["rung_evidence"]` would KeyError if it
+        # were dropped, which is the same rule stated the other way.
+        for field in (
+            "requested",
+            "obtained_rung",
+            "kernel_abi",
+            "clamped_by_build",
+            "rung_evidence",
+        ):
+            self.assertIsNone(iso["landlock"][field], f"landlock.{field}: {unmeasured}")
         self.assertIsNone(observed["root_dev_differs"], f"root_dev_differs: {unmeasured}")
         self.assertIsNone(observed["canaries_unreachable"], f"canaries_unreachable: {unmeasured}")
         self.assertEqual(

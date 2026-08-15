@@ -202,6 +202,7 @@ def test_to_png_round_trips_the_golden_without_pillow(server, tmp_path) -> None:
     conn.close()
 
 
+@pytest.mark.capability("pillow")
 def test_to_png_decodes_with_pillow(server, tmp_path) -> None:
     """The independent-decoder proof (test-only Pillow, skipped when absent):
     a real PNG implementation reads back exactly the golden's RGB pixels,

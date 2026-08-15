@@ -24,9 +24,17 @@ from vitrin_os import protocol
 
 IDL = Path(__file__).resolve().parents[3] / "protocol" / "vitrin-v0.xml"
 
-pytestmark = pytest.mark.skipif(
-    not IDL.is_file(), reason=f"IDL not present at {IDL} (not a repo checkout)"
-)
+# The `capability` mark names WHICH machine state this module's skip
+# describes, so `conftest.py` can hold it to `VITRIN_REQUIRE_IDL` (issue
+# #288). A skip with no `capability` mark is an unclassified skip and fails
+# the run — the pytest side of `crates/xtask`'s INVENTORY, and the reason the
+# expected skip set is no longer a prose comment in .github/workflows/ci.yml.
+pytestmark = [
+    pytest.mark.capability("idl"),
+    pytest.mark.skipif(
+        not IDL.is_file(), reason=f"IDL not present at {IDL} (not a repo checkout)"
+    ),
+]
 
 # The IDL's own phrasing for a verb that version 1 defines but refuses.
 UNSERVED_MARKER = "refused unsupported in version 1"

@@ -209,3 +209,26 @@ python -m pytest sdk/python/tests
 Optionally `python -m pip install pillow` first: it enables the
 independent-decoder PNG test (test-only; the SDK itself never uses Pillow —
 without it that one test skips and everything else still runs).
+
+### Skips are classified, and enforced under CI
+
+`tests/conftest.py` carries the pytest half of issue
+[#288](https://github.com/vitrin-os/vitrin-os/issues/288). Every skip must
+carry `@pytest.mark.capability("<class>")` naming the machine state it
+describes; an unclassified skip **fails the run**, so a newly skipping module
+cannot join a passing suite unnoticed. Each class has a require-variable
+(`VITRIN_REQUIRE_PILLOW`, `VITRIN_REQUIRE_IDL`) that *excuses* rather than
+requires: under CI a skip is a failure unless the job sets that variable to
+`0`, so a typo in a workflow turns a job red rather than quietly switching
+the gate off. `VITRIN_MIN_TESTS` is the collection floor — a suite that
+collected nothing exits 0, and "0 skipped" over it would be a claim about
+tests that did not run. Under CI it is **required, and may not be `0`**: a
+floor of zero is met by a run that collected nothing, which is the hole the
+floor exists to close rather than a way to opt out of it. A value that is not
+a non-negative integer is rejected before the first test runs, not halfway
+through a hook.
+
+Running the suite on your own machine is unaffected: off CI, with no
+variable set, nothing is required, there is no floor, and a Pillow-less box
+still skips that one test. What this measures is whether tests ran — not
+whether they assert anything.

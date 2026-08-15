@@ -1516,15 +1516,32 @@ mod gpu_tests {
     const W: u32 = 96;
     const H: u32 = 64;
 
-    /// Skip (returning `None`) unless the env gate is set — belt to the
-    /// `#[ignore]` braces, so `--ignored` runs on a GPU-less box degrade to
-    /// a loud skip instead of a failure.
-    fn env_gate() -> Option<()> {
-        if std::env::var_os("VITRIN_GPU_TESTS").is_none() {
-            eprintln!("skipping: set VITRIN_GPU_TESTS=1 to run real-GPU dmabuf tests");
-            return None;
-        }
-        Some(())
+    /// Whether the env gate is set — belt to the `#[ignore]` braces, so
+    /// `--ignored` runs on a GPU-less box degrade to a loud skip instead of
+    /// a failure.
+    ///
+    /// A [`vitrin_skip::Verdict`] rather than the `Option<()>` this was
+    /// (#288). The old shape was `let Some(()) = env_gate() else { return }`
+    /// — a bare `return` in a test body, in a module NO CI job compiles, so
+    /// nothing anywhere would have noticed it becoming unconditional. The
+    /// verdict is opaque: it cannot be matched, so that shape no longer
+    /// type-checks, here or in a copy of it somebody writes next year.
+    fn gpu_tests_requested() -> vitrin_skip::Verdict {
+        vitrin_skip::Verdict::capable_if(
+            std::env::var_os("VITRIN_GPU_TESTS").is_some(),
+            "set VITRIN_GPU_TESTS=1 to run the real-GPU dmabuf tests",
+        )
+    }
+
+    /// Whether this renderer imports the format the acceptance measures.
+    ///
+    /// Linear-import support is a per-GPU reality (plan risk R3); a driver
+    /// without it exercises the fallback path, not this test.
+    fn imports_linear_xrgb(supported: bool) -> vitrin_skip::Verdict {
+        vitrin_skip::Verdict::capable_if(
+            supported,
+            "this renderer does not import XRGB8888+LINEAR dmabufs",
+        )
     }
 
     /// A GLES renderer plus a GBM device on that renderer's *own* DRM
@@ -1731,7 +1748,7 @@ mod gpu_tests {
     #[test]
     #[ignore = "requires a real GPU (EGL + DRM render node); VITRIN_GPU_TESTS=1 cargo test -p vitrin-core --features gpu-tests -- --ignored dmabuf"]
     fn real_gpu_dmabuf_frames_are_zero_copy_end_to_end() {
-        let Some(()) = env_gate() else { return };
+        vitrin_skip::skip_unless!(vitrin_skip::GPU, gpu_tests_requested());
         let _fd = crate::capture::tests::fd_lock();
         let Some((mut renderer, gbm, node)) = gpu_harness() else {
             panic!("VITRIN_GPU_TESTS=1 but no EGL device with a working GBM pipeline was found");
@@ -1743,12 +1760,7 @@ mod gpu_tests {
             content: &mut probe_slot,
         }
         .supports(Format::Xrgb8888);
-        if !supported {
-            // Linear-import support is a per-GPU reality (risk R3); a
-            // driver without it exercises the fallback path, not this test.
-            eprintln!("skipping: renderer does not import XRGB8888+LINEAR dmabufs");
-            return;
-        }
+        vitrin_skip::skip_unless!(vitrin_skip::GPU, imports_linear_xrgb(supported));
 
         let (mut core, shim_conn) = Connection::pair().expect("socketpair");
         let mut server = ShimServer::new(ShimConfig {
@@ -1891,7 +1903,7 @@ mod gpu_tests {
     #[test]
     #[ignore = "requires a real GPU (EGL + DRM render node); VITRIN_GPU_TESTS=1 cargo test -p vitrin-core --features gpu-tests -- --ignored dmabuf"]
     fn real_gpu_probe_accepts_dmabuf_and_kills_memfd_lie() {
-        let Some(()) = env_gate() else { return };
+        vitrin_skip::skip_unless!(vitrin_skip::GPU, gpu_tests_requested());
         let _fd = crate::capture::tests::fd_lock();
         let Some((mut renderer, gbm, node)) = gpu_harness() else {
             panic!("VITRIN_GPU_TESTS=1 but no EGL device with a working GBM pipeline was found");
@@ -1978,7 +1990,7 @@ mod gpu_tests {
     #[test]
     #[ignore = "requires a real GPU (EGL + DRM render node); VITRIN_GPU_TESTS=1 cargo test -p vitrin-core --features gpu-tests -- --ignored dmabuf"]
     fn real_gpu_oversized_dmabuf_center_crops_the_full_view() {
-        let Some(()) = env_gate() else { return };
+        vitrin_skip::skip_unless!(vitrin_skip::GPU, gpu_tests_requested());
         let _fd = crate::capture::tests::fd_lock();
         let Some((mut renderer, gbm, node)) = gpu_harness() else {
             panic!("VITRIN_GPU_TESTS=1 but no EGL device with a working GBM pipeline was found");
@@ -1997,10 +2009,10 @@ mod gpu_tests {
             renderer: &mut renderer,
             content: &mut content,
         };
-        if !importer.supports(Format::Xrgb8888) {
-            eprintln!("skipping: renderer does not import XRGB8888+LINEAR dmabufs");
-            return;
-        }
+        vitrin_skip::skip_unless!(
+            vitrin_skip::GPU,
+            imports_linear_xrgb(importer.supports(Format::Xrgb8888))
+        );
         let (fd, stride) = gbm_frame_sized(&gbm, N, SW, SH).expect("gbm buffer");
         importer
             .import(

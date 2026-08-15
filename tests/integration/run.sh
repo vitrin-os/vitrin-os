@@ -143,8 +143,30 @@ PROPERTY_GATES=(
                                 # a wire-reachable path into `spawn.rs`, so its
                                 # silent absence is the costliest of any here.
 )
+# The rest of the suite: modules that are neither a milestone gate nor a named
+# property gate, but that `unittest discover` collects and this run is cited
+# for. Named here for one reason (issue #288): until this list existed, SEVEN
+# `test_*.py` modules appeared in no list at all, so deleting one made the
+# suite collect fewer tests and exit 0 with nothing to say about it. That is
+# the same failure class as a silent skip -- a green count standing in for
+# absent evidence -- one level below where the two lists above could see it.
+SUPPORTING_MODULES=(
+  test_real_firefox.py          # M1.2's Firefox render proof. Also run by its
+                                # own dedicated CI step, by exact filename.
+  test_real_gtk.py              # the GTK text-field rung of the actuation
+                                # ladder (needs gtk-entry-probe co-built)
+  test_runtime_wiring.py        # the runtime tree, socket paths and env the
+                                # shipped binary really builds
+  test_hostile_client.py        # a peer that lies on the wire is refused
+                                # rather than crashing the core
+  test_multi_realm.py           # several realms at once over one socket
+  test_actuation.py             # the actuation path against the mock shim
+                                # (the component half of #108's ladder)
+  test_consent_injector.py      # the scripted-consent channel itself, the
+                                # instrument #138's gate rides on
+)
 missing=()
-for gate in "${MILESTONE_GATES[@]}" "${PROPERTY_GATES[@]}"; do
+for gate in "${MILESTONE_GATES[@]}" "${PROPERTY_GATES[@]}" "${SUPPORTING_MODULES[@]}"; do
   [ -f "tests/integration/$gate" ] || missing+=("$gate")
 done
 if [ ${#missing[@]} -ne 0 ]; then
@@ -152,8 +174,28 @@ if [ ${#missing[@]} -ne 0 ]; then
   echo "       \`unittest discover\` would simply not collect them and this suite" >&2
   echo "       would exit 0 with that gate's evidence contributing nothing." >&2
   echo "       Restore the file, or -- if a gate is genuinely being retired --" >&2
-  echo "       remove it from MILESTONE_GATES/PROPERTY_GATES here AND from the" >&2
-  echo "       gate table in tests/integration/README.md, in the same commit." >&2
+  echo "       remove it from MILESTONE_GATES/PROPERTY_GATES/SUPPORTING_MODULES" >&2
+  echo "       here AND from the gate table in tests/integration/README.md, in" >&2
+  echo "       the same commit." >&2
+  exit 1
+fi
+
+# ...and the other direction, which is what makes the three lists a partition
+# rather than a wish: a module ON DISK that appears in none of them is a
+# module nobody has classified, and the next one to be deleted silently.
+unlisted=()
+for path in tests/integration/test_*.py; do
+  name="$(basename "$path")"
+  found=0
+  for gate in "${MILESTONE_GATES[@]}" "${PROPERTY_GATES[@]}" "${SUPPORTING_MODULES[@]}"; do
+    [ "$gate" = "$name" ] && found=1 && break
+  done
+  [ "$found" -eq 1 ] || unlisted+=("$name")
+done
+if [ ${#unlisted[@]} -ne 0 ]; then
+  echo "ERROR: module(s) in tests/integration/ named in no list here: ${unlisted[*]}" >&2
+  echo "       Add each to MILESTONE_GATES, PROPERTY_GATES or SUPPORTING_MODULES." >&2
+  echo "       An unlisted module is one whose deletion this script cannot notice." >&2
   exit 1
 fi
 
@@ -361,6 +403,31 @@ if [ "$skipped" -ne 0 ]; then
   echo ""
   echo "==> $skipped test(s) SKIPPED. This run did not exercise:"
   grep '\.\.\. skipped' "$LOG" | sed 's/^/      /'
+fi
+
+# ---- ...and what this run did not even COLLECT ----------------------------
+#
+# The presence checks at the top of this script prove the named modules exist
+# on disk. They cannot prove `unittest discover` collected them: a module that
+# imports but exposes no test case, a `load_tests` that returns an empty suite,
+# or a discovery pattern change all leave the file in place and the evidence
+# absent. So every named module is required to appear in the verbose log at
+# least once -- by NAME, never as a count, because a count is a number somebody
+# bumps and a name is a line a reviewer reads (issue #288).
+#
+# `-v` prints one `test_x (module.Class.test_x) ... ok|FAIL|ERROR|skipped` line
+# per collected test, so a skipped module still satisfies this: the question
+# here is "was it collected", and "did it skip" is the census above.
+uncollected=()
+for gate in "${MILESTONE_GATES[@]}" "${PROPERTY_GATES[@]}" "${SUPPORTING_MODULES[@]}"; do
+  grep -q "${gate%.py}\." "$LOG" || uncollected+=("$gate")
+done
+if [ ${#uncollected[@]} -ne 0 ]; then
+  echo "" >&2
+  echo "ERROR: named module(s) collected ZERO tests: ${uncollected[*]}" >&2
+  echo "       The file exists, so the presence check above passed, but nothing" >&2
+  echo "       from it ran. Whatever this suite is cited for, it is not that." >&2
+  exit 1
 fi
 
 # The one skip class that is always a misconfiguration, checked even though the

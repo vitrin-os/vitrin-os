@@ -410,9 +410,9 @@ grant.pointer.click(640, 84)</pre>
       <code>aa-exec</code>, though whether that borrow yields a user namespace
       turns on <code>kernel.apparmor_restrict_unprivileged_unconfined</code>,
       at which value AppArmor stacks the borrowed profile with
-      <code>unconfined</code> rather than transitioning to it. Which value
-      Ubuntu 24.04 ships is unverified, so the cost is published as
-      unmitigated. Both are stated in full, with citations, on the
+      <code>unconfined</code> rather than transitioning to it. Measured
+      <code>0</code> on a stock runner, so the borrow works and the cost is
+      real. Both are stated in full, with citations, on the
       <a href="https://github.com/vitrin-os/vitrin-os/blob/main/docs/book/src/limits.md">limits
       page</a>.</p>
       <p><strong>And since P2.6.3 there is a second host requirement, with a

@@ -614,29 +614,31 @@ for. It is the same cost Ubuntu already accepted for `chrome`, `firefox` and
 `flatpak`, which is company rather than a justification.
 
 Whether the ask *succeeds* depends on a second knob,
-`kernel.apparmor_restrict_unprivileged_unconfined`, **and this page does not
-know that knob's value on Ubuntu 24.04.** It has now been asserted here twice
-and wrongly in opposite directions — first as `0` by default, so the borrow
-just works; then as `1`, shipped by the `apparmor` package's
-`/usr/lib/sysctl.d/10-apparmor.conf`, so it does not. Neither was measured.
-The second reading came from the AppArmor project's own
-[userns-restriction wiki page][aa-userns], which describes what upstream
-intends that file to contain; nobody here has read the file as Ubuntu 24.04
-actually ships it.
+`kernel.apparmor_restrict_unprivileged_unconfined`, and **it has now been
+measured: `0`.** Recorded by the `apparmor profile` CI job as
+`RESULT unconfined_knob=0` on a stock `ubuntu-latest` (kernel
+`6.17.0-1020-azure`, 2026-08-15), on the same machine and in the same run that
+`apparmor_restrict_unprivileged_userns` read `1`.
 
-So the honest statement is conditional, and both branches are real:
+**So the cost is real and unmitigated.** At `0`, `aa-exec -p vitrind` borrows
+this profile's name and the borrower is genuinely unconfined — any local user
+can obtain an unprivileged user namespace by naming a profile they do not own.
+That is the price of installing this file, and it does not depend on vitrin
+being installed or running.
 
-* If the knob is **`0`**, `aa-exec -p vitrind` borrows this profile and the
-  borrower is genuinely unconfined. That is the security cost, unmitigated.
-* If the knob is **`1`**, the [unconfined-restriction page][aa-unconf]
-  describes `change_profile` — which is what `aa-exec -p` performs — as
-  stacking rather than transitioning: "instead of transitioning to the
-  specified profile it will stack the specified profile with unconfined", so
-  "the system restrictions are retained by the stacked unconfined profile".
-  The borrow is permitted but sheds nothing.
+This page asserted that knob twice before measuring it, wrongly in both
+directions — first `0` for the wrong reason, then `1` on the strength of the
+AppArmor project's [userns-restriction wiki page][aa-userns] describing what
+upstream intends `/usr/lib/sysctl.d/10-apparmor.conf` to contain, which is not
+the same as reading what Ubuntu ships. The measurement happens to agree with
+the first guess. It was still a guess, and the second correction was confidently
+wrong, which is why the job now records this knob on every run rather than
+leaving it to prose.
 
-Treat the cost as unmitigated until a run says otherwise. Assuming the
-favourable branch is how this paragraph was wrong the second time.
+Had it read `1`, the [unconfined-restriction page][aa-unconf] describes
+`change_profile` — what `aa-exec -p` performs — as stacking rather than
+transitioning, so the borrow would shed nothing. That is the branch this page
+does **not** get to claim, on this runner.
 
 So: the cost is real where an operator has set that knob to `0`, and is
 mitigated by the stacking behaviour where Ubuntu's shipped `1` is in force.

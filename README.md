@@ -625,9 +625,9 @@ That is the complete list of what confines a realm right now.
   worth knowing before you install it — the profile's *name* is borrowable via
   `aa-exec`, and whether that borrow actually yields a user namespace turns on
   `kernel.apparmor_restrict_unprivileged_unconfined` — at `1` AppArmor stacks
-  rather than transitions and the restriction survives, at `0` it does not, and
-  **which value Ubuntu 24.04 ships is unverified here**, so the cost is
-  published as unmitigated. The [limits page](docs/book/src/limits.md) states both
+  rather than transitions and the restriction survives, at `0` it does not.
+  **Measured `0`** on a stock `ubuntu-latest` (2026-08-15), so the cost is real
+  and unmitigated there. The [limits page](docs/book/src/limits.md) states both
   in full, with the citations. **This is
   not the only host requirement** — the bullet below is a second one with a
   completely different remedy, and the refusal names which mechanism it could

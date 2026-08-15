@@ -2026,6 +2026,15 @@ jobs:
         run: |
           sudo install -d -m 0755 /usr/lib/vitrin
           sudo install -m 0755 target/debug/vitrind target/debug/vitrin-realm-init /usr/lib/vitrin/
+          # The two deliberately-broken helpers the confinement gate needs, from
+          # crates/vitrin-realm-init-fixtures. They are not part of the profile's
+          # attachment glob and get no grant -- being refused is their whole job --
+          # but `test_real_confinement.py` resolves them as siblings of the helper,
+          # so installing vitrind here without them makes that gate fail for a
+          # reason that has nothing to do with AppArmor. It did, on this job's
+          # first real run: 8 executed, 2 failed, both "is missing".
+          sudo install -m 0755 target/debug/unshare-only-init \
+                               target/debug/leaks-a-dirfd-init /usr/lib/vitrin/
           results="${RUNNER_TEMP}/apparmor-results"
           real_core="$(readlink -f /usr/lib/vitrin/vitrind)"
           real_helper="$(readlink -f /usr/lib/vitrin/vitrin-realm-init)"

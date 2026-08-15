@@ -18,7 +18,7 @@ and what each rung of the ABI buys the ruleset on the way.**
 This build's two numbers, both read out of the source that declares them rather
 than typed here:
 
-- **floor — `build.landlock_min_abi` = 7.** A kernel reporting a lower
+- **floor — `build.landlock_min_abi` = 6.** A kernel reporting a lower
   Landlock ABI is refused at startup. It is not confined at a weaker rung.
 - **ceiling — `build.landlock_max_rung` = 9.** A kernel reporting a higher
   ABI gets a rung-9 ruleset, journaled as
@@ -56,7 +56,7 @@ mainline and about distributions, and this repository has measured two machines.
 
 Every cell below is a property of this build's own code — `spawn::isolation`'s
 `Report::mechanism` for the verdict and `landlock::apply_with` for the second
-refusal — with the floor at 7 and the ceiling at 9.
+refusal — with the floor at 6 and the ceiling at 9.
 
 | `vitrind --print-isolation` says | what this build does |
 |---|---|
@@ -78,12 +78,12 @@ so for those rungs there is nothing for a cap to take away.
 
 | ABI | what it buys | axis | capping simulates it | this build asks for it | `handled_access_fs` | `scoped` | vs. this build's floor | published claim |
 |---|---|---|---|---|---|---|---|---|
-| 1 | the base access-mask bits — `EXECUTE`, `WRITE_FILE`, `READ_FILE`, `READ_DIR`, the `REMOVE_*` pair and the seven `MAKE_*` bits | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0x1fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=1,required=7)`; reachable only through `--landlock=abi:1`, which warns that no published confinement claim applies | `refer-makes-the-cap-a-dial`, `abi-floor-refuses-below-the-number` |
-| 2 | `LANDLOCK_ACCESS_FS_REFER` | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0x3fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=2,required=7)`; reachable only through `--landlock=abi:2`, which warns that no published confinement claim applies | `refer-makes-the-cap-a-dial` |
-| 3 | `LANDLOCK_ACCESS_FS_TRUNCATE` | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0x7fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=3,required=7)`; reachable only through `--landlock=abi:3`, which warns that no published confinement claim applies | `truncate-arrives-at-abi-3` |
-| 4 | `handled_access_net` — TCP bind/connect scoping by port | `handled_access_net` | **no** — not an access-mask bit | no — the realm's own network namespace carries that claim structurally and far more completely, since it covers UDP and raw sockets too | `0x7fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=4,required=7)`; reachable only through `--landlock=abi:4`, which warns that no published confinement claim applies | `net-scoping-is-carried-by-the-namespace`, `nine-rungs-are-six-domains` |
-| 5 | `LANDLOCK_ACCESS_FS_IOCTL_DEV` | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0xffff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=5,required=7)`; reachable only through `--landlock=abi:5`, which warns that no published confinement claim applies | `ioctl-dev-does-not-close-the-render-node` |
-| 6 | the `scoped` field — `SCOPE_ABSTRACT_UNIX_SOCKET` and `SCOPE_SIGNAL` | `scoped` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0xffff` | `0x3` | **below the floor** — a session refuses to start with `below-floor(abi=6,required=7)`; reachable only through `--landlock=abi:6`, which warns that no published confinement claim applies | `scoped-is-defence-in-depth` |
+| 1 | the base access-mask bits — `EXECUTE`, `WRITE_FILE`, `READ_FILE`, `READ_DIR`, the `REMOVE_*` pair and the seven `MAKE_*` bits | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0x1fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=1,required=6)`; reachable only through `--landlock=abi:1`, which warns that no published confinement claim applies | `refer-makes-the-cap-a-dial`, `abi-floor-refuses-below-the-number` |
+| 2 | `LANDLOCK_ACCESS_FS_REFER` | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0x3fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=2,required=6)`; reachable only through `--landlock=abi:2`, which warns that no published confinement claim applies | `refer-makes-the-cap-a-dial` |
+| 3 | `LANDLOCK_ACCESS_FS_TRUNCATE` | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0x7fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=3,required=6)`; reachable only through `--landlock=abi:3`, which warns that no published confinement claim applies | `truncate-arrives-at-abi-3` |
+| 4 | `handled_access_net` — TCP bind/connect scoping by port | `handled_access_net` | **no** — not an access-mask bit | no — the realm's own network namespace carries that claim structurally and far more completely, since it covers UDP and raw sockets too | `0x7fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=4,required=6)`; reachable only through `--landlock=abi:4`, which warns that no published confinement claim applies | `net-scoping-is-carried-by-the-namespace`, `nine-rungs-are-six-domains` |
+| 5 | `LANDLOCK_ACCESS_FS_IOCTL_DEV` | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0xffff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=5,required=6)`; reachable only through `--landlock=abi:5`, which warns that no published confinement claim applies | `ioctl-dev-does-not-close-the-render-node` |
+| 6 | the `scoped` field — `SCOPE_ABSTRACT_UNIX_SOCKET` and `SCOPE_SIGNAL` | `scoped` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0xffff` | `0x3` | at or above the floor — a shipped session runs here | `scoped-is-defence-in-depth` |
 | 7 | `landlock_restrict_self` log flags — `LOG_SAME_EXEC_OFF`, `LOG_NEW_EXEC_ON`, `LOG_SUBDOMAINS_OFF` | `landlock_restrict_self` flags | **no** — not an access-mask bit | no — the log flags are observability, not confinement, and no published claim depends on them; the one that is reachable at all is reachable only through the `VITRIN_LANDLOCK_AUDIT` diagnostic in vitrind's own environment | `0xffff` | `0x3` | at or above the floor — a shipped session runs here | `restrict-self-flags-are-not-mask-bits`, `nine-rungs-are-six-domains` |
 | 8 | `landlock_restrict_self` `TSYNC` — apply the domain to every thread of the caller | `landlock_restrict_self` flags | **no** — not an access-mask bit | no — the helper is single-threaded by design and enforces the domain on the one thread that then `execve`s, so its shape already carries what `TSYNC` would buy | `0xffff` | `0x3` | at or above the floor — a shipped session runs here | `restrict-self-flags-are-not-mask-bits`, `nine-rungs-are-six-domains` |
 | 9 | `LANDLOCK_ACCESS_FS_IOCTL_DEV`'s ladder successor `RESOLVE_UNIX` — `connect(2)` and addressed `sendmsg(2)` restricted to pathname UNIX sockets | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0x1ffff` | `0x3` | at or above the floor — a shipped session runs here | `the-ladder-stops-at-the-build-ceiling` |
@@ -181,21 +181,26 @@ published sentence cannot be deleted or reworded while this table still cites it
   that was left half-taken: a table carrying the ABI of the machine that
   generated it cannot be byte-stable across two machines, so it cannot be the
   thing CI holds. The plan carries that as Correction 5.
-- **Which kernels clear the floor.** Two machines have been measured — this
-  repository's development box at Landlock ABI 9 on 2026-08-15, and the runner
-  its CI uses at ABI 7 on 2026-08-14. Those two numbers are *measurements*; the
-  floor of 7 is a *choice* made to equal the lower of them, because it is the
-  highest floor this repository can actually exercise. **The runner's number was
-  read out of a CI job log and is recorded in no artefact here** — the diagnostic
-  step that printed it archives nothing and GitHub expires job logs, so the floor
-  rests on a transcription that cannot be re-read from the tree;
-  [the limits page](limits.md) publishes that bound. The ABI-to-release mapping
-  is a fact about mainline that was not measured here, and no page in this
-  repository states which kernel releases the floor excludes.
+- **Which kernels clear the floor — measured elsewhere, not here.** This page
+  still probes nothing. Since 2026-08-16 the per-kernel measurement exists as its
+  own artefact: [the kernel page](isolation-kernels.md), generated from boot logs
+  checked in under `tests/kernel-matrix/rows/`. Read the two together and do not
+  confuse them — this page says what the *build* requires, that one says what five
+  *kernels* answered and which of them the floor of 6 admits. Two live machines
+  are also on record: this repository's
+  development box at Landlock ABI 9 on 2026-08-15, and the runner its CI uses
+  at ABI 7 on 2026-08-14. The runner's number was read out of a CI job log that
+  archives nothing, and it is corroborated but **not** replaced by the kernel page:
+  booting the runner's own `6.17.0-1020-azure` in a bare initramfs answers ABI 7
+  too, which is a fact about that kernel and not about that runner.
 - **Any statement that P2.6.3 is finished.** What landed with this page is a
-  generated ladder of what this build requires, held by CI. The per-kernel row
-  set did not land, and the behavioural per-rung tests this page's numbers rest
-  on live in `vitrin-realm-init`'s own suite, on one box.
+  generated ladder of what this build requires, held by CI. A per-kernel row set
+  landed separately on 2026-08-16 — five kernels, on [the kernel
+  page](isolation-kernels.md) — and it is a row per *kernel*, not the "one row per
+  ABI actually reported" the criteria ask for: five kernels answered five ABIs, and
+  four of the nine rungs are reported by none of them. The behavioural per-rung
+  tests this page's numbers rest on still live in `vitrin-realm-init`'s own suite,
+  on one box.
 - **The realm's grant table.** Which hierarchies get which rights is
   [the limits page](limits.md)'s two-tier grant list, not a per-rung fact. The
   only grant-table row here is the one denial the mount table does not carry.

@@ -52,6 +52,19 @@ name: CI
 #                 cites. It measures no kernel and cannot: the page has to be
 #                 byte-identical on a runner reporting Landlock ABI 7 and on
 #                 the development box reporting 9.
+#                 A FOURTH regeneration diff arrived with #281:
+#                 `cargo xtask kernel-matrix --check`, holding
+#                 docs/book/src/isolation-kernels.md against the boot rows in
+#                 tests/kernel-matrix/rows/. Those rows ARE per-kernel
+#                 measurements -- the shipped vitrind's own output on five
+#                 pinned distribution kernels booted under QEMU -- but this
+#                 step boots nothing: it holds the PAGE to the ROWS. Holding
+#                 the ROWS to the KERNELS is tests/kernel-matrix/collect.sh
+#                 --check, which lives in .github/workflows/kernel-matrix.yml
+#                 and runs on a schedule and on demand, never on a pull
+#                 request. Do not read a green codegen-diff as evidence that
+#                 those kernels still answer that way; read the collection
+#                 date the page prints.
 #                 This job also carries `cargo xtask limits-check`, which is
 #                 neither codegen nor a regeneration diff and is here because
 #                 it is the other docs-honesty gate: it holds published-claim
@@ -580,6 +593,39 @@ jobs:
         # `rust` job's `cargo test --workspace`, because xtask is a workspace
         # member.
         run: cargo xtask isolation-matrix --check
+
+      - name: cargo xtask kernel-matrix --check
+        # The OTHER half of #281, and the half that does measure kernels --
+        # except that the measuring did not happen here and this step is
+        # careful about which claim it is making.
+        #
+        # docs/book/src/isolation-kernels.md is rendered from the boot rows in
+        # tests/kernel-matrix/rows/, one file per kernel, each holding the
+        # SHIPPED vitrind's own `--print-isolation` and `--print-floor` output
+        # plus its startup verdict, collected by booting that kernel under QEMU
+        # (tests/kernel-matrix/collect.sh). This step re-renders the page from
+        # those checked-in rows and compares byte-for-byte.
+        #
+        # SO WHAT A GREEN RESULT HERE PROVES: the page agrees with the rows.
+        # WHAT IT DOES NOT PROVE: that the kernels still answer that way.
+        # Holding the ROWS to the KERNELS is `collect.sh --check`, which boots
+        # five kernels and is deliberately NOT wired into any pull request --
+        # it needs qemu, downloads ~220 MiB of kernel packages, and re-checks
+        # something that changes when a distribution ships a kernel rather than
+        # when this repository changes. .github/workflows/kernel-matrix.yml
+        # runs it on a schedule and on demand instead, and every row carries a
+        # collection date so its age is visible on the page.
+        #
+        # This step needs no qemu, no network and no privileges: it reads two
+        # sets of files that are both in the tree.
+        #
+        # The generator's own gates -- a row with no stated reason for being in
+        # the set, a row collected against a different LANDLOCK_MIN_ABI than
+        # this tree declares, a verdict that contradicts the ABI in its own
+        # row, and the cross-validation table's requirement that the two
+        # columns actually disagree somewhere -- run in the `rust` job's
+        # `cargo test --workspace`, because xtask is a workspace member.
+        run: cargo xtask kernel-matrix --check
 
       - name: cargo xtask limits-check
         # WS-E.4.4 / issue #224 acceptance criterion 1: "Changing a WS-E claim

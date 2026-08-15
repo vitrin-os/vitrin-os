@@ -87,6 +87,29 @@
 //!                                --print-isolation`, which the page tells the
 //!                                reader how to read against it.
 //!
+//! cargo xtask kernel-matrix     Regenerate docs/book/src/isolation-kernels.md
+//!                                from the boot rows in tests/kernel-matrix/rows/
+//!                                (issue #281), in place. Unlike every other
+//!                                generator here it renders a MEASUREMENT: each
+//!                                row is the shipped `vitrind`'s own output on a
+//!                                pinned distribution kernel, booted under QEMU
+//!                                by tests/kernel-matrix/collect.sh. This
+//!                                command boots nothing and needs no network --
+//!                                it only reads what that script wrote.
+//!
+//! cargo xtask kernel-matrix --check
+//!                                Verify the checked-in page is what the
+//!                                checked-in rows render to. This is what CI
+//!                                runs, and it holds the PAGE to the ROWS.
+//!                                Holding the ROWS to the KERNELS is
+//!                                `tests/kernel-matrix/collect.sh --check`,
+//!                                which needs qemu and runs in no pull request.
+//!                                A green PR therefore proves the page matches
+//!                                the measurement, and proves nothing about
+//!                                whether the measurement is still current --
+//!                                which is why every row carries a collection
+//!                                date.
+//!
 //! cargo xtask isolation-matrix --check
 //!                                Verify the checked-in page is byte-identical
 //!                                to what the generator emits. Reads only.
@@ -131,6 +154,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 mod isolation_matrix;
+mod kernel_matrix;
 mod limits;
 mod session_matrix;
 mod skip_census;
@@ -152,7 +176,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask limits-check\n       cargo xtask skip-scan\n       cargo xtask skip-census --min-tests N [--expect-self-marker] -- CMD [ARG...]"
+    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask kernel-matrix [--check]\n       cargo xtask limits-check\n       cargo xtask skip-scan\n       cargo xtask skip-census --min-tests N [--expect-self-marker] -- CMD [ARG...]"
 }
 
 fn run() -> Result<()> {
@@ -257,6 +281,20 @@ fn run() -> Result<()> {
                 }
             }
             isolation_matrix::isolation_matrix(&workspace_root()?, check)
+        }
+        "kernel-matrix" => {
+            let mut check = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--check" => check = true,
+                    "-h" | "--help" => {
+                        println!("{}", usage());
+                        return Ok(());
+                    }
+                    other => bail!("unknown flag '{other}' for 'kernel-matrix'\n\n{}", usage()),
+                }
+            }
+            kernel_matrix::kernel_matrix(&workspace_root()?, check)
         }
         "limits-check" => {
             // No flags: the check has exactly one mode. A `--check` spelling

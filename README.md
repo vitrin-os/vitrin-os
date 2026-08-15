@@ -608,8 +608,24 @@ That is the complete list of what confines a realm right now.
   to start. **That is one CI image, not a distribution survey**; the
   cross-kernel matrix is
   [#281](https://github.com/vitrin-os/vitrin-os/issues/281). `vitrind
-  --print-isolation` answers for the machine in front of you; packaging that
-  makes the grant routine is #286, and `--isolation=off` is not it. **This is
+  --print-isolation` answers for the machine in front of you, and
+  `--isolation=off` is not a remedy — it starts an unconfined session.
+  **There is now an AppArmor profile for this, at `packaging/apparmor/vitrind`,
+  and it has never been loaded by anyone who wrote it.** It is the per-binary
+  grant Ubuntu ships a mechanism for — the shape Chromium, Firefox and flatpak
+  already use — chosen over asking operators to weaken a system-wide default.
+  It was authored on a machine with AppArmor compiled out, so it has not been
+  parsed, loaded, attached or observed to grant anything; **do not install it
+  expecting it to work.** The `apparmor-profile` CI job is what will say: it
+  runs on a runner it does not modify (the only job in that workflow that never
+  touches the sysctl above), loads the profile, spawns a real realm, and then
+  removes the profile and requires the spawn to fail again. It also has a cost
+  worth knowing before you install it — the profile's *name* is borrowable via
+  `aa-exec`, and whether that borrow actually yields a user namespace turns on
+  `kernel.apparmor_restrict_unprivileged_unconfined`, which Ubuntu 24.04 ships
+  set to `1` (at which value AppArmor stacks rather than transitions, and the
+  restriction survives). The [limits page](docs/book/src/limits.md) states both
+  in full, with the citations. **This is
   not the only host requirement** — the bullet below is a second one with a
   completely different remedy, and the refusal names which mechanism it could
   not get (`namespaces` here, `landlock` there). Read that word first.
